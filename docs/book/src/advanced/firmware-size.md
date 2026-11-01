@@ -942,6 +942,28 @@ fragment and duplicate state. An MG22 router does not fit: 30,472 B of
 linker rejects it and CI asserts the failure. The baseline JSON rows were
 moved by the same-path deltas.
 
+### EFR32 Series 2: interrupt Imm-Ack on routers
+
+The routers enable the HAL `isr-ack` feature and use `Parent<8, 8, 0>`.
+Same-path deltas against `4f842fd`:
+
+| image | flash | text | bss | mac_code | stack |
+|---|---:|---:|---:|---:|---:|
+| `efr32mg21-router` | +2,008 | +1,592 | +1,032 | −1,258 | +0 |
+| `ha-connect-zbt1-router` | +1,824 | +1,452 | +1,028 | −1,258 | +0 |
+| MG21/MG22/ZBT-1 ED, SED and sensor images | −4 | +0 | +0 | +0 | +0 |
+| every non-Series-2 image | +0 | +0 | +0 | +0 | +0 |
+
+The interrupt handler and the FP table cost flash, and the core's software
+ACK and pending queue (`PENDING = 0`) are no longer linked, so `mac_code`
+shrinks. In `.bss`, the 1 KiB hardware RX buffer, the 1 KiB software RX
+queue and the FP table replace the 512-byte buffer, and the core's pending
+frame queue is gone (`PENDING = 0`). The net growth is about 1 KiB. The
+leaf images keep their `.text` unchanged (the `radio_op!` macro compiles to
+the old radio code without `isr-ack`) and lose 4 B of `.rodata`. Builds must
+use the same checkout path for these numbers, because the panic strings
+embed absolute paths.
+
 ## Measurement commands
 
 Raw binary:

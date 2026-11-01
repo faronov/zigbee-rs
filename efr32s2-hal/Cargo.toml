@@ -16,6 +16,13 @@ rt = []
 # Embassy time driver on the RTCC (32,768 Hz, runs in EM2). Defines the
 # `RTCC` interrupt handler.
 time-driver = ["dep:embassy-time-driver", "dep:embassy-time-queue-utils"]
+# Interrupt-driven Imm-Ack for parent (router) images: the `FRC` RX-done
+# interrupt acknowledges frames with a Frame Pending bit from a HAL
+# source-match table and moves frames for this node out of the 1 KiB RX
+# buffer into a 1 KiB queue for the stack (2 KiB total). Defines the `FRC`
+# interrupt handler, so firmware builds need `rt` too (host tests do not).
+# End-device images leave it off.
+isr-ack = []
 
 [dependencies]
 cortex-m = "0.7"

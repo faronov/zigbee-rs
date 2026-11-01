@@ -26,9 +26,10 @@ if [[ -z "${NM:-}" ]]; then
 fi
 [[ -n "$NM" ]] || { echo "$0: no llvm-nm found (set NM)" >&2; exit 2; }
 
-# Parent MAC (`soft_mac::parent`), router app lifecycle, and the NWK
-# parent-maintenance entry points.
-PARENT_SYMS='soft_mac::parent|ParentRouterApp|ParentCore|parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
+# Parent MAC (`soft_mac::parent`), router app lifecycle, the NWK
+# parent-maintenance entry points, and parent-only radio HAL paths
+# (EFR32 Series 2 interrupt Imm-Ack with Frame Pending, `isr_ack`).
+PARENT_SYMS='soft_mac::parent|ParentRouterApp|ParentCore|parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status|radio::isr_ack::'
 
 status=0
 for elf in "$@"; do

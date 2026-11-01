@@ -367,14 +367,18 @@ Each Series 2 example crate builds one bin per role. The features `ed`,
 | BRD4183A (MG22, 32 KiB RAM) | `efr32mg22-sensor` (default) | `efr32mg22-ed` | does not fit, link rejected |
 
 **MAC.** The router uses `Efr32s2RouterMac = SoftMacCore<Efr32s2RadioPhy,
-Parent<8, 8, 8>>`. The PHY uses the `SoftwareAck` mode: its hardware ACK
-filter stays empty, and the core sends every Imm-Ack through
-`RadioPhy::send_ack`. The core sets the Frame Pending bit from its `PENDING`
-indirect queue (8 entries). The core also builds beacons, association and
-orphan responses and indirect data. The ED and SED bins keep the end-device
-MAC with the default `HalAck` mode, in which the HAL acknowledges matching
-frames itself while `receive` polls it. `tools/check-role-symbols.sh` checks
-in CI that the ED and SED images contain no parent code.
+Parent<8, 8, 0>>` with the HAL feature `isr-ack`. The `FRC` RX-done
+interrupt sends every Imm-Ack (see *Interrupt Imm-Ack* below), so the PHY
+reports `hardware_auto_ack` and the core never calls `send_ack`. The Frame
+Pending bit comes from an 8 short + 8 extended source-match table in the
+HAL that the core arms through `RadioPhy::set_ack_frame_pending` whenever
+it queues indirect data or an association response. `PENDING = 0`: the HAL
+table is the only Frame Pending owner, as on TLSR8258. The core still
+builds beacons, association and orphan responses and indirect data;
+`PENDING = 0` compiles out only the core's software Frame Pending table. The ED and SED bins keep the
+polled HAL ACK: the HAL acknowledges matching frames while `receive` polls
+it, always with FP = 0. `tools/check-role-symbols.sh` checks in CI that the
+ED and SED images contain neither parent code nor `radio::isr_ack`.
 
 **Persistence.** Router images store the child table and the APS
 duplicate/fragment state in their own flash partitions, which sit between
@@ -384,43 +388,79 @@ partitions, so the security journal never moves. The role tag in the
 journal makes a reflash that changes role rejoin while it keeps the frame
 counters.
 
-**RREQ relay and RX overflow.** A router relays Route Requests three times,
-254 ms apart, after a 4–256 ms jitter. Nothing drains the receiver during
-these delays, so a storm of relayed RREQs from neighbours overflowed the
-RAC RX buffer. `transmit_cca` then found the receiver still on but in
-RxOverflow, CCA read no valid RSSI, and every attempt failed with
-ChannelBusy. On the ZBT-1 this caused about six "Failed to forward RREQ"
-warnings every 10 minutes. `transmit_cca` now clears a pending overflow
-before it enables RX. In 9 minutes afterwards, with 9 overflows, no forward
-failed. The receiver still overflows during storms, because the core does
-not receive while NWK delays run. That is a possible core improvement.
+**Interrupt Imm-Ack (router images).** In the first router release the
+core sent each ACK in software. It often came too late: the core handles one
+frame at a time (software AES-CCM*, RTT logging), so the next frame aged
+past the ACK window and the PHY had to drop it unacknowledged. With one
+polling child the ZBT-1 dropped 123 frames and ACKed 158 in 16 minutes
+(session `…202457Z-mg22-sed-via-zbt1-steady`). The `isr-ack` HAL feature
+moves the ACK into the `FRC` interrupt (IRQ 34, `FRC_IEN` = RXDONE | RXOF).
+For each newly completed frame in the RX buffer, the handler:
 
-**Stale software ACKs (open item).** In `SoftwareAck` mode the PHY can't
-know when a frame actually arrived, so it bounds the frame's age by
-`now - last empty poll`. When that exceeds 400 µs, the PHY drops the frame
-without an ACK, and the sender's MAC retries it. That way the parent never
-delivers a frame it didn't acknowledge. While the core works on one frame
-(software AES-CCM*, RTT logging), the next frame ages past the bound. With
-one polling child, the ZBT-1 router dropped 123 stale frames and ACKed 158
-in 16 minutes (session `…202457Z-mg22-sed-via-zbt1-steady`). Retries hide
-most of it, but it costs airtime and retry budget. A per-frame RX timestamp
-would bound the age exactly. FRC `TRAILRXDATA.RTCSTAMP` (bit 5) was tried:
-it appends four bytes, but they read zero in every frame (session
-`…203334Z-zbt1-router-exp-rtcstamp2`). That needs PROTIMER/PRS setup the
-GSDK sources don't document. The real fix is a HAL interrupt-driven Imm-Ack
-with a source-match Frame-Pending table (`hardware_auto_ack = true`, core
-`PENDING = 0`, like TLSR8258), which the ED/SED `HalAck` path could also
-share.
+- reads the MHR (24 bytes at most) and checks the PAN ID and destination
+  the way the HAL's ACK filter does;
+- sends a precomputed 5-byte ACK at once if AR = 1 and the frame is for us,
+  setting FP = 1 only for an unsecured MAC Data Request (command 0x04) whose
+  source address is in the FP table. An ACK to a data frame carries FP = 0
+  (802.15.4-2006 7.2.2.3.1; we do not use the "FP on every frame from a
+  pending child" variant);
+- drops ACK frames, frames for other nodes or PANs, and frames it could no
+  longer ACK within 400 µs of their end (the sender retransmits, so such a
+  frame must not be delivered twice);
+- moves every kept frame (`[len, MPDU, raw RSSI]`) out of the 1 KiB
+  hardware RX buffer into a 1 KiB software queue, and always advances the
+  buffer's read offset. The hardware buffer is therefore empty after every
+  interrupt. Frames without an ACK request (mostly relayed broadcast copies)
+  must leave two maximum-length records (254 B) free, so a broadcast storm
+  cannot starve unicasts to this node; such drops count in
+  `AckStats::queue_full`. An ACK-requested frame that still finds no room is
+  left unacknowledged, so the sender retries
+  (`AckStats::queue_full_unacked`). A corrupt length byte clears the buffer
+  (`AckStats::resyncs`).
+
+Task-side radio operations mask the `FRC` line, so the interrupt never sees
+the radio mid-operation. When the lock is released, it re-pends the
+interrupt if a frame completed meanwhile, and that frame is aged from the
+start of the lock. `receive` pops only from the software queue, which holds
+frames the interrupt has already examined, so the ACK decision always comes
+before delivery. The sequencer's
+hardware auto-ACK was evaluated and rejected: it is driven by RAIL's
+sequencer microcode, which this driver does not load (the sequencer stays
+clock-gated).
+
+**RREQ relay and RX overflow.** A router relays Route Requests three times,
+254 ms apart, after a 4–256 ms jitter. The core does not receive while these
+NWK delays run (`SoftMacCore::delay_micros`), and a storm of relayed RREQs
+from neighbours overflowed the old 512-byte RX buffer (1458 overflows in
+12.7 h on the software-ACK router). `transmit_cca` clears a pending overflow
+before it enables RX, so CCA never sees a stale RxOverflow. On the
+interrupt-ACK router a first version left foreign frames in a 2 KiB
+hardware buffer until the task read past them. Channel 15 carries about
+25 frames/s, of which about 2.6/s are for us, so a 0.8 s RREQ relay
+(`nwk_commands.rs`) or broadcast jitter (`nlde.rs`) still overflowed it
+(86 overflows in 22 min, session `…102430Z-s2ack-mg22-sed-via-zbt1-israck-v2`).
+Router images now drain the radio in the HAL instead of the core. The
+interrupt empties the hardware buffer on every frame and keeps only the
+frames for us in the software queue, already ACKed, which the core reads
+after the delay. The hardware buffer shrank from 2 KiB to 1 KiB, so the
+1 KiB queue costs no extra RAM. A core change (receiving during NWK delays)
+would grow every other router image, so it was not made.
 
 **RAM budget (Cortex-M33, default tables).**
 
 | image | `.bss` | linked stack | notes |
 |---|---:|---:|---|
-| ZBT-1 router | 37,644 | 60,148 | 96 KiB part |
-| MG21 router (BRD4181A) | 30,472 | about 34.5 KiB | 64 KiB part |
-| MG22 router | 30,472 | below the 14 KiB floor | does not fit 32 KiB |
+| ZBT-1 router | 38,672 | 58,608 | 96 KiB part; worst-case call chain 30,944 |
+| MG21 router (BRD4181A) | 31,504 | 33,520 | 64 KiB part; worst-case call chain 30,944 |
+| MG22 router | about 31,500 | below the 14 KiB floor | does not fit 32 KiB |
 
-The MG22 router's `.bss` breaks down as follows: `ZigbeeDevice<_, Router>`
+The `isr-ack` HAL state is 1 KiB of hardware RX buffer, the 1 KiB
+software RX queue and the FP table (8 short + 8 extended entries). It adds
+about 1 KiB of `.bss` to the router images compared with the 512-byte RX
+buffer of the leaf images.
+
+The MG22 router's `.bss` breaks down as follows (measured at `4f842fd`,
+before `isr-ack`, which adds a net 1,032 B): `ZigbeeDevice<_, Router>`
 19,824 B, main future pool 4,520 B, security journal 2,464 B, application
 2,392 B, radio 768 B. Including the 14 KiB stack floor, this exceeds the
 32 KiB of SRAM. The product linker script `ASSERT` rejects the link, and CI
@@ -440,6 +480,31 @@ session IDs):
 | ZBT-1 | Router (final image, after the SED) | The role tag cleared the SED state. The first join reused `0xBAAF`, but the Node_Desc_rsp from the TC never arrived: the previous parent `0xD586` still held `0xBAAF` as its sleepy child. The TCLK exchange failed, so the router left and rejoined 12 s later as `0x794A`, with Confirm-Key SUCCESS. ZHA shows a Router at `0x794A`. Its former child, the MG22, found a new parent by itself (`0xD066`) and kept reporting. | `…204449Z-zbt1-router-final` |
 | ZBT-1 | Router (`service_overflow` out of line) | Resumed `0x794A` from the journal without rejoining. In 240 s: 15–17 neighbours, a route, 3 RX overflows cleared, 28 transmissions, 0 TX failures. ZHA still lists it as an available Router. | `…210701Z-zbt1-router-step7-inline-never` |
 | MG22 | SED | See the BRD4183A section above. | earlier sessions |
+
+**Interrupt Imm-Ack on the ZBT-1 router** (2026-11-01, same network; the
+MG22 SED `0xEE0F` is the ZBT-1's child in every run; counters are at the end
+of each capture):
+
+| build | duration | ACKs (FP = 1) | late | RX overflow | queue-full (unACKed) | other | sessions |
+|---|---:|---:|---:|---:|---:|---|---|
+| software ACK, `Parent<8,8,8>` (`4f842fd`) | 16 min | 158 | 123 dropped as stale | 1458 in 12.7 h | — | | `2026-10-31T202457Z-mg22-sed-via-zbt1-steady`, `2026-11-01T094924Z-s2ack-pre-state` |
+| `isr-ack` v2, 2 KiB hardware buffer | 22 min | 451 (35) | 1 | 86 | — | max turnaround 159 µs | `…102430Z-s2ack-mg22-sed-via-zbt1-israck-v2` |
+| v3, interrupt drains into the queue | 21 min | 351 (31) | 0 | 0 | 2491 (not split) | broadcast storm at 180–420 s; tx-fail 0; resync 7; max 167 µs | `…110156Z-s2ack-mg22-sed-via-zbt1-israck-v3-queue` |
+| v4, split counters | 18 min | 461 (0) | 0 | 0 | 903 (88) | the 88 at 0–415 s; one MG22 report lost to NoAck at 210 s; tx-fail 0; max 157 µs | `…113132Z-s2ack-mg22-sed-via-zbt1-israck-v4` |
+| v5, 254 B reserved for ACK-requested frames | 18 min | 743 (36) | 0 | 0 | 319 (0) | resync 3; tx-fail 0; ack-fail 0; max 295 µs | `…115456Z-s2ack-mg22-sed-via-zbt1-israck-v5-reserve` |
+
+`late` counts ACK-requested frames the interrupt found more than 400 µs
+after their end. `max turnaround` is measured from interrupt entry to the
+ACK's TX start; it stays below the 400 µs deadline and the sender's 864 µs
+`macAckWaitDuration`. It was not cross-checked with a sniffer. In every run
+the router resumed `0x794A` from the journal, restored its children and sent
+Parent_annce. The MG22 reported temperature and humidity through it without
+a MAC failure, except for the one v4 loss. Third-party sleepy children
+joined through the ZBT-1 and completed the ZHA interview during these runs:
+an nRF52833 SED (`0x9254`, v3) and a TLSR8258 SED (`0xBDF2`, v5). The FP = 1
+ACKs are from their Transport Key and interview traffic. After v5, ZHA lists
+the ZBT-1 Router `0x794A` and the end devices `0xEE0F`, `0x9254` and
+`0xBDF2` as available.
 
 Not run on hardware: the MG22 always-on ED, every BRD4181A image (no board
 in the lab), and the MG21 router on BRD4181A.

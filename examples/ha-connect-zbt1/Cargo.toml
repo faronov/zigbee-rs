@@ -54,9 +54,9 @@ static_cell = "2"
 default = ["ed"]
 # Always-on End Device (the original image).
 ed = []
-# Router: parent MAC (software Imm-Ack with Frame Pending), ParentRouterApp,
+# Router: parent MAC (interrupt Imm-Ack, HAL-owned Frame Pending), ParentRouterApp,
 # durable child and APS tables.
-router = ["router-app/router", "zigbee-runtime/router"]
+router = ["router-app/router", "zigbee-runtime/router", "efr32s2-hal/isr-ack"]
 # Sleepy End Device: sensor-sed-app lifecycle, EM2 between slow polls.
 sed = [
     "dep:sensor-sed-app",

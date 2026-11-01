@@ -37,9 +37,11 @@
 //!   CRC (`FCD1.CALCCRC`).
 //! - RX: FRC drops frames with a bad CRC and stores `[PHR][PSDU - FCS]` in
 //!   BUFC buffer 1, followed by a one-byte RSSI trailer (`TRAILRXDATA`).
-//! - ACKs are generated and checked in software ([`Radio::receive`] and
-//!   [`Radio::transmit_csma`]); turnaround therefore depends on the caller
-//!   polling `receive` while it expects acknowledged traffic.
+//! - ACKs are generated and checked in software. By default
+//!   [`Radio::receive`] acknowledges matching frames, so turnaround depends
+//!   on the caller polling `receive`. With the `isr-ack` feature (parent
+//!   images) the `FRC` RX-done interrupt sends every Imm-Ack instead, with a
+//!   Frame Pending bit from a source-match table (see `isr_ack.rs`).
 //!
 //! The per-chip tables and the radio state hand-shake (xG22: `RAC.SEQIF`
 //! with the sequencer clock-gated; xG21: a driver-owned sequencer vector
@@ -51,6 +53,11 @@ mod chip;
 #[cfg(feature = "efr32mg22")]
 #[path = "xg22.rs"]
 mod chip;
+#[cfg(feature = "isr-ack")]
+mod isr_ack;
+// The `FRC` handler only reaches the vector table through `rt`.
+#[cfg(all(feature = "isr-ack", not(feature = "rt"), target_os = "none"))]
+compile_error!("efr32s2-hal: `isr-ack` firmware needs the `rt` feature");
 
 use core::cell::UnsafeCell;
 
@@ -124,9 +131,15 @@ const FRC_STATUS: u32 = 0x08;
 const FRC_CMD: u32 = 0x2C;
 const FRC_TRAILRXDATA: u32 = 0x54;
 const FRC_IF: u32 = 0x68;
+/// `FRC.IEN` (offset confirmed from RAIL's `FRC_IRQHandler`, which masks
+/// `IF` 0x68 with `IEN` 0x6C).
+#[cfg(feature = "isr-ack")]
+const FRC_IEN: u32 = 0x6C;
 const FRC_IF_TXDONE: u32 = 1 << 0;
 const FRC_IF_TXABORTED: u32 = 1 << 2;
 const FRC_IF_TXUF: u32 = 1 << 3;
+#[cfg(feature = "isr-ack")]
+const FRC_IF_RXDONE: u32 = 1 << 4;
 const FRC_IF_RXOF: u32 = 1 << 8;
 const FRC_CMD_RXABORT: u32 = 1 << 0;
 
@@ -142,8 +155,9 @@ const RAC_SWRXEN: u32 = 1 << 1;
 const RAC_IF: u32 = 0x1C;
 const RAC_IEN: u32 = 0x20;
 const RAC_IF_STATECHANGE: u32 = 1 << 0;
-/// NVIC set-enable register holding `RAC_RSM` (IRQ 37) on xG21 and xG22.
-#[cfg(feature = "rt")]
+/// NVIC set-enable register holding `RAC_RSM` (IRQ 37) and `FRC` (IRQ 34)
+/// on xG21 and xG22.
+#[cfg(any(feature = "rt", feature = "isr-ack"))]
 const NVIC_ISER1: u32 = 0xE000_E104;
 #[cfg(feature = "rt")]
 const RAC_RSM_IRQ_BIT: u32 = 1 << (37 - 32);
@@ -193,11 +207,17 @@ const BUF_CMD: u32 = 0x28;
 const BUF_CMD_CLEAR: u32 = 1 << 0;
 const BUF_STATUS_BYTES: u32 = 0x1FFF;
 
-/// TX buffer: 256 B (size code 2), RX buffer: 512 B (size code 3).
+/// TX buffer: 256 B (size code 2). RX buffer: 512 B (size code 3), or
+/// 1 KiB (size code 4) with `isr-ack`, whose interrupt empties it into a
+/// separate 1 KiB queue of frames for the stack (`isr_ack::RX_QUEUE_LEN`);
+/// BUFC then only has to absorb the radio lock and interrupt latency.
 const TX_BUF_SIZE_CODE: u32 = 2;
+#[cfg(not(feature = "isr-ack"))]
 const RX_BUF_SIZE_CODE: u32 = 3;
-/// Bytes of the RX buffer (`RX_BUF_SIZE_CODE` 3 = 512 bytes).
-const RX_BUF_LEN: u32 = 512;
+#[cfg(feature = "isr-ack")]
+const RX_BUF_SIZE_CODE: u32 = 4;
+/// Bytes of the RX buffer (`64 << RX_BUF_SIZE_CODE`).
+const RX_BUF_LEN: u32 = 64 << RX_BUF_SIZE_CODE;
 /// READOFFSET counts modulo 8 KiB; the buffer wraps at `RX_BUF_LEN`.
 const BUF_OFFSET_MASK: u32 = 0x1FFF;
 const FRC_TRAILRXDATA_RSSI: u32 = 1 << 0;
@@ -311,10 +331,76 @@ pub struct AckFilter {
     pub extended_address: Option<u64>,
 }
 
+/// Whether this build acknowledges frames from the `FRC` interrupt
+/// (`isr-ack` feature) and supports the Frame Pending source-match table.
+pub const ISR_ACK: bool = cfg!(feature = "isr-ack");
+
+/// Capacity of each Frame Pending source-match table (short and extended).
+pub const FP_TABLE_LEN: usize = 8;
+
+/// A child address in the Frame Pending source-match table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpAddress {
+    Short(u16),
+    /// Extended address as `u64::from_le_bytes` of the over-the-air bytes.
+    Extended(u64),
+}
+
+/// Why [`Radio::set_frame_pending`] refused an address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpError {
+    /// The table for this address mode already holds [`FP_TABLE_LEN`]
+    /// other addresses.
+    TableFull,
+    /// Broadcast/reserved short address or all-zero/all-ones extended
+    /// address.
+    InvalidAddress,
+    /// This build has no source-match table (no `isr-ack`).
+    Unsupported,
+}
+
+/// Counters of the interrupt-driven Imm-Ack path (`isr-ack`); all zero
+/// otherwise.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AckStats {
+    /// `FRC` interrupt runs (RX done, RX overflow or re-pended work).
+    pub isr_runs: u32,
+    /// Imm-Acks sent from the interrupt.
+    pub acks: u32,
+    /// Of those, with Frame Pending set (Data Request from a pending child).
+    pub fp_acks: u32,
+    /// Frames that requested our ACK but were examined too late (or while
+    /// the receiver was off): dropped unacknowledged so the sender retries.
+    pub late: u32,
+    /// Frames for another node or PAN, and ACKs, dropped by the interrupt.
+    pub filtered: u32,
+    /// BUFC RX overflows handled by the interrupt (frames lost in
+    /// hardware: the interrupt could not run for a whole buffer's worth of
+    /// traffic).
+    pub overflows: u32,
+    /// Frames without an ACK request (broadcasts, mostly relayed copies)
+    /// dropped because the queue for the stack was full (the stack did not
+    /// read for a whole queue's worth of frames).
+    pub queue_full: u32,
+    /// Frames that requested our ACK but found the queue full: left
+    /// unacknowledged, so the sender retries.
+    pub queue_full_unacked: u32,
+    /// Corrupt PHR lengths that made the interrupt clear BUFC.
+    pub resyncs: u32,
+    /// Imm-Ack transmissions that failed (frame dropped like a late one).
+    pub ack_tx_fail: u32,
+    /// Receiver restarts after an ACK that failed (RX off until the next
+    /// radio call).
+    pub rx_restart_fail: u32,
+    /// Longest frame-end-to-ACK-TX-start latency seen, in microseconds
+    /// (measured from interrupt entry, so it excludes interrupt latency).
+    pub max_turnaround_us: u32,
+}
+
 #[repr(C, align(256))]
 struct TxRam(UnsafeCell<[u8; 256]>);
 #[repr(C, align(512))]
-struct RxRam(UnsafeCell<[u8; 512]>);
+struct RxRam(UnsafeCell<[u8; RX_BUF_LEN as usize]>);
 // SAFETY: BUFC writes these through DMA; the CPU writes TX_RAM only via BUFC
 // WRITEDATA and reads RX_RAM only (volatile) for bytes that BUFC STATUS has
 // already reported available. The singleton `RadioToken` guarantees a single
@@ -323,7 +409,7 @@ unsafe impl Sync for TxRam {}
 unsafe impl Sync for RxRam {}
 
 static TX_RAM: TxRam = TxRam(UnsafeCell::new([0; 256]));
-static RX_RAM: RxRam = RxRam(UnsafeCell::new([0; 512]));
+static RX_RAM: RxRam = RxRam(UnsafeCell::new([0; RX_BUF_LEN as usize]));
 
 /// Exclusive ownership of the radio blocks (RAC/FRC/MODEM/AGC/SYNTH/BUFC).
 pub struct RadioToken {
@@ -393,34 +479,74 @@ pub struct Radio {
     pub stats: RadioStats,
 }
 
+/// Declare a public radio operation. With `isr-ack` the body runs with the
+/// `FRC` interrupt masked, so the interrupt never sees the radio
+/// mid-operation; on release it picks up the RX state, channel, TX power
+/// and ACK filter. Without `isr-ack` the method is emitted unchanged, which
+/// keeps end-device images byte-identical to the plain driver.
+macro_rules! radio_op {
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident(&mut $this:ident $(, $arg:ident: $ty:ty)* $(,)?)
+            $(-> $ret:ty)? $body:block
+    ) => {
+        #[cfg(not(feature = "isr-ack"))]
+        $(#[$meta])*
+        $vis fn $name(&mut $this $(, $arg: $ty)*) $(-> $ret)? $body
+
+        #[cfg(feature = "isr-ack")]
+        $(#[$meta])*
+        $vis fn $name(&mut $this $(, $arg: $ty)*) $(-> $ret)? {
+            isr_ack::lock($this);
+            #[allow(clippy::redundant_closure_call)]
+            let result = (|| $(-> $ret)? { $body })();
+            isr_ack::unlock($this);
+            result
+        }
+    };
+}
+
 impl Radio {
+    #[cfg(feature = "isr-ack")]
+    #[inline(always)]
+    fn locked<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        isr_ack::lock(self);
+        let result = f(self);
+        isr_ack::unlock(self);
+        result
+    }
+
     pub fn channel(&self) -> u8 {
         self.channel
     }
 
-    /// Tune to an O-QPSK channel 11..=26. Restarts RX if it was enabled.
-    pub fn set_channel(&mut self, channel: u8) -> Result<(), RadioError> {
-        let freq = synth_freq(channel).ok_or(RadioError::InvalidChannel)?;
-        let was_rx = self.rx_enabled;
-        self.idle();
-        unsafe {
-            write(L.synth + SYNTH_CHCTRL, 0);
-            write(L.synth + SYNTH_FREQ, freq);
+    radio_op! {
+        /// Tune to an O-QPSK channel 11..=26. Restarts RX if it was enabled.
+        pub fn set_channel(&mut self, channel: u8) -> Result<(), RadioError> {
+            let freq = synth_freq(channel).ok_or(RadioError::InvalidChannel)?;
+            let was_rx = self.rx_enabled;
+            self.idle();
+            unsafe {
+                write(L.synth + SYNTH_CHCTRL, 0);
+                write(L.synth + SYNTH_FREQ, freq);
+            }
+            self.channel = channel;
+            if was_rx {
+                self.rx_on()?;
+            }
+            Ok(())
         }
-        self.channel = channel;
-        if was_rx {
-            self.rx_on()?;
-        }
-        Ok(())
     }
 
-    /// Select the highest calibrated level not above `ddbm` (deci-dBm);
-    /// returns the applied level.
-    pub fn set_tx_power_ddbm(&mut self, ddbm: i16) -> i16 {
-        let (level, ramp, pa) = tx_power_entry(ddbm);
-        chip::write_tx_power(ramp, pa);
-        self.power_ddbm = level;
-        level
+    radio_op! {
+        /// Select the highest calibrated level not above `ddbm` (deci-dBm);
+        /// returns the applied level.
+        pub fn set_tx_power_ddbm(&mut self, ddbm: i16) -> i16 {
+            let (level, ramp, pa) = tx_power_entry(ddbm);
+            chip::write_tx_power(ramp, pa);
+            self.power_ddbm = level;
+            level
+        }
     }
 
     pub fn tx_power_ddbm(&self) -> i16 {
@@ -431,8 +557,10 @@ impl Radio {
         self.cca_threshold_dbm = threshold;
     }
 
-    pub fn set_ack_filter(&mut self, filter: AckFilter) {
-        self.ack_filter = filter;
+    radio_op! {
+        pub fn set_ack_filter(&mut self, filter: AckFilter) {
+            self.ack_filter = filter;
+        }
     }
 
     pub fn rac_state(&self) -> RacState {
@@ -440,25 +568,64 @@ impl Radio {
     }
 
     pub fn is_rx_on(&self) -> bool {
+        #[cfg(feature = "isr-ack")]
+        if isr_ack::rx_lost() {
+            return false;
+        }
         self.rx_enabled
     }
 
-    /// Enter continuous receive (RX search) on the current channel.
-    pub fn rx_on(&mut self) -> Result<(), RadioError> {
-        if self.rx_enabled {
-            return Ok(());
+    /// Arm (`pending = true`) or clear Frame Pending for Imm-Acks to Data
+    /// Requests from `address`. Idempotent; clearing an absent address is
+    /// not an error.
+    pub fn set_frame_pending(&mut self, address: FpAddress, pending: bool) -> Result<(), FpError> {
+        #[cfg(feature = "isr-ack")]
+        {
+            self.locked(|_| isr_ack::set_frame_pending(address, pending))
         }
-        self.start_rx()?;
-        self.rx_enabled = true;
-        Ok(())
+        #[cfg(not(feature = "isr-ack"))]
+        {
+            let _ = (address, pending);
+            Err(FpError::Unsupported)
+        }
     }
 
-    /// Stop RX/TX and power the analog front end down. Already received
-    /// frames stay in the RX buffer.
-    pub fn idle(&mut self) {
-        self.force_off();
-        unsafe { write(L.synth + SYNTH_CMD, SYNTH_CMD_STOP) };
-        apply_state(&chip::IDLE);
+    /// Empty the Frame Pending table (MLME-RESET).
+    pub fn clear_frame_pending(&mut self) {
+        #[cfg(feature = "isr-ack")]
+        self.locked(|_| isr_ack::clear_frame_pending());
+    }
+
+    /// Counters of the interrupt-driven Imm-Ack path.
+    pub fn ack_stats(&self) -> AckStats {
+        #[cfg(feature = "isr-ack")]
+        {
+            isr_ack::stats()
+        }
+        #[cfg(not(feature = "isr-ack"))]
+        AckStats::default()
+    }
+
+    radio_op! {
+        /// Enter continuous receive (RX search) on the current channel.
+        pub fn rx_on(&mut self) -> Result<(), RadioError> {
+            if self.rx_enabled {
+                return Ok(());
+            }
+            self.start_rx()?;
+            self.rx_enabled = true;
+            Ok(())
+        }
+    }
+
+    radio_op! {
+        /// Stop RX/TX and power the analog front end down. Already received
+        /// frames stay in the RX buffer.
+        pub fn idle(&mut self) {
+            self.force_off();
+            unsafe { write(L.synth + SYNTH_CMD, SYNTH_CMD_STOP) };
+            apply_state(&chip::IDLE);
+        }
     }
 
     /// Bring the RSM to `OFF` (bounded). `RXDIS` alone only takes effect at
@@ -485,21 +652,23 @@ impl Radio {
         wait_off_releasing(200)
     }
 
-    /// Re-program the radio after EM2 before any other radio call.
-    ///
-    /// On xG22 the PHY register file survives EM2 except for a few
-    /// sequencer-owned registers, but the receiver does not work again
-    /// until it is re-initialized (lab gate `s2-em2`). Keeps channel, TX
-    /// power, CCA/ACK settings and the synthesizer calibration cache;
-    /// frames still buffered before sleep are dropped. Leaves RX off.
-    pub fn resume(&mut self) -> Result<(), RadioError> {
-        self.rx_enabled = false;
-        program_phy();
-        leave_shutdown()?;
-        apply_state(&chip::IDLE);
-        let power = self.power_ddbm;
-        self.set_tx_power_ddbm(power);
-        self.set_channel(self.channel)
+    radio_op! {
+        /// Re-program the radio after EM2 before any other radio call.
+        ///
+        /// On xG22 the PHY register file survives EM2 except for a few
+        /// sequencer-owned registers, but the receiver does not work again
+        /// until it is re-initialized (lab gate `s2-em2`). Keeps channel, TX
+        /// power, CCA/ACK settings and the synthesizer calibration cache;
+        /// frames still buffered before sleep are dropped. Leaves RX off.
+        pub fn resume(&mut self) -> Result<(), RadioError> {
+            self.rx_enabled = false;
+            program_phy();
+            leave_shutdown()?;
+            apply_state(&chip::IDLE);
+            let power = self.power_ddbm;
+            self.set_tx_power_ddbm(power);
+            self.set_channel(self.channel)
+        }
     }
 
     fn start_rx(&mut self) -> Result<(), RadioError> {
@@ -524,65 +693,73 @@ impl Radio {
         rssi_from_reg(unsafe { read(L.agc + L.agc_rssi) })
     }
 
-    /// Peak RSSI over `duration_us` (receiver must be on). Used for both
-    /// energy detection and CCA.
-    pub fn energy_detect(&mut self, duration_us: u32) -> Result<Option<i8>, RadioError> {
-        self.rx_on()?;
-        let deadline = Deadline::after_us(duration_us);
-        let mut peak: Option<i8> = None;
-        loop {
-            service_sequencer();
-            if let Some(rssi) = self.rssi_dbm() {
-                peak = Some(peak.map_or(rssi, |p| p.max(rssi)));
-            }
-            if deadline.expired() {
-                return Ok(peak);
-            }
-        }
-    }
-
-    /// Energy-above-threshold CCA over 8 symbols. `true` = channel clear.
-    pub fn cca(&mut self) -> Result<bool, RadioError> {
-        // The AGC needs a few us after RX entry before RSSI is valid.
-        let deadline = Deadline::after_us(CCA_US * 2);
-        loop {
-            match self.energy_detect(CCA_US)? {
-                Some(peak) => return Ok(peak < self.cca_threshold_dbm),
-                None if deadline.expired() => return Ok(false),
-                None => {}
-            }
-        }
-    }
-
-    /// Transmit `frame` (MHR + payload, without FCS) immediately, without
-    /// CCA and without waiting for an ACK. The receiver is restored
-    /// afterwards if it was on.
-    pub fn transmit(&mut self, frame: &[u8]) -> Result<(), RadioError> {
-        if frame.len() > MAX_FRAME {
-            return Err(RadioError::FrameTooLong);
-        }
-        let resume_rx = self.rx_enabled;
-        let result = self.transmit_raw(frame);
-        if resume_rx {
-            self.rx_enabled = false;
+    radio_op! {
+        /// Peak RSSI over `duration_us` (receiver must be on). Used for both
+        /// energy detection and CCA.
+        pub fn energy_detect(&mut self, duration_us: u32) -> Result<Option<i8>, RadioError> {
             self.rx_on()?;
+            let deadline = Deadline::after_us(duration_us);
+            let mut peak: Option<i8> = None;
+            loop {
+                service_sequencer();
+                if let Some(rssi) = self.rssi_dbm() {
+                    peak = Some(peak.map_or(rssi, |p| p.max(rssi)));
+                }
+                if deadline.expired() {
+                    return Ok(peak);
+                }
+            }
         }
-        result
     }
 
-    /// Transmit an Imm-Ack for `sequence` with the given Frame Pending bit,
-    /// then resume RX if it was on.
-    ///
-    /// For callers that own ACK policy themselves (a parent MAC answering
-    /// data polls with a per-child Frame Pending bit). Such callers keep the
-    /// [`AckFilter`] empty so [`receive`](Self::receive) never ACKs on its
-    /// own, and must call this promptly: the sender only waits
-    /// macAckWaitDuration (864 us) for the ACK.
-    pub fn send_ack(&mut self, sequence: u8, frame_pending: bool) -> Result<(), RadioError> {
-        let ack = [0x02 | ((frame_pending as u8) << 4), 0x00, sequence];
-        self.transmit(&ack)?;
-        self.stats.acks_sent += 1;
-        Ok(())
+    radio_op! {
+        /// Energy-above-threshold CCA over 8 symbols. `true` = channel clear.
+        pub fn cca(&mut self) -> Result<bool, RadioError> {
+            // The AGC needs a few us after RX entry before RSSI is valid.
+            let deadline = Deadline::after_us(CCA_US * 2);
+            loop {
+                match self.energy_detect(CCA_US)? {
+                    Some(peak) => return Ok(peak < self.cca_threshold_dbm),
+                    None if deadline.expired() => return Ok(false),
+                    None => {}
+                }
+            }
+        }
+    }
+
+    radio_op! {
+        /// Transmit `frame` (MHR + payload, without FCS) immediately, without
+        /// CCA and without waiting for an ACK. The receiver is restored
+        /// afterwards if it was on.
+        pub fn transmit(&mut self, frame: &[u8]) -> Result<(), RadioError> {
+            if frame.len() > MAX_FRAME {
+                return Err(RadioError::FrameTooLong);
+            }
+            let resume_rx = self.rx_enabled;
+            let result = self.transmit_raw(frame);
+            if resume_rx {
+                self.rx_enabled = false;
+                self.rx_on()?;
+            }
+            result
+        }
+    }
+
+    radio_op! {
+        /// Transmit an Imm-Ack for `sequence` with the given Frame Pending bit,
+        /// then resume RX if it was on.
+        ///
+        /// For callers that own ACK policy themselves (a parent MAC answering
+        /// data polls with a per-child Frame Pending bit). Such callers keep the
+        /// [`AckFilter`] empty so [`receive`](Self::receive) never ACKs on its
+        /// own, and must call this promptly: the sender only waits
+        /// macAckWaitDuration (864 us) for the ACK.
+        pub fn send_ack(&mut self, sequence: u8, frame_pending: bool) -> Result<(), RadioError> {
+            let ack = [0x02 | ((frame_pending as u8) << 4), 0x00, sequence];
+            self.transmit(&ack)?;
+            self.stats.acks_sent += 1;
+            Ok(())
+        }
     }
 
     fn transmit_raw(&mut self, frame: &[u8]) -> Result<(), RadioError> {
@@ -649,76 +826,80 @@ impl Radio {
         result
     }
 
-    /// One clear-channel assessment, then transmit `frame` and, when it
-    /// requests an acknowledgement, wait macAckWaitDuration for it.
-    ///
-    /// This is the single-attempt primitive a MAC layer's CSMA-CA and retry
-    /// loop drives (`SoftMacCore` with `AckWaitTx`). A busy channel returns
-    /// [`RadioError::ChannelBusy`] without transmitting; a missing ACK
-    /// returns [`RadioError::NoAck`]. Leaves the receiver on afterwards.
-    /// Frames received while waiting for the ACK stay queued for
-    /// [`receive`](Self::receive).
-    pub fn transmit_cca(&mut self, frame: &[u8]) -> Result<TxOutcome, RadioError> {
-        if frame.len() > MAX_FRAME {
-            return Err(RadioError::FrameTooLong);
-        }
-        // Nothing drains the RX buffer while the MAC waits before a TX
-        // (e.g. RREQ relay jitter). A receiver left in RXOVERFLOW has no
-        // valid RSSI, so CCA would report a busy channel indefinitely.
-        self.service_overflow();
-        self.rx_on()?;
-        if !self.cca()? {
-            return Err(RadioError::ChannelBusy);
-        }
-        let ack_requested = frame.len() >= 3 && frame[0] & 0x20 != 0;
-        let sequence = frame.get(2).copied().unwrap_or(0);
-        self.transmit_raw(frame)?;
-        self.start_rx()?;
-        self.rx_enabled = true;
-        if !ack_requested {
-            return Ok(TxOutcome {
-                ack_frame_pending: None,
-            });
-        }
-        // ACK must start within macAckWaitDuration; allow its 352 us airtime.
-        let deadline = Deadline::after_us(ACK_WAIT_US + 12 * 32);
-        loop {
-            service_sequencer();
+    radio_op! {
+        /// One clear-channel assessment, then transmit `frame` and, when it
+        /// requests an acknowledgement, wait macAckWaitDuration for it.
+        ///
+        /// This is the single-attempt primitive a MAC layer's CSMA-CA and retry
+        /// loop drives (`SoftMacCore` with `AckWaitTx`). A busy channel returns
+        /// [`RadioError::ChannelBusy`] without transmitting; a missing ACK
+        /// returns [`RadioError::NoAck`]. Leaves the receiver on afterwards.
+        /// Frames received while waiting for the ACK stay queued for
+        /// [`receive`](Self::receive).
+        pub fn transmit_cca(&mut self, frame: &[u8]) -> Result<TxOutcome, RadioError> {
+            if frame.len() > MAX_FRAME {
+                return Err(RadioError::FrameTooLong);
+            }
+            // Nothing drains the RX buffer while the MAC waits before a TX
+            // (e.g. RREQ relay jitter). A receiver left in RXOVERFLOW has no
+            // valid RSSI, so CCA would report a busy channel indefinitely.
             self.service_overflow();
-            if let Some(found) = self.find_ack(sequence) {
+            self.rx_on()?;
+            if !self.cca()? {
+                return Err(RadioError::ChannelBusy);
+            }
+            let ack_requested = frame.len() >= 3 && frame[0] & 0x20 != 0;
+            let sequence = frame.get(2).copied().unwrap_or(0);
+            self.transmit_raw(frame)?;
+            self.start_rx()?;
+            self.rx_enabled = true;
+            if !ack_requested {
                 return Ok(TxOutcome {
-                    ack_frame_pending: Some(found),
+                    ack_frame_pending: None,
                 });
             }
-            if deadline.expired() {
-                return Err(RadioError::NoAck);
+            // ACK must start within macAckWaitDuration; allow its 352 us airtime.
+            let deadline = Deadline::after_us(ACK_WAIT_US + 12 * 32);
+            loop {
+                service_sequencer();
+                self.service_overflow();
+                if let Some(found) = self.find_ack(sequence) {
+                    return Ok(TxOutcome {
+                        ack_frame_pending: Some(found),
+                    });
+                }
+                if deadline.expired() {
+                    return Err(RadioError::NoAck);
+                }
             }
         }
     }
 
-    /// Unslotted CSMA-CA (IEEE 802.15.4-2015 6.2.5.1) around
-    /// [`transmit_cca`](Self::transmit_cca), without retries. For lab
-    /// binaries; a MAC layer runs its own CSMA-CA.
-    pub fn transmit_csma(
-        &mut self,
-        frame: &[u8],
-        csma: CsmaConfig,
-    ) -> Result<TxOutcome, RadioError> {
-        let mut be = csma.min_be;
-        let mut backoffs = 0u8;
-        loop {
-            let slots = self.next_random() & ((1u32 << be) - 1);
-            self.rx_on()?;
-            spin_cycles(us_to_cycles(slots * UNIT_BACKOFF_US));
-            match self.transmit_cca(frame) {
-                Err(RadioError::ChannelBusy) => {}
-                other => return other,
+    radio_op! {
+        /// Unslotted CSMA-CA (IEEE 802.15.4-2015 6.2.5.1) around
+        /// [`transmit_cca`](Self::transmit_cca), without retries. For lab
+        /// binaries; a MAC layer runs its own CSMA-CA.
+        pub fn transmit_csma(
+            &mut self,
+            frame: &[u8],
+            csma: CsmaConfig,
+        ) -> Result<TxOutcome, RadioError> {
+            let mut be = csma.min_be;
+            let mut backoffs = 0u8;
+            loop {
+                let slots = self.next_random() & ((1u32 << be) - 1);
+                self.rx_on()?;
+                spin_cycles(us_to_cycles(slots * UNIT_BACKOFF_US));
+                match self.transmit_cca(frame) {
+                    Err(RadioError::ChannelBusy) => {}
+                    other => return other,
+                }
+                backoffs += 1;
+                if backoffs > csma.max_backoffs {
+                    return Err(RadioError::ChannelBusy);
+                }
+                be = (be + 1).min(csma.max_be);
             }
-            backoffs += 1;
-            if backoffs > csma.max_backoffs {
-                return Err(RadioError::ChannelBusy);
-            }
-            be = (be + 1).min(csma.max_be);
         }
     }
 
@@ -754,23 +935,26 @@ impl Radio {
         None
     }
 
-    /// Fetch the next received frame into `out` (without FCS). Sends a
-    /// software ACK first when the frame requests one and is addressed to
-    /// this node (see [`set_ack_filter`](Self::set_ack_filter)).
-    pub fn receive(&mut self, out: &mut [u8; MAX_FRAME]) -> Option<RxFrame> {
-        service_sequencer();
-        self.service_overflow();
-        let frame = self.read_frame(out, true)?;
-        self.stats.rx_frames += 1;
-        if self.rx_enabled && needs_ack(&out[..frame.len], &self.ack_filter) {
-            let ack = [0x02, 0x00, out[2]];
-            if self.transmit_raw(&ack).is_ok() {
-                self.stats.acks_sent += 1;
+    radio_op! {
+        /// Fetch the next received frame into `out` (without FCS). Sends a
+        /// software ACK first when the frame requests one and is addressed to
+        /// this node (see [`set_ack_filter`](Self::set_ack_filter)).
+        pub fn receive(&mut self, out: &mut [u8; MAX_FRAME]) -> Option<RxFrame> {
+            service_sequencer();
+            self.service_overflow();
+            let frame = self.read_frame(out, true)?;
+            self.stats.rx_frames += 1;
+            #[cfg(not(feature = "isr-ack"))]
+            if self.rx_enabled && needs_ack(&out[..frame.len], &self.ack_filter) {
+                let ack = [0x02, 0x00, out[2]];
+                if self.transmit_raw(&ack).is_ok() {
+                    self.stats.acks_sent += 1;
+                }
+                self.rx_enabled = false;
+                let _ = self.rx_on();
             }
-            self.rx_enabled = false;
-            let _ = self.rx_on();
+            Some(frame)
         }
-        Some(frame)
     }
 
     // Out of line: called from six places; inlining duplicated it into
@@ -791,6 +975,7 @@ impl Radio {
 
     /// Pop one complete frame from BUFC buffer 1. With `skip_acks`, ACK
     /// frames (already consumed by `transmit_csma` or stale) are dropped.
+    #[cfg(not(feature = "isr-ack"))]
     fn read_frame(&mut self, out: &mut [u8; MAX_FRAME], skip_acks: bool) -> Option<RxFrame> {
         // Frames are peeked straight from the SRAM backing of buffer 1 and
         // consumed by advancing READOFFSET once complete. Reading through
@@ -830,6 +1015,21 @@ impl Radio {
                 lqi: lqi_from_rssi(rssi),
             });
         }
+    }
+
+    /// Pop one frame from the interrupt's RX queue. The interrupt moves
+    /// every examined frame out of BUFC (ACK frames and foreign frames are
+    /// never queued), so BUFC only holds frames still awaiting their ACK
+    /// decision.
+    #[cfg(feature = "isr-ack")]
+    fn read_frame(&mut self, out: &mut [u8; MAX_FRAME], _skip_acks: bool) -> Option<RxFrame> {
+        let (len, raw_rssi) = isr_ack::pop(out)?;
+        let rssi = rssi_adjust(raw_rssi as i32);
+        Some(RxFrame {
+            len,
+            rssi_dbm: rssi,
+            lqi: lqi_from_rssi(rssi),
+        })
     }
 
     /// Debug counters since init.
@@ -900,6 +1100,12 @@ fn program_phy() {
         write(rx + BUF_ADDR, RX_RAM.0.get() as u32);
         write(rx + BUF_CMD, BUF_CMD_CLEAR);
         write(L.frc + FRC_IF + CLR, u32::MAX);
+        // RX done and RX overflow raise `FRC`; the NVIC line is enabled when
+        // the first `Radio` operation releases its lock.
+        #[cfg(feature = "isr-ack")]
+        {
+            write(L.frc + FRC_IEN, FRC_IF_RXDONE | FRC_IF_RXOF);
+        }
         // Take over the sequencer's state hand-shake: release the RSM
         // from SHUTDOWN now and service every later state change from
         // the RAC_RSM interrupt (and from this driver's busy-waits).
@@ -1028,6 +1234,13 @@ fn tx_power_down() {
 #[unsafe(no_mangle)]
 extern "C" fn RAC_RSM() {
     service_sequencer();
+}
+
+/// `FRC` interrupt: RX done / RX overflow; sends Imm-Acks (`isr-ack`).
+#[cfg(all(feature = "isr-ack", target_arch = "arm", target_os = "none"))]
+#[unsafe(no_mangle)]
+extern "C" fn FRC() {
+    isr_ack::on_frc_interrupt();
 }
 
 /// LO-counter target for the programmed channel, matching the hardware's

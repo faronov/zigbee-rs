@@ -58,9 +58,9 @@ default = ["sed"]
 sed = ["dep:sensor-sed-app", "efr32mg21-sensor-product/sed"]
 # Always-on End Device: router-app AlwaysOnEndDeviceApp, end-device MAC.
 ed = []
-# Router: parent MAC (software Imm-Ack with Frame Pending), ParentRouterApp,
+# Router: parent MAC (interrupt Imm-Ack, HAL-owned Frame Pending), ParentRouterApp,
 # durable child and APS tables.
-router = ["router-app/router", "zigbee-runtime/router"]
+router = ["router-app/router", "zigbee-runtime/router", "efr32s2-hal/isr-ack"]
 # Keep the debug interface powered in EM2 (SWD attach while asleep).
 # Off by default so EM2 current is representative.
 em2-debug = []
