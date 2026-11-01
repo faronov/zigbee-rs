@@ -857,6 +857,7 @@ dependencies = [
  "esp-storage",
  "esp32-zigbee-devkit",
  "log",
+ "router-app",
  "sensor-sed-app",
  "zigbee-aps",
  "zigbee-bdb",
@@ -928,9 +929,11 @@ dependencies = [
  "esp32-zigbee-devkit-product",
  "log",
  "portable-atomic",
+ "router-app",
  "sensor-sed-app",
  "static_cell",
  "zigbee-mac",
+ "zigbee-nwk",
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
@@ -1401,6 +1404,16 @@ dependencies = [
  "libc",
  "rustversion",
  "svgbobdoc",
+]
+
+[[package]]
+name = "router-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-aps",
+ "zigbee-mac",
+ "zigbee-nwk",
+ "zigbee-runtime",
 ]
 
 [[package]]

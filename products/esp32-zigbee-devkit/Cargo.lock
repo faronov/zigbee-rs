@@ -627,6 +627,7 @@ dependencies = [
  "esp-storage",
  "esp32-zigbee-devkit",
  "log",
+ "router-app",
  "sensor-sed-app",
  "zigbee-aps",
  "zigbee-bdb",
@@ -1039,6 +1040,16 @@ name = "riscv-target-parser"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1376b15f3ff160e9b1e8ea564ce427f2f6fcf77528cc0a8bf405cb476f9cea7"
+
+[[package]]
+name = "router-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-aps",
+ "zigbee-mac",
+ "zigbee-nwk",
+ "zigbee-runtime",
+]
 
 [[package]]
 name = "rustversion"

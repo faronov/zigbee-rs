@@ -118,6 +118,18 @@ pub const NV_OFFSET: u32 = 0x003F_E000;
 /// Size of the log-structured Zigbee NV storage (two pages).
 pub const NV_SIZE: u32 = 0x0000_2000;
 
+/// Router-role child-table journal: the first two sectors of `zbnv`. The
+/// end-device roles never open it; every role image uses the same partition
+/// table, so a reflash to another role cannot overwrite it.
+pub const CHILD_TABLE_OFFSET: u32 = ZBNV_OFFSET;
+/// Size of the child-table journal (two 4 KiB sectors).
+pub const CHILD_TABLE_SIZE: u32 = 2 * SECTOR_SIZE;
+
+/// Router-role APS binding/group journal, directly after the child table.
+pub const APS_TABLE_OFFSET: u32 = CHILD_TABLE_OFFSET + CHILD_TABLE_SIZE;
+/// Size of the APS binding/group journal (two 4 KiB sectors).
+pub const APS_TABLE_SIZE: u32 = 2 * SECTOR_SIZE;
+
 /// Exact entries required by the OTA writer and the ESP-IDF bootloader.
 pub(crate) const EXPECTED_PARTITIONS: [PartitionSpec; 4] = [
     PartitionSpec::new(0x01, 0x00, OTADATA_OFFSET, OTADATA_SIZE, b"otadata"),
@@ -188,6 +200,13 @@ const _: () = assert!(NV_SIZE == 2 * SECTOR_SIZE);
 const _: () = assert!(NV_OFFSET + NV_SIZE == ZBNV_OFFSET + ZBNV_SIZE);
 // Untouched pre-partition-table NV placement.
 const _: () = assert!(NV_OFFSET == 0x003F_E000);
+// Router journals: sector-aligned, inside `zbnv`, disjoint from each other
+// and below the security journal.
+const _: () = assert!(CHILD_TABLE_OFFSET >= ZBNV_OFFSET);
+const _: () = assert!(CHILD_TABLE_OFFSET.is_multiple_of(SECTOR_SIZE));
+const _: () = assert!(CHILD_TABLE_OFFSET + CHILD_TABLE_SIZE <= APS_TABLE_OFFSET);
+const _: () = assert!(APS_TABLE_OFFSET.is_multiple_of(SECTOR_SIZE));
+const _: () = assert!(APS_TABLE_OFFSET + APS_TABLE_SIZE <= NV_OFFSET);
 
 #[cfg(test)]
 mod tests {
@@ -307,6 +326,27 @@ mod tests {
         assert_eq!(NV_OFFSET + NV_SIZE, 0x0040_0000);
         const { assert!(NV_OFFSET >= ZBNV_OFFSET) };
         const { assert!(NV_OFFSET + NV_SIZE <= ZBNV_OFFSET + ZBNV_SIZE) };
+    }
+
+    #[test]
+    fn router_journals_are_disjoint_inside_zbnv() {
+        let windows = [
+            (CHILD_TABLE_OFFSET, CHILD_TABLE_SIZE),
+            (APS_TABLE_OFFSET, APS_TABLE_SIZE),
+            (NV_OFFSET, NV_SIZE),
+        ];
+        for (index, (start, size)) in windows.iter().enumerate() {
+            assert!(*start >= ZBNV_OFFSET && start + size <= ZBNV_OFFSET + ZBNV_SIZE);
+            assert_eq!(*size, 2 * SECTOR_SIZE);
+            assert!(!is_ota_writable(*start, *size));
+            for (other_start, other_size) in &windows[index + 1..] {
+                assert!(start + size <= *other_start || other_start + other_size <= *start);
+            }
+        }
+        assert_eq!(
+            (CHILD_TABLE_OFFSET, APS_TABLE_OFFSET),
+            (0x003F_0000, 0x003F_2000)
+        );
     }
 
     #[test]

@@ -52,6 +52,8 @@ impl TimerQueue {
         }
     }
 
+    // Light sleep is entered only by the sleepy sensor's wake controller.
+    #[cfg(any(feature = "sed", test))]
     fn prepare_sleep(&mut self, max_us: u64, alarm: &mut impl Alarm) -> u64 {
         let remaining = self.next_deadline.saturating_sub(alarm.now()).min(max_us);
         alarm.disarm();
@@ -68,10 +70,9 @@ mod hardware {
     use esp_hal::Blocking;
     use esp_hal::peripherals::SYSTIMER;
     use esp_hal::time::{Duration, Instant};
-    use esp_hal::timer::{
-        OneShotTimer,
-        systimer::{SystemTimer, Unit},
-    };
+    #[cfg(feature = "sed")]
+    use esp_hal::timer::systimer::Unit;
+    use esp_hal::timer::{OneShotTimer, systimer::SystemTimer};
 
     impl Alarm for OneShotTimer<'_, Blocking> {
         fn now(&self) -> u64 {
@@ -145,6 +146,7 @@ mod hardware {
     }
 
     /// Bound sleep by the earliest registered Embassy deadline and disarm alarm 0.
+    #[cfg(feature = "sed")]
     pub(crate) fn prepare_sleep(cs: critical_section::CriticalSection<'_>, max_us: u64) -> u64 {
         let mut state = DRIVER.state.borrow(cs).borrow_mut();
         let State { queue, alarm } = state.as_mut().expect("ESP sleep before timer init");
@@ -152,6 +154,7 @@ mod hardware {
     }
 
     /// Account once for stopped time, then wake overdue tasks and rearm alarm 0.
+    #[cfg(feature = "sed")]
     pub(crate) fn resume_after_sleep(
         cs: critical_section::CriticalSection<'_>,
         missing_ticks: u64,
@@ -172,9 +175,10 @@ mod hardware {
 
 #[cfg(target_os = "none")]
 pub use hardware::init;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "sed"))]
 pub(crate) use hardware::{prepare_sleep, resume_after_sleep};
 
+#[cfg(any(feature = "sed", test))]
 fn corrected_counter(current: u64, missing: u64) -> u64 {
     current.wrapping_add(missing) & ((1 << 52) - 1)
 }
