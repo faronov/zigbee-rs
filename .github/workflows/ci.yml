@@ -845,7 +845,7 @@ jobs:
         with:
           toolchain: ${{ env.ESP_PHY_RUST_TOOLCHAIN }}
           targets: riscv32imac-unknown-none-elf
-          components: rust-src, llvm-tools
+          components: rust-src, llvm-tools, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/esp32c6-sensor
@@ -944,7 +944,7 @@ jobs:
         with:
           toolchain: ${{ env.ESP_PHY_RUST_TOOLCHAIN }}
           targets: riscv32imac-unknown-none-elf
-          components: rust-src, llvm-tools
+          components: rust-src, llvm-tools, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/esp32h2-sensor
