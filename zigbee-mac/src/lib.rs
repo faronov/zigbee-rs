@@ -25,6 +25,8 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(any(feature = "esp-parent", test))]
+pub mod ack_pending;
 pub mod frames;
 pub mod lqi;
 pub mod phy;
