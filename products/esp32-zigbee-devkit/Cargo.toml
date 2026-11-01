@@ -11,7 +11,8 @@ publish = false
 embedded-storage = "0.3"
 embassy-time-queue-utils = { version = "0.1", features = ["generic-queue-8"] }
 log = "0.4"
-sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
+router-app = { path = "../../apps/router", default-features = false, optional = true }
+sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"], optional = true }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-bdb = { path = "../../zigbee-bdb" }
 zigbee-mac = { path = "../../zigbee-mac" }
@@ -35,6 +36,13 @@ esp-storage = { version = "0.7", default-features = false, features = [
 
 [features]
 default = []
+# Sleepy sensor role: SED policy, wake controller and OTA client/boot
+# confirmation (pulls in the SED lifecycle crate). The mains role images
+# (always-on End Device, Router) build without it.
+sed = ["dep:sensor-sed-app"]
+# Mains role policies/profiles (always-on End Device, Router) and the
+# router's child/APS journals.
+roles = ["dep:router-app"]
 light-sleep = []
 esp32c6 = ["esp32-zigbee-devkit/esp32c6", "esp-hal/esp32c6", "zigbee-runtime/ota"]
 esp32h2 = ["esp32-zigbee-devkit/esp32h2", "esp-hal/esp32h2", "zigbee-runtime/ota"]

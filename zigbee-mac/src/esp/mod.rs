@@ -16,6 +16,8 @@
 //! - Bounded, fail-closed hardware AES-128 for Zigbee security
 //! - Hardware RNG service while the RF subsystem is active
 //! - Retained light sleep through [`crate::RadioPhy::sleep`] / `wake`
+//! - Parent/router role ([`EspRouterMac`], feature `esp-parent`): Frame
+//!   Pending in the hardware auto-ACK from a bounded source table
 
 mod radio_phy;
 
@@ -24,6 +26,11 @@ use crate::esp_aes::{AesDriver, AesRegisters};
 pub use crate::esp_aes::AesEngineError;
 pub use esp_radio::ieee802154::SuspendError;
 pub use radio_phy::{DEFAULT_TX_POWER_DBM, ESP_PENDING_RX, EspRadioPhy, EspSoftMac};
+#[cfg(feature = "esp-parent")]
+pub use radio_phy::{
+    ESP_ACK_PENDING_SOURCES, ESP_PARENT_ASSOCIATIONS, ESP_PARENT_EVENTS, EspParentStats,
+    EspRouterMac, parent_stats,
+};
 
 const AES_BASE: usize = 0x6008_8000;
 const AES_KEY_OFFSET: usize = 0x00;

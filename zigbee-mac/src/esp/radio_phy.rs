@@ -61,6 +61,18 @@
 //! spurious NoAck that NWK/APS recover from. Receivers discard MAC
 //! retransmissions by DSN, so a retry of a frame that was in fact received is
 //! harmless.
+//!
+//! # Parent role and Frame Pending (`esp-parent`)
+//!
+//! [`EspRouterMac`] runs the shared parent core on the same PHY. The radio's
+//! hardware auto-ACK answers a child's Data Request 192 µs after the frame,
+//! long before any software MAC task could; its Frame Pending bit comes from
+//! the `ACK_FRAME_PENDING_EN` register. The patched `esp-radio`
+//! (`ieee802154-ack-pending`) calls [`ack_pending_hook`] first in the RX_DONE
+//! interrupt, and the hook rewrites that register for every auto-ACKed
+//! frame from a bounded [`AckPendingTable`] that the parent core arms through
+//! [`RadioPhy::set_ack_frame_pending`]. The PHY is the single Frame Pending
+//! owner; the core's software pending set is `PENDING = 0`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -69,11 +81,15 @@ use esp_radio::ieee802154::{Config, Ieee802154, SuspendError};
 use zigbee_types::IeeeAddress;
 
 use super::{AesEngineError, EspAesEngine, EspHardwareAes128};
+#[cfg(feature = "esp-parent")]
+use crate::ack_pending::{AckPendingError, AckPendingTable, data_request_source};
 use crate::pib::{MacPib, PibAttribute, PibValue};
 use crate::{
     AckResult, AckWaitTx, EndDevice, MAX_PHY_FRAME_LEN, MacError, PhyAddressFilter,
     PhyCapabilities, PhyError, PhyRxFrame, PlatformServices, RadioPhy, SoftMacCore,
 };
+#[cfg(feature = "esp-parent")]
+use core::sync::atomic::AtomicU32;
 
 /// Retained-RX depth of the ESP end-device MAC (frames received while the
 /// software MAC waits for a poll or association response).
@@ -89,6 +105,99 @@ pub const DEFAULT_TX_POWER_DBM: i8 = 10;
 
 /// Shared software MAC (end-device role) on the ESP 802.15.4 radio.
 pub type EspSoftMac<'a> = SoftMacCore<EspRadioPhy<'a>, EndDevice, ESP_PENDING_RX>;
+
+/// Child sources the hardware auto-ACK can flag with Frame Pending at once.
+/// The parent core arms one entry per child with a queued indirect frame and
+/// one per association in progress; a full table is reported as
+/// `TransactionOverflow`, never silently dropped.
+#[cfg(feature = "esp-parent")]
+pub const ESP_ACK_PENDING_SOURCES: usize = 16;
+
+/// Indication slots of [`EspRouterMac`] (parent core `EVENTS`).
+#[cfg(feature = "esp-parent")]
+pub const ESP_PARENT_EVENTS: usize = 8;
+
+/// Concurrent associations of [`EspRouterMac`] (parent core `ASSOC`).
+#[cfg(feature = "esp-parent")]
+pub const ESP_PARENT_ASSOCIATIONS: usize = 8;
+
+/// Shared software MAC (parent/router role) on the ESP 802.15.4 radio.
+///
+/// `PENDING = 0`: Frame Pending is owned by the PHY's hardware auto-ACK
+/// table, not by the core.
+#[cfg(feature = "esp-parent")]
+pub type EspRouterMac<'a> = SoftMacCore<
+    EspRadioPhy<'a>,
+    crate::Parent<ESP_PARENT_EVENTS, ESP_PARENT_ASSOCIATIONS, 0>,
+    ESP_PENDING_RX,
+>;
+
+#[cfg(feature = "esp-parent")]
+static ACK_PENDING: esp_sync::NonReentrantMutex<AckPendingTable<ESP_ACK_PENDING_SOURCES>> =
+    esp_sync::NonReentrantMutex::new(AckPendingTable::new());
+
+/// RX_DONE-interrupt Frame Pending decision. `frame` is the received MAC
+/// frame whose two FCS bytes the radio replaced with RSSI/LQI.
+#[cfg(feature = "esp-parent")]
+fn ack_pending_hook(frame: &[u8]) -> bool {
+    let Some(mac_len) = frame.len().checked_sub(2) else {
+        return false;
+    };
+    let Some(source) = data_request_source(&frame[..mac_len]) else {
+        return false;
+    };
+    PARENT_DATA_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let pending = ACK_PENDING.with(|table| table.contains(&source));
+    if pending {
+        PARENT_FP_ACKS.fetch_add(1, Ordering::Relaxed);
+    }
+    pending
+}
+
+#[cfg(feature = "esp-parent")]
+static PARENT_DATA_REQUESTS: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "esp-parent")]
+static PARENT_FP_ACKS: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "esp-parent")]
+static PARENT_RAW_TX: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "esp-parent")]
+static PARENT_ACKED_TX: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "esp-parent")]
+static PARENT_TX_NO_ACK: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "esp-parent")]
+static PARENT_TX_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// Free-running counters of the parent PHY since boot (wrap at `u32::MAX`).
+#[cfg(feature = "esp-parent")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EspParentStats {
+    /// Child Data Requests the hardware auto-ACKed.
+    pub data_requests: u32,
+    /// Of those, ACKs sent with Frame Pending set.
+    pub frame_pending_acks: u32,
+    /// Raw transmissions started (every CSMA attempt, broadcast or unicast).
+    pub raw_tx: u32,
+    /// Unicast transmissions that requested an ACK.
+    pub acked_tx: u32,
+    /// Of those, no matching ACK inside the software ACK window.
+    pub tx_no_ack: u32,
+    /// Of the raw transmissions, those the radio rejected (`Busy`) or never
+    /// completed; the core retries them as a busy channel.
+    pub tx_errors: u32,
+}
+
+/// Snapshot of the parent PHY counters (Frame Pending and TX health).
+#[cfg(feature = "esp-parent")]
+pub fn parent_stats() -> EspParentStats {
+    EspParentStats {
+        data_requests: PARENT_DATA_REQUESTS.load(Ordering::Relaxed),
+        frame_pending_acks: PARENT_FP_ACKS.load(Ordering::Relaxed),
+        raw_tx: PARENT_RAW_TX.load(Ordering::Relaxed),
+        acked_tx: PARENT_ACKED_TX.load(Ordering::Relaxed),
+        tx_no_ack: PARENT_TX_NO_ACK.load(Ordering::Relaxed),
+        tx_errors: PARENT_TX_ERRORS.load(Ordering::Relaxed),
+    }
+}
 
 /// Minimum esp-radio receive queue depth enforced by [`apply_radio_policy`].
 const RADIO_RX_QUEUE_DEPTH: usize = 20;
@@ -244,6 +353,26 @@ impl<'a> EspRadioPhy<'a> {
         SoftMacCore::new_custom(self, pib)
     }
 
+    /// Build the parent/router [`EspRouterMac`] on top of this PHY.
+    ///
+    /// Same identity, DSN/BSN seeding and power as [`Self::into_soft_mac`];
+    /// additionally installs the RX_DONE Frame Pending hook with an empty
+    /// source table.
+    #[cfg(feature = "esp-parent")]
+    #[inline(never)]
+    pub fn into_parent_mac(mut self) -> Result<EspRouterMac<'a>, MacError> {
+        ACK_PENDING.with(AckPendingTable::clear);
+        self.driver.set_ack_pending_fn(ack_pending_hook);
+        let seed = esp_hal::rng::Rng::new().random();
+        let mut pib = MacPib::new(read_efuse_ieee(), seed as u8, (seed >> 8) as u8);
+        pib.set(
+            PibAttribute::PhyTransmitPower,
+            PibValue::I8(DEFAULT_TX_POWER_DBM),
+        )
+        .map_err(|_| MacError::InvalidParameter)?;
+        SoftMacCore::new_custom(self, pib)
+    }
+
     /// Update the radio configuration.
     ///
     /// `set_config()` only updates esp-radio's software PIB; the registers are
@@ -268,7 +397,23 @@ impl<'a> EspRadioPhy<'a> {
     /// INCLUDING FCS, so two padding bytes are added for the FCS the
     /// hardware appends.
     #[inline(never)]
-    fn transmit(&mut self, frame: &[u8]) -> Result<(), PhyError> {
+    fn transmit(&mut self, frame: &[u8], discard_received: bool) -> Result<(), PhyError> {
+        #[cfg(feature = "esp-parent")]
+        {
+            PARENT_RAW_TX.fetch_add(1, Ordering::Relaxed);
+            let result = self.transmit_raw_frame(frame, discard_received);
+            if result.is_err() {
+                PARENT_TX_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        }
+        #[cfg(not(feature = "esp-parent"))]
+        self.transmit_raw_frame(frame, discard_received)
+    }
+
+    /// [`Self::transmit`] without the parent counters.
+    #[inline(always)]
+    fn transmit_raw_frame(&mut self, frame: &[u8], discard_received: bool) -> Result<(), PhyError> {
         if frame.len() > MAX_PHY_FRAME_LEN {
             return Err(PhyError::FrameTooLong);
         }
@@ -277,7 +422,7 @@ impl<'a> EspRadioPhy<'a> {
 
         TX_COMPLETE.store(false, Ordering::Release);
         self.driver
-            .transmit_raw(&padded[..frame.len() + 2])
+            .transmit_raw_discarding(&padded[..frame.len() + 2], discard_received)
             .map_err(map_radio_error)?;
 
         let deadline = esp_hal::time::Instant::now()
@@ -310,7 +455,21 @@ impl<'a> EspRadioPhy<'a> {
         let Some(&sequence) = frame.get(2) else {
             return Err(PhyError::Unsupported);
         };
-        self.transmit(frame)?;
+        #[cfg(feature = "esp-parent")]
+        PARENT_ACKED_TX.fetch_add(1, Ordering::Relaxed);
+        // Idle-RX discard. esp-radio keeps its receiver on between
+        // operations (`rx_when_idle`), so a sleepy end device hears every
+        // broadcast between two polls while its stack is not receiving, and
+        // the 20-frame queue fills. The ACK window would then park that
+        // backlog instead of finding the ACK (or the full queue drops the
+        // ACK), and every poll would be reported unacknowledged (hardware
+        // session `2026-11-01T111317Z-esp32c6-sed-ls-v3-join`). A receiver
+        // that was really off while idle would never have heard those
+        // frames, so esp-radio drops them inside the critical section it
+        // already takes for the transmission. Parked frames and frames
+        // received after this point are kept; always-on devices
+        // (`macRxOnWhenIdle`) keep every frame.
+        self.transmit(frame, !self.rx_on_when_idle)?;
 
         let deadline =
             esp_hal::time::Instant::now() + esp_hal::time::Duration::from_micros(ACK_WINDOW_US);
@@ -330,6 +489,8 @@ impl<'a> EspRadioPhy<'a> {
             }
         }
 
+        #[cfg(feature = "esp-parent")]
+        PARENT_TX_NO_ACK.fetch_add(1, Ordering::Relaxed);
         Ok(None)
     }
 
@@ -382,9 +543,16 @@ fn take_from_radio(driver: &mut Ieee802154<'_>, frame: &mut PhyRxFrame) -> bool 
     if phr < 3 || phr >= raw.data.len() {
         return false;
     }
-    // The radio's LQI byte is passed through unchanged, as the legacy
-    // `EspMac` delivered it to NWK.
-    frame.set(&raw.data[1..phr - 1], raw.data[phr]).is_ok()
+    // The radio's own LQI byte is on an undocumented small scale (about 7
+    // at -84 dBm and 9 at -70 dBm on the C6). A router's NWK link costs and
+    // link status need the IEEE 0..=255 scale, so the parent build applies
+    // the stack-wide RSSI policy. The end-device images still pass the raw
+    // byte, as the legacy `EspMac` did (switching them costs 44 B of flash).
+    #[cfg(feature = "esp-parent")]
+    let lqi = crate::lqi::from_rssi_dbm(raw.data[phr - 1] as i8);
+    #[cfg(not(feature = "esp-parent"))]
+    let lqi = raw.data[phr];
+    frame.set(&raw.data[1..phr - 1], lqi).is_ok()
 }
 
 impl RadioPhy for EspRadioPhy<'_> {
@@ -412,7 +580,7 @@ impl RadioPhy for EspRadioPhy<'_> {
 
     /// One raw transmission without CCA (see the module documentation).
     async fn try_transmit(&mut self, frame: &[u8]) -> Result<(), PhyError> {
-        self.transmit(frame)
+        self.transmit(frame, false)
     }
 
     /// ACKs are generated by the radio (`auto_ack_tx`).
@@ -491,19 +659,44 @@ impl RadioPhy for EspRadioPhy<'_> {
         self.rx_on_when_idle = enabled;
     }
 
+    /// Arm/disarm Frame Pending for one child's Data Requests in the
+    /// hardware auto-ACK (see the module documentation).
+    #[cfg(feature = "esp-parent")]
+    fn set_ack_frame_pending(
+        &mut self,
+        source: &zigbee_types::MacAddress,
+        pending: bool,
+    ) -> Result<(), PhyError> {
+        ACK_PENDING
+            .with(|table| table.set(*source, pending))
+            .map_err(|error| match error {
+                // Mapped to TransactionOverflow by the parent core.
+                AckPendingError::TableFull => PhyError::Hardware,
+                // Mapped to InvalidParameter.
+                AckPendingError::InvalidAddress => PhyError::InvalidChannel,
+            })
+    }
+
+    #[cfg(feature = "esp-parent")]
+    fn clear_ack_frame_pending(&mut self) {
+        ACK_PENDING.with(AckPendingTable::clear);
+    }
+
     /// Quiesce the radio for retained light sleep.
     ///
     /// Only an idle sleepy end device may stop its receiver: `macRxOnWhenIdle`,
-    /// promiscuous mode (scan), parked frames, a queued or racing receive, an
-    /// active TX/ACK or a pending radio interrupt veto sleep without consuming
-    /// anything.
+    /// promiscuous mode (scan), parked frames, a racing receive, an active
+    /// TX/ACK or a pending radio interrupt veto sleep. Frames queued while
+    /// the device was idle are discarded first (see `transmit_acknowledged`).
     fn sleep(&mut self) -> Result<(), PhyError> {
         let result = if self.rx_on_when_idle || self.config.promiscuous {
             Err(SuspendError::Busy)
         } else if !self.parked.is_empty() {
             Err(SuspendError::PendingReceive)
         } else {
-            self.driver.try_suspend()
+            // Idle-RX discard (see `transmit_acknowledged`): frames queued
+            // while idle would otherwise veto sleep indefinitely.
+            self.driver.try_suspend_discarding_received()
         };
         match result {
             Ok(()) => {

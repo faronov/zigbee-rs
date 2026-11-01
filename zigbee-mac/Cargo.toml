@@ -18,7 +18,10 @@ efr32s2-hal = { path = "../efr32s2-hal", optional = true }
 
 # ── ESP32-C6 backend ────────────────────────────────────────
 esp-hal = { version = "=1.0.0", features = ["rt", "unstable"], default-features = false, optional = true }
-esp-radio = { version = "=0.17.0", features = ["ieee802154", "unstable"], default-features = false, optional = true }
+# `ieee802154-tx-when-rx-full` (vendor/esp-radio/LOCAL-PATCHES.md): upstream
+# refuses every transmission while its receive queue is full, which wedges an
+# end device that stops draining it and starves a router's forwarding.
+esp-radio = { version = "=0.17.0", features = ["ieee802154", "ieee802154-tx-when-rx-full", "unstable"], default-features = false, optional = true }
 esp-alloc = { version = "0.9.0", optional = true }
 esp-sync = { version = "0.1.0", optional = true }
 
@@ -65,6 +68,10 @@ esp32h2 = [
     "esp-radio/esp32h2", "esp-hal/esp32h2", "esp-alloc/esp32h2", "esp-sync/esp32h2",
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
+# ESP32-C6/H2 parent (router) role: Frame Pending in the hardware auto-ACK,
+# decided by a bounded source table in the RX_DONE interrupt
+# (vendor/esp-radio/LOCAL-PATCHES.md). Only router images enable it.
+esp-parent = ["esp-radio?/ieee802154-ack-pending"]
 nrf52840 = [
     "hardware-aes-nrf",
     "dep:embassy-nrf52840",

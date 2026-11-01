@@ -2,13 +2,38 @@
 name = "esp32c6-sensor"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+
+# One crate per board, one bin per Zigbee role. Exactly one role feature
+# may be enabled per build (`src/roles.rs` enforces it for the new bins), so
+# dependency feature unification never links router code into an
+# end-device image:
+#   cargo build --release                                       # sed (default)
+#   cargo build --release --no-default-features --features ed
+#   cargo build --release --no-default-features --features router
+[[bin]]
+name = "esp32c6-sensor"
+path = "src/main.rs"
+required-features = ["sed"]
+
+[[bin]]
+name = "esp32c6-ed"
+path = "src/ed.rs"
+required-features = ["ed"]
+
+[[bin]]
+name = "esp32c6-router"
+path = "src/router.rs"
+required-features = ["router"]
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac", features = ["esp32c6"] }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 zigbee-runtime = { path = "../../zigbee-runtime", features = ["ota"] }
-sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"] }
+sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"], optional = true }
+router-app = { path = "../../apps/router", default-features = false, optional = true }
+zigbee-nwk = { path = "../../zigbee-nwk", optional = true }
 esp32-zigbee-devkit-product = { path = "../../products/esp32-zigbee-devkit", features = ["esp32c6"] }
 
 # ESP32-C6 HAL and runtime
@@ -32,7 +57,21 @@ opt-level = "s"
 lto = true
 
 [features]
-default = []
+default = ["sed"]
+# Sleepy environmental sensor (the original image).
+sed = ["dep:sensor-sed-app", "esp32-zigbee-devkit-product/sed"]
+# Always-on End Device: router-app AlwaysOnEndDeviceApp, end-device MAC.
+ed = ["dep:router-app", "dep:zigbee-nwk", "esp32-zigbee-devkit-product/roles"]
+# Router: parent MAC (hardware auto-ACK with Frame Pending from the PHY's
+# source table), ParentRouterApp, durable child and APS tables.
+router = [
+    "dep:router-app",
+    "router-app/router",
+    "zigbee-runtime/router",
+    "zigbee-mac/esp-parent",
+    "esp32-zigbee-devkit-product/roles",
+]
+# Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
 
 [patch.crates-io]

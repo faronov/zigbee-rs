@@ -32,6 +32,13 @@
 //!
 //! ESP32-C6 and ESP32-H2 use distinct OTA image types so a coordinator cannot
 //! offer an application image for the wrong chip.
+//!
+//! Besides the sleepy sensor, the product owns two mains roles that share the
+//! same partition table and security journal (separated by [`role`] tags):
+//!
+//! * [`end_device`] — always-on (RX-on-when-idle) End Device policy/profile.
+//! * [`router`] — parent Router policy/profile plus the child-table and APS
+//!   binding/group journals in the first 16 KiB of `zbnv`.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -41,17 +48,22 @@ compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 
 pub mod chip_temperature;
+#[cfg(feature = "roles")]
+pub mod end_device;
 #[cfg(any(target_os = "none", test))]
 pub mod executor;
 pub mod migration;
+#[cfg(feature = "sed")]
 pub mod policy;
 pub mod profile;
+#[cfg(feature = "roles")]
+pub mod router;
 pub mod sleep;
 #[cfg(target_os = "none")]
 pub mod storage;
 #[cfg(any(target_os = "none", test))]
 pub mod time_driver;
-#[cfg(any(target_os = "none", test))]
+#[cfg(all(feature = "sed", any(target_os = "none", test)))]
 pub mod wake;
 
 #[cfg(test)]
@@ -66,9 +78,9 @@ pub mod firmware;
 pub mod layout;
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod ota;
-#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(all(feature = "sed", any(feature = "esp32c6", feature = "esp32h2")))]
 pub mod ota_boot;
-#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(all(feature = "sed", any(feature = "esp32c6", feature = "esp32h2")))]
 pub mod ota_transport;
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod otadata;
@@ -84,6 +96,32 @@ pub const ENDPOINT: u8 = 1;
 pub const MODEL: &str = "ESP32-C6-Sensor";
 #[cfg(feature = "esp32h2")]
 pub const MODEL: &str = "ESP32-H2-Sensor";
+
+/// Model identifiers of the mains role images.
+#[cfg(feature = "esp32c6")]
+pub const ROUTER_MODEL: &str = "ESP32-C6-Router";
+#[cfg(feature = "esp32c6")]
+pub const END_DEVICE_MODEL: &str = "ESP32-C6-ED";
+#[cfg(feature = "esp32h2")]
+pub const ROUTER_MODEL: &str = "ESP32-H2-Router";
+#[cfg(feature = "esp32h2")]
+pub const END_DEVICE_MODEL: &str = "ESP32-H2-ED";
+
+/// Security-journal role tags (`SecurityStateJournal::select_role_tag`).
+///
+/// All role images share one security journal so outgoing frame counters
+/// stay monotonic across a reflash; the tag stops one role from resuming
+/// another role's network state. The original sensor image predates the
+/// tags and writes none; leave the network before returning to it from a
+/// tagged role.
+pub mod role {
+    pub const ROUTER: u16 = 0x5201;
+    pub const END_DEVICE: u16 = 0x5202;
+}
+
+/// Mains roles re-arm commissioning on their own this long after a Leave
+/// (the BOOT button re-arms it immediately).
+pub const RECOMMISSION_AFTER_LEAVE_MS: u64 = 5 * 60 * 1000;
 
 /// Manufacturer code advertised in `QueryNextImageRequest` and stamped into
 /// the OTA container by `tools/create-ota.py`. ZHA matches images on this
