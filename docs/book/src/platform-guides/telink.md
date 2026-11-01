@@ -2,13 +2,13 @@
 
 TLSR8258 uses the custom `tc32-1.98.1-20261003-31a272` Rust toolchain
 (LLVM 23.1.2), targeting `tc32-unknown-none-elf`. The production
-sensor and router use the same shared application frontends as the ARM and
-RISC-V products.
+sleepy sensor, always-on End Device and router use the same shared
+application frontends as the ARM and RISC-V products.
 
 ## Layering
 
 ```text
-sensor or parent-router product behavior
+sensor, always-on End Device or parent-router product behavior
         ↓
 products/tlsr8258-tb04
         ↓
@@ -17,9 +17,14 @@ boards/tlsr8258-tb04
 tlsr8258-hal + zigbee-mac (TelinkMac / TelinkRouterMac) + tlsr8258-rt
 ```
 
-The sensor/router `main.rs` files are the short composition roots.
+The sensor, ED and router `main.rs` files are the short composition roots.
+Each role is its own crate (`examples/telink-tlsr8258-{sensor,ed,router}`)
+rather than a bin of one board crate: the TC32 build script, the post-link
+layout gates, the LOW32K retention features and the CI cache are keyed on the
+crate and bin name. The product crate selects the role with its `sensor`,
+`end-device` or `router` feature.
 
-The sensors use `TelinkMac`, which is the shared
+The sleepy sensor and the always-on ED use `TelinkMac`, which is the shared
 `SoftMacCore<TelinkRadioPhy, EndDevice>`: scan, association, polling, frame
 retries and ACK matching run in the portable core, while the HAL performs the
 CSMA-CA backoff (with the PIB parameters), the transmission and the Imm-Ack
@@ -115,6 +120,41 @@ starts Network Steering again, retrying with the 5..60 s policy backoff. A
 product built on a module with a button should map its short press to
 `request_commissioning()`.
 
+## Always-on End Device application
+
+`examples/telink-tlsr8258-ed` is a mains-powered, RX-on-when-idle,
+non-routing End Device:
+
+```rust,ignore
+AlwaysOnEndDeviceApp::<_, _, _, _, _, _, EdObserver>::new_observed(
+    ZigbeeNode::new(device, security_store, profile),
+    &END_DEVICE_POLICY,
+    RouterParts::new(status, supervisor, NoDiagnostics),
+)?;
+```
+
+It uses the end-device `TelinkMac` (no parent MAC, no `router` feature), and
+the same IRQ-driven RX/auto-ACK path as the router, because the HAL services
+receive in the IRQ only while `macRxOnWhenIdle` is set.
+`products/tlsr8258-tb04` (`end-device` feature) owns:
+
+- the identity: model `TLSR8258-ED`, IEEE offset `0x45`, distinct from the
+  sensor (`0x33`) and router (`0x52`);
+- the Basic + Identify profile: the TB-04 has no measured cluster to report;
+- the 15..60 s retry policy;
+- the security-journal role tag `END_DEVICE` (`0x5202`).
+
+The sensor and router remain untagged legacy images. Their distinct IEEE
+offsets still make a role switch reset the network state while keeping the
+frame-counter limits. The ED reserves only the security journal; it has no
+child or APS-table journal.
+
+The ED shares the router's LED adapters (`status_leds`). Like the router, it
+has no button. After a Leave it stays factory-new until the next power cycle.
+
+`TELINK_ED_METRICS` (magic `TJED`, `#[no_mangle]`) exports the commissioning
+results, network identity, uptime and HAL RX counters for debugger reads.
+
 ## Flash ownership
 
 The 512 KiB TB-04 product preserves:
@@ -129,8 +169,8 @@ The 512 KiB TB-04 product preserves:
 ```
 
 The sensor keeps only the security token and drops the APS/child tokens, so
-those persistence paths are removed. The router consumes all three independent
-journal tokens.
+those persistence paths are removed; the always-on ED does the same. The router
+consumes all three independent journal tokens.
 
 Flash geometry is verified before factory-data access on non-512-KiB layouts.
 Zbit writes require the ADC/PC5 voltage guard before every page program or
@@ -151,7 +191,19 @@ Host tools remain on Rust `1.94.1`.
 ./scripts/tlsr8258.sh build sensor-retention
 ./scripts/tlsr8258.sh build sensor-retention-10s
 ./scripts/tlsr8258.sh build router
+./scripts/tlsr8258.sh build ed
 ```
+
+`tools/tlsr8258-firmware.sh` gates the ED image on:
+
+- no parent or router symbols;
+- the End Device Timeout client symbols;
+- no sleep or retention path;
+- exactly one `tlsr8258_rt::block_on` root;
+- the default 16 KiB SVC / 1 KiB IRQ stack layout.
+
+CI also runs `tools/check-role-symbols.sh`: `leaf` for the sensor and the ED,
+`parent` for the router.
 
 Production and radio-harness configurations enable LLVM tail merging. The
 October 4 rebuild measured **195,688 B** for the default sensor and
@@ -219,4 +271,7 @@ Remaining gates:
 - LOW32K proof completion on the `sensor-retention` images;
 - pad/comparator wake modes;
 - corrected-image first-attempt child admission and complete interview;
+- the always-on ED: join, interview, and resume after reset on hardware;
+- the `SoftMacCore` parent router: join, ZHA interview, neighbour/LQI, a child
+  joining through it, and the stack high-water on the persistence paths;
 - long-duration router and sleep stability.

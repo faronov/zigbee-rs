@@ -1,13 +1,36 @@
 //! Product-owned flash layout and persistence policy for TLSR8258 TB-04 firmware.
+//!
+//! One product, three node roles, each its own image: the polling sleepy
+//! sensor (`sensor`), the always-on End Device (`end-device`) and the
+//! parent router (`router`). All three link the same partition map, so a
+//! reflash between roles never moves a journal.
 
 #![no_std]
 
+#[cfg(feature = "end-device")]
+pub mod end_device;
 #[cfg(all(target_arch = "tc32", feature = "router"))]
 pub mod router;
 #[cfg(feature = "sensor")]
 pub mod sensor;
+#[cfg(all(target_arch = "tc32", any(feature = "router", feature = "end-device")))]
+pub mod status_leds;
 #[cfg(target_arch = "tc32")]
 pub mod storage;
+
+/// Security-journal role tags (`SecurityStateJournal::select_role_tag`).
+///
+/// All TB-04 role images share the security journal at
+/// [`SECURITY_PARTITION_START`], so outgoing frame-counter limits survive a
+/// reflash between roles. The sensor and router images predate the tags and
+/// write none; each role image also derives its own IEEE address from the
+/// factory EUI-64, so `reset_security_state_if_identity_changed` already
+/// keeps the counter limits and clears foreign network state when they
+/// meet. The End Device, the first tagged TB-04 role, additionally selects
+/// [`role::END_DEVICE`]; values follow the repository-wide role template.
+pub mod role {
+    pub const END_DEVICE: u16 = 0x5202;
+}
 
 pub const FLASH_CAPACITY: usize = tlsr8258_tb04::ONBOARD_FLASH_CAPACITY;
 pub const SECURITY_PARTITION_START: u32 = 0x0007_4000;

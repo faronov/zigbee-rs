@@ -219,6 +219,7 @@ IMAGES: list[Image] = [
             "telink-tlsr8258-sensor"),
     _telink("tlsr8258-sensor-retention-10s", "sensor-retention-10s",
             "telink-tlsr8258-sensor"),
+    _telink("tlsr8258-ed", "ed", "telink-tlsr8258-ed"),
     _telink("tlsr8258-router", "router", "telink-tlsr8258-router"),
 ]
 

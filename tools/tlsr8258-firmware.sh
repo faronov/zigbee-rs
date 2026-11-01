@@ -176,7 +176,8 @@ verify_layout() {
             exit 1
         fi
     done
-    if [[ "$binary_name" == "telink-tlsr8258-sensor" ]]; then
+    if [[ "$binary_name" == "telink-tlsr8258-sensor" ||
+          "$binary_name" == "telink-tlsr8258-ed" ]]; then
         if "$LLVM_NM" -C "$elf" | awk '
             /parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status|ParentRouterApp/ {
                 found = 1
@@ -322,6 +323,32 @@ verify_layout() {
             fi
         done
         echo "default-idle OK: LOW32K absent; full-SRAM atomic SUSPEND retained"
+    elif [[ "$binary_name" == "telink-tlsr8258-ed" ]]; then
+        if (( svc_bottom != 0x84BC00 || svc_top != 0x84FC00 ||
+              irq_bottom != 0x84FC00 || irq_top != 0x850000 )); then
+            echo "layout-check FAIL: always-on ED no longer uses the validated full-SRAM stack layout" >&2
+            exit 1
+        fi
+        if "$LLVM_NM" -C "$elf" | awk '
+            /TELINK_RETENTION_IMAGE|cpu_suspend|cpu_sleep_timer|_rust_retention_entry|resume_after_sleep/ {
+                found = 1
+            }
+            END { exit(found ? 0 : 1) }
+        '; then
+            echo "layout-check FAIL: always-on ED links a sleep/retention path" >&2
+            exit 1
+        fi
+        local ed_block_on_count
+        ed_block_on_count=$("$LLVM_NM" -C "$elf" | awk '
+            / [tT] tlsr8258_rt::block_on::</ { count++ }
+            END { print count + 0 }
+        ')
+        if (( ed_block_on_count != 1 )); then
+            printf 'ed-root FAIL: expected one block_on monomorph, found %d\n' \
+                "$ed_block_on_count" >&2
+            exit 1
+        fi
+        echo "ed-role OK: leaf-only, no sleep path, single block_on root"
     fi
 
     printf 'layout-check OK: image=%d B flash_limit=0x%X ram_code=%d B data=0x%X bss_end=0x%X rf_dma=[0x%X..0x%X) (rx=0x%X tx=0x%X ack=0x%X) aps_nv=[0x%X..0x%X) child_nv=[0x%X..0x%X) sec_nv=[0x%X..0x%X)\n' \

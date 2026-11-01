@@ -15,6 +15,13 @@ router = [
     "zigbee-runtime/router",
     "zigbee-runtime/compact-single-endpoint",
 ]
+# Always-on (RX-on-when-idle) non-routing End Device. Pulls the shared
+# router app without its parent/router feature, so no parent MAC, child
+# table or routing code can link.
+end-device = [
+    "dep:router-app",
+    "zigbee-runtime/compact-single-endpoint",
+]
 sensor = [
     "dep:sensor-sed-app",
     "dep:zigbee-mac",
