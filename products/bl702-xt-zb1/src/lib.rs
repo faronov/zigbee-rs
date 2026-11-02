@@ -36,12 +36,14 @@ pub const TX_POWER_DBM: i8 = 0;
 ///
 /// All role images share one security journal so outgoing frame counters
 /// stay monotonic across a reflash; the tag stops one role from resuming
-/// another role's network state. The sensor SED predates the tags and
-/// writes none, so leave the network before flashing it after a tagged
-/// role.
+/// another role's network state.
 pub mod role {
     pub const ROUTER: u16 = 0x5201;
     pub const END_DEVICE: u16 = 0x5202;
+    /// The sensor SED predates the tags: its records are untagged, so
+    /// shipped sensors keep their network state, while a tagged role's
+    /// state (one that rejoined after its Leave) is cleared.
+    pub const SENSOR: u16 = zigbee_runtime::security_journal::SECURITY_JOURNAL_UNTAGGED;
 }
 
 /// Model identifiers of the role images.

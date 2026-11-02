@@ -164,6 +164,10 @@ async fn sensor(application: hal::ApplicationResources) {
             hal::halt()
         }
     }
+    if let Err(error) = security_store.select_role_tag(product::role::SENSOR) {
+        log::error!("security role selection failed: {error:?}");
+        hal::halt()
+    }
 
     let node = ZigbeeNode::new(device, &mut security_store, profile);
     let mut app = match SensorApp::new(
