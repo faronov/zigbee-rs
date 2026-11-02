@@ -157,42 +157,47 @@ impl<M: MacDriver> NwkLayer<M> {
 
         let seq = self.nib.next_seq();
 
-        let header = NwkHeader {
-            frame_control: NwkFrameControl {
-                frame_type: NwkFrameType::Command as u8,
-                protocol_version: 0x02,
-                discover_route: 0,
-                multicast: false,
-                security: self.nib.security_enabled,
-                source_route: false,
-                dst_ieee_present: dst_ieee.is_some(),
-                src_ieee_present: src_ieee.is_some(),
-                end_device_initiator: false,
-            },
-            dst_addr,
-            src_addr,
-            radius,
-            seq_number: seq,
-            dst_ieee,
-            src_ieee,
-            multicast_control: None,
-            source_route: None,
-        };
-
-        // Assemble full command: [cmd_id, ...cmd_payload]
-        let mut full_cmd = [0u8; 80];
-        full_cmd[0] = cmd_id as u8;
-        let cmd_len = 1 + cmd_payload.len();
-        if cmd_len > full_cmd.len() {
-            return Err(NwkStatus::FrameTooLong);
-        }
-        full_cmd[1..cmd_len].copy_from_slice(cmd_payload);
-
-        // The shared builder owns header serialization, key selection, the
-        // durable frame-counter reservation and CCM*, so commands, data and
-        // relayed frames are all secured the same way.
+        // The header and the assembled command are dead once the frame is
+        // built; scoping them keeps them out of the state saved across the
+        // MAC transmission below.
         let mut buf = [0u8; crate::nlde::MAX_NWK_FRAME];
-        let total_len = self.build_nwk_frame(&header, &full_cmd[..cmd_len], &mut buf)?;
+        let total_len = {
+            let header = NwkHeader {
+                frame_control: NwkFrameControl {
+                    frame_type: NwkFrameType::Command as u8,
+                    protocol_version: 0x02,
+                    discover_route: 0,
+                    multicast: false,
+                    security: self.nib.security_enabled,
+                    source_route: false,
+                    dst_ieee_present: dst_ieee.is_some(),
+                    src_ieee_present: src_ieee.is_some(),
+                    end_device_initiator: false,
+                },
+                dst_addr,
+                src_addr,
+                radius,
+                seq_number: seq,
+                dst_ieee,
+                src_ieee,
+                multicast_control: None,
+                source_route: None,
+            };
+
+            // Assemble full command: [cmd_id, ...cmd_payload]
+            let mut full_cmd = [0u8; 80];
+            full_cmd[0] = cmd_id as u8;
+            let cmd_len = 1 + cmd_payload.len();
+            if cmd_len > full_cmd.len() {
+                return Err(NwkStatus::FrameTooLong);
+            }
+            full_cmd[1..cmd_len].copy_from_slice(cmd_payload);
+
+            // The shared builder owns header serialization, key selection, the
+            // durable frame-counter reservation and CCM*, so commands, data and
+            // relayed frames are all secured the same way.
+            self.build_nwk_frame(&header, &full_cmd[..cmd_len], &mut buf)?
+        };
 
         let next_hop = match explicit_next_hop {
             Some(next_hop) => next_hop,
@@ -227,6 +232,21 @@ impl<M: MacDriver> NwkLayer<M> {
             return Ok(true);
         }
 
+        #[cfg(feature = "router")]
+        {
+            let request = self.hop_request(next_hop, &buf[..total_len], seq);
+            let mut result = self.mac.mcps_data(request).await.map(drop);
+            // As for data (R22 §3.6.3.7): penalise a failed link and offer
+            // the command once to a routing-table alternative.
+            if explicit_next_hop.is_none()
+                && let Some(alternate) = self.noack_alternate(result, dst_addr, next_hop)
+            {
+                let request = self.hop_request(alternate, &buf[..total_len], seq);
+                result = self.mac.mcps_data(request).await.map(drop);
+            }
+            result.map_err(|_| NwkStatus::RouteError)?;
+        }
+        #[cfg(not(feature = "router"))]
         self.mac
             .mcps_data(McpsDataRequest {
                 src_addr_mode: AddressMode::Short,
@@ -1413,5 +1433,40 @@ mod tests {
         );
         block_on(end_device.send_link_status()).expect("the call is a no-op");
         assert!(end_device.mac().tx_history().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_command_that_a_direct_neighbour_never_acks_takes_the_route() {
+        // A Leave or Network Status reply to the coordinator must not die on a
+        // link the coordinator cannot hear us over (R22 §3.6.3.7).
+        let coordinator = ShortAddress(0x0000);
+        let relay = ShortAddress(0x4444);
+        let mut router = node(DeviceType::Router);
+        neighbour(
+            &mut router,
+            coordinator,
+            NeighborDeviceType::Coordinator,
+            2,
+            2,
+        );
+        router.routing.update_route(coordinator, relay, 2).unwrap();
+        router.mac_mut().set_tx_failures(1);
+
+        block_on(router.send_nwk_command(coordinator, NwkCommandId::NetworkStatus, &[0x00, 0x00]))
+            .expect("the alternative route delivers the command");
+
+        let history = router.mac().tx_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].dst, MacAddress::Short(PAN, relay));
+        assert_eq!(
+            router
+                .neighbors
+                .find_by_short(coordinator)
+                .unwrap()
+                .outgoing_cost,
+            0,
+            "the failed link waits for the coordinator's next Link Status",
+        );
     }
 }

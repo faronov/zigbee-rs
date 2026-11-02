@@ -201,6 +201,26 @@ impl NeighborEntry {
         )
     }
 
+    /// Whether a unicast addressed to this neighbor may be handed to it
+    /// directly without further evidence (R22 §3.6.3.3, §3.6.3.4).
+    ///
+    /// * Our own children are always one hop away: their association was a
+    ///   two-way MAC exchange, and an end-device child can only be reached
+    ///   through us.
+    /// * Any other neighbor needs a known cost in *both* directions below the
+    ///   worst link cost 7: an outgoing cost reported in its Link Status
+    ///   (`0` = it does not hear us, or never told us; R22 §3.6.3.4.2) and our
+    ///   own LQI-based incoming cost (§3.6.3.1). Hearing a device — even a
+    ///   coordinator that never ACKs us — does not make the link usable for
+    ///   transmission (§3.6.3.4: links may be asymmetric).
+    #[cfg(feature = "router")]
+    pub fn is_confirmed_direct_hop(&self) -> bool {
+        matches!(
+            self.relationship,
+            Relationship::Child | Relationship::UnauthenticatedChild
+        ) || ((1..7).contains(&self.outgoing_cost) && (1..7).contains(&self.incoming_cost))
+    }
+
     /// Re-arm the R22 End Device Timeout deadline from the stored enumeration.
     ///
     /// Called when an end-device child is authenticated and on every keepalive

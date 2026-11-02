@@ -257,6 +257,34 @@ destination with no known route.
    (RREP)** is unicast back along the best path
 5. Each router along the path installs a route entry
 
+### Next-hop selection (router builds, R22 §3.6.3.3)
+
+`resolve_next_hop` picks the next hop for a unicast in this order:
+
+1. **A confirmed direct neighbour.** Our own children (end-device or router)
+   are always direct. Any other neighbour is direct only if both link costs
+   are known and usable: a Link Status-reported outgoing cost in `1..=6` and
+   an LQI-derived incoming cost in `1..=6`
+   (`NeighborEntry::is_confirmed_direct_hop`). Hearing a device does not mean
+   it hears us (§3.6.3.4, asymmetric links).
+2. **An active routing-table entry.**
+3. **Best effort direct.** The destination is any other neighbour, or our
+   parent. If the destination is a router-type neighbour without a route and
+   the frame allows discovery, a Route Request goes out first. The frame is
+   then still sent directly, so it is carried rather than dropped while the
+   route forms.
+4. Otherwise the existing unroutable path is taken (discovery or Network
+   Status).
+
+When a unicast to a neighbour next hop ends in **MAC NoAck**, the link is
+penalised: the neighbour's `outgoing_cost` is set to `0` until its next Link
+Status restores it. If a routing-table entry offers a different next hop,
+the same secured frame is sent once more along it, without a new frame
+counter. A Network Status / relay failure is reported only after that.
+Penalising the link also means the next frame to that destination starts
+route discovery. Children are never penalised: their liveness is handled by
+child aging and keepalive.
+
 ### Tree Routing
 
 Tree routing uses the hierarchical network address space to forward frames
