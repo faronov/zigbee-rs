@@ -420,16 +420,17 @@ struct RxAddressFilter {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum RxPriority {
-    /// Provably not ours: another PAN, or a unicast to some other node.
-    /// Only queued while there is spare room.
+    /// Provably not ours: another PAN, a unicast to some other node, or a
+    /// malformed / reserved MAC header. Never queued (see
+    /// [`rx_queue_admits`]).
     Foreign = 0,
-    /// MAC acknowledgement captured outside a synchronous ACK window.
+    /// MAC acknowledgement captured outside a synchronous ACK window, while
+    /// the local identity is known.
     ///
-    /// ACK frames carry no destination, so a queued ACK cannot be proven to
-    /// belong to this node. Expected ACKs are consumed by the polled
-    /// `transmit_with_ack` path before they reach this queue; retain a queued
-    /// ACK over known-foreign traffic, but never over a broadcast or local
-    /// data frame.
+    /// Every transmit path consumes its own ACK synchronously inside the
+    /// HAL's ACK wait, so an ACK that reaches the interrupt queue is either
+    /// another node's or arrived after its transmit already gave up. Never
+    /// queued (see [`rx_queue_admits`]).
     Ack = 1,
     /// Broadcast, or a frame with no destination addressing (beacons,
     /// coordinator-directed frames). Cannot be proven irrelevant.
@@ -518,6 +519,27 @@ fn classify_rx_priority(psdu: &[u8], filter: &RxAddressFilter) -> RxPriority {
     }
 }
 
+/// Whether a classified frame may take a slot in the interrupt receive queue.
+///
+/// On the always-on TB-04 router 87% of the length/CRC-valid frames on
+/// channel 15 were other nodes' MAC ACKs and unicasts to other nodes or
+/// PANs. Admitting them made the 16 slots overflow while upper layers were
+/// busy (NWK broadcast/RREQ jitter waits, transmits, frame processing), and
+/// the outright drops then hit the broadcasts and frames this router must
+/// act on. No consumer can use those frames: the MAC drops every frame that
+/// fails its destination check and consumes ACKs inside its own transmit,
+/// so rejecting them here, after the software ACK was already sent, changes
+/// nothing above the HAL except that relevant frames are no longer lost.
+///
+/// While the local identity is unknown or reception is promiscuous,
+/// [`classify_rx_priority`] reports every well-formed frame as
+/// [`RxPriority::Local`], so only malformed headers are rejected and scans
+/// still see every beacon.
+#[cfg(any(target_arch = "tc32", test))]
+fn rx_queue_admits(priority: RxPriority) -> bool {
+    priority > RxPriority::Ack
+}
+
 /// Slot count of the bounded interrupt receive queue.
 ///
 /// Sized from the five-hour channel-15 TB-04 capture rather than guessed:
@@ -528,6 +550,13 @@ fn classify_rx_priority(psdu: &[u8], filter: &RxAddressFilter) -> RxPriority {
 /// 16-frame back-to-back burst. [`RxDiagnostics::queue_high_water`] reports
 /// the depth actually reached so this bound stays measured instead of
 /// re-guessed.
+///
+/// That sizing assumed every valid frame takes a slot. A lab build on the
+/// joined TB-04 router measured un-drained gaps of up to ~800 ms (NWK
+/// broadcast jitter busy-waits and frame processing), which no affordable
+/// slot count covers at 26 frames/s. With [`rx_queue_admits`] only the
+/// ~1 frame/s this router can use is queued, so 16 slots cover such a gap
+/// with a wide margin and no longer need to grow.
 #[cfg(any(target_arch = "tc32", test))]
 const IRQ_RX_QUEUE_CAPACITY: usize = 16;
 
@@ -552,12 +581,18 @@ enum RxQueuePush {
 /// the MAC ever observes on an idle channel. Under overload the queue
 /// sacrifices the oldest strictly-lower-priority frame instead of the newest
 /// arrival, because the newest arrival is the one the upper layers are
-/// usually waiting for (an ACK, or a ZDO response addressed to us) while the
-/// stale entries are unrelated channel traffic this node only has to relay.
+/// usually waiting for (a ZDO/APS frame addressed to us) while the stale
+/// entries are broadcasts this node only has to relay.
+///
+/// Frames that can never reach a consumer do not get here at all: see
+/// [`rx_queue_admits`].
 ///
 /// `order` is a permutation of every slot index: positions
 /// `head..head + len` are occupied and the remainder are free, so an
 /// eviction only shifts single-byte indices and never copies frame bytes.
+/// Each entry is stored XORed with its own array index, so the all-zero
+/// value is the identity permutation and the 2 KiB queue is zero-initialised
+/// `.bss` instead of a `.data` image copied out of flash at boot.
 #[cfg(any(target_arch = "tc32", test))]
 struct RxQueue {
     slots: [ReceivedFrame; IRQ_RX_QUEUE_CAPACITY],
@@ -572,17 +607,12 @@ struct RxQueue {
 
 #[cfg(any(target_arch = "tc32", test))]
 impl RxQueue {
+    /// All-zero, so a `static` of this type is placed in `.bss`.
     const fn new() -> Self {
-        let mut order = [0u8; IRQ_RX_QUEUE_CAPACITY];
-        let mut index = 0;
-        while index < IRQ_RX_QUEUE_CAPACITY {
-            order[index] = index as u8;
-            index += 1;
-        }
         Self {
             slots: [ReceivedFrame::EMPTY; IRQ_RX_QUEUE_CAPACITY],
             priorities: [RxPriority::Foreign; IRQ_RX_QUEUE_CAPACITY],
-            order,
+            order: [0; IRQ_RX_QUEUE_CAPACITY],
             head: 0,
             len: 0,
             high_water: 0,
@@ -591,8 +621,17 @@ impl RxQueue {
         }
     }
 
+    /// Slot index stored at `order` array index `index`.
+    fn order_get(&self, index: usize) -> u8 {
+        self.order[index] ^ index as u8
+    }
+
+    fn order_set(&mut self, index: usize, slot: u8) {
+        self.order[index] = slot ^ index as u8;
+    }
+
     fn slot_at(&self, position: usize) -> usize {
-        self.order[(self.head as usize + position) % IRQ_RX_QUEUE_CAPACITY] as usize
+        self.order_get((self.head as usize + position) % IRQ_RX_QUEUE_CAPACITY) as usize
     }
 
     fn push(&mut self, frame: ReceivedFrame, priority: RxPriority) -> RxQueuePush {
@@ -606,14 +645,14 @@ impl RxQueue {
             // into the (currently empty) free region at the tail. Only
             // `u8` indices move; the 128-byte frame bodies stay put.
             let head = self.head as usize;
-            let evicted_slot = self.order[(head + victim) % IRQ_RX_QUEUE_CAPACITY];
+            let evicted_slot = self.order_get((head + victim) % IRQ_RX_QUEUE_CAPACITY);
             let mut position = victim;
             while position + 1 < len {
-                self.order[(head + position) % IRQ_RX_QUEUE_CAPACITY] =
-                    self.order[(head + position + 1) % IRQ_RX_QUEUE_CAPACITY];
+                let next = self.order_get((head + position + 1) % IRQ_RX_QUEUE_CAPACITY);
+                self.order_set((head + position) % IRQ_RX_QUEUE_CAPACITY, next);
                 position += 1;
             }
-            self.order[(head + len - 1) % IRQ_RX_QUEUE_CAPACITY] = evicted_slot;
+            self.order_set((head + len - 1) % IRQ_RX_QUEUE_CAPACITY, evicted_slot);
             self.len -= 1;
             self.evicted = self.evicted.wrapping_add(1);
             self.store(frame, priority);
@@ -801,9 +840,18 @@ impl Radio {
         true
     }
 
+    /// Program the software-ACK identity; the interrupt receive queue then
+    /// admits only frames that can be addressed to this node.
     #[cfg(target_arch = "tc32")]
     pub fn set_ack_filter(&mut self, pan_id: u16, short_address: u16, extended_address: [u8; 8]) {
         hw::set_ack_filter(pan_id, short_address, extended_address);
+    }
+
+    /// Admit every well-formed frame to the interrupt receive queue until
+    /// the next [`Self::set_ack_filter`]; the ACK identity is kept.
+    #[cfg(target_arch = "tc32")]
+    pub fn set_rx_promiscuous(&mut self) {
+        hw::set_rx_promiscuous();
     }
 
     /// Keep the PHY armed between bounded MAC operations.
@@ -1295,6 +1343,138 @@ mod tests {
         );
     }
 
+    fn admitted(psdu: &[u8], filter: &RxAddressFilter) -> bool {
+        rx_queue_admits(classify_rx_priority(psdu, filter))
+    }
+
+    #[test]
+    fn rx_queue_admits_only_frames_a_consumer_can_use() {
+        // Addressed to us, MAC broadcasts and beacons take a slot.
+        assert!(admitted(&short_data_to(0x1A62, 0x9F3C), &TEST_FILTER));
+        assert!(admitted(
+            &extended_data_to(0x1A62, TEST_FILTER.extended_address),
+            &TEST_FILTER
+        ));
+        assert!(admitted(&short_data_to(0x1A62, 0xFFFF), &TEST_FILTER));
+        assert!(admitted(&short_data_to(0xFFFF, 0xFFFF), &TEST_FILTER));
+        assert!(admitted(
+            &[0x00, 0x80, 0x01, 0x62, 0x1A, 0x00, 0x00],
+            &TEST_FILTER
+        ));
+        // Other nodes' unicasts, other PANs and stray ACKs never do: the MAC
+        // would discard them, and they are what overflowed the queue.
+        assert!(!admitted(&short_data_to(0x1A62, 0x1234), &TEST_FILTER));
+        assert!(!admitted(&short_data_to(0x7788, 0x9F3C), &TEST_FILTER));
+        assert!(!admitted(
+            &extended_data_to(0x1A62, [0xFE; 8]),
+            &TEST_FILTER
+        ));
+        assert!(!admitted(&[0x02, 0x00, 0x61], &TEST_FILTER));
+        assert!(!admitted(
+            &[ack_frame_control(true), 0x00, 0x61],
+            &TEST_FILTER
+        ));
+        // Malformed headers are never admitted.
+        assert!(!admitted(&[0x61, 0x88], &TEST_FILTER));
+        assert!(!admitted(
+            &[0x65, 0x88, 0x42, 0x62, 0x1A, 0x3C, 0x9F],
+            &TEST_FILTER
+        ));
+    }
+
+    #[test]
+    fn promiscuous_or_unknown_identity_admits_every_well_formed_frame() {
+        // `push_irq_rx` passes `enabled: false` while promiscuous (scan or
+        // MacPromiscuousMode) and before `set_ack_filter`; an unassociated
+        // node still has PAN id 0xFFFF.
+        let promiscuous = RxAddressFilter {
+            enabled: false,
+            ..TEST_FILTER
+        };
+        let unassociated = RxAddressFilter {
+            pan_id: 0xFFFF,
+            short_address: 0xFFFF,
+            ..TEST_FILTER
+        };
+        for filter in [promiscuous, unassociated] {
+            assert!(admitted(&short_data_to(0x7788, 0x1234), &filter));
+            assert!(admitted(&short_data_to(0x1A62, 0x1234), &filter));
+            assert!(admitted(&extended_data_to(0x1A62, [0xFE; 8]), &filter));
+            assert!(admitted(&[0x02, 0x00, 0x61], &filter));
+            assert!(admitted(
+                &[0x00, 0x80, 0x01, 0x62, 0x1A, 0x00, 0x00],
+                &filter
+            ));
+            assert!(!admitted(&[0x61, 0x88], &filter));
+        }
+    }
+
+    #[test]
+    fn zero_initialised_rx_queue_matches_a_fifo_model_under_eviction() {
+        // `RxQueue::new()` is all-zero (so the static lands in `.bss`); the
+        // XOR-encoded `order` must decode to a valid permutation and keep
+        // exact FIFO-with-priority-eviction semantics through every wrap.
+        let mut queue = RxQueue::new();
+        assert!(queue.order.iter().all(|&entry| entry == 0));
+        let mut model: [(u8, RxPriority); 64] = [(0, RxPriority::Foreign); 64];
+        let mut model_len = 0usize;
+        let mut random = 0x1234_5678u32;
+        let mut tag = 0u8;
+        for _ in 0..20_000 {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            if random.is_multiple_of(3) {
+                let popped = queue.pop().map(|frame| frame.as_slice()[0]);
+                let expected = (model_len != 0).then(|| {
+                    let front = model[0].0;
+                    model.copy_within(1..model_len, 0);
+                    model_len -= 1;
+                    front
+                });
+                assert_eq!(popped, expected);
+            } else {
+                let priority = match (random >> 8) % 4 {
+                    0 => RxPriority::Foreign,
+                    1 => RxPriority::Ack,
+                    2 => RxPriority::Broadcast,
+                    _ => RxPriority::Local,
+                };
+                tag = tag.wrapping_add(1);
+                let outcome = queue.push(ReceivedFrame::new(&[tag; 3], 0, 0), priority);
+                if model_len < IRQ_RX_QUEUE_CAPACITY {
+                    assert_eq!(outcome, RxQueuePush::Queued);
+                    model[model_len] = (tag, priority);
+                    model_len += 1;
+                } else {
+                    let lowest = model[..model_len]
+                        .iter()
+                        .map(|entry| entry.1)
+                        .min()
+                        .unwrap();
+                    if lowest < priority {
+                        assert_eq!(outcome, RxQueuePush::Evicted);
+                        let victim = model[..model_len]
+                            .iter()
+                            .position(|entry| entry.1 == lowest)
+                            .unwrap();
+                        model.copy_within(victim + 1..model_len, victim);
+                        model[model_len - 1] = (tag, priority);
+                    } else {
+                        assert_eq!(outcome, RxQueuePush::Dropped);
+                    }
+                }
+            }
+            assert_eq!(queue.len(), model_len);
+            let mut seen = [false; IRQ_RX_QUEUE_CAPACITY];
+            for index in 0..IRQ_RX_QUEUE_CAPACITY {
+                let slot = queue.order_get(index) as usize;
+                assert!(!seen[slot], "order must stay a permutation");
+                seen[slot] = true;
+            }
+        }
+    }
+
     #[test]
     fn rx_queue_is_strict_fifo_while_it_has_room() {
         let mut queue = RxQueue::new();
@@ -1488,6 +1668,10 @@ mod hw {
         short_address: u16,
         extended_address: [u8; 8],
         enabled: u8,
+        /// Non-zero: queue every well-formed frame (MAC promiscuous mode or
+        /// a scan). The software-ACK identity above is unaffected. Fits the
+        /// struct's existing tail padding.
+        promiscuous: u8,
     }
 
     static mut ACK_FILTER: AckFilter = AckFilter {
@@ -1495,6 +1679,7 @@ mod hw {
         short_address: 0xFFFF,
         extended_address: [0; 8],
         enabled: 0,
+        promiscuous: 0,
     };
     // Updates are published by flipping ACK_PENDING_ACTIVE only after the
     // inactive snapshot is complete. This keeps an eventual RX IRQ (and the
@@ -1618,6 +1803,10 @@ mod hw {
         end_radio_operation(restore_rx);
     }
 
+    /// Program the identity the software-ACK path acknowledges for, and
+    /// leave promiscuous reception: the interrupt receive queue again admits
+    /// only frames that can be addressed to this node (see
+    /// [`super::rx_queue_admits`]).
     pub fn set_ack_filter(pan_id: u16, short_address: u16, extended_address: [u8; 8]) {
         let restore_irq = mask_cpu_rx_irq();
         unsafe {
@@ -1628,8 +1817,20 @@ mod hw {
                     short_address,
                     extended_address,
                     enabled: 1,
+                    promiscuous: 0,
                 },
             );
+        }
+        restore_cpu_rx_irq(restore_irq);
+    }
+
+    /// Queue every well-formed received frame regardless of its destination
+    /// (MAC promiscuous mode, scans), keeping the software-ACK identity
+    /// programmed by [`set_ack_filter`]. [`set_ack_filter`] ends it.
+    pub fn set_rx_promiscuous() {
+        let restore_irq = mask_cpu_rx_irq();
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(ACK_FILTER.promiscuous), 1);
         }
         restore_cpu_rx_irq(restore_irq);
     }
@@ -2292,9 +2493,14 @@ mod hw {
                 pan_id: filter.pan_id,
                 short_address: filter.short_address,
                 extended_address: filter.extended_address,
-                enabled: filter.enabled != 0,
+                enabled: filter.enabled != 0 && filter.promiscuous == 0,
             },
         );
+        // Frames no consumer can use never take a slot. They are still
+        // counted in `frames_valid` and were already acknowledged if due.
+        if !super::rx_queue_admits(priority) {
+            return;
+        }
         compiler_fence(Ordering::Release);
         // The return value is intentionally unused here: `RxQueue` already
         // accounts for every outcome in its own cumulative counters, which
@@ -2656,5 +2862,5 @@ pub use hw::{
     CsmaParams, CsmaStats, RX_WINDOW_TICKS, RxOutcome, TX_TIMEOUT_TICKS, TxOutcome, csma_stats,
     dma_buffers_aligned, handle_irq, init, rx_diagnostics, rx_raw_window_for, rx_window,
     rx_window_for, send_beacon_request, send_mac_frame, set_ack_filter, set_channel,
-    software_ack_stats,
+    set_rx_promiscuous, software_ack_stats,
 };

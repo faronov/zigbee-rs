@@ -278,6 +278,26 @@ In steady state, losses fell to about 2 %. The router loop handles one frame
 per iteration plus a tick. The overflow counter does not say whether a dropped
 frame was addressed to the router.
 
+A lab build with per-class queue counters on the joined router (ZHA, channel
+15) then showed what filled the queue. About 87 % of the queued valid frames
+could never reach a consumer: other nodes' MAC ACKs (the MAC consumes its own
+ACKs inside the transmit, never from this queue) and unicasts to other nodes or
+PANs (the MAC drops them on its destination check). The upper layers left the
+queue undrained for up to ~0.8 s, mostly in the busy-wait NWK broadcast and
+RREQ relay jitter. The outright drops then hit the broadcasts the router has to
+act on: 16.7 % of them were lost. The soft MAC's own 8-slot retained-RX queue
+was never the bottleneck (high-water 1, no evictions).
+
+The HAL now classifies each frame after the software ACK and queues only
+broadcasts and frames for this node. Promiscuous reception (scans) and an
+unknown local identity still admit every well-formed frame. On the same
+router, the base image lost 10.3 % of valid frames to overflow (8.6 % outright).
+After a 31-minute soak, the fixed image lost 0.15 % of valid frames: 66 of
+43,702, all outright, with no evictions. That is about 3 % of the queued
+relevant frames, against 16.7 % of broadcasts before. The remaining
+overflow comes in bursts with high-water 16. It matches the inline RREQ relay
+schedule, which blocks for up to 2·128 ms jitter plus two 254 ms retries.
+
 Remaining gates:
 
 - repeated application-level default SUSPEND acceptance with network/counter
@@ -286,7 +306,7 @@ Remaining gates:
 - pad/comparator wake modes;
 - corrected-image first-attempt child admission and complete interview;
 - the parent router: a child joining through it, its own neighbour table in
-  ZHA, a paint-based stack high-water on the persistence paths, and RX-queue
-  throughput under bursts;
+  ZHA, a paint-based stack high-water on the persistence paths, and the
+  residual RX-queue overflow during the blocking NWK relay jitter waits;
 - the one-off SED `security persistence` panic seen once and not reproduced;
 - long-duration router and sleep stability.
