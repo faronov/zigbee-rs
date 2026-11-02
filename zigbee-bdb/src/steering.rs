@@ -973,6 +973,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_lost_permit_joining_broadcast_does_not_undo_an_authenticated_join() {
+        // BDB v3.0.1 §8.2 steps 14–16: the broadcast after a successful
+        // Confirm-Key is unacknowledged and has no failure branch; only the
+        // link-key procedure itself (step 12) may make the node leave.
+        let mut bdb = waiting_for_confirm_key_bdb();
+        let mac = bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+        mac.clear_tx_history();
+        mac.set_tx_failures(1);
+
+        inject_successful_confirm_key(&mut bdb, 0x0000_0300);
+        assert_eq!(step(&mut bdb), TclkProgress::Complete);
+        assert!(bdb.is_on_network());
+        assert_eq!(
+            bdb.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::Success,
+        );
+        assert_eq!(
+            transmitted_nwk_destination(&bdb, 0),
+            ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
+            "the authenticated Device_annce still follows"
+        );
+
+        // On-network steering (§8.1 step 5) has no failure branch for the
+        // broadcast either: the router still opens its own association flag.
+        let mut on_network = joined_router_bdb();
+        on_network
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .set_tx_failures(1);
+        assert_eq!(block_on(on_network.steer_on_network()), Ok(()));
+        assert!(on_network.zdo().nwk().nib().permit_joining);
+        assert_eq!(
+            on_network.attributes().commissioning_status,
+            crate::attributes::BdbCommissioningStatus::Success,
+        );
+    }
+
     fn inject_verify_key_ack(bdb: &mut BdbLayer<MockMac>) {
         let aps_counter = bdb
             .zdo()
@@ -3610,17 +3650,27 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Complete BDB steering by extending the network-wide permit-joining
     /// window, then opening the local association flag when this node can
     /// admit children (BDB v3.0.1 §§8.1 step 3–4 and 8.2 steps 14–15).
+    ///
+    /// The broadcast is best effort. It is unacknowledged, and both
+    /// procedures then set bdbCommissioningStatus to SUCCESS without a
+    /// failure branch (§8.1 step 5, §8.2 step 16). After a join, the only
+    /// failure that undoes it is the Trust Center link-key procedure (§8.2
+    /// step 12). A lost broadcast therefore must not make a node leave the
+    /// network it has just authenticated on. Only a refused local
+    /// NLME-PERMIT-JOINING request fails steering.
     async fn activate_permit_joining_after_steering(&mut self) -> Result<(), BdbStatus> {
         let duration = core::cmp::min(BDB_MIN_COMMISSIONING_TIME, 254) as u8;
 
-        self.zdo
+        // A frame that does not go out is already reported by the NWK layer
+        // ("[NWK TX] MAC send failed").
+        let _ = self
+            .zdo
             .mgmt_permit_joining_req(
                 ShortAddress::BROADCAST_ROUTERS_AND_COORDINATOR,
                 duration,
                 true,
             )
-            .await
-            .map_err(|_| BdbStatus::SteeringFailure)?;
+            .await;
 
         #[cfg(any(feature = "router", test))]
         if self.zdo.nwk().device_type() != DeviceType::EndDevice {

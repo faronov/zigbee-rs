@@ -558,7 +558,7 @@ static PROFILE_SLOT: RootSlot<{ size_of::<RouterProfile>() }> = RootSlot::new();
 static APP_SLOT: RootSlot<APP_SLOT_BYTES> = RootSlot::new();
 static FUTURE_SLOT: RootSlot<FUTURE_SLOT_BYTES> = RootSlot::new();
 const APP_SLOT_BYTES: usize = 2416;
-const FUTURE_SLOT_BYTES: usize = 4400;
+const FUTURE_SLOT_BYTES: usize = 4248;
 const ROOT_SLOT_SLACK: usize = 64;
 
 fn place<T: 'static, const N: usize>(slot: &'static RootSlot<N>, value: T) -> &'static mut T {

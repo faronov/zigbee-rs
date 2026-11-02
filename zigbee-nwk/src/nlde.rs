@@ -486,6 +486,20 @@ impl<M: MacDriver> NwkLayer<M> {
         #[cfg(not(feature = "router"))]
         let next_hop = self.resolve_next_hop(dst_addr)?;
 
+        // R22 §3.6.3.3: no routing-table entry backs a best-effort direct hop
+        // (a weak, one-way, unreported or failed link), so this frame takes
+        // it while route discovery looks for a usable path for the following
+        // ones. The RREQ goes first, before this frame reserves its security
+        // counter, so counters reach the air in order. After a NoAck without
+        // an alternative the penalised link is unconfirmed, so the next frame
+        // to this destination starts the discovery.
+        #[cfg(feature = "router")]
+        if !has_source_route && discover_route && self.direct_hop_unconfirmed(dst_addr, next_hop) {
+            let _ = self
+                .handle_unroutable_destination(dst_addr, true, NwkStatus::RouteError)
+                .await;
+        }
+
         // Auto Route Record: if the destination route requires one, transmit
         // it before reserving the data frame's security counter. Receivers
         // commit replay counters in transmission order, so building data
@@ -580,6 +594,17 @@ impl<M: MacDriver> NwkLayer<M> {
             &nwk_buf[..core::cmp::min(8, total_len)],
         );
         // Send via MAC
+        #[cfg(feature = "router")]
+        let (mac_result, _) = self
+            .send_hop(
+                dst_addr,
+                next_hop,
+                &nwk_buf[..total_len],
+                seq,
+                !has_source_route,
+            )
+            .await;
+        #[cfg(not(feature = "router"))]
         let mac_result = self
             .mac
             .mcps_data(McpsDataRequest {
@@ -1966,13 +1991,11 @@ impl<M: MacDriver> NwkLayer<M> {
         // notification is the one exception: if the failed route is already
         // gone, R22 sends it through a random router neighbor.
         let next_hop = if is_many_to_one_status {
-            if self.neighbors.find_by_short(header.dst_addr).is_some() {
-                header.dst_addr
-            } else if let Some(next_hop) = self.routing.next_hop(header.dst_addr) {
-                next_hop
-            } else {
-                self.random_router_neighbor(Some(previous_hop), None)
-                    .ok_or(NwkStatus::RouteError)?
+            match self.resolve_next_hop(header.dst_addr) {
+                Ok(next_hop) => next_hop,
+                Err(_) => self
+                    .random_router_neighbor(Some(previous_hop), None)
+                    .ok_or(NwkStatus::RouteError)?,
             }
         } else {
             match self.resolve_next_hop(header.dst_addr) {
@@ -1983,6 +2006,16 @@ impl<M: MacDriver> NwkLayer<M> {
                 }
             }
         };
+
+        // R22 §3.6.3.3: a relay without a routing-table entry discovers a
+        // route when the frame allows it; this frame meanwhile takes the
+        // best-effort direct hop.
+        if header.frame_control.discover_route != 0
+            && self.direct_hop_unconfirmed(header.dst_addr, next_hop)
+            && !self.routing.has_active_discovery(header.dst_addr)
+        {
+            let _ = self.discover_route(header.dst_addr).await;
+        }
 
         // A parent forwarding its direct end-device child's data over a
         // many-to-one route originates a Route Record on the child's behalf
@@ -2034,19 +2067,21 @@ impl<M: MacDriver> NwkLayer<M> {
             return self.enqueue_indirect_for_child(next_hop, &relay_buf[..total]);
         }
 
-        let mac_result = self
-            .mac
-            .mcps_data(McpsDataRequest {
-                src_addr_mode: AddressMode::Short,
-                dst_address: MacAddress::Short(self.nib.pan_id, next_hop),
-                payload: &relay_buf[..total],
-                msdu_handle: self.nib.next_seq(),
-                tx_options: TxOptions {
-                    ack_tx: next_hop.0 != 0xFFFF,
-                    ..Default::default()
-                },
-            })
-            .await;
+        let msdu_handle = self.nib.next_seq();
+        let request = self.hop_request(next_hop, &relay_buf[..total], msdu_handle);
+        let mut mac_result = self.mac.mcps_data(request).await.map(drop);
+
+        // A failed link (R22 §3.6.3.7) is penalised, and a routing-table
+        // alternative to a failed direct hop is tried before the originator
+        // is told that there is no route.
+        let mut failed_hop = next_hop;
+        if !is_many_to_one_status
+            && let Some(alternate) = self.noack_alternate(mac_result, header.dst_addr, next_hop)
+        {
+            let request = self.hop_request(alternate, &relay_buf[..total], msdu_handle);
+            mac_result = self.mac.mcps_data(request).await.map(drop);
+            failed_hop = alternate;
+        }
 
         // ── Route repair: if MAC TX fails, handle relay failure ──
         if mac_result.is_err() && is_many_to_one_status {
@@ -2075,7 +2110,7 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         if mac_result.is_err() {
-            self.handle_relay_failure(header, next_hop, false);
+            self.handle_relay_failure(header, failed_hop, false);
             return Err(NwkStatus::RouteError);
         }
 
@@ -2662,14 +2697,21 @@ impl<M: MacDriver> NwkLayer<M> {
     ///
     /// * An end device hands every frame — unicast or broadcast — to its
     ///   parent (R22 §3.6.3.3 / §3.6.5).
-    /// * A router sends broadcasts as MAC broadcasts, unicasts straight to a
-    ///   destination in its neighbor table (devices heard directly, including
-    ///   its children, R22 §3.6.1.5) and otherwise along an active routing
-    ///   table entry.
+    /// * A router sends broadcasts as MAC broadcasts. A unicast goes, in order:
+    ///   1. straight to a child, or to a neighbor whose link is known to work
+    ///      in both directions ([`NeighborEntry::is_confirmed_direct_hop`],
+    ///      R22 §3.6.3.3 "may route directly", §3.6.3.4);
+    ///   2. along an active routing-table entry (§3.6.3.3 "shall");
+    ///   3. best effort, straight to a neighbor heard over a weak, one-way or
+    ///      not-yet-reported link, or to the parent we joined through. The
+    ///      caller learns this through [`Self::direct_hop_unconfirmed`] and
+    ///      starts route discovery so the next frame has a proper route.
     /// * Anything else is unroutable (`RouteError`): the caller starts route
     ///   discovery or reports the failure. Knowing a device's address pair
     ///   (address map) is never evidence that it is one hop away, and
     ///   stochastic addressing has no tree to fall back on.
+    ///
+    /// [`NeighborEntry::is_confirmed_direct_hop`]: crate::neighbor::NeighborEntry::is_confirmed_direct_hop
     #[inline(never)]
     pub(crate) fn resolve_next_hop(
         &self,
@@ -2695,18 +2737,152 @@ impl<M: MacDriver> NwkLayer<M> {
                 Err(NwkStatus::RouteError)
             };
         }
-        if self.neighbors.find_by_short(destination).is_some() {
+        let neighbor = self.neighbors.find_by_short(destination);
+        #[cfg(feature = "router")]
+        if neighbor.is_some_and(crate::neighbor::NeighborEntry::is_confirmed_direct_hop) {
             return Ok(destination);
         }
         if let Some(next_hop) = self.routing.next_hop(destination) {
             return Ok(next_hop);
         }
-        // The parent we joined through was one hop away; a restored image may
-        // not have re-learned it into the neighbor table yet.
-        if destination == self.nib.parent_address {
+        // Best effort: a neighbor we hear, or the parent we joined through (a
+        // restored image may not have re-learned it yet), is still the best
+        // path we have while a route is being discovered.
+        if neighbor.is_some() || destination == self.nib.parent_address {
             return Ok(destination);
         }
         Err(NwkStatus::RouteError)
+    }
+
+    /// Whether `next_hop`, chosen by [`Self::resolve_next_hop`] for a unicast
+    /// to `destination`, is only a best-effort direct hop: no routing-table
+    /// entry backs it and the link is not known to work both ways.
+    ///
+    /// R22 §3.6.3.3: with no routing-table entry and route discovery allowed,
+    /// a router initiates route discovery; meanwhile the frame may be
+    /// delivered along the best path available, which is this neighbor.
+    ///
+    /// Only a neighbor known to be a router or coordinator qualifies: every
+    /// routing device periodically reports its link costs (§3.6.3.4.1), so a
+    /// missing, unusable or penalised outgoing cost is real evidence against
+    /// the link. A neighbor of unknown type gives no such evidence and keeps
+    /// the plain direct path.
+    #[cfg(feature = "router")]
+    fn direct_hop_unconfirmed(&self, destination: ShortAddress, next_hop: ShortAddress) -> bool {
+        next_hop == destination
+            && self.device_type != DeviceType::EndDevice
+            && self.routing.next_hop(destination).is_none()
+            && self
+                .neighbors
+                .find_by_short(destination)
+                .is_some_and(|n| n.is_router() && !n.is_confirmed_direct_hop())
+    }
+
+    /// Record a unicast the MAC could not deliver to `failed_hop` after
+    /// exhausting its own retries, and return another next hop for
+    /// `destination`, if the routing table has one.
+    ///
+    /// R22 §3.6.3.7 requires a per-neighbor failure count and leaves the
+    /// scheme to the implementer; one exhausted MAC retry sequence classifies
+    /// the outgoing link as failed. The penalty clears the neighbor's
+    /// outgoing cost (R22 Table 3-63: `0` = no outgoing cost available), so
+    /// [`Self::resolve_next_hop`] stops preferring the link until the
+    /// neighbor's next Link Status reports that it hears us again
+    /// (§3.6.3.4.2). Children are reached only directly and keep their entry.
+    #[cfg(feature = "router")]
+    pub(crate) fn note_link_failure(
+        &mut self,
+        destination: ShortAddress,
+        failed_hop: ShortAddress,
+    ) -> Option<ShortAddress> {
+        if let Some(neighbor) = self.neighbors.find_by_short_mut(failed_hop)
+            && !matches!(
+                neighbor.relationship,
+                crate::neighbor::Relationship::Child
+                    | crate::neighbor::Relationship::UnauthenticatedChild
+            )
+        {
+            log::warn!(
+                "[NWK] Link to 0x{:04X} failed; ignoring it until its next Link Status",
+                failed_hop.0
+            );
+            neighbor.outgoing_cost = 0;
+        }
+        self.routing
+            .next_hop(destination)
+            .filter(|next_hop| *next_hop != failed_hop)
+    }
+
+    /// MAC request carrying one NWK frame to `hop`, acknowledged unless it
+    /// is a broadcast.
+    #[cfg(feature = "router")]
+    pub(crate) fn hop_request<'a>(
+        &self,
+        hop: ShortAddress,
+        frame: &'a [u8],
+        msdu_handle: u8,
+    ) -> McpsDataRequest<'a> {
+        McpsDataRequest {
+            src_addr_mode: AddressMode::Short,
+            dst_address: MacAddress::Short(self.nib.pan_id, hop),
+            payload: frame,
+            msdu_handle,
+            tx_options: TxOptions {
+                ack_tx: hop != ShortAddress::BROADCAST,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// `result` is a MAC result reduced to `Result<(), MacError>`: it is
+    /// `Copy`, so it does not keep a confirm alive across the retry's await.
+    ///
+    /// After a NoAck from `failed_hop`, mark the link as failed
+    /// ([`Self::note_link_failure`], R22 §3.6.3.7) and name the
+    /// routing-table alternative that should carry the same NWK frame once.
+    /// The NWK header does not name the MAC next hop, so a secured frame is
+    /// resent unchanged without another security counter.
+    #[cfg(feature = "router")]
+    pub(crate) fn noack_alternate(
+        &mut self,
+        result: Result<(), zigbee_mac::MacError>,
+        destination: ShortAddress,
+        failed_hop: ShortAddress,
+    ) -> Option<ShortAddress> {
+        if result != Err(zigbee_mac::MacError::NoAck) {
+            return None;
+        }
+        let alternate = self.note_link_failure(destination, failed_hop)?;
+        log::info!(
+            "[NWK TX] dst=0x{:04X} retry via 0x{:04X}",
+            destination.0,
+            alternate.0
+        );
+        Some(alternate)
+    }
+
+    /// Send `frame` to `next_hop`; with `retry`, a NoAck is retried once
+    /// along the routing-table alternative ([`Self::noack_alternate`]).
+    ///
+    /// The data path awaits only this future while its frame buffer is live,
+    /// which keeps that buffer out of the state shared by all its await
+    /// points. Returns the final MAC result and the hop that produced it.
+    #[cfg(feature = "router")]
+    pub(crate) async fn send_hop(
+        &mut self,
+        destination: ShortAddress,
+        next_hop: ShortAddress,
+        frame: &[u8],
+        msdu_handle: u8,
+        retry: bool,
+    ) -> (Result<(), zigbee_mac::MacError>, ShortAddress) {
+        let request = self.hop_request(next_hop, frame, msdu_handle);
+        let result = self.mac.mcps_data(request).await.map(drop);
+        if retry && let Some(alternate) = self.noack_alternate(result, destination, next_hop) {
+            let request = self.hop_request(alternate, frame, msdu_handle);
+            return (self.mac.mcps_data(request).await.map(drop), alternate);
+        }
+        (result, next_hop)
     }
 
     // ── NWK Command Dispatch ─────────────────────────────────
@@ -7864,6 +8040,212 @@ mod tests {
             Ok(ShortAddress(0x0000))
         );
         assert_eq!(nwk.resolve_next_hop(FAR), Err(NwkStatus::RouteError));
+    }
+
+    // ── Direct next hop only over a usable link (R22 §3.6.3.3/§3.6.3.4) ──
+
+    /// The RREQs a device put on air.
+    #[cfg(feature = "router")]
+    fn route_request_count(nwk: &NwkLayer<MockMac>) -> usize {
+        nwk.mac
+            .tx_history()
+            .iter()
+            .filter(|record| {
+                let (header, cmd) = tx_frame(record);
+                header.frame_control.frame_type == NwkFrameType::Command as u8
+                    && cmd == NwkCommandId::RouteRequest as u8
+            })
+            .count()
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_weak_or_one_way_neighbour_yields_to_an_existing_route() {
+        // (incoming LQI cost, outgoing Link Status cost) of a link that must
+        // not carry unicasts directly: the hardware case (we hear the
+        // coordinator at LQI ~31, it lists us), a neighbour that never listed
+        // us, and one that reports the worst cost.
+        for (lqi, outgoing) in [(31, 1), (220, 0), (220, 7), (25, 7)] {
+            let coordinator = ShortAddress(0x0000);
+            let mut nwk = node(DeviceType::Router, OUR_ADDR);
+            nwk.nib.parent_address = ShortAddress(0xFFFF);
+            neighbour_with_cost(&mut nwk, coordinator, 1);
+            let neighbor = nwk.neighbors.find_by_short_mut(coordinator).unwrap();
+            neighbor.lqi = lqi;
+            neighbor.update_incoming_cost_from_lqi();
+            neighbor.outgoing_cost = outgoing;
+            nwk.routing.update_route(coordinator, NEXT_HOP, 2).unwrap();
+
+            assert_eq!(
+                nwk.resolve_next_hop(coordinator),
+                Ok(NEXT_HOP),
+                "lqi={lqi} outgoing={outgoing}"
+            );
+            block_on(nwk.nlde_data_request(coordinator, 30, &[0x01], false, true)).unwrap();
+            let history = nwk.mac.tx_history();
+            assert_eq!(history.len(), 1, "no RREQ: the route is known");
+            assert_eq!(tx_short_dst(&history[0]), Some(NEXT_HOP));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_bidirectional_neighbour_is_reached_directly() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut nwk, PEER, 3);
+        nwk.routing.update_route(PEER, NEXT_HOP, 2).unwrap();
+
+        assert_eq!(nwk.resolve_next_hop(PEER), Ok(PEER));
+        block_on(nwk.nlde_data_request(PEER, 30, &[0x01], false, true)).unwrap();
+        let history = nwk.mac.tx_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(tx_short_dst(&history[0]), Some(PEER));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_end_device_child_is_always_reached_directly() {
+        // R22 §3.6.3.3: an end-device child "shall" be routed directly, with
+        // no Link Status and whatever its LQI.
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.update_neighbor_address(ORIGIN, ORIGIN_IEEE);
+        let child = nwk.neighbors.find_by_short_mut(ORIGIN).unwrap();
+        child.relationship = crate::neighbor::Relationship::Child;
+        child.device_type = crate::neighbor::NeighborDeviceType::EndDevice;
+        child.rx_on_when_idle = true;
+        child.lqi = 20;
+        child.update_incoming_cost_from_lqi();
+        child.outgoing_cost = 0;
+        nwk.routing.update_route(ORIGIN, NEXT_HOP, 2).unwrap();
+
+        assert_eq!(nwk.resolve_next_hop(ORIGIN), Ok(ORIGIN));
+        block_on(nwk.nlde_data_request(ORIGIN, 30, &[0x01], false, true)).unwrap();
+        let history = nwk.mac.tx_history();
+        assert_eq!(history.len(), 1, "a child never triggers route discovery");
+        assert_eq!(tx_short_dst(&history[0]), Some(ORIGIN));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_weak_neighbour_without_a_route_carries_the_frame_while_discovering() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut nwk, PEER, 7);
+
+        assert_eq!(nwk.resolve_next_hop(PEER), Ok(PEER), "best effort");
+        block_on(nwk.nlde_data_request(PEER, 30, &[0x01], false, true))
+            .expect("the frame is not dropped while the route is discovered");
+        let history = nwk.mac.tx_history();
+        assert_eq!(history.len(), 2);
+        // The RREQ precedes the data frame, so counters reach the air in order.
+        assert_eq!(tx_short_dst(&history[0]), Some(ShortAddress::BROADCAST));
+        assert_eq!(tx_frame(&history[0]).1, NwkCommandId::RouteRequest as u8);
+        assert_eq!(tx_short_dst(&history[1]), Some(PEER));
+        assert!(nwk.routing.has_active_discovery(PEER));
+
+        block_on(nwk.nlde_data_request(PEER, 30, &[0x02], false, true)).unwrap();
+        assert_eq!(route_request_count(&nwk), 1, "one discovery at a time");
+
+        // Without permission to discover, the frame still goes best effort.
+        let mut quiet = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut quiet, PEER, 7);
+        block_on(quiet.nlde_data_request(PEER, 30, &[0x01], false, false)).unwrap();
+        assert_eq!(route_request_count(&quiet), 0);
+        assert_eq!(tx_short_dst(&quiet.mac.tx_history()[0]), Some(PEER));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_noack_penalises_the_link_and_retries_along_the_route() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut nwk, PEER, 2);
+        nwk.routing.update_route(PEER, NEXT_HOP, 2).unwrap();
+        nwk.mac.set_tx_failures(1);
+
+        block_on(nwk.nlde_data_request(PEER, 30, &[0x01], false, true))
+            .expect("the routing-table alternative delivers the frame");
+        let history = nwk.mac.tx_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(tx_short_dst(&history[0]), Some(NEXT_HOP));
+        assert_eq!(
+            nwk.neighbors.find_by_short(PEER).unwrap().outgoing_cost,
+            0,
+            "R22 §3.6.3.7: the failed link is no longer preferred"
+        );
+        assert_eq!(nwk.resolve_next_hop(PEER), Ok(NEXT_HOP));
+
+        // The neighbour's next Link Status listing us restores the link.
+        let mut payload = [0u8; 4];
+        payload[0] = 0x61; // first + last frame, one entry
+        payload[1..3].copy_from_slice(&OUR_ADDR.0.to_le_bytes());
+        payload[3] = 0x22;
+        nwk.handle_link_status(PEER, &payload);
+        assert_eq!(nwk.resolve_next_hop(PEER), Ok(PEER));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_noack_without_an_alternative_starts_route_discovery() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut nwk, PEER, 2);
+        nwk.mac.set_tx_failures(1);
+
+        let result = block_on(nwk.nlde_data_request(PEER, 30, &[0x01], false, true));
+        assert_eq!(result.err(), Some(NwkStatus::RouteError));
+        assert_eq!(nwk.neighbors.find_by_short(PEER).unwrap().outgoing_cost, 0);
+
+        // The penalised link no longer counts as confirmed: the next frame
+        // discovers a route first and still goes out best effort.
+        block_on(nwk.nlde_data_request(PEER, 30, &[0x02], false, true)).unwrap();
+        assert!(nwk.routing.has_active_discovery(PEER));
+        assert_eq!(route_request_count(&nwk), 1);
+        let history = nwk.mac.tx_history();
+        assert_eq!(tx_short_dst(history.last().unwrap()), Some(PEER));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relay_noack_takes_the_route_before_reporting_a_failure() {
+        let mut relay = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut relay, PEER, 2);
+        relay.routing.update_route(PEER, NEXT_HOP, 2).unwrap();
+        relay.mac.set_tx_failures(1);
+
+        let header = frame(NwkFrameType::Data, ORIGIN, PEER);
+        block_on(relay.relay_frame(&header, &[0x01], ORIGIN)).expect("relayed via the route");
+        let history = relay.mac.tx_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(tx_short_dst(&history[0]), Some(NEXT_HOP));
+        assert!(relay.pending_route_errors.is_empty(), "no Network Status");
+        assert_eq!(
+            relay.neighbors.find_by_short(PEER).unwrap().outgoing_cost,
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relay_prefers_the_route_over_a_one_way_neighbour() {
+        // The hardware failure: relaying to the coordinator straight over a
+        // link it never ACKs, while a many-to-one route via a good router
+        // exists, ended in NoAck and Network Status storms.
+        let coordinator = ShortAddress(0x0000);
+        let mut relay = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut relay, coordinator, 7);
+        relay
+            .routing
+            .update_route_many_to_one(
+                coordinator,
+                NEXT_HOP,
+                2,
+                crate::routing::ConcentratorType::HighRam,
+            )
+            .unwrap();
+
+        let header = frame(NwkFrameType::Data, PEER, coordinator);
+        block_on(relay.relay_frame(&header, &[0x01], PEER)).unwrap();
+        let sent: std::vec::Vec<_> = relay.mac.tx_history().iter().map(tx_short_dst).collect();
+        assert_eq!(sent.last(), Some(&Some(NEXT_HOP)));
+        assert!(!sent.contains(&Some(coordinator)));
     }
 
     #[test]
