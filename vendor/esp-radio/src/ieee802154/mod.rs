@@ -215,6 +215,21 @@ impl<'a> Ieee802154<'a> {
         }
     }
 
+    /// Write the configuration set with [`Self::set_config`] to the radio
+    /// registers now instead of at the next transmission (local patch, see
+    /// LOCAL-PATCHES.md). `Error::Busy` while a TX, an automatic ACK, a
+    /// receive or interrupt work is in progress; nothing is changed then.
+    pub fn apply_config(&mut self) -> Result<(), Error> {
+        raw::apply_pib()
+    }
+
+    /// Whether [`Self::transmit_raw`] would be accepted now (local patch):
+    /// `Error::Busy` while a TX, an automatic ACK, a receive or interrupt
+    /// work is in progress.
+    pub fn can_transmit(&self) -> Result<(), Error> {
+        raw::can_transmit()
+    }
+
     /// Stop an outstanding application TX before its buffer can be reused.
     /// The caller must report this cancellation as a failed transmission.
     pub fn cancel_transmit(&mut self) {
