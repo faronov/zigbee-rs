@@ -1998,11 +1998,14 @@ impl<M: MacDriver> NwkLayer<M> {
                     .ok_or(NwkStatus::RouteError)?,
             }
         } else {
+            // A frame is never handed back to the hop it came from: that is a
+            // routing loop, and the parent standing in for a route to the
+            // coordinator could otherwise bounce it until its radius ends.
             match self.resolve_next_hop(header.dst_addr) {
-                Ok(next_hop) => next_hop,
-                Err(status) => {
+                Ok(next_hop) if next_hop != previous_hop => next_hop,
+                result => {
                     self.handle_unroutable_relay(header).await;
-                    return Err(status);
+                    return Err(result.err().unwrap_or(NwkStatus::RouteError));
                 }
             }
         };
@@ -2077,6 +2080,7 @@ impl<M: MacDriver> NwkLayer<M> {
         let mut failed_hop = next_hop;
         if !is_many_to_one_status
             && let Some(alternate) = self.noack_alternate(mac_result, header.dst_addr, next_hop)
+            && alternate != previous_hop
         {
             let request = self.hop_request(alternate, &relay_buf[..total], msdu_handle);
             mac_result = self.mac.mcps_data(request).await.map(drop);
@@ -2705,7 +2709,9 @@ impl<M: MacDriver> NwkLayer<M> {
     ///   3. best effort, straight to a neighbor heard over a weak, one-way or
     ///      not-yet-reported link, or to the parent we joined through. The
     ///      caller learns this through [`Self::direct_hop_unconfirmed`] and
-    ///      starts route discovery so the next frame has a proper route.
+    ///      starts route discovery so the next frame has a proper route;
+    ///   4. for the coordinator only, through the parent
+    ///      ([`Self::toward_root`], R22 §3.6.3.2), likewise best effort.
     /// * Anything else is unroutable (`RouteError`): the caller starts route
     ///   discovery or reports the failure. Knowing a device's address pair
     ///   (address map) is never evidence that it is one hop away, and
@@ -2751,12 +2757,36 @@ impl<M: MacDriver> NwkLayer<M> {
         if neighbor.is_some() || destination == self.nib.parent_address {
             return Ok(destination);
         }
-        Err(NwkStatus::RouteError)
+        self.toward_root(destination).ok_or(NwkStatus::RouteError)
+    }
+
+    /// The parent, as the tree next hop for a unicast to the coordinator.
+    ///
+    /// R22 §3.6.3.2: a destination that is not a descendant is reached
+    /// through the parent. The coordinator, the root of the tree, is never a
+    /// descendant, and the parent we joined through reached it when it
+    /// relayed our authentication, so this holds under stochastic addressing
+    /// as well. It keeps a router that has no usable route — a freshly
+    /// joined one, or one whose only route just failed — able to reach the
+    /// Trust Center (Request-Key, Verify-Key, Device_annce replies), and
+    /// [`Self::direct_hop_unconfirmed`] still starts route discovery when the
+    /// caller allows it. Any other unroutable destination stays unroutable,
+    /// and a parent that is the coordinator itself adds nothing: the
+    /// best-effort direct hop above already covers it, and a retry straight
+    /// to it would reopen the one-way coordinator link.
+    fn toward_root(&self, destination: ShortAddress) -> Option<ShortAddress> {
+        let parent = self.nib.parent_address;
+        (destination == ShortAddress::COORDINATOR
+            && parent != destination
+            && is_unicast_address(parent))
+        .then_some(parent)
     }
 
     /// Whether `next_hop`, chosen by [`Self::resolve_next_hop`] for a unicast
-    /// to `destination`, is only a best-effort direct hop: no routing-table
-    /// entry backs it and the link is not known to work both ways.
+    /// to `destination`, is only a best-effort hop: no routing-table entry
+    /// backs it, and it is either the parent standing in for a route to the
+    /// coordinator ([`Self::toward_root`]) or a direct link not known to work
+    /// both ways.
     ///
     /// R22 §3.6.3.3: with no routing-table entry and route discovery allowed,
     /// a router initiates route discovery; meanwhile the frame may be
@@ -2769,13 +2799,17 @@ impl<M: MacDriver> NwkLayer<M> {
     /// the plain direct path.
     #[cfg(feature = "router")]
     fn direct_hop_unconfirmed(&self, destination: ShortAddress, next_hop: ShortAddress) -> bool {
-        next_hop == destination
-            && self.device_type != DeviceType::EndDevice
+        self.device_type != DeviceType::EndDevice
             && self.routing.next_hop(destination).is_none()
-            && self
-                .neighbors
-                .find_by_short(destination)
-                .is_some_and(|n| n.is_router() && !n.is_confirmed_direct_hop())
+            && if next_hop == destination {
+                self.neighbors
+                    .find_by_short(destination)
+                    .is_some_and(|n| n.is_router() && !n.is_confirmed_direct_hop())
+            } else {
+                // Only the parent standing in for the coordinator; a
+                // broadcast's MAC hop never names its destination either.
+                destination == ShortAddress::COORDINATOR
+            }
     }
 
     /// Record a unicast the MAC could not deliver to `failed_hop` after
@@ -2808,9 +2842,11 @@ impl<M: MacDriver> NwkLayer<M> {
             );
             neighbor.outgoing_cost = 0;
         }
+        let other = |hop: &ShortAddress| *hop != failed_hop;
         self.routing
             .next_hop(destination)
-            .filter(|next_hop| *next_hop != failed_hop)
+            .filter(other)
+            .or_else(|| self.toward_root(destination).filter(other))
     }
 
     /// MAC request carrying one NWK frame to `hop`, acknowledged unless it
@@ -8219,6 +8255,118 @@ mod tests {
         assert_eq!(
             relay.neighbors.find_by_short(PEER).unwrap().outgoing_cost,
             0
+        );
+    }
+
+    /// A router that has just joined through `PARENT`: the parent is its only
+    /// neighbour and has sent no Link Status yet (outgoing cost unknown).
+    #[cfg(feature = "router")]
+    fn freshly_joined_router() -> NwkLayer<MockMac> {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.nib.parent_address = PARENT;
+        neighbour_with_cost(&mut nwk, PARENT, 0);
+        let parent = nwk.neighbors.find_by_short_mut(PARENT).unwrap();
+        parent.relationship = crate::neighbor::Relationship::Parent;
+        parent.lqi = 180;
+        parent.update_incoming_cost_from_lqi();
+        nwk
+    }
+
+    #[cfg(feature = "router")]
+    const PARENT: ShortAddress = ShortAddress(0x1EBD);
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_fresh_router_is_never_stranded_from_the_coordinator() {
+        // The ESP32-H2 join failure: the discovered route to the TC failed
+        // with a NoAck, its relay then reported "no route", and every
+        // commissioning frame to 0x0000 (which may not discover) ended in
+        // RouteError until Request-Key gave up.
+        let coordinator = ShortAddress::COORDINATOR;
+        let mut nwk = freshly_joined_router();
+        nwk.routing.update_route(coordinator, NEXT_HOP, 7).unwrap();
+        nwk.mac.set_tx_failures(1);
+
+        block_on(nwk.nlde_data_request(coordinator, 30, &[0x01], false, false))
+            .expect("the parent carries the frame the failed route could not");
+        // The mock records delivered frames only: the route's NoAck left no
+        // entry, the parent took the same frame.
+        let sent: std::vec::Vec<_> = nwk.mac.tx_history().iter().map(tx_short_dst).collect();
+        assert_eq!(sent, [Some(PARENT)]);
+
+        // The relay's Network Status removes the route: the parent, the tree
+        // hop towards the root, still reaches the coordinator.
+        nwk.routing.remove(coordinator);
+        assert_eq!(nwk.resolve_next_hop(coordinator), Ok(PARENT));
+        nwk.mac.clear_tx_history();
+        block_on(nwk.nlde_data_request(coordinator, 30, &[0x02], false, false)).unwrap();
+        assert_eq!(tx_short_dst(&nwk.mac.tx_history()[0]), Some(PARENT));
+
+        // A NoAck from the parent itself penalises it but cannot strand us.
+        nwk.mac.set_tx_failures(1);
+        assert_eq!(
+            block_on(nwk.nlde_data_request(coordinator, 30, &[0x03], false, false)).err(),
+            Some(NwkStatus::RouteError)
+        );
+        assert_eq!(nwk.resolve_next_hop(coordinator), Ok(PARENT));
+        assert_eq!(nwk.resolve_next_hop(PARENT), Ok(PARENT));
+        block_on(nwk.nlde_data_request(coordinator, 30, &[0x04], false, false)).unwrap();
+        block_on(nwk.send_route_record(coordinator, &[]))
+            .expect("NWK commands to the TC take the parent too");
+        let history = nwk.mac.tx_history();
+        assert_eq!(tx_short_dst(&history[history.len() - 2]), Some(PARENT));
+        assert_eq!(tx_short_dst(history.last().unwrap()), Some(PARENT));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn the_parent_carries_coordinator_traffic_while_a_route_is_discovered() {
+        let coordinator = ShortAddress::COORDINATOR;
+        let mut nwk = freshly_joined_router();
+
+        block_on(nwk.nlde_data_request(coordinator, 30, &[0x01], false, true))
+            .expect("not dropped while discovering");
+        let history = nwk.mac.tx_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(tx_frame(&history[0]).1, NwkCommandId::RouteRequest as u8);
+        assert_eq!(tx_short_dst(&history[1]), Some(PARENT));
+        assert!(nwk.routing.has_active_discovery(coordinator));
+
+        // A broadcast (Device_annce, permit joining) is never "unconfirmed":
+        // it neither discovers a route nor warns about a missing one.
+        nwk.mac.clear_tx_history();
+        for broadcast in [ShortAddress(0xFFFD), ShortAddress(0xFFFC)] {
+            assert!(!nwk.direct_hop_unconfirmed(broadcast, ShortAddress::BROADCAST));
+            block_on(nwk.nlde_data_request(broadcast, 30, &[0x02], false, true)).unwrap();
+        }
+        assert!(
+            nwk.mac
+                .tx_history()
+                .iter()
+                .all(|tx| tx_frame(tx).0.frame_control.frame_type == NwkFrameType::Data as u8)
+        );
+        // Only the coordinator, the root every parent leads to, falls back.
+        assert_eq!(nwk.resolve_next_hop(FAR), Err(NwkStatus::RouteError));
+        let mut orphan = node(DeviceType::Router, OUR_ADDR);
+        orphan.nib.parent_address = ShortAddress(0xFFFF);
+        assert_eq!(
+            orphan.resolve_next_hop(coordinator),
+            Err(NwkStatus::RouteError)
+        );
+
+        // A frame the parent relayed to us is never handed back to it.
+        let mut relay = freshly_joined_router();
+        let header = frame(NwkFrameType::Data, PEER, coordinator);
+        assert_eq!(
+            block_on(relay.relay_frame(&header, &[0xAA], PARENT)).err(),
+            Some(NwkStatus::RouteError)
+        );
+        assert!(
+            relay
+                .mac
+                .tx_history()
+                .iter()
+                .all(|tx| tx_frame(tx).0.frame_control.frame_type != NwkFrameType::Data as u8)
         );
     }
 
