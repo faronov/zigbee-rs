@@ -289,15 +289,17 @@ impl RadioPhy for TelinkRadioPhy {
     }
 
     /// Program the identity the HAL's ISR ACK path and its bounded RX queue
-    /// use. Promiscuous reception (`None`) is a software decision in the
-    /// core; the ACK identity stays the device's own.
+    /// use. The queue then admits only frames that can be addressed to this
+    /// node. Promiscuous reception (`None`, also used by scans) admits every
+    /// well-formed frame; the ACK identity stays the device's own.
     fn set_address_filter(&mut self, filter: Option<PhyAddressFilter>) -> Result<(), PhyError> {
-        if let Some(filter) = filter {
-            self.radio.set_ack_filter(
+        match filter {
+            Some(filter) => self.radio.set_ack_filter(
                 filter.pan_id.0,
                 filter.short_address.0,
                 filter.extended_address,
-            );
+            ),
+            None => self.radio.set_rx_promiscuous(),
         }
         Ok(())
     }

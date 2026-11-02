@@ -96,3 +96,8 @@ Still open:
 Retained `TELINK_JOIN_METRICS` and queue-overload counters support HIL, but
 reading them over SWire halts/restarts the tested target and must be treated as
 another reset/resume event.
+
+The HAL interrupt RX queue admits only broadcasts and frames addressed to this
+node, so other nodes' ACKs and foreign unicasts can no longer push out frames
+the router must relay. `frames_valid` still counts every valid frame, so
+`queue_overflow / frames_valid` stays comparable with older images.
