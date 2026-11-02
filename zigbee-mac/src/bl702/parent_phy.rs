@@ -48,11 +48,12 @@
 //! # Validation
 //!
 //! Compiles for `riscv32imc` and the table/ring logic is host-tested.
+//! XT-ZB1 diagnostic capture: the M154 CLIC source fires and a received
+//! beacon raises only status `0x0010_0000` (an `IRQ_RX_AUX` bit), which
+//! the ISR must treat as frame completion.
 //! **Not hardware-tested:** the auto-ACK enable bit, the address and FPT
-//! register encodings, the frame-completion status bits used by the ISR,
-//! the receiver re-arm after a hardware ACK, and the M154 CLIC source
-//! number come from vendor headers and the previous register
-//! reverse-engineering, not from a capture on the XT-ZB1.
+//! register encodings and the receiver re-arm after a hardware ACK come
+//! from vendor headers and the previous register reverse-engineering.
 
 use core::cell::RefCell;
 
@@ -97,10 +98,13 @@ pub const FPT_ENTRIES: usize = 32;
 
 const _: () = assert!(FPT_ENTRIES <= 32, "FPT bitmaps are one 32-bit word");
 
-/// Status bits after which the M154 RX buffer holds a complete frame: the
-/// CRC verdict, RX done and the received-ACK event (raised instead of RX
-/// done for Imm-Ack frames while the ACK event is enabled).
-const IRQ_RX_COMPLETE: u32 = IRQ_RX_CRC | IRQ_RX_DONE | IRQ_RX_ACK;
+/// Status bits after which the M154 RX buffer holds a complete frame, as in
+/// the vendor `LMAC154_ISR`: the frame-received events `IRQ_RX_AUX`
+/// (XT-ZB1 capture: a beacon during an active scan raises `0x0010_0000`
+/// and nothing else), the promiscuous RX done and the received-ACK event.
+/// `IRQ_RX_CRC` is not a completion: with `M154_RX_STATUS[0]` set it marks
+/// a CRC failure, otherwise the frame arrives through these bits.
+const IRQ_RX_COMPLETE: u32 = IRQ_RX_DONE | IRQ_RX_AUX | IRQ_RX_ACK;
 
 /// Outcome of a [`FramePendingTable::update`] for the register writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,10 +281,10 @@ impl Shared {
         self.tx_status |= status & IRQ_TX_MASK;
 
         let mut queued = false;
-        if status & IRQ_RX_COMPLETE != 0 {
-            if status & IRQ_RX_CRC != 0 && read32(M154_RX_STATUS) & 1 != 0 {
-                self.crc_errors = self.crc_errors.wrapping_add(1);
-            } else if let Some(slot) = self.ring.tail_slot() {
+        if status & IRQ_RX_CRC != 0 && read32(M154_RX_STATUS) & 1 != 0 {
+            self.crc_errors = self.crc_errors.wrapping_add(1);
+        } else if status & IRQ_RX_COMPLETE != 0 {
+            if let Some(slot) = self.ring.tail_slot() {
                 if read_rx_frame(slot).is_ok() {
                     self.ring.commit_tail();
                     queued = true;
@@ -290,8 +294,9 @@ impl Shared {
             }
         }
         if self.rx_on_when_idle && !self.tx_active {
-            // No-op while the hardware still sends the Imm-Ack; the next
-            // TX-finished event or `receive` re-arms it.
+            // No-op while the hardware still sends the Imm-Ack; its
+            // auto-ACK-done event (`0x2000_0000`, vendor
+            // `lmac154_hwAutoTxAckDoneEvent`) re-enters here and re-arms.
             let _ = enable_rx();
         }
         queued
@@ -753,8 +758,12 @@ mod tests {
     }
 
     #[test]
-    fn rx_completion_bits_exclude_auxiliary_status() {
-        assert_eq!(IRQ_RX_COMPLETE & IRQ_RX_AUX, 0);
-        assert_eq!(IRQ_RX_COMPLETE | IRQ_RX_AUX, IRQ_RX_MASK);
+    fn rx_completion_bits_follow_the_vendor_isr() {
+        // XT-ZB1: a received beacon raises only 0x0010_0000.
+        assert_ne!(IRQ_RX_COMPLETE & 0x0010_0000, 0);
+        assert_eq!(IRQ_RX_COMPLETE & IRQ_RX_AUX, IRQ_RX_AUX);
+        // The CRC status is a verdict, never a completion on its own.
+        assert_eq!(IRQ_RX_COMPLETE & IRQ_RX_CRC, 0);
+        assert_eq!(IRQ_RX_COMPLETE | IRQ_RX_CRC, IRQ_RX_MASK);
     }
 }
