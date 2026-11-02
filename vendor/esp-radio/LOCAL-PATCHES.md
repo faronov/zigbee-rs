@@ -102,3 +102,88 @@ upstream behaviour.
 Reference: ESP-IDF **v5.5.1** `esp_ieee802154_dev.c` hands each frame to
 the upper layer from the RX_DONE interrupt and has no driver queue; the
 Zigbee stack there turns the receiver off while idle on a sleepy device.
+
+## Apply a changed configuration at once; ask whether TX would be accepted
+
+Additive API, no cargo feature: `Ieee802154::apply_config()` and
+`Ieee802154::can_transmit()`. Nothing upstream calls them, so the driver
+behaves as before unless the caller uses them.
+
+- `set_config` only updates the software PIB. Upstream
+  `ieee802154_receive()` returns early when the driver is already in
+  `Receive`, so the address filter, PAN ID and channel registers were
+  written only by the next `tx_init()`.
+  - After MAC association the short-address filter therefore stayed at
+    0xFFFF until the joiner's first transmission. A Transport-Key sent
+    directly to the new short address in that gap was neither
+    acknowledged nor received, so the key was lost and the join failed
+    (ESP32-H2, hwlab sessions `2026-11-01T171249Z-esp32h2-ed-v3-join` and
+    `2026-11-01T173811Z-esp32h2-router-v1-final-join`).
+  - A sleepy device was not affected, because its first poll (a TX)
+    applied the PIB before the parent released the key.
+- `apply_config` writes the PIB to the registers now. It refuses with
+  `Busy`, leaving the hardware unchanged, while a TX, an automatic ACK, an
+  inbound frame or unprocessed interrupt work is in progress (the same
+  veto as `transmit_raw`). In `Receive` it stops the radio, keeps a frame
+  that completed during the stop (`finish_stop`), writes the PIB and
+  restarts the receiver. In `Sleep` it does nothing; `resume()` writes the
+  PIB.
+- `can_transmit` reports the `Busy` conditions of `transmit_raw` without
+  starting anything. `zigbee-mac` uses it to wait for the end of a receive
+  or an ACK instead of reporting the refusal as a channel-access failure
+  (see the next paragraph).
+
+`zigbee-mac` (`src/esp/radio_phy.rs`) handles a `Busy` refusal from
+`transmit_raw` in thread context: it spins until `can_transmit` is OK
+(bounded by 6 ms: a maximum PPDU, its ACK and a guard), waits a further
+aTurnaroundTime plus SHR so another node's immediate ACK is not stepped
+on, then a random 0..2^macMinBE-1 unit backoff periods (as after a busy
+CCA, without incrementing NB), and resubmits. The refusal does not consume a CSMA backoff or a MAC
+retry. Only a refusal that outlives the bound is reported as
+`ChannelAccessFailure`. The interrupt handler, and with it the automatic
+ACK and its Frame Pending bit, is never delayed.
+
+Reference: ESP-IDF **v5.5.1** `esp_ieee802154_dev.c`:
+`ieee802154_receive()` checks `ieee802154_pib_is_pending()` and re-runs
+`rx_init()`, which calls `ieee802154_pib_update()`.
+
+## Leave `TxAck` when the automatic ACK is aborted (`ieee802154-tx-ack-abort`)
+
+Unconditional fix, no cargo feature: the old behaviour can wedge the
+radio permanently.
+
+- **Observed:** a master router on ESP32-H2 (0xB67A, hwlab session
+  `2026-11-02T150137Z-esp32h2-router-master-txbusy-baseline`) became deaf
+  and mute while running.
+  - Every transmission was refused as `Busy` (tx +20 / tx-err +20 per
+    summary), and every link status failed.
+  - Live reads through the debug probe (hart running) showed `STATE.state
+    == TxAck` with an empty queue, `event_status == 0`, the receiver idle
+    (`rx_state 0`), and every receive error counter frozen across five
+    minutes.
+- **Cause:** upstream enables the `TxAckTimeout`, `TxAckCoexBreak` and
+  `RxStop` receive-abort interrupts, but its handler only clears the abort
+  status. When an automatic ACK ends in an abort there is no AckTxDone, so
+  the state stays `TxAck`:
+  - `transmit_raw` refuses forever;
+  - `ensure_receive_enabled` only restarts in `Receive`;
+  - nothing restarts the receiver.
+- **Trigger:** `ensure_receive_enabled`, which `received()` and
+  `raw_received()` call on every poll, issued `RxStart` even while an
+  RX_DONE was pending (the hardware ACK turnaround) or a frame was on the
+  air. That aborted the ACK, and also cut off inbound frames.
+  - During a join, the same race can abort the joiner's ACK of the
+    parent's Transport-Key and cut off the parent's retransmissions.
+- **Patch:**
+  1. The receive-abort handler reads `rx_abort_status` before clearing it.
+     For `TxAckTimeout`, `TxAckStop` or `TxAckCoexBreak` in state `TxAck`
+     it runs `next_operation` (receiver back on, `rx_available` notified),
+     as ESP-IDF v5.5.1 `isr_handle_rx_abort` does. It runs before the
+     RX_DONE handling of the same interrupt, because an aborted ACK belongs
+     to the previous frame.
+  2. `TxAckStop` is added to the enabled receive-abort interrupts, so a
+     stopped ACK is reported too. The driver never stops the radio itself
+     in `TxAck`: `transmit_raw`, `apply_config` and suspend all refuse there.
+  3. `ensure_receive_enabled` issues `RxStart` only in `Receive` with no
+     pending event and no frame on the air. The ESP-IDF thread never
+     restarts an active receive.

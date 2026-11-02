@@ -159,7 +159,7 @@ fn log_summary(app: &App) {
     let neighbors = nwk.neighbor_table();
     let radio = zigbee_mac::esp::parent_stats();
     log::info!(
-        "[ESP32-C6] neighbours {} children {} routes {} | data-req {} fp-acks {} | tx {} tx-err {} ack-tx {} no-ack {}",
+        "[ESP32-C6] neighbours {} children {} routes {} | data-req {} fp-acks {} | tx {} tx-err {} deferred {} ack-tx {} no-ack {}",
         neighbors.len(),
         neighbors.children().count(),
         nwk.routing_table().len(),
@@ -167,6 +167,7 @@ fn log_summary(app: &App) {
         radio.frame_pending_acks,
         radio.raw_tx,
         radio.tx_errors,
+        radio.tx_deferred,
         radio.acked_tx,
         radio.tx_no_ack
     );

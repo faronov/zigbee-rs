@@ -424,6 +424,12 @@ pub(crate) fn abort_tx() {
         .modify(|_, w| unsafe { w.tx_abort_status().bits(0) });
 }
 
+/// Reason of the last receive abort, as a `RxAbortReason` discriminant.
+#[inline(always)]
+pub(crate) fn rx_abort_reason() -> u8 {
+    IEEE802154::regs().rx_status().read().rx_abort_status().bits()
+}
+
 #[inline(always)]
 pub(crate) fn abort_rx() {
     IEEE802154::regs()

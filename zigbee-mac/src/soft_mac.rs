@@ -197,13 +197,12 @@ impl TxOffload for FullTx {
 
 /// What a [`SoftMacCore::listen`] window is waiting for.
 enum Want<'a> {
-    /// Nothing: retain and acknowledge traffic until the window closes.
-    Nothing,
     /// Return as soon as a frame was retained (data indication / command).
     Retained,
     /// The Imm-Ack with this sequence number.
     Ack(u8),
-    /// Our parent's indirect data frame; it is queued at the front.
+    /// Our parent's indirect data frame, or right after association its
+    /// first unicast to the new address; it is queued at the front.
     PollResponse,
     /// An Association Response addressed to us.
     AssocResponse,
@@ -732,7 +731,14 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
                 if let Some(response) = response {
                     let confirm = self.finish_association(response)?;
                     if confirm.status == AssociationStatus::Success
-                        && let Err(error) = self.listen(POST_ASSOCIATION_RX_US, Want::Nothing).await
+                        // Until the parent's first unicast to the new
+                        // address (normally the Transport-Key), placed at the
+                        // front like a poll response. Retained RX keeps only
+                        // the newest `RX` frames, so listening on through a
+                        // broadcast burst would push the key out before the
+                        // upper layer reads it.
+                        && let Err(error) =
+                            self.listen(POST_ASSOCIATION_RX_US, Want::PollResponse).await
                     {
                         self.pending_error = Some(error);
                     }
@@ -2424,6 +2430,59 @@ mod tests {
             core.phy().sent_acks.as_slice(),
             [(0x44, false), (0x55, false)]
         );
+    }
+
+    #[test]
+    fn post_association_window_keeps_the_transport_key_ahead_of_a_broadcast_burst() {
+        let mut core = core();
+        let response = association_response(0x44, ShortAddress(0x5678), 0);
+        let data = |sequence: u8, destination: u16, payload: u8, ack: bool| {
+            build_data_frame(
+                sequence,
+                AddressMode::Short,
+                ShortAddress(0x0000),
+                &[0; 8],
+                &MacAddress::Short(PanId(0x1234), ShortAddress(destination)),
+                &[payload],
+                ack,
+                false,
+            )
+            .unwrap()
+        };
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap(),
+            )))
+            .unwrap();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&response, 210).unwrap())))
+            .unwrap();
+        // The key, then more broadcasts than retained RX can hold.
+        let key = data(0x55, 0x5678, 0xEE, true);
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&key, 200).unwrap())))
+            .unwrap();
+        for tag in 0..DEFAULT_PENDING_RX as u8 + 1 {
+            let broadcast = data(0x60 + tag, 0xFFFF, tag, false);
+            core.phy_mut()
+                .rx_frames
+                .push_back(Ok(Some(PhyRxFrame::from_slice(&broadcast, 200).unwrap())))
+                .unwrap();
+        }
+
+        block_on(core.associate(associate_request())).unwrap();
+        let first = block_on(core.receive_data(0)).unwrap();
+
+        assert_eq!(first.payload.as_slice(), [0xEE]);
+        assert_eq!(
+            core.phy().sent_acks.as_slice(),
+            [(0x44, false), (0x55, false)]
+        );
+        // The burst was left with the radio for the next receive.
+        assert_eq!(core.phy().rx_frames.len(), DEFAULT_PENDING_RX + 1);
     }
 
     #[test]

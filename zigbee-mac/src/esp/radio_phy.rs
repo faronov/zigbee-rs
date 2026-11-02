@@ -166,6 +166,8 @@ static PARENT_ACKED_TX: AtomicU32 = AtomicU32::new(0);
 static PARENT_TX_NO_ACK: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "esp-parent")]
 static PARENT_TX_ERRORS: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "esp-parent")]
+static PARENT_TX_DEFERRED: AtomicU32 = AtomicU32::new(0);
 
 /// Free-running counters of the parent PHY since boot (wrap at `u32::MAX`).
 #[cfg(feature = "esp-parent")]
@@ -181,9 +183,14 @@ pub struct EspParentStats {
     pub acked_tx: u32,
     /// Of those, no matching ACK inside the software ACK window.
     pub tx_no_ack: u32,
-    /// Of the raw transmissions, those the radio rejected (`Busy`) or never
-    /// completed; the core retries them as a busy channel.
+    /// Of the raw transmissions, those that failed: the radio stayed busy
+    /// for longer than the deferral bound, or never completed. The core
+    /// retries them as a busy channel.
     pub tx_errors: u32,
+    /// Times a transmission waited for a receive, automatic ACK or
+    /// interrupt work to finish (esp-radio `Busy`) before it was started.
+    /// Not failures: no CSMA-CA backoff or retry is spent on them.
+    pub tx_deferred: u32,
 }
 
 /// Snapshot of the parent PHY counters (Frame Pending and TX health).
@@ -196,6 +203,7 @@ pub fn parent_stats() -> EspParentStats {
         acked_tx: PARENT_ACKED_TX.load(Ordering::Relaxed),
         tx_no_ack: PARENT_TX_NO_ACK.load(Ordering::Relaxed),
         tx_errors: PARENT_TX_ERRORS.load(Ordering::Relaxed),
+        tx_deferred: PARENT_TX_DEFERRED.load(Ordering::Relaxed),
     }
 }
 
@@ -222,6 +230,23 @@ const ACK_WINDOW_US: u64 = 1_000;
 
 /// Busy-wait between radio-queue polls inside the ACK window.
 const ACK_POLL_SPIN_US: u64 = 50;
+
+/// Longest time esp-radio may keep refusing a transmission or a
+/// configuration write (`Busy`): a maximum-length PPDU (133 octets,
+/// 4256 µs), the Imm-Ack after it (aTurnaroundTime 192 µs + 352 µs) and
+/// [`ACK_GUARD_US`], rounded up.
+const BUSY_WAIT_US: u64 = 6_000;
+
+/// After a deferred transmission found the radio idle: aTurnaroundTime
+/// (192 µs) + phySHRDuration (160 µs), the latest moment an Imm-Ack for
+/// the frame just received becomes visible as a receive in progress.
+const ACK_GUARD_US: u64 = 352;
+
+/// aUnitBackoffPeriod (20 symbols).
+const UNIT_BACKOFF_PERIOD_US: u64 = 320;
+
+/// Random backoff after a deferral: 0..2^macMinBE-1 (default macMinBE 3).
+const DEFER_BACKOFF_SLOT_MASK: u32 = (1 << 3) - 1;
 
 /// Sleep between radio-queue polls in [`RadioPhy::receive`].
 const RX_POLL_INTERVAL_US: u64 = 200;
@@ -375,11 +400,18 @@ impl<'a> EspRadioPhy<'a> {
 
     /// Update the radio configuration.
     ///
-    /// `set_config()` only updates esp-radio's software PIB; the registers are
-    /// written by `ieee802154_pib_update()`, which runs from `rx_init()` and
-    /// `tx_init()` only. The hard re-arm below reaches `rx_init()`, and
-    /// `tx_init()` runs before every transmission, so a changed
-    /// channel/address is live by the time we transmit or receive again.
+    /// `set_config()` only updates esp-radio's software PIB. Its
+    /// `start_receive()` does not reach `rx_init()` while the driver is
+    /// already receiving (the normal state, `rx_when_idle`), so without
+    /// `apply_config()` the registers kept the old values until the next
+    /// `tx_init()`. After association that left the hardware short-address
+    /// filter at 0xFFFF: a parent's direct Transport-Key to the new short
+    /// address was neither acknowledged nor received, and the device timed
+    /// out waiting for the key (hwlab session
+    /// `2026-11-01T173811Z-esp32h2-router-v1-final-join`).
+    ///
+    /// `apply_config()` refuses while a TX, an automatic ACK or a receive is
+    /// on air, so the write waits for the end of that frame (bounded).
     fn update_config(&mut self, update_fn: impl FnOnce(&mut Config)) {
         let before = self.config;
         update_fn(&mut self.config);
@@ -388,7 +420,23 @@ impl<'a> EspRadioPhy<'a> {
             return;
         }
         self.driver.set_config(self.config);
+        self.apply_config_bounded();
         self.rearm_receive();
+    }
+
+    /// Write the PIB to the registers, waiting (bounded) for a frame on air.
+    /// Not generic, so the closure instances of `update_config` share it.
+    #[inline(never)]
+    fn apply_config_bounded(&mut self) {
+        let started = esp_hal::time::Instant::now();
+        while self.driver.apply_config().is_err() {
+            if started.elapsed() > esp_hal::time::Duration::from_micros(BUSY_WAIT_US) {
+                // Still written by the next `tx_init()`.
+                log::warn!("[ESP] radio busy, configuration applied at next TX");
+                break;
+            }
+            spin_micros(ACK_POLL_SPIN_US);
+        }
     }
 
     /// Transmit a raw 802.15.4 frame and wait for TX completion.
@@ -421,9 +469,15 @@ impl<'a> EspRadioPhy<'a> {
         padded[..frame.len()].copy_from_slice(frame);
 
         TX_COMPLETE.store(false, Ordering::Release);
-        self.driver
+        let started = esp_hal::time::Instant::now();
+        while let Err(error) = self
+            .driver
             .transmit_raw_discarding(&padded[..frame.len() + 2], discard_received)
-            .map_err(map_radio_error)?;
+        {
+            if !(error == esp_radio::ieee802154::Error::Busy && self.defer_busy(started)) {
+                return Err(map_radio_error(error));
+            }
+        }
 
         let deadline = esp_hal::time::Instant::now()
             + esp_hal::time::Duration::from_micros(TX_DONE_TIMEOUT_US);
@@ -441,6 +495,40 @@ impl<'a> EspRadioPhy<'a> {
         // (`rx_when_idle`); calling `start_receive()` here could abort an ACK
         // we are transmitting for a frame that arrived in the meantime.
         Ok(())
+    }
+
+    /// esp-radio refused a transmission with `Busy` because the radio is
+    /// receiving, sending an automatic ACK, or has interrupt work pending.
+    /// Wait for that frame to end instead of reporting a busy channel, so
+    /// the refusal costs neither a CSMA-CA backoff (`NB`) nor a frame retry.
+    ///
+    /// The wait spins at thread level, so the RX_DONE interrupt and its
+    /// automatic Imm-Ack (with Frame Pending) are not delayed. Once the
+    /// radio is idle, aTurnaroundTime + phySHRDuration (352 µs) pass so the
+    /// Imm-Ack another device sends for the frame just heard is detected
+    /// (`Busy` again) instead of collided with. A fresh random backoff of
+    /// 0..2^macMinBE-1 unit periods follows, as after a busy CCA, so nodes
+    /// that waited for the same frame do not all start together.
+    ///
+    /// Returns `false` once the radio has been busy for [`BUSY_WAIT_US`]
+    /// (longer than a maximum-length frame and its ACK) since `started`;
+    /// that is reported as a busy channel to the CSMA-CA algorithm.
+    #[inline(never)]
+    fn defer_busy(&mut self, started: esp_hal::time::Instant) -> bool {
+        #[cfg(feature = "esp-parent")]
+        PARENT_TX_DEFERRED.fetch_add(1, Ordering::Relaxed);
+        loop {
+            if started.elapsed() > esp_hal::time::Duration::from_micros(BUSY_WAIT_US) {
+                return false;
+            }
+            if self.driver.can_transmit().is_ok() {
+                break;
+            }
+            spin_micros(ACK_POLL_SPIN_US);
+        }
+        let slots = esp_hal::rng::Rng::new().random() & DEFER_BACKOFF_SLOT_MASK;
+        spin_micros(ACK_GUARD_US + u64::from(slots) * UNIT_BACKOFF_PERIOD_US);
+        true
     }
 
     /// One raw transmission, then the software ACK window (synchronous).
@@ -749,7 +837,8 @@ impl PlatformServices for EspRadioPhy<'_> {
 fn map_radio_error(error: esp_radio::ieee802154::Error) -> PhyError {
     use esp_radio::ieee802154::Error;
     match error {
-        // A previous TX or a hardware ACK is still on air.
+        // The radio stayed busy (TX, automatic ACK or receive on air) for
+        // longer than `BUSY_WAIT_US`.
         Error::Busy => PhyError::ChannelBusy,
         Error::Incomplete | Error::BadInput => PhyError::FrameTooLong,
         // `wake()` was not called after sleep.

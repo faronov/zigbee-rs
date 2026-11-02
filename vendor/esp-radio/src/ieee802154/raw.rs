@@ -164,7 +164,12 @@ fn ieee802154_mac_init() {
             | TxAbortReason::TxStop,
     );
     enable_rx_abort_events(
-        RxAbortReason::TxAckTimeout | RxAbortReason::TxAckCoexBreak | RxAbortReason::RxStop,
+        RxAbortReason::TxAckTimeout
+            | RxAbortReason::TxAckCoexBreak
+            | RxAbortReason::RxStop
+            // Local patch `ieee802154-tx-ack-abort`: every way an automatic
+            // ACK can end without AckTxDone must reach the handler.
+            | RxAbortReason::TxAckStop,
     );
 
     set_ed_sample_mode(EdSampleMode::Avg);
@@ -300,6 +305,43 @@ pub fn ieee802154_receive() -> i32 {
     });
 
     0 // ESP-OK
+}
+
+/// Write the software PIB to the radio registers now (local patch, see
+/// LOCAL-PATCHES.md, "Apply a changed configuration at once").
+///
+/// `ieee802154_receive()` returns early while the driver is already in
+/// `Receive`, so after `set_config()` the address filter, PAN ID and
+/// channel registers would only be written by the next `tx_init()`. ESP-IDF
+/// v5.5.1 instead marks the PIB pending and re-runs `rx_init()` from
+/// `ieee802154_receive()`. This is that re-initialisation with the TX/ACK
+/// veto of the transmit path: an application TX, an automatic ACK, an
+/// inbound frame or unprocessed interrupt work refuses with `Busy` and
+/// leaves the hardware untouched. In `Receive` the radio is stopped first;
+/// a frame that completed during the stop is preserved (`finish_stop`)
+/// and the receiver is restarted with the new registers. `Sleep` is left
+/// to `resume()`, which writes the PIB itself.
+pub(crate) fn apply_pib() -> Result<(), super::Error> {
+    use super::suspend::Boundary as _;
+
+    STATE.with(|state| {
+        match state.state {
+            Ieee802154State::Sleep => return Ok(()),
+            Ieee802154State::Transmit | Ieee802154State::TxAck => return Err(super::Error::Busy),
+            _ if events() != 0 || receive_in_progress() => return Err(super::Error::Busy),
+            _ => {}
+        }
+        if state.state == Ieee802154State::Receive {
+            let mut boundary = SleepBoundary(state);
+            boundary.stop();
+            boundary.finish_stop();
+            ieee802154_pib_update();
+            boundary.resume_receive();
+        } else {
+            ieee802154_pib_update();
+        }
+        Ok(())
+    })
 }
 
 fn receive_in_progress() -> bool {
@@ -548,11 +590,38 @@ fn next_operation() {
 pub(crate) fn ensure_receive_enabled() {
     // shouldn't be necessary but avoids a problem with rx stopping
     // unexpectedly when used together with BLE
+    //
+    // Local patch `ieee802154-tx-ack-abort`: never restart while an event is
+    // pending or a frame is on the air. A pending RX_DONE means the hardware
+    // is in its automatic-ACK turnaround; RxStart then aborts the ACK, and
+    // an inbound frame would be cut off.
     STATE.with(|state| {
-        if state.state == Ieee802154State::Receive {
+        if state.state == Ieee802154State::Receive && events() == 0 && !receive_in_progress() {
             set_cmd(Command::RxStart);
         }
     });
+}
+
+/// Local patch `ieee802154-tx-ack-abort`: an automatic ACK that ends in a
+/// receive abort (timeout, coexistence break or stop) produces no AckTxDone.
+/// Leave `TxAck` as ESP-IDF 5.5.1 `isr_handle_rx_abort` does; otherwise the
+/// state stays `TxAck`, every transmission is refused as busy and the
+/// receiver is never restarted.
+fn tx_ack_aborted() {
+    let reason = rx_abort_reason();
+    if reason == RxAbortReason::TxAckTimeout as u8
+        || reason == RxAbortReason::TxAckStop as u8
+        || reason == RxAbortReason::TxAckCoexBreak as u8
+    {
+        let previous = STATE.with(|state| {
+            if state.state == Ieee802154State::TxAck {
+                next_operation_inner(state)
+            } else {
+                Ieee802154State::Idle
+            }
+        });
+        notify_state(previous);
+    }
 }
 
 #[handler(priority = Priority::Priority1)]
@@ -579,6 +648,13 @@ fn zb_mac_handler() {
     if events & Event::TxDone != 0 {
         trace!("tx done");
         next_operation();
+    }
+
+    // Before RxDone: an aborted ACK belongs to the previous frame.
+    if events & Event::RxAbort != 0 {
+        trace!("RxAbort");
+        tx_ack_aborted();
+        abort_rx();
     }
 
     if events & Event::RxDone != 0 {
@@ -635,11 +711,6 @@ fn zb_mac_handler() {
     if events & Event::TxAbort != 0 {
         trace!("TxAbort");
         abort_tx();
-    }
-
-    if events & Event::RxAbort != 0 {
-        trace!("RxAbort");
-        abort_rx();
     }
 }
 

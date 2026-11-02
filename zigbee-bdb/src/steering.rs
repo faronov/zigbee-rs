@@ -272,6 +272,60 @@ mod tests {
     }
 
     #[test]
+    fn receiver_on_transport_key_wait_listens_between_polls_for_the_whole_window() {
+        // Parent answers every poll with Frame Pending clear and nothing is
+        // heard: the joiner must keep listening for a directly delivered key
+        // for the full window, not burn its round budget on back-to-back polls.
+        let mut bdb = test_bdb();
+        let mac = bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+        mac.set_rx_delay_us(u32::MAX);
+        let started = mac.monotonic_micros();
+
+        assert!(!block_on(bdb.wait_for_transport_key()));
+
+        let mac = bdb.zdo().nwk().mac();
+        assert!(mac.monotonic_micros().wrapping_sub(started) >= TRANSPORT_KEY_WAIT_US);
+        assert_eq!(mac.poll_count(), 50);
+    }
+
+    #[test]
+    fn receiver_on_transport_key_wait_reads_a_frame_heard_after_an_empty_poll() {
+        let mut bdb = test_bdb();
+        bdb.zdo_mut().aps_mut().nwk_mut().mac_mut().enqueue_rx(
+            zigbee_mac::primitives::McpsDataIndication {
+                src_address: MacAddress::Short(PanId(0x1A62), ShortAddress(0x1EBD)),
+                dst_address: MacAddress::Short(PanId(0x1A62), ShortAddress(0x6A30)),
+                lqi: 200,
+                payload: zigbee_mac::MacFrame::from_slice(&[0x08, 0x00]).unwrap(),
+                security_use: false,
+            },
+        );
+
+        assert!(!block_on(bdb.wait_for_transport_key()));
+        assert_eq!(bdb.steering_diagnostics.passive_rx_frames, 1);
+        assert_eq!(bdb.steering_diagnostics.last_frame_len, 2);
+    }
+
+    #[test]
+    fn sleepy_transport_key_wait_only_polls() {
+        let mut bdb = test_bdb();
+        bdb.zdo_mut().aps_mut().nwk_mut().set_rx_on_when_idle(false);
+        bdb.zdo_mut().aps_mut().nwk_mut().mac_mut().enqueue_rx(
+            zigbee_mac::primitives::McpsDataIndication {
+                src_address: MacAddress::Short(PanId(0x1A62), ShortAddress(0x1EBD)),
+                dst_address: MacAddress::Short(PanId(0x1A62), ShortAddress::BROADCAST),
+                lqi: 200,
+                payload: zigbee_mac::MacFrame::from_slice(&[0x08, 0x00]).unwrap(),
+                security_use: false,
+            },
+        );
+
+        assert!(!block_on(bdb.wait_for_transport_key()));
+        assert_eq!(bdb.steering_diagnostics.passive_rx_frames, 0);
+        assert_eq!(bdb.zdo().nwk().mac().poll_count(), 128);
+    }
+
+    #[test]
     fn tclk_exchange_fails_and_resets_after_attempt_budget() {
         let tc_ieee = [0xAA; 8];
         let mut bdb = test_bdb();
@@ -3687,65 +3741,20 @@ impl<M: MacDriver> BdbLayer<M> {
         let mut key_received = false;
         let rx_on = self.zdo.nwk().rx_on_when_idle();
 
-        // A receiver-on device can receive the direct Transport-Key
-        // immediately. A sleepy child must poll because its parent buffers the
-        // command as an indirect transaction.
-        if rx_on {
-            log::info!("[BDB:Steering] Phase 0: passive RX for direct Transport-Key...");
-            for rx_attempt in 0..4u8 {
-                #[allow(clippy::single_match)]
-                match self
-                    .zdo
-                    .aps_mut()
-                    .nwk_mut()
-                    .mac_mut()
-                    .mcps_data_indication()
-                    .await
-                {
-                    Ok(mac_frame) => {
-                        self.steering_diagnostics.passive_rx_frames = self
-                            .steering_diagnostics
-                            .passive_rx_frames
-                            .saturating_add(1);
-                        self.steering_diagnostics.last_frame_len =
-                            mac_frame.payload.len().min(u8::MAX as usize) as u8;
-                        let prefix_len = mac_frame
-                            .payload
-                            .len()
-                            .min(self.steering_diagnostics.last_frame_prefix.len());
-                        self.steering_diagnostics.last_frame_prefix[..prefix_len]
-                            .copy_from_slice(&mac_frame.payload.as_slice()[..prefix_len]);
-                        let mac_payload = mac_frame.payload.as_slice();
-                        bdb_diag!(
-                            "[BDB] passive_rx[{}] {} bytes",
-                            rx_attempt,
-                            mac_payload.len()
-                        );
-                        log::info!(
-                            "[BDB:Steering] RX {}: {} bytes",
-                            rx_attempt,
-                            mac_payload.len(),
-                        );
-                        if let Some(true) = self.try_process_frame(mac_payload) {
-                            key_received = true;
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        bdb_diag!("[BDB] passive_rx[{}] none", rx_attempt);
-                    }
-                }
-            }
-            if key_received {
-                log::info!("[BDB:Steering] Transport-Key received during passive RX!");
-            }
-        } else {
-            log::info!("[BDB:Steering] Phase 0: skipped (sleepy device, TK via indirect poll)");
-        }
-
+        // A sleepy child polls: its parent buffers the Transport-Key as an
+        // indirect transaction. A receiver-on child also polls (some parents
+        // queue the key by EUI-64), but its key normally arrives directly,
+        // so every round without a polled frame then listens. A poll does not
+        // read frames that arrived while it was on air, and a parent that
+        // answers with Frame Pending clear ends it at once: before this
+        // listen, 128 back-to-back polls (about 1-2 s, far short of
+        // `TRANSPORT_KEY_WAIT_US`) never read a directly delivered key (ESP32
+        // hwlab session `2026-11-01T171249Z-esp32h2-ed-v3-join`). The listen
+        // also paces the polls.
         const MAX_TOTAL_ROUNDS: usize = 128;
         const MAX_EMPTY_ROUNDS: u16 = 128;
         const POLL_TIMEOUT_US: u32 = 500_000;
+        const RX_ON_LISTEN_US: u32 = 100_000;
         let mut empty_count: u16 = 0;
         let mut total_rounds: usize = 0;
         let mut data_frames: usize = 0;
@@ -3757,7 +3766,6 @@ impl<M: MacDriver> BdbLayer<M> {
             && !self.security_exchange_timed_out(transport_key_wait_started)
         {
             total_rounds += 1;
-            let mut got_data_this_round = false;
             let elapsed = self
                 .zdo
                 .aps()
@@ -3769,7 +3777,9 @@ impl<M: MacDriver> BdbLayer<M> {
 
             self.steering_diagnostics.poll_attempts =
                 self.steering_diagnostics.poll_attempts.saturating_add(1);
-            match self
+            // Each frame is processed where it was received, so the polled
+            // and the heard frame never occupy the stack at the same time.
+            let mut heard = match self
                 .zdo
                 .aps_mut()
                 .nwk_mut()
@@ -3780,55 +3790,51 @@ impl<M: MacDriver> BdbLayer<M> {
                 Ok(Some(mac_frame)) => {
                     self.steering_diagnostics.poll_data_frames =
                         self.steering_diagnostics.poll_data_frames.saturating_add(1);
-                    self.steering_diagnostics.last_frame_len =
-                        mac_frame.len().min(u8::MAX as usize) as u8;
-                    let prefix_len = mac_frame
-                        .len()
-                        .min(self.steering_diagnostics.last_frame_prefix.len());
-                    self.steering_diagnostics.last_frame_prefix[..prefix_len]
-                        .copy_from_slice(&mac_frame.as_slice()[..prefix_len]);
-                    got_data_this_round = true;
-                    data_frames += 1;
-                    let mac_payload = mac_frame.as_slice();
-                    bdb_diag!(
-                        "[BDB] parent_poll[{}] {} bytes total={}",
-                        total_rounds,
-                        mac_payload.len(),
-                        data_frames
-                    );
                     log::info!(
-                        "[BDB:Steering] P-Poll {}: {} bytes (total={})",
+                        "[BDB:Steering] P-Poll {}: {} bytes",
                         total_rounds,
-                        mac_payload.len(),
-                        data_frames,
+                        mac_frame.len()
                     );
-                    if let Some(true) = self.try_process_frame(mac_payload) {
-                        bdb_diag!("[BDB] transport_key=ok via parent_poll");
-                        key_received = true;
-                        break;
-                    }
+                    Some(self.try_process_frame(mac_frame.as_slice()) == Some(true))
                 }
-                Ok(None) => {
-                    bdb_diag!("[BDB] parent_poll[{}] none", total_rounds);
-                }
+                Ok(None) => None,
                 Err(error) => {
                     self.steering_diagnostics.poll_errors =
                         self.steering_diagnostics.poll_errors.saturating_add(1);
-                    bdb_diag!("[BDB] parent_poll[{}] err {:?}", total_rounds, error);
                     log::warn!("[BDB:Steering] P-Poll {}: err {:?}", total_rounds, error);
+                    None
                 }
+            };
+            if heard.is_none()
+                && rx_on
+                && let Ok(indication) = self
+                    .zdo
+                    .aps_mut()
+                    .nwk_mut()
+                    .mac_mut()
+                    .mcps_data_indication_timeout(RX_ON_LISTEN_US.min(remaining))
+                    .await
+            {
+                self.steering_diagnostics.passive_rx_frames = self
+                    .steering_diagnostics
+                    .passive_rx_frames
+                    .saturating_add(1);
+                heard = Some(self.try_process_frame(indication.payload.as_slice()) == Some(true));
             }
 
-            if got_data_this_round {
+            if let Some(key) = heard {
                 empty_count = 0;
+                data_frames += 1;
+                key_received = key;
+                bdb_diag!("[BDB] key_wait[{}] total={}", total_rounds, data_frames);
             } else {
                 empty_count += 1;
             }
         }
 
         log::info!(
-            "[BDB:Steering] Transport-Key wait done: passive_rx={} rounds={} frames={} empty={}",
-            if key_received { "hit" } else { "miss" },
+            "[BDB:Steering] Transport-Key wait done: key={} rounds={} frames={} empty={}",
+            key_received,
             total_rounds,
             data_frames,
             empty_count
@@ -3836,9 +3842,16 @@ impl<M: MacDriver> BdbLayer<M> {
         key_received
     }
 
-    /// Parse a MAC payload, log diagnostics, and attempt Transport-Key extraction.
+    /// Record a MAC payload as the last received frame, parse it, log
+    /// diagnostics, and attempt Transport-Key extraction.
     /// Returns `Some(true)` if the NWK key was installed.
     fn try_process_frame(&mut self, mac_payload: &[u8]) -> Option<bool> {
+        self.steering_diagnostics.last_frame_len = mac_payload.len().min(u8::MAX as usize) as u8;
+        let prefix_len = mac_payload
+            .len()
+            .min(self.steering_diagnostics.last_frame_prefix.len());
+        self.steering_diagnostics.last_frame_prefix[..prefix_len]
+            .copy_from_slice(&mac_payload[..prefix_len]);
         if let Some((nwk_hdr, nwk_consumed)) = zigbee_nwk::frames::NwkHeader::parse(mac_payload) {
             self.steering_diagnostics.nwk_header_len = nwk_consumed.min(u8::MAX as usize) as u8;
             self.steering_diagnostics.nwk_security = nwk_hdr.frame_control.security;

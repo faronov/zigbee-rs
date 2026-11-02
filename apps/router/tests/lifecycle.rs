@@ -789,8 +789,12 @@ fn application_transport_key_frame(
     MacFrame::from_slice(&bytes[..nwk_aad_len + encrypted.len()]).unwrap()
 }
 
+/// Script a join whose Transport-Key arrives directly, in the first bounded
+/// receive window after association. A fixture that models a silent channel
+/// (`set_rx_delay_us(u32::MAX)`) must restore it after `initialize()`.
 fn script_fresh_router_join(device: &mut ZigbeeDevice<MockMac, Router>) {
     let mac = device.bdb_mut().zdo_mut().aps_mut().nwk_mut().mac_mut();
+    mac.set_rx_delay_us(0);
     mac.add_beacon(join_beacon());
     mac.set_associate_response(MlmeAssociateConfirm {
         short_address: ShortAddress(SHORT_ADDRESS),
@@ -4289,6 +4293,10 @@ fn runtime_run_again_shortens_the_next_monotonic_receive_window() {
     .unwrap();
 
     block_on(app.initialize()).unwrap();
+    app.node_mut()
+        .device_mut()
+        .mac_mut()
+        .set_rx_delay_us(u32::MAX);
     assert!(app.node().device().is_joined());
 
     block_on(app.step()).unwrap();
@@ -6355,6 +6363,10 @@ fn exhausted_device_annce_backs_off_instead_of_resetting_in_a_tight_loop() {
     .unwrap();
 
     block_on(app.initialize()).unwrap();
+    app.node_mut()
+        .device_mut()
+        .mac_mut()
+        .set_rx_delay_us(u32::MAX);
     assert!(
         app.node()
             .device()
