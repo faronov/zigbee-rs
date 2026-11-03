@@ -23,6 +23,7 @@ use zigbee_zcl::clusters::basic::PowerSource;
 
 use tlsr8258_hal::root::RootSlot;
 use tlsr8258_tb04::{leds::StatusLeds, resources::BoardResources};
+use tlsr8258_tb04_product::boot::{failure, halted};
 use tlsr8258_tb04_product::router::{
     ROUTER_POLICY, RouterProfile, led_adapters, range_extender_profile,
 };
@@ -530,19 +531,6 @@ impl RouterObserver<TelinkRouterMac, Router> for TelinkJoinObserver {
             // never in the turnaround-critical IRQ or per-frame path.
             TELINK_JOIN_METRICS.capture_radio(device.mac());
         }
-    }
-}
-
-fn failure(leds: &StatusLeds) -> ! {
-    leds.green.write(false);
-    leds.blue.write(false);
-    leds.red.write(true);
-    halted()
-}
-
-fn halted() -> ! {
-    loop {
-        tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(1_000));
     }
 }
 

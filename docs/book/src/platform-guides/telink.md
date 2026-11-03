@@ -40,18 +40,23 @@ the firmware-size chapter has their footprint.
 
 The board owns fitted LEDs, flash/ADC resources, and physical wiring. The
 product owns identity, profile, battery/poll behavior, sleep policy,
-partitions, linker layout, and retention restoration policy.
+partitions, linker layout, and which LED state a LOW32K wake restores.
 
-The example's `src/app.rs` is composition/storage glue required by TC32 and
-reset-on-wake entry. Commissioning, polling, reporting, persistence, and
-router lifecycle are in `apps/sensor-sed` and `apps/router`, not a local
-application state machine.
+| Layer | Crate / file | Owns |
+|---|---|---|
+| runtime | `tlsr8258-rt` `retention` (feature `retention-proof`) | `RetainedCell`, the checksummed `RetainedRoot` commit record, retention stack guard, the `TELINK_RETENTION_IMAGE` layout marker |
+| chip adapter | `apps/tlsr8258-sensor` (`tlsr8258-sensor-app`) | `TelinkWake` (Active/SUSPEND/LOW32K `WakeController`), retained MAC/AES/ADC platform record, wake resume and fail-closed reset, `TelinkSupervisor`, `TelinkNoDiagnostics`, `init_sleep_clocks` |
+| product | `products/tlsr8258-tb04` `boot`, `sensor` | TB-04 bring-up (`boot`, `failure`, `halted`) shared by sensor/ED/router; sensor identity, `SENSOR_POLICY`, clusters, synthetic source, RGB status and its `RetainedIndicator` |
+| example | `examples/telink-tlsr8258-sensor` | entries (`main.rs`), part list and device builder (`app.rs`), SUSPEND root (`suspend.rs`), LOW32K retained statics and fresh root (`retention.rs`) |
+
+Commissioning, polling, reporting, persistence, and router lifecycle are in
+`apps/sensor-sed` and `apps/router`, not a local application state machine.
 
 ## Sensor application
 
 The default image constructs `SensorApp` with:
 
-- `TelinkSuspendWake`;
+- `TelinkWake` (from `tlsr8258-sensor-app`);
 - RGB semantic status;
 - synthetic temperature/humidity;
 - fixed battery;
@@ -82,7 +87,8 @@ sensor does not enter suspend is obsolete.
 LOW32K path with the existing 250 ms policy.
 
 `retention-proof-10s` uses the same restoration path and a 10-second
-steady-state slow poll.
+steady-state slow poll. Both are one `SENSOR_POLICY` whose slow-poll and
+slow-depth fields are selected by `cfg!`.
 
 These are explicit proof images, not silent replacements for the default
 SUSPEND product. Retained application/MAC/AES/ADC state is reconstructed before

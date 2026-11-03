@@ -9,6 +9,9 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+#[cfg(feature = "retention-proof")]
+pub mod retention;
+
 /// Run one async application future on the single-threaded TLSR8258 runtime.
 ///
 /// The future is moved into this frame. Long-lived roots should be placed in

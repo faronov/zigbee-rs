@@ -42,6 +42,7 @@ exclude = [
     "tlsr8258-rt",
     "boards/tlsr8258-tb04",
     "apps/nrf-sensor",
+    "apps/tlsr8258-sensor",
     "boards/nrf52840-dk",
     "boards/nrf52833-dk",
     "boards/phy62x2-evk",
