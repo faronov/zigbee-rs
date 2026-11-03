@@ -70,6 +70,10 @@ pub mod wake;
 #[path = "../../../vendor/esp-radio/src/ieee802154/suspend.rs"]
 mod radio_suspend_tests;
 
+#[cfg(test)]
+#[path = "../../../vendor/esp-radio/src/ieee802154/fcf.rs"]
+mod radio_fcf_tests;
+
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod esp_image;
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]

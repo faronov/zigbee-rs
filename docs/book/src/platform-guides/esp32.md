@@ -380,11 +380,30 @@ The router run used the image from before the receive-queue discard. That
 change passes `false` on router and ED paths, and those images were rebuilt
 and checked but not rerun on hardware.
 
+The `0 Data Requests` above was not only a lack of children. Until the
+`ieee802154-fcf-offsets` patch (see `vendor/esp-radio/LOCAL-PATCHES.md`),
+the ACK-request bit was read from the wrong FCF octet. As a result, no
+received frame took the auto-ACK path. The Frame Pending hook never ran, and
+the receive path restarted RX during the hardware ACK turnaround.
+
+ESP32-H2 router (4 MiB DevKit, ZHA channel 15, joined as `0xA17F`), with the
+`ieee802154-fcf-offsets` patch:
+
+| check | result | hwlab sessions |
+|---|---|---|
+| before the patch | a ZBT-1 (EFR32MG21) router picked the H2 as parent. Association succeeded, but the H2 never acknowledged the first Data Request (`Join failed: DeviceNotFound`); the H2 counted `data-req 0` | `2026-11-03T061048Z-h2assoc-repro2` |
+| joins through the H2 | 3 of 3 fresh ZBT-1 joins associated on the first attempt via `0xA17F` (`0x9420`, `0x9421`, `0x9422`). Each received Transport-Key on the first poll, then ZDO descriptors, Basic/Identify reads and TCLK Verify/Confirm-Key. The H2 counters reached `data-req 3 fp-acks 3` with `tx-err 0` | `2026-11-03T063725Z-h2assoc-fix-verify1`, `2026-11-03T064553Z-h2assoc-fix-verify2`, `2026-11-03T065319Z-h2assoc-fix-verify3` |
+| Identify | a ZHA Identify (5 s) toggled `identifying` true→false | `2026-11-03T065319Z-h2assoc-fix-verify3` |
+| reset/resume | after a SoC reset the H2 resumed with 15 neighbours and child `0x9422` restored; the child stayed online without rejoining | `2026-11-03T070153Z-h2assoc-fix-resume`, `2026-11-03T070425Z-h2assoc-fix-resume2` |
+
 Open hardware gates:
 
-- No child has joined through the C6 router yet, so the auto-ACK Frame
-  Pending path is unproven on hardware.
+- The C6 router uses the same patch but has not been rerun on hardware.
+- No sleepy child has polled an ESP router for a long run, so Frame Pending
+  delivery of queued indirect data is still unproven on hardware.
+- No packet sniffer has confirmed the turnaround timing of individual ACKs.
 - Light sleep is vetoed while the native USB Serial/JTAG session is
   attached. Sleep power needs a cold boot from a power-only supply.
 - Light-sleep current has not been measured.
-- The H2 role images are build-, layout- and symbol-checked only.
+- The H2 ED and sensor role images are build-, layout- and symbol-checked
+  only.
