@@ -187,3 +187,37 @@ radio permanently.
   3. `ensure_receive_enabled` issues `RxStart` only in `Receive` with no
      pending event and no frame on the air. The ESP-IDF thread never
      restarts an active receive.
+
+## Read AR and frame version from the right FCF octets (`ieee802154-fcf-offsets`)
+
+Unconditional fix, no cargo feature; backport of esp-hal #5650 (upstream
+commit `10e48dd74837bae4be663a7d1825d12875363727`). The readers moved to
+`src/ieee802154/fcf.rs` so product host tests can source-link them.
+
+- **Cause:** `frame_is_ack_required` and `frame_get_version` used the
+  ESP-IDF offsets 1 and 2, but every caller here passes the frame without
+  the PHY length byte (`RX_BUFFER[1..]`). AR was read from FCF octet 1 bit 5
+  (a frame-version bit, clear in every 2003/2006 frame) and the version from
+  the sequence number, so `will_auto_send_ack` was false for every Zigbee
+  frame.
+- **Effect in RX_DONE:**
+  - The Frame Pending hook never ran, so the hardware ACK of a child's Data
+    Request never carried Frame Pending (`data-req 0` on a router whose
+    child had just polled).
+  - The state never became `TxAck`. The handler ran `next_operation`
+    instead, issuing `RxStart` and moving the RX buffer during the
+    hardware ACK turnaround — the same restart that aborts an automatic ACK
+    in the section above.
+- **Observed:** an ESP32-H2 router (0xA17F) did not acknowledge a joiner's
+  first extended-source Data Request after its Association Request. The
+  ZBT-1 joiner reported `Join failed: DeviceNotFound` (MAC NoAck) and
+  joined through another router. hwlab session
+  `2026-11-03T061048Z-h2assoc-repro2`; the H2 counters stayed `data-req 0`.
+- **Patch:** offsets 0 and 1, as upstream. Auto-acknowledged frames now
+  enter `TxAck` and run the Frame Pending hook. Host tests:
+  `radio_fcf_tests` in `products/esp32-zigbee-devkit`. On hardware, 3 of 3
+  ZBT-1 joins through the H2 then succeeded on the first attempt
+  (`data-req 3 fp-acks 3`, `tx-err 0`; sessions
+  `2026-11-03T063725Z-h2assoc-fix-verify1`, `...064553Z-...-verify2`,
+  `...065319Z-...-verify3`). No sniffer was used, so the exact
+  per-frame ACK timing is inferred.

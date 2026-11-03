@@ -34,6 +34,7 @@ pub use self::{
 #[cfg(feature = "ieee802154-ack-pending")]
 pub use self::raw::AckPendingFn;
 
+mod fcf;
 mod frame;
 mod hal;
 mod pib;

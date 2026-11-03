@@ -3,13 +3,10 @@ use alloc::vec::Vec;
 use ieee802154::mac::{FrameContent, Header};
 
 pub(crate) const FRAME_SIZE: usize = 129;
-pub(crate) const FRAME_VERSION_1: u8 = 0x10; // IEEE 802.15.4 - 2006 & 2011
-pub(crate) const FRAME_VERSION_2: u8 = 0x20; // IEEE 802.15.4 - 2015
-
-const FRAME_AR_OFFSET: usize = 1;
-const FRAME_AR_BIT: u8 = 0x20;
-const FRAME_VERSION_OFFSET: usize = 2;
-const FRAME_VERSION_MASK: u8 = 0x30;
+// Local patch `ieee802154-fcf-offsets`: the FCF readers live in `fcf.rs`.
+pub(crate) use super::fcf::{
+    FRAME_VERSION_1, FRAME_VERSION_2, frame_get_version, frame_is_ack_required,
+};
 
 /// IEEE 802.15.4 MAC frame
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,18 +32,4 @@ pub struct ReceivedFrame {
     pub rssi: i8,
     /// Link Quality Indication (LQI)
     pub lqi: u8,
-}
-
-pub(crate) fn frame_is_ack_required(frame: &[u8]) -> bool {
-    if frame.len() <= FRAME_AR_OFFSET {
-        return false;
-    }
-    (frame[FRAME_AR_OFFSET] & FRAME_AR_BIT) != 0
-}
-
-pub(crate) fn frame_get_version(frame: &[u8]) -> u8 {
-    if frame.len() <= FRAME_VERSION_OFFSET {
-        return 0;
-    }
-    frame[FRAME_VERSION_OFFSET] & FRAME_VERSION_MASK
 }
