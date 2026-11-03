@@ -276,6 +276,31 @@ destination with no known route.
 4. Otherwise the existing unroutable path is taken (discovery or Network
    Status).
 
+### Broadcast relay schedule (router builds, R22 §3.6.5, §3.6.3.5.2)
+
+A router never waits out relay jitter or retry intervals inline. Relaying a
+broadcast or forwarding a Route Request builds and secures the frame at
+once (its frame counter is consumed then) and stores it in a bounded
+`BroadcastTxTable` (4 entries) with a deadline. `process_pending_routing`
+calls `service_broadcast_tx`, which transmits each entry when it is due. The
+receive path returns straight away, so the platform loop keeps draining the
+radio during the up to ~770 ms an RREQ relay used to block.
+
+| Entry | First transmission | Repeats |
+|---|---|---|
+| Relayed broadcast | after `R[0, nwkcMaxBroadcastJitter)` (64 ms) | up to `nwkMaxBroadcastRetries` while a router neighbour has not been heard relaying it (passive ack), one `nwkPassiveAckTimeout` apart; none for radius 1 |
+| Own broadcast | sent by the caller | as for a relayed broadcast |
+| Route Request forward | after `2*R[2,128]` ms | `nwkcRREQRetries` (2), `nwkcRREQRetryInterval` (254 ms) apart, same frame and MAC handle |
+
+Deadlines are met to within one router loop slice (about 20 ms on TLSR8258)
+plus the processing time of the frame in hand. When the table is full, a new
+relay evicts an entry that is already on air (ordinary retries before Route
+Request retries). An entry still waiting for its first transmission is never
+displaced. If all four are in that state, the new broadcast relay is dropped
+with a warning before any frame counter is used. A Route Request forward
+instead stays in its own 4-entry queue until a slot frees. Leave and reset
+clear the schedule; any consumed counters are simply skipped.
+
 When a unicast to a neighbour next hop ends in **MAC NoAck**, the link is
 penalised: the neighbour's `outgoing_cost` is set to `0` until its next Link
 Status restores it. If a routing-table entry offers a different next hop,
