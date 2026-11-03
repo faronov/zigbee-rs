@@ -443,8 +443,11 @@ Router images now drain the radio in the HAL instead of the core. The
 interrupt empties the hardware buffer on every frame and keeps only the
 frames for us in the software queue, already ACKed, which the core reads
 after the delay. The hardware buffer shrank from 2 KiB to 1 KiB, so the
-1 KiB queue costs no extra RAM. A core change (receiving during NWK delays)
-would grow every other router image, so it was not made.
+1 KiB queue costs no extra RAM. Since then, the NWK layer schedules broadcast
+and RREQ relays instead of waiting inline (see the broadcast relay schedule in
+[NWK](../core-concepts/nwk.md)), so the router loop keeps reading the queue
+during jitter and retry intervals. The figures above predate that change and
+have not been re-measured on the EFR32 routers.
 
 **RAM budget (Cortex-M33, default tables).**
 

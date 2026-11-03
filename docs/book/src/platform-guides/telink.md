@@ -295,8 +295,22 @@ router, the base image lost 10.3 % of valid frames to overflow (8.6 % outright).
 After a 31-minute soak, the fixed image lost 0.15 % of valid frames: 66 of
 43,702, all outright, with no evictions. That is about 3 % of the queued
 relevant frames, against 16.7 % of broadcasts before. The remaining
-overflow comes in bursts with high-water 16. It matches the inline RREQ relay
-schedule, which blocks for up to 2·128 ms jitter plus two 254 ms retries.
+overflow comes in bursts with high-water 16. It matched the inline RREQ relay
+schedule, which then blocked for up to 2·128 ms jitter plus two 254 ms
+retries.
+
+NWK broadcast and RREQ relays are now scheduled instead of waited out inline
+(see the broadcast relay schedule in [NWK](../core-concepts/nwk.md)), so the
+router loop keeps draining this queue during jitter and retry intervals. The
+same router resumed as 0x565F without a new association, and Identify worked.
+32 minutes after the reset, it had received 46,429 valid frames with 55
+overflows (0.12 %, all outright), no evictions, and high-water 16. The image
+it replaced had run for days and lost 744 of 30,524 valid frames (2.44 %, 13
+evictions) in the 15 minutes just before the flash. Its lifetime rate was
+0.92 %, so the channel traffic varies a lot between runs. A short burst
+overflow remains, and no per-phase attribution has been run on the new image.
+Frames that arrive while flash erase/write runs with interrupts disabled are
+lost without being counted.
 
 Remaining gates:
 
@@ -306,7 +320,8 @@ Remaining gates:
 - pad/comparator wake modes;
 - corrected-image first-attempt child admission and complete interview;
 - the parent router: a child joining through it, its own neighbour table in
-  ZHA, a paint-based stack high-water on the persistence paths, and the
-  residual RX-queue overflow during the blocking NWK relay jitter waits;
+  ZHA, a paint-based stack high-water on the persistence paths, and
+  attribution of the residual burst RX-queue overflow (0.12 %) that remains
+  with the scheduled NWK relays;
 - the one-off SED `security persistence` panic seen once and not reproduced;
 - long-duration router and sleep stability.

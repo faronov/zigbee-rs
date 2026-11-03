@@ -5166,6 +5166,12 @@ mod resume_tests {
         ))
         .unwrap();
         assert_eq!(store.replay_calls, 1);
+        // The released relay waits out its broadcast jitter on the schedule.
+        block_on(zigbee_mac::PlatformServices::delay_micros(
+            rebooted.mac_mut(),
+            zigbee_nwk::conflict::MAX_BROADCAST_JITTER_US,
+        ));
+        block_on(rebooted.bdb.zdo_mut().nwk_mut().process_pending_routing());
         assert!(
             !rebooted.mac().tx_history().is_empty(),
             "the idempotent retry may relay only after replay persistence"
@@ -5992,7 +5998,18 @@ mod resume_tests {
         assert!(entry.many_to_one);
 
         // And the forwarded copy is still the concentrator's own broadcast.
+        // The forward is scheduled, not waited for: maintenance passes put it
+        // on air after its 2*R[2,128] ms jitter and repeat it twice at the
+        // 254 ms retry interval.
         block_on(device.bdb.zdo_mut().nwk_mut().process_pending_routing());
+        assert!(device.mac().tx_history().is_empty());
+        for _ in 0..3 {
+            block_on(zigbee_mac::PlatformServices::delay_micros(
+                device.mac_mut(),
+                256_000,
+            ));
+            block_on(device.bdb.zdo_mut().nwk_mut().process_pending_routing());
+        }
         let history = device.mac_mut().tx_history();
         assert_eq!(
             history.len(),

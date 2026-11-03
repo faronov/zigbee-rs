@@ -624,13 +624,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // acknowledgement by its router neighbours, like a relayed one.
         #[cfg(feature = "router")]
         if mac_result.is_ok() && next_hop == ShortAddress::BROADCAST && self.can_route() {
-            self.track_broadcast(
-                header.src_addr,
-                seq,
-                &nwk_buf[..total_len],
-                header.radius,
-                None,
-            );
+            self.track_broadcast(header.src_addr, seq, &nwk_buf[..total_len], header.radius);
         }
 
         if let Err(ref e) = mac_result {
@@ -1160,7 +1154,6 @@ impl<M: MacDriver> NwkLayer<M> {
                         relay.payload.as_slice(),
                         relay.previous_hop,
                     )
-                    .await
                 } else if relay.header.frame_control.frame_type == NwkFrameType::Command as u8
                     && relay.payload.first() == Some(&(NwkCommandId::RouteRecord as u8))
                 {
@@ -1324,7 +1317,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 if is_nwk_broadcast(dst)
                     && let Some(hop) = prev_hop
                 {
-                    self.passive_acks.note_relay(src, header.seq_number, hop);
+                    self.broadcast_tx.note_relay(src, header.seq_number, hop);
                 }
             }
             log::debug!(
@@ -1535,7 +1528,7 @@ impl<M: MacDriver> NwkLayer<M> {
             if self.btr.is_duplicate(src, header.seq_number) {
                 // A neighbour's copy of a broadcast we already handled is its
                 // passive acknowledgement of our relay (R22 §3.6.5).
-                self.passive_acks
+                self.broadcast_tx
                     .note_relay(src, header.seq_number, prev_hop.unwrap_or(src));
                 log::debug!(
                     "[NWK] BTR dup: src=0x{:04X} seq={}",
@@ -1692,9 +1685,8 @@ impl<M: MacDriver> NwkLayer<M> {
             && relayable_broadcast
             && !(authenticated_replay.is_some() && lifecycle_kind.is_some())
         {
-            let rebroadcast = self
-                .relay_broadcast(&header, payload.as_slice(), prev_hop.unwrap_or(src))
-                .await;
+            let rebroadcast =
+                self.relay_broadcast(&header, payload.as_slice(), prev_hop.unwrap_or(src));
             if let Err(e) = rebroadcast {
                 log::warn!(
                     "[NWK] Rebroadcast of frame from 0x{:04X} failed: {:?}",
@@ -2524,8 +2516,13 @@ impl<M: MacDriver> NwkLayer<M> {
     /// `nwkcMaxBroadcastJitter` first, so neighbours that heard the same copy
     /// do not collide, and is then tracked for passive acknowledgement —
     /// `previous_hop`, which transmitted it to us, already holds it.
+    ///
+    /// The frame is built (and its frame counter consumed) now, but only
+    /// scheduled: [`Self::service_broadcast_tx`] puts it on air once the
+    /// jitter has elapsed, so the receive path never waits it out and keeps
+    /// draining the radio in the meantime.
     #[cfg(feature = "router")]
-    async fn relay_broadcast(
+    fn relay_broadcast(
         &mut self,
         header: &NwkHeader,
         payload: &[u8],
@@ -2534,6 +2531,15 @@ impl<M: MacDriver> NwkLayer<M> {
         let new_radius = header.radius.saturating_sub(1);
         if new_radius == 0 {
             return Ok(());
+        }
+        if !self.broadcast_tx.can_schedule() {
+            // Every entry is a broadcast still waiting for its own first
+            // transmission; building this one would only burn a counter.
+            log::warn!(
+                "[NWK] Broadcast schedule full — not relaying frame from 0x{:04X}",
+                header.src_addr.0
+            );
+            return Err(NwkStatus::RouteError);
         }
 
         let mut relay_header = header.clone();
@@ -2548,90 +2554,84 @@ impl<M: MacDriver> NwkLayer<M> {
             new_radius
         );
 
+        let now = self.mac.monotonic_micros();
         let jitter = crate::routing::routing_random_sample(
-            self.mac.monotonic_micros()
-                ^ (u32::from(self.nib.network_address.0) << 16)
+            now ^ (u32::from(self.nib.network_address.0) << 16)
                 ^ u32::from(header.src_addr.0)
                 ^ (u32::from(header.seq_number) << 8),
         ) % crate::conflict::MAX_BROADCAST_JITTER_US;
-        self.mac.delay_micros(jitter).await;
 
-        self.send_tracked_broadcast(
-            header.src_addr,
-            header.seq_number,
+        let retries_left = if new_radius > 1 {
+            self.nib.max_broadcast_retries
+        } else {
+            0
+        };
+        let mut heard = heapless::Vec::new();
+        let _ = heard.push(previous_hop);
+        self.schedule_broadcast(
+            crate::routing::PendingBroadcast {
+                src: header.src_addr,
+                seq: header.seq_number,
+                frame: heapless::Vec::new(),
+                retries_left,
+                deadline_us: now.wrapping_add(jitter),
+                sent: false,
+                rreq: false,
+                handle: 0,
+                heard,
+            },
             &relay_buf[..total],
-            new_radius,
-            Some(previous_hop),
         )
-        .await
     }
 
-    /// MAC-broadcast a NWK broadcast frame and, when router neighbours are
-    /// expected to relay it further, keep it for passive acknowledgement
-    /// and up to `nwkMaxBroadcastRetries` retransmissions (R22 §3.6.5).
+    /// Hold `frame` in the broadcast transmission schedule; see
+    /// [`crate::routing::BroadcastTxTable::schedule`].
+    #[cfg(feature = "router")]
+    #[inline(never)]
+    pub(crate) fn schedule_broadcast(
+        &mut self,
+        mut pending: crate::routing::PendingBroadcast,
+        frame: &[u8],
+    ) -> Result<(), NwkStatus> {
+        if pending.frame.extend_from_slice(frame).is_err() {
+            return Err(NwkStatus::FrameTooLong);
+        }
+        if self.broadcast_tx.schedule(pending) {
+            Ok(())
+        } else {
+            Err(NwkStatus::RouteError)
+        }
+    }
+
+    /// Keep a broadcast this router just put on air itself for passive
+    /// acknowledgement and up to `nwkMaxBroadcastRetries` retransmissions
+    /// (R22 §3.6.5).
     ///
     /// A frame sent with radius 1 is not relayed by anyone, so no
     /// acknowledgement can ever be heard for it and it is sent once.
     #[cfg(feature = "router")]
     #[inline(never)]
-    pub(crate) async fn send_tracked_broadcast(
-        &mut self,
-        src: ShortAddress,
-        seq: u8,
-        frame: &[u8],
-        radius: u8,
-        already_heard: Option<ShortAddress>,
-    ) -> Result<(), NwkStatus> {
-        self.mac
-            .mcps_data(McpsDataRequest {
-                src_addr_mode: AddressMode::Short,
-                dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
-                payload: frame,
-                msdu_handle: self.nib.next_seq(),
-                tx_options: TxOptions {
-                    ack_tx: false, // No ACK for broadcast
-                    ..Default::default()
-                },
-            })
-            .await
-            .map_err(|_| NwkStatus::RouteError)?;
-        self.track_broadcast(src, seq, frame, radius, already_heard);
-        Ok(())
-    }
-
-    /// Keep a broadcast just put on air for passive acknowledgement; see
-    /// [`Self::send_tracked_broadcast`].
-    #[cfg(feature = "router")]
-    #[inline(never)]
-    fn track_broadcast(
-        &mut self,
-        src: ShortAddress,
-        seq: u8,
-        frame: &[u8],
-        radius: u8,
-        already_heard: Option<ShortAddress>,
-    ) {
-        if radius > 1 && self.nib.max_broadcast_retries > 0 {
-            let mut heard = heapless::Vec::new();
-            if let Some(hop) = already_heard {
-                let _ = heard.push(hop);
-            }
-            if !self.all_router_neighbors_heard(&heard)
-                && let Ok(frame) = heapless::Vec::from_slice(frame)
-            {
-                let deadline_us = self
-                    .mac
-                    .monotonic_micros()
-                    .wrapping_add(u32::from(self.nib.passive_ack_timeout) * 1_000);
-                let _ = self.passive_acks.track(crate::routing::PendingBroadcast {
+    fn track_broadcast(&mut self, src: ShortAddress, seq: u8, frame: &[u8], radius: u8) {
+        if radius > 1 && self.nib.max_broadcast_retries > 0 && !self.all_router_neighbors_heard(&[])
+        {
+            let deadline_us = self
+                .mac
+                .monotonic_micros()
+                .wrapping_add(u32::from(self.nib.passive_ack_timeout) * 1_000);
+            let _ = self.schedule_broadcast(
+                crate::routing::PendingBroadcast {
                     src,
                     seq,
-                    frame,
+                    frame: heapless::Vec::new(),
                     retries_left: self.nib.max_broadcast_retries,
                     deadline_us,
-                    heard,
-                });
-            }
+                    sent: true,
+                    rreq: false,
+                    handle: 0,
+                    heard: heapless::Vec::new(),
+                },
+                frame,
+            );
         }
     }
 
@@ -2649,50 +2649,84 @@ impl<M: MacDriver> NwkLayer<M> {
             })
     }
 
-    /// Retransmit broadcasts whose passive-acknowledgement window closed
-    /// before every router neighbour was heard relaying them (R22 §3.6.5).
+    /// Put due scheduled broadcasts on air (R22 §3.6.5, §3.6.3.5.2).
     ///
-    /// Called from [`NwkLayer::process_pending_routing`]; a retransmission
-    /// therefore happens at the first maintenance pass after
-    /// `nwkPassiveAckTimeout`, never before it.
+    /// * A relay whose jitter has elapsed is transmitted for the first time.
+    /// * An ordinary broadcast whose passive-acknowledgement window closed
+    ///   before every router neighbour was heard relaying it is retransmitted,
+    ///   at most `nwkMaxBroadcastRetries` times.
+    /// * A forwarded Route Request is repeated `nwkcRREQRetries` times at
+    ///   `nwkcRREQRetryInterval`, with the same frame and MAC handle.
+    ///
+    /// Called from [`NwkLayer::process_pending_routing`]; a transmission
+    /// therefore happens at the first maintenance pass after its deadline,
+    /// never before it, and the receive loop runs freely in between.
     #[cfg(feature = "router")]
     #[inline(never)]
-    pub(crate) async fn service_passive_acks(&mut self) {
+    pub(crate) async fn service_broadcast_tx(&mut self) {
         let mut index = 0;
-        while index < self.passive_acks.entries.len() {
+        while index < self.broadcast_tx.entries.len() {
             let now = self.mac.monotonic_micros();
-            let entry = &self.passive_acks.entries[index];
+            let entry = &self.broadcast_tx.entries[index];
             if (now.wrapping_sub(entry.deadline_us) as i32) < 0 {
                 index += 1;
                 continue;
             }
-            if entry.retries_left == 0 || self.all_router_neighbors_heard(&entry.heard) {
-                self.passive_acks.entries.swap_remove(index);
-                continue;
+            if entry.sent {
+                if entry.retries_left == 0
+                    || (!entry.rreq && self.all_router_neighbors_heard(&entry.heard))
+                {
+                    self.broadcast_tx.entries.swap_remove(index);
+                    continue;
+                }
+                let entry = &mut self.broadcast_tx.entries[index];
+                entry.retries_left -= 1;
+                log::debug!(
+                    "[NWK] Retransmitting broadcast src=0x{:04X} seq={} ({} left)",
+                    entry.src.0,
+                    entry.seq,
+                    entry.retries_left,
+                );
             }
+            let entry = &mut self.broadcast_tx.entries[index];
+            // A Route Request keeps one MAC handle for all of its copies; an
+            // ordinary broadcast takes a fresh one per transmission.
+            if !(entry.rreq && entry.sent) {
+                entry.handle = self.nib.next_seq();
+            }
+            entry.sent = true;
             let frame = entry.frame.clone();
-            log::debug!(
-                "[NWK] Broadcast src=0x{:04X} seq={} not relayed by all router neighbours — retransmitting",
-                entry.src.0,
-                entry.seq,
-            );
-            let _ = self
+            let handle = entry.handle;
+            if let Err(e) = self
                 .mac
                 .mcps_data(McpsDataRequest {
                     src_addr_mode: AddressMode::Short,
                     dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
                     payload: &frame,
-                    msdu_handle: self.nib.next_seq(),
+                    msdu_handle: handle,
                     tx_options: TxOptions {
-                        ack_tx: false,
+                        ack_tx: false, // No ACK for broadcast
                         ..Default::default()
                     },
                 })
-                .await;
-            let timeout = u32::from(self.nib.passive_ack_timeout) * 1_000;
-            let entry = &mut self.passive_acks.entries[index];
-            entry.retries_left -= 1;
-            entry.deadline_us = self.mac.monotonic_micros().wrapping_add(timeout);
+                .await
+            {
+                log::warn!("[NWK] Scheduled broadcast transmission failed: {:?}", e);
+            }
+            let entry = &self.broadcast_tx.entries[index];
+            if entry.retries_left == 0
+                || (!entry.rreq && self.all_router_neighbors_heard(&entry.heard))
+            {
+                self.broadcast_tx.entries.swap_remove(index);
+                continue;
+            }
+            let interval = if entry.rreq {
+                crate::nwk_commands::RREQ_RETRY_INTERVAL_US
+            } else {
+                u32::from(self.nib.passive_ack_timeout) * 1_000
+            };
+            let deadline = self.mac.monotonic_micros().wrapping_add(interval);
+            self.broadcast_tx.entries[index].deadline_us = deadline;
             index += 1;
         }
     }
@@ -4254,6 +4288,48 @@ mod tests {
         }
     }
 
+    /// Let every scheduled broadcast that is still waiting out its jitter go
+    /// on air — and nothing else: retransmissions that fall due later stay
+    /// pending.
+    #[cfg(feature = "router")]
+    fn send_scheduled_relays(nwk: &mut NwkLayer<MockMac>) {
+        let now = nwk.mac.monotonic_micros();
+        let latest = nwk
+            .broadcast_tx
+            .entries
+            .iter()
+            .filter(|e| !e.sent)
+            .map(|e| e.deadline_us.wrapping_sub(now))
+            .filter(|remaining| (*remaining as i32) >= 0)
+            .max();
+        if let Some(remaining) = latest {
+            block_on(nwk.mac.delay_micros(remaining));
+        }
+        block_on(nwk.service_broadcast_tx());
+    }
+
+    /// Run the broadcast schedule to completion: every jittered relay, every
+    /// Route Request retry and every passive-acknowledgement retransmission.
+    #[cfg(feature = "router")]
+    fn drain_scheduled_broadcasts(nwk: &mut NwkLayer<MockMac>) {
+        for _ in 0..64 {
+            let now = nwk.mac.monotonic_micros();
+            let Some(next) = nwk
+                .broadcast_tx
+                .entries
+                .iter()
+                .map(|e| e.deadline_us.wrapping_sub(now))
+                .map(|remaining| if (remaining as i32) < 0 { 0 } else { remaining })
+                .min()
+            else {
+                return;
+            };
+            block_on(nwk.mac.delay_micros(next));
+            block_on(nwk.service_broadcast_tx());
+        }
+        panic!("broadcast schedule never drained");
+    }
+
     fn node(device_type: DeviceType, addr: ShortAddress) -> NwkLayer<MockMac> {
         let mut nwk = NwkLayer::new(MockMac::new([1, 2, 3, 4, 5, 6, 7, 8]), device_type);
         nwk.joined = true;
@@ -4867,6 +4943,7 @@ mod tests {
                 10,
             );
             let _ = block_on(receiver.process_incoming_nwk_frame(&on_air, 42));
+            send_scheduled_relays(&mut receiver);
             assert_eq!(receiver.nib.active_key_seq_number, KEY_SEQ + 1);
             assert!(!receiver.security.activation_pending);
             assert!(receiver.pending_lifecycle_replay().is_none());
@@ -4949,11 +5026,13 @@ mod tests {
                 PEER
             );
             assert!(block_on(receiver.process_incoming_nwk_frame(&on_air, 42)).is_none());
+            send_scheduled_relays(&mut receiver);
             assert!(receiver.mac.tx_history().is_empty());
 
             // Simulates the owner having committed snapshot, child state
             // (if any), and replay floor; only this call may release the relay.
             block_on(receiver.complete_lifecycle_persistence());
+            send_scheduled_relays(&mut receiver);
             assert_eq!(receiver.mac.tx_history().len(), 1);
             assert_eq!(
                 tx_short_dst(&receiver.mac.tx_history()[0]),
@@ -4981,6 +5060,7 @@ mod tests {
                 dst != FAR
             );
             block_on(receiver.complete_lifecycle_persistence());
+            send_scheduled_relays(&mut receiver);
             assert_eq!(receiver.mac.tx_history().len(), 1);
         }
     }
@@ -4999,6 +5079,7 @@ mod tests {
             receiver.abort_lifecycle_persistence();
             assert!(receiver.pending_lifecycle_relay.is_none());
             block_on(receiver.complete_lifecycle_persistence());
+            send_scheduled_relays(&mut receiver);
             assert!(receiver.mac.tx_history().is_empty());
             assert_eq!(receiver.nib.outgoing_frame_counter, 0);
             assert!(!receiver.btr.is_duplicate(ORIGIN, header.seq_number));
@@ -5018,6 +5099,7 @@ mod tests {
             ));
             assert!(receiver.mac.tx_history().is_empty());
             block_on(receiver.complete_lifecycle_persistence());
+            send_scheduled_relays(&mut receiver);
             assert_eq!(receiver.mac.tx_history().len(), 1);
         }
     }
@@ -5769,6 +5851,7 @@ mod tests {
             let len = encode(&header, &[0x55], &mut buf);
 
             assert!(block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+            send_scheduled_relays(&mut nwk);
             assert!(
                 nwk.mac.tx_history().is_empty(),
                 "frame type {frame_type} must never be rebroadcast"
@@ -5780,6 +5863,7 @@ mod tests {
             assert_eq!(genuine.seq_number, header.seq_number);
             let len = encode(&genuine, &[0x55], &mut buf);
             assert!(block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)).is_some());
+            send_scheduled_relays(&mut nwk);
             assert_eq!(nwk.mac.tx_history().len(), 1);
         }
     }
@@ -5836,6 +5920,7 @@ mod tests {
         );
 
         let first = block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42));
+        send_scheduled_relays(&mut nwk);
         assert!(matches!(first, Some(NwkIndication::Borrowed(_))));
         assert_eq!(
             nwk.mac.tx_history().len(),
@@ -5850,6 +5935,7 @@ mod tests {
         );
 
         let second = block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42));
+        send_scheduled_relays(&mut nwk);
         assert!(
             second.is_none(),
             "BTR must suppress the duplicate broadcast"
@@ -6128,6 +6214,14 @@ mod tests {
             let start = router.mac.monotonic_micros();
             let bytes = broadcast_from(PEER, seq, 5);
             assert!(block_on(router.process_incoming_nwk_frame(&bytes, 200)).is_some());
+            assert_eq!(
+                router.mac.monotonic_micros(),
+                start,
+                "the receive path never waits out the jitter itself"
+            );
+            assert_eq!(router.mac.tx_history().len(), usize::from(seq));
+            send_scheduled_relays(&mut router);
+            assert_eq!(router.mac.tx_history().len(), usize::from(seq) + 1);
             let delay = router.mac.monotonic_micros().wrapping_sub(start);
             assert!(delay < crate::conflict::MAX_BROADCAST_JITTER_US);
             delays.push(delay).unwrap();
@@ -6148,6 +6242,7 @@ mod tests {
         assert!(
             block_on(router.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER))).is_some()
         );
+        send_scheduled_relays(&mut router);
         assert_eq!(router.mac.tx_history().len(), 1, "relayed once");
 
         // Inside nwkPassiveAckTimeout nothing is repeated.
@@ -6183,7 +6278,7 @@ mod tests {
             2,
             "acknowledged — no more retries"
         );
-        assert!(router.passive_acks.entries.is_empty());
+        assert!(router.broadcast_tx.entries.is_empty());
     }
 
     #[test]
@@ -6201,7 +6296,7 @@ mod tests {
             router.mac.tx_history().len(),
             1 + usize::from(router.nib.max_broadcast_retries),
         );
-        assert!(router.passive_acks.entries.is_empty());
+        assert!(router.broadcast_tx.entries.is_empty());
     }
 
     #[test]
@@ -6222,6 +6317,262 @@ mod tests {
             block_on(nwk.process_pending_routing());
             assert_eq!(nwk.mac.tx_history().len(), 1);
         }
+    }
+
+    /// A unicast Data frame addressed to this router.
+    #[cfg(feature = "router")]
+    fn data_for_us(seq: u8) -> heapless::Vec<u8, 128> {
+        let mut header = frame(NwkFrameType::Data, PEER, OUR_ADDR);
+        header.seq_number = seq;
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &[0xD0, seq], &mut buf);
+        heapless::Vec::from_slice(&buf[..len]).expect("the frame fits")
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn frames_received_while_a_relay_waits_out_its_jitter_are_processed() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        let start = router.mac.monotonic_micros();
+
+        let first = broadcast_from(PEER, 0x31, 5);
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&first, 200, Some(PEER))).is_some()
+        );
+        // The relay is pending; the receive path returned at once and the
+        // next frames are handled before anything goes on air.
+        let unicast = data_for_us(0x32);
+        match block_on(router.process_incoming_nwk_frame_from(&unicast, 200, Some(PEER))) {
+            Some(NwkIndication::Borrowed(data)) => assert_eq!(data.payload, &[0xD0, 0x32]),
+            other => panic!("a frame for us is delivered while a relay is pending: {other:?}"),
+        }
+        let second = broadcast_from(NEXT_HOP, 0x33, 5);
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&second, 200, Some(NEXT_HOP)))
+                .is_some()
+        );
+        assert_eq!(
+            router.mac.monotonic_micros(),
+            start,
+            "no receive call waited"
+        );
+        assert!(router.mac.tx_history().is_empty());
+        assert_eq!(router.broadcast_tx.entries.len(), 2);
+
+        // Both relays go on air once their jitter has elapsed.
+        send_scheduled_relays(&mut router);
+        assert!(
+            router.mac.monotonic_micros().wrapping_sub(start)
+                < crate::conflict::MAX_BROADCAST_JITTER_US
+        );
+        let sources: heapless::Vec<ShortAddress, 2> = router
+            .mac
+            .tx_history()
+            .iter()
+            .map(|record| tx_frame(record).0.src_addr)
+            .collect();
+        assert_eq!(sources.len(), 2);
+        assert!(sources.contains(&PEER) && sources.contains(&NEXT_HOP));
+
+        // A frame received while the passive-acknowledgement window is open
+        // is processed too, and the retries still follow on schedule: each
+        // relay heard from only one of the two router neighbours is repeated
+        // once the window closes.
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&data_for_us(0x34), 200, Some(PEER)))
+                .is_some()
+        );
+        block_on(router.process_pending_routing());
+        assert_eq!(router.mac.tx_history().len(), 2);
+        pass_time(&mut router, 500_001);
+        block_on(router.process_pending_routing());
+        assert_eq!(router.mac.tx_history().len(), 4, "one retry per relay");
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn route_request_retries_keep_their_interval_while_frames_are_received() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        let on_air = rreq_on_air(CONCENTRATOR, 0x41, 5, &many_to_one_rreq(2, 0));
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER))).is_none()
+        );
+        let start = router.mac.monotonic_micros();
+        block_on(router.process_pending_routing());
+        assert_eq!(router.mac.monotonic_micros(), start);
+        assert!(router.mac.tx_history().is_empty());
+        let deadline = router.broadcast_tx.entries[0]
+            .deadline_us
+            .wrapping_sub(start);
+        assert!(
+            (4_000..=256_000).contains(&deadline),
+            "2*R[2,128] ms jitter, got {deadline} us"
+        );
+
+        // Frames keep being processed while the forward waits.
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&data_for_us(1), 200, Some(PEER)))
+                .is_some()
+        );
+        send_scheduled_relays(&mut router);
+        assert_eq!(router.mac.tx_history().len(), 1);
+        assert_eq!(router.mac.monotonic_micros().wrapping_sub(start), deadline);
+
+        for copy in 2..=3 {
+            // Not a microsecond early, even with traffic in between...
+            pass_time(&mut router, crate::nwk_commands::RREQ_RETRY_INTERVAL_US - 1);
+            assert!(
+                block_on(router.process_incoming_nwk_frame_from(
+                    &data_for_us(copy as u8),
+                    200,
+                    Some(PEER)
+                ))
+                .is_some()
+            );
+            block_on(router.process_pending_routing());
+            assert_eq!(router.mac.tx_history().len(), copy - 1);
+            // ...and due at nwkcRREQRetryInterval.
+            pass_time(&mut router, 1);
+            block_on(router.process_pending_routing());
+            assert_eq!(router.mac.tx_history().len(), copy);
+        }
+        let history = router.mac.tx_history();
+        assert!(
+            history.iter().all(|record| {
+                record.payload.as_slice() == history[0].payload.as_slice()
+                    && record.handle == history[0].handle
+            }),
+            "every copy is the same frame and MAC transaction"
+        );
+        assert!(router.broadcast_tx.entries.is_empty(), "retries exhausted");
+        pass_time(&mut router, 1_000_000);
+        block_on(router.process_pending_routing());
+        assert_eq!(router.mac.tx_history().len(), 3);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_full_broadcast_schedule_drops_a_new_relay_but_never_an_unsent_one() {
+        use crate::routing::MAX_PENDING_BROADCASTS;
+
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        for seq in 0..MAX_PENDING_BROADCASTS as u8 {
+            let bytes = broadcast_from(PEER, seq, 5);
+            block_on(router.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER)));
+        }
+        assert_eq!(router.broadcast_tx.entries.len(), MAX_PENDING_BROADCASTS);
+
+        // Every entry still waits for its first transmission: the new relay
+        // is refused rather than displacing one of them.
+        let overflow = broadcast_from(PEER, 0x80, 5);
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&overflow, 200, Some(PEER))).is_some(),
+            "local delivery does not depend on the relay"
+        );
+        assert_eq!(router.broadcast_tx.entries.len(), MAX_PENDING_BROADCASTS);
+        assert!(
+            router.broadcast_tx.entries.iter().all(|e| e.seq != 0x80),
+            "the overflowing relay is not scheduled"
+        );
+        send_scheduled_relays(&mut router);
+        assert_eq!(router.mac.tx_history().len(), MAX_PENDING_BROADCASTS);
+
+        // Now every entry has been on air and only waits for passive
+        // acknowledgement: a new relay displaces one of those retries.
+        let fresh = broadcast_from(PEER, 0x81, 5);
+        block_on(router.process_incoming_nwk_frame_from(&fresh, 200, Some(PEER)));
+        assert_eq!(router.broadcast_tx.entries.len(), MAX_PENDING_BROADCASTS);
+        assert!(
+            router
+                .broadcast_tx
+                .entries
+                .iter()
+                .any(|e| e.seq == 0x81 && !e.sent)
+        );
+        send_scheduled_relays(&mut router);
+        assert_eq!(router.mac.tx_history().len(), MAX_PENDING_BROADCASTS + 1);
+        let (relayed, _) = tx_frame(router.mac.tx_history().last().unwrap());
+        assert_eq!(relayed.seq_number, 0x81);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_unsent_broadcast_displaces_ordinary_retries_before_route_request_retries() {
+        use crate::routing::{BroadcastTxTable, MAX_PENDING_BROADCASTS, PendingBroadcast};
+        let entry = |seq: u8, sent: bool, rreq: bool| PendingBroadcast {
+            src: PEER,
+            seq,
+            frame: heapless::Vec::new(),
+            retries_left: 2,
+            deadline_us: 0,
+            sent,
+            rreq,
+            handle: 0,
+            heard: heapless::Vec::new(),
+        };
+        let mut table = BroadcastTxTable::new();
+        assert!(table.schedule(entry(0, true, true)));
+        assert!(table.schedule(entry(1, true, false)));
+        for seq in 2..MAX_PENDING_BROADCASTS as u8 {
+            assert!(table.schedule(entry(seq, false, false)));
+        }
+        assert!(
+            !table.schedule(entry(0x40, true, false)),
+            "a transmitted broadcast never displaces anything"
+        );
+        assert!(table.can_schedule());
+        assert!(table.schedule(entry(0x41, false, false)));
+        assert!(
+            table.entries.iter().all(|e| e.seq != 1),
+            "the ordinary retry goes first"
+        );
+        assert!(table.schedule(entry(0x42, false, true)));
+        assert!(
+            table.entries.iter().all(|e| e.seq != 0),
+            "then the Route Request retry"
+        );
+        assert!(!table.can_schedule(), "only unsent broadcasts are left");
+        assert!(!table.schedule(entry(0x43, false, false)));
+        assert_eq!(table.entries.len(), MAX_PENDING_BROADCASTS);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_route_request_waits_in_its_queue_while_the_schedule_is_full() {
+        use crate::routing::MAX_PENDING_BROADCASTS;
+
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        for seq in 0..MAX_PENDING_BROADCASTS as u8 {
+            let bytes = broadcast_from(PEER, seq, 5);
+            block_on(router.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER)));
+        }
+        let on_air = rreq_on_air(CONCENTRATOR, 0x51, 5, &many_to_one_rreq(4, 0));
+        block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER)));
+        assert_eq!(router.pending_rreq_forwards.len(), 1);
+
+        let counter = router.nib.outgoing_frame_counter;
+        block_on(router.process_pending_routing());
+        assert_eq!(
+            router.pending_rreq_forwards.len(),
+            1,
+            "the forward stays queued instead of being dropped"
+        );
+        assert_eq!(router.nib.outgoing_frame_counter, counter);
+
+        // The relays go out; with every router neighbour heard they need no
+        // retries and free their entries, so the request is scheduled next.
+        send_scheduled_relays(&mut router);
+        assert!(router.broadcast_tx.entries.is_empty());
+        block_on(router.process_pending_routing());
+        assert!(router.pending_rreq_forwards.is_empty());
+        drain_scheduled_broadcasts(&mut router);
+        assert_eq!(sent_route_requests(&router), 3);
     }
 
     #[test]
@@ -6384,6 +6735,7 @@ mod tests {
             block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER))).is_none()
         );
         block_on(router.process_pending_routing());
+        drain_scheduled_broadcasts(&mut router);
 
         assert!(
             sent_route_replies(&router).is_empty(),
@@ -6567,12 +6919,14 @@ mod tests {
         let rreq = recorded_frame(&a, 0);
         assert!(block_on(b.process_incoming_nwk_frame_from(&rreq, 230, Some(A))).is_none());
         block_on(b.process_pending_routing());
+        drain_scheduled_broadcasts(&mut b);
 
         // B's forward reaches C, which answers for its child.
         let forwarded = recorded_frame(&b, 0);
         assert_eq!(parse_rreq(&forwarded).1.path_cost, 1);
         assert!(block_on(c.process_incoming_nwk_frame_from(&forwarded, 230, Some(B))).is_none());
         block_on(c.process_pending_routing());
+        drain_scheduled_broadcasts(&mut c);
         assert_eq!(
             sent_route_requests(&c),
             0,
@@ -6589,6 +6943,7 @@ mod tests {
         let rrep = recorded_frame(&c, c_tx);
         assert!(block_on(b.process_incoming_nwk_frame_from(&rrep, 230, Some(C))).is_none());
         block_on(b.process_pending_routing());
+        drain_scheduled_broadcasts(&mut b);
         assert_eq!(b.routing.next_hop(e), Some(C));
         let b_replies = sent_route_replies(&b);
         assert_eq!(b_replies.len(), 1);
@@ -7628,6 +7983,7 @@ mod tests {
             }
             other => panic!("expected local delivery of the broadcast, got {other:?}"),
         }
+        send_scheduled_relays(&mut relay);
         assert_eq!(
             relay.rx_security_stats().decrypt_successes,
             1,
@@ -7665,6 +8021,7 @@ mod tests {
         // The incoming counter was committed, so the very same frame is now a
         // replay — and nothing further goes on air.
         assert!(block_on(relay.process_incoming_nwk_frame(&on_air, 42)).is_none());
+        send_scheduled_relays(&mut relay);
         assert_eq!(relay.rx_security_stats().replay_rejections, 1);
         assert_eq!(relay.mac.tx_history().len(), 1);
     }
@@ -7687,6 +8044,7 @@ mod tests {
                 .set_frame_counter_reservation(RESERVED_FLOOR, RESERVED_FLOOR + 8)
         );
         let _ = block_on(relay.process_incoming_nwk_frame(&on_air, 42));
+        send_scheduled_relays(&mut relay);
         let rebroadcast = recorded_frame(&relay, 0);
         let (relayed_header, consumed) =
             NwkHeader::parse(&rebroadcast).expect("rebroadcast parses");
@@ -7741,6 +8099,7 @@ mod tests {
                 .set_frame_counter_reservation(RESERVED_FLOOR, RESERVED_FLOOR + 8)
         );
         let _ = block_on(relay.process_incoming_nwk_frame(&frame_bytes[..frame_len], 42));
+        send_scheduled_relays(&mut relay);
         let rebroadcast = recorded_frame(&relay, 0);
         let (relayed_header, consumed) =
             NwkHeader::parse(&rebroadcast).expect("rebroadcast parses");
@@ -7918,6 +8277,7 @@ mod tests {
             block_on(relay.process_incoming_nwk_frame(&buf[..len], 42)).is_none(),
             "an unsecured broadcast is not delivered on a secured network"
         );
+        send_scheduled_relays(&mut relay);
         assert!(
             relay.mac.tx_history().is_empty(),
             "an unsecured broadcast must never be rebroadcast"
@@ -7938,6 +8298,7 @@ mod tests {
             }
             other => panic!("expected local delivery of the secured broadcast, got {other:?}"),
         }
+        send_scheduled_relays(&mut relay);
         assert_eq!(
             relay.mac.tx_history().len(),
             1,
@@ -8631,6 +8992,11 @@ mod tests {
         assert_eq!(nwk.pending_rreq_forwards[0].path_cost, 3 + 7);
 
         block_on(nwk.process_pending_routing());
+        assert!(
+            nwk.mac.tx_history().is_empty() && nwk.mac.monotonic_micros() == 0,
+            "the forward is scheduled, never waited for in line"
+        );
+        drain_scheduled_broadcasts(&mut nwk);
 
         assert_eq!(
             nwk.mac.tx_history().len(),
@@ -8733,6 +9099,7 @@ mod tests {
                 block_on(router.process_incoming_nwk_frame(&buf[..len], 42)).is_none(),
                 "{command:?} is handled inside NWK",
             );
+            send_scheduled_relays(&mut router);
             assert_eq!(
                 router.mac.tx_history().len(),
                 1,
@@ -8753,6 +9120,7 @@ mod tests {
             assert_eq!(bytes[consumed], command as u8);
 
             assert!(block_on(router.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+            send_scheduled_relays(&mut router);
             assert_eq!(
                 router.mac.tx_history().len(),
                 1,
@@ -8822,6 +9190,7 @@ mod tests {
         );
 
         assert!(block_on(manager.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+        send_scheduled_relays(&mut manager);
         assert_eq!(
             manager.nib.nwk_update_id(),
             Some(0xFF),
@@ -8992,6 +9361,7 @@ mod tests {
             block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)),
             Some(NwkIndication::Borrowed(_))
         ));
+        send_scheduled_relays(&mut nwk);
         assert_eq!(nwk.mac.tx_history().len(), 1);
         let (rebroadcast, _) = tx_frame(&nwk.mac.tx_history()[0]);
         assert_eq!(
@@ -9163,6 +9533,7 @@ mod tests {
             block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER))).is_none()
         );
         block_on(router.process_pending_routing());
+        drain_scheduled_broadcasts(&mut router);
 
         assert_eq!(
             router.mac.tx_history().len(),
@@ -9205,6 +9576,7 @@ mod tests {
         let on_air = rreq_on_air(ORIGIN, 0x5A, 5, &standard_rreq(9, NEXT_HOP, 0));
         assert!(block_on(first.process_incoming_nwk_frame_from(&on_air, 42, Some(PEER))).is_none());
         block_on(first.process_pending_routing());
+        drain_scheduled_broadcasts(&mut first);
         let forwarded = next_transmission(&first, &mut 0).expect("the first router forwards");
 
         // The next router hears an equal-cost retry through another neighbour.
@@ -9217,6 +9589,7 @@ mod tests {
                 .is_none()
         );
         block_on(second.process_pending_routing());
+        drain_scheduled_broadcasts(&mut second);
         assert_eq!(second.mac.tx_history().len(), 3);
         assert!(
             !second.btr.is_duplicate(ORIGIN, 0x5A),
@@ -9227,6 +9600,7 @@ mod tests {
                 .is_none()
         );
         block_on(second.process_pending_routing());
+        drain_scheduled_broadcasts(&mut second);
 
         assert_eq!(
             second.mac.tx_history().len(),
@@ -9246,6 +9620,7 @@ mod tests {
             .is_none()
         );
         block_on(first.process_pending_routing());
+        drain_scheduled_broadcasts(&mut first);
         assert_eq!(first.mac.tx_history().len(), 3);
     }
 
@@ -9264,6 +9639,7 @@ mod tests {
             block_on(b.process_incoming_nwk_frame_from(&a_request, 42, Some(ORIGIN))).is_none()
         );
         block_on(b.process_pending_routing());
+        drain_scheduled_broadcasts(&mut b);
         assert_eq!(b.mac.tx_history().len(), 3);
 
         // One of B's relays reaches C and is forwarded with a strictly larger
@@ -9271,10 +9647,12 @@ mod tests {
         let from_b = recorded_frame(&b, 0);
         let _ = block_on(c.process_incoming_nwk_frame_from(from_b.as_slice(), 42, Some(OUR_ADDR)));
         block_on(c.process_pending_routing());
+        drain_scheduled_broadcasts(&mut c);
         assert_eq!(c.mac.tx_history().len(), 3);
         let from_c = recorded_frame(&c, 0);
         let _ = block_on(b.process_incoming_nwk_frame_from(from_c.as_slice(), 42, Some(FAR)));
         block_on(b.process_pending_routing());
+        drain_scheduled_broadcasts(&mut b);
 
         assert_eq!(
             b.mac.tx_history().len(),
@@ -9295,6 +9673,7 @@ mod tests {
                 .is_none()
         );
         block_on(first.process_pending_routing());
+        drain_scheduled_broadcasts(&mut first);
 
         let entry = first
             .routing
@@ -9426,6 +9805,7 @@ mod tests {
             block_on(router.process_incoming_nwk_frame_from(&first, 255, Some(PEER))).is_none()
         );
         block_on(router.process_pending_routing());
+        drain_scheduled_broadcasts(&mut router);
         assert_eq!(
             router.routing.get_entry(CONCENTRATOR).unwrap().next_hop,
             PEER
@@ -9445,6 +9825,7 @@ mod tests {
             block_on(router.process_incoming_nwk_frame_from(&worse, 255, Some(NEXT_HOP))).is_none()
         );
         block_on(router.process_pending_routing());
+        drain_scheduled_broadcasts(&mut router);
         assert_eq!(
             router.routing.get_entry(CONCENTRATOR).unwrap().next_hop,
             PEER,
@@ -9463,6 +9844,7 @@ mod tests {
                 .is_none()
         );
         block_on(router.process_pending_routing());
+        drain_scheduled_broadcasts(&mut router);
         assert_eq!(
             router.routing.get_entry(CONCENTRATOR).unwrap().next_hop,
             NEXT_HOP,
@@ -9975,6 +10357,7 @@ mod tests {
                 block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)).is_none(),
                 "0x{dst:04X} names no device and no broadcast group"
             );
+            send_scheduled_relays(&mut nwk);
             assert!(
                 nwk.mac.tx_history().is_empty(),
                 "0x{dst:04X} must be neither rebroadcast nor relayed"
@@ -9995,6 +10378,7 @@ mod tests {
                 block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)),
                 Some(NwkIndication::Borrowed(_))
             ));
+            send_scheduled_relays(&mut nwk);
             assert_eq!(nwk.mac.tx_history().len(), 1);
         }
     }
@@ -10017,6 +10401,7 @@ mod tests {
             );
 
             let indication = block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42));
+            send_scheduled_relays(&mut nwk);
             assert_eq!(
                 indication.is_some(),
                 delivered,
@@ -10156,6 +10541,7 @@ mod tests {
             block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER))).is_none()
         );
         block_on(router.process_pending_routing());
+        drain_scheduled_broadcasts(&mut router);
         assert_eq!(
             router.routing.get_entry(CONCENTRATOR).unwrap().next_hop,
             PEER
@@ -10169,6 +10555,7 @@ mod tests {
             block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER))).is_none()
         );
         block_on(router.process_pending_routing());
+        drain_scheduled_broadcasts(&mut router);
         assert_eq!(
             router.mac.tx_history().len(),
             3,
@@ -10181,6 +10568,7 @@ mod tests {
                 .is_none()
         );
         block_on(router.process_pending_routing());
+        drain_scheduled_broadcasts(&mut router);
         assert_eq!(
             router.routing.get_entry(CONCENTRATOR).unwrap().next_hop,
             THIRD_HOP,
@@ -10198,6 +10586,7 @@ mod tests {
             block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER))).is_none()
         );
         block_on(router.process_pending_routing());
+        drain_scheduled_broadcasts(&mut router);
         assert_eq!(
             router.mac.tx_history().len(),
             6,
@@ -10211,6 +10600,7 @@ mod tests {
                 .is_none()
         );
         block_on(router.process_pending_routing());
+        drain_scheduled_broadcasts(&mut router);
         assert_eq!(
             router.routing.get_entry(CONCENTRATOR).unwrap().next_hop,
             NEXT_HOP,
@@ -10224,6 +10614,7 @@ mod tests {
             block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER))).is_none()
         );
         block_on(router.process_pending_routing());
+        drain_scheduled_broadcasts(&mut router);
         assert_eq!(
             router.routing.get_entry(CONCENTRATOR).unwrap().next_hop,
             NEXT_HOP
@@ -10260,6 +10651,7 @@ mod tests {
                 .is_none()
         );
         block_on(relay.process_pending_routing());
+        drain_scheduled_broadcasts(&mut relay);
         assert_eq!(
             relay.rx_security_stats().decrypt_successes,
             1,
