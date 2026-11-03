@@ -2152,9 +2152,10 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Route Request or Route Reply, which only routers send. Its IEEE
     /// address must be authenticated: NWK security is hop by hop, so the
     /// auxiliary header names the transmitter; on an unsecured network only
-    /// a directly sent frame's source IEEE address can name it. An IEEE
-    /// address already bound to another short address is left to address
-    /// conflict processing instead of being remapped here.
+    /// a directly sent frame's source IEEE address can name it. A known IEEE
+    /// address heard from another short address has moved there: it goes
+    /// through [`crate::NwkLayer::update_address_map`], exactly like a
+    /// `Device_annce`.
     #[cfg(feature = "router")]
     #[inline(never)]
     fn observe_transmitting_neighbor(
@@ -2191,12 +2192,17 @@ impl<M: MacDriver> NwkLayer<M> {
             },
             None => return,
         };
-        if ieee == [0; 8]
-            || ieee == [0xFF; 8]
-            || ieee == self.nib.ieee_address
-            || self.neighbors.find_by_ieee(&ieee).is_some()
-        {
+        if ieee == [0; 8] || ieee == [0xFF; 8] || ieee == self.nib.ieee_address {
             return;
+        }
+        if self.neighbors.find_by_ieee(&ieee).is_some() {
+            // The authenticated transmitter now uses `hop`: the same IEEE
+            // address announced there (R22 §2.4.3.1.11), so a missed
+            // Device_annce does not leave a moved router behind.
+            self.update_address_map(hop, ieee);
+            if self.neighbors.find_by_ieee(&ieee).is_some() {
+                return;
+            }
         }
         let mut entry = crate::neighbor::NeighborEntry::new_from_annce(hop, ieee);
         entry.device_type = if hop == ShortAddress::COORDINATOR {
@@ -2857,12 +2863,24 @@ impl<M: MacDriver> NwkLayer<M> {
     /// [`Self::resolve_next_hop`] stops preferring the link until the
     /// neighbor's next Link Status reports that it hears us again
     /// (§3.6.3.4.2). Children are reached only directly and keep their entry.
+    ///
+    /// A normal routing-table entry whose next hop failed is removed, as a
+    /// relay does and as §3.6.3.7.1 has a router do on a link-failure
+    /// Network Status; otherwise an originated frame would keep a dead next
+    /// hop Active forever. Many-to-one routes keep their own failure path.
     #[cfg(feature = "router")]
     pub(crate) fn note_link_failure(
         &mut self,
         destination: ShortAddress,
         failed_hop: ShortAddress,
     ) -> Option<ShortAddress> {
+        if self
+            .routing
+            .get_entry(destination)
+            .is_some_and(|route| route.next_hop == failed_hop && !route.many_to_one)
+        {
+            self.routing.remove(destination);
+        }
         if let Some(neighbor) = self.neighbors.find_by_short_mut(failed_hop)
             && !matches!(
                 neighbor.relationship,
@@ -8823,6 +8841,140 @@ mod tests {
             entry.network_address, child,
             "only join/rejoin/conflict processing may move a child"
         );
+    }
+
+    /// A router child at `addr` that has been silent long enough to be
+    /// stale is not distinguishable from a live one here; the relationship
+    /// is what matters.
+    #[cfg(feature = "router")]
+    fn router_child(nwk: &mut NwkLayer<MockMac>, addr: ShortAddress, ieee: IeeeAddress) {
+        nwk.update_neighbor_address(addr, ieee);
+        let child = nwk.neighbors.find_by_short_mut(addr).unwrap();
+        child.relationship = crate::neighbor::Relationship::Child;
+        child.device_type = crate::neighbor::NeighborDeviceType::Router;
+        child.rx_on_when_idle = true;
+        child.lqi = 159;
+        child.update_incoming_cost_from_lqi();
+    }
+
+    #[cfg(feature = "router")]
+    const MOVED_OLD: ShortAddress = ShortAddress(0x565F);
+    #[cfg(feature = "router")]
+    const MOVED_NEW: ShortAddress = ShortAddress(0xD724);
+    #[cfg(feature = "router")]
+    const MOVED_IEEE: IeeeAddress = [0xA7, 0x4E, 0x33, 0x39, 0x36, 0x38, 0xC1, 0xA4];
+    #[cfg(feature = "router")]
+    const BEYOND: ShortAddress = ShortAddress(0xE8E2);
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_router_child_announcing_a_new_address_is_retired_with_its_routes() {
+        // ZBT-1 field state: former router child 0x565F rejoined elsewhere as
+        // 0xD724, yet stayed a Child and the next hop of an Active route.
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        router_child(&mut nwk, MOVED_OLD, MOVED_IEEE);
+        nwk.routing.update_route(BEYOND, MOVED_OLD, 3).unwrap();
+        nwk.routing.update_route(MOVED_OLD, MOVED_OLD, 1).unwrap();
+        nwk.routing.update_route(PEER, NEXT_HOP, 2).unwrap();
+
+        nwk.note_announced_address(MOVED_NEW, MOVED_IEEE);
+
+        assert!(
+            nwk.neighbors.find_by_short(MOVED_OLD).is_none(),
+            "R22 §2.4.3.1.11: the old short address no longer names the device"
+        );
+        assert_eq!(nwk.find_short_by_ieee(&MOVED_IEEE), Some(MOVED_NEW));
+        assert_eq!(nwk.routing.next_hop(BEYOND), None, "next hop is gone");
+        assert_eq!(nwk.routing.next_hop(MOVED_OLD), None);
+        assert_eq!(nwk.routing.next_hop(PEER), Some(NEXT_HOP), "unrelated");
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn the_new_address_of_a_known_router_is_learned_from_its_link_status() {
+        // The Device_annce may be missed; the moved router's next
+        // authenticated Link Status names the same IEEE at its new address.
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        router_child(&mut nwk, MOVED_OLD, MOVED_IEEE);
+        nwk.routing.update_route(BEYOND, MOVED_OLD, 3).unwrap();
+
+        let header = frame(NwkFrameType::Command, MOVED_NEW, ShortAddress(0xFFFC));
+        nwk.observe_transmitting_neighbor(
+            &header,
+            MOVED_NEW,
+            200,
+            Some(MOVED_IEEE),
+            Some(NwkCommandId::LinkStatus as u8),
+        );
+
+        assert!(nwk.neighbors.find_by_short(MOVED_OLD).is_none());
+        let moved = nwk
+            .neighbors
+            .find_by_short(MOVED_NEW)
+            .expect("the router is learned at its new address");
+        assert_eq!(moved.ieee_address, MOVED_IEEE);
+        assert_eq!(
+            moved.relationship,
+            crate::neighbor::Relationship::Sibling,
+            "it joined through another parent"
+        );
+        assert_eq!(nwk.routing.next_hop(BEYOND), None);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_sibling_that_moves_takes_no_stale_route_along() {
+        // ESP32-H2 field state: 0x565F kept as Sibling plus an Active route
+        // 0x565F -> 0x565F after the device became 0xD724.
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.update_neighbor_address(MOVED_OLD, MOVED_IEEE);
+        nwk.neighbors
+            .find_by_short_mut(MOVED_OLD)
+            .unwrap()
+            .device_type = crate::neighbor::NeighborDeviceType::Router;
+        nwk.routing.update_route(MOVED_OLD, MOVED_OLD, 1).unwrap();
+
+        nwk.note_announced_address(MOVED_NEW, MOVED_IEEE);
+
+        let moved = nwk.neighbors.find_by_ieee(&MOVED_IEEE).unwrap();
+        assert_eq!(moved.network_address, MOVED_NEW);
+        assert_eq!(nwk.routing.next_hop(MOVED_OLD), None);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_route_to_a_former_address_is_dropped_when_the_device_reannounces() {
+        // TLSR field state: an Active route to 0x9421, ZBT-1's previous
+        // address, learned from its route request, outlived its rejoin as
+        // 0x9422.
+        let old = ShortAddress(0x9421);
+        let new = ShortAddress(0x9422);
+        let ieee = [0x5A; 8];
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        nwk.update_address_map(old, ieee);
+        nwk.routing.update_route(old, NEXT_HOP, 4).unwrap();
+
+        nwk.note_announced_address(new, ieee);
+
+        assert_eq!(nwk.routing.next_hop(old), None);
+        assert_eq!(nwk.find_ieee_by_short(old), None);
+        assert_eq!(nwk.find_short_by_ieee(&ieee), Some(new));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_originated_noack_drops_the_route_through_the_failed_hop() {
+        // R22 §3.6.3.7.1: a router removes a routing-table entry whose link
+        // failed; an originated frame must not keep a dead next hop Active.
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut nwk, NEXT_HOP, 2);
+        nwk.routing.update_route(FAR, NEXT_HOP, 3).unwrap();
+        nwk.mac.set_tx_failures(1);
+
+        let result = block_on(nwk.nlde_data_request(FAR, 30, &[0x01], false, false));
+
+        assert_eq!(result.err(), Some(NwkStatus::RouteError));
+        assert_eq!(nwk.routing.next_hop(FAR), None);
     }
 
     #[test]
