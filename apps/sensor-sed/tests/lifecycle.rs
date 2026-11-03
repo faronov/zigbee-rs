@@ -1375,6 +1375,68 @@ fn reporting_completion_uses_short_grace_then_the_slow_wait_depth() {
     exercise_reporting_completion(false);
 }
 
+/// A report deadline 1 ms past a whole number of slow polls.
+const RESIDUE_POLICY: SensorPolicy = SensorPolicy {
+    sample_interval_ms: 10_001,
+    fast_poll_ms: 250,
+    slow_poll_ms: 1_000,
+    restored_fast_ms: 2_500,
+    slow_sleep_depth: SleepDepth::Idle,
+    ..BASE_POLICY
+};
+
+/// The lifecycle shortens a low-power wait to any deadline residue, down to
+/// 1 ms. Every `WakeController` must accept that at each sleep depth; TLSR8258
+/// SUSPEND/LOW32K reject a sleep below their PM wake floor (`TooShort`), so its
+/// controller busy-waits such a residue instead of failing the wait.
+#[test]
+fn a_report_deadline_residue_requests_a_one_ms_wait_at_the_slow_depth() {
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::with_state(commissioned_state(0x02), &store_calls);
+    let mut profile = test_profile();
+    let mut device = test_device(&profile, &RESIDUE_POLICY);
+
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake = RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+        let mut app = SensorApp::new(
+            node,
+            &RESIDUE_POLICY,
+            parts(
+                wake,
+                RecordingStatus { events: &status },
+                NoOta,
+                &environment_samples,
+                &battery_samples,
+                &heartbeats,
+                &diagnostics,
+            ),
+        )
+        .unwrap();
+        block_on(app.initialize()).unwrap();
+        for _ in 0..30 {
+            block_on(app.step()).unwrap();
+        }
+    }
+
+    let waits = waits.borrow();
+    assert!(
+        waits.contains(&WaitRequest {
+            timeout_ms: 1,
+            sleep_depth: SleepDepth::Idle,
+        }),
+        "waits: {waits:?}"
+    );
+}
+
 #[test]
 fn receive_activity_without_sleep_is_processed_before_rechecking_idle() {
     exercise_reporting_completion(true);
