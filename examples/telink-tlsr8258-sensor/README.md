@@ -15,8 +15,17 @@ boards/tlsr8258-tb04
 tlsr8258-hal + TelinkMac (SoftMacCore<TelinkRadioPhy>) + tlsr8258-rt
 ```
 
-This example is the composition/reset root. `src/app.rs` assembles
-borrowed/static TC32 resources and reset-on-wake entry.
+This example is only the composition root:
+
+- `src/main.rs`: `_rust_entry` / LOW32K wake entry;
+- `src/app.rs`: the sensor part list and device builder;
+- `src/suspend.rs`: default SUSPEND image root;
+- `src/retention.rs`: LOW32K retained statics, cold start and fresh root.
+
+What the sensor *is* (identity, `SENSOR_POLICY`, clusters, synthetic source,
+RGB status) lives in `products/tlsr8258-tb04/src/sensor.rs`; TB-04 bring-up
+in `products/tlsr8258-tb04/src/boot.rs`. Generic TLSR wake/retention
+machinery is in `apps/tlsr8258-sensor` and `tlsr8258-rt` (`retention`).
 It does not contain a separate commissioning, polling, reporting, or
 persistence state machine.
 

@@ -21,6 +21,7 @@ on:
       - "tlsr8258-rt/**"
       - "apps/router/**"
       - "apps/sensor-sed/**"
+      - "apps/tlsr8258-sensor/**"
       - "zigbee-*/**"
       - ".github/workflows/build-tc32.yml"
   pull_request:
@@ -43,6 +44,7 @@ on:
       - "tlsr8258-rt/**"
       - "apps/router/**"
       - "apps/sensor-sed/**"
+      - "apps/tlsr8258-sensor/**"
       - "zigbee-*/**"
       - ".github/workflows/build-tc32.yml"
   workflow_dispatch:
@@ -125,6 +127,8 @@ jobs:
             tlsr8258-hal/target
             boards/tlsr8258-tb04/target
             products/tlsr8258-tb04/target
+            apps/tlsr8258-sensor/target
+            tlsr8258-rt/target
             examples/telink-tlsr8258-radio/target
           key: ${{ env.TC32_TOOLCHAIN_TAG }}-${{ env.TC32_TOOLCHAIN_SHA256 }}-${{ env.HOST_RUST_TOOLCHAIN }}-${{ runner.os }}-tc32-unknown-none-elf-prod-retention-router-pm-retention-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/.cargo/config.toml', '**/memory*.x', 'scripts/tlsr8258.sh', 'tools/tlsr8258-firmware.sh', 'examples/telink-tlsr8258-radio/scripts/tlsr8258.sh') }}
 
@@ -250,7 +254,8 @@ jobs:
           for manifest in \
             tlsr8258-hal/Cargo.toml \
             boards/tlsr8258-tb04/Cargo.toml \
-            products/tlsr8258-tb04/Cargo.toml
+            products/tlsr8258-tb04/Cargo.toml \
+            apps/tlsr8258-sensor/Cargo.toml
           do
             cargo "+${HOST_RUST_TOOLCHAIN}" test --manifest-path "$manifest" \
               --release --locked --target "$HOST_TARGET"
@@ -279,11 +284,29 @@ jobs:
           cargo "+${HOST_RUST_TOOLCHAIN}" test \
             --manifest-path products/tlsr8258-tb04/Cargo.toml \
             --release --locked --target "$HOST_TARGET" \
+            --no-default-features --features retention-proof-10s
+          cargo "+${HOST_RUST_TOOLCHAIN}" test \
+            --manifest-path products/tlsr8258-tb04/Cargo.toml \
+            --release --locked --target "$HOST_TARGET" \
             --no-default-features --features end-device
           cargo "+${HOST_RUST_TOOLCHAIN}" clippy \
             --manifest-path products/tlsr8258-tb04/Cargo.toml \
             --release --locked --target "$HOST_TARGET" --all-targets \
             --no-default-features --features end-device -- -D warnings
+          for feature in sensor retention-proof retention-proof-10s; do
+            cargo "+${HOST_RUST_TOOLCHAIN}" clippy \
+              --manifest-path products/tlsr8258-tb04/Cargo.toml \
+              --release --locked --target "$HOST_TARGET" --all-targets \
+              --no-default-features --features "$feature" -- -D warnings
+          done
+          # Retained-cell/root checksum layout of the LOW32K image.
+          cargo "+${HOST_RUST_TOOLCHAIN}" test \
+            --manifest-path tlsr8258-rt/Cargo.toml \
+            --release --locked --target "$HOST_TARGET" --features retention-proof
+          cargo "+${HOST_RUST_TOOLCHAIN}" clippy \
+            --manifest-path tlsr8258-rt/Cargo.toml \
+            --release --locked --target "$HOST_TARGET" --all-targets \
+            --features retention-proof -- -D warnings
 
       - name: Upload TLSR8258 binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -315,3 +338,4 @@ jobs:
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path tlsr8258-rt/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path products/tlsr8258-tb04/Cargo.toml -- --check
           cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path examples/telink-tlsr8258-sensor/Cargo.toml -- --check
+          cargo "+${HOST_RUST_TOOLCHAIN}" fmt --manifest-path apps/tlsr8258-sensor/Cargo.toml -- --check

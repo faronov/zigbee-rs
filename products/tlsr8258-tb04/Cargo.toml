@@ -24,14 +24,16 @@ end-device = [
 ]
 sensor = [
     "dep:sensor-sed-app",
+    "dep:tlsr8258-sensor-app",
     "dep:zigbee-mac",
     "zigbee-runtime/compact-single-endpoint",
 ]
+# LOW32K reset-on-wake for joined steady-state waits.
 retention-proof = [
     "sensor",
-    "tlsr8258-hal/retention-proof",
-    "zigbee-mac/telink-retention-proof",
+    "tlsr8258-sensor-app/retention",
 ]
+# Same image with a ten-second joined slow poll.
 retention-proof-10s = ["retention-proof"]
 
 [dependencies]
@@ -39,6 +41,7 @@ embedded-storage = "0.3"
 router-app = { path = "../../apps/router", optional = true }
 sensor-sed-app = { path = "../../apps/sensor-sed", optional = true }
 tlsr8258-hal = { path = "../../tlsr8258-hal" }
+tlsr8258-sensor-app = { path = "../../apps/tlsr8258-sensor", optional = true }
 tlsr8258-tb04 = { path = "../../boards/tlsr8258-tb04" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-mac = { path = "../../zigbee-mac", optional = true }

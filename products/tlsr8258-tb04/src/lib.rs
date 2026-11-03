@@ -7,6 +7,8 @@
 
 #![no_std]
 
+#[cfg(target_arch = "tc32")]
+pub mod boot;
 #[cfg(feature = "end-device")]
 pub mod end_device;
 #[cfg(all(target_arch = "tc32", feature = "router"))]

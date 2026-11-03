@@ -182,6 +182,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tlsr8258-rt"
+version = "0.1.0"
+
+[[package]]
+name = "tlsr8258-sensor-app"
+version = "0.1.0"
+dependencies = [
+ "sensor-sed-app",
+ "tlsr8258-hal",
+ "tlsr8258-rt",
+ "zigbee-mac",
+]
+
+[[package]]
 name = "tlsr8258-tb04"
 version = "0.1.0"
 dependencies = [
@@ -196,6 +210,7 @@ dependencies = [
  "router-app",
  "sensor-sed-app",
  "tlsr8258-hal",
+ "tlsr8258-sensor-app",
  "tlsr8258-tb04",
  "zigbee-aps",
  "zigbee-mac",
@@ -247,6 +262,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "heapless",
+ "tlsr8258-hal",
 ]
 
 [[package]]

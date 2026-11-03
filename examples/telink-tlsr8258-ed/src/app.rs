@@ -22,7 +22,8 @@ use zigbee_runtime::profile::ApplicationProfile;
 use zigbee_runtime::role::EndDevice;
 use zigbee_zcl::clusters::basic::PowerSource;
 
-use tlsr8258_tb04::{leds::StatusLeds, resources::BoardResources};
+use tlsr8258_tb04::leds::StatusLeds;
+use tlsr8258_tb04_product::boot::{Boot, boot, failure, halted};
 use tlsr8258_tb04_product::end_device::{
     DATE_CODE, DEVICE_EUI_OFFSET, END_DEVICE_MODEL, END_DEVICE_POLICY, EndDeviceProfile,
     MANUFACTURER, SW_BUILD, end_device_profile,
@@ -188,19 +189,6 @@ impl RouterObserver<TelinkMac, EndDevice> for EdObserver {
     }
 }
 
-fn failure(leds: &StatusLeds) -> ! {
-    leds.green.write(false);
-    leds.blue.write(false);
-    leds.red.write(true);
-    halted()
-}
-
-fn halted() -> ! {
-    loop {
-        tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(1_000));
-    }
-}
-
 /// Build the MAC and the End Device straight into static storage.
 ///
 /// Kept out of [`run`] so the by-value MAC and the builder are temporaries
@@ -239,56 +227,39 @@ fn build_device(
         .build_into(unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_STORAGE) })
 }
 
-pub fn run() -> ! {
-    tlsr8258_hal::timer::init();
-    let resources = match BoardResources::take() {
-        Some(resources) => resources,
-        None => loop {
-            core::hint::spin_loop();
-        },
-    };
-    let leds = resources.lighting.into_status_leds();
-    if leds.init().is_err() {
-        failure(&leds);
-    }
-    let adc = match tlsr8258_hal::adc::Adc::new(
-        resources.adc,
-        tlsr8258_hal::flash::FlashGeometry::KiB512,
-    ) {
-        Ok(adc) => adc,
-        Err(_) => failure(&leds),
-    };
-    if adc.install_flash_voltage_guard(resources.adc_pc5).is_err() {
-        failure(&leds);
-    }
+/// Board bring-up in its own short frame; measured smaller in flash and
+/// stack for this image than inlining it into [`run`].
+#[inline(never)]
+fn bring_up() -> Boot {
+    boot(DEVICE_EUI_OFFSET)
+}
 
-    let mut ieee_address = [0u8; 8];
-    tlsr8258_hal::flash::factory_ieee(&mut ieee_address);
-    ieee_address[0] = ieee_address[0].wrapping_add(DEVICE_EUI_OFFSET);
+pub fn run() -> ! {
+    let board = bring_up();
     let mut profile = end_device_profile();
-    let device = build_device(ieee_address, resources.aes, &leds, &mut profile);
+    let device = build_device(board.ieee_address, board.aes, &board.leds, &mut profile);
 
     // The End Device owns only the security journal; the APS and child
     // partitions stay reserved (and untouched) for the router image.
     let (security_partition, _child_partition, _aps_partition) =
-        tlsr8258_tb04_product::storage::split_flash(resources.flash);
+        tlsr8258_tb04_product::storage::split_flash(board.flash);
     let mut security_store = tlsr8258_tb04_product::storage::security_store(security_partition);
     // Before ZigbeeNode construction: persisted keys/counters may never be
     // resumed under a different EUI-64, nor by a different role image.
     if device
-        .reset_security_state_if_identity_changed(&mut security_store, ieee_address)
+        .reset_security_state_if_identity_changed(&mut security_store, board.ieee_address)
         .is_err()
     {
-        failure(&leds);
+        failure(&board.leds);
     }
     if security_store
         .select_role_tag(tlsr8258_tb04_product::role::END_DEVICE)
         .is_err()
     {
-        failure(&leds);
+        failure(&board.leds);
     }
     let node = ZigbeeNode::new(device, &mut security_store, &mut profile);
-    let (status, supervisor) = led_adapters(leds);
+    let (status, supervisor) = led_adapters(board.leds);
     let parts = RouterParts::new(status, supervisor, NoDiagnostics);
     let mut app = match AlwaysOnEndDeviceApp::<_, _, _, _, _, _, EdObserver>::new_observed(
         node,

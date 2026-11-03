@@ -1,0 +1,31 @@
+[package]
+name = "tlsr8258-sensor-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "TLSR8258 adapters for the shared Zigbee sleepy-sensor application"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Chip adapter layer (compare `apps/nrf-sensor`): wake/sleep transactions,
+# LOW32K retained-platform hand-off, supervisor and diagnostics for any
+# TLSR8258 sensor product. Board wiring, identity and the fitted indicator
+# stay in the product, which plugs in through `retention::RetainedIndicator`.
+[features]
+default = []
+# Reset-on-wake LOW32K retention (`SleepDepth::Retention`). Without it the
+# wake controller rejects Retention explicitly.
+retention = [
+    "tlsr8258-hal/retention-proof",
+    "tlsr8258-rt/retention-proof",
+    "zigbee-mac/telink-retention-proof",
+]
+
+[dependencies]
+sensor-sed-app = { path = "../sensor-sed" }
+tlsr8258-hal = { path = "../../tlsr8258-hal" }
+tlsr8258-rt = { path = "../../tlsr8258-rt" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["tlsr8258", "hardware-aes"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }
