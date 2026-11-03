@@ -92,7 +92,18 @@ slow-depth fields are selected by `cfg!`.
 
 These are explicit proof images, not silent replacements for the default
 SUSPEND product. Retained application/MAC/AES/ADC state is reconstructed before
-a fresh root future calls the finite `step()` lifecycle.
+a fresh root future continues the lifecycle.
+
+A LOW32K wait never returns: the timer wake re-enters through
+`_rust_retention_entry`. The fresh root therefore first calls
+`SensorApp::resume_after_timer_wake()`, which completes the iteration that
+slept (expired join backoff, due joined poll/report work), and only then
+calls `step()`. Without it the root re-entered `step()` with the slept wait
+still pending, so the next wait shrank until it fell below the LOW32K wake
+floor (`MIN_SLEEP_TICKS`, 1.765 ms) and the image halted in `wake_failure`
+with `PowerManagement(TooShort)`; an unjoined image also never retried
+because its join backoff was never consumed. A wait below the floor is now
+busy-waited in `TelinkWake` instead of being reported as an error.
 
 The former independent retention lab (`diag-retention`, completion marker
 `0x5254600D`) was removed together with `tools/telink-tlsr8258-lab`. A LOW32K
@@ -100,6 +111,13 @@ hardware proof must now be run on the `sensor-retention` images themselves:
 repeated reset-on-wake cycles with retained network state, frame counters and
 continued ZCL reporting. A successful build or symbol check is not that
 proof.
+
+Lab result (2026-11-03, TB-04, `sensor-retention` 250 ms, functional only):
+fresh join through a third-party router, ZHA interview, about 21 minutes of
+continuous 30 s temperature/humidity reports across LOW32K wakes, silent
+resume after a hard reset with monotonic outgoing/TCLK frame counters, and an
+unjoined image (permit closed for about 4.5 minutes) that kept retrying and
+joined on its own once permit-join opened. Current was not measured.
 
 ## Router application
 
@@ -249,6 +267,11 @@ poll), which overran `.rf_dma` and retained statics and prevented joining.
 analyzer bounds both fresh-stack roots (`_rust_cold_entry`,
 `_rust_retention_entry`) within the declared 24 KiB
 (`tools/tlsr8258-sensor-retention-stack-gate.args`; ~21 KB analyzed).
+Painted high-water on hardware with the new layout, measured at the first
+retention transaction: 15,420 B after a cold resume from the journal and
+15,444 B after a fresh join, both with the guard intact (about 9.1 KB
+headroom). Warm-wake depth cannot be measured by halting, because LOW32K sleep
+resets the debug block; it is bounded by the analyzer (20,104 B).
 
 The router's old 356,352 B budget was a pre-R22 baseline. The former
 430,080 B (`0x69000`) budget was introduced above the earlier 427,776 B image.
@@ -336,7 +359,9 @@ Remaining gates:
 
 - repeated application-level default SUSPEND acceptance with network/counter
   checks and measured current;
-- LOW32K proof completion on the `sensor-retention` images;
+- LOW32K proof completion on the `sensor-retention` images: measured sleep
+  current, a multi-hour run, and ZHA device removal (a `zha.remove` was not
+  observed to reach the SED through its third-party parent);
 - pad/comparator wake modes;
 - corrected-image first-attempt child admission and complete interview;
 - the parent router: a child joining through it, its own neighbour table in

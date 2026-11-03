@@ -1433,6 +1433,41 @@ where
         Ok(())
     }
 
+    /// Complete an iteration whose wait ended by a reset-on-wake timer wake.
+    ///
+    /// A platform whose deepest sleep never returns from
+    /// [`WakeController::wait`] (for example TLSR8258 LOW32K retention,
+    /// which re-enters through a fresh executor root) calls this once after
+    /// each validated timer wake, before resuming [`step`](Self::step).
+    /// Calling `step` directly would start a new wait without the poll,
+    /// reports or unjoined backoff accounting of the iteration that slept.
+    ///
+    /// The lifecycle state is the retained pre-sleep state, so the request
+    /// that slept is recomputed; the platform has already verified that the
+    /// timer, not an early event, ended it.
+    pub async fn resume_after_timer_wake(&mut self) -> Result<(), SensorLifecycleError> {
+        if !self.initialized {
+            return Err(SensorLifecycleError::NotInitialized);
+        }
+        self.resources.supervisor.heartbeat();
+        // The service half of `step_initialized` for a timer wake, whose
+        // poll is always due.
+        if self.node.device().is_joined() {
+            let precharged_secs = self.charge_runtime_clock().await;
+            if self.node.device().is_joined() {
+                self.service_joined_polls().await;
+            }
+            self.service_periodic_joined(precharged_secs).await;
+        } else {
+            // Unjoined state is unchanged since the sleep, so this is the
+            // backoff chunk that was requested and slept.
+            let (waited_ms, _, _) = self.next_wait_ms();
+            self.join_wait_ms = self.join_wait_ms.saturating_sub(waited_ms);
+            self.service_unjoined().await;
+        }
+        Ok(())
+    }
+
     /// Convenience wrapper identical to one [`initialize`](Self::initialize)
     /// followed by an infinite sequence of [`step`](Self::step) iterations.
     pub async fn run(&mut self) -> ! {
