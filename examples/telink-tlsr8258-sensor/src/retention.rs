@@ -97,6 +97,7 @@ pub extern "C" fn TELINK_RETENTION_FRESH_ROOT(cold: bool) -> ! {
             if app.step().await.is_err() {
                 fail_closed_reset();
             }
+            tlsr8258_tb04_product::stack_guard::check();
         }
     })
 }

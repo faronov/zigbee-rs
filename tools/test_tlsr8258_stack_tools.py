@@ -192,6 +192,18 @@ class GateTest(unittest.TestCase):
         _, failure = report.chain_budget(graph, prefix, names, r"gone=missing=1")
         self.assertIn("no reachable function", failure)
 
+    def test_multiple_svc_roots_keep_the_deepest_prefix(self):
+        graph = report.Graph(call_graph(
+            {"cold": 300, "warm": 100, "shared": 50, "leaf": 1000},
+            {"cold": ["shared"], "warm": ["shared"], "shared": ["leaf"]}))
+        per_root, prefix, parent = report.analyze_roots(graph, ["warm", "cold"])
+        self.assertEqual(set(per_root), {"warm", "cold"})
+        self.assertEqual(graph.subtree["cold"], 1350)
+        self.assertEqual(graph.subtree["warm"], 1150)
+        self.assertEqual(prefix["shared"], 300)
+        self.assertEqual(parent["shared"], "cold")
+        self.assertEqual(per_root["warm"][0]["shared"], 100)
+
     def test_reset_vector_is_never_an_indirect_target(self):
         words = {0x4000: 0x1, 0x4004: 0x2001}
         functions = {

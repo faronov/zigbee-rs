@@ -242,16 +242,23 @@ verify_layout() {
     fi
 
     if [[ "$image_feature" == retention-proof* ]]; then
+        # Retained state (.data/.bss/.retained/.rf_dma plus a 256 B tripwire)
+        # stays in LOW32K. The stacks and their 64 B guard live in the
+        # non-retained upper 32 KiB: a retention wake re-enters __reset with
+        # fresh stack pointers, so no stack byte must survive sleep.
         if (( retention_limit != 0x848000 ||
               sdata >= retention_limit || ebss > retained_start ||
               retained_end > rf_dma_start || rf_dma_end > guard_start ||
-              guard_end - guard_start < 0x100 || guard_end > svc_bottom ||
-              svc_top > irq_bottom || irq_top > retention_limit ||
-              retention_limit - irq_top < 0x400 ||
-              svc_top - svc_bottom < 0x2000 )); then
-            printf 'retention-layout FAIL: data=0x%X bss=0x%X retained=[0x%X..0x%X) dma=[0x%X..0x%X) guard=[0x%X..0x%X) svc=[0x%X..0x%X) irq=[0x%X..0x%X) limit=0x%X\n' \
+              guard_end - guard_start < 0x100 || guard_end > retention_limit ||
+              svc_bottom != 0x849C00 || svc_top != 0x84FC00 ||
+              irq_bottom != 0x84FC00 || irq_top != 0x850000 ||
+              svc_guard_end != svc_bottom || svc_guard_end - svc_guard_start != 64 ||
+              svc_guard_start < retention_limit ||
+              svc_guard_start - rf_dma_end < 0x1000 || svc_guard_start - ebss < 0x1000 )); then
+            printf 'retention-layout FAIL: data=0x%X bss=0x%X retained=[0x%X..0x%X) dma=[0x%X..0x%X) tripwire=[0x%X..0x%X) svc_guard=[0x%X..0x%X) svc=[0x%X..0x%X) irq=[0x%X..0x%X) limit=0x%X\n' \
                 "$sdata" "$ebss" "$retained_start" "$retained_end" \
                 "$rf_dma_start" "$rf_dma_end" "$guard_start" "$guard_end" \
+                "$svc_guard_start" "$svc_guard_end" \
                 "$svc_bottom" "$svc_top" "$irq_bottom" "$irq_top" "$retention_limit" >&2
             exit 1
         fi
@@ -300,7 +307,14 @@ verify_layout() {
                 "$block_on_count" >&2
             exit 1
         fi
-        echo "retention-layout OK: all writable/DMA/stacks below LOW32K; fresh-root and restore symbols present"
+        # Heuristic static stack gate over both SVC roots (see the args file);
+        # HIL paint stays the authoritative runtime evidence.
+        TC32_TOOLCHAIN="$TC32_TOOLCHAIN" python3 "$ROOT_DIR/tools/tlsr8258-stack-report.py" "$elf" \
+            --objdump "$LLVM_OBJDUMP" --compact --check \
+            @"$ROOT_DIR/tools/tlsr8258-sensor-retention-stack-gate.args" > /dev/null
+        printf 'retention-layout OK: retained state below 0x%X (tripwire [0x%X..0x%X)); svc=[0x%X..0x%X) %d B + 64 B guard in non-retained RAM, gap to rf_dma_end=%d B; stack gate passed\n' \
+            "$retention_limit" "$guard_start" "$guard_end" "$svc_bottom" "$svc_top" \
+            "$((svc_top - svc_bottom))" "$((svc_guard_start - rf_dma_end))"
     else
         # HW-04: declared 20 KiB SVC stack, a 64 B guard directly below it,
         # and >= 4 KiB of unused RAM between every static/DMA byte and the

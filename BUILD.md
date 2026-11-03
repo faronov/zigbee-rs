@@ -451,8 +451,11 @@ The mandatory physical `0x70000` boundary and all journals are unchanged:
 that snapshot has 22,680 B of physical headroom. The 28,672 B difference
 between the former budget and physical boundary is not a reserved partition.
 
-The LOW32K images retain an 8,448 B fresh-root SVC stack, 256 B above the
-8 KiB gate.
+The LOW32K images place their 24 KiB fresh-root SVC stack, its 64 B guard and
+the IRQ stack in non-retained SRAM (`[0x849BC0, 0x850000)`); only retained
+state stays below `0x848000`. The build runs the static stack analyzer over
+both entry roots against that budget
+(`tools/tlsr8258-sensor-retention-stack-gate.args`).
 
 ## Documentation
 

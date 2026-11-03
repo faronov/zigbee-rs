@@ -44,7 +44,7 @@ partitions, linker layout, and which LED state a LOW32K wake restores.
 
 | Layer | Crate / file | Owns |
 |---|---|---|
-| runtime | `tlsr8258-rt` `retention` (feature `retention-proof`) | `RetainedCell`, the checksummed `RetainedRoot` commit record, retention stack guard, the `TELINK_RETENTION_IMAGE` layout marker |
+| runtime | `tlsr8258-rt` `retention` (feature `retention-proof`) | `RetainedCell`, the checksummed `RetainedRoot` commit record, retained-state tripwire, the `TELINK_RETENTION_IMAGE` layout marker |
 | chip adapter | `apps/tlsr8258-sensor` (`tlsr8258-sensor-app`) | `TelinkWake` (Active/SUSPEND/LOW32K `WakeController`), retained MAC/AES/ADC platform record, wake resume and fail-closed reset, `TelinkSupervisor`, `TelinkNoDiagnostics`, `init_sleep_clocks` |
 | product | `products/tlsr8258-tb04` `boot`, `sensor` | TB-04 bring-up (`boot`, `failure`, `halted`) shared by sensor/ED/router; sensor identity, `SENSOR_POLICY`, clusters, synthetic source, RGB status and its `RetainedIndicator` |
 | example | `examples/telink-tlsr8258-sensor` | entries (`main.rs`), part list and device builder (`app.rs`), SUSPEND root (`suspend.rs`), LOW32K retained statics and fresh root (`retention.rs`) |
@@ -233,8 +233,22 @@ Former regression budgets are historical comparisons, no longer enforced:
 | LOW32K 10 s proof | 295,552 | 299,008 | 3,456 |
 | parent router | 436,072 | 430,080 | -5,992 |
 
-The retained LOW32K fresh-root SVC stack is 8,448 B, 256 B above its 8 KiB
-gate.
+The LOW32K images keep only state that must survive deep retention below
+`0x848000`: `.ram_code`, `.data`, `.bss`, `.retained`, `.rf_dma` and a
+256 B retained tripwire after the last DMA byte, verified before a wake is
+accepted. The stacks do not need to survive sleep (every entry reloads both
+stack pointers), so they live in the non-retained upper 32 KiB with the same
+placement as the default image: a 24 KiB SVC stack `[0x849C00, 0x84FC00)`, a
+64 B guard `[0x849BC0, 0x849C00)` re-armed on every cold and retention entry
+and checked after every executor step and before every flash erase/program,
+and the 1 KiB IRQ stack `[0x84FC00, 0x850000)`. The previous layout gave the
+fresh root an 11,008 B SVC stack in LOW32K without a guard; hardware measured
+about 11.7 KB on the join path (association, transport-key wait, soft-MAC
+poll), which overran `.rf_dma` and retained statics and prevented joining.
+`tools/tlsr8258-firmware.sh` now fails the LOW32K build unless the static
+analyzer bounds both fresh-stack roots (`_rust_cold_entry`,
+`_rust_retention_entry`) within the declared 24 KiB
+(`tools/tlsr8258-sensor-retention-stack-gate.args`; ~21 KB analyzed).
 
 The router's old 356,352 B budget was a pre-R22 baseline. The former
 430,080 B (`0x69000`) budget was introduced above the earlier 427,776 B image.

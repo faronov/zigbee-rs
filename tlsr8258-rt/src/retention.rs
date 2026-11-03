@@ -5,8 +5,12 @@
 //! startup). Composition roots place their long-lived objects in
 //! [`RetainedCell`]s inside the product's NOLOAD `.retained` section and
 //! publish them with one [`RetainedRoot`] header. A wake is accepted only if
-//! that header still names the same cells and the stack guard below the fresh
-//! SVC stack is intact; anything else must reset rather than resume.
+//! that header still names the same cells and the retained tripwire that the
+//! product linker places directly after the last retained/DMA byte
+//! (`_retention_stack_guard_*`) is intact; anything else must reset rather
+//! than resume. The stacks themselves need not be retained: every entry
+//! reloads both stack pointers, so a product may place them (and their own
+//! guard) in non-retained SRAM.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -199,8 +203,8 @@ fn stack_guard_range() -> (*mut u8, *mut u8) {
     )
 }
 
-/// True if the linker-placed guard below the retention SVC stack still holds
-/// the pattern painted by [`RetainedRoot::begin_cold`].
+/// True if the linker-placed retained tripwire after the last retained/DMA
+/// byte still holds the pattern painted by [`RetainedRoot::begin_cold`].
 #[cfg(target_arch = "tc32")]
 pub fn stack_guard_intact() -> bool {
     let (mut cursor, end) = stack_guard_range();

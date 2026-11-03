@@ -110,13 +110,23 @@ SECTIONS
     } > RAM
 
     /*
-     * The feature image emits TELINK_RETENTION_IMAGE. It places a fresh,
-     * deliberately smaller root stack, IRQ stack and guards wholly in LOW32K.
-     * The default image keeps the stacks at the top of the 64 KiB SRAM:
-     * a 20 KiB SVC stack derived from its top, a 64-byte guard immediately
-     * below it, and the 1 KiB IRQ stack above it. At least 4 KiB of unused
-     * physical RAM must separate the last static allocation from the guard;
-     * that gap is not part of the stack budget.
+     * Both layouts keep the stacks at the top of the 64 KiB SRAM: the SVC
+     * stack grows down from 0x84FC00, a 64-byte guard sits immediately below
+     * it, and the 1 KiB IRQ stack occupies [0x84FC00, 0x850000). At least
+     * 4 KiB of unused physical RAM must separate the last static allocation
+     * from the guard; that gap is not part of the stack budget.
+     *
+     * The default image uses a 20 KiB SVC stack. The feature image emits
+     * TELINK_RETENTION_IMAGE and uses a 24 KiB SVC stack (its analyzed
+     * worst case exceeds 20 KiB; see tools/tlsr8258-sensor-retention-stack-
+     * gate.args). In that image the stacks and their guard live entirely in
+     * the upper 32 KiB, which is NOT retained in LOW32K deep retention: a
+     * retention wake re-enters `__reset`, which reloads both stack pointers
+     * and re-arms the SVC guard before any stack-deep work, so no stack
+     * content is needed across sleep. Everything that must survive sleep
+     * (.ram_code, .data, .bss, .retained, .rf_dma) stays below
+     * _retention_limit_, followed by a 256-byte retained tripwire that is
+     * painted on cold boot and verified before a wake is accepted.
      */
     _retention_image_enabled_ = DEFINED(TELINK_RETENTION_IMAGE);
     _retention_limit_ = 0x00848000;
@@ -124,22 +134,19 @@ SECTIONS
         _retention_image_enabled_ ? ((_rf_dma_end_ + 15) & ~15) : 0;
     _retention_stack_guard_end_ =
         _retention_image_enabled_ ? _retention_stack_guard_start_ + 0x100 : 0;
-    _retention_svc_bottom_ =
-        (_retention_stack_guard_end_ + 0xFF) & ~0xFF;
 
     _default_svc_stack_top_ = 0x0084FC00;
     _default_svc_stack_bytes_ = 20 * 1024;
+    _retention_svc_stack_bytes_ = 24 * 1024;
     _default_svc_stack_guard_bytes_ = 64;
     _default_min_static_gap_ = 4096;
-    _svc_stack_top    = _retention_image_enabled_ ? 0x00847800 : _default_svc_stack_top_;
-    _svc_stack_bottom = _retention_image_enabled_ ? _retention_svc_bottom_
-        : _default_svc_stack_top_ - _default_svc_stack_bytes_;
-    _svc_stack_guard_end = _retention_image_enabled_ ? 0 : _svc_stack_bottom;
-    _svc_stack_guard_start = _retention_image_enabled_ ? 0
-        : _svc_stack_bottom - _default_svc_stack_guard_bytes_;
-    _irq_stack_bottom = _retention_image_enabled_ ? 0x00847800 : 0x0084FC00;
-    _irq_stack_top    = _retention_image_enabled_ ? 0x00847C00 : 0x00850000;
-    _retention_top_guard_end_ = _retention_image_enabled_ ? _retention_limit_ : 0;
+    _svc_stack_top    = _default_svc_stack_top_;
+    _svc_stack_bottom = _default_svc_stack_top_ - (_retention_image_enabled_
+        ? _retention_svc_stack_bytes_ : _default_svc_stack_bytes_);
+    _svc_stack_guard_end = _svc_stack_bottom;
+    _svc_stack_guard_start = _svc_stack_bottom - _default_svc_stack_guard_bytes_;
+    _irq_stack_bottom = 0x0084FC00;
+    _irq_stack_top    = 0x00850000;
     _stack_top = _svc_stack_top;
 
     _bin_size_ = _code_size_ + SIZEOF(.data);
@@ -177,30 +184,30 @@ SECTIONS
     _assert_default_svc_stack = ASSERT(_retention_image_enabled_ ||
         (_svc_stack_top - _svc_stack_bottom) == _default_svc_stack_bytes_,
         "ERROR: default SVC stack must be exactly 20 KiB");
-    _assert_default_svc_guard = ASSERT(_retention_image_enabled_ ||
+    _assert_retention_svc_stack = ASSERT(!_retention_image_enabled_ ||
+        (_svc_stack_top - _svc_stack_bottom) == _retention_svc_stack_bytes_,
+        "ERROR: retention SVC stack must be exactly 24 KiB");
+    _assert_svc_guard = ASSERT(
         (_svc_stack_guard_end - _svc_stack_guard_start) == _default_svc_stack_guard_bytes_,
-        "ERROR: default SVC stack guard must be 64 bytes");
-    _assert_default_static_gap = ASSERT(_retention_image_enabled_ ||
-        (_svc_stack_guard_start >= _rf_dma_end_ + _default_min_static_gap_ &&
-         _svc_stack_guard_start >= _ebss + _default_min_static_gap_),
+        "ERROR: SVC stack guard must be 64 bytes");
+    _assert_static_gap = ASSERT(
+        _svc_stack_guard_start >= _rf_dma_end_ + _default_min_static_gap_ &&
+        _svc_stack_guard_start >= _ebss + _default_min_static_gap_,
         "ERROR: less than 4 KiB between static RAM and the SVC stack guard");
+    _assert_stacks_above_irq = ASSERT(_svc_stack_top <= _irq_stack_bottom &&
+        _irq_stack_top <= 0x00850000,
+        "ERROR: SVC/IRQ stacks overlap or exceed physical SRAM");
     _assert_retained_state_low32 = ASSERT(!_retention_image_enabled_ ||
-        (_retained_end_ <= _retention_limit_ && _rf_dma_end_ <= _retention_limit_),
-        "ERROR: retained writable/RF state exceeds LOW32K");
+        (_retained_end_ <= _retention_limit_ && _rf_dma_end_ <= _retention_limit_ &&
+         _ebss <= _retention_limit_ &&
+         _retention_stack_guard_end_ <= _retention_limit_),
+        "ERROR: retained writable/RF state or its tripwire exceeds LOW32K");
     _assert_retention_guard = ASSERT(!_retention_image_enabled_ ||
         (_retention_stack_guard_end_ - _retention_stack_guard_start_) >= 0x100,
-        "ERROR: LOW32K state/stack guard is smaller than 256 bytes");
-    _assert_retention_svc_size = ASSERT(!_retention_image_enabled_ ||
-        (_svc_stack_top - _svc_stack_bottom) >= 0x2000,
-        "ERROR: retained fresh-root SVC stack is smaller than 8 KiB");
-    _assert_retention_stacks_low32 = ASSERT(!_retention_image_enabled_ ||
-        (_svc_stack_bottom >= _retention_stack_guard_end_ &&
-         _svc_stack_top <= _irq_stack_bottom &&
-         _irq_stack_top <= _retention_limit_),
-        "ERROR: retained stack/guard ranges overlap or exceed LOW32K");
-    _assert_retention_top_guard = ASSERT(!_retention_image_enabled_ ||
-        (_retention_limit_ - _irq_stack_top) >= 0x400,
-        "ERROR: LOW32K top guard is smaller than 1 KiB");
+        "ERROR: LOW32K retained tripwire is smaller than 256 bytes");
+    _assert_retention_stacks_unretained = ASSERT(!_retention_image_enabled_ ||
+        _svc_stack_guard_start >= _retention_limit_,
+        "ERROR: retention stacks/guard must live in the non-retained upper 32 KiB");
     _assert_image_below_aps_nv = ASSERT(_bin_size_ <= _aps_nv_start_,
         "ERROR: firmware image overlaps APS-table journal at 0x70000");
     _assert_aps_nv_before_child_nv = ASSERT(_aps_nv_end_ <= _child_nv_start_,
