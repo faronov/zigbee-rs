@@ -38,11 +38,21 @@ pub unsafe extern "C" fn _rust_entry() -> ! {
     suspend::run()
 }
 
+/// The LOW32K image keeps the SVC stack and its 64 B guard in non-retained
+/// upper SRAM, which loses power in retention: both entries re-arm the guard
+/// before any stack-deep work or flash write. One out-of-line copy.
+#[cfg(feature = "retention-proof")]
+#[inline(never)]
+fn arm_stack_guard() {
+    tlsr8258_tb04_product::stack_guard::arm();
+}
+
 /// Cold entry of the LOW32K image: same clock bring-up, then every
 /// long-lived object is built in retained storage.
 #[cfg(feature = "retention-proof")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _rust_cold_entry() -> ! {
+    arm_stack_guard();
     if !tlsr8258_sensor_app::init_sleep_clocks() {
         halt();
     }
@@ -54,6 +64,7 @@ pub unsafe extern "C" fn _rust_cold_entry() -> ! {
 #[cfg(feature = "retention-proof")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _rust_retention_entry() -> ! {
+    arm_stack_guard();
     if tlsr8258_hal::clocks::init().is_err() {
         retention::fail_closed_reset();
     }

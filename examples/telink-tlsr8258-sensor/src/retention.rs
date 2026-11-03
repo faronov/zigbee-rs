@@ -90,13 +90,20 @@ pub fn fail_closed_reset() -> ! {
 pub extern "C" fn TELINK_RETENTION_FRESH_ROOT(cold: bool) -> ! {
     tlsr8258_rt::block_on(async move {
         let app = unsafe { TELINK_RETAINED_APP_STORAGE.get() };
-        if cold && app.initialize().await.is_err() {
-            halted();
+        if cold {
+            if app.initialize().await.is_err() {
+                halted();
+            }
+        } else if app.resume_after_timer_wake().await.is_err() {
+            // The LOW32K sleep never returns from `wait`: finish the
+            // iteration that slept before starting the next one.
+            fail_closed_reset();
         }
         loop {
             if app.step().await.is_err() {
                 fail_closed_reset();
             }
+            tlsr8258_tb04_product::stack_guard::check();
         }
     })
 }

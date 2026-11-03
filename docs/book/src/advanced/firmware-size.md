@@ -181,7 +181,7 @@ assertions; removing the regression gate does not establish hardware acceptance.
 | CC2340R5 fallback | 16 | 17,428 | 17,444 | 19,420 available |
 | ESP32-C6 default / `light-sleep` | 3,412 / 3,608 | 50,384 | 53,796 / 53,992 | 390,696 / 390,504 linked |
 | ESP32-H2 default / `light-sleep` | 3,120 / 3,368 | 50,328 | 53,448 / 53,696 | 201,312 / 200,640 linked |
-| TLSR8258 retained fresh-root SVC | — | — | — | 8,448 linked |
+| TLSR8258 LOW32K fresh-root SVC (non-retained) | — | — | — | 24,576 linked |
 
 ESP32 initialized data includes `.data.wifi` (80 B for C6, 84 B for H2);
 the static totals exclude RAM-resident code. The always-on nRF52840 image

@@ -85,13 +85,13 @@ impl NorFlash for GuardedFlash {
     const ERASE_SIZE: usize = FlashRegion::ERASE_SIZE;
 
     fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
-        #[cfg(feature = "router")]
+        #[cfg(any(feature = "router", feature = "retention-proof"))]
         crate::stack_guard::check();
         self.0.erase(from, to)
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
-        #[cfg(feature = "router")]
+        #[cfg(any(feature = "router", feature = "retention-proof"))]
         crate::stack_guard::check();
         self.0.write(offset, bytes)
     }

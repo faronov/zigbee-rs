@@ -411,6 +411,23 @@ def describe_path(graph, path, start, pretty, width):
     return rows
 
 
+def analyze_roots(graph, roots):
+    """Analyze several entry roots that each start on a fresh SVC stack.
+
+    Returns per-root (prefix, parent) maps plus a merged view in which every
+    function keeps the deepest caller prefix over all roots."""
+    per_root = {}
+    merged_prefix, merged_parent = {}, {}
+    for root in roots:
+        prefix, parent = graph.analyze(root)
+        per_root[root] = (prefix, parent)
+        for name, depth in prefix.items():
+            if depth > merged_prefix.get(name, -1):
+                merged_prefix[name] = depth
+                merged_parent[name] = parent[name]
+    return per_root, merged_prefix, merged_parent
+
+
 def layout_failures(layout, declared_svc=None, declared_irq=None, min_gap=None):
     failures = []
     for label, required, actual in (
@@ -514,7 +531,9 @@ def main():
     parser.add_argument("--objdump", default=str(toolchain / "llvm" / "bin" / "llvm-objdump"))
     parser.add_argument("--cxxfilt", default=str(toolchain / "llvm" / "bin" / "llvm-cxxfilt"))
     parser.add_argument("--disassembly", help="reuse an existing `llvm-objdump -d` listing")
-    parser.add_argument("--svc-root", default="_rust_entry")
+    parser.add_argument("--svc-root", action="append", default=[],
+                        help="SVC entry root (repeatable; each starts on a fresh SVC stack "
+                             "and must fit the declared budget). Default: _rust_entry")
     parser.add_argument("--irq-root", default="__irq")
     parser.add_argument("--frame-threshold", type=int, default=1024)
     parser.add_argument("--max-frame", type=int, help="fail --check when a frame exceeds this")
@@ -545,6 +564,7 @@ def main():
     parser.add_argument("--allow-unresolved", action="append", default=[], metavar="REGEX",
                         help="reviewed function allowed to keep unresolved indirect call sites")
     args = parser.parse_args()
+    svc_roots = args.svc_root or ["_rust_entry"]
 
     elf = Elf(args.elf)
     if args.disassembly:
@@ -599,13 +619,15 @@ def main():
               "indirect_branches": []}
     failures = layout_failures(layout, args.declared_svc, args.declared_irq, args.min_gap)
     frame_allow = parse_frame_allow(args.frame_allow)
-    for label, root, budget in (
-        ("svc", args.svc_root, layout["declared_svc_stack_bytes"]),
-        ("irq", args.irq_root, layout["declared_irq_stack_bytes"]),
-    ):
+    for root in svc_roots + [args.irq_root]:
         if root not in functions:
             raise SystemExit(f"root function {root} not found")
-        prefix, parent = graph.analyze(root)
+    per_root, svc_prefix, svc_parent = analyze_roots(graph, svc_roots)
+    irq_prefix, _ = graph.analyze(args.irq_root)
+    entries = [("svc" if len(svc_roots) == 1 else f"svc:{root}", root, per_root[root][0],
+                layout["declared_svc_stack_bytes"]) for root in svc_roots]
+    entries.append(("irq", args.irq_root, irq_prefix, layout["declared_irq_stack_bytes"]))
+    for label, root, prefix, budget in entries:
         worst = graph.subtree[root]
         report["roots"][label] = {
             "root": root,
@@ -616,8 +638,6 @@ def main():
         }
         if worst > budget:
             failures.append(f"{label} worst static path {worst} B > declared {budget} B")
-        if label == "svc":
-            svc_prefix, svc_parent = prefix, parent
 
     for name, function in sorted(functions.items(), key=lambda item: -item[1]["frame"]):
         if function["frame"] < args.frame_threshold:

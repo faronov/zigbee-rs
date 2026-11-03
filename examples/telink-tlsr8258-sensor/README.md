@@ -96,7 +96,17 @@ These artificial budgets are no longer enforced. The physical `0x70000`
 application boundary, protected journals/factory data, RAM, and stack checks
 remain mandatory.
 
-The retained fresh-root SVC stack is 8,448 B, 256 B above its 8 KiB gate.
+The LOW32K images keep only retained state (code, data, `.retained`, RF DMA
+and a 256 B tripwire) below `0x848000`. Their fresh-root SVC stack is
+24 KiB at `[0x849C00, 0x84FC00)` in non-retained SRAM, with a 64 B guard below
+it that both entries re-arm and the IRQ stack above it; the build fails if the
+static analyzer bounds either entry root above 24 KiB
+(`tools/tlsr8258-sensor-retention-stack-gate.args`). Hardware paint measured
+15,420 B (cold resume) and 15,444 B (fresh join) with the guard intact.
+
+A LOW32K timer wake re-enters the fresh root, which calls
+`SensorApp::resume_after_timer_wake()` before `step()` so the iteration that
+slept is serviced; waits shorter than the LOW32K wake floor are busy-waited.
 
 ## Storage
 

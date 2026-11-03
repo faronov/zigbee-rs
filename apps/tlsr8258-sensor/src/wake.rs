@@ -132,7 +132,17 @@ impl WakeController<TelinkMac> for TelinkWake {
             }
             SleepDepth::Idle => suspend(mac, request.timeout_ms)?,
             #[cfg(feature = "retention")]
-            SleepDepth::Retention => retention_sleep(mac, request.timeout_ms)?,
+            SleepDepth::Retention => {
+                // The lifecycle may shorten a wait to 1 ms; below the PM
+                // early-wake floor a LOW32K entry is rejected (`TooShort`),
+                // so such a residue is waited out actively instead.
+                let ticks = tlsr8258_hal::pm::system_timer_ms(request.timeout_ms);
+                if ticks < tlsr8258_hal::pm::calc::MIN_SLEEP_TICKS {
+                    tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(request.timeout_ms));
+                } else {
+                    retention_sleep(mac, request.timeout_ms)?
+                }
+            }
             #[cfg(not(feature = "retention"))]
             SleepDepth::Retention => return Err(TelinkWakeError::RetentionUnsupported),
         }

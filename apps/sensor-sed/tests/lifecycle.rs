@@ -2018,6 +2018,10 @@ struct Script {
     /// any network search the app starts would succeed.
     beacon: bool,
     steps: usize,
+    /// Emulate a reset-on-wake platform: each iteration's sleep is taken by
+    /// the platform (time advances by the request) and the app resumes with
+    /// `resume_after_timer_wake` instead of returning from `wait`.
+    reset_on_wake: bool,
 }
 
 impl Script {
@@ -2030,6 +2034,7 @@ impl Script {
             reasons: Vec::new(),
             beacon: false,
             steps,
+            reset_on_wake: false,
         }
     }
 }
@@ -2089,7 +2094,11 @@ fn run_scenario<A: sensor_sed_app::UserActionPolicy, const MODULUS: u64>(
         .expect("valid scenario policy");
         block_on(app.initialize()).unwrap();
         for _ in 0..script.steps {
-            block_on(app.step()).unwrap();
+            if script.reset_on_wake {
+                block_on(app.resume_after_timer_wake()).unwrap();
+            } else {
+                block_on(app.step()).unwrap();
+            }
         }
     }
 
@@ -2209,6 +2218,64 @@ fn unjoined_backoff_doubles_sleeps_and_blinks_only_during_attempts() {
         .count();
     assert_eq!(blinks, 2 * 6);
     assert_eq!(unjoined.delay_calls, 3 * 6);
+}
+
+#[test]
+fn reset_on_wake_resume_finishes_the_slept_iteration_without_a_new_wait() {
+    let mut script = Script::new(&BASE_POLICY, 5);
+    script.reset_on_wake = true;
+    let resumed = run_scenario::<_, { 1 << 32 }>(script, NoUserAction);
+    assert!(!resumed.joined);
+    assert!(resumed.waits.is_empty(), "the platform owned every sleep");
+    // Each resumed timer wake charges the whole backoff chunk, so it
+    // makes exactly the attempt `step` would have made after its wait.
+    assert_eq!(resumed.backoffs(), vec![100, 200, 400, 800, 1_600, 3_200]);
+    assert_eq!(resumed.attempts(), 5);
+}
+
+#[test]
+fn reset_on_wake_resume_polls_a_joined_parent_and_requires_initialization() {
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::with_state(commissioned_state(0x02), &store_calls);
+    let mut profile = test_profile();
+    let mut device = test_device(&profile, &BASE_POLICY);
+
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake = RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+        let mut app = SensorApp::new(
+            node,
+            &BASE_POLICY,
+            parts(
+                wake,
+                RecordingStatus { events: &status },
+                NoOta,
+                &environment_samples,
+                &battery_samples,
+                &heartbeats,
+                &diagnostics,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            block_on(app.resume_after_timer_wake()),
+            Err(SensorLifecycleError::NotInitialized)
+        );
+        block_on(app.initialize()).unwrap();
+        block_on(app.resume_after_timer_wake()).unwrap();
+    }
+
+    assert!(device.is_joined());
+    assert!(waits.borrow().is_empty());
+    assert!(device.mac().poll_count() > 0, "the slept poll is serviced");
 }
 
 #[test]
