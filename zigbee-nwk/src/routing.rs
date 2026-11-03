@@ -894,18 +894,29 @@ impl Default for BtrTable {
     }
 }
 
-// ── Broadcast passive acknowledgement (R22 §3.6.5) ───────────
+// ── Broadcast transmission schedule (R22 §3.6.5, §3.6.3.5.2) ──
 
-/// Broadcasts this router is still waiting to hear relayed.
+/// Broadcasts this router still has to put on air: relays waiting out their
+/// jitter, and transmitted broadcasts kept for passive acknowledgement or
+/// Route Request retries.
 #[cfg(feature = "router")]
-pub const MAX_PENDING_BROADCASTS: usize = 2;
+pub const MAX_PENDING_BROADCASTS: usize = 4;
 /// Router neighbours remembered per broadcast as having relayed it.
 #[cfg(feature = "router")]
 pub const MAX_PASSIVE_ACK_NEIGHBORS: usize = 8;
 
-/// A broadcast this router transmitted and keeps for retransmission until
-/// each of its router neighbours has been heard relaying it (passive
-/// acknowledgement) or `nwkMaxBroadcastRetries` is exhausted.
+/// A broadcast this router transmits on a deadline instead of waiting for it
+/// in line.
+///
+/// A relayed broadcast or Route Request is first held for its random jitter
+/// (`sent == false`). Once on air, an ordinary broadcast is kept for
+/// retransmission until each of its router neighbours has been heard relaying
+/// it (passive acknowledgement) or `nwkMaxBroadcastRetries` is exhausted; a
+/// forwarded Route Request is repeated `nwkcRREQRetries` times at
+/// `nwkcRREQRetryInterval` regardless of what was overheard.
+///
+/// Every deadline is serviced from the maintenance pass, so the receive path
+/// keeps draining the radio while a broadcast waits.
 #[cfg(feature = "router")]
 pub(crate) struct PendingBroadcast {
     pub src: ShortAddress,
@@ -914,32 +925,59 @@ pub(crate) struct PendingBroadcast {
     /// it is the same broadcast transaction, not a new one, so neighbours
     /// that already received it drop the copy as a duplicate/replay.
     pub frame: heapless::Vec<u8, { crate::nlde::MAX_NWK_FRAME }>,
+    /// Transmissions still owed after the next one goes on air.
     pub retries_left: u8,
-    /// When the passive acknowledgement window closes.
+    /// When the next transmission is due.
     pub deadline_us: u32,
+    /// Whether the frame has been put on air at least once.
+    pub sent: bool,
+    /// A forwarded Route Request: fixed retries, passive acks ignored.
+    pub rreq: bool,
+    /// MAC handle reused for every copy of a Route Request.
+    pub handle: u8,
     /// Neighbours heard (re)transmitting this broadcast.
     pub heard: heapless::Vec<ShortAddress, MAX_PASSIVE_ACK_NEIGHBORS>,
 }
 
-/// Broadcasts awaiting passive acknowledgement.
+/// Broadcasts waiting for their next transmission deadline.
 #[cfg(feature = "router")]
-pub(crate) struct PassiveAckTable {
+pub(crate) struct BroadcastTxTable {
     pub entries: heapless::Vec<PendingBroadcast, MAX_PENDING_BROADCASTS>,
 }
 
 #[cfg(feature = "router")]
-impl PassiveAckTable {
+impl BroadcastTxTable {
     pub const fn new() -> Self {
         Self {
             entries: heapless::Vec::new(),
         }
     }
 
-    /// Start waiting for neighbours to relay a broadcast just transmitted.
+    /// Whether a broadcast that has not been put on air yet would be
+    /// accepted by [`Self::schedule`].
+    pub fn can_schedule(&self) -> bool {
+        !self.entries.is_full() || self.entries.iter().any(|e| e.sent)
+    }
+
+    /// Hold a broadcast for its next transmission.
     ///
-    /// With no free entry the broadcast is simply not retransmitted; an
-    /// entry still inside its window is never displaced.
-    pub fn track(&mut self, pending: PendingBroadcast) -> bool {
+    /// A broadcast that has not been on air yet outranks the optional
+    /// retransmissions of one that has: with no free entry it displaces a
+    /// transmitted broadcast (an ordinary one before a Route Request, whose
+    /// retries are unconditional). A broadcast that was already transmitted
+    /// never displaces anything, and one still waiting for its first
+    /// transmission is never displaced.
+    pub fn schedule(&mut self, pending: PendingBroadcast) -> bool {
+        if self.entries.is_full() && !pending.sent {
+            let victim = self
+                .entries
+                .iter()
+                .position(|e| e.sent && !e.rreq)
+                .or_else(|| self.entries.iter().position(|e| e.sent));
+            if let Some(index) = victim {
+                self.entries.swap_remove(index);
+            }
+        }
         self.entries.push(pending).is_ok()
     }
 

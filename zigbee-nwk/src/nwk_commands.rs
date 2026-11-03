@@ -9,17 +9,26 @@ use crate::frames::{
     PanIdConflictReport, PanIdUpdate, RouteReply, RouteRequest,
 };
 use crate::nlde::{is_nwk_broadcast, is_unicast_address};
+#[cfg(feature = "router")]
 use crate::routing::routing_random_sample;
 use crate::{IndirectFrameKind, LeaveRequestDelivery, NwkLayer, NwkStatus};
-use zigbee_mac::{AddressMode, MacDriver, McpsDataRequest, TxOptions};
+use zigbee_mac::MacDriver;
+#[cfg(not(feature = "router"))]
+use zigbee_mac::{AddressMode, McpsDataRequest, TxOptions};
 use zigbee_types::*;
 
 const ALL_ROUTERS_AND_COORDINATOR: ShortAddress = ShortAddress(0xFFFC);
 /// R22 §3.4.8.2 — a Link Status frame is a one-hop broadcast.
 const LINK_STATUS_RADIUS: u8 = 1;
+/// `nwkcRREQRetries`.
+#[cfg(feature = "router")]
 const RREQ_RELAY_RETRIES: u8 = 2;
-const RREQ_RETRY_INTERVAL_US: u32 = 254_000;
+/// `nwkcRREQRetryInterval`.
+#[cfg(feature = "router")]
+pub(crate) const RREQ_RETRY_INTERVAL_US: u32 = 254_000;
+#[cfg(feature = "router")]
 const MIN_RREQ_JITTER_MS: u32 = 2;
+#[cfg(feature = "router")]
 const MAX_RREQ_JITTER_MS: u32 = 128;
 
 impl<M: MacDriver> NwkLayer<M> {
@@ -858,7 +867,13 @@ impl<M: MacDriver> NwkLayer<M> {
     /// NWK security is hop by hop, so the frame is re-secured through the
     /// shared builder with *this* device's IEEE address and a fresh durable
     /// frame counter over the header that actually goes on air.
-    async fn forward_route_request(
+    ///
+    /// The frame is only scheduled here: R22 §3.6.3.5.2 delays the relay by
+    /// 2*R[2,128] ms and repeats it `nwkcRREQRetries` (2) times at
+    /// `nwkcRREQRetryInterval`, and [`Self::service_broadcast_tx`] carries
+    /// out those transmissions while the receive loop keeps running.
+    #[cfg(feature = "router")]
+    fn schedule_route_request_forward(
         &mut self,
         pending: &crate::QueuedRreqForward,
     ) -> Result<(), NwkStatus> {
@@ -907,13 +922,13 @@ impl<M: MacDriver> NwkLayer<M> {
         let mut buf = [0u8; crate::nlde::MAX_NWK_FRAME];
         let total_len = self.build_nwk_frame(&header, &cmd[..cmd_len], &mut buf)?;
 
-        // R22 delays the original relay by 2*R[2,128] ms and retransmits it
-        // `nwkcRREQRetries` (2) times at the 254 ms retry interval. Reuse the
-        // same NWK frame for all three MAC broadcasts: they are retries of one
-        // discovery, not new NWK/security transactions.
+        // The same NWK frame and MAC handle serve all three MAC broadcasts:
+        // they are retries of one discovery, not new NWK/security
+        // transactions. The NWK sequence number in the header stays the
+        // originator's.
+        let now = self.mac.monotonic_micros();
         let sample = routing_random_sample(
-            self.mac.monotonic_micros()
-                ^ (u32::from(self.nib.network_address.0) << 16)
+            now ^ (u32::from(self.nib.network_address.0) << 16)
                 ^ u32::from(pending.originator.0)
                 ^ (u32::from(pending.route_request_id) << 8)
                 ^ (u32::from(pending.path_cost) << 24)
@@ -921,37 +936,21 @@ impl<M: MacDriver> NwkLayer<M> {
         );
         let jitter_span = MAX_RREQ_JITTER_MS - MIN_RREQ_JITTER_MS + 1;
         let jitter_ms = 2 * (MIN_RREQ_JITTER_MS + sample % jitter_span);
-        self.mac.delay_micros(jitter_ms * 1_000).await;
 
-        let mut sent = false;
-        let msdu_handle = self.nib.next_seq();
-        for attempt in 0..=RREQ_RELAY_RETRIES {
-            if attempt != 0 {
-                self.mac.delay_micros(RREQ_RETRY_INTERVAL_US).await;
-            }
-            let result = self
-                .mac
-                .mcps_data(McpsDataRequest {
-                    src_addr_mode: AddressMode::Short,
-                    dst_address: MacAddress::Short(self.nib.pan_id, ShortAddress::BROADCAST),
-                    payload: &buf[..total_len],
-                    // MAC transaction handle only — the NWK sequence number in
-                    // the header above stays the originator's.
-                    msdu_handle,
-                    tx_options: TxOptions {
-                        ack_tx: false,
-                        ..Default::default()
-                    },
-                })
-                .await;
-            sent |= result.is_ok();
-        }
-
-        if sent {
-            Ok(())
-        } else {
-            Err(NwkStatus::RouteError)
-        }
+        self.schedule_broadcast(
+            crate::routing::PendingBroadcast {
+                src: pending.originator,
+                seq: pending.seq_number,
+                frame: heapless::Vec::new(),
+                retries_left: RREQ_RELAY_RETRIES,
+                deadline_us: now.wrapping_add(jitter_ms * 1_000),
+                sent: false,
+                rreq: true,
+                handle: 0,
+                heard: heapless::Vec::new(),
+            },
+            &buf[..total_len],
+        )
     }
 
     /// Drain and send all queued route replies and Route Request forwards.
@@ -981,9 +980,13 @@ impl<M: MacDriver> NwkLayer<M> {
             }
         }
 
-        // Drain accepted Route Request forwards
-        while let Some(pending) = self.pending_rreq_forwards.pop() {
-            if let Err(e) = zigbee_types::await_out_of_line!(self.forward_route_request(&pending)) {
+        // Schedule accepted Route Request forwards. One that finds the
+        // broadcast schedule full stays queued for a later pass.
+        #[cfg(feature = "router")]
+        while self.broadcast_tx.can_schedule()
+            && let Some(pending) = self.pending_rreq_forwards.pop()
+        {
+            if let Err(e) = self.schedule_route_request_forward(&pending) {
                 log::warn!(
                     "[NWK] Failed to forward RREQ for 0x{:04X}: {:?}",
                     pending.rreq_dst.0,
@@ -992,9 +995,10 @@ impl<M: MacDriver> NwkLayer<M> {
             }
         }
 
-        // Retransmit broadcasts no router neighbour was heard relaying
+        // Transmit relays whose jitter elapsed, and broadcast / Route Request
+        // retries that are due.
         #[cfg(feature = "router")]
-        zigbee_types::await_out_of_line!(self.service_passive_acks());
+        zigbee_types::await_out_of_line!(self.service_broadcast_tx());
 
         // Send link status if due
         if self.link_status_due {

@@ -234,6 +234,7 @@ pub struct PendingRreqRebroadcast {
 /// receiver's broadcast transaction record and let two routers pass the same
 /// discovery back and forth forever.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "router"), allow(dead_code))]
 pub(crate) struct QueuedRreqForward {
     /// Frame control of the received frame — protocol version, discover-route
     /// bits, security flag and the end-device-initiator bit are preserved.
@@ -338,9 +339,10 @@ pub struct NwkLayer<M: MacDriver> {
     /// Route requests already acted upon, keyed by originator and request ID.
     #[cfg(feature = "router")]
     rreq_records: routing::RreqRecordTable,
-    /// Broadcasts awaiting passive acknowledgement (R22 §3.6.5).
+    /// Relayed and own broadcasts waiting for their jitter, passive
+    /// acknowledgement or retry deadline (R22 §3.6.5, §3.6.3.5.2).
     #[cfg(feature = "router")]
-    passive_acks: routing::PassiveAckTable,
+    broadcast_tx: routing::BroadcastTxTable,
     /// Pending Network Status (route error) notifications.
     #[cfg(feature = "router")]
     pending_route_errors: heapless::Vec<PendingNetworkStatus, 4>,
@@ -445,7 +447,7 @@ impl<M: MacDriver> NwkLayer<M> {
             #[cfg(feature = "router")]
             rreq_records: routing::RreqRecordTable::new(),
             #[cfg(feature = "router")]
-            passive_acks: routing::PassiveAckTable::new(),
+            broadcast_tx: routing::BroadcastTxTable::new(),
             #[cfg(feature = "router")]
             pending_route_errors: heapless::Vec::new(),
             #[cfg(not(feature = "router"))]
@@ -507,7 +509,7 @@ impl<M: MacDriver> NwkLayer<M> {
             #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).rreq_records).write(routing::RreqRecordTable::new());
             #[cfg(feature = "router")]
-            core::ptr::addr_of_mut!((*slot).passive_acks).write(routing::PassiveAckTable::new());
+            core::ptr::addr_of_mut!((*slot).broadcast_tx).write(routing::BroadcastTxTable::new());
             #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).pending_route_errors).write(heapless::Vec::new());
             #[cfg(not(feature = "router"))]
