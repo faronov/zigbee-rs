@@ -7,7 +7,8 @@
 //! 0x00000..0x87000  boot header, bootloader and running image: read-only
 //! ```
 //!
-//! Every runtime flash user sees the single [`XipFlash`] through a bounded
+//! Every runtime flash user sees the single [`XipFlash`] (wrapped in the
+//! stack-guard-checking [`MainFlash`]) through a bounded
 //! view: the journal through [`NvWindow`], the OTA writer through
 //! [`OtaFlash`]. Neither can erase or write the boot header, the bootloader,
 //! the running image or the other's partition. [`SharedFlash`] lets both
@@ -49,9 +50,57 @@ const _: () = assert!(
 const _: () =
     assert!(SECURITY_JOURNAL_SECTOR_SIZE.is_multiple_of(<XipFlash as NorFlash>::ERASE_SIZE));
 
+/// The product's flash handle: the XIP flash behind the stack guard.
+pub type MainFlash = GuardedFlash<XipFlash>;
+
 /// The one physical flash of the product, shared by the journal and OTA.
-pub fn main_flash(token: Flash) -> Result<XipFlash, FlashError> {
-    XipFlash::new(token, bl702_xt_zb1::ONBOARD_FLASH_CAPACITY)
+/// Every erase and program first checks the stack guard.
+pub fn main_flash(token: Flash) -> Result<MainFlash, FlashError> {
+    XipFlash::new(token, bl702_xt_zb1::ONBOARD_FLASH_CAPACITY).map(GuardedFlash::new)
+}
+
+/// A [`NorFlash`] that checks [`crate::stack_guard`] before every erase and
+/// program, so a stack overflow can never reach the flash (security
+/// journal, child/APS journals, OTA slot) from corrupted RAM.
+pub struct GuardedFlash<F> {
+    flash: F,
+}
+
+impl<F> GuardedFlash<F> {
+    pub const fn new(flash: F) -> Self {
+        Self { flash }
+    }
+}
+
+impl<F: ErrorType> ErrorType for GuardedFlash<F> {
+    type Error = F::Error;
+}
+
+impl<F: ReadNorFlash> ReadNorFlash for GuardedFlash<F> {
+    const READ_SIZE: usize = F::READ_SIZE;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.flash.read(offset, bytes)
+    }
+
+    fn capacity(&self) -> usize {
+        self.flash.capacity()
+    }
+}
+
+impl<F: NorFlash> NorFlash for GuardedFlash<F> {
+    const WRITE_SIZE: usize = F::WRITE_SIZE;
+    const ERASE_SIZE: usize = F::ERASE_SIZE;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        crate::stack_guard::check();
+        self.flash.erase(from, to)
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        crate::stack_guard::check();
+        self.flash.write(offset, bytes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,5 +491,24 @@ mod tests {
         assert!(below.iter().all(|byte| *byte == 0xFF));
         let nv = &flash.borrow().bytes[NV_START as usize..];
         assert!(nv.iter().all(|byte| *byte == 0xFF));
+    }
+
+    #[test]
+    fn guarded_flash_forwards_every_operation() {
+        let flash = RefCell::new(GuardedFlash::new(MockMainFlash::new()));
+        assert_eq!(
+            <GuardedFlash<MockMainFlash> as NorFlash>::ERASE_SIZE,
+            MockMainFlash::ERASE_SIZE
+        );
+        assert_eq!(flash.borrow().capacity(), FLASH_SIZE as usize);
+        let mut store = security_store(SharedFlash::new(&flash));
+        assert_eq!(store.load().unwrap(), None);
+        let mut ota = OtaFlash::new(SharedFlash::new(&flash));
+        ota.erase(SECONDARY_SLOT, SECONDARY_SLOT + 0x1000).unwrap();
+        ota.write(SECONDARY_SLOT, &[0x12, 0x34]).unwrap();
+        let mut bytes = [0; 2];
+        ota.read(SECONDARY_SLOT, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x12, 0x34]);
+        assert!(ota.write(PRIMARY_SLOT, &[0]).is_err());
     }
 }

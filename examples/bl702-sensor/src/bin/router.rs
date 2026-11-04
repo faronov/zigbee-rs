@@ -30,12 +30,12 @@ mod roles;
 #[allow(dead_code)]
 mod time_driver;
 
-use bl702_hal::flash::XipFlash;
 use bl702_hal::interrupt::{self, M154_IRQ};
 use bl702_xt_zb1_product as product;
 use embassy_executor::Executor;
 use panic_halt as _;
 use product::router::{ApsTableStore, ChildStore, RouterProfile, RouterSecurityStore};
+use product::storage::MainFlash;
 use roles::{CommissioningTrigger, LogDiagnostics, LogStatus, ResetSupervisor};
 use router_app::{
     NoObserver, NodeArchetype, ParentRouterApp, PersistentApsTables, PersistentChildren,
@@ -51,14 +51,14 @@ type Mac = Bl702RouterMac;
 type App = ParentRouterApp<
     'static,
     Mac,
-    RouterSecurityStore<'static, XipFlash>,
+    RouterSecurityStore<'static, MainFlash>,
     RouterProfile,
-    ChildStore<'static, XipFlash>,
+    ChildStore<'static, MainFlash>,
     LogStatus,
     ResetSupervisor,
     LogDiagnostics,
     NoObserver,
-    PersistentApsTables<ApsTableStore<'static, XipFlash>>,
+    PersistentApsTables<ApsTableStore<'static, MainFlash>>,
 >;
 
 const ARCHETYPE: NodeArchetype = NodeArchetype::ParentRouter;
@@ -81,6 +81,7 @@ async fn run(resources: hal::ApplicationResources) {
         roles::fatal(app.parts_mut(), ARCHETYPE, error);
     }
     loop {
+        product::stack_guard::check();
         if trigger.poll(app.awaiting_commissioning_request()) {
             app.request_commissioning();
         }
@@ -113,7 +114,7 @@ fn compose(started: roles::Started) -> &'static mut App {
     // SAFETY: the dispatcher installed by `hal::init` handles M154_IRQ.
     unsafe { interrupt::enable(M154_IRQ) };
 
-    static SECURITY: StaticCell<RouterSecurityStore<'static, XipFlash>> = StaticCell::new();
+    static SECURITY: StaticCell<RouterSecurityStore<'static, MainFlash>> = StaticCell::new();
     static PROFILE: StaticCell<RouterProfile> = StaticCell::new();
     static DEVICE: StaticCell<ZigbeeDevice<Mac, Router>> = StaticCell::new();
     static APP: StaticCell<App> = StaticCell::new();

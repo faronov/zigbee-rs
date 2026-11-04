@@ -79,6 +79,9 @@ impl WakeController<Bl702SoftMac> for Bl702Wake {
         mac: &mut Bl702SoftMac,
         request: WaitRequest,
     ) -> Result<WakeReason, Self::Error> {
+        // Every SensorApp cycle ends here: check the stack guard once per
+        // cycle, before the radio or the timer is touched.
+        bl702_xt_zb1_product::stack_guard::check();
         let timeout = Duration::from_millis(u64::from(request.timeout_ms));
         match request.sleep_depth {
             SleepDepth::Active => {

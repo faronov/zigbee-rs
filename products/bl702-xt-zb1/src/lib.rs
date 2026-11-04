@@ -16,6 +16,7 @@ pub mod policy;
 pub mod profile;
 #[cfg(feature = "roles")]
 pub mod router;
+pub mod stack_guard;
 pub mod storage;
 
 use zigbee_types::ChannelMask;
