@@ -29,10 +29,14 @@ _rust_entry
 # on the final ELF (22,236 B) and rounded up to the next 256 B boundary. The
 # rejoin-failure budget also fails if that path stops being reachable or
 # analyzed, so the root worst case can never silently drop it.
+# Re-baselined 22272 -> 22528 for the SED recovery change (staged rejoin,
+# APS-ack strikes, RecoveryPolicy): the app future grew and secure_rejoin()
+# gained a second caller, so it is no longer inlined. Worst path 22,236 ->
+# 22,348 B (+112 B), 2,228 B under the declared 24 KiB SVC stack.
 --chain-budget
-rejoin-failure=SensorApp<.*>::record_failed_rejoin=22272
+rejoin-failure=SensorApp<.*>::record_failed_rejoin=22528
 --chain-budget
-steering-rejoin=(start_or_resume_steering|secure_rejoin|rejoin_with|start_fresh_steering|nlme_network_discovery)=22272
+steering-rejoin=(start_or_resume_steering|secure_rejoin|rejoin_with|start_fresh_steering|nlme_network_discovery)=22528
 
 # Reviewed functions with unresolved indirect call sites (dyn FnMut /
 # cluster vtables / flash guard hooks). Same list as the router gate plus the
