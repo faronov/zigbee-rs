@@ -1,0 +1,57 @@
+# Static stack gate for the production BL702 XT-ZB1 always-on End Device ELF.
+# Usage: tools/bl702-stack-gate.py ELF @tools/bl702-ed-stack-gate.args
+#
+# Heuristic direct-call bound, not a whole-program proof: indirect calls
+# other than the executor poll and the CLIC dispatch pointer are not
+# followed. The hardware stack paint stays the authoritative runtime
+# evidence.
+
+# products/bl702-xt-zb1/link/memory.x: 24 KiB stack below the reset-time
+# memory window, 64-byte guard immediately below it.
+--declared
+24576
+--guard
+64
+--stack-ceiling
+0x4202C000
+
+# Static worst case: the commissioning/rejoin path, 15,152 B task + 144 B
+# entry + 112 B interrupt = 15,408 B, a 9,168 B gap. Not measured on
+# hardware.
+--min-gap
+4096
+--max-frame
+4096
+
+# Roots. The executor reaches the task poll through a function pointer and
+# the CLIC trap reaches the HAL dispatcher the same way; the gate adds the
+# worst of each (entry + task + trap entry + handler). Interrupts do not
+# nest (mstatus.MIE stays clear in the handler).
+--entry
+^main$
+--task
+^<embassy_executor::raw::TaskStorage<.*>>::poll$
+--irq-entry
+^_bl702_clic_trap$
+--irq-handler
+::time_driver::dispatch$
+
+# Chain budgets: worst depth below (and including) any matching function,
+# measured on the 24 KiB fix build, rounded up to the next 256 B boundary
+# above the measurement. A regression fails the build.
+--chain-budget
+boot=^bl702_ed::compose$=4864
+--chain-budget
+commissioning=attempt_start|start_or_resume_steering|start_fresh_steering|nlme_network_discovery=14080
+--chain-budget
+rejoin=perform_secure_rejoin|secure_rejoin|rejoin_with|tick_steering_deferred_reset=8704
+--chain-budget
+secured-receive=process_incoming_aps_frame_with_data_persistence|aps_decrypt_incoming|process_incoming_nwk_frame_from_with_replay_commit|NwkSecurity>::decrypt_with|authenticate_incoming=2048
+--chain-budget
+security-journal=^<zigbee_runtime::security_journal::SecurityStateJournal<=1792
+--chain-budget
+aps-journal=^<zigbee_runtime::aps_table_store::ApsTableJournal<|persist_aps_tables_if_dirty=2048
+--chain-budget
+reporting=send_due_reports=2048
+--chain-budget
+factory-reset-leave=factory_reset|nlme_leave|handle_mgmt_leave_req=2560

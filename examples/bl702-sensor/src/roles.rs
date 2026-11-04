@@ -16,9 +16,9 @@ compile_error!("select either production or diagnostic-logging, not both");
 use core::cell::RefCell;
 use core::fmt::Write;
 
-use bl702_hal::flash::XipFlash;
 use bl702_xt_zb1_product as product;
 use embassy_time::Instant;
+use product::storage::MainFlash;
 use router_app::{
     DiagnosticEvent, Diagnostics, NodeArchetype, RouterAppError, RouterParts, RouterStatus,
     StatusSink, Supervisor,
@@ -60,11 +60,13 @@ pub struct Started {
     pub ieee: [u8; 8],
     pub radio: Bl702RadioPhy,
     pub pib: MacPib,
-    pub flash: &'static RefCell<XipFlash>,
+    pub flash: &'static RefCell<MainFlash>,
 }
 
 /// Clocks, UART log, alarm interrupt; must run before the executor.
 pub fn boot(model: &str) -> hal::ApplicationResources {
+    // First: everything after this may be the deepest stack user.
+    product::stack_guard::arm();
     let Ok(resources) = hal::init() else {
         hal::halt()
     };
@@ -85,7 +87,7 @@ pub fn boot(model: &str) -> hal::ApplicationResources {
 /// calibration temporaries stay out of the task frame.
 #[inline(never)]
 pub fn start(resources: hal::ApplicationResources) -> Started {
-    static FLASH: static_cell::StaticCell<RefCell<XipFlash>> = static_cell::StaticCell::new();
+    static FLASH: static_cell::StaticCell<RefCell<MainFlash>> = static_cell::StaticCell::new();
 
     let hal::ApplicationResources { flash, aes, .. } = resources;
     let Ok(flash) = product::storage::main_flash(flash) else {

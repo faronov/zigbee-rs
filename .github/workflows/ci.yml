@@ -57,6 +57,8 @@ jobs:
         run: python3 -m unittest discover -s tools -p 'test_bl702_ota.py' -v
       - name: Test MAC footprint stack-frame analysis
         run: python3 -m unittest discover -s tools -p 'test_mac_footprint.py' -v
+      - name: Test BL702 static stack gate
+        run: python3 -m unittest discover -s tools -p 'test_bl702_stack_gate.py' -v
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -1256,6 +1258,15 @@ jobs:
               exit 1
             fi
           done
+      # The linker script already asserts the stack/guard layout; this gate
+      # adds the static stack budget, frame caps and chain budgets per image.
+      - name: Check BL702 static stack budgets
+        working-directory: examples/bl702-sensor
+        run: |
+          DIR=target/riscv32imc-unknown-none-elf/release
+          python3 ../../tools/bl702-stack-gate.py "$DIR/bl702-sensor" @../../tools/bl702-sensor-stack-gate.args
+          python3 ../../tools/bl702-stack-gate.py "$DIR/bl702-ed" @../../tools/bl702-ed-stack-gate.args
+          python3 ../../tools/bl702-stack-gate.py "$DIR/bl702-router" @../../tools/bl702-router-stack-gate.args
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: 3.11.9

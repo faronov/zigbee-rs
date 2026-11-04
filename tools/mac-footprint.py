@@ -426,7 +426,9 @@ def analyse_stack(elf: Path) -> dict:
     return analyse_disassembly(run("llvm-objdump", elf, "-d", "-C", "--no-show-raw-insn"))
 
 
-def analyse_disassembly(disasm: str) -> dict:
+def build_call_graph(disasm: str) -> dict[int, Func]:
+    """Parse an ``llvm-objdump -d -C`` listing into functions keyed by start
+    address, with prologue frame sizes and resolved direct call/tail edges."""
     funcs: dict[int, Func] = {}
     order: list[int] = []
     current: Func | None = None
@@ -549,7 +551,13 @@ def analyse_disassembly(disasm: str) -> dict:
         tails = (resolve(a) for a in func.tails)
         func.calls = {owner(a) for a in calls if a is not None} - {None}
         func.tails = {owner(a) for a in tails if a is not None} - {None, address}
+    return funcs
 
+
+def stack_depths(funcs: dict[int, Func]) -> tuple[dict, dict, set]:
+    """Worst direct-call stack depth of every function (its own frame
+    included, panic paths excluded): ``(depth, best_child, recursive)``."""
+    starts = sorted(funcs)
     sys.setrecursionlimit(100000)
     depth: dict[int, int] = {}
     best_child: dict[int, int | None] = {}
@@ -584,6 +592,13 @@ def analyse_disassembly(disasm: str) -> dict:
 
     for address in starts:
         visit(address)
+    return depth, best_child, recursive
+
+
+def analyse_disassembly(disasm: str) -> dict:
+    funcs = build_call_graph(disasm)
+    starts = sorted(funcs)
+    depth, best_child, recursive = stack_depths(funcs)
 
     # Deepest chain that executes MAC code, measured from its outermost
     # caller: the stack actually needed while the MAC runs, independent of

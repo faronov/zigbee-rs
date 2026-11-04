@@ -25,12 +25,11 @@ mod roles;
 #[allow(dead_code)]
 mod time_driver;
 
-use bl702_hal::flash::XipFlash;
 use bl702_xt_zb1_product as product;
 use embassy_executor::Executor;
 use panic_halt as _;
 use product::end_device::EndDeviceProfile;
-use product::storage::{SecurityStore, SharedFlash};
+use product::storage::{MainFlash, SecurityStore, SharedFlash};
 use roles::{CommissioningTrigger, LogDiagnostics, LogStatus, ResetSupervisor};
 use router_app::{AlwaysOnEndDeviceApp, NodeArchetype};
 use static_cell::StaticCell;
@@ -43,7 +42,7 @@ use zigbee_runtime::{
 use zigbee_zcl::clusters::basic::PowerSource;
 
 type Mac = Bl702SoftMac;
-type Store = SecurityStore<SharedFlash<'static, XipFlash>>;
+type Store = SecurityStore<SharedFlash<'static, MainFlash>>;
 type App = AlwaysOnEndDeviceApp<
     'static,
     Mac,
@@ -74,6 +73,7 @@ async fn run(resources: hal::ApplicationResources) {
         roles::fatal(app.parts_mut(), ARCHETYPE, error);
     }
     loop {
+        product::stack_guard::check();
         if trigger.poll(app.awaiting_commissioning_request()) {
             app.request_commissioning();
         }

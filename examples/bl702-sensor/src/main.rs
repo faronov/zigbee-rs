@@ -20,12 +20,11 @@ use core::cell::RefCell;
 use core::fmt::{Display, Formatter, Write};
 use core::mem::MaybeUninit;
 
-use bl702_hal::flash::XipFlash;
 use bl702_xt_zb1_product as product;
 use embassy_executor::Executor;
 use panic_halt as _;
 use product::ota::{Bl702OtaLifecycle, Bl702Writer, Channel, OtaSensorProfile};
-use product::storage::{OtaFlash, SharedFlash};
+use product::storage::{MainFlash, OtaFlash, SharedFlash};
 use sensor_sed_app::{BlockingBattery, BlockingEnvironment, NoStatus, SensorApp, SensorSedParts};
 use zigbee_mac::bl702::radio_phy::{Bl702RadioPhy, Bl702SoftMac};
 use zigbee_mac::{MacPib, SoftMacCore};
@@ -75,6 +74,7 @@ impl Display for Hex<'_> {
 
 #[riscv_rt::entry]
 fn main() -> ! {
+    product::stack_guard::arm();
     let application_resources = match hal::init() {
         Ok(resources) => resources,
         Err(_) => hal::halt(),
@@ -231,7 +231,7 @@ fn build_mac(ieee: [u8; 8], aes: bl702_hal::peripherals::Aes) -> Bl702SoftMac {
     }
 }
 
-type Bl702Profile<'f> = OtaSensorProfile<Bl702Writer<SharedFlash<'f, XipFlash>>>;
+type Bl702Profile<'f> = OtaSensorProfile<Bl702Writer<SharedFlash<'f, MainFlash>>>;
 
 /// Compose the sensor endpoint and OTA client and move it into `slot`.
 ///
@@ -239,7 +239,7 @@ type Bl702Profile<'f> = OtaSensorProfile<Bl702Writer<SharedFlash<'f, XipFlash>>>
 /// than in the sensor task's poll frame.
 #[inline(never)]
 fn build_profile<'f, 's>(
-    flash: &'f RefCell<XipFlash>,
+    flash: &'f RefCell<MainFlash>,
     slot: &'s mut MaybeUninit<Bl702Profile<'f>>,
 ) -> &'s mut Bl702Profile<'f> {
     match product::ota::sensor_ota_profile(SharedFlash::new(flash)) {
