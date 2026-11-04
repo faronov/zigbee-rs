@@ -19,7 +19,7 @@ Partition addresses belong to the product, not a generic HAL or example loop.
 
 - network identity and keys;
 - outgoing NWK/APS counter reservations;
-- exact incoming NWK/APS replay floors, bound to the authenticating key;
+- exact incoming APS replay floors, bound to the authenticating key;
 - parent and commissioned state;
 - staged or previous secondary Network-Key state and update state;
 - End Device Timeout client state.
@@ -33,12 +33,57 @@ Outgoing counters are reserved ahead in durable storage, in blocks of
 runtime resumes above the reservation rather than reusing a secured frame
 counter.
 
-Incoming replay floors use compact append-only records. A verified frame is
-committed after MIC verification but before relay, APS acknowledgement,
-security-command dispatch, or ZCL side effects. Reboot restores NWK,
-Trust-Center-link-key, application-link-key, and global commissioning-key
-domains. If the append fails, the frame is dropped without acknowledgement or
-application execution.
+Incoming APS replay floors use compact append-only records. A verified
+APS-secured frame is committed after MIC verification but before relay, APS
+acknowledgement, security-command dispatch, or ZCL side effects. Reboot
+restores Trust-Center-link-key, application-link-key, and global
+commissioning-key domains. If the append fails, the frame is dropped without
+acknowledgement or application execution.
+
+### Incoming NWK replay floors are RAM-only
+
+Incoming NWK frame counters are never written to flash. The NWK layer's
+replay table (`zigbee_nwk::security`, `MAX_FRAME_COUNTER_ENTRIES`: 64 in
+`router` builds, 16 otherwise) is the only authority:
+
+- a floor is keyed by the auxiliary-header sender IEEE address and the key
+  sequence number, never by the routed NWK originator;
+- the R22 incoming check (frame counter strictly greater than the floor) is
+  unchanged and the floor only moves forward within a boot;
+- the table never evicts a floor. When it is full, a new sender is refused
+  (counted in `replay_rejections`) instead of forgetting an existing floor.
+  Slots are reserved for parents and children that have no floor yet, and the
+  only reclaimable floors are those of the retained *previous* network key;
+  reclaiming one seals that key so frames under it are refused for the rest
+  of the boot;
+- floors for a key sequence are dropped only when that key is removed or its
+  material is replaced. A key update whose snapshot fails to commit keeps the
+  active key's floors and fences further receive until the snapshot commits;
+- a reboot forgets every NWK floor.
+
+This is the same trade-off as EmberZNet, ZBOSS and Z-Stack, which keep
+incoming NWK counters in RAM. Until a sender's next frame re-establishes its
+floor, a reboot lets an attacker replay one NWK frame that was captured under
+the current network key. APS-secured traffic (Trust Center commands, key
+transport, application-link-key data) stays protected by its durable APS
+floors, and the device's own outgoing counters stay store-ahead reserved.
+
+The reason is flash endurance. Persisting every newer NWK counter appended
+one journal record per accepted secured frame. On a Home Assistant Connect
+ZBT-1 router (EFR32MG21, 8 KiB journal sectors) that measured about 285
+appends per 65 s and about one sector rotation per minute (about 720 erases
+per page per day; the device had already reached generation 3,165, about
+1,580 erases per page). The 10,000-cycle Series 2 rating would wear the
+journal out in about two weeks. The synchronous flash writes also stalled the main
+loop and overflowed the radio receive ring.
+
+Journals written by earlier firmware may still contain NWK replay records
+(kind 0). The scanner skips them, the runtime never restores them, and the
+next journal generation (rollover, retirement tombstone or retained-domain
+rewrite) drops them physically. No format change, factory reset or rejoin is
+required; the device resumes on the existing journal. Downgrading to an
+earlier image is harmless for NWK floors: it sees stale or no NWK records and
+re-learns them from traffic.
 
 Persisted rejoin keeps `rejoin_pending` set across both secure and centralized
 Trust Center attempts. When a Trust Center rejoin returns a current network
@@ -57,11 +102,12 @@ up to 112 active replay domains; a full rollover then consumes 28 replay slots
 plus one state slot and leaves only 12 incoming-frame appends before the next
 erase. The format fits, but that geometry is not an endurance claim.
 
-Small end devices with few peers may keep 4 KiB sectors after calculating
-their traffic and flash endurance. Parent routers and coordinators must use a
-larger protected partition or a storage technology qualified for per-frame
-appends. A practical starting point is 16 KiB per logical sector (32 KiB for
-the two-sector journal), followed by product-specific lifetime testing.
+Because only APS-secured frames append, the steady-state write rate follows
+Trust Center, key-transport and APS-secured application traffic rather than
+every routed NWK frame. Parent routers and coordinators with many APS-secured
+peers should still use a larger protected partition (a practical starting
+point is 16 KiB per logical sector, 32 KiB for the two-sector journal) and
+product-specific lifetime testing.
 
 A product fixes its logical sector size in the type while retaining the same
 journal logic:
@@ -177,8 +223,8 @@ accepting a mutation that cannot survive reboot.
 Bind/Unbind reception in a router application selecting `PersistentApsTables`
 also spans both stores. ZDO prepares an owned response while applying the
 mutation, without transmitting it. The application commits the APS snapshot;
-the runtime then commits the NWK and, when present, APS replay floors before
-sending the APS ACK and finally the prepared ZDO response. A single pending
+the runtime then records the RAM NWK floor and commits the APS replay floor,
+when present, before sending the APS ACK and finally the prepared ZDO response. A single pending
 transaction blocks another store-backed receive/tick until completion.
 Storage errors retain the transaction; ACK/response transport errors retain the unsent work for a
 bounded retry on the next `step()`, without applying Bind/Unbind again.

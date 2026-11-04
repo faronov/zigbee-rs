@@ -71,9 +71,6 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             return Err(BindingPersistenceError::SnapshotRequired);
         }
         self.refresh_security_state(store)?;
-        if let Some((replay, _)) = self.pending_nwk_lifecycle_replay() {
-            store.commit_replay_counter(PersistentReplayCounter::Nwk(replay))?;
-        }
         if let Some(replay) = self.bdb.zdo().aps().pending_data_replay() {
             store.commit_replay_counter(PersistentReplayCounter::Aps(replay))?;
         }

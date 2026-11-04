@@ -190,15 +190,14 @@ where
     pub async fn complete_child_nwk_lifecycle_persistence(&mut self) -> Result<(), NodeError> {
         #[cfg(feature = "router")]
         {
-            let Some((replay, kind)) = self.device.pending_nwk_lifecycle_replay() else {
+            let Some((_, kind)) = self.device.pending_nwk_lifecycle_replay() else {
                 return Ok(());
             };
             if kind != zigbee_nwk::nlde::NwkLifecyclePersistence::ChildState {
                 return Ok(());
             }
-            self.security_store
-                .commit_replay_counter(crate::security_store::PersistentReplayCounter::Nwk(replay))
-                .map_err(NodeError::Persistence)?;
+            // The child-state snapshot is the durable part; the NWK floor is
+            // RAM-only.
             self.device
                 .bdb_mut()
                 .zdo_mut()

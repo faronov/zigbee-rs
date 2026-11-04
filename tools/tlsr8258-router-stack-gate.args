@@ -76,8 +76,13 @@ factory-reset-leave=(factory_reset|nlme_leave|handle_mgmt_leave_req|complete_pen
 ^<zigbee_bdb::BdbLayer<\.\.>>::reserve_trust_center_link_key$
 --allow-unresolved
 ^<zigbee_nwk::NwkLayer<\.\.>>::authenticate_incoming$
+# The NWK replay-commit hook (`&mut dyn FnMut(NwkReplayCounter) -> bool`):
+# one site in join_via_rejoin, two inlined commit_incoming_replay sites in the
+# receive body. The runtime passes a capture-free `|_| true` closure because
+# incoming NWK floors are RAM-only. On master these sites were attributed to
+# the replay-protection predicate vtable literal in the same function.
 --allow-unresolved
-^<zigbee_nwk::security::NwkSecurity>::commit_frame_counter_for_key_protecting$
+^<zigbee_nwk::NwkLayer<\.\.>>::(join_via_rejoin|process_incoming_nwk_frame_from_with_replay_commit)::\{closure#0\}$
 --allow-unresolved
 ^<zigbee_runtime::ZigbeeDevice<\.\.>>::send_due_reports::\{closure#0\}$
 --allow-unresolved

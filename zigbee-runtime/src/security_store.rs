@@ -158,7 +158,12 @@ pub enum SecurityStoreError {
     GenerationExhausted,
 }
 
-/// One durably committed incoming replay floor.
+/// One incoming replay floor.
+///
+/// Only APS floors are durable. The `Nwk` variant identifies an NWK replay
+/// domain (auxiliary-header sender IEEE, key sequence and key fingerprint)
+/// for retirement scopes and for decoding journals written by older
+/// firmware; stores do not persist it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistentReplayCounter {
     Nwk(zigbee_nwk::security::NwkReplayCounter),
@@ -773,6 +778,14 @@ pub trait SecurityStateStore {
     ) -> Result<(), SecurityStoreError> {
         Ok(())
     }
+    /// Durably commit an incoming replay floor before its frame has effects.
+    ///
+    /// The runtime only commits APS floors. Incoming NWK floors are RAM-only
+    /// (the NWK replay table is their authority and they are forgotten on
+    /// reboot), and the runtime ignores any NWK floor a store reports on
+    /// restore. The flash journal accepts a [`PersistentReplayCounter::Nwk`]
+    /// as a no-op; the RAM test store records it so tests can prove the
+    /// runtime never commits one.
     fn commit_replay_counter(
         &mut self,
         _replay: PersistentReplayCounter,
