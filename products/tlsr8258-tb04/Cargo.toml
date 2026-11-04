@@ -28,7 +28,8 @@ sensor = [
     "dep:zigbee-mac",
     "zigbee-runtime/compact-single-endpoint",
 ]
-# LOW32K reset-on-wake for joined steady-state waits.
+# LOW32K reset-on-wake for joined steady-state waits, with a 250 ms
+# wake-stress slow poll (the default sensor polls every 5 s).
 retention-proof = [
     "sensor",
     "tlsr8258-sensor-app/retention",

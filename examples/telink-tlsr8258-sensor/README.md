@@ -37,10 +37,16 @@ Relative Humidity. Temperature/humidity are synthetic.
 The default product policy is:
 
 ```text
-fast wait: Active
-slow wait: Idle
-slow poll: 250 ms
+fast poll: 250 ms, Active   (join/rejoin + 120 s, interview, Identify,
+                             pending APS ack / ZCL response, OTA)
+slow poll: 5 s, Idle        (joined steady state)
+reports:   30 s sample cadence, independent of the poll
 ```
+
+`SLOW_POLL_MS` (product crate) selects the joined slow poll; the production
+value is `RESPONSIVE_SLOW_POLL_MS` from `sensor-sed-app`, the shortest common
+parent indirect hold (6 s) minus a 1 s margin, so coordinator commands are
+fetched before the parent expires them.
 
 `Idle` is an atomic full-SRAM timer `SUSPEND` transaction:
 
@@ -59,7 +65,8 @@ feature-gated image.
 ./scripts/tlsr8258.sh build sensor-retention-10s
 ```
 
-- `sensor-retention`: reset-on-wake `Retention`, 250 ms slow cadence.
+- `sensor-retention`: reset-on-wake `Retention`, 250 ms slow cadence (wake-cycle
+  stress proof).
 - `sensor-retention-10s`: the same restore path, 10-second slow cadence.
 
 The former independent retention HIL image (pass marker `0x5254600D`) was

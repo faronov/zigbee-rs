@@ -99,7 +99,9 @@ Feature-gated proof images:
 ./scripts/tlsr8258.sh build sensor-retention-10s
 ```
 
-The first retains the 250 ms slow cadence; the second uses 10 seconds. The
+The default TB-04 sensor polls every 5 s once joined (`RESPONSIVE_SLOW_POLL_MS`,
+below the shortest common parent indirect hold). The first proof image keeps
+a 250 ms slow cadence as a wake-cycle stress test; the second uses 10 seconds. The
 standalone legacy lab stack has been removed, so the LOW32K retention HIL
 proof has to run on these images; a successful compile is not that proof.
 

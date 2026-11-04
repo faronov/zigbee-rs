@@ -11,8 +11,8 @@ usage: scripts/tlsr8258.sh <check|build|flash> [sensor|sensor-retention|sensor-r
        scripts/tlsr8258.sh <dump|dump-activate> <address> [word-count]
 
 Production firmware:
-  sensor       polling end-device sensor with hardware AES
-  sensor-retention       feature-gated 250 ms LOW32K proof
+  sensor       sleepy end-device sensor, 5 s joined poll in SUSPEND, hardware AES
+  sensor-retention       feature-gated LOW32K proof, 250 ms wake-stress poll
   sensor-retention-10s   feature-gated 10 s steady-state LOW32K proof
   ed           always-on (RX-on-when-idle) non-routing End Device
   router       always-on join/relay router with hardware AES
