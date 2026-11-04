@@ -83,7 +83,9 @@ router = [
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
 # Temperature-only sleepy thermometer (`esp32h2-thermometer` bin); its
 # identity, reporting defaults and cadence come from `thermometer.toml`.
-thermometer = ["sed", "dep:zigbee-aps"]
+thermometer = ["sed", "dep:zigbee-aps", "reporting-persist"]
+# Keep coordinator Configure Reporting across resets (product `zbnv` journal).
+reporting-persist = ["esp32-zigbee-devkit-product/reporting-persist"]
 # Compile out all `log` output; the thermometer bin then links no console.
 quiet = ["log/max_level_off", "log/release_max_level_off"]
 

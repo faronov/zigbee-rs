@@ -632,14 +632,11 @@ fn take_from_radio(driver: &mut Ieee802154<'_>, frame: &mut PhyRxFrame) -> bool 
         return false;
     }
     // The radio's own LQI byte is on an undocumented small scale (about 7
-    // at -84 dBm and 9 at -70 dBm on the C6). A router's NWK link costs and
-    // link status need the IEEE 0..=255 scale, so the parent build applies
-    // the stack-wide RSSI policy. The end-device images still pass the raw
-    // byte, as the legacy `EspMac` did (switching them costs 44 B of flash).
-    #[cfg(feature = "esp-parent")]
+    // at -84 dBm and 9 at -70 dBm on the C6). NWK link costs need the IEEE
+    // 0..=255 scale on every role: an end device's rejoin parent selection
+    // gates on link cost, and the raw byte maps every router to cost 7. So
+    // all images apply the stack-wide RSSI policy.
     let lqi = crate::lqi::from_rssi_dbm(raw.data[phr - 1] as i8);
-    #[cfg(not(feature = "esp-parent"))]
-    let lqi = raw.data[phr];
     frame.set(&raw.data[1..phr - 1], lqi).is_ok()
 }
 

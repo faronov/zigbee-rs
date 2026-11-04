@@ -40,6 +40,11 @@ pub enum DiagnosticEvent {
     SecureRejoinLimitReached {
         failures: u8,
     },
+    /// Parent-loss evidence (APS end-to-end failures plus pending work that
+    /// outlived its bound) reached the product limit; a rejoin starts.
+    ParentLossSuspected {
+        strikes: u8,
+    },
     Environment(EnvironmentReading),
     EnvironmentReadFailed,
     /// A product-specific [`crate::SensorMeasurement`] updated one cluster's
@@ -117,7 +122,8 @@ pub enum DiagnosticEvent {
         attempt: u8,
     },
     /// An unjoined commissioning attempt failed; the next one starts after
-    /// `delay_ms` of sleep (exponential backoff, capped at 30 minutes).
+    /// `delay_ms` of sleep (jittered exponential backoff up to the product's
+    /// `RecoveryPolicy::join_retry_max_ms`).
     JoinBackoff {
         delay_ms: u32,
     },

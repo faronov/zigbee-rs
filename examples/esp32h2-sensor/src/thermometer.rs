@@ -168,12 +168,18 @@ fn main() -> ! {
     #[cfg(feature = "quiet")]
     rtc.disable_rom_message_printing();
     #[cfg(feature = "light-sleep")]
-    let sleep = Some(product::sleep::LightSleep::new(
-        rtc,
-        peripherals.LP_TIMER,
-        peripherals.PMU,
-        peripherals.LP_AON,
-    ));
+    let sleep = Some(
+        product::sleep::LightSleep::new(
+            rtc,
+            peripherals.LP_TIMER,
+            peripherals.PMU,
+            peripherals.LP_AON,
+        )
+        .with_power_down(product::sleep::RetainedPowerDown {
+            xtal: config::SLEEP_XTAL_OFF,
+            rc_fast: config::SLEEP_RC_FAST_OFF,
+        }),
+    );
     #[cfg(not(feature = "light-sleep"))]
     let sleep = {
         let _rtc = rtc;
@@ -209,5 +215,32 @@ fn main() -> ! {
     let Ok(app) = SensorApp::new(node, &POLICY, parts) else {
         halt()
     };
-    block_on(APP.init(app).run())
+    block_on(run(APP.init(app)))
+}
+
+/// `initialize` → restore the persisted reporting configuration → `step`
+/// forever, persisting a changed configuration after each iteration.
+async fn run(app: &'static mut App) -> ! {
+    if app.initialize().await.is_err() {
+        halt()
+    }
+    #[cfg(feature = "reporting-persist")]
+    let mut reporting = Some(product::reporting::reporting_persistence());
+    #[cfg(feature = "reporting-persist")]
+    if let Some(persistence) = reporting.as_mut() {
+        // A failed restore keeps the product defaults; the next sync
+        // replaces the unreadable snapshot.
+        let _ = persistence.restore(app.device_mut());
+    }
+    loop {
+        let _ = app.step().await;
+        #[cfg(feature = "reporting-persist")]
+        if let Some(persistence) = reporting.as_mut() {
+            if persistence.sync(app.device()).is_err() {
+                // Flash refused the commit: stop for this boot instead of
+                // re-erasing the window on every wake.
+                reporting = None;
+            }
+        }
+    }
 }

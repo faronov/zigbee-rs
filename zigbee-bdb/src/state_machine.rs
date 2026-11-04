@@ -526,12 +526,16 @@ impl<M: MacDriver> BdbLayer<M> {
         // agility) recovers on its next attempt without making every attempt
         // pay for a full scan. Success returns to the last-channel first scan.
         let last_channel = 1u32 << channel;
+        // A product may narrow its BDB channel sets to its home channel to
+        // speed up joining; a widened rejoin that would rescan only that
+        // channel scans every 2.4 GHz channel instead (R22 §3.6.1.4.2).
         let channel_mask = zigbee_types::ChannelMask(if self.rejoin_scan_widened {
             let all = zigbee_types::ChannelMask::ALL_2_4GHZ.0;
             let sets = (self.attributes.primary_channel_set.0
-                | self.attributes.secondary_channel_set.0)
+                | self.attributes.secondary_channel_set.0
+                | last_channel)
                 & all;
-            if sets == 0 { all } else { sets | last_channel }
+            if sets & !last_channel == 0 { all } else { sets }
         } else {
             last_channel
         });

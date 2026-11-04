@@ -52,10 +52,17 @@ pub mod chip_temperature;
 pub mod end_device;
 #[cfg(any(target_os = "none", test))]
 pub mod executor;
+#[cfg(all(
+    target_os = "none",
+    any(feature = "roles", feature = "reporting-persist")
+))]
+mod flash_window;
 pub mod migration;
 #[cfg(feature = "sed")]
 pub mod policy;
 pub mod profile;
+#[cfg(all(target_os = "none", feature = "reporting-persist"))]
+pub mod reporting;
 #[cfg(feature = "roles")]
 pub mod router;
 pub mod sleep;

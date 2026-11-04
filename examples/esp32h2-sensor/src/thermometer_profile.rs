@@ -7,8 +7,8 @@
 
 use esp32_zigbee_devkit_product as product;
 use sensor_sed_app::{
-    ButtonPolicy, DiagnosticEvent, Diagnostics, EnvironmentSink, SampleTrigger, SensorMeasurement,
-    SensorPolicy, SleepDepth,
+    ButtonPolicy, DiagnosticEvent, Diagnostics, EnvironmentSink, RecoveryPolicy, SampleTrigger,
+    SensorMeasurement, SensorPolicy, SleepDepth,
 };
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::MacDriver;
@@ -19,6 +19,7 @@ use zigbee_runtime::profile::{
 };
 use zigbee_runtime::role::DeviceRole;
 use zigbee_runtime::{ClusterRef, ZigbeeDevice};
+use zigbee_zcl::clusters::poll_control::{PollControlCluster, PollControlConfig};
 use zigbee_zcl::clusters::temperature::{TemperatureCluster, ATTR_MEASURED_VALUE};
 use zigbee_zcl::clusters::Cluster;
 use zigbee_zcl::data_types::{ZclDataType, ZclValue};
@@ -45,23 +46,53 @@ pub static POLICY: SensorPolicy = SensorPolicy {
         long_press_ms: product::policy::SENSOR_POLICY.button.long_press_ms,
         debounce_ms: product::policy::SENSOR_POLICY.button.debounce_ms,
     },
-    fast_sleep_depth: SleepDepth::Active,
+    fast_sleep_depth: if cfg!(feature = "light-sleep") && config::FAST_POLL_LIGHT_SLEEP {
+        SleepDepth::Idle
+    } else {
+        SleepDepth::Active
+    },
     slow_sleep_depth: if cfg!(feature = "light-sleep") {
         SleepDepth::Idle
     } else {
         SleepDepth::Active
     },
+    join_retry_ms: config::JOIN_RETRY_MS,
+    secure_rejoin_failure_limit: 0,
+    recovery: RecoveryPolicy {
+        join_retry_max_ms: config::JOIN_RETRY_MAX_MS,
+        join_retry_jitter_pct: config::JOIN_RETRY_JITTER_PCT,
+        parent_loss_strikes: config::PARENT_LOSS_STRIKES,
+        max_active_ms: config::MAX_ACTIVE_MS,
+        report_aps_ack: config::REPORT_APS_ACK,
+    },
     ..product::policy::SENSOR_POLICY
 };
+
+/// Poll Control server values and limits from the build profile.
+pub const POLL_CONTROL: PollControlConfig = PollControlConfig {
+    check_in_interval: config::CHECK_IN_INTERVAL_QS,
+    long_poll_interval: config::LONG_POLL_INTERVAL_QS,
+    short_poll_interval: config::SHORT_POLL_INTERVAL_QS,
+    fast_poll_timeout: config::FAST_POLL_TIMEOUT_QS,
+    check_in_interval_min: config::CHECK_IN_INTERVAL_MIN_QS,
+    long_poll_interval_min: config::LONG_POLL_MIN_QS,
+    fast_poll_timeout_max: config::FAST_POLL_TIMEOUT_MAX_QS,
+    long_poll_interval_max: config::LONG_POLL_MAX_QS,
+    check_in_response_timeout: config::CHECK_IN_RESPONSE_QS,
+};
+
+const _: () = assert!(POLL_CONTROL.is_valid());
+const _: () = assert!(config::LONG_POLL_MAX_QS * 250 <= sensor_sed_app::policy::MAX_WAIT_MS);
 
 // No status LED is fitted (`NoStatus`), and the slow poll must fit the
 // shared application's bounded wait.
 const _: () = assert!(POLICY.is_valid_for_status(false));
 const _: () = assert!(config::SLOW_POLL_MS <= sensor_sed_app::policy::MAX_WAIT_MS);
 
-/// Basic + Identify + Temperature Measurement server.
+/// Basic + Identify + Poll Control + Temperature Measurement server.
 pub struct Thermometer {
     temperature: TemperatureCluster,
+    poll_control: PollControlCluster,
 }
 
 impl Thermometer {
@@ -73,6 +104,7 @@ impl Thermometer {
                 config::MIN_MEASURED_CENTI_C,
                 config::MAX_MEASURED_CENTI_C,
             ),
+            poll_control: PollControlCluster::with_config(POLL_CONTROL),
         }
     }
 
@@ -86,6 +118,7 @@ impl ProfileComponent for Thermometer {
         endpoint
             .cluster_server(ClusterId::BASIC)
             .cluster_server(ClusterId::IDENTIFY)
+            .cluster_server(ClusterId::POLL_CONTROL)
             .cluster_server(self.temperature.cluster_id())
     }
 
@@ -98,6 +131,12 @@ impl ProfileComponent for Thermometer {
             .push(ClusterRef {
                 endpoint,
                 cluster: &mut self.temperature,
+            })
+            .map_err(|_| ProfileError::TooManyClusters)?;
+        clusters
+            .push(ClusterRef {
+                endpoint,
+                cluster: &mut self.poll_control,
             })
             .map_err(|_| ProfileError::TooManyClusters)
     }
@@ -139,6 +178,10 @@ impl EnvironmentSink for Thermometer {
     }
 
     fn update_battery(&mut self, _measurement: BatteryMeasurement) {}
+
+    fn poll_control_mut(&mut self) -> Option<&mut PollControlCluster> {
+        Some(&mut self.poll_control)
+    }
 }
 
 pub type ThermoProfile =

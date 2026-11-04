@@ -159,66 +159,105 @@ impl ConfigureReportingRequest {
         let mut configs = heapless::Vec::new();
         let mut i = 0;
         while i < data.len() {
-            let direction = match data[i] {
-                0x00 => ReportDirection::Send,
-                0x01 => ReportDirection::Receive,
-                _ => return None,
-            };
+            let (config, consumed) = ReportingConfig::parse_record(&data[i..])?;
+            i += consumed;
+            configs.push(config).ok()?;
+        }
+        Some(Self { configs })
+    }
+}
+
+impl ReportingConfig {
+    /// Parse one Configure Reporting attribute record (ZCL wire format).
+    ///
+    /// Returns the configuration and the number of bytes consumed.
+    pub fn parse_record(data: &[u8]) -> Option<(Self, usize)> {
+        let direction = match *data.first()? {
+            0x00 => ReportDirection::Send,
+            0x01 => ReportDirection::Receive,
+            _ => return None,
+        };
+        let mut i = 1;
+        if i + 2 > data.len() {
+            return None;
+        }
+        let attr_id = AttributeId(u16::from_le_bytes([data[i], data[i + 1]]));
+        i += 2;
+
+        if direction == ReportDirection::Send {
+            if i + 5 > data.len() {
+                return None;
+            }
+            let dt = ZclDataType::from_u8(data[i])?;
             i += 1;
+            let min_interval = u16::from_le_bytes([data[i], data[i + 1]]);
+            i += 2;
+            let max_interval = u16::from_le_bytes([data[i], data[i + 1]]);
+            i += 2;
+            // Reportable change only for analog types
+            let reportable_change = if data_types::is_analog_type(dt) {
+                let (val, consumed) = ZclValue::deserialize(dt, &data[i..])?;
+                i += consumed;
+                Some(val)
+            } else {
+                None
+            };
+            Some((
+                ReportingConfig {
+                    direction,
+                    attribute_id: attr_id,
+                    data_type: dt,
+                    min_interval,
+                    max_interval,
+                    reportable_change,
+                },
+                i,
+            ))
+        } else {
+            // Receive direction: timeout period
             if i + 2 > data.len() {
                 return None;
             }
-            let attr_id = AttributeId(u16::from_le_bytes([data[i], data[i + 1]]));
+            let timeout = u16::from_le_bytes([data[i], data[i + 1]]);
             i += 2;
-
-            if direction == ReportDirection::Send {
-                if i + 5 > data.len() {
-                    return None;
-                }
-                let dt = ZclDataType::from_u8(data[i])?;
-                i += 1;
-                let min_interval = u16::from_le_bytes([data[i], data[i + 1]]);
-                i += 2;
-                let max_interval = u16::from_le_bytes([data[i], data[i + 1]]);
-                i += 2;
-                // Reportable change only for analog types
-                let reportable_change = if data_types::is_analog_type(dt) {
-                    let (val, consumed) = ZclValue::deserialize(dt, &data[i..])?;
-                    i += consumed;
-                    Some(val)
-                } else {
-                    None
-                };
-                configs
-                    .push(ReportingConfig {
-                        direction,
-                        attribute_id: attr_id,
-                        data_type: dt,
-                        min_interval,
-                        max_interval,
-                        reportable_change,
-                    })
-                    .ok()?;
-            } else {
-                // Receive direction: timeout period
-                if i + 2 > data.len() {
-                    return None;
-                }
-                let timeout = u16::from_le_bytes([data[i], data[i + 1]]);
-                i += 2;
-                configs
-                    .push(ReportingConfig {
-                        direction,
-                        attribute_id: attr_id,
-                        data_type: ZclDataType::NoData,
-                        min_interval: 0,
-                        max_interval: timeout,
-                        reportable_change: None,
-                    })
-                    .ok()?;
-            }
+            Some((
+                ReportingConfig {
+                    direction,
+                    attribute_id: attr_id,
+                    data_type: ZclDataType::NoData,
+                    min_interval: 0,
+                    max_interval: timeout,
+                    reportable_change: None,
+                },
+                i,
+            ))
         }
-        Some(Self { configs })
+    }
+
+    /// Serialize this configuration as one Configure Reporting attribute
+    /// record (the exact inverse of [`parse_record`](Self::parse_record)).
+    ///
+    /// Returns `None` without a usable result when `buf` is too short or an
+    /// analog Send record has no representable reportable change.
+    pub fn encode_record(&self, buf: &mut [u8]) -> Option<usize> {
+        let head = buf.get_mut(..3)?;
+        head[0] = self.direction as u8;
+        head[1..3].copy_from_slice(&self.attribute_id.0.to_le_bytes());
+        if self.direction == ReportDirection::Receive {
+            buf.get_mut(3..5)?
+                .copy_from_slice(&self.max_interval.to_le_bytes());
+            return Some(5);
+        }
+        let body = buf.get_mut(3..8)?;
+        body[0] = self.data_type as u8;
+        body[1..3].copy_from_slice(&self.min_interval.to_le_bytes());
+        body[3..5].copy_from_slice(&self.max_interval.to_le_bytes());
+        if !data_types::is_analog_type(self.data_type) {
+            return Some(8);
+        }
+        let change = self.reportable_change.as_ref()?;
+        let n = change.try_serialize(buf.get_mut(8..)?)?;
+        Some(8 + n)
     }
 }
 
@@ -452,6 +491,14 @@ impl ReportingEngine {
                     && s.config.attribute_id == attr_id
             })
             .map(|s| &s.config)
+    }
+
+    /// Every stored configuration as `(endpoint, cluster_id, config)`, in
+    /// insertion order. Used to snapshot the engine for persistence.
+    pub fn configs(&self) -> impl Iterator<Item = (u8, u16, &ReportingConfig)> {
+        self.states
+            .iter()
+            .map(|s| (s.endpoint, s.cluster_id, &s.config))
     }
 
     /// Check reports for a cluster using a type-erased attribute store (trait object).
@@ -941,6 +988,74 @@ mod tests {
                 9,
                 0
             ]
+        );
+    }
+
+    #[test]
+    fn reporting_record_encode_is_the_inverse_of_parse() {
+        let send = ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: AttributeId(0),
+            data_type: ZclDataType::I16,
+            min_interval: 30,
+            max_interval: 900,
+            reportable_change: Some(ZclValue::I16(50)),
+        };
+        let digital = ReportingConfig {
+            data_type: ZclDataType::Bool,
+            reportable_change: None,
+            ..send.clone()
+        };
+        let receive = ReportingConfig {
+            direction: ReportDirection::Receive,
+            attribute_id: AttributeId(7),
+            data_type: ZclDataType::NoData,
+            min_interval: 0,
+            max_interval: 120,
+            reportable_change: None,
+        };
+        for (config, expected_len) in [(send, 10), (digital, 8), (receive, 5)] {
+            let mut buf = [0u8; 16];
+            let n = config.encode_record(&mut buf).unwrap();
+            assert_eq!(n, expected_len);
+            let (parsed, consumed) = ReportingConfig::parse_record(&buf[..n]).unwrap();
+            assert_eq!(consumed, n);
+            assert_eq!(parsed.direction, config.direction);
+            assert_eq!(parsed.attribute_id, config.attribute_id);
+            assert_eq!(parsed.data_type, config.data_type);
+            assert_eq!(parsed.min_interval, config.min_interval);
+            assert_eq!(parsed.max_interval, config.max_interval);
+            assert_eq!(parsed.reportable_change, config.reportable_change);
+            for short in 0..n {
+                assert!(config.encode_record(&mut buf[..short]).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn analog_record_without_change_cannot_be_encoded() {
+        let mut config = config(0);
+        config.reportable_change = None;
+        assert!(config.encode_record(&mut [0u8; 16]).is_none());
+    }
+
+    #[test]
+    fn engine_lists_every_configuration_in_insertion_order() {
+        let mut engine = ReportingEngine::new();
+        engine.configure_for_cluster(1, 0x0402, config(0)).unwrap();
+        engine.configure_for_cluster(2, 0x0405, config(1)).unwrap();
+        let mut replacement = config(0);
+        replacement.max_interval = 300;
+        engine
+            .configure_for_cluster(1, 0x0402, replacement)
+            .unwrap();
+        let listed: heapless::Vec<_, 4> = engine
+            .configs()
+            .map(|(ep, cluster, cfg)| (ep, cluster, cfg.attribute_id.0, cfg.max_interval))
+            .collect();
+        assert_eq!(
+            listed.as_slice(),
+            &[(1, 0x0402, 0, 300), (2, 0x0405, 1, 60)]
         );
     }
 }

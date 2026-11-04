@@ -93,7 +93,7 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     announce_retry_ms: 8_000,
     // BDB steering already owns the bounded Device_annce retry sequence.
     announce_retries: 0,
-    secure_rejoin_failure_limit: 4,
+    secure_rejoin_failure_limit: 0,
     interview_complete_grace_ms: 5_000,
     button: ButtonPolicy {
         long_press_ms: None,
@@ -114,6 +114,7 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     } else {
         SleepDepth::Idle
     },
+    recovery: sensor_sed_app::RecoveryPolicy::DEFAULT,
 };
 
 // The production image must stay commandable behind any common parent.

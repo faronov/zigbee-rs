@@ -24,21 +24,32 @@ role_tag = 0x5203
 min_measured_centi_c = -1000
 max_measured_centi_c = 8000
 
-# Default Send-direction reporting of MeasuredValue, applied at every cold
-# boot. A ZCL Configure Reporting (e.g. ZHA's interview) replaces it until
-# the next reboot. ZCL semantics: max 0 = no periodic report,
-# max 0xFFFF = reporting off.
+# Default Send-direction reporting of MeasuredValue for a fresh network. A
+# ZCL Configure Reporting (e.g. ZHA's interview) replaces it; with the
+# `reporting-persist` feature (part of `thermometer`) the replacement is
+# journaled in flash and restored after a reset on the same network.
+# ZCL semantics: max 0 = no periodic report, max 0xFFFF = reporting off.
 report_min_s = 30
 report_max_s = 300
 report_change_centi_c = 50
 
 # --- polling and sampling ------------------------------------------------
-# Joined slow (sleepy) parent poll. Must stay below the parent's child
-# timeout (the stack requests the 256-minute default).
+# Joined slow (sleepy) parent poll, and the Poll Control LongPollInterval
+# power-on value. Must stay below the parent's child timeout (the stack
+# requests the 256-minute default). Multiple of 250 ms.
 slow_poll_ms = 30000
 # Poll period while joining, interviewing, identifying, receiving OTA or
-# with pending APS/ZDO transactions.
+# with pending APS/ZDO transactions; also the Poll Control
+# ShortPollInterval. Multiple of 250 ms.
 fast_poll_ms = 250
+# Light sleep (radio off) between fast polls too. false keeps the CPU awake
+# between fast polls (lowest command latency during interview/OTA).
+fast_poll_light_sleep = true
+# Oscillators stopped during light sleep (ESP-IDF's light-sleep default is
+# both off). XTAL off also lowers the retained HP domain to 0.6 V and stops
+# SYSTIMER (compensated from the calibrated RTC). false = keep running.
+sleep_xtal_off = true
+sleep_rc_fast_off = true
 # Fast-poll windows after a fresh join (ZHA interview) and after a resume.
 fresh_join_fast_ms = 120000
 restored_fast_ms = 60000
@@ -48,6 +59,41 @@ button_fast_poll_ms = 10000
 # Die temperature sample on every Nth slow-poll wake (sampling shares the
 # poll wake; it never schedules its own).
 sample_every_polls = 1
+
+# --- Poll Control (0x0020) ---------------------------------------------
+# Periodic Check-in to the bound client (ZHA binds it and writes 55 min at
+# its configure step). 0 disables check-ins.
+check_in_interval_s = 3600
+# Smallest CheckInInterval a client may write.
+check_in_interval_min_s = 300
+# Range a client may set with SetLongPollInterval. The minimum keeps the
+# battery budget (ZHA asks for 6 s on every check-in; it is refused); the
+# maximum is the shared application's longest bounded sleep (60 s).
+long_poll_min_ms = 30000
+long_poll_max_ms = 60000
+# FastPollTimeout attribute default and the largest a client may request.
+fast_poll_timeout_ms = 10000
+fast_poll_timeout_max_ms = 60000
+# Fast-poll period after each Check-in, waiting for the Check-in Response.
+check_in_response_ms = 8000
+
+# --- recovery ------------------------------------------------------------
+# First rejoin/commissioning retry delay; doubles per failed attempt up to
+# the cap, each delay shortened by up to `join_retry_jitter_pct` percent.
+# The device sleeps (radio off) for the whole delay and keeps its network:
+# only a user factory reset or a Leave from the network clears it.
+join_retry_ms = 15000
+join_retry_max_ms = 900000
+join_retry_jitter_pct = 25
+# Parent-loss evidence (exhausted APS-acknowledged reports, or pending
+# work that outlived `max_active_ms`) that starts the staged rejoin
+# (current channel, all channels, Trust Center). 0 disables.
+parent_loss_strikes = 3
+# Longest time pending protocol work may keep the chip awake (0 = no bound).
+max_active_ms = 30000
+# Request APS acknowledgements for unicast reports (end-to-end delivery
+# evidence for parent-loss detection; costs about one extra poll per report).
+report_aps_ack = true
 
 # --- power ---------------------------------------------------------------
 # With no USB host seen within this window after boot, the USB Serial/JTAG

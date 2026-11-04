@@ -55,6 +55,7 @@ static POLICY: SensorPolicy = SensorPolicy {
     },
     fast_sleep_depth: SleepDepth::Active,
     slow_sleep_depth: SleepDepth::Active,
+    recovery: sensor_sed_app::RecoveryPolicy::DEFAULT,
 };
 
 #[derive(Default)]

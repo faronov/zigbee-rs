@@ -48,6 +48,11 @@ mod thermometer {
     /// Longest joined wait the shared sleepy application accepts
     /// (`sensor_sed_app::policy::MAX_WAIT_MS`, checked again at compile time).
     const MAX_SLOW_POLL_MS: u32 = 60_000;
+    /// Largest rejoin backoff cap (`sensor_sed_app::JOIN_RETRY_MAX_MS`,
+    /// checked again at compile time through `POLICY`).
+    const JOIN_RETRY_MAX_MS: u32 = 30 * 60 * 1_000;
+    /// ZCL Poll Control intervals are quarter-seconds.
+    const QS_MS: i64 = 250;
 
     pub fn generate() -> String {
         println!("cargo:rerun-if-env-changed=H2_THERMO_CONFIG");
@@ -78,7 +83,53 @@ mod thermometer {
                 1_000,
                 i64::from(MAX_SLOW_POLL_MS),
             ),
-            fast_poll_ms: int(&mut values, "fast_poll_ms", 50, 7_500),
+            fast_poll_ms: int(&mut values, "fast_poll_ms", 250, 7_500),
+            fast_poll_light_sleep: boolean(&mut values, "fast_poll_light_sleep"),
+            check_in_interval_s: int(&mut values, "check_in_interval_s", 0, 0x006E_0000 / 4),
+            check_in_interval_min_s: int(
+                &mut values,
+                "check_in_interval_min_s",
+                0,
+                0x006E_0000 / 4,
+            ),
+            long_poll_min_ms: int(
+                &mut values,
+                "long_poll_min_ms",
+                1_000,
+                i64::from(MAX_SLOW_POLL_MS),
+            ),
+            long_poll_max_ms: int(
+                &mut values,
+                "long_poll_max_ms",
+                1_000,
+                i64::from(MAX_SLOW_POLL_MS),
+            ),
+            fast_poll_timeout_ms: int(&mut values, "fast_poll_timeout_ms", 250, 0xFFFF * 250),
+            fast_poll_timeout_max_ms: int(
+                &mut values,
+                "fast_poll_timeout_max_ms",
+                250,
+                0xFFFF * 250,
+            ),
+            check_in_response_ms: int(&mut values, "check_in_response_ms", 250, 0xFFFF * 250),
+            join_retry_ms: int(
+                &mut values,
+                "join_retry_ms",
+                1_000,
+                i64::from(JOIN_RETRY_MAX_MS),
+            ),
+            join_retry_max_ms: int(
+                &mut values,
+                "join_retry_max_ms",
+                1_000,
+                i64::from(JOIN_RETRY_MAX_MS),
+            ),
+            join_retry_jitter_pct: int(&mut values, "join_retry_jitter_pct", 0, 50),
+            parent_loss_strikes: int(&mut values, "parent_loss_strikes", 0, 255),
+            max_active_ms: int(&mut values, "max_active_ms", 0, i64::from(MAX_SLOW_POLL_MS)),
+            report_aps_ack: boolean(&mut values, "report_aps_ack"),
+            sleep_xtal_off: boolean(&mut values, "sleep_xtal_off"),
+            sleep_rc_fast_off: boolean(&mut values, "sleep_rc_fast_off"),
             fresh_join_fast_ms: int(&mut values, "fresh_join_fast_ms", 1, 3_600_000),
             restored_fast_ms: int(&mut values, "restored_fast_ms", 1, 3_600_000),
             button_fast_poll_ms: int(&mut values, "button_fast_poll_ms", 1, 600_000),
@@ -103,6 +154,22 @@ mod thermometer {
         report_change: i64,
         slow_poll_ms: i64,
         fast_poll_ms: i64,
+        fast_poll_light_sleep: bool,
+        check_in_interval_s: i64,
+        check_in_interval_min_s: i64,
+        long_poll_min_ms: i64,
+        long_poll_max_ms: i64,
+        fast_poll_timeout_ms: i64,
+        fast_poll_timeout_max_ms: i64,
+        check_in_response_ms: i64,
+        join_retry_ms: i64,
+        join_retry_max_ms: i64,
+        join_retry_jitter_pct: i64,
+        parent_loss_strikes: i64,
+        max_active_ms: i64,
+        report_aps_ack: bool,
+        sleep_xtal_off: bool,
+        sleep_rc_fast_off: bool,
         fresh_join_fast_ms: i64,
         restored_fast_ms: i64,
         button_fast_poll_ms: i64,
@@ -139,6 +206,39 @@ mod thermometer {
                 self.slow_poll_ms * self.sample_every_polls <= u32::MAX as i64,
                 "sample interval overflows"
             );
+            for (key, value) in [
+                ("slow_poll_ms", self.slow_poll_ms),
+                ("fast_poll_ms", self.fast_poll_ms),
+                ("long_poll_min_ms", self.long_poll_min_ms),
+                ("long_poll_max_ms", self.long_poll_max_ms),
+                ("fast_poll_timeout_ms", self.fast_poll_timeout_ms),
+                ("fast_poll_timeout_max_ms", self.fast_poll_timeout_max_ms),
+                ("check_in_response_ms", self.check_in_response_ms),
+            ] {
+                assert!(
+                    value % QS_MS == 0,
+                    "`{key}` = {value} must be a multiple of 250 ms (ZCL quarter-seconds)"
+                );
+            }
+            assert!(
+                self.long_poll_min_ms <= self.slow_poll_ms
+                    && self.slow_poll_ms <= self.long_poll_max_ms,
+                "slow_poll_ms must lie within long_poll_min_ms..=long_poll_max_ms"
+            );
+            assert!(
+                self.check_in_interval_s == 0
+                    || (self.check_in_interval_s >= self.check_in_interval_min_s
+                        && self.check_in_interval_s * 1_000 >= self.slow_poll_ms),
+                "check_in_interval_s must be 0, or at least check_in_interval_min_s and slow_poll_ms"
+            );
+            assert!(
+                self.fast_poll_timeout_ms <= self.fast_poll_timeout_max_ms,
+                "fast_poll_timeout_ms must not exceed fast_poll_timeout_max_ms"
+            );
+            assert!(
+                self.join_retry_ms <= self.join_retry_max_ms,
+                "join_retry_ms must not exceed join_retry_max_ms"
+            );
         }
 
         fn render(&self) -> String {
@@ -158,7 +258,25 @@ mod thermometer {
                  pub const RESTORED_FAST_MS: u32 = {restored};\n\
                  pub const BUTTON_FAST_POLL_MS: u32 = {button};\n\
                  pub const SAMPLE_EVERY_POLLS: u32 = {every};\n\
-                 pub const USB_HOST_WAIT_MS: u32 = {usb};\n",
+                 pub const USB_HOST_WAIT_MS: u32 = {usb};\n\
+                 pub const FAST_POLL_LIGHT_SLEEP: bool = {fast_light};\n\
+                 pub const CHECK_IN_INTERVAL_QS: u32 = {check_in};\n\
+                 pub const CHECK_IN_INTERVAL_MIN_QS: u32 = {check_in_min};\n\
+                 pub const LONG_POLL_INTERVAL_QS: u32 = {long_qs};\n\
+                 pub const LONG_POLL_MIN_QS: u32 = {long_min};\n\
+                 pub const LONG_POLL_MAX_QS: u32 = {long_max};\n\
+                 pub const SHORT_POLL_INTERVAL_QS: u16 = {short_qs};\n\
+                 pub const FAST_POLL_TIMEOUT_QS: u16 = {fpt};\n\
+                 pub const FAST_POLL_TIMEOUT_MAX_QS: u16 = {fpt_max};\n\
+                 pub const CHECK_IN_RESPONSE_QS: u16 = {resp};\n\
+                 pub const JOIN_RETRY_MS: u32 = {jr};\n\
+                 pub const JOIN_RETRY_MAX_MS: u32 = {jr_max};\n\
+                 pub const JOIN_RETRY_JITTER_PCT: u8 = {jitter};\n\
+                 pub const PARENT_LOSS_STRIKES: u8 = {strikes};\n\
+                 pub const MAX_ACTIVE_MS: u32 = {max_active};\n\
+                 pub const REPORT_APS_ACK: bool = {aps_ack};\n\
+                 pub const SLEEP_XTAL_OFF: bool = {xtal_off};\n\
+                 pub const SLEEP_RC_FAST_OFF: bool = {fosc_off};\n",
                 model = self.model,
                 ota = self.ota_image_type,
                 role = self.role_tag,
@@ -174,6 +292,24 @@ mod thermometer {
                 button = self.button_fast_poll_ms,
                 every = self.sample_every_polls,
                 usb = self.usb_host_wait_ms,
+                fast_light = self.fast_poll_light_sleep,
+                check_in = self.check_in_interval_s * 4,
+                check_in_min = self.check_in_interval_min_s * 4,
+                long_qs = self.slow_poll_ms / QS_MS,
+                long_min = self.long_poll_min_ms / QS_MS,
+                long_max = self.long_poll_max_ms / QS_MS,
+                short_qs = self.fast_poll_ms / QS_MS,
+                fpt = self.fast_poll_timeout_ms / QS_MS,
+                fpt_max = self.fast_poll_timeout_max_ms / QS_MS,
+                resp = self.check_in_response_ms / QS_MS,
+                jr = self.join_retry_ms,
+                jr_max = self.join_retry_max_ms,
+                jitter = self.join_retry_jitter_pct,
+                strikes = self.parent_loss_strikes,
+                max_active = self.max_active_ms,
+                aps_ack = self.report_aps_ack,
+                xtal_off = self.sleep_xtal_off,
+                fosc_off = self.sleep_rc_fast_off,
             )
         }
     }
@@ -230,6 +366,14 @@ mod thermometer {
             .and_then(|s| s.strip_suffix('"'))
             .unwrap_or(raw)
             .to_owned()
+    }
+
+    fn boolean(values: &mut BTreeMap<String, String>, key: &str) -> bool {
+        match take(values, key).trim() {
+            "true" => true,
+            "false" => false,
+            other => panic!("`{key}` = `{other}` must be true or false"),
+        }
     }
 
     fn int(values: &mut BTreeMap<String, String>, key: &str, min: i64, max: i64) -> i64 {

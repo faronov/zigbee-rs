@@ -52,7 +52,8 @@ pub use ota::{
 };
 pub use parts::SensorSedParts;
 pub use policy::{
-    ButtonPolicy, ForceReportAction, JoinOnlyAction, NoUserAction, PARENT_INDIRECT_HOLD_MARGIN_MS,
-    PARENT_INDIRECT_HOLD_MIN_MS, RESPONSIVE_SLOW_POLL_MS, SensorPolicy, ShortPressAction,
-    SleepDepth, StatusPolicy, ToggleJoinAction, UserActionPolicy,
+    ButtonPolicy, ForceReportAction, JOIN_RETRY_MAX_MS, JoinOnlyAction, MAX_JOIN_RETRY_JITTER_PCT,
+    MAX_WAIT_MS, NoUserAction, PARENT_INDIRECT_HOLD_MARGIN_MS, PARENT_INDIRECT_HOLD_MIN_MS,
+    RESPONSIVE_SLOW_POLL_MS, RecoveryPolicy, SensorPolicy, ShortPressAction, SleepDepth,
+    StatusPolicy, ToggleJoinAction, UserActionPolicy,
 };

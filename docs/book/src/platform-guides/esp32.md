@@ -89,11 +89,11 @@ inside the critical section that esp-radio already takes, before each
 acknowledged transmission and before suspend, but only while
 `macRxOnWhenIdle` is false. Routers and always-on end devices keep every
 frame.
-Router images also
+All images
 convert RSSI to the IEEE 0–255 LQI scale (`zigbee_mac::lqi`) for neighbour
-and link-cost decisions. End-device images keep the radio's raw LQI byte,
-which is not on that scale; converting it there costs 44 bytes of flash, so it
-is not enabled yet.
+and link-cost decisions. The radio's raw LQI byte (about 7–11) maps every
+router to link cost 7, which made end-device rejoin parent selection reject
+every beacon ("none suitable as parent").
 
 **Persistence.** The role images write a role tag (ROUTER `0x5201`,
 END_DEVICE `0x5202`) in the security journal. The SED image writes none, so
@@ -170,6 +170,44 @@ effect of sleep.
 OTA cluster events reach `OtaTransport` before generic application handling.
 When the image is ready, `SensorApp` checkpoints Zigbee security state before
 the product writer changes `otadata` and resets.
+
+### ESP32-H2 thermometer SED (`thermometer`, `quiet`)
+
+`esp32h2-thermometer` is a temperature-only Sleepy End Device for battery and
+current measurements on boards without status hardware (the ESP32-H2
+SuperMini). Endpoint 1 carries Basic, Identify, Poll Control (0x0020) and
+Temperature Measurement (0x0402) fed by the eFuse-calibrated die sensor.
+Every policy value — identity, reporting defaults, poll/fast-poll periods,
+sampling cadence, Poll Control limits, rejoin backoff, the Active-time
+bound, the oscillator power-down and the USB pad policy — comes from
+`examples/esp32h2-sensor/thermometer.toml` through `build.rs` (override per
+build with `H2_THERMO_<KEY>` or `H2_THERMO_CONFIG`).
+
+```bash
+cd examples/esp32h2-sensor
+cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
+  --bin esp32h2-thermometer --features thermometer,light-sleep,quiet
+```
+
+- `quiet` sets `log` to `max_level_off`; the bin links no console.
+- `reporting-persist` (enabled by `thermometer`) journals the coordinator's
+  Configure Reporting in the product's two-sector `0x3F4000..0x3F6000`
+  window (keyed by extended PAN ID, CRC + commit marker, alternating
+  sectors) and restores it after a reset on the same network. About 4.5 KB
+  of flash: journal scan/commit/erase ≈2.4 KB, snapshot capture/encode
+  ≈0.6 KB, record parse ≈0.4 KB, the rest flash-window glue.
+- Poll Control: periodic Check-in to the bound client, Check-in Response
+  fast poll bounded by `fast_poll_timeout_max_ms`, Fast Poll Stop, and
+  Set Long/Short Poll Interval range-checked against the profile. Written
+  attributes are not persisted across a reset.
+- Light sleep stops XTAL and RC_FAST (`sleep_xtal_off`,
+  `sleep_rc_fast_off`) and applies ESP-IDF's light-sleep analog settings
+  (see `vendor/esp-hal/LOCAL-PATCHES.md`). CPU, top, modem and flash
+  domains stay powered.
+
+Status: build- and host-tested. Join, interview, reporting persistence,
+Poll Control check-in and the current floor with oscillator power-down
+are **hardware gates still open**.
 
 ## Product-owned flash layout
 
@@ -404,6 +442,10 @@ Open hardware gates:
 - No packet sniffer has confirmed the turnaround timing of individual ACKs.
 - Light sleep is vetoed while the native USB Serial/JTAG session is
   attached. Sleep power needs a cold boot from a power-only supply.
-- Light-sleep current has not been measured.
+- Light-sleep current in normal operation has not been measured. An H2
+  SED that had lost end-to-end delivery through its parent was measured
+  stuck in `Active` at ~26.4 mA (WSTK AEM); the shared recovery changes
+  (bounded Active time, staged rejoin with slept backoff) target that
+  defect and still need an AEM rerun.
 - The H2 ED and sensor role images are build-, layout- and symbol-checked
   only.

@@ -130,6 +130,7 @@ pub mod ota_transport;
 pub mod power;
 pub mod profile;
 pub mod remote_reporting;
+pub mod reporting_store;
 pub mod role;
 pub mod security_journal;
 pub mod security_store;
@@ -2219,6 +2220,88 @@ mod resume_tests {
         (payload, len + 1)
     }
 
+    /// Reporting persistence restores only on the same joined network and
+    /// writes only when the engine configuration changed.
+    #[test]
+    fn reporting_persistence_restores_matching_network_and_writes_on_change() {
+        use crate::reporting_store::{RamReportingStore, ReportingPersistence};
+        use zigbee_zcl::foundation::reporting::{ReportDirection, ReportingConfig};
+
+        let temperature = |max_interval| ReportingConfig {
+            direction: ReportDirection::Send,
+            attribute_id: zigbee_zcl::AttributeId(0),
+            data_type: zigbee_zcl::data_types::ZclDataType::I16,
+            min_interval: 30,
+            max_interval,
+            reportable_change: Some(zigbee_zcl::data_types::ZclValue::I16(50)),
+        };
+        let max_interval = |device: &ZigbeeDevice<MockMac>| {
+            device
+                .reporting()
+                .get_config(1, 0x0402, ReportDirection::Send, zigbee_zcl::AttributeId(0))
+                .unwrap()
+                .max_interval
+        };
+
+        let mut unjoined = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        let mut persistence = ReportingPersistence::new(RamReportingStore::new());
+        assert_eq!(persistence.restore(&mut unjoined), Ok(0));
+        assert_eq!(persistence.sync(&unjoined), Ok(false));
+        assert_eq!(unjoined.joined_extended_pan_id(), None);
+
+        let mut security = RamSecurityStateStore::new();
+        security.store(&commissioned_state()).unwrap();
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        block_on(device.start_or_resume_with_security_store(&mut security)).unwrap();
+        assert_eq!(device.joined_extended_pan_id(), Some([1; 8]));
+
+        // Product defaults: nothing stored yet, nothing written.
+        device
+            .reporting_mut()
+            .configure_for_cluster(1, 0x0402, temperature(300))
+            .unwrap();
+        assert_eq!(persistence.restore(&mut device), Ok(0));
+        assert_eq!(persistence.sync(&device), Ok(false));
+
+        // A coordinator Configure Reporting is written exactly once.
+        device
+            .reporting_mut()
+            .configure_for_cluster(1, 0x0402, temperature(900))
+            .unwrap();
+        assert_eq!(persistence.sync(&device), Ok(true));
+        assert_eq!(persistence.sync(&device), Ok(false));
+        assert_eq!(persistence.store_mut().writes, 1);
+
+        // After a reboot the defaults are replaced by the stored value.
+        let store = core::mem::take(persistence.store_mut());
+        let mut rebooted = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        block_on(rebooted.start_or_resume_with_security_store(&mut security)).unwrap();
+        rebooted
+            .reporting_mut()
+            .configure_for_cluster(1, 0x0402, temperature(300))
+            .unwrap();
+        let mut persistence = ReportingPersistence::new(store);
+        assert_eq!(persistence.restore(&mut rebooted), Ok(1));
+        assert_eq!(max_interval(&rebooted), 900);
+        assert_eq!(persistence.sync(&rebooted), Ok(false));
+
+        // A snapshot from another network is never applied.
+        let store = core::mem::take(persistence.store_mut());
+        let mut foreign_state = commissioned_state();
+        foreign_state.extended_pan_id = [2; 8];
+        let mut foreign_security = RamSecurityStateStore::new();
+        foreign_security.store(&foreign_state).unwrap();
+        let mut foreign = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        block_on(foreign.start_or_resume_with_security_store(&mut foreign_security)).unwrap();
+        foreign
+            .reporting_mut()
+            .configure_for_cluster(1, 0x0402, temperature(300))
+            .unwrap();
+        let mut persistence = ReportingPersistence::new(store);
+        assert_eq!(persistence.restore(&mut foreign), Ok(0));
+        assert_eq!(max_interval(&foreign), 300);
+    }
+
     /// A device holding a prepared (not yet committed) Bind response.
     fn device_with_pending_binding_response(
         store: &mut RamSecurityStateStore,
@@ -2924,6 +3007,12 @@ mod resume_tests {
             unsecured_rejoin_response(ShortAddress(OUR_SHORT), NEW_SHORT),
             ShortAddress(OUR_SHORT),
         ));
+        // The widened secured stage of the same attempt is refused too
+        // (MockMac pops with swap_remove: the last entry is delivered second).
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            secured_rejoin_response(0x65, ShortAddress(OUR_SHORT), 1),
+            ShortAddress(OUR_SHORT),
+        ));
 
         let result = block_on(device.start_or_resume_with_security_store(&mut store));
         assert_eq!(
@@ -2952,12 +3041,16 @@ mod resume_tests {
         assert!(persisted.tclk_incoming_counter_valid);
 
         let history = device.mac().tx_history();
-        assert!(history.len() >= 3);
-        let (secured_request, _) =
-            zigbee_nwk::frames::NwkHeader::parse(history[0].payload.as_slice()).unwrap();
+        assert!(history.len() >= 4);
+        // Secured stage on the last channel, secured widened stage, then
+        // the unsecured Trust Center rejoin request.
+        for secured in &history[..2] {
+            let (secured_request, _) =
+                zigbee_nwk::frames::NwkHeader::parse(secured.payload.as_slice()).unwrap();
+            assert!(secured_request.frame_control.security);
+        }
         let (tc_request, _) =
-            zigbee_nwk::frames::NwkHeader::parse(history[1].payload.as_slice()).unwrap();
-        assert!(secured_request.frame_control.security);
+            zigbee_nwk::frames::NwkHeader::parse(history[2].payload.as_slice()).unwrap();
         assert!(!tc_request.frame_control.security);
         assert_eq!(
             device
@@ -3005,6 +3098,12 @@ mod resume_tests {
             unsecured_rejoin_response(ShortAddress(OUR_SHORT), NEW_SHORT),
             ShortAddress(OUR_SHORT),
         ));
+        // The widened secured stage of the same attempt is refused too
+        // (MockMac pops with swap_remove: the last entry is delivered second).
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            secured_rejoin_response(0x67, ShortAddress(OUR_SHORT), 1),
+            ShortAddress(OUR_SHORT),
+        ));
 
         let mut profile = DeviceProfile::new(
             1,
@@ -3017,11 +3116,15 @@ mod resume_tests {
 
         assert!(device.is_joined());
         let history = device.mac().tx_history();
-        let (secured_request, _) =
-            zigbee_nwk::frames::NwkHeader::parse(history[0].payload.as_slice()).unwrap();
+        // Secured stage on the last channel, secured widened stage, then
+        // the unsecured Trust Center rejoin request.
+        for secured in &history[..2] {
+            let (secured_request, _) =
+                zigbee_nwk::frames::NwkHeader::parse(secured.payload.as_slice()).unwrap();
+            assert!(secured_request.frame_control.security);
+        }
         let (tc_request, _) =
-            zigbee_nwk::frames::NwkHeader::parse(history[1].payload.as_slice()).unwrap();
-        assert!(secured_request.frame_control.security);
+            zigbee_nwk::frames::NwkHeader::parse(history[2].payload.as_slice()).unwrap();
         assert!(!tc_request.frame_control.security);
         let persisted = store.load().unwrap().unwrap();
         assert_eq!(persisted.network_key, CURRENT_KEY);
@@ -3066,6 +3169,90 @@ mod resume_tests {
         assert_eq!(device.mac().tx_history().len(), 1);
     }
 
+    fn distributed_rejoin_state() -> PersistentSecurityState {
+        let mut state = commissioned_state();
+        state.rejoin_pending = true;
+        state.node_join_link_key_type =
+            zigbee_bdb::NodeJoinLinkKeyType::DistributedSecurityGlobalLinkKey;
+        state.tclk_present = false;
+        state.trust_center_address = [0xFF; 8];
+        state.trust_center_link_key = [0; 16];
+        state.tclk_counter_limit = 0;
+        state
+    }
+
+    #[test]
+    fn every_scheduled_rejoin_attempt_transmits_after_a_failed_one() {
+        // Regression: a failed attempt rolled `node_is_on_a_network` back,
+        // and every later attempt ended in NotOnNetwork without a scan.
+        let mut store = RamSecurityStateStore::new();
+        store.store(&distributed_rejoin_state()).unwrap();
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        device.mac_mut().add_beacon(rejoin_beacon());
+        for counter in [0x56, 0x57] {
+            device.mac_mut().enqueue_rx(rejoin_indication(
+                secured_rejoin_response(counter, ShortAddress(OUR_SHORT), 1),
+                ShortAddress(OUR_SHORT),
+            ));
+        }
+        assert!(matches!(
+            block_on(device.start_or_resume_with_security_store(&mut store)),
+            Err(crate::event_loop::StartError::CommissioningFailed(_))
+        ));
+        assert_eq!(device.mac().tx_history().len(), 2);
+
+        for counter in [0x58, 0x59] {
+            device.mac_mut().enqueue_rx(rejoin_indication(
+                secured_rejoin_response(counter, ShortAddress(OUR_SHORT), 1),
+                ShortAddress(OUR_SHORT),
+            ));
+        }
+        assert!(matches!(
+            block_on(device.rejoin_with_security_store(&mut store)),
+            Err(crate::event_loop::StartError::CommissioningFailed(
+                zigbee_bdb::BdbStatus::SteeringFailure
+            ))
+        ));
+        assert_eq!(
+            device.mac().tx_history().len(),
+            4,
+            "the retry must scan and send both secured stages again"
+        );
+        assert!(store.load().unwrap().unwrap().rejoin_pending);
+    }
+
+    #[test]
+    fn widened_secured_stage_finds_a_parent_on_another_channel() {
+        const NEW_SHORT: ShortAddress = ShortAddress(0x4321);
+        let mut store = RamSecurityStateStore::new();
+        store.store(&distributed_rejoin_state()).unwrap();
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        // The network moved from the stored channel 15 to channel 20.
+        let mut moved = rejoin_beacon();
+        moved.channel = 20;
+        device.mac_mut().add_beacon(moved);
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            secured_rejoin_response(0x56, NEW_SHORT, 0),
+            ShortAddress(OUR_SHORT),
+        ));
+        assert_eq!(
+            block_on(device.start_or_resume_with_security_store(&mut store)),
+            Ok(NEW_SHORT.0)
+        );
+        // The last-channel stage heard nothing and sent nothing: the first
+        // transmission is the widened stage's secured Rejoin Request
+        // (followed by Device_annce and the end-device timeout request).
+        let (first, _) =
+            zigbee_nwk::frames::NwkHeader::parse(device.mac().tx_history()[0].payload.as_slice())
+                .unwrap();
+        assert!(first.frame_control.security);
+        assert_eq!(
+            first.frame_control.frame_type,
+            zigbee_nwk::frames::NwkFrameType::Command as u8
+        );
+        assert_eq!(device.channel(), 20);
+    }
+
     #[test]
     fn distributed_persisted_rejoin_never_uses_trust_center_fallback() {
         let mut state = commissioned_state();
@@ -3084,16 +3271,23 @@ mod resume_tests {
             secured_rejoin_response(0x56, ShortAddress(OUR_SHORT), 1),
             ShortAddress(OUR_SHORT),
         ));
+        // The widened secured stage of the same attempt is refused too.
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            secured_rejoin_response(0x66, ShortAddress(OUR_SHORT), 1),
+            ShortAddress(OUR_SHORT),
+        ));
 
         assert!(matches!(
             block_on(device.start_or_resume_with_security_store(&mut store)),
             Err(crate::event_loop::StartError::CommissioningFailed(_))
         ));
-        assert_eq!(device.mac().tx_history().len(), 1);
-        let (request, _) =
-            zigbee_nwk::frames::NwkHeader::parse(device.mac().tx_history()[0].payload.as_slice())
-                .unwrap();
-        assert!(request.frame_control.security);
+        // Current-channel then widened secured stage; never unsecured.
+        assert_eq!(device.mac().tx_history().len(), 2);
+        for frame in device.mac().tx_history() {
+            let (request, _) =
+                zigbee_nwk::frames::NwkHeader::parse(frame.payload.as_slice()).unwrap();
+            assert!(request.frame_control.security);
+        }
         assert!(store.load().unwrap().unwrap().rejoin_pending);
     }
 
@@ -3121,6 +3315,12 @@ mod resume_tests {
             unsecured_rejoin_response(ShortAddress(OUR_SHORT), NEW_SHORT),
             ShortAddress(OUR_SHORT),
         ));
+        // The widened secured stage of the same attempt is refused too
+        // (MockMac pops with swap_remove: the last entry is delivered second).
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            secured_rejoin_response(0x67, ShortAddress(OUR_SHORT), 1),
+            ShortAddress(OUR_SHORT),
+        ));
 
         assert_eq!(
             block_on(device.start_or_resume_with_security_store(&mut store)),
@@ -3130,7 +3330,7 @@ mod resume_tests {
         );
         assert_eq!(
             device.mac().tx_history().len(),
-            2,
+            3,
             "Device_annce must wait for the current key and counter reservation"
         );
         assert!(!device.is_joined());
@@ -3142,7 +3342,7 @@ mod resume_tests {
         let mut rebooted = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
         rebooted.mac_mut().add_beacon(rejoin_beacon());
         rebooted.mac_mut().enqueue_rx(rejoin_indication(
-            secured_rejoin_response(0x58, ShortAddress(OUR_SHORT), 1),
+            secured_rejoin_response(0x69, ShortAddress(OUR_SHORT), 1),
             ShortAddress(OUR_SHORT),
         ));
         rebooted.mac_mut().enqueue_rx(rejoin_indication(
@@ -3151,6 +3351,10 @@ mod resume_tests {
         ));
         rebooted.mac_mut().enqueue_rx(rejoin_indication(
             unsecured_rejoin_response(ShortAddress(OUR_SHORT), NEW_SHORT),
+            ShortAddress(OUR_SHORT),
+        ));
+        rebooted.mac_mut().enqueue_rx(rejoin_indication(
+            secured_rejoin_response(0x6A, ShortAddress(OUR_SHORT), 1),
             ShortAddress(OUR_SHORT),
         ));
         assert_eq!(
@@ -3185,6 +3389,12 @@ mod resume_tests {
         ));
         device.mac_mut().enqueue_rx(rejoin_indication(
             unsecured_rejoin_response(ShortAddress(OUR_SHORT), NEW_SHORT),
+            ShortAddress(OUR_SHORT),
+        ));
+        // The widened secured stage of the same attempt is refused too
+        // (MockMac pops with swap_remove: the last entry is delivered second).
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            secured_rejoin_response(0x69, ShortAddress(OUR_SHORT), 1),
             ShortAddress(OUR_SHORT),
         ));
 
@@ -3288,6 +3498,12 @@ mod resume_tests {
         ));
         device.mac_mut().enqueue_rx(rejoin_indication(
             unsecured_rejoin_response(ShortAddress(OUR_SHORT), NEW_SHORT),
+            ShortAddress(OUR_SHORT),
+        ));
+        // The widened secured stage of the same attempt is refused too
+        // (MockMac pops with swap_remove: the last entry is delivered second).
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            secured_rejoin_response(0x6A, ShortAddress(OUR_SHORT), 1),
             ShortAddress(OUR_SHORT),
         ));
 
@@ -7583,6 +7799,8 @@ pub struct ZigbeeDevice<M: MacDriver, R: crate::role::DeviceRole = crate::role::
     fragmented_send_confirm: Option<zigbee_aps::apsde::ApsdeDataConfirm>,
     /// Store-backed receive paths delay APS ACKs until security state is durable.
     defer_aps_ack: bool,
+    /// Request an APS acknowledgement on unicast attribute reports.
+    report_aps_ack: bool,
     /// The current LeaveRequested event came from a self-targeted TC Remove-Device.
     trust_center_removal_pending: bool,
     /// Accepted Mgmt_Leave whose response waits for durable reset/rejoin intent.
@@ -9393,10 +9611,32 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 SecurityStoreError::Corrupt,
             )),
             RejoinFallback::SecureOnly => {
-                await_in_place!(self.secure_rejoin_with_security_store(store))
+                await_in_place!(self.staged_secure_rejoin_with_security_store(store))
             }
             RejoinFallback::TrustCenterRejoin => {
                 await_in_place!(self.secure_then_trust_center_rejoin_with_security_store(store))
+            }
+        }
+    }
+
+    /// One scheduled rejoin attempt's secured stages (R22 §3.6.1.4.2 / BDB
+    /// §7.1): a secured rejoin on the last operating channel, then — only if
+    /// that over-the-air exchange failed — a secured rejoin over the widened
+    /// channel sets (all channels when the sets are the home channel).
+    ///
+    /// The stages share one await site so the secured-rejoin future is
+    /// embedded once.
+    async fn staged_secure_rejoin_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<u16, event_loop::StartError> {
+        let mut widened = false;
+        loop {
+            self.bdb.set_rejoin_scan_widened(widened);
+            let result = await_in_place!(self.secure_rejoin_with_security_store(store));
+            match result {
+                Err(event_loop::StartError::CommissioningFailed(_)) if !widened => widened = true,
+                other => return other,
             }
         }
     }
@@ -9482,7 +9722,17 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         &mut self,
         store: &mut S,
     ) -> Result<u16, event_loop::StartError> {
-        match await_in_place!(self.secure_rejoin_with_security_store(store)) {
+        match await_in_place!(self.staged_secure_rejoin_with_security_store(store)) {
+            // A Trust Center rejoin only helps when the network was heard
+            // (the node may have missed a key update). With no beacon on any
+            // channel a third scan would only lengthen the outage.
+            Err(event_loop::StartError::CommissioningFailed(
+                zigbee_bdb::BdbStatus::NoScanResponse,
+            )) => {
+                return Err(event_loop::StartError::CommissioningFailed(
+                    zigbee_bdb::BdbStatus::NoScanResponse,
+                ));
+            }
             // Only a failed over-the-air exchange may widen to the unsecured
             // Trust Center rejoin; persistence failures stop here.
             Err(event_loop::StartError::CommissioningFailed(status)) => {
@@ -9493,6 +9743,8 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             }
             other => return other,
         }
+        // The Trust Center rejoin scans the widened sets as well.
+        self.bdb.set_rejoin_scan_widened(true);
         self.trust_center_rejoin_fallback_with_security_store(store)
             .await
     }
@@ -9611,6 +9863,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             .map_err(event_loop::StartError::PersistenceFailed)?;
         self.persist_rejoin_pending(store, true)
             .map_err(event_loop::StartError::PersistenceFailed)?;
+        // A previous failed attempt rolled the BDB "on a network" flag back;
+        // the commissioned record just validated above is what authorizes
+        // this attempt, as for the Trust Center fallback. Without this every
+        // retry after the first failure ended in NotOnNetwork without
+        // transmitting anything.
+        self.bdb.attributes_mut().node_is_on_a_network = true;
 
         self.remote_reporting.clear();
         self.bdb.zdo_mut().nwk_mut().set_joined(false);
@@ -10080,6 +10338,27 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             || self.pending_action.is_some()
             || !self.pending_responses.is_empty()
             || self.bdb.zdo().aps().has_pending_ack()
+    }
+
+    /// Request (or stop requesting) an APS acknowledgement on unicast
+    /// attribute reports. Off by default. With it on, every unicast report
+    /// is end-to-end evidence: a parent that MAC-acknowledges polls and
+    /// frames but delivers nothing shows up in
+    /// [`consecutive_aps_ack_failures`](Self::consecutive_aps_ack_failures).
+    /// Group and broadcast destinations never request an ACK.
+    pub fn set_report_aps_ack(&mut self, enabled: bool) {
+        self.report_aps_ack = enabled;
+    }
+
+    /// Acknowledged unicasts that exhausted every APS retry since the last
+    /// APS ACK arrived (or since [`clear_aps_ack_failures`](Self::clear_aps_ack_failures)).
+    pub fn consecutive_aps_ack_failures(&self) -> u8 {
+        self.bdb.zdo().aps().consecutive_ack_failures()
+    }
+
+    /// Forget accumulated end-to-end APS failures, e.g. after a rejoin.
+    pub fn clear_aps_ack_failures(&mut self) {
+        self.bdb.zdo_mut().aps_mut().clear_ack_failures();
     }
 
     /// Whether a coordinator-requested secure rejoin still needs retrying.

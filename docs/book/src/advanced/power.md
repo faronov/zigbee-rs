@@ -59,6 +59,36 @@ The shared application also shortens the wait for:
 
 `NoStatus::PRESENT = false` removes status-only deadlines.
 
+## Parent loss and rejoin recovery
+
+`sensor-sed-app` (all SED products) bounds how long a lost or broken parent
+can keep a battery device awake, via `SensorPolicy::recovery`
+(`RecoveryPolicy::DEFAULT` unless a product overrides it):
+
+- **Parent-loss evidence.** An APS-acknowledged report that exhausts its
+  retries (`report_aps_ack`), or pending protocol work that outlives
+  `max_active_ms` (30 s), counts one strike; MAC-level poll failures are
+  still handled by the runtime. `parent_loss_strikes` (3) consecutive
+  strikes start a rejoin. This catches a parent that ACKs MAC polls but
+  delivers nothing end to end.
+- **Staged rejoin.** Secure rejoin on the current channel, then on all
+  channels, then a Trust Center rejoin. Parent selection normalises LQI
+  to the IEEE 0–255 scale and, if every candidate exceeds the link-cost
+  limit, retries the selection accepting any valid link cost (still ranked
+  by depth, then cost) rather than rejecting every router.
+- **Backoff.** Each failed attempt doubles the delay from `join_retry_ms`
+  up to `join_retry_max_ms` (15 min), shortened by up to
+  `join_retry_jitter_pct` (25 %). The device waits at its slow depth
+  (radio off) for the whole delay, not in a radio-on retry loop.
+- **No self factory reset.** `secure_rejoin_failure_limit = 0` on every SED
+  product: the network is kept until a user action (long press) or a Leave
+  from the network. A non-zero limit restores the old give-up behaviour.
+
+Router and always-on end-device apps (`apps/router`) are unchanged.
+
+Status: host-tested (`apps/sensor-sed/tests/lifecycle.rs`); the AEM proof
+of the sleep floor between attempts is a hardware gate.
+
 ## Current product policies
 
 | product | fast | slow | implementation/status |

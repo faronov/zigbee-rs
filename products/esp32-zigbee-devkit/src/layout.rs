@@ -130,6 +130,14 @@ pub const APS_TABLE_OFFSET: u32 = CHILD_TABLE_OFFSET + CHILD_TABLE_SIZE;
 /// Size of the APS binding/group journal (two 4 KiB sectors).
 pub const APS_TABLE_SIZE: u32 = 2 * SECTOR_SIZE;
 
+/// Sleepy-sensor ZCL reporting-configuration journal, directly after the
+/// router's APS journal. Only images built with `reporting-persist` open it;
+/// it stays disjoint from every other role's journal so a role reflash never
+/// overwrites it.
+pub const REPORTING_OFFSET: u32 = APS_TABLE_OFFSET + APS_TABLE_SIZE;
+/// Size of the reporting journal (two 4 KiB sectors).
+pub const REPORTING_SIZE: u32 = 2 * SECTOR_SIZE;
+
 /// Exact entries required by the OTA writer and the ESP-IDF bootloader.
 pub(crate) const EXPECTED_PARTITIONS: [PartitionSpec; 4] = [
     PartitionSpec::new(0x01, 0x00, OTADATA_OFFSET, OTADATA_SIZE, b"otadata"),
@@ -207,6 +215,9 @@ const _: () = assert!(CHILD_TABLE_OFFSET.is_multiple_of(SECTOR_SIZE));
 const _: () = assert!(CHILD_TABLE_OFFSET + CHILD_TABLE_SIZE <= APS_TABLE_OFFSET);
 const _: () = assert!(APS_TABLE_OFFSET.is_multiple_of(SECTOR_SIZE));
 const _: () = assert!(APS_TABLE_OFFSET + APS_TABLE_SIZE <= NV_OFFSET);
+const _: () = assert!(REPORTING_OFFSET.is_multiple_of(SECTOR_SIZE));
+const _: () = assert!(APS_TABLE_OFFSET + APS_TABLE_SIZE <= REPORTING_OFFSET);
+const _: () = assert!(REPORTING_OFFSET + REPORTING_SIZE <= NV_OFFSET);
 
 #[cfg(test)]
 mod tests {
@@ -329,10 +340,11 @@ mod tests {
     }
 
     #[test]
-    fn router_journals_are_disjoint_inside_zbnv() {
+    fn persistence_journals_are_disjoint_inside_zbnv() {
         let windows = [
             (CHILD_TABLE_OFFSET, CHILD_TABLE_SIZE),
             (APS_TABLE_OFFSET, APS_TABLE_SIZE),
+            (REPORTING_OFFSET, REPORTING_SIZE),
             (NV_OFFSET, NV_SIZE),
         ];
         for (index, (start, size)) in windows.iter().enumerate() {
@@ -344,8 +356,8 @@ mod tests {
             }
         }
         assert_eq!(
-            (CHILD_TABLE_OFFSET, APS_TABLE_OFFSET),
-            (0x003F_0000, 0x003F_2000)
+            (CHILD_TABLE_OFFSET, APS_TABLE_OFFSET, REPORTING_OFFSET),
+            (0x003F_0000, 0x003F_2000, 0x003F_4000)
         );
     }
 
