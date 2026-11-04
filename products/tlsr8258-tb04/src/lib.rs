@@ -15,15 +15,25 @@ pub mod end_device;
 pub mod router;
 #[cfg(feature = "sensor")]
 pub mod sensor;
-#[cfg(all(
-    target_arch = "tc32",
-    any(feature = "router", feature = "retention-proof")
-))]
+#[cfg(target_arch = "tc32")]
 pub mod stack_guard;
 #[cfg(all(target_arch = "tc32", any(feature = "router", feature = "end-device")))]
 pub mod status_leds;
 #[cfg(target_arch = "tc32")]
 pub mod storage;
+
+/// Selects the router's 20 KiB SVC stack in `link/memory.x`.
+///
+/// The leaf images (sensor, End Device) get a 24 KiB SVC stack; the router's
+/// larger `.bss` leaves room for only 20 KiB above the 4 KiB static gap, and
+/// its static worst case fits that. The linker keeps this section and tests
+/// `DEFINED(TELINK_TB04_ROUTER_IMAGE)`; losing the marker gives the router
+/// the 24 KiB stack, which fails the link-time static-gap assertion.
+#[cfg(all(target_arch = "tc32", feature = "router"))]
+#[used]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".tb04_router_image_marker")]
+pub static TELINK_TB04_ROUTER_IMAGE: u32 = 0x5254_3442; // "B4TR"
 
 /// Security-journal role tags (`SecurityStateJournal::select_role_tag`).
 ///

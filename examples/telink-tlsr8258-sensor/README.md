@@ -104,6 +104,15 @@ static analyzer bounds either entry root above 24 KiB
 (`tools/tlsr8258-sensor-retention-stack-gate.args`). Hardware paint measured
 15,420 B (cold resume) and 15,444 B (fresh join) with the guard intact.
 
+The default SUSPEND image keeps all SRAM retained and uses the leaf 24 KiB
+SVC stack `[0x849C00, 0x84FC00)` with a 64 B guard below it, armed at entry
+and checked after every executor step and before every flash erase/program.
+The build fails if the static analyzer bounds `_rust_entry` above 24 KiB or
+the app-level rejoin-failure chain above its regression budget
+(`tools/tlsr8258-sensor-stack-gate.args`; 22,236 B analyzed). Hardware paint
+on the previous 20 KiB layout measured at most 15,136 B (fresh join and
+interview); the analyzed rejoin-failure path was not exercised on hardware.
+
 A LOW32K timer wake re-enters the fresh root, which calls
 `SensorApp::resume_after_timer_wake()` before `step()` so the iteration that
 slept is serviced; waits shorter than the LOW32K wake floor are busy-waited.

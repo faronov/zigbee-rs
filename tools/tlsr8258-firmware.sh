@@ -275,6 +275,7 @@ verify_layout() {
             "_rust_retention_fault_entry" \
             "__tlsr8258_retention_probe" \
             "TELINK_RETENTION_FRESH_ROOT" \
+            "tlsr8258_tb04_product::stack_guard::check" \
             "cpu_sleep_timer_rc_retention_transaction" \
             "begin_low32k_resume" \
             "complete_low32k_resume" \
@@ -316,10 +317,23 @@ verify_layout() {
             "$retention_limit" "$guard_start" "$guard_end" "$svc_bottom" "$svc_top" \
             "$((svc_top - svc_bottom))" "$((svc_guard_start - rf_dma_end))"
     else
-        # HW-04: declared 20 KiB SVC stack, a 64 B guard directly below it,
-        # and >= 4 KiB of unused RAM between every static/DMA byte and the
-        # guard. The gap is margin, not stack.
-        if (( svc_bottom != 0x84AC00 || svc_top != 0x84FC00 ||
+        # HW-04: declared SVC stack (router 20 KiB; leaf sensor/ED 24 KiB),
+        # a 64 B guard directly below it, and >= 4 KiB of unused RAM between
+        # every static/DMA byte and the guard. The gap is margin, not stack.
+        local expected_svc_bottom=0x849C00 stack_gate
+        case "$binary_name" in
+            telink-tlsr8258-router)
+                expected_svc_bottom=0x84AC00
+                stack_gate=tlsr8258-router-stack-gate.args
+                ;;
+            telink-tlsr8258-sensor) stack_gate=tlsr8258-sensor-stack-gate.args ;;
+            telink-tlsr8258-ed) stack_gate=tlsr8258-ed-stack-gate.args ;;
+            *)
+                printf 'stack-layout FAIL: no stack gate for %s\n' "$binary_name" >&2
+                exit 1
+                ;;
+        esac
+        if (( svc_bottom != expected_svc_bottom || svc_top != 0x84FC00 ||
               irq_bottom != 0x84FC00 || irq_top != 0x850000 ||
               svc_guard_end != svc_bottom || svc_guard_end - svc_guard_start != 64 ||
               svc_guard_start - rf_dma_end < 0x1000 || svc_guard_start - ebss < 0x1000 )); then
@@ -328,16 +342,22 @@ verify_layout() {
                 "$irq_bottom" "$irq_top" "$rf_dma_end" "$ebss" >&2
             exit 1
         fi
-        printf 'stack-layout OK: svc=[0x%X..0x%X) %d B, guard=[0x%X..0x%X), gap to rf_dma_end=%d B\n' \
-            "$svc_bottom" "$svc_top" "$((svc_top - svc_bottom))" \
-            "$svc_guard_start" "$svc_guard_end" "$((svc_guard_start - rf_dma_end))"
-    fi
-    if [[ "$binary_name" == "telink-tlsr8258-router" ]]; then
+        # Every image arms and checks the 64 B guard (stack_guard.rs).
+        if ! "$LLVM_NM" -C "$elf" | awk '
+            index($0, "tlsr8258_tb04_product::stack_guard::check") { found = 1 }
+            END { exit(found ? 0 : 1) }
+        '; then
+            echo "stack-layout FAIL: SVC stack guard check is not linked" >&2
+            exit 1
+        fi
         # Heuristic static stack gate (see the args file); HIL paint stays
         # the authoritative runtime evidence.
         TC32_TOOLCHAIN="$TC32_TOOLCHAIN" python3 "$ROOT_DIR/tools/tlsr8258-stack-report.py" "$elf" \
             --objdump "$LLVM_OBJDUMP" --compact --check \
-            @"$ROOT_DIR/tools/tlsr8258-router-stack-gate.args" > /dev/null
+            @"$ROOT_DIR/tools/$stack_gate" > /dev/null
+        printf 'stack-layout OK: svc=[0x%X..0x%X) %d B, guard=[0x%X..0x%X), gap to rf_dma_end=%d B; %s passed\n' \
+            "$svc_bottom" "$svc_top" "$((svc_top - svc_bottom))" \
+            "$svc_guard_start" "$svc_guard_end" "$((svc_guard_start - rf_dma_end))" "$stack_gate"
     fi
     if [[ "$image_feature" != retention-proof* && "$binary_name" == "telink-tlsr8258-sensor" ]]; then
         if "$LLVM_NM" -C "$elf" | awk '
@@ -360,7 +380,7 @@ verify_layout() {
         done
         echo "default-idle OK: LOW32K absent; full-SRAM atomic SUSPEND retained"
     elif [[ "$binary_name" == "telink-tlsr8258-ed" ]]; then
-        # The ED shares the product-wide HW-04 stack layout checked above.
+        # The ED shares the leaf HW-04 stack layout and gate checked above.
         if "$LLVM_NM" -C "$elf" | awk '
             /TELINK_RETENTION_IMAGE|cpu_suspend|cpu_sleep_timer|_rust_retention_entry|resume_after_sleep/ {
                 found = 1

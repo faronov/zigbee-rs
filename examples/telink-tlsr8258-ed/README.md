@@ -62,8 +62,13 @@ The image is built at `opt-level=s` because the TC32 backend cannot build at
 - lacks the End Device Timeout client symbols;
 - links a sleep or retention path;
 - has anything other than exactly one `tlsr8258_rt::block_on` root;
-- moves off the product-wide 20 KiB SVC (64 B guard below it) / 1 KiB IRQ
-  stack layout.
+- moves off the leaf 24 KiB SVC (64 B guard below it) / 1 KiB IRQ stack
+  layout, or the static analyzer bounds `_rust_entry` above 24 KiB or its
+  steering/rejoin chain above its regression budget
+  (`tools/tlsr8258-ed-stack-gate.args`; 19,096 B analyzed).
+
+The image arms the 64 B SVC stack guard at entry and checks it on every
+stack tick and before every flash erase/program; a damaged guard halts it.
 
 ## Validation
 

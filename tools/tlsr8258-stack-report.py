@@ -6,7 +6,10 @@ The report is derived only from the linked image:
 * linker stack symbols (`_svc_stack_*`, `_irq_stack_*`, `_rf_dma_end_`);
 * per-function frame sizes decoded from the TC32 prologue
   (`tpush`, `tsub sp, #imm`, `tadd sp, rX` with a negative literal-pool
-  constant, and `sp` re-alignment);
+  constant, and `sp` re-alignment). Each function is decoded only within
+  its `STT_FUNC` symbol size: bytes the disassembler lists after a short
+  function (e.g. the 8-byte `memset` shim followed by `.text` data) are
+  not code and must not add frame bytes or call edges;
 * direct call edges (`tjl`/`tj` to another function symbol).
 
 It is a heuristic, not a sound whole-program bound:
@@ -90,14 +93,19 @@ class Elf:
             fields = struct.unpack_from("<IIIIIIIIII", self.data, shoff + index * shentsize)
             self.sections.append(fields)
         self.symbols = {}
+        # Code address (Thumb bit cleared) -> STT_FUNC symbol size in bytes.
+        self.function_sizes = {}
         for fields in self.sections:
             if fields[1] != 2:  # SHT_SYMTAB
                 continue
             strtab = self.sections[fields[6]]
             for offset in range(fields[4], fields[4] + fields[5], 16):
-                name_off, value, _size, _info, _other, _shndx = struct.unpack_from(
+                name_off, value, size, info, _other, _shndx = struct.unpack_from(
                     "<IIIBBH", self.data, offset
                 )
+                if info & 0xF == 2 and size > 0:  # STT_FUNC
+                    address = value & ~1
+                    self.function_sizes[address] = max(self.function_sizes.get(address, 0), size)
                 start = strtab[4] + name_off
                 end = self.data.index(b"\0", start)
                 name = self.data[start:end].decode("utf-8", "replace")
@@ -161,7 +169,15 @@ def track_constants(registers, mnemonic, operands, current):
         registers.pop(target, None)
 
 
-def parse_disassembly(lines, read_word):
+def parse_disassembly(lines, read_word, function_sizes=None):
+    """Decode frames and edges per function header.
+
+    `function_sizes` maps a function address to its `STT_FUNC` size; when a
+    header has one, instructions at or beyond `address + size` are ignored
+    (trailing data/padding before the next symbol). Headers without a sized
+    symbol keep the previous behaviour and run to the next header.
+    """
+    function_sizes = function_sizes or {}
     stubs = set()
     for line in lines:
         insn = INSN.match(line)
@@ -169,6 +185,7 @@ def parse_disassembly(lines, read_word):
             stubs.add(int(insn.group(1), 16))
     functions = {}
     current = None
+    limit = None
     registers = {}
     history = []
     for line in lines:
@@ -188,6 +205,8 @@ def parse_disassembly(lines, read_word):
             }
             functions[header.group(2)] = current
             name = header.group(2)
+            size = function_sizes.get(current["address"])
+            limit = current["address"] + size if size else None
             registers = {}
             history = []
             continue
@@ -197,6 +216,8 @@ def parse_disassembly(lines, read_word):
         if not insn:
             continue
         address, mnemonic, operands = insn.group(1), insn.group(2), insn.group(3) or ""
+        if limit is not None and int(address, 16) >= limit:
+            continue
         history = (history + [(mnemonic, operands)])[-8:]
         track_constants(registers, mnemonic, operands, current)
         if mnemonic == "tpush":
@@ -573,7 +594,7 @@ def main():
         lines = subprocess.run(
             [args.objdump, "-d", "--no-show-raw-insn", args.elf], capture_output=True, text=True, check=True
         ).stdout.splitlines()
-    functions = parse_disassembly(lines, elf.read_word)
+    functions = parse_disassembly(lines, elf.read_word, elf.function_sizes)
     unresolved, taken_count = resolve_indirect(functions, elf.read_word, args.indirect)
     pretty = demangler(args.cxxfilt, compact=args.compact)
     pretty.prime(list(functions))

@@ -224,7 +224,8 @@ Host tools remain on Rust `1.94.1`.
 - the End Device Timeout client symbols;
 - no sleep or retention path;
 - exactly one `tlsr8258_rt::block_on` root;
-- the product-wide 20 KiB SVC (64 B guard below it) / 1 KiB IRQ stack layout.
+- the leaf 24 KiB SVC (64 B guard below it) / 1 KiB IRQ stack layout and the
+  static stack gate `tools/tlsr8258-ed-stack-gate.args`.
 
 CI also runs `tools/check-role-symbols.sh`: `leaf` for the sensor and the ED,
 `parent` for the router.
@@ -266,12 +267,31 @@ poll), which overran `.rf_dma` and retained statics and prevented joining.
 `tools/tlsr8258-firmware.sh` now fails the LOW32K build unless the static
 analyzer bounds both fresh-stack roots (`_rust_cold_entry`,
 `_rust_retention_entry`) within the declared 24 KiB
-(`tools/tlsr8258-sensor-retention-stack-gate.args`; ~21 KB analyzed).
+(`tools/tlsr8258-sensor-retention-stack-gate.args`; 21,012 B analyzed).
 Painted high-water on hardware with the new layout, measured at the first
 retention transaction: 15,420 B after a cold resume from the journal and
 15,444 B after a fresh join, both with the guard intact (about 9.1 KB
 headroom). Warm-wake depth cannot be measured by halting, because LOW32K sleep
-resets the debug block; it is bounded by the analyzer (20,104 B).
+resets the debug block; it is bounded by the analyzer (19,928 B).
+
+Stack layout of the non-retention images (`products/tlsr8258-tb04/link/memory.x`).
+The leaf images (default SUSPEND sensor and End Device) use a 24 KiB SVC
+stack `[0x849C00, 0x84FC00)` with a 64 B guard `[0x849BC0, 0x849C00)`; the
+router emits `TELINK_TB04_ROUTER_IMAGE` and keeps 20 KiB `[0x84AC00,
+0x84FC00)`, because its larger `.bss` leaves only 3,176 B (< the mandatory
+4 KiB gap) below a 24 KiB stack, and its analyzed worst case is ~14.6 KB.
+Every TB-04 image arms the guard at entry, checks it in its main loop (router
+and End Device on each stack tick, default sensor after each executor step)
+and before every flash erase/program, and fails closed if it is damaged.
+`tools/tlsr8258-firmware.sh` runs the static analyzer gate of each image
+(`tools/tlsr8258-{sensor,ed,router}-stack-gate.args`). The analyzer bounds
+the default sensor at 22,236 B through the app-level rejoin-failure fallback
+(`SensorApp::record_failed_rejoin` -> steering -> network discovery -> radio
+TX) and the End Device at 19,096 B; both exceeded or nearly filled the
+previous 20 KiB stack. Hardware paint of the default sensor on the old 20 KiB
+layout measured 15,136 B (fresh join and interview, CCM* decrypt), 13,472 B
+(cold resume) and 13,788 B (Identify); the rejoin-failure path was not
+exercised on hardware.
 
 The router's old 356,352 B budget was a pre-R22 baseline. The former
 430,080 B (`0x69000`) budget was introduced above the earlier 427,776 B image.

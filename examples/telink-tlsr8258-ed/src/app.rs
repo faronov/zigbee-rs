@@ -173,6 +173,8 @@ impl RouterObserver<TelinkMac, EndDevice> for EdObserver {
     }
 
     fn on_tick(_device: &Device, elapsed_secs: u16, _result: &TickResult) {
+        // Main-loop SVC stack guard check; fails closed.
+        tlsr8258_tb04_product::stack_guard::check();
         if elapsed_secs != 0 {
             let uptime = TELINK_ED_METRICS.uptime_secs.load(Ordering::Relaxed);
             TELINK_ED_METRICS.uptime_secs.store(
@@ -235,6 +237,7 @@ fn bring_up() -> Boot {
 }
 
 pub fn run() -> ! {
+    tlsr8258_tb04_product::stack_guard::arm();
     let board = bring_up();
     let mut profile = end_device_profile();
     let device = build_device(board.ieee_address, board.aes, &board.leds, &mut profile);

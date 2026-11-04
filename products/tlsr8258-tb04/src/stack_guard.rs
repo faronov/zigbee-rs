@@ -7,11 +7,12 @@
 //! damaged guard means the SVC stack already left its declared budget, so the
 //! firmware stops instead of persisting or transmitting from corrupted RAM.
 //!
-//! The router arms it once at startup and checks it from its main loop. The
-//! LOW32K `retention-proof` sensor keeps the guard (with both stacks) in the
-//! non-retained upper 32 KiB, so it re-arms it on every cold *and* retention
-//! entry and checks it after every executor step. Both check it before every
-//! flash erase/program (`storage::GuardedFlash`).
+//! Every TB-04 image arms it at entry: the router and the End Device check
+//! it from their main-loop tick, the default (SUSPEND) sensor after every
+//! executor step. The LOW32K `retention-proof` sensor keeps the guard (with
+//! both stacks) in the non-retained upper 32 KiB, so it re-arms it on every
+//! cold *and* retention entry and checks it after every executor step. All
+//! check it before every flash erase/program (`storage::GuardedFlash`).
 //!
 //! The guard only *detects* an overflow; the stack budget itself is enforced
 //! by `tools/tlsr8258-stack-report.py` and the HIL stack-paint regression.

@@ -59,9 +59,9 @@ pub const fn split_flash(
     )
 }
 
-/// Product flash partition. In the router image it re-checks the SVC stack
-/// guard before every erase or program, so a stack overflow can never reach
-/// persistent state. The sensor retention image owns a separate LOW32K guard.
+/// Product flash partition. Every TB-04 image re-checks the SVC stack guard
+/// before each erase or program, so a stack overflow can never reach
+/// persistent state.
 pub struct GuardedFlash(FlashRegion);
 
 impl ErrorType for GuardedFlash {
@@ -85,13 +85,11 @@ impl NorFlash for GuardedFlash {
     const ERASE_SIZE: usize = FlashRegion::ERASE_SIZE;
 
     fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
-        #[cfg(any(feature = "router", feature = "retention-proof"))]
         crate::stack_guard::check();
         self.0.erase(from, to)
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
-        #[cfg(any(feature = "router", feature = "retention-proof"))]
         crate::stack_guard::check();
         self.0.write(offset, bytes)
     }
