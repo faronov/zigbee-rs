@@ -9,7 +9,7 @@ use core::convert::Infallible;
 
 use sensor_sed_app::{
     ButtonPolicy, EnvironmentReading, EnvironmentSink, EnvironmentSource, FixedBattery,
-    NoUserAction, NonOtaComponent, SensorPolicy, SleepDepth, StatusPolicy,
+    NoUserAction, NonOtaComponent, RESPONSIVE_SLOW_POLL_MS, SensorPolicy, SleepDepth, StatusPolicy,
 };
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::MacDriver;
@@ -52,18 +52,40 @@ const _: () = {
 
 pub const USER_ACTIONS: NoUserAction = NoUserAction;
 
-/// 250 ms polling and a 30-second synthetic sample cadence. Joining and
-/// interview waits stay Active; joined steady-state waits use full-SRAM
-/// SUSPEND (`Idle`), or LOW32K reset-on-wake with `retention-proof`.
-/// `retention-proof-10s` lengthens only the joined slow poll to ten seconds.
+/// Joined steady-state parent poll of the production SUSPEND image: the
+/// longest poll that still fetches a coordinator command (Identify, read,
+/// Configure Reporting) before any common parent expires it, so the sensor
+/// stays commandable while waking 20 times less often than the former
+/// 250 ms cadence.
+pub const PRODUCTION_SLOW_POLL_MS: u32 = RESPONSIVE_SLOW_POLL_MS;
+
+/// LOW32K wake-cycle stress proof (`retention-proof`): the bring-up 250 ms
+/// cadence, kept so that proof still exercises many reset-on-wake cycles.
+pub const RETENTION_STRESS_SLOW_POLL_MS: u32 = 250;
+
+/// LOW32K long-interval proof (`retention-proof-10s`). Longer than the
+/// shortest parent indirect hold: commands rely on the sender's APS retries.
+pub const RETENTION_LONG_SLOW_POLL_MS: u32 = 10_000;
+
+/// Joined slow poll selected for this image.
+pub const SLOW_POLL_MS: u32 = if cfg!(feature = "retention-proof-10s") {
+    RETENTION_LONG_SLOW_POLL_MS
+} else if cfg!(feature = "retention-proof") {
+    RETENTION_STRESS_SLOW_POLL_MS
+} else {
+    PRODUCTION_SLOW_POLL_MS
+};
+
+/// 250 ms fast polls while joining, during the interview, Identify and
+/// outstanding APS acknowledgements/ZCL responses; the joined steady state
+/// polls every [`SLOW_POLL_MS`]. Reports keep the 30-second synthetic
+/// sample cadence. Fast waits stay Active; joined steady-state waits use
+/// full-SRAM SUSPEND (`Idle`), or LOW32K reset-on-wake with
+/// `retention-proof`.
 pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     sample_interval_ms: 30_000,
     fast_poll_ms: 250,
-    slow_poll_ms: if cfg!(feature = "retention-proof-10s") {
-        10_000
-    } else {
-        250
-    },
+    slow_poll_ms: SLOW_POLL_MS,
     fresh_join_fast_ms: 120_000,
     restored_fast_ms: 120_000,
     wake_duration_ms: 500,
@@ -93,6 +115,10 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
         SleepDepth::Idle
     },
 };
+
+// The production image must stay commandable behind any common parent.
+const _: () =
+    assert!(cfg!(feature = "retention-proof") || SENSOR_POLICY.slow_poll_within_parent_hold());
 
 const SYNTHETIC_SENSOR: SyntheticSensor = SyntheticSensor::new(2_150, 100, 5_000, 400);
 
@@ -440,10 +466,20 @@ mod tests {
         assert!(SENSOR_POLICY.is_valid());
         assert_eq!(SENSOR_POLICY.sample_interval_ms, 30_000);
         assert_eq!(SENSOR_POLICY.fast_poll_ms, 250);
-        #[cfg(not(feature = "retention-proof-10s"))]
+        #[cfg(not(feature = "retention-proof"))]
+        {
+            assert_eq!(SENSOR_POLICY.slow_poll_ms, 5_000);
+            assert!(SENSOR_POLICY.slow_poll_within_parent_hold());
+        }
+        #[cfg(all(feature = "retention-proof", not(feature = "retention-proof-10s")))]
         assert_eq!(SENSOR_POLICY.slow_poll_ms, 250);
         #[cfg(feature = "retention-proof-10s")]
-        assert_eq!(SENSOR_POLICY.slow_poll_ms, 10_000);
+        {
+            assert_eq!(SENSOR_POLICY.slow_poll_ms, 10_000);
+            assert!(!SENSOR_POLICY.slow_poll_within_parent_hold());
+        }
+        // Reports stay on their own cadence, independent of the poll.
+        assert!(SENSOR_POLICY.sample_interval_ms > SENSOR_POLICY.slow_poll_ms);
         assert_eq!(SENSOR_POLICY.fast_sleep_depth, SleepDepth::Active);
         #[cfg(not(feature = "retention-proof"))]
         assert_eq!(SENSOR_POLICY.slow_sleep_depth, SleepDepth::Idle);

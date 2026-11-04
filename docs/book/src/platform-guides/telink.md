@@ -66,10 +66,31 @@ The default image constructs `SensorApp` with:
 ### Default SUSPEND policy
 
 ```text
-fast wait: Active
-slow wait: Idle
-slow poll: 250 ms
+fast poll: 250 ms, Active   (join/rejoin + 120 s, interview, Identify,
+                             pending APS ack / ZCL response, OTA)
+slow poll: 5 s, Idle        (joined steady state)
+reports:   30 s sample cadence, independent of the poll
 ```
+
+The joined slow poll is `SLOW_POLL_MS` in the product crate. The production
+value is the shared `RESPONSIVE_SLOW_POLL_MS` (`sensor-sed-app`): the shortest
+common parent indirect hold (`PARENT_INDIRECT_HOLD_MIN_MS`, 6 s, Z-Stack's
+7 s aged on a 1 s tick; EmberZNet/ZBOSS/IEEE default 7.68 s) minus a 1 s
+margin for service time and sleep-clock drift. A command queued by the parent
+right after a poll is therefore fetched before it expires, so Identify,
+attribute reads/writes and Configure Reporting arrive on the first
+transmission. A compile-time assertion keeps the production image within that
+bound. The former 250 ms slow poll was the polled bring-up main-loop tick
+carried over unchanged; it woke the radio 20 times as often.
+
+Lab result (TB-04, ZHA/EZSP coordinator, sensor behind a depth-6 third-party
+parent; poll cadence from non-halting SWire counter watches, no TLSR power
+meter): steady-state wakes every ~5.03 s with ~10–45 ms awake windows and
+SUSPEND between them (estimated duty cycle under 1 %); fresh join and ZHA
+interview complete; 21 min of reports at the 30 s sample cadence; Identify
+press / Identify-cluster attribute write round trip 0.9–6.1 s (median ~3 s,
+23 samples, one 32 s outlier upstream of the sensor); reset resumes silently
+with the 120 s restored fast window and monotonic frame counters.
 
 `Idle` performs one interrupt-masked transaction:
 
@@ -84,10 +105,13 @@ sensor does not enter suspend is obsolete.
 ### Feature-gated LOW32K images
 
 `retention-proof` changes the slow depth to `Retention` and uses a reset-on-wake
-LOW32K path with the existing 250 ms policy.
+LOW32K path with a 250 ms slow poll
+(`RETENTION_STRESS_SLOW_POLL_MS`), kept as a wake-cycle stress proof.
 
 `retention-proof-10s` uses the same restoration path and a 10-second
-steady-state slow poll. Both are one `SENSOR_POLICY` whose slow-poll and
+steady-state slow poll (`RETENTION_LONG_SLOW_POLL_MS`). It exceeds the
+shortest parent indirect hold, so coordinator commands rely on APS retries.
+All three are one `SENSOR_POLICY` whose slow-poll (`SLOW_POLL_MS`) and
 slow-depth fields are selected by `cfg!`.
 
 These are explicit proof images, not silent replacements for the default

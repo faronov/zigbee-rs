@@ -424,11 +424,11 @@ build/layout/symbol-checked only.
 The default sensor uses:
 
 - fast wait: `Active`;
-- slow wait: `Idle`;
+- slow wait: `Idle`, joined slow poll 5 s (`RESPONSIVE_SLOW_POLL_MS`);
 - atomic full-SRAM timer `SUSPEND`.
 
 `sensor-retention` is a feature-gated reset-on-wake LOW32K image with a
-250 ms policy. `sensor-retention-10s` uses the same restoration path with a
+250 ms wake-stress slow poll. `sensor-retention-10s` uses the same restoration path with a
 10-second steady-state slow poll. Neither changes the default production
 selection.
 

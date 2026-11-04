@@ -139,6 +139,17 @@ impl SensorPolicy {
                     && self.status.reset_phase_ms != 0))
     }
 
+    /// Whether the joined slow poll fetches a frame that the parent queued
+    /// just after the previous poll before a common parent expires it.
+    ///
+    /// When true, an unsolicited command (Identify, attribute read/write,
+    /// Configure Reporting, bind) reaches the device on its first
+    /// transmission. When false, delivery relies on the sender's APS
+    /// retries, and a command sent between polls may be lost.
+    pub const fn slow_poll_within_parent_hold(&self) -> bool {
+        self.slow_poll_ms <= RESPONSIVE_SLOW_POLL_MS
+    }
+
     pub const fn power_mode(&self) -> PowerMode {
         PowerMode::Sleepy {
             poll_interval_ms: self.slow_poll_ms,
@@ -146,6 +157,32 @@ impl SensorPolicy {
         }
     }
 }
+
+/// Shortest time a common Zigbee parent keeps an indirect frame for a sleepy
+/// child before discarding it.
+///
+/// The IEEE 802.15.4 default `macTransactionPersistenceTime` (0x01F4 ×
+/// 15.36 ms = 7.68 s) is used by EmberZNet, ZBOSS and this stack's
+/// `SoftMacCore` parent. Z-Stack holds an indirect frame for
+/// `NWK_INDIRECT_MSG_TIMEOUT` = 7 s, aged on a one-second tick, so a frame
+/// can expire after about 6 s.
+pub const PARENT_INDIRECT_HOLD_MIN_MS: u32 = 6_000;
+
+/// Part of [`PARENT_INDIRECT_HOLD_MIN_MS`] reserved for the awake service
+/// time between two polls and for wake-timer drift (the poll-to-poll gap is
+/// the slow poll plus the service iteration, measured on an RC or crystal
+/// sleep clock).
+pub const PARENT_INDIRECT_HOLD_MARGIN_MS: u32 = 1_000;
+
+/// Longest joined slow poll that keeps a sleepy sensor commandable on the
+/// first transmission behind any common parent (5 s).
+pub const RESPONSIVE_SLOW_POLL_MS: u32 =
+    PARENT_INDIRECT_HOLD_MIN_MS - PARENT_INDIRECT_HOLD_MARGIN_MS;
+
+// The shortest hold must not exceed the 802.15.4 default
+// macTransactionPersistenceTime (0x01F4 unit backoff periods of 15.36 ms).
+const _: () = assert!(PARENT_INDIRECT_HOLD_MIN_MS <= 0x01F4 * 15_360 / 1_000);
+const _: () = assert!(PARENT_INDIRECT_HOLD_MARGIN_MS < PARENT_INDIRECT_HOLD_MIN_MS);
 
 /// Upper bound of the unjoined commissioning backoff (30 minutes).
 pub const JOIN_RETRY_MAX_MS: u32 = 30 * 60 * 1_000;
@@ -285,6 +322,17 @@ mod tests {
         assert!(!policy.is_valid());
         policy.slow_poll_ms = MAX_WAIT_MS;
         assert!(policy.is_valid(), "the slow poll bounds the wait");
+    }
+
+    #[test]
+    fn responsive_slow_poll_leaves_margin_below_the_shortest_parent_hold() {
+        assert_eq!(RESPONSIVE_SLOW_POLL_MS, 5_000);
+
+        let mut policy = VALID;
+        policy.slow_poll_ms = RESPONSIVE_SLOW_POLL_MS;
+        assert!(policy.slow_poll_within_parent_hold());
+        policy.slow_poll_ms = RESPONSIVE_SLOW_POLL_MS + 1;
+        assert!(!policy.slow_poll_within_parent_hold());
     }
 
     const VALID: SensorPolicy = SensorPolicy {
