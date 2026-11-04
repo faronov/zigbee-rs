@@ -642,6 +642,12 @@ impl<M: MacDriver> NwkLayer<M> {
                     self.routing.remove(dst_addr);
                 }
             }
+        } else {
+            // A source route that just carried a frame is in use.
+            #[cfg(feature = "router")]
+            if has_source_route {
+                self.source_route_table.note_used(dst_addr);
+            }
         }
 
         mac_result.map_err(|_| NwkStatus::RouteError)?;
@@ -1317,7 +1323,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 if is_nwk_broadcast(dst)
                     && let Some(hop) = prev_hop
                 {
-                    self.broadcast_tx.note_relay(src, header.seq_number, hop);
+                    self.note_broadcast_relay(src, header.seq_number, hop);
                 }
             }
             log::debug!(
@@ -1545,8 +1551,7 @@ impl<M: MacDriver> NwkLayer<M> {
             if self.btr.is_duplicate(src, header.seq_number) {
                 // A neighbour's copy of a broadcast we already handled is its
                 // passive acknowledgement of our relay (R22 §3.6.5).
-                self.broadcast_tx
-                    .note_relay(src, header.seq_number, prev_hop.unwrap_or(src));
+                self.note_broadcast_relay(src, header.seq_number, prev_hop.unwrap_or(src));
                 log::debug!(
                     "[NWK] BTR dup: src=0x{:04X} seq={}",
                     src.0,
@@ -2561,7 +2566,8 @@ impl<M: MacDriver> NwkLayer<M> {
             // Every entry is a broadcast still waiting for its own first
             // transmission; building this one would only burn a counter.
             log::warn!(
-                "[NWK] Broadcast schedule full — not relaying frame from 0x{:04X}",
+                "[NWK] Broadcast schedule full ({} RREQ) — not relaying frame from 0x{:04X}",
+                self.broadcast_tx.unsent_route_requests(),
                 header.src_addr.0
             );
             return Err(NwkStatus::RouteError);
@@ -2672,6 +2678,29 @@ impl<M: MacDriver> NwkLayer<M> {
                 ) || n.relationship == crate::neighbor::Relationship::PreviousChild
                     || heard.contains(&n.network_address)
             })
+    }
+
+    /// Record `by` relaying the broadcast (`src`, `seq`) as its passive
+    /// acknowledgement (R22 §3.6.5).
+    ///
+    /// Once every router neighbour has been heard, a broadcast that has
+    /// already made its mandatory first transmission owes no retransmission,
+    /// so its schedule entry is released at once instead of at the end of the
+    /// passive-acknowledgement window. A relay still waiting out its jitter
+    /// keeps its entry, and Route Request forwards keep their fixed
+    /// `nwkcRREQRetries` copies.
+    #[cfg(feature = "router")]
+    fn note_broadcast_relay(&mut self, src: ShortAddress, seq: u8, by: ShortAddress) {
+        self.broadcast_tx.note_relay(src, seq, by);
+        if let Some(index) = self
+            .broadcast_tx
+            .entries
+            .iter()
+            .position(|e| e.src == src && e.seq == seq && e.sent && !e.rreq)
+            && self.all_router_neighbors_heard(&self.broadcast_tx.entries[index].heard)
+        {
+            self.broadcast_tx.entries.swap_remove(index);
+        }
     }
 
     /// Put due scheduled broadcasts on air (R22 §3.6.5, §3.6.3.5.2).
@@ -3720,6 +3749,10 @@ impl<M: MacDriver> NwkLayer<M> {
         // originator's NWK sequence number. This record compares path cost and
         // immediate sender: R22 equal-cost alternate paths remain admissible,
         // while repeated MAC transmissions from one neighbor are suppressed.
+        let improves = self
+            .rreq_records
+            .recorded_cost(originator, rreq.route_request_id)
+            .is_none_or(|best| forward_cost < best);
         if !self
             .rreq_records
             .admit(originator, rreq.route_request_id, prev_hop, forward_cost)
@@ -3765,7 +3798,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 forward_cost,
             );
 
-            self.queue_rreq_forward(header, &rreq, forward_cost);
+            self.queue_rreq_forward(header, &rreq, forward_cost, improves);
             return;
         }
 
@@ -3835,7 +3868,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 prev_hop.0,
             );
         } else if recorded {
-            self.queue_rreq_forward(header, &rreq, forward_cost);
+            self.queue_rreq_forward(header, &rreq, forward_cost, improves);
         } else {
             // Without a discovery entry the Route Reply could not be carried
             // back through this device, so propagating the request would only
@@ -3884,12 +3917,29 @@ impl<M: MacDriver> NwkLayer<M> {
     /// whose radius is exhausted: a frame received with radius 1 has reached
     /// the last hop the originator allowed, so forwarding it with radius 0
     /// would extend the flood past its bound.
+    ///
+    /// One discovery holds at most one forward. `improves` is whether this
+    /// copy is cheaper than every copy admitted before it:
+    ///
+    /// * A cheaper copy discards the forward still queued, waiting out its
+    ///   jitter or owing retries, and takes its place (R22 §3.6.3.5.2 "may
+    ///   choose to discard route request command frames awaiting
+    ///   retransmission ... with a lower path cost").
+    /// * An equal-cost copy from another neighbour while a forward is still
+    ///   pending would put the same originator header, sequence number and
+    ///   path cost on air again: the pending forward already is that
+    ///   broadcast. Receivers that heard it hold this router as an accepted
+    ///   sender at that cost and would drop the repeat. The discovery entry
+    ///   has already recorded the new sender, so the copy is merged into the
+    ///   pending forward. With no forward pending it is propagated as R22
+    ///   specifies.
     #[cfg(feature = "router")]
     fn queue_rreq_forward(
         &mut self,
         header: &NwkHeader,
         rreq: &crate::frames::RouteRequest,
         path_cost: u8,
+        improves: bool,
     ) {
         if !self.can_route() {
             return;
@@ -3936,6 +3986,32 @@ impl<M: MacDriver> NwkLayer<M> {
             queued.radius,
             queued.path_cost,
         );
+
+        // Every copy of one discovery carries the originator's address and
+        // NWK sequence number, so that pair names its scheduled forward.
+        let queued_at = self.pending_rreq_forwards.iter().position(|q| {
+            q.originator == queued.originator && q.route_request_id == queued.route_request_id
+        });
+        let scheduled_at = self
+            .broadcast_tx
+            .entries
+            .iter()
+            .position(|e| e.rreq && e.src == queued.originator && e.seq == queued.seq_number);
+        if !improves && (queued_at.is_some() || scheduled_at.is_some()) {
+            log::debug!(
+                "[NWK] RREQ id={} from 0x{:04X} merged into its pending forward",
+                queued.route_request_id,
+                queued.originator.0,
+            );
+            return;
+        }
+        if let Some(index) = scheduled_at {
+            self.broadcast_tx.entries.swap_remove(index);
+        }
+        if let Some(index) = queued_at {
+            self.pending_rreq_forwards[index] = queued;
+            return;
+        }
 
         if self.pending_rreq_forwards.push(queued).is_err() {
             log::warn!(
@@ -5663,6 +5739,53 @@ mod tests {
         assert_eq!(router.source_route_table.entry_age(PEER), Some(7));
     }
 
+    /// Source routes age out like normal routes: one that keeps carrying
+    /// frames, or that a new Route Record re-learns, stays; an idle one is
+    /// retired after ROUTE_EXPIRY_SECS so a device that left stops holding
+    /// an entry.
+    #[test]
+    #[cfg(feature = "router")]
+    fn idle_source_routes_expire_while_used_or_rerecorded_ones_stay() {
+        use crate::routing::ROUTE_EXPIRY_SECS;
+        const RERECORDED: ShortAddress = ShortAddress(0x5A5A);
+        let mut concentrator = node(DeviceType::Coordinator, CONCENTRATOR);
+        concentrator.start_concentrator(crate::routing::ConcentratorType::LowRam, 0, 5);
+        concentrator
+            .source_route_table
+            .insert(FAR, &[NEXT_HOP, OUR_ADDR]);
+        concentrator.routing.update_route(FAR, OUR_ADDR, 2).unwrap();
+        concentrator.source_route_table.insert(PEER, &[OUR_ADDR]);
+        concentrator
+            .source_route_table
+            .insert(RERECORDED, &[OUR_ADDR]);
+
+        concentrator.tick_router_maintenance(ROUTE_EXPIRY_SECS - 100);
+        block_on(concentrator.nlde_data_request(FAR, 5, &[0xAB], false, false))
+            .expect("the acknowledged source-routed frame refreshes its path");
+        assert!(
+            !concentrator.mac.tx_history()[0].payload.is_empty(),
+            "the frame went out"
+        );
+        concentrator
+            .source_route_table
+            .insert(RERECORDED, &[NEXT_HOP, OUR_ADDR]);
+        concentrator.tick_router_maintenance(200);
+
+        assert!(concentrator.source_route_table.lookup(FAR).is_some());
+        assert_eq!(
+            concentrator.source_route_table.lookup(RERECORDED),
+            Some(&[NEXT_HOP, OUR_ADDR][..]),
+            "a Route Record restarts the age"
+        );
+        assert!(
+            concentrator.source_route_table.lookup(PEER).is_none(),
+            "a source route unused for ROUTE_EXPIRY_SECS is retired"
+        );
+
+        concentrator.tick_router_maintenance(ROUTE_EXPIRY_SECS + 1);
+        assert!(concentrator.source_route_table.is_empty());
+    }
+
     #[test]
     #[cfg(feature = "router")]
     fn high_ram_routes_rearm_route_record_only_when_the_path_changes() {
@@ -6626,6 +6749,226 @@ mod tests {
         assert!(router.pending_rreq_forwards.is_empty());
         drain_scheduled_broadcasts(&mut router);
         assert_eq!(sent_route_requests(&router), 3);
+    }
+
+    /// Scheduled Route Request forwards, sent or not.
+    #[cfg(feature = "router")]
+    fn scheduled_route_requests(nwk: &NwkLayer<MockMac>) -> usize {
+        nwk.broadcast_tx.entries.iter().filter(|e| e.rreq).count()
+    }
+
+    /// Route Requests the device put on air, with their path costs.
+    #[cfg(feature = "router")]
+    fn forwarded_rreq_costs(nwk: &NwkLayer<MockMac>) -> heapless::Vec<u8, 16> {
+        let mut costs = heapless::Vec::new();
+        for record in nwk.mac.tx_history() {
+            let bytes = record.payload.as_slice();
+            let (_, consumed) = NwkHeader::parse(bytes).expect("recorded frame parses");
+            if bytes[consumed] == NwkCommandId::RouteRequest as u8 {
+                let (_, rreq) = parse_rreq(bytes);
+                let _ = costs.push(rreq.path_cost);
+            }
+        }
+        costs
+    }
+
+    /// A dense mesh: one discovery reaches this router over four router
+    /// neighbours with the same accumulated cost, each copy handled by its own
+    /// receive/maintenance pass as on hardware. The copies describe one
+    /// forward — a broadcast byte-identical to the one already waiting — so
+    /// they take one schedule entry, and a ZDO broadcast arriving in the
+    /// middle of the flood is still relayed.
+    #[test]
+    #[cfg(feature = "router")]
+    fn equal_cost_copies_of_one_route_request_share_one_scheduled_forward() {
+        const NEIGHBOURS: [ShortAddress; 4] = [
+            ShortAddress(0x5101),
+            ShortAddress(0x5102),
+            ShortAddress(0x5103),
+            ShortAddress(0x5104),
+        ];
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        for neighbour in NEIGHBOURS {
+            neighbour_with_cost(&mut router, neighbour, 1);
+        }
+        let on_air = rreq_on_air(ORIGIN, 0x30, 5, &standard_rreq(7, FAR, 1));
+        for neighbour in NEIGHBOURS {
+            assert!(
+                block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(neighbour)))
+                    .is_none()
+            );
+            block_on(router.process_pending_routing());
+        }
+        assert_eq!(
+            scheduled_route_requests(&router),
+            1,
+            "one discovery takes one schedule entry"
+        );
+        assert!(router.pending_rreq_forwards.is_empty());
+        assert_eq!(
+            router
+                .routing
+                .find_discovery_for(ORIGIN, 7)
+                .map(|d| d.sender),
+            Some(NEIGHBOURS[3]),
+            "each equal-cost copy still updates the discovery sender"
+        );
+
+        // NWK_addr_req from another device in the middle of the flood.
+        let zdo = broadcast_from(PEER, 0x80, 5);
+        assert!(block_on(router.process_incoming_nwk_frame_from(&zdo, 200, Some(PEER))).is_some());
+        assert!(
+            router
+                .broadcast_tx
+                .entries
+                .iter()
+                .any(|e| e.src == PEER && e.seq == 0x80),
+            "the ordinary relay finds room"
+        );
+
+        drain_scheduled_broadcasts(&mut router);
+        assert_eq!(
+            sent_route_requests(&router),
+            3,
+            "one forward with its nwkcRREQRetries copies"
+        );
+        // The ZDO relay is retransmitted nwkMaxBroadcastRetries times: none of
+        // the router neighbours is heard relaying it.
+        assert_eq!(
+            router.mac.tx_history().len(),
+            3 + 1 + usize::from(router.nib.max_broadcast_retries),
+            "plus the ZDO relay"
+        );
+    }
+
+    /// R22 §3.6.3.5.2: "Implementers may choose to discard route request
+    /// command frames awaiting retransmission in the case that a frame with
+    /// the same source and route request identifier arrives with a lower path
+    /// cost." The cheaper copy replaces the forward instead of adding another
+    /// one, both before its first transmission and during its retries.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_cheaper_route_request_copy_replaces_the_forward_awaiting_transmission() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 5);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+
+        // Replaced before its first transmission.
+        let first = rreq_on_air(ORIGIN, 0x31, 5, &standard_rreq(8, FAR, 1));
+        block_on(router.process_incoming_nwk_frame_from(&first, 255, Some(PEER)));
+        block_on(router.process_pending_routing());
+        assert_eq!(scheduled_route_requests(&router), 1);
+        block_on(router.process_incoming_nwk_frame_from(&first, 255, Some(NEXT_HOP)));
+        block_on(router.process_pending_routing());
+        assert_eq!(scheduled_route_requests(&router), 1, "replaced, not added");
+        drain_scheduled_broadcasts(&mut router);
+        assert_eq!(
+            forwarded_rreq_costs(&router).as_slice(),
+            &[2, 2, 2],
+            "only the cheaper copy goes on air"
+        );
+
+        // Replaced while its retries are still pending.
+        let second = rreq_on_air(ORIGIN, 0x32, 5, &standard_rreq(9, FAR, 1));
+        block_on(router.process_incoming_nwk_frame_from(&second, 255, Some(PEER)));
+        block_on(router.process_pending_routing());
+        send_scheduled_relays(&mut router);
+        assert_eq!(
+            forwarded_rreq_costs(&router).len(),
+            4,
+            "the costlier copy went out once"
+        );
+        block_on(router.process_incoming_nwk_frame_from(&second, 255, Some(NEXT_HOP)));
+        block_on(router.process_pending_routing());
+        assert_eq!(scheduled_route_requests(&router), 1);
+        drain_scheduled_broadcasts(&mut router);
+        assert_eq!(
+            forwarded_rreq_costs(&router).as_slice(),
+            &[2, 2, 2, 6, 2, 2, 2],
+            "its remaining retries are discarded for the cheaper forward"
+        );
+    }
+
+    /// Route Request forwards wait in their own queue; an ordinary relay has
+    /// none. Forwards therefore never take the last schedule entry.
+    #[test]
+    #[cfg(feature = "router")]
+    fn route_request_forwards_leave_an_entry_for_an_ordinary_relay() {
+        use crate::routing::MAX_PENDING_BROADCASTS;
+        const ORIGINATORS: [ShortAddress; 4] = [
+            ShortAddress(0x6001),
+            ShortAddress(0x6002),
+            ShortAddress(0x6003),
+            ShortAddress(0x6004),
+        ];
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        for (index, originator) in ORIGINATORS.iter().enumerate() {
+            let on_air = rreq_on_air(*originator, 0x40, 5, &standard_rreq(index as u8, FAR, 1));
+            block_on(router.process_incoming_nwk_frame_from(&on_air, 255, Some(PEER)));
+        }
+        assert_eq!(router.pending_rreq_forwards.len(), ORIGINATORS.len());
+        block_on(router.process_pending_routing());
+        assert_eq!(
+            scheduled_route_requests(&router),
+            MAX_PENDING_BROADCASTS - 1
+        );
+        assert_eq!(
+            router.pending_rreq_forwards.len(),
+            1,
+            "one forward keeps waiting"
+        );
+
+        let zdo = broadcast_from(NEXT_HOP, 0x81, 5);
+        block_on(router.process_incoming_nwk_frame_from(&zdo, 200, Some(NEXT_HOP)));
+        assert!(
+            router
+                .broadcast_tx
+                .entries
+                .iter()
+                .any(|e| e.src == NEXT_HOP && e.seq == 0x81),
+            "the relay takes the entry the forwards left free"
+        );
+
+        for _ in 0..8 {
+            drain_scheduled_broadcasts(&mut router);
+            block_on(router.process_pending_routing());
+        }
+        assert!(router.pending_rreq_forwards.is_empty());
+        assert_eq!(sent_route_requests(&router), 3 * ORIGINATORS.len());
+    }
+
+    /// R22 §3.6.5: retransmission continues only while a router neighbour has
+    /// not relayed the broadcast. Once every one has, the entry is released
+    /// at once instead of being held until nwkPassiveAckTimeout.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_broadcast_is_released_as_soon_as_every_router_neighbour_relayed_it() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        let bytes = broadcast_from(PEER, 0x22, 5);
+        block_on(router.process_incoming_nwk_frame_from(&bytes, 200, Some(PEER)));
+        send_scheduled_relays(&mut router);
+        assert_eq!(
+            router.broadcast_tx.entries.len(),
+            1,
+            "NEXT_HOP is still owed"
+        );
+
+        let mut relayed = frame(NwkFrameType::Data, PEER, ShortAddress::BROADCAST);
+        relayed.seq_number = 0x22;
+        relayed.radius = 4;
+        let mut buf = [0u8; 128];
+        let len = encode(&relayed, &[0xB0], &mut buf);
+        block_on(router.process_incoming_nwk_frame_from(&buf[..len], 200, Some(NEXT_HOP)));
+        assert!(
+            router.broadcast_tx.entries.is_empty(),
+            "the last passive acknowledgement completes the broadcast"
+        );
+        pass_time(&mut router, 2_000_000);
+        block_on(router.process_pending_routing());
+        assert_eq!(router.mac.tx_history().len(), 1, "never retransmitted");
     }
 
     #[test]

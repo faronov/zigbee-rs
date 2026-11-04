@@ -981,12 +981,19 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Route ages are wall-clock seconds, not maintenance-call counts.
         self.routing.age_by(elapsed_secs);
+        #[cfg(not(feature = "router"))]
         self.source_route_table.age_by(elapsed_secs);
         // Unused routes are retired so destinations that left or moved stop
         // occupying the table; routes in use are refreshed on every
-        // acknowledged hop (`RoutingTable::note_used`).
+        // acknowledged hop (`RoutingTable::note_used`). Source routes follow
+        // the same policy, refreshed by each Route Record and each frame they
+        // carry (`SourceRouteTable::note_used`).
         #[cfg(feature = "router")]
-        self.routing.expire_stale(crate::routing::ROUTE_EXPIRY_SECS);
+        {
+            self.routing.expire_stale(crate::routing::ROUTE_EXPIRY_SECS);
+            self.source_route_table
+                .age_and_expire(elapsed_secs, crate::routing::ROUTE_EXPIRY_SECS);
+        }
 
         // Fail route discoveries that never produced a Route Reply so a later
         // data request may retry instead of being suppressed forever.

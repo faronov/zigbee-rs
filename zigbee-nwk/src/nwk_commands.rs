@@ -981,9 +981,12 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         // Schedule accepted Route Request forwards. One that finds the
-        // broadcast schedule full stays queued for a later pass.
+        // broadcast schedule short of room stays queued for a later pass:
+        // forwards always leave one entry for an ordinary relay, which has no
+        // queue of its own and would otherwise be dropped (R22 §3.6.5 "every
+        // router shall buffer at least 1 frame").
         #[cfg(feature = "router")]
-        while self.broadcast_tx.can_schedule()
+        while self.broadcast_tx.can_schedule_route_request()
             && let Some(pending) = self.pending_rreq_forwards.pop()
         {
             if let Err(e) = self.schedule_route_request_forward(&pending) {
