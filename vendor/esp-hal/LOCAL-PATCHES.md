@@ -34,6 +34,22 @@ and H2 `soc/regi2c_bias.h`. These are references, not linked IDF dependencies.
   It accepts only timer/digital-GPIO wake and rejects all power-down flags.
   It does not run C6's unrelated EXT1 pad cleanup. H2 deep sleep and powered-down
   CPU/top-domain configurations are not supported by this backport.
+- Add opt-in `unsafe Rtc::sleep_light_retained_power_down(RetainedPowerDown, ..)`
+  (`sleep_light_retained` = `RetainedPowerDown::NONE`). **H2 only**: it may stop
+  XTAL (`xtal`) and RC_FAST (`rc_fast`) and then programs the HP_SLEEP/LP_SLEEP
+  bias and regulator registers the way IDF v5.5.1 `pmu_sleep_config_default`
+  does (`pmu_param.c`/`pmu_sleep.c`): XTAL off → `xpd_trx=0`, `pd_cur=1`,
+  `bias_sleep=1`, HP sleep dbias 1, LP sleep dbias from `DSLP_DBIAS` eFuse
+  (default 6); XTAL on → active dbias from `ACTIVE_HP/LP_DBIAS` (+2, capped,
+  only for eFuse block ≥ v0.3). Without this the analog registers stay at
+  their reset values (bias on, HP regulator near active voltage) — IDF's
+  "XTAL-on" light sleep. The six registers are saved before sleep and
+  restored after wake (before clock restore). `pmu_sleep_calculate_hw_wait_time`
+  follows IDF (XTAL settle time only when XTAL is stopped). The C6 backport has
+  no analog sleep config and rejects any oscillator power-down. CPU, top,
+  modem and VDD_SDIO (flash) domains remain powered: CPU/top need REGDMA
+  retention, modem power-down would lose 802.15.4 MAC/coex init, and flash
+  power-down needs RAM-resident sleep code — none of these are implemented.
 - Use calibrated Q19 RTC periods and checked 48-bit timer arithmetic. Handle H2
   ECO2 RC_FAST calibration division, including REF_TICK enable/restoration.
   Detect zero/invalid calibration and restore clocks before returning an error.
@@ -46,7 +62,9 @@ and H2 `soc/regi2c_bias.h`. These are references, not linked IDF dependencies.
 Patch **all** firmware dependency graphs to this single HAL copy; keep the pinned
 compiler and radio-facing HAL APIs. The product `sleep.rs` requires the local
 retained entry. It owns calibrated elapsed-time accounting and returns missing
-SYSTIMER ticks; the HAL does **not** advance SYSTIMER automatically.
+SYSTIMER ticks; the HAL does **not** advance SYSTIMER automatically. With
+`xtal` power-down SYSTIMER stops for the whole sleep; the same RTC-calibrated
+compensation covers it.
 
 The caller must hold its critical section across radio suspend, GPIO setup,
 PMU sleep, one-time SYSTIMER compensation/alarm servicing, and radio resume.

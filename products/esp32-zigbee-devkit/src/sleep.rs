@@ -163,6 +163,8 @@ mod accounting {
 }
 
 #[cfg(target_os = "none")]
+pub use esp_hal::rtc_cntl::sleep::RetainedPowerDown;
+#[cfg(target_os = "none")]
 pub use hardware::LightSleep;
 
 #[cfg(target_os = "none")]
@@ -179,6 +181,7 @@ mod hardware {
         _timer: LP_TIMER<'d>,
         _pmu: PMU<'d>,
         _aon: LP_AON<'d>,
+        power_down: esp_hal::rtc_cntl::sleep::RetainedPowerDown,
     }
 
     impl<'d> LightSleep<'d> {
@@ -188,7 +191,21 @@ mod hardware {
                 _timer: timer,
                 _pmu: pmu,
                 _aon: aon,
+                power_down: esp_hal::rtc_cntl::sleep::RetainedPowerDown::NONE,
             }
+        }
+
+        /// Also stop the selected oscillators during each sleep (H2 only; the
+        /// C6 HAL rejects anything but `NONE` on the first sleep).
+        ///
+        /// Stopping XTAL stops SYSTIMER: [`SleepReport::missing_systimer_ticks`]
+        /// then carries the whole interval, which the caller already applies.
+        pub fn with_power_down(
+            mut self,
+            power_down: esp_hal::rtc_cntl::sleep::RetainedPowerDown,
+        ) -> Self {
+            self.power_down = power_down;
+            self
         }
 
         /// Enter actual PMU light sleep, retaining digital state.
@@ -231,13 +248,19 @@ mod hardware {
                 let rtc_before = rtc_ticks();
                 let wake_timer =
                     TimerWakeupSource::new(core::time::Duration::from_micros(duration_us));
+                let power_down = self.power_down;
                 let result = if gpio_wakeup {
                     unsafe {
-                        self._rtc
-                            .sleep_light_retained(&[&wake_timer, &GpioWakeupSource::new()])
+                        self._rtc.sleep_light_retained_power_down(
+                            power_down,
+                            &[&wake_timer, &GpioWakeupSource::new()],
+                        )
                     }
                 } else {
-                    unsafe { self._rtc.sleep_light_retained(&[&wake_timer]) }
+                    unsafe {
+                        self._rtc
+                            .sleep_light_retained_power_down(power_down, &[&wake_timer])
+                    }
                 };
                 let rtc_after = rtc_ticks();
                 let systimer_after = SystemTimer::unit_value(Unit::Unit0);
