@@ -932,6 +932,7 @@ dependencies = [
  "router-app",
  "sensor-sed-app",
  "static_cell",
+ "zigbee-aps",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-runtime",

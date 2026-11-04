@@ -61,4 +61,26 @@ impl H2TemperatureSensor {
 
         Ok(calibration.centi_celsius(raw))
     }
+
+    /// [`Self::read_centi_celsius`] with the SAR ADC register and TSENS
+    /// clocks enabled only for the conversion, so neither keeps running
+    /// from XTAL through retained light sleep.
+    #[allow(dead_code)] // Used by the thermometer bin only.
+    pub fn read_gated_centi_celsius(&self) -> Result<i16, Error> {
+        set_clocks(true);
+        let result = self.read_centi_celsius();
+        set_clocks(false);
+        result
+    }
+}
+
+#[allow(dead_code)]
+fn set_clocks(on: bool) {
+    let system = SYSTEM::regs();
+    system
+        .saradc_conf()
+        .modify(|_, w| w.saradc_reg_clk_en().bit(on));
+    system
+        .tsens_clk_conf()
+        .modify(|_, w| w.tsens_clk_en().bit(on));
 }

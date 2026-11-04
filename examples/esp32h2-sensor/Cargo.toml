@@ -16,6 +16,14 @@ name = "esp32h2-sensor"
 path = "src/main.rs"
 required-features = ["sed"]
 
+# Battery thermometer build profile (`thermometer.toml`), see
+# `src/thermometer.rs`:
+#   cargo build --release --bin esp32h2-thermometer --features thermometer,light-sleep,quiet
+[[bin]]
+name = "esp32h2-thermometer"
+path = "src/thermometer.rs"
+required-features = ["thermometer"]
+
 [[bin]]
 name = "esp32h2-ed"
 path = "src/ed.rs"
@@ -34,6 +42,7 @@ zigbee-runtime = { path = "../../zigbee-runtime", features = ["ota"] }
 sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"], optional = true }
 router-app = { path = "../../apps/router", default-features = false, optional = true }
 zigbee-nwk = { path = "../../zigbee-nwk", optional = true }
+zigbee-aps = { path = "../../zigbee-aps", optional = true }
 esp32-zigbee-devkit-product = { path = "../../products/esp32-zigbee-devkit", features = ["esp32h2"] }
 
 # ESP32-H2 HAL and runtime
@@ -72,6 +81,11 @@ router = [
 ]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
+# Temperature-only sleepy thermometer (`esp32h2-thermometer` bin); its
+# identity, reporting defaults and cadence come from `thermometer.toml`.
+thermometer = ["sed", "dep:zigbee-aps"]
+# Compile out all `log` output; the thermometer bin then links no console.
+quiet = ["log/max_level_off", "log/release_max_level_off"]
 
 [patch.crates-io]
 esp-hal = { path = "../../vendor/esp-hal" }

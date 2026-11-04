@@ -1,0 +1,56 @@
+# ESP32-H2 thermometer SED build profile (`--features thermometer`).
+#
+# `build.rs` validates these values and turns them into constants; nothing in
+# `src/thermometer*.rs` repeats them. Override any key for one build with
+# `H2_THERMO_<KEY>` (upper case), e.g. `H2_THERMO_REPORT_MAX_S=600`, or point
+# `H2_THERMO_CONFIG` at another file with the same keys.
+#
+# Integers accept decimal or 0x-prefixed hex. Strings use double quotes.
+
+# --- identity -----------------------------------------------------------
+# Basic cluster ModelIdentifier (ASCII, at most 32 bytes).
+model = "ESP32-H2-Thermometer"
+# Zigbee OTA image type: distinct from the H2 sensor image (0x0002) so an
+# OTA server never offers the environmental-sensor image to this product.
+ota_image_type = 0x0012
+# Security-journal role tag: a different tag never resumes the network
+# state written by another image (router 0x5201, ED 0x5202, the original
+# sensor image writes none).
+role_tag = 0x5203
+
+# --- Temperature Measurement (0x0402) ------------------------------------
+# Min/MaxMeasuredValue in 0.01 degC. The die sensor is configured for its
+# -10..80 degC range.
+min_measured_centi_c = -1000
+max_measured_centi_c = 8000
+
+# Default Send-direction reporting of MeasuredValue, applied at every cold
+# boot. A ZCL Configure Reporting (e.g. ZHA's interview) replaces it until
+# the next reboot. ZCL semantics: max 0 = no periodic report,
+# max 0xFFFF = reporting off.
+report_min_s = 30
+report_max_s = 300
+report_change_centi_c = 50
+
+# --- polling and sampling ------------------------------------------------
+# Joined slow (sleepy) parent poll. Must stay below the parent's child
+# timeout (the stack requests the 256-minute default).
+slow_poll_ms = 30000
+# Poll period while joining, interviewing, identifying, receiving OTA or
+# with pending APS/ZDO transactions.
+fast_poll_ms = 250
+# Fast-poll windows after a fresh join (ZHA interview) and after a resume.
+fresh_join_fast_ms = 120000
+restored_fast_ms = 60000
+# Fast-poll window after the interview completes and after a BOOT press
+# (force report), so queued commands from the coordinator can be delivered.
+button_fast_poll_ms = 10000
+# Die temperature sample on every Nth slow-poll wake (sampling shares the
+# poll wake; it never schedules its own).
+sample_every_polls = 1
+
+# --- power ---------------------------------------------------------------
+# With no USB host seen within this window after boot, the USB Serial/JTAG
+# pad (and its D+ pull-up) is switched off until the next reset. 0 keeps USB
+# powered. Recovery: reset with USB attached (or hold BOOT while resetting).
+usb_host_wait_ms = 1000
