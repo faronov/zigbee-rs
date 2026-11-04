@@ -327,8 +327,16 @@ power-on attribute values and the ranges a client may write or request
 outside those ranges return `INVALID_VALUE`. `take_fast_poll_event()`
 reports Check-in Response fast-poll starts and Fast Poll Stop to the
 application, which owns the actual poll period. `sensor-sed-app` services
-this through `SensorProfile::poll_control_mut`; written attributes are not
-persisted across a reset.
+this through `SensorProfile::poll_control_mut`.
+
+`state()` / `restore_state()` expose the client-changeable values
+(`PollControlState`: CheckInInterval, LongPollInterval, ShortPollInterval,
+FastPollTimeout). `restore_state` validates them together against the
+product's `PollControlConfig` limits and refuses an inconsistent state.
+`zigbee_runtime::reporting_store::ReportingPersistence::{restore_with,
+sync_with}` persists them as an optional 13-byte section of the reporting
+snapshot, bound to the joined extended PAN ID; without a persistence
+backend the values revert to the product defaults after a reset.
 
 ---
 

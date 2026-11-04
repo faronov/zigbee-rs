@@ -240,6 +240,19 @@ where
         self.node.device_mut()
     }
 
+    /// The Zigbee device together with the profile's Poll Control server,
+    /// if fitted, for composition roots that persist both (see
+    /// `zigbee_runtime::reporting_store::ReportingPersistence::restore_with`).
+    pub fn device_and_poll_control_mut(
+        &mut self,
+    ) -> (
+        &mut zigbee_runtime::ZigbeeDevice<M, EndDevice>,
+        Option<&mut zigbee_zcl::clusters::poll_control::PollControlCluster>,
+    ) {
+        let (device, profile) = self.node.device_and_profile_mut();
+        (device, profile.poll_control_mut())
+    }
+
     fn mark(&self) -> W::Mark {
         self.resources.wake.mark()
     }

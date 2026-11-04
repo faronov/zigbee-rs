@@ -95,6 +95,42 @@ impl Default for PollControlConfig {
     }
 }
 
+/// The Poll Control values a client can change remotely (CheckInInterval and
+/// FastPollTimeout by Write Attributes, LongPollInterval and
+/// ShortPollInterval by command), in quarter-seconds, for products that
+/// persist them across a reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollControlState {
+    pub check_in_interval: u32,
+    pub long_poll_interval: u32,
+    pub short_poll_interval: u16,
+    pub fast_poll_timeout: u16,
+}
+
+impl PollControlState {
+    /// Encoded length: two little-endian `u32` and two `u16`.
+    pub const ENCODED_LEN: usize = 12;
+
+    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0..4].copy_from_slice(&self.check_in_interval.to_le_bytes());
+        out[4..8].copy_from_slice(&self.long_poll_interval.to_le_bytes());
+        out[8..10].copy_from_slice(&self.short_poll_interval.to_le_bytes());
+        out[10..12].copy_from_slice(&self.fast_poll_timeout.to_le_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; Self::ENCODED_LEN] = bytes.try_into().ok()?;
+        Some(Self {
+            check_in_interval: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            long_poll_interval: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            short_poll_interval: u16::from_le_bytes([bytes[8], bytes[9]]),
+            fast_poll_timeout: u16::from_le_bytes([bytes[10], bytes[11]]),
+        })
+    }
+}
+
 /// A client's fast-poll decision, for products that run their own poll
 /// timing instead of [`PollControlCluster::tick`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +312,52 @@ impl PollControlCluster {
     /// ShortPollInterval in quarter-seconds.
     pub fn short_poll_interval_qs(&self) -> u16 {
         self.u32_attr(ATTR_SHORT_POLL_INTERVAL) as u16
+    }
+
+    /// Current client-changeable values; see [`PollControlState`].
+    pub fn state(&self) -> PollControlState {
+        PollControlState {
+            check_in_interval: self.u32_attr(ATTR_CHECK_IN_INTERVAL),
+            long_poll_interval: self.u32_attr(ATTR_LONG_POLL_INTERVAL),
+            short_poll_interval: self.u32_attr(ATTR_SHORT_POLL_INTERVAL) as u16,
+            fast_poll_timeout: self.u32_attr(ATTR_FAST_POLL_TIMEOUT) as u16,
+        }
+    }
+
+    /// Apply persisted client-changeable values.
+    ///
+    /// The values are validated together against this product's limits
+    /// (the same ranges and orderings [`PollControlConfig::is_valid`]
+    /// enforces); an inconsistent or out-of-range state is refused and the
+    /// cluster keeps its current values. Returns whether it was applied.
+    pub fn restore_state(&mut self, state: PollControlState) -> bool {
+        let candidate = PollControlConfig {
+            check_in_interval: state.check_in_interval,
+            long_poll_interval: state.long_poll_interval,
+            short_poll_interval: state.short_poll_interval,
+            fast_poll_timeout: state.fast_poll_timeout,
+            ..self.config
+        };
+        if !candidate.is_valid() {
+            return false;
+        }
+        let _ = self.store.set_raw(
+            ATTR_CHECK_IN_INTERVAL,
+            ZclValue::U32(state.check_in_interval),
+        );
+        let _ = self.store.set_raw(
+            ATTR_LONG_POLL_INTERVAL,
+            ZclValue::U32(state.long_poll_interval),
+        );
+        let _ = self.store.set_raw(
+            ATTR_SHORT_POLL_INTERVAL,
+            ZclValue::U16(state.short_poll_interval),
+        );
+        let _ = self.store.set_raw(
+            ATTR_FAST_POLL_TIMEOUT,
+            ZclValue::U16(state.fast_poll_timeout),
+        );
+        true
     }
 
     /// Fast-poll period after a Check-in, waiting for its response.
@@ -694,5 +776,61 @@ mod tests {
             Err(ZclStatus::InvalidField)
         );
         assert_eq!(c.take_fast_poll_event(), None);
+    }
+
+    #[test]
+    fn client_state_round_trips_and_restores_within_product_limits() {
+        let mut c = PollControlCluster::with_config(PRODUCT);
+        // A coordinator's writes and commands.
+        c.set(ATTR_CHECK_IN_INTERVAL, ZclValue::U32(13200)).unwrap();
+        c.set(ATTR_FAST_POLL_TIMEOUT, ZclValue::U16(80)).unwrap();
+        c.handle_command(CMD_SET_LONG_POLL_INTERVAL, &240u32.to_le_bytes())
+            .unwrap();
+        c.handle_command(CMD_SET_SHORT_POLL_INTERVAL, &2u16.to_le_bytes())
+            .unwrap();
+        let state = c.state();
+        assert_eq!(
+            state,
+            PollControlState {
+                check_in_interval: 13200,
+                long_poll_interval: 240,
+                short_poll_interval: 2,
+                fast_poll_timeout: 80,
+            }
+        );
+        let encoded = state.encode();
+        assert_eq!(PollControlState::decode(&encoded), Some(state));
+        assert_eq!(PollControlState::decode(&encoded[..11]), None);
+
+        let mut fresh = PollControlCluster::with_config(PRODUCT);
+        assert!(fresh.restore_state(state));
+        assert_eq!(fresh.state(), state);
+        assert_eq!(fresh.long_poll_interval_qs(), 240);
+
+        // Out of this product's limits (long poll above its maximum, check-in
+        // below its minimum, short above long): refused, values unchanged.
+        for bad in [
+            PollControlState {
+                long_poll_interval: 241,
+                ..state
+            },
+            PollControlState {
+                check_in_interval: 479,
+                ..state
+            },
+            PollControlState {
+                short_poll_interval: 241,
+                ..state
+            },
+            PollControlState {
+                fast_poll_timeout: 0,
+                ..state
+            },
+        ] {
+            let mut c = PollControlCluster::with_config(PRODUCT);
+            let before = c.state();
+            assert!(!c.restore_state(bad));
+            assert_eq!(c.state(), before);
+        }
     }
 }

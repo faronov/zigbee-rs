@@ -218,8 +218,9 @@ fn main() -> ! {
     block_on(run(APP.init(app)))
 }
 
-/// `initialize` → restore the persisted reporting configuration → `step`
-/// forever, persisting a changed configuration after each iteration.
+/// `initialize` → restore the persisted reporting configuration and Poll
+/// Control values → `step` forever, persisting a changed configuration after
+/// each iteration.
 async fn run(app: &'static mut App) -> ! {
     if app.initialize().await.is_err() {
         halt()
@@ -230,13 +231,18 @@ async fn run(app: &'static mut App) -> ! {
     if let Some(persistence) = reporting.as_mut() {
         // A failed restore keeps the product defaults; the next sync
         // replaces the unreadable snapshot.
-        let _ = persistence.restore(app.device_mut());
+        let (device, poll_control) = app.device_and_poll_control_mut();
+        let _ = persistence.restore_with(device, poll_control);
     }
     loop {
         let _ = app.step().await;
         #[cfg(feature = "reporting-persist")]
         if let Some(persistence) = reporting.as_mut() {
-            if persistence.sync(app.device()).is_err() {
+            let (device, poll_control) = app.device_and_poll_control_mut();
+            if persistence
+                .sync_with(device, poll_control.as_deref())
+                .is_err()
+            {
                 // Flash refused the commit: stop for this boot instead of
                 // re-erasing the window on every wake.
                 reporting = None;

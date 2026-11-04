@@ -198,8 +198,11 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   ≈0.6 KB, record parse ≈0.4 KB, the rest flash-window glue.
 - Poll Control: periodic Check-in to the bound client, Check-in Response
   fast poll bounded by `fast_poll_timeout_max_ms`, Fast Poll Stop, and
-  Set Long/Short Poll Interval range-checked against the profile. Written
-  attributes are not persisted across a reset.
+  Set Long/Short Poll Interval range-checked against the profile. With
+  `reporting-persist`, CheckInInterval, FastPollTimeout and the
+  Long/Short Poll Interval a coordinator changed are journalled in the
+  same snapshot (same window and extended-PAN binding) and restored after a
+  reset only if they still fit the profile's limits.
 - Light sleep stops XTAL and RC_FAST (`sleep_xtal_off`,
   `sleep_rc_fast_off`) and applies ESP-IDF's light-sleep analog settings
   (see `vendor/esp-hal/LOCAL-PATCHES.md`). CPU, top, modem and flash

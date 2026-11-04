@@ -2302,6 +2302,101 @@ mod resume_tests {
         assert_eq!(max_interval(&foreign), 300);
     }
 
+    /// Poll Control values a coordinator changed are persisted with the
+    /// reporting snapshot, restored on the same network only and refused if
+    /// outside the product's limits.
+    #[test]
+    fn reporting_persistence_carries_poll_control_values() {
+        use crate::reporting_store::{RamReportingStore, ReportingPersistence};
+        use zigbee_zcl::clusters::Cluster;
+        use zigbee_zcl::clusters::poll_control::{
+            ATTR_CHECK_IN_INTERVAL, PollControlCluster, PollControlConfig, PollControlState,
+        };
+        use zigbee_zcl::data_types::ZclValue;
+
+        const PRODUCT: PollControlConfig = PollControlConfig {
+            check_in_interval: 14400,
+            long_poll_interval: 120,
+            short_poll_interval: 1,
+            fast_poll_timeout: 40,
+            check_in_interval_min: 480,
+            long_poll_interval_min: 120,
+            fast_poll_timeout_max: 240,
+            long_poll_interval_max: 240,
+            check_in_response_timeout: 32,
+        };
+        let joined = |security: &mut RamSecurityStateStore| {
+            let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+            block_on(device.start_or_resume_with_security_store(security)).unwrap();
+            device
+        };
+        let mut security = RamSecurityStateStore::new();
+        security.store(&commissioned_state()).unwrap();
+
+        let mut device = joined(&mut security);
+        let mut poll = PollControlCluster::with_config(PRODUCT);
+        let mut persistence = ReportingPersistence::new(RamReportingStore::new());
+        assert_eq!(
+            persistence.restore_with(&mut device, Some(&mut poll)),
+            Ok(0)
+        );
+        // Defaults are not written; a coordinator write is, once.
+        assert_eq!(persistence.sync_with(&device, Some(&poll)), Ok(false));
+        poll.attributes_mut()
+            .set(ATTR_CHECK_IN_INTERVAL, ZclValue::U32(7200))
+            .unwrap();
+        assert_eq!(persistence.sync_with(&device, Some(&poll)), Ok(true));
+        assert_eq!(persistence.sync_with(&device, Some(&poll)), Ok(false));
+        let changed = poll.state();
+
+        // Reboot on the same network: restored.
+        let store = core::mem::take(persistence.store_mut());
+        let mut rebooted = joined(&mut security);
+        let mut fresh = PollControlCluster::with_config(PRODUCT);
+        let mut persistence = ReportingPersistence::new(store);
+        assert_eq!(
+            persistence.restore_with(&mut rebooted, Some(&mut fresh)),
+            Ok(0)
+        );
+        assert_eq!(fresh.state(), changed);
+        assert_eq!(persistence.sync_with(&rebooted, Some(&fresh)), Ok(false));
+
+        // A product with tighter limits refuses the stored state.
+        let store = core::mem::take(persistence.store_mut());
+        let mut rebooted = joined(&mut security);
+        let mut strict = PollControlCluster::with_config(PollControlConfig {
+            check_in_interval_min: 9600,
+            ..PRODUCT
+        });
+        let mut persistence = ReportingPersistence::new(store);
+        persistence
+            .restore_with(&mut rebooted, Some(&mut strict))
+            .unwrap();
+        assert_eq!(strict.state().check_in_interval, 14400);
+
+        // Another network: not applied.
+        let store = core::mem::take(persistence.store_mut());
+        let mut foreign_state = commissioned_state();
+        foreign_state.extended_pan_id = [2; 8];
+        let mut foreign_security = RamSecurityStateStore::new();
+        foreign_security.store(&foreign_state).unwrap();
+        let mut foreign = joined(&mut foreign_security);
+        let mut other = PollControlCluster::with_config(PRODUCT);
+        let mut persistence = ReportingPersistence::new(store);
+        persistence
+            .restore_with(&mut foreign, Some(&mut other))
+            .unwrap();
+        assert_eq!(
+            other.state(),
+            PollControlState {
+                check_in_interval: 14400,
+                long_poll_interval: 120,
+                short_poll_interval: 1,
+                fast_poll_timeout: 40,
+            }
+        );
+    }
+
     /// A device holding a prepared (not yet committed) Bind response.
     fn device_with_pending_binding_response(
         store: &mut RamSecurityStateStore,

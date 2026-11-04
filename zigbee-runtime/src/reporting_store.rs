@@ -16,12 +16,17 @@
 //!   product applied its defaults, and afterwards writes only when the
 //!   engine's configuration actually changed while joined.
 //!
+//! A snapshot may also carry the client-changeable Poll Control (0x0020)
+//! values ([`PollControlState`]) a coordinator wrote, bound to the same
+//! extended PAN ID; see [`ReportingPersistence::restore_with`].
+//!
 //! Reporting timers and last reported values are not persisted: a restored
 //! configuration starts a fresh minimum/maximum interval.
 
 use embedded_storage::nor_flash::NorFlash;
 use zigbee_mac::MacDriver;
 use zigbee_types::IeeeAddress;
+use zigbee_zcl::clusters::poll_control::{PollControlCluster, PollControlState};
 use zigbee_zcl::foundation::reporting::{MAX_REPORT_CONFIGS, ReportingConfig, ReportingEngine};
 
 use crate::ZigbeeDevice;
@@ -32,9 +37,14 @@ use crate::security_journal::crc32;
 /// attribute (2), type (1), min (2), max (2) and an at most 8-byte analog
 /// reportable change.
 pub const MAX_ENCODED_REPORTING_RECORD_LEN: usize = 3 + 8 + 8;
-/// Largest encoded snapshot payload: a record count and every record.
+/// Tag of the optional trailing Poll Control section.
+const POLL_CONTROL_TAG: u8 = 0x20;
+/// Encoded Poll Control section: tag and [`PollControlState`].
+const POLL_CONTROL_SECTION_LEN: usize = 1 + PollControlState::ENCODED_LEN;
+/// Largest encoded snapshot payload: a record count, every record and the
+/// optional Poll Control section.
 pub const MAX_ENCODED_REPORTING_LEN: usize =
-    1 + MAX_REPORT_CONFIGS * MAX_ENCODED_REPORTING_RECORD_LEN;
+    1 + MAX_REPORT_CONFIGS * MAX_ENCODED_REPORTING_RECORD_LEN + POLL_CONTROL_SECTION_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportingStoreError {
@@ -92,6 +102,36 @@ impl PersistentReporting {
         })
     }
 
+    /// Append the client-changeable Poll Control values.
+    pub fn with_poll_control(
+        mut self,
+        state: PollControlState,
+    ) -> Result<Self, ReportingStoreError> {
+        if self.poll_control_offset().is_some() {
+            return Err(ReportingStoreError::Corrupt);
+        }
+        let section = self
+            .bytes
+            .get_mut(self.len..self.len + POLL_CONTROL_SECTION_LEN)
+            .ok_or(ReportingStoreError::Corrupt)?;
+        section[0] = POLL_CONTROL_TAG;
+        section[1..].copy_from_slice(&state.encode());
+        self.len += POLL_CONTROL_SECTION_LEN;
+        Ok(self)
+    }
+
+    /// Stored Poll Control values, if the snapshot carries them.
+    pub fn poll_control(&self) -> Option<PollControlState> {
+        let offset = self.poll_control_offset()?;
+        PollControlState::decode(&self.payload()[offset + 1..])
+    }
+
+    /// Offset of a well-formed trailing Poll Control section.
+    fn poll_control_offset(&self) -> Option<usize> {
+        let records_end = self.for_each_record(|_, _, _| {}).ok()?;
+        (records_end != self.len).then_some(records_end)
+    }
+
     /// Extended PAN ID of the network this snapshot belongs to.
     pub const fn extended_pan_id(&self) -> IeeeAddress {
         self.extended_pan_id
@@ -137,11 +177,12 @@ impl PersistentReporting {
         Ok(snapshot)
     }
 
-    /// Decode every record, failing on any malformed or trailing byte.
+    /// Decode every record, failing on any malformed or trailing byte other
+    /// than a complete Poll Control section. Returns where the records end.
     fn for_each_record(
         &self,
         mut visit: impl FnMut(u8, u16, ReportingConfig),
-    ) -> Result<(), ReportingStoreError> {
+    ) -> Result<usize, ReportingStoreError> {
         let count = self.len();
         if count > MAX_REPORT_CONFIGS || self.extended_pan_id == [0; 8] {
             return Err(ReportingStoreError::Corrupt);
@@ -159,10 +200,14 @@ impl PersistentReporting {
             pos += 3 + consumed;
             visit(endpoint, cluster_id, config);
         }
-        if pos != self.len {
+        // Nothing but an optional, complete Poll Control section may follow.
+        if pos != self.len
+            && (pos + POLL_CONTROL_SECTION_LEN != self.len
+                || self.payload()[pos] != POLL_CONTROL_TAG)
+        {
             return Err(ReportingStoreError::Corrupt);
         }
-        Ok(())
+        Ok(pos)
     }
 
     /// Apply every stored configuration to `engine`, replacing configurations
@@ -496,17 +541,45 @@ impl<S: ReportingStore> ReportingPersistence<S> {
         &mut self,
         device: &mut ZigbeeDevice<M, R>,
     ) -> Result<usize, ReportingStoreError> {
+        self.restore_with(device, None)
+    }
+
+    /// [`restore`](Self::restore), also restoring the stored Poll Control
+    /// values into `poll_control` (refused if outside its product limits).
+    pub fn restore_with<M: MacDriver, R: DeviceRole>(
+        &mut self,
+        device: &mut ZigbeeDevice<M, R>,
+        mut poll_control: Option<&mut PollControlCluster>,
+    ) -> Result<usize, ReportingStoreError> {
         let restored = match (device.joined_extended_pan_id(), self.store.load()?) {
             (Some(epid), Some(snapshot)) if snapshot.extended_pan_id() == epid => {
-                snapshot.apply(device.reporting_mut())?
+                let applied = snapshot.apply(device.reporting_mut())?;
+                if let (Some(state), Some(cluster)) =
+                    (snapshot.poll_control(), poll_control.as_deref_mut())
+                {
+                    cluster.restore_state(state);
+                }
+                applied
             }
             _ => 0,
         };
         if let Some(epid) = device.joined_extended_pan_id() {
-            self.saved =
-                Some(PersistentReporting::capture(device.reporting(), epid)?.fingerprint());
+            let state = poll_control.map(|cluster| cluster.state());
+            self.saved = Some(Self::capture(device, epid, state)?.fingerprint());
         }
         Ok(restored)
+    }
+
+    fn capture<M: MacDriver, R: DeviceRole>(
+        device: &ZigbeeDevice<M, R>,
+        epid: IeeeAddress,
+        poll_control: Option<PollControlState>,
+    ) -> Result<PersistentReporting, ReportingStoreError> {
+        let snapshot = PersistentReporting::capture(device.reporting(), epid)?;
+        match poll_control {
+            Some(state) => snapshot.with_poll_control(state),
+            None => Ok(snapshot),
+        }
     }
 
     /// Persist the engine configuration if it changed while joined.
@@ -517,10 +590,20 @@ impl<S: ReportingStore> ReportingPersistence<S> {
         &mut self,
         device: &ZigbeeDevice<M, R>,
     ) -> Result<bool, ReportingStoreError> {
+        self.sync_with(device, None)
+    }
+
+    /// [`sync`](Self::sync), also persisting `poll_control`'s
+    /// client-changeable values when they changed.
+    pub fn sync_with<M: MacDriver, R: DeviceRole>(
+        &mut self,
+        device: &ZigbeeDevice<M, R>,
+        poll_control: Option<&PollControlCluster>,
+    ) -> Result<bool, ReportingStoreError> {
         let Some(epid) = device.joined_extended_pan_id() else {
             return Ok(false);
         };
-        let snapshot = PersistentReporting::capture(device.reporting(), epid)?;
+        let snapshot = Self::capture(device, epid, poll_control.map(PollControlCluster::state))?;
         let fingerprint = snapshot.fingerprint();
         if self.saved == Some(fingerprint) {
             return Ok(false);
@@ -707,6 +790,76 @@ mod tests {
         assert!(PersistentReporting::from_parts(EPID, &trailing[..payload.len() + 1]).is_err());
         assert!(PersistentReporting::from_parts([0; 8], payload).is_err());
         assert!(PersistentReporting::from_parts(EPID, &[]).is_err());
+    }
+
+    const POLL: PollControlState = PollControlState {
+        check_in_interval: 13200,
+        long_poll_interval: 120,
+        short_poll_interval: 2,
+        fast_poll_timeout: 80,
+    };
+
+    #[test]
+    fn poll_control_section_round_trips_and_old_snapshots_stay_readable() {
+        let plain = PersistentReporting::capture(&engine(900), EPID).unwrap();
+        assert_eq!(plain.poll_control(), None);
+        let with_poll = plain.clone().with_poll_control(POLL).unwrap();
+        assert_eq!(with_poll.payload().len(), plain.payload().len() + 13);
+        assert_eq!(with_poll.poll_control(), Some(POLL));
+        assert_ne!(with_poll.fingerprint(), plain.fingerprint());
+        // Only one section.
+        assert_eq!(
+            with_poll.clone().with_poll_control(POLL),
+            Err(ReportingStoreError::Corrupt)
+        );
+        // Records still apply with the section present.
+        let mut restored = ReportingEngine::new();
+        assert_eq!(with_poll.apply(&mut restored), Ok(2));
+        assert_eq!(max_interval(&restored), 900);
+
+        // Through the journal, and an older record without the section.
+        let mut journal = journal(MockFlash::new());
+        journal.store(&plain).unwrap();
+        assert_eq!(journal.load().unwrap().unwrap().poll_control(), None);
+        journal.store(&with_poll).unwrap();
+        let loaded = journal.load().unwrap().unwrap();
+        assert_eq!(loaded, with_poll);
+        assert_eq!(loaded.poll_control(), Some(POLL));
+
+        // An empty engine still carries Poll Control.
+        let empty = PersistentReporting::capture(&ReportingEngine::new(), EPID)
+            .unwrap()
+            .with_poll_control(POLL)
+            .unwrap();
+        assert_eq!(empty.poll_control(), Some(POLL));
+        assert_eq!(
+            PersistentReporting::from_parts(EPID, empty.payload())
+                .unwrap()
+                .poll_control(),
+            Some(POLL)
+        );
+    }
+
+    #[test]
+    fn malformed_poll_control_sections_are_rejected() {
+        let with_poll = PersistentReporting::capture(&engine(900), EPID)
+            .unwrap()
+            .with_poll_control(POLL)
+            .unwrap();
+        let payload = with_poll.payload();
+        let records_end = payload.len() - 13;
+        // Truncated section.
+        for len in records_end + 1..payload.len() {
+            assert!(PersistentReporting::from_parts(EPID, &payload[..len]).is_err());
+        }
+        // Wrong tag.
+        let mut bytes = [0u8; MAX_ENCODED_REPORTING_LEN];
+        bytes[..payload.len()].copy_from_slice(payload);
+        bytes[records_end] = 0x21;
+        assert!(PersistentReporting::from_parts(EPID, &bytes[..payload.len()]).is_err());
+        // Extra byte after the section.
+        bytes[records_end] = POLL_CONTROL_TAG;
+        assert!(PersistentReporting::from_parts(EPID, &bytes[..payload.len() + 1]).is_err());
     }
 
     #[test]
