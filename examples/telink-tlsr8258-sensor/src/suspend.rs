@@ -40,5 +40,18 @@ pub fn run() -> ! {
         // The RGB adapter has not changed the initialized red state yet.
         Err(_) => halted(),
     };
-    tlsr8258_rt::block_on(app.run())
+    // Initialize, then one wait/service step at a time with the SVC stack
+    // guard checked after each step. The future only borrows `app`.
+    let app = &mut app;
+    tlsr8258_rt::block_on(async move {
+        if app.initialize().await.is_err() {
+            halted();
+        }
+        loop {
+            if app.step().await.is_err() {
+                halted();
+            }
+            tlsr8258_tb04_product::stack_guard::check();
+        }
+    })
 }

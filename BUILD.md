@@ -457,6 +457,14 @@ state stays below `0x848000`. The build runs the static stack analyzer over
 both entry roots against that budget
 (`tools/tlsr8258-sensor-retention-stack-gate.args`).
 
+The default sensor and End Device use the same 24 KiB SVC stack and guard
+placement in fully retained SRAM; the router keeps a 20 KiB stack
+(`[0x84AC00, 0x84FC00)`, selected by its `TELINK_TB04_ROUTER_IMAGE` marker)
+because its `.bss` leaves no room for more above the 4 KiB static gap. Each
+build runs its own static stack gate
+(`tools/tlsr8258-{sensor,ed,router}-stack-gate.args`), and every image checks
+the 64 B guard in its main loop and before each flash erase/program.
+
 ## Documentation
 
 ```bash

@@ -30,6 +30,7 @@ fn halt() -> ! {
 #[cfg(not(feature = "retention-proof"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _rust_entry() -> ! {
+    arm_stack_guard();
     // A clock-bring-up failure leaves the clock tree in an unknown state:
     // never reach the MAC/radio.
     if !tlsr8258_sensor_app::init_sleep_clocks() {
@@ -38,10 +39,9 @@ pub unsafe extern "C" fn _rust_entry() -> ! {
     suspend::run()
 }
 
-/// The LOW32K image keeps the SVC stack and its 64 B guard in non-retained
-/// upper SRAM, which loses power in retention: both entries re-arm the guard
-/// before any stack-deep work or flash write. One out-of-line copy.
-#[cfg(feature = "retention-proof")]
+/// Arm the 64 B SVC stack guard before any stack-deep work or flash write.
+/// The LOW32K image keeps the stack and guard in non-retained upper SRAM,
+/// which loses power in retention, so both of its entries re-arm it.
 #[inline(never)]
 fn arm_stack_guard() {
     tlsr8258_tb04_product::stack_guard::arm();

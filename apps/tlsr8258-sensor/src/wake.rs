@@ -7,6 +7,10 @@
 //! - `Retention` (feature `retention`): LOW32K sleep. The transaction never
 //!   returns on success; the image re-enters through `_rust_retention_entry`
 //!   and [`crate::retention::resume`]. Without the feature it is rejected.
+//!
+//! Both timer PM transactions reject a duration below the early-wake floor
+//! (`MIN_SLEEP_TICKS`, about 1.765 ms), so a shorter `Idle` or `Retention`
+//! wait is busy-waited on Timer0 like `Active`.
 
 use sensor_sed_app::{SleepDepth, WaitRequest, WakeController, WakeReason};
 use tlsr8258_hal::pm::SuspendTransactionPhase;
@@ -72,6 +76,10 @@ impl SleepClock {
     }
 }
 
+fn active_wait(timeout_ms: u32) {
+    tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(timeout_ms));
+}
+
 fn suspend(mac: &mut TelinkMac, timeout_ms: u32) -> Result<(), TelinkWakeError> {
     let mut clock = SleepClock::new();
     let status = tlsr8258_hal::pm::cpu_suspend_timer_rc_transaction(
@@ -126,25 +134,20 @@ impl WakeController<TelinkMac> for TelinkWake {
         mac: &mut TelinkMac,
         request: WaitRequest,
     ) -> Result<WakeReason, Self::Error> {
+        // The lifecycle may shorten any wait to 1 ms (a report, poll or
+        // run-again deadline residue). Both timer PM transactions reject a
+        // duration below the early-wake floor (`TooShort`), so such a residue
+        // is waited out actively at every low-power depth.
+        let below_floor = tlsr8258_hal::pm::system_timer_ms(request.timeout_ms)
+            < tlsr8258_hal::pm::calc::MIN_SLEEP_TICKS;
         match request.sleep_depth {
-            SleepDepth::Active => {
-                tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(request.timeout_ms));
-            }
-            SleepDepth::Idle => suspend(mac, request.timeout_ms)?,
-            #[cfg(feature = "retention")]
-            SleepDepth::Retention => {
-                // The lifecycle may shorten a wait to 1 ms; below the PM
-                // early-wake floor a LOW32K entry is rejected (`TooShort`),
-                // so such a residue is waited out actively instead.
-                let ticks = tlsr8258_hal::pm::system_timer_ms(request.timeout_ms);
-                if ticks < tlsr8258_hal::pm::calc::MIN_SLEEP_TICKS {
-                    tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(request.timeout_ms));
-                } else {
-                    retention_sleep(mac, request.timeout_ms)?
-                }
-            }
             #[cfg(not(feature = "retention"))]
             SleepDepth::Retention => return Err(TelinkWakeError::RetentionUnsupported),
+            SleepDepth::Active => active_wait(request.timeout_ms),
+            _ if below_floor => active_wait(request.timeout_ms),
+            SleepDepth::Idle => suspend(mac, request.timeout_ms)?,
+            #[cfg(feature = "retention")]
+            SleepDepth::Retention => retention_sleep(mac, request.timeout_ms)?,
         }
         Ok(WakeReason::Timer)
     }
@@ -154,6 +157,6 @@ impl WakeController<TelinkMac> for TelinkWake {
     }
 
     async fn delay_ms(&mut self, duration_ms: u32) {
-        tlsr8258_hal::timer::sleep_ticks(tlsr8258_hal::timer::ms(duration_ms));
+        active_wait(duration_ms);
     }
 }

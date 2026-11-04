@@ -53,6 +53,7 @@ SECTIONS
         *(.text._start);
         *(.text._start.*);
         KEEP(*(.retention_image_marker));
+        KEEP(*(.tb04_router_image_marker));
         *(.text .text.*);
         *(.rodata .rodata.*);
         *(.ARM.exidx .ARM.exidx.*);
@@ -116,19 +117,27 @@ SECTIONS
      * 4 KiB of unused physical RAM must separate the last static allocation
      * from the guard; that gap is not part of the stack budget.
      *
-     * The default image uses a 20 KiB SVC stack. The feature image emits
-     * TELINK_RETENTION_IMAGE and uses a 24 KiB SVC stack (its analyzed
-     * worst case exceeds 20 KiB; see tools/tlsr8258-sensor-retention-stack-
-     * gate.args). In that image the stacks and their guard live entirely in
-     * the upper 32 KiB, which is NOT retained in LOW32K deep retention: a
-     * retention wake re-enters `__reset`, which reloads both stack pointers
-     * and re-arms the SVC guard before any stack-deep work, so no stack
-     * content is needed across sleep. Everything that must survive sleep
-     * (.ram_code, .data, .bss, .retained, .rf_dma) stays below
-     * _retention_limit_, followed by a 256-byte retained tripwire that is
-     * painted on cold boot and verified before a wake is accepted.
+     * The leaf images (default sensor, End Device, retention sensor) use a
+     * 24 KiB SVC stack: their analyzed worst cases exceed or nearly fill
+     * 20 KiB (tools/tlsr8258-{sensor,ed,sensor-retention}-stack-gate.args).
+     * The router image emits TELINK_TB04_ROUTER_IMAGE and keeps a 20 KiB SVC
+     * stack: its larger .bss leaves no room for more above the 4 KiB gap,
+     * and its analyzed worst case fits (tools/tlsr8258-router-stack-
+     * gate.args). A router that lost its marker would get 24 KiB and fail
+     * the static-gap assertion below.
+     *
+     * The retention image emits TELINK_RETENTION_IMAGE. In that image the
+     * stacks and their guard live entirely in the upper 32 KiB, which is NOT
+     * retained in LOW32K deep retention: a retention wake re-enters
+     * `__reset`, which reloads both stack pointers and re-arms the SVC guard
+     * before any stack-deep work, so no stack content is needed across
+     * sleep. Everything that must survive sleep (.ram_code, .data, .bss,
+     * .retained, .rf_dma) stays below _retention_limit_, followed by a
+     * 256-byte retained tripwire that is painted on cold boot and verified
+     * before a wake is accepted.
      */
     _retention_image_enabled_ = DEFINED(TELINK_RETENTION_IMAGE);
+    _router_image_enabled_ = DEFINED(TELINK_TB04_ROUTER_IMAGE);
     _retention_limit_ = 0x00848000;
     _retention_stack_guard_start_ =
         _retention_image_enabled_ ? ((_rf_dma_end_ + 15) & ~15) : 0;
@@ -136,13 +145,13 @@ SECTIONS
         _retention_image_enabled_ ? _retention_stack_guard_start_ + 0x100 : 0;
 
     _default_svc_stack_top_ = 0x0084FC00;
-    _default_svc_stack_bytes_ = 20 * 1024;
-    _retention_svc_stack_bytes_ = 24 * 1024;
+    _leaf_svc_stack_bytes_ = 24 * 1024;
+    _router_svc_stack_bytes_ = 20 * 1024;
     _default_svc_stack_guard_bytes_ = 64;
     _default_min_static_gap_ = 4096;
     _svc_stack_top    = _default_svc_stack_top_;
-    _svc_stack_bottom = _default_svc_stack_top_ - (_retention_image_enabled_
-        ? _retention_svc_stack_bytes_ : _default_svc_stack_bytes_);
+    _svc_stack_bottom = _default_svc_stack_top_ - (_router_image_enabled_
+        ? _router_svc_stack_bytes_ : _leaf_svc_stack_bytes_);
     _svc_stack_guard_end = _svc_stack_bottom;
     _svc_stack_guard_start = _svc_stack_bottom - _default_svc_stack_guard_bytes_;
     _irq_stack_bottom = 0x0084FC00;
@@ -181,12 +190,15 @@ SECTIONS
         "ERROR: .rf_dma overlaps the TLSR8258 I-cache tag/data reservation");
     _assert_dma_under_stack = ASSERT(_rf_dma_end_ <= _svc_stack_bottom,
         "ERROR: .rf_dma extends into the SVC stack region");
-    _assert_default_svc_stack = ASSERT(_retention_image_enabled_ ||
-        (_svc_stack_top - _svc_stack_bottom) == _default_svc_stack_bytes_,
-        "ERROR: default SVC stack must be exactly 20 KiB");
-    _assert_retention_svc_stack = ASSERT(!_retention_image_enabled_ ||
-        (_svc_stack_top - _svc_stack_bottom) == _retention_svc_stack_bytes_,
-        "ERROR: retention SVC stack must be exactly 24 KiB");
+    _assert_single_layout_marker = ASSERT(
+        !(_retention_image_enabled_ && _router_image_enabled_),
+        "ERROR: an image cannot be both the router and the retention sensor");
+    _assert_router_svc_stack = ASSERT(!_router_image_enabled_ ||
+        (_svc_stack_top - _svc_stack_bottom) == _router_svc_stack_bytes_,
+        "ERROR: router SVC stack must be exactly 20 KiB");
+    _assert_leaf_svc_stack = ASSERT(_router_image_enabled_ ||
+        (_svc_stack_top - _svc_stack_bottom) == _leaf_svc_stack_bytes_,
+        "ERROR: sensor/End Device SVC stack must be exactly 24 KiB");
     _assert_svc_guard = ASSERT(
         (_svc_stack_guard_end - _svc_stack_guard_start) == _default_svc_stack_guard_bytes_,
         "ERROR: SVC stack guard must be 64 bytes");

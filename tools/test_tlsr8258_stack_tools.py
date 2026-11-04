@@ -90,6 +90,24 @@ class ParseDisassemblyTest(unittest.TestCase):
         ]))
         self.assertEqual(functions["caller"]["copies"], [])
 
+    def test_decoding_stops_at_the_function_symbol_size(self):
+        # An 8-byte shim followed by .text data that decodes as a prologue
+        # and a call must not gain frame bytes or edges past its symbol size.
+        body = [
+            insn(0x2000, "tpush", "{r7, lr}"),
+            insn(0x2002, "tjl", "0x2100 <real>        @ imm = #0xfe"),
+            insn(0x2006, "tpop", "{r7, pc}"),
+            insn(0x2008, "tpush", "{r4-r7, lr}"),
+            insn(0x200a, "tsub", "sp, #0x100"),
+            insn(0x200c, "tjl", "0x2200 <bogus>        @ imm = #0x1f4"),
+        ]
+        shim = (0x2000, "shim", body)
+        unbounded = report.parse_disassembly(listing(shim), read_word)["shim"]
+        bounded = report.parse_disassembly(listing(shim), read_word, {0x2000: 8})["shim"]
+        self.assertEqual(unbounded["frame"], 8 + 20 + 0x100)
+        self.assertEqual(bounded["frame"], 8)
+        self.assertEqual(bounded["calls"], {"real": "call"})
+
     def test_tjex_stub_call_is_an_indirect_site(self):
         functions = self.parse(
             (0x1000, "caller", [insn(0x1000, "tjl", "0x2000 <stub>        @ imm = #0xffe")]),

@@ -1,0 +1,65 @@
+# Static stack gate for the TB-04 always-on End Device image.
+# Run by tools/tlsr8258-firmware.sh after the layout check:
+#   tools/tlsr8258-stack-report.py ELF --compact --check @tools/tlsr8258-ed-stack-gate.args
+#
+# Heuristic direct-call bound, not a whole-program proof: recursion is cut and
+# the unresolved indirect edges below are reviewed, not proven bounded. HIL
+# stack paint stays the authoritative runtime evidence.
+#
+# Budget history: the image had a 20 KiB SVC stack and an analyzed worst case
+# of ~19.1 KB (deferred-reset steering -> nlme_network_discovery -> scan ->
+# radio TX), < 1.4 KB of headroom. As a leaf image it shares the sensor's
+# 24 KiB SVC stack with a 64 B guard and >= 4 KiB of free RAM between the
+# last static byte and the guard.
+
+# The only SVC root: `_rust_entry` -> app::run, one executor root.
+--svc-root
+_rust_entry
+
+--declared-svc
+24576
+--declared-irq
+1024
+--min-gap
+4096
+
+# Regression budget: worst SVC path through any matching function, measured
+# on the final ELF (19,096 B) and rounded up to the next 256 B boundary.
+--chain-budget
+steering-rejoin=(start_or_resume_steering|secure_rejoin|rejoin_with|start_fresh_steering|nlme_network_discovery|tick_steering_deferred_reset)=19200
+
+# Reviewed functions with unresolved indirect call sites (dyn FnMut /
+# cluster vtables / flash guard hooks). Same list as the sensor gates plus
+# the security journal's replay-counter retain hook, which the router gate
+# also reviews (inlined into its caller in the sensor images). Any new one
+# fails the gate.
+--allow-unresolved
+^<&mut dyn core::ops::function::FnMut<\.\.> as core::ops::function::FnMut<\.\.>>::call_mut$
+--allow-unresolved
+^<&mut dyn core::ops::function::FnMut<\.\.> as core::ops::function::FnOnce<\.\.>>::call_once::\{shim:vtable#0\}$
+--allow-unresolved
+^<core::option::Option<\.\.>>::or_else::<<\.\.>::dispatch_inner::\{closure#7\}>$
+--allow-unresolved
+^<zigbee_aps::ApsLayer<\.\.>>::process_incoming_aps_frame_with_data_persistence$
+--allow-unresolved
+^<zigbee_bdb::BdbLayer<\.\.>>::finalize_tclk_success::\{closure#0\}$
+--allow-unresolved
+^<zigbee_bdb::BdbLayer<\.\.>>::reserve_trust_center_link_key$
+--allow-unresolved
+^<zigbee_nwk::NwkLayer<\.\.>>::join_via_rejoin::\{closure#0\}$
+--allow-unresolved
+^<zigbee_nwk::NwkLayer<\.\.>>::process_incoming_nwk_frame_from_with_replay_commit::\{closure#0\}$
+--allow-unresolved
+^<zigbee_runtime::ZigbeeDevice<\.\.>>::send_due_reports::\{closure#0\}$
+--allow-unresolved
+^<zigbee_runtime::security_journal::SecurityStateJournal<\.\.> as zigbee_runtime::security_store::SecurityStateStore>::retain_replay_counters$
+--allow-unresolved
+^<zigbee_runtime::zcl_dispatch::LocalZclCtx<\.\.>>::(apply_configure_reporting|dispatch|reset_zcl_to_factory_defaults)$
+--allow-unresolved
+^<zigbee_runtime::zcl_dispatch::LocalZclCtx<\.\.>>::with_cluster(_mut|_for_direction)?::<.*<\.\.>::dispatch_inner::\{closure#\d+\}>$
+--allow-unresolved
+^tlsr8258_hal::flash::ensure_safe_flash$
+--allow-unresolved
+^zigbee_aps::apsde::aps_decrypt_incoming::<zigbee_mac::soft_mac::SoftMacCore<\.\.>>$
+--allow-unresolved
+^zigbee_zcl::foundation::(discover::process_discover_extended_dyn|write_attributes::(process_write_dyn|validate_write_undivided_dyn))$
