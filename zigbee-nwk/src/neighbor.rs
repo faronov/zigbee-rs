@@ -126,6 +126,15 @@ pub struct NeighborEntry {
     /// it was: only a parent ever sends a Parent Announce.
     #[cfg(feature = "router")]
     pub parent_annce_pending: bool,
+    /// A router child admitted (or restored) by this parent that has not yet
+    /// sent a Link Status covering this device.
+    ///
+    /// Its association or rejoin was a two-way MAC exchange, so it is a
+    /// usable direct hop until its first Link Status reports the real link
+    /// costs (R22 §3.6.3.4.2) or `nwkRouterAgeLimit` periods pass without one
+    /// (§3.6.3.4.3). Cleared by that Link Status and by a MAC NoAck to it.
+    #[cfg(feature = "router")]
+    pub awaiting_link_status: bool,
     /// Extended PAN ID of neighbor's network
     pub extended_pan_id: IeeeAddress,
     /// Whether this entry is occupied
@@ -153,6 +162,8 @@ impl NeighborEntry {
             keepalive_confirmed: false,
             #[cfg(feature = "router")]
             parent_annce_pending: false,
+            #[cfg(feature = "router")]
+            awaiting_link_status: false,
             extended_pan_id: [0; 8],
             active: false,
         }
@@ -204,9 +215,13 @@ impl NeighborEntry {
     /// Whether a unicast addressed to this neighbor may be handed to it
     /// directly without further evidence (R22 §3.6.3.3, §3.6.3.4).
     ///
-    /// * Our own children are always one hop away: their association was a
-    ///   two-way MAC exchange, and an end-device child can only be reached
+    /// * An end-device child is always one hop away: it can only be reached
     ///   through us.
+    /// * A router child is confirmed by its association or rejoin (a two-way
+    ///   MAC exchange) only until its first Link Status covering us arrives,
+    ///   and only while that Link Status is not overdue (R22 §3.6.3.4.3).
+    ///   After that it is judged like every other router neighbor, so a NoAck
+    ///   penalty or a Link Status that omits us takes effect.
     /// * Any other neighbor needs a known cost in *both* directions below the
     ///   worst link cost 7: an outgoing cost reported in its Link Status
     ///   (`0` = it does not hear us, or never told us; R22 §3.6.3.4.2) and our
@@ -215,10 +230,54 @@ impl NeighborEntry {
     ///   transmission (§3.6.3.4: links may be asymmetric).
     #[cfg(feature = "router")]
     pub fn is_confirmed_direct_hop(&self) -> bool {
-        matches!(
+        let bidirectional =
+            (1..7).contains(&self.outgoing_cost) && (1..7).contains(&self.incoming_cost);
+        match self.relationship {
+            Relationship::Child | Relationship::UnauthenticatedChild if !self.is_router() => true,
+            Relationship::Child | Relationship::UnauthenticatedChild => {
+                bidirectional
+                    || (self.awaiting_link_status && self.link_status_age <= ROUTER_AGE_LIMIT)
+            }
+            _ => bidirectional,
+        }
+    }
+
+    /// A router child that has missed more than `nwkRouterAgeLimit` Link
+    /// Status periods: R22 §3.6.3.4.3 lets its table entry be reused.
+    #[cfg(feature = "router")]
+    pub fn is_stale_router_child(&self) -> bool {
+        self.relationship == Relationship::Child
+            && self.is_router()
+            && self.link_status_age > ROUTER_AGE_LIMIT
+    }
+
+    /// Whether a full table may overwrite this entry: anything outside an
+    /// active parent/child authorization relationship, plus a stale router
+    /// child.
+    fn is_evictable(&self) -> bool {
+        #[cfg(feature = "router")]
+        if self.is_stale_router_child() {
+            return true;
+        }
+        !matches!(
             self.relationship,
-            Relationship::Child | Relationship::UnauthenticatedChild
-        ) || ((1..7).contains(&self.outgoing_cost) && (1..7).contains(&self.incoming_cost))
+            Relationship::Parent | Relationship::Child | Relationship::UnauthenticatedChild
+        )
+    }
+
+    /// Order among evictable entries: the largest rank is overwritten first.
+    ///
+    /// A router build also evicts stale router children, but only after every
+    /// non-child entry; within each class the longest-silent entry goes.
+    #[cfg(feature = "router")]
+    fn eviction_rank(&self) -> (bool, u16) {
+        (self.relationship != Relationship::Child, self.age)
+    }
+
+    /// Order among evictable entries: the longest-silent entry goes first.
+    #[cfg(not(feature = "router"))]
+    fn eviction_rank(&self) -> u16 {
+        self.age
     }
 
     /// Re-arm the R22 End Device Timeout deadline from the stored enumeration.
@@ -316,18 +375,14 @@ impl NeighborTable {
         })
     }
 
-    /// Whether a child can be inserted without evicting a parent or child.
+    /// Whether a child can be inserted without evicting a parent or a live
+    /// child.
     pub fn has_child_slot(&self) -> bool {
         self.entries.iter().any(|entry| !entry.active)
-            || self.entries.iter().any(|entry| {
-                entry.active
-                    && !matches!(
-                        entry.relationship,
-                        Relationship::Parent
-                            | Relationship::Child
-                            | Relationship::UnauthenticatedChild
-                    )
-            })
+            || self
+                .entries
+                .iter()
+                .any(|entry| entry.active && entry.is_evictable())
     }
 
     /// Add or update a neighbor entry. Returns Ok if added, Err if table full.
@@ -364,20 +419,14 @@ impl NeighborTable {
             Ok(())
         } else {
             // Table full — evict only entries outside an active
-            // parent/child authorization relationship.
+            // parent/child authorization relationship, or a router child
+            // that stopped sending Link Status (R22 §3.6.3.4.3), in
+            // `eviction_rank` order.
             if let Some(victim) = self
                 .entries
                 .iter_mut()
-                .filter(|e| {
-                    e.active
-                        && !matches!(
-                            e.relationship,
-                            Relationship::Parent
-                                | Relationship::Child
-                                | Relationship::UnauthenticatedChild
-                        )
-                })
-                .max_by_key(|e| e.age)
+                .filter(|e| e.active && e.is_evictable())
+                .max_by_key(|e| e.eviction_rank())
             {
                 *victim = entry;
                 victim.active = true;

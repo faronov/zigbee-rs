@@ -160,6 +160,7 @@ fn test_neighbor_table_add_and_find() {
         // The `tests` crate always builds `zigbee-nwk` with `router`, so this
         // router-only field is unconditionally present here.
         parent_annce_pending: false,
+        awaiting_link_status: false,
         extended_pan_id: [0; 8],
         active: true,
     };
@@ -194,6 +195,7 @@ fn test_neighbor_table_aging() {
         // The `tests` crate always builds `zigbee-nwk` with `router`, so this
         // router-only field is unconditionally present here.
         parent_annce_pending: false,
+        awaiting_link_status: false,
         extended_pan_id: [0; 8],
         active: true,
     };
