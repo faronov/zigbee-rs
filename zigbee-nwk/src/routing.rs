@@ -173,6 +173,17 @@ impl SourceRouteTable {
         }
     }
 
+    /// Restart the idle age of a source route that just carried a frame.
+    pub fn note_used(&mut self, destination: ShortAddress) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.active && e.destination == destination)
+        {
+            entry.age = 0;
+        }
+    }
+
     /// Age all entries by elapsed seconds and expire those exceeding max_age.
     pub fn age_and_expire(&mut self, elapsed_secs: u16, max_age: u16) {
         for entry in self.entries.iter_mut().filter(|e| e.active) {
@@ -1013,6 +1024,28 @@ impl BroadcastTxTable {
         !self.entries.is_full() || self.entries.iter().any(|e| e.sent)
     }
 
+    /// Entries still waiting for their first transmission. Only these can
+    /// make the schedule refuse a new broadcast.
+    fn unsent(&self) -> usize {
+        self.entries.iter().filter(|e| !e.sent).count()
+    }
+
+    /// Whether a queued Route Request forward may take an entry now.
+    ///
+    /// A forward is held back while scheduling it would leave no entry for
+    /// an ordinary relay: Route Request forwards wait in their own queue,
+    /// whereas a relay that finds the schedule full is lost. One discovery
+    /// flood heard over many neighbours therefore cannot crowd out a
+    /// Device_annce or a ZDO request broadcast arriving at the same time.
+    pub fn can_schedule_route_request(&self) -> bool {
+        self.unsent() + 1 < MAX_PENDING_BROADCASTS
+    }
+
+    /// Unsent Route Request forwards, for the schedule-full diagnostic.
+    pub fn unsent_route_requests(&self) -> usize {
+        self.entries.iter().filter(|e| e.rreq && !e.sent).count()
+    }
+
     /// Hold a broadcast for its next transmission.
     ///
     /// A broadcast that has not been on air yet outranks the optional
@@ -1213,7 +1246,6 @@ impl RreqRecordTable {
     }
 
     /// Best cost recorded for a route request, while the record is still live.
-    #[cfg(all(test, feature = "router"))]
     pub(crate) fn recorded_cost(
         &self,
         originator: ShortAddress,

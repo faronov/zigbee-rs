@@ -297,9 +297,32 @@ plus the processing time of the frame in hand. When the table is full, a new
 relay evicts an entry that is already on air (ordinary retries before Route
 Request retries). An entry still waiting for its first transmission is never
 displaced. If all four are in that state, the new broadcast relay is dropped
-with a warning before any frame counter is used. A Route Request forward
+with a warning before any frame counter is used; the warning gives how many
+of the four are Route Request forwards. A Route Request forward
 instead stays in its own 4-entry queue until a slot frees. Leave and reset
 clear the schedule; any consumed counters are simply skipped.
+
+Three rules keep a dense mesh from filling the schedule with one discovery
+flood:
+
+* **One forward per discovery.** Copies of one Route Request (same
+  originator and request ID) heard from several neighbours share one queued
+  or scheduled forward. A strictly cheaper copy replaces the forward still
+  waiting for its jitter or owing retries, as §3.6.3.5.2 permits. An
+  equal-cost copy only updates the discovery's sender; it is forwarded on its
+  own only when no forward of that discovery is pending.
+* **A slot is reserved for relays.** Route Request forwards are moved from
+  their queue only while that leaves a free entry. Ordinary relays have no
+  queue, so they would otherwise be lost.
+* **Early passive-ack completion.** An ordinary broadcast that has been on
+  air is released as soon as every router neighbour has been heard relaying
+  it, rather than at the end of its passive-acknowledgement window. Route
+  Request forwards keep their fixed retries.
+
+0xFFFD/0xFFFC broadcasts are never delivered to sleepy children, and the
+passive-ack set contains only router neighbours. Broadcast retries are
+therefore the same for every broadcast destination. Buffering 0xFFFF
+broadcasts for sleepy children (§3.6.5 indirect delivery) is not implemented.
 
 When a unicast to a neighbour next hop ends in **MAC NoAck**, the link is
 penalised: the neighbour's `outgoing_cost` is set to `0` until its next Link
@@ -385,6 +408,14 @@ routing.mark_discovery(destination)               // Mark as discovering
 
 When the route table is full, the oldest entry whose status is not `Active`
 is evicted; if every entry is `Active`, `update_route` fails.
+
+A concentrator's source routes (one relay list per destination, learned from
+Route Record) follow the same idle-expiry policy as routes: each maintenance
+pass ages them by elapsed seconds, and one unused for longer than
+`ROUTE_EXPIRY_SECS` (600 s) is retired. Each Route Record from the
+destination and each frame sent successfully along the source route restarts
+the age (`SourceRouteTable::note_used`). A MAC failure on a source-routed
+frame still drops the source route at once.
 
 ## Neighbor Table
 
