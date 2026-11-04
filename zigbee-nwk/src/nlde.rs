@@ -1519,6 +1519,23 @@ impl<M: MacDriver> NwkLayer<M> {
             );
         }
 
+        // R22 §3.6.5: the BTT exists so a broadcast is processed and relayed
+        // once. A secured radius-1 broadcast heard straight from its
+        // originator (Link Status, one-hop announcements) is relayed by
+        // nobody, and its only possible duplicate — a verbatim retransmission
+        // — repeats the NWK frame counter that the replay check above already
+        // rejects. Recording it anyway costs one entry per router neighbour
+        // per nwkLinkStatusPeriod, which fills the table in a dense mesh and
+        // then drops real multi-hop broadcasts. A radius-1 copy relayed by
+        // another router carries that router's counter and is still recorded.
+        #[cfg(feature = "router")]
+        let records_broadcast = is_broadcast
+            && can_route
+            && !is_route_request
+            && !(authenticated_replay.is_some()
+                && header.radius <= 1
+                && prev_hop.unwrap_or(src) == src);
+
         // Check a broadcast transaction before staging its replay. Recording
         // is delayed until the replay floor is durable, otherwise a failed
         // journal write would make the legitimate retransmission look like a
@@ -1537,7 +1554,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 );
                 return None;
             }
-            if self.btr.is_full() {
+            if records_broadcast && self.btr.is_full() {
                 // R22 §3.6.5: without room to record the transaction the new
                 // broadcast is dropped; live entries are never evicted, or a
                 // still-circulating broadcast would be accepted again.
@@ -1586,7 +1603,7 @@ impl<M: MacDriver> NwkLayer<M> {
             if let Some(kind) = lifecycle_kind {
                 self.defer_incoming_replay(replay, kind);
                 #[cfg(feature = "router")]
-                if is_broadcast && can_route && !is_route_request {
+                if records_broadcast {
                     self.pending_lifecycle_btr = Some((src, header.seq_number));
                 }
                 #[cfg(feature = "router")]
@@ -1611,7 +1628,7 @@ impl<M: MacDriver> NwkLayer<M> {
         }
 
         #[cfg(feature = "router")]
-        if is_broadcast && can_route && !is_route_request && lifecycle_kind.is_none() {
+        if records_broadcast && lifecycle_kind.is_none() {
             let _ = self.btr.record(src, header.seq_number);
         }
 
@@ -2110,6 +2127,8 @@ impl<M: MacDriver> NwkLayer<M> {
             return Err(NwkStatus::RouteError);
         }
 
+        // The hop acknowledged the frame: the route carrying it is in use.
+        self.routing.note_used(header.dst_addr, failed_hop);
         Ok(())
     }
 
@@ -2881,13 +2900,18 @@ impl<M: MacDriver> NwkLayer<M> {
         {
             self.routing.remove(destination);
         }
+        // An end-device child is only ever reached through us, so a NoAck
+        // says nothing about the link; its End Device Timeout governs it. A
+        // router child loses the presumption its association gave it.
         if let Some(neighbor) = self.neighbors.find_by_short_mut(failed_hop)
-            && !matches!(
-                neighbor.relationship,
-                crate::neighbor::Relationship::Child
-                    | crate::neighbor::Relationship::UnauthenticatedChild
-            )
+            && (neighbor.is_router()
+                || !matches!(
+                    neighbor.relationship,
+                    crate::neighbor::Relationship::Child
+                        | crate::neighbor::Relationship::UnauthenticatedChild
+                ))
         {
+            neighbor.awaiting_link_status = false;
             log::warn!(
                 "[NWK] Link to 0x{:04X} failed; ignoring it until its next Link Status",
                 failed_hop.0
@@ -2965,12 +2989,17 @@ impl<M: MacDriver> NwkLayer<M> {
         retry: bool,
     ) -> (Result<(), zigbee_mac::MacError>, ShortAddress) {
         let request = self.hop_request(next_hop, frame, msdu_handle);
-        let result = self.mac.mcps_data(request).await.map(drop);
+        let mut result = self.mac.mcps_data(request).await.map(drop);
+        let mut used_hop = next_hop;
         if retry && let Some(alternate) = self.noack_alternate(result, destination, next_hop) {
             let request = self.hop_request(alternate, frame, msdu_handle);
-            return (self.mac.mcps_data(request).await.map(drop), alternate);
+            result = self.mac.mcps_data(request).await.map(drop);
+            used_hop = alternate;
         }
-        (result, next_hop)
+        if result.is_ok() {
+            self.routing.note_used(destination, used_hop);
+        }
+        (result, used_hop)
     }
 
     // ── NWK Command Dispatch ─────────────────────────────────
@@ -3578,6 +3607,10 @@ impl<M: MacDriver> NwkLayer<M> {
             .then_some(entry.ieee_address)
         });
         self.neighbors.remove(src);
+        // The departed device's address is free for reuse: routes to it or
+        // through it are stale from now on.
+        #[cfg(feature = "router")]
+        self.forget_routes_for(src);
         if src == self.nib.parent_address {
             self.joined = false;
             self.nib.reset_end_device_timeout_negotiation();
@@ -4156,6 +4189,8 @@ impl<M: MacDriver> NwkLayer<M> {
 
         let outgoing_cost = report.incoming_cost_for(our_addr).unwrap_or(0);
         neighbor.outgoing_cost = outgoing_cost & 0x07;
+        // A router child's own report now governs its link (R22 §3.6.3.4.2).
+        neighbor.awaiting_link_status = false;
         log::debug!(
             "[NWK] LinkStatus from 0x{:04X}: {} entries, our outgoing cost {}",
             src.0,
@@ -8855,6 +8890,460 @@ mod tests {
         child.rx_on_when_idle = true;
         child.lqi = 159;
         child.update_incoming_cost_from_lqi();
+    }
+
+    // ── Route aging, router-child staleness, Leave purge, stochastic
+    //    addresses and broadcast-transaction admission ─────────────
+
+    #[cfg(feature = "router")]
+    const STALE_CHILD: ShortAddress = ShortAddress(0x5A5A);
+    #[cfg(feature = "router")]
+    const STALE_CHILD_IEEE: IeeeAddress = [0x5A; 8];
+
+    /// A router child installed the way a reboot restores it.
+    #[cfg(feature = "router")]
+    fn restored_router_child(nwk: &mut NwkLayer<MockMac>) {
+        assert!(nwk.restore_child(
+            STALE_CHILD_IEEE,
+            STALE_CHILD,
+            true,
+            true,
+            true,
+            crate::frames::ED_TIMEOUT_ENUM_DEFAULT,
+        ));
+    }
+
+    /// Run the parent maintenance pass the runtime runs, one second at a time.
+    #[cfg(feature = "router")]
+    fn maintain(nwk: &mut NwkLayer<MockMac>, secs: u16) -> heapless::Vec<ShortAddress, 32> {
+        let mut evicted = heapless::Vec::new();
+        for _ in 0..secs {
+            nwk.tick_router_maintenance(1);
+            for child in nwk.age_end_device_children(1) {
+                let _ = evicted.push(child);
+            }
+        }
+        evicted
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_full_routing_table_reclaims_its_least_recently_used_idle_route() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        for index in 0..crate::routing::MAX_ROUTES as u16 {
+            router
+                .routing
+                .update_route(ShortAddress(0x1000 + index), NEXT_HOP, 1)
+                .unwrap();
+            router.routing.age_by(1);
+        }
+        router
+            .routing
+            .age_by(crate::routing::ROUTE_EVICTION_MIN_AGE_SECS);
+        // The oldest route is still carrying traffic; the second oldest is not.
+        router.routing.note_used(ShortAddress(0x1000), NEXT_HOP);
+
+        router
+            .routing
+            .update_route(FAR, PEER, 2)
+            .expect("an idle Active route is reclaimed for a new one");
+        assert_eq!(router.routing.next_hop(FAR), Some(PEER));
+        assert_eq!(
+            router.routing.next_hop(ShortAddress(0x1000)),
+            Some(NEXT_HOP)
+        );
+        assert_eq!(
+            router.routing.next_hop(ShortAddress(0x1001)),
+            None,
+            "the least recently used route made room"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_many_to_one_route_is_never_reclaimed_or_expired() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        router
+            .routing
+            .update_route_many_to_one(
+                CONCENTRATOR,
+                NEXT_HOP,
+                1,
+                crate::routing::ConcentratorType::HighRam,
+            )
+            .unwrap();
+        for index in 1..crate::routing::MAX_ROUTES as u16 {
+            router
+                .routing
+                .update_route(ShortAddress(0x1000 + index), NEXT_HOP, 1)
+                .unwrap();
+        }
+        router.routing.age_by(u16::MAX);
+
+        for index in 1..crate::routing::MAX_ROUTES as u16 {
+            router
+                .routing
+                .update_route(ShortAddress(0x2000 + index), PEER, 1)
+                .expect("idle normal routes make room");
+        }
+        assert!(
+            router.routing.update_route(FAR, PEER, 1).is_err(),
+            "neither the fresh routes nor the many-to-one route are displaced"
+        );
+        let concentrator = router
+            .routing
+            .get_entry(CONCENTRATOR)
+            .expect("the many-to-one route is never displaced");
+        assert!(concentrator.many_to_one);
+
+        router.tick_router_maintenance(crate::routing::ROUTE_EXPIRY_SECS + 1);
+        assert!(
+            router.routing.get_entry(CONCENTRATOR).is_some(),
+            "nor expired: only the concentrator's next MTOR refreshes it"
+        );
+        assert_eq!(router.routing.len(), 1, "every idle normal route expired");
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn idle_routes_expire_while_routes_carrying_traffic_stay() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        router.routing.update_route(FAR, NEXT_HOP, 1).unwrap();
+        router.routing.update_route(BEYOND, NEXT_HOP, 1).unwrap();
+
+        router.tick_router_maintenance(crate::routing::ROUTE_EXPIRY_SECS - 100);
+        block_on(router.nlde_data_request(FAR, 30, &[0x01], false, false))
+            .expect("the acknowledged frame refreshes its route");
+        router.tick_router_maintenance(200);
+
+        assert_eq!(router.routing.next_hop(FAR), Some(NEXT_HOP));
+        assert_eq!(
+            router.routing.next_hop(BEYOND),
+            None,
+            "a route unused for ROUTE_EXPIRY_SECS is retired"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relayed_unicast_refreshes_the_route_it_used() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, NEXT_HOP, 1);
+        router.routing.update_route(FAR, NEXT_HOP, 1).unwrap();
+        router.routing.age_by(500);
+
+        let mut header = frame(NwkFrameType::Data, PEER, FAR);
+        header.radius = 5;
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &[0xB0], &mut buf);
+        let _ = block_on(router.process_incoming_nwk_frame(&buf[..len], 200));
+
+        assert_eq!(tx_short_dst(&router.mac.tx_history()[0]), Some(NEXT_HOP));
+        assert_eq!(router.routing.get_entry(FAR).unwrap().age, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_noack_withdraws_a_router_childs_presumed_link() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        restored_router_child(&mut parent);
+        let child = parent.neighbors.find_by_short(STALE_CHILD).unwrap();
+        assert!(
+            child.is_confirmed_direct_hop(),
+            "a fresh router child is a direct hop before its first Link Status"
+        );
+
+        let _ = parent.note_link_failure(FAR, STALE_CHILD);
+
+        assert!(
+            !parent
+                .neighbors
+                .find_by_short(STALE_CHILD)
+                .unwrap()
+                .is_confirmed_direct_hop(),
+            "the NoAck penalty applies to a router child as well"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_router_childs_link_status_decides_whether_it_is_a_direct_hop() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        restored_router_child(&mut parent);
+
+        // A complete Link Status that does not list us: it does not hear us.
+        let mut omits_us = [0u8; 4];
+        omits_us[0] = 0x61;
+        omits_us[1..3].copy_from_slice(&0x0001u16.to_le_bytes());
+        omits_us[3] = 0x11;
+        parent.handle_link_status(STALE_CHILD, &omits_us);
+        assert!(
+            !parent
+                .neighbors
+                .find_by_short(STALE_CHILD)
+                .unwrap()
+                .is_confirmed_direct_hop()
+        );
+
+        let mut lists_us = [0u8; 4];
+        lists_us[0] = 0x61;
+        lists_us[1..3].copy_from_slice(&OUR_ADDR.0.to_le_bytes());
+        lists_us[3] = 0x22;
+        parent.handle_link_status(STALE_CHILD, &lists_us);
+        assert!(
+            parent
+                .neighbors
+                .find_by_short(STALE_CHILD)
+                .unwrap()
+                .is_confirmed_direct_hop()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_fresh_router_child_stays_a_direct_hop_only_within_its_link_status_allowance() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        restored_router_child(&mut parent);
+        let confirmed = |nwk: &NwkLayer<MockMac>| {
+            nwk.neighbors
+                .find_by_short(STALE_CHILD)
+                .is_some_and(|child| child.is_confirmed_direct_hop())
+        };
+
+        let allowance =
+            u16::from(crate::neighbor::ROUTER_AGE_LIMIT) * crate::neighbor::LINK_STATUS_PERIOD_SECS;
+        let _ = maintain(&mut parent, allowance);
+        assert!(
+            confirmed(&parent),
+            "no route discovery for a fresh router child"
+        );
+        let _ = maintain(&mut parent, crate::neighbor::LINK_STATUS_PERIOD_SECS);
+        assert!(
+            !confirmed(&parent),
+            "R22 §3.6.3.4.3: its link is now unknown"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_silent_router_child_ages_out_with_its_routes() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        restored_router_child(&mut parent);
+        parent.routing.update_route(BEYOND, STALE_CHILD, 2).unwrap();
+
+        let evicted = maintain(&mut parent, crate::ROUTER_CHILD_SILENCE_SECS - 1);
+        assert!(evicted.is_empty());
+        assert!(parent.neighbors.find_by_short(STALE_CHILD).is_some());
+
+        let evicted = maintain(&mut parent, 1);
+        assert_eq!(evicted.as_slice(), &[STALE_CHILD]);
+        assert!(parent.neighbors.find_by_short(STALE_CHILD).is_none());
+        assert_eq!(parent.routing.next_hop(BEYOND), None);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_router_child_that_keeps_transmitting_is_not_aged_out() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        restored_router_child(&mut parent);
+        for _ in 0..4 {
+            let _ = maintain(&mut parent, crate::ROUTER_CHILD_SILENCE_SECS - 1);
+            parent.neighbors.find_by_short_mut(STALE_CHILD).unwrap().age = 0;
+        }
+        assert!(parent.neighbors.find_by_short(STALE_CHILD).is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_full_neighbour_table_reuses_a_stale_router_child() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        restored_router_child(&mut parent);
+        for index in 1..crate::neighbor::MAX_NEIGHBORS as u16 {
+            assert!(parent.restore_child(
+                [0x10, index as u8, 0, 0, 0, 0, 0, 1],
+                ShortAddress(0x6000 + index),
+                false,
+                true,
+                false,
+                crate::frames::ED_TIMEOUT_ENUM_DEFAULT,
+            ));
+        }
+        assert!(!parent.neighbors.has_child_slot());
+
+        for _ in 0..=crate::neighbor::ROUTER_AGE_LIMIT {
+            parent.neighbors.age_router_link_status();
+        }
+        assert!(parent.neighbors.has_child_slot());
+        let incoming = crate::neighbor::NeighborEntry::new_from_annce(FAR, [0x77; 8]);
+        parent
+            .neighbors
+            .add_or_update(incoming)
+            .expect("R22 §3.6.3.4.3: the stale router child's entry is reused");
+        assert!(parent.neighbors.find_by_short(STALE_CHILD).is_none());
+        assert!(parent.neighbors.find_by_short(FAR).is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_leave_indication_purges_routes_to_and_through_the_leaver() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        router.routing.update_route(PEER, PEER, 1).unwrap();
+        router.routing.update_route(FAR, PEER, 2).unwrap();
+        router.routing.update_route(BEYOND, NEXT_HOP, 2).unwrap();
+
+        let leave = crate::frames::LeaveCommand {
+            remove_children: false,
+            request: false,
+            rejoin: false,
+        };
+        let mut payload = [0u8; 32];
+        let payload_len = command_payload(NwkCommandId::Leave, &[leave.serialize()], &mut payload);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(
+                NwkFrameType::Command,
+                PEER,
+                ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
+            ),
+            &payload[..payload_len],
+            &mut buf,
+        );
+        let _ = block_on(router.process_incoming_nwk_frame(&buf[..len], 200));
+
+        assert_eq!(router.routing.next_hop(PEER), None);
+        assert_eq!(router.routing.next_hop(FAR), None);
+        assert_eq!(router.routing.next_hop(BEYOND), Some(NEXT_HOP));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn removing_a_departed_device_purges_its_routes() {
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        router.update_address_map(FAR, [0x22; 8]);
+        router.routing.update_route(FAR, NEXT_HOP, 2).unwrap();
+        router.routing.update_route(BEYOND, FAR, 3).unwrap();
+
+        router.remove_neighbor(FAR);
+
+        assert_eq!(router.routing.next_hop(FAR), None);
+        assert_eq!(router.routing.next_hop(BEYOND), None);
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn stochastic_child_addresses_are_random_across_rejoins() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        let ieee = [0x9A, 0x20, 1, 2, 3, 4, 5, 6];
+        let mut drawn = heapless::Vec::<u16, 8>::new();
+        for _ in 0..8 {
+            drawn.push(parent.assign_child_address(&ieee).0).unwrap();
+        }
+        for (i, a) in drawn.iter().enumerate() {
+            for b in &drawn[i + 1..] {
+                assert!(
+                    a.abs_diff(*b) > 16,
+                    "R22 §3.6.1.7 requires random addresses, got {drawn:04X?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_stochastic_child_address_avoids_addresses_already_in_use() {
+        let ieee = [0x9A, 0x20, 1, 2, 3, 4, 5, 6];
+        let first = node(DeviceType::Router, OUR_ADDR).assign_child_address(&ieee);
+
+        let mut mapped = node(DeviceType::Router, OUR_ADDR);
+        mapped.update_address_map(first, [0x33; 8]);
+        assert_ne!(mapped.assign_child_address(&ieee), first);
+
+        let mut routed = node(DeviceType::Router, OUR_ADDR);
+        routed.routing.update_route(first, NEXT_HOP, 1).unwrap();
+        assert_ne!(routed.assign_child_address(&ieee), first);
+
+        let mut own = node(DeviceType::Router, OUR_ADDR);
+        own.update_address_map(first, ieee);
+        assert_eq!(
+            own.assign_child_address(&ieee),
+            first,
+            "the child's own previous address is not a conflict"
+        );
+    }
+
+    /// Secured Link Status frames from `count` distinct router neighbours,
+    /// each heard directly from its originator.
+    #[cfg(feature = "router")]
+    fn link_status_burst(router: &mut NwkLayer<MockMac>, count: u16) {
+        for index in 0..count {
+            let address = ShortAddress(0x3000 + index);
+            let mut neighbour = secured_node(
+                DeviceType::Router,
+                address,
+                [0x30, index as u8, 0, 0, 0, 0, 0, 2],
+            );
+            neighbour_with_cost(&mut neighbour, OUR_ADDR, 1);
+            block_on(neighbour.send_link_status()).expect("the neighbour sends link status");
+            let on_air = recorded_frame(&neighbour, 0);
+            let _ = block_on(router.process_incoming_nwk_frame_from(&on_air, 220, Some(address)));
+            assert!(router.neighbors.find_by_short(address).is_some());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn one_hop_link_status_does_not_exhaust_the_broadcast_transaction_table() {
+        let mut router = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        link_status_burst(&mut router, crate::routing::MAX_BTR as u16 + 4);
+        assert!(!router.btr.is_full());
+
+        let mut header = frame(NwkFrameType::Data, ORIGIN, ShortAddress::BROADCAST);
+        header.seq_number = 0x42;
+        header.radius = 5;
+        let on_air = frame_with_network_key(&header, &[0xB0], NETWORK_KEY, KEY_SEQ, 10);
+        assert!(
+            block_on(router.process_incoming_nwk_frame(&on_air, 200)).is_some(),
+            "a multi-hop broadcast is still admitted after a Link Status burst"
+        );
+        assert!(router.btr.is_duplicate(ORIGIN, 0x42));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_retransmitted_link_status_is_rejected_by_its_frame_counter() {
+        let mut router = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let mut neighbour = secured_node(DeviceType::Router, NEXT_HOP, [0x44; 8]);
+        neighbour_with_cost(&mut neighbour, OUR_ADDR, 1);
+        block_on(neighbour.send_link_status()).unwrap();
+        let on_air = recorded_frame(&neighbour, 0);
+
+        let _ = block_on(router.process_incoming_nwk_frame_from(&on_air, 220, Some(NEXT_HOP)));
+        router.neighbors.age_router_link_status();
+        let _ = block_on(router.process_incoming_nwk_frame_from(&on_air, 220, Some(NEXT_HOP)));
+
+        assert_eq!(
+            router
+                .neighbors
+                .find_by_short(NEXT_HOP)
+                .unwrap()
+                .link_status_age,
+            1,
+            "the verbatim copy is not processed a second time"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_relayed_radius_one_broadcast_is_still_recorded() {
+        let mut router = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        let mut header = frame(NwkFrameType::Data, ORIGIN, ShortAddress::BROADCAST);
+        header.seq_number = 0x43;
+        header.radius = 1;
+        let on_air = frame_with_network_key(&header, &[0xB0], NETWORK_KEY, KEY_SEQ, 11);
+        let _ = block_on(router.process_incoming_nwk_frame_from(&on_air, 200, Some(PEER)));
+        assert!(router.btr.is_duplicate(ORIGIN, 0x43));
     }
 
     #[cfg(feature = "router")]

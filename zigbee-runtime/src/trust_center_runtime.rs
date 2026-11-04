@@ -2396,6 +2396,24 @@ mod tests {
             .unwrap()
     }
 
+    /// Re-installs a child at the short address it held before a reboot,
+    /// as a restored child table would. Child addresses are stochastic, so a
+    /// fresh association after a reboot is not expected to reproduce them.
+    fn restore_child_at(
+        device: &mut ZigbeeDevice<MockMac>,
+        address: IeeeAddress,
+        short: ShortAddress,
+    ) {
+        assert!(device.aps_mut().nwk_mut().restore_child(
+            address,
+            short,
+            true,
+            true,
+            false,
+            zigbee_nwk::frames::ED_TIMEOUT_ENUM_DEFAULT,
+        ));
+    }
+
     fn begin_join<S: TrustCenterDeviceStore>(
         runtime: &mut TrustCenterRuntime<S>,
         device: &mut ZigbeeDevice<MockMac>,
@@ -2428,21 +2446,22 @@ mod tests {
         block_on(runtime.poll(device)).unwrap();
     }
 
+    fn sleepy_capability() -> u8 {
+        CapabilityInfo {
+            device_type_ffd: false,
+            mains_powered: false,
+            rx_on_when_idle: false,
+            security_capable: true,
+            allocate_address: true,
+        }
+        .to_byte()
+    }
+
     fn add_sleepy_child(device: &mut ZigbeeDevice<MockMac>, address: IeeeAddress) -> ShortAddress {
         device
             .aps_mut()
             .nwk_mut()
-            .handle_child_association(
-                address,
-                CapabilityInfo {
-                    device_type_ffd: false,
-                    mains_powered: false,
-                    rx_on_when_idle: false,
-                    security_capable: true,
-                    allocate_address: true,
-                }
-                .to_byte(),
-            )
+            .handle_child_association(address, sleepy_capability())
             .unwrap()
     }
 
@@ -2487,7 +2506,17 @@ mod tests {
         let mut reboot_store = RamTrustCenterDeviceStore::new();
         reboot_store.store(&saved).unwrap();
         let mut rebooted = restored_coordinator(&mut security_store);
-        assert_eq!(add_sleepy_child(&mut rebooted, CHILD_A), short);
+        // The child never received the key, so it returns by an unsecured
+        // rejoin that keeps its address (child addresses are stochastic).
+        assert_eq!(
+            rebooted.aps_mut().nwk_mut().handle_child_rejoin(
+                short,
+                CHILD_A,
+                sleepy_capability(),
+                false
+            ),
+            Ok(short)
+        );
         let mut runtime = TrustCenterRuntime::new(reboot_store);
         block_on(runtime.initialize(&mut rebooted)).unwrap();
         assert!(rebooted.mac().tx_history().is_empty());
@@ -2774,7 +2803,7 @@ mod tests {
         let mut reboot_store = RamTrustCenterDeviceStore::new();
         reboot_store.store(&snapshot).unwrap();
         let mut rebooted = restored_coordinator(&mut security_store);
-        assert_eq!(add_child(&mut rebooted, CHILD_A), parent);
+        restore_child_at(&mut rebooted, CHILD_A, parent);
         let mut runtime = TrustCenterRuntime::new(reboot_store);
         block_on(runtime.initialize(&mut rebooted)).unwrap();
         assert_eq!(
@@ -3152,7 +3181,7 @@ mod tests {
         let mut trust_center_store = RamTrustCenterDeviceStore::new();
         trust_center_store.store(&durable).unwrap();
         let mut rebooted = restored_coordinator(&mut security_store);
-        assert_eq!(add_child(&mut rebooted, CHILD_A), child_short);
+        restore_child_at(&mut rebooted, CHILD_A, child_short);
         rebooted.mac_mut().clear_tx_history();
         let mut runtime = TrustCenterRuntime::new(trust_center_store);
         block_on(runtime.initialize(&mut rebooted)).unwrap();
@@ -3220,7 +3249,7 @@ mod tests {
         let mut trust_center_store = RamTrustCenterDeviceStore::new();
         trust_center_store.store(&durable).unwrap();
         let mut rebooted = restored_coordinator(&mut security_store);
-        assert_eq!(add_child(&mut rebooted, CHILD_A), parent_short);
+        restore_child_at(&mut rebooted, CHILD_A, parent_short);
         rebooted.mac_mut().clear_tx_history();
         let mut runtime = TrustCenterRuntime::new(trust_center_store);
         block_on(runtime.initialize(&mut rebooted)).unwrap();
@@ -3710,8 +3739,8 @@ mod tests {
         let mut trust_center_store = RamTrustCenterDeviceStore::new();
         trust_center_store.store(&after_first).unwrap();
         let mut rebooted = restored_coordinator(&mut security_store);
-        assert_eq!(add_child(&mut rebooted, CHILD_A), child_a_short);
-        assert_eq!(add_child(&mut rebooted, CHILD_B), child_b_short);
+        restore_child_at(&mut rebooted, CHILD_A, child_a_short);
+        restore_child_at(&mut rebooted, CHILD_B, child_b_short);
         let mut runtime = TrustCenterRuntime::new(trust_center_store);
         block_on(runtime.initialize(&mut rebooted)).unwrap();
         assert_eq!(

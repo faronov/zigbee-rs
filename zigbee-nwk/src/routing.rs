@@ -224,6 +224,18 @@ pub const MAX_ROUTE_DISCOVERIES: usize = 8;
 #[cfg(not(feature = "router"))]
 pub const MAX_ROUTE_DISCOVERIES: usize = 0;
 
+/// Idle time after which an unused normal route is retired.
+///
+/// R22 does not fix a routing-table entry lifetime; ten minutes keeps a route
+/// across a sleepy end device's slowest normal reporting cadence while
+/// letting the table forget destinations that have left or moved.
+pub const ROUTE_EXPIRY_SECS: u16 = 600;
+
+/// Minimum idle time before an `Active` route may be displaced by a new one
+/// when the table is full: `nwkRouteDiscoveryTime` (10 s), so a route just
+/// installed by a discovery is not reclaimed before it carries its frame.
+pub const ROUTE_EVICTION_MIN_AGE_SECS: u16 = 10;
+
 /// `nwkRouteDiscoveryTime` (spec default 10 s) expressed in microseconds.
 ///
 /// A discovery older than this is failed so the destination becomes eligible
@@ -360,45 +372,76 @@ impl RoutingTable {
             return Ok(());
         }
 
-        // Find empty slot
-        if let Some(slot) = self.routes.iter_mut().find(|r| !r.active) {
-            *slot = RouteEntry {
-                destination,
-                next_hop,
-                status: RouteStatus::Active,
-                many_to_one: false,
-                route_record_required: false,
-                route_record_every_frame: false,
-                group_id: false,
-                path_cost: cost,
-                age: 0,
-                active: true,
-            };
-            Ok(())
-        } else {
-            // Evict oldest inactive or highest-cost route
-            if let Some(victim) = self
-                .routes
-                .iter_mut()
-                .filter(|r| r.active && r.status != RouteStatus::Active)
-                .max_by_key(|r| r.age)
-            {
-                *victim = RouteEntry {
-                    destination,
-                    next_hop,
-                    status: RouteStatus::Active,
-                    many_to_one: false,
-                    route_record_required: false,
-                    route_record_every_frame: false,
-                    group_id: false,
-                    path_cost: cost,
-                    age: 0,
-                    active: true,
-                };
-                Ok(())
-            } else {
-                Err(())
-            }
+        let Some(slot) = self.reclaim_slot() else {
+            return Err(());
+        };
+        *slot = RouteEntry {
+            destination,
+            next_hop,
+            status: RouteStatus::Active,
+            many_to_one: false,
+            route_record_required: false,
+            route_record_every_frame: false,
+            group_id: false,
+            path_cost: cost,
+            age: 0,
+            active: true,
+        };
+        Ok(())
+    }
+
+    /// The slot a new route may take when no entry exists for its destination.
+    ///
+    /// R22 §3.6.3.2 leaves routing-table capacity management to the
+    /// implementation; entries are reclaimed in this order:
+    ///
+    /// 1. a free slot that does not hold a failed many-to-one tombstone;
+    /// 2. the oldest entry whose status is not `Active` (failed or abandoned
+    ///    discovery, validation);
+    /// 3. the least recently used `Active` normal route that has been idle
+    ///    for at least [`ROUTE_EVICTION_MIN_AGE_SECS`], so a route that a
+    ///    discovery in flight has just installed is never displaced;
+    /// 4. a failed many-to-one tombstone, which only suppresses rediscovery
+    ///    toward a concentrator that has not re-announced itself.
+    ///
+    /// An `Active` many-to-one route is never reclaimed: losing it would
+    /// silently cut every upstream path to its concentrator until the next
+    /// MTOR, and R22 forbids rediscovering it on demand.
+    fn reclaim_slot(&mut self) -> Option<&mut RouteEntry> {
+        let routes = &self.routes;
+        let index = routes
+            .iter()
+            .position(|r| !r.active && !r.many_to_one)
+            .or_else(|| {
+                (0..routes.len())
+                    .filter(|&i| routes[i].active && routes[i].status != RouteStatus::Active)
+                    .max_by_key(|&i| routes[i].age)
+            })
+            .or_else(|| {
+                (0..routes.len())
+                    .filter(|&i| {
+                        let r = &routes[i];
+                        r.active
+                            && r.status == RouteStatus::Active
+                            && !r.many_to_one
+                            && r.age >= ROUTE_EVICTION_MIN_AGE_SECS
+                    })
+                    .max_by_key(|&i| routes[i].age)
+            })
+            .or_else(|| routes.iter().position(|r| !r.active))?;
+        Some(&mut self.routes[index])
+    }
+
+    /// A frame was delivered to `next_hop` on the route to `destination`:
+    /// the route is in use, so its idle age restarts.
+    pub fn note_used(&mut self, destination: ShortAddress, next_hop: ShortAddress) {
+        if let Some(entry) = self.routes.iter_mut().find(|r| {
+            r.active
+                && r.status == RouteStatus::Active
+                && r.destination == destination
+                && r.next_hop == next_hop
+        }) {
+            entry.age = 0;
         }
     }
 
@@ -693,23 +736,11 @@ impl RoutingTable {
             active: true,
         };
 
-        if let Some(slot) = self.routes.iter_mut().find(|r| !r.active) {
-            *slot = new_entry;
-            Ok(())
-        } else {
-            // Evict oldest inactive
-            if let Some(victim) = self
-                .routes
-                .iter_mut()
-                .filter(|r| r.active && r.status != RouteStatus::Active)
-                .max_by_key(|r| r.age)
-            {
-                *victim = new_entry;
-                Ok(())
-            } else {
-                Err(())
-            }
-        }
+        let Some(slot) = self.reclaim_slot() else {
+            return Err(());
+        };
+        *slot = new_entry;
+        Ok(())
     }
 
     /// Clear a one-shot Route Record requirement after successful transmission.
@@ -732,9 +763,18 @@ impl RoutingTable {
         self.routes.iter().filter(|r| r.active)
     }
 
-    /// Mark routes with age exceeding `max_age` as [`RouteStatus::Inactive`].
+    /// Retire normal routes that have been idle for longer than `max_age`
+    /// seconds.
+    ///
+    /// Many-to-one routes are kept: they are refreshed by the concentrator's
+    /// periodic MTOR and must not be rediscovered on demand. A route whose
+    /// discovery is underway is left to [`Self::expire_discoveries`].
     pub fn expire_stale(&mut self, max_age: u16) {
-        for route in self.routes.iter_mut().filter(|r| r.active) {
+        for route in self
+            .routes
+            .iter_mut()
+            .filter(|r| r.active && !r.many_to_one && r.status != RouteStatus::DiscoveryUnderway)
+        {
             if route.age > max_age {
                 route.status = RouteStatus::Inactive;
                 route.active = false;

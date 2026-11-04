@@ -52,6 +52,14 @@ use zigbee_types::{IeeeAddress, MacAddress, ShortAddress};
 
 const UNAUTHENTICATED_CHILD_TIMEOUT_SECS: u16 = 10;
 
+/// Seconds a stale router child (no Link Status for more than
+/// `nwkRouterAgeLimit` periods) must also have been completely silent before
+/// it is aged out: `(nwkRouterAgeLimit + 1) × nwkLinkStatusPeriod`, so a router
+/// child that is still transmitting is never removed, and a freshly admitted
+/// one always gets its full Link Status allowance first.
+pub const ROUTER_CHILD_SILENCE_SECS: u16 =
+    (neighbor::ROUTER_AGE_LIMIT as u16 + 1) * neighbor::LINK_STATUS_PERIOD_SECS;
+
 /// NWK layer status codes (Zigbee spec Table 3-70)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -716,9 +724,23 @@ impl<M: MacDriver> NwkLayer<M> {
     }
 
     /// Remove a device that sent a NWK Leave indication.
+    ///
+    /// Every route to or through the departed address goes with it: once the
+    /// address map entry is gone, a later Device_annce reusing the address
+    /// can no longer be matched to these routes and purge them.
     pub fn remove_neighbor(&mut self, address: ShortAddress) {
         self.neighbors.remove(address);
         self.address_map.remove(address);
+        #[cfg(feature = "router")]
+        self.forget_routes_for(address);
+    }
+
+    /// Drop every normal route to or through `address` and its source route
+    /// (R22 §3.6.1.10: a device that has left no longer owns its address).
+    #[cfg(feature = "router")]
+    pub(crate) fn forget_routes_for(&mut self, address: ShortAddress) {
+        self.routing.remove_through(address);
+        self.source_route_table.remove(address);
     }
 
     /// Read-only access to the routing table.
@@ -960,6 +982,11 @@ impl<M: MacDriver> NwkLayer<M> {
         // Route ages are wall-clock seconds, not maintenance-call counts.
         self.routing.age_by(elapsed_secs);
         self.source_route_table.age_by(elapsed_secs);
+        // Unused routes are retired so destinations that left or moved stop
+        // occupying the table; routes in use are refreshed on every
+        // acknowledged hop (`RoutingTable::note_used`).
+        #[cfg(feature = "router")]
+        self.routing.expire_stale(crate::routing::ROUTE_EXPIRY_SECS);
 
         // Fail route discoveries that never produced a Route Reply so a later
         // data request may retry instead of being suppressed forever.
@@ -1313,6 +1340,12 @@ impl<M: MacDriver> NwkLayer<M> {
     /// enumeration can neither overflow nor wrap. Eviction cleans the coupled
     /// indirect queue, routing entry, replay counters and MAC Frame Pending
     /// state consistently, mirroring the provisional-child expiry path.
+    ///
+    /// Router children are aged out here too: one that has missed more than
+    /// `nwkRouterAgeLimit` Link Status periods (R22 §3.6.3.4.3) and has not
+    /// been heard at all for [`ROUTER_CHILD_SILENCE_SECS`] is removed with
+    /// every route to or through it. Its replay counters are kept: unlike an
+    /// end device it may still be routing elsewhere in the network.
     pub fn age_end_device_children(
         &mut self,
         elapsed_secs: u16,
@@ -1320,6 +1353,23 @@ impl<M: MacDriver> NwkLayer<M> {
         let mut evicted = heapless::Vec::new();
         if !self.can_route() || elapsed_secs == 0 {
             return evicted;
+        }
+        #[cfg(feature = "router")]
+        {
+            for entry in self.neighbors.iter() {
+                if entry.is_stale_router_child() && entry.age >= ROUTER_CHILD_SILENCE_SECS {
+                    let _ = evicted.push(entry.network_address);
+                }
+            }
+            for &short in evicted.iter() {
+                self.neighbors.remove(short);
+                self.routing.remove_through(short);
+                self.source_route_table.remove(short);
+                log::warn!(
+                    "[NWK] Router child 0x{:04X} aged out (no Link Status, R22 §3.6.3.4.3)",
+                    short.0
+                );
+            }
         }
         let elapsed = u32::from(elapsed_secs);
         let mut expired: heapless::Vec<(ShortAddress, IeeeAddress), { neighbor::MAX_NEIGHBORS }> =
@@ -1402,6 +1452,8 @@ impl<M: MacDriver> NwkLayer<M> {
             keepalive_confirmed: false,
             #[cfg(feature = "router")]
             parent_annce_pending: false,
+            #[cfg(feature = "router")]
+            awaiting_link_status: is_router,
             extended_pan_id: self.nib.extended_pan_id,
             active: true,
         };
@@ -1836,27 +1888,54 @@ impl<M: MacDriver> NwkLayer<M> {
         })
     }
 
-    /// Assign a short address to a new child device using stochastic addressing.
+    /// Assign a short address to a new child device using stochastic
+    /// addressing (R22 §3.6.1.7): a random value in `0x0001..=0xFFF7`.
     ///
-    /// Generates a pseudo-random address based on the child's IEEE address
-    /// and a monotonic counter to avoid collisions.
+    /// The draw uses the NWK timing mixer
+    /// ([`routing::routing_random_sample`]) seeded with the microsecond
+    /// arrival time of the request, the child's IEEE address and a draw
+    /// counter. Stochastic addressing needs addresses that do not repeat or
+    /// run sequentially across rejoins and reboots, not secrecy — collisions
+    /// are still detected and resolved by R22 §3.6.1.9 — so, as for routing
+    /// jitter, this avoids linking a platform entropy harvester and DRBG
+    /// (software AES on TLSR8258) into router images.
+    ///
+    /// Draws that collide with an address this device already knows to be in
+    /// use — its own, its parent's, any neighbor's, an address-map entry for
+    /// another device, or a routed destination — are rejected. After a
+    /// bounded number of draws the last candidate is returned and the
+    /// caller's own neighbor-table check decides.
     pub fn assign_child_address(&mut self, child_ieee: &IeeeAddress) -> ShortAddress {
-        // Stochastic addressing: hash IEEE address + offset counter
-        let mut hash: u16 = 0;
-        for &b in child_ieee.iter() {
-            hash = hash.wrapping_mul(31).wrapping_add(b as u16);
+        let ieee_mix = child_ieee.iter().fold(0u32, |acc, &b| {
+            acc.rotate_left(5) ^ u32::from(b).wrapping_mul(0x9E37_79B9)
+        });
+        let mut candidate = ShortAddress(0x0001);
+        for _ in 0..16 {
+            let mixed = routing::routing_random_sample(
+                self.mac.monotonic_micros()
+                    ^ ieee_mix
+                    ^ u32::from(self.next_child_addr_offset).wrapping_mul(0x85EB_CA6B),
+            );
+            let sample = (mixed ^ (mixed >> 16)) as u16;
+            self.next_child_addr_offset = self.next_child_addr_offset.wrapping_add(1);
+            candidate = ShortAddress(sample % 0xFFF7 + 1);
+            if !self.child_address_in_use(candidate, child_ieee) {
+                break;
+            }
         }
-        hash = hash.wrapping_add(self.next_child_addr_offset);
-        self.next_child_addr_offset = self.next_child_addr_offset.wrapping_add(1);
+        candidate
+    }
 
-        // Preserve valid hashes and fold only reserved values into the
-        // allocated unicast range.
-        let address = if (0x0001..=0xFFF7).contains(&hash) {
-            hash
-        } else {
-            (hash % 0xFFF7).saturating_add(1)
-        };
-        ShortAddress(address)
+    /// Whether `address` is known to belong to a device other than `ieee`.
+    fn child_address_in_use(&self, address: ShortAddress, ieee: &IeeeAddress) -> bool {
+        address == self.nib.network_address
+            || address == self.nib.parent_address
+            || self.neighbors.find_by_short(address).is_some()
+            || self
+                .address_map
+                .ieee_of(address)
+                .is_some_and(|owner| owner != *ieee)
+            || self.routing.next_hop(address).is_some()
     }
 
     /// Handle a child association request (called by the runtime when MAC
@@ -1978,6 +2057,8 @@ impl<M: MacDriver> NwkLayer<M> {
             keepalive_confirmed: false,
             #[cfg(feature = "router")]
             parent_annce_pending: false,
+            #[cfg(feature = "router")]
+            awaiting_link_status: dev_type == neighbor::NeighborDeviceType::Router,
             extended_pan_id: self.nib.extended_pan_id,
             active: true,
         };
@@ -2173,6 +2254,8 @@ impl<M: MacDriver> NwkLayer<M> {
             keepalive_confirmed: secured,
             #[cfg(feature = "router")]
             parent_annce_pending: false,
+            #[cfg(feature = "router")]
+            awaiting_link_status: requested_type == neighbor::NeighborDeviceType::Router,
             extended_pan_id: self.nib.extended_pan_id,
             active: true,
         };
