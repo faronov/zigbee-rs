@@ -757,8 +757,14 @@ impl<M: MacDriver> NwkLayer<M> {
     /// entry, so it can never make a multi-hop device look directly
     /// reachable. An existing non-parent/non-child neighbor entry for the same
     /// IEEE address follows the device to its new short address; parent and
-    /// child entries are only changed through join, rejoin and conflict
-    /// processing.
+    /// end-device child entries are only changed through join, rejoin,
+    /// conflict processing and End Device Timeout aging.
+    ///
+    /// A device seen under a new short address no longer owns its previous
+    /// one (R22 §2.4.3.1.11): every route to or through the previous address
+    /// is dropped, and a router child — whose address only changes when it
+    /// rejoins elsewhere or resolves a conflict itself (§3.6.1.9.3) — stops
+    /// being our child. Its next Link Status relearns it as a neighbor.
     ///
     /// A build without the `router` feature sends every unicast to its parent
     /// and never routes on its neighbor table, so its small neighbor cache
@@ -767,6 +773,25 @@ impl<M: MacDriver> NwkLayer<M> {
     pub fn update_address_map(&mut self, nwk_addr: ShortAddress, ieee_addr: IeeeAddress) {
         #[cfg(feature = "router")]
         {
+            if let Some(previous) = self
+                .find_short_by_ieee(&ieee_addr)
+                .filter(|previous| *previous != nwk_addr)
+            {
+                use neighbor::Relationship::{Child, Parent, UnauthenticatedChild};
+                let relation = self
+                    .neighbors
+                    .find_by_ieee(&ieee_addr)
+                    .map(|entry| (entry.relationship, entry.is_router()));
+                if !matches!(
+                    relation,
+                    Some((Parent | UnauthenticatedChild, _) | (Child, false))
+                ) {
+                    if relation == Some((Child, true)) {
+                        self.neighbors.remove(previous);
+                    }
+                    self.routing.remove_through(previous);
+                }
+            }
             self.address_map.update(nwk_addr, ieee_addr);
             if let Some(entry) = self.neighbors.find_by_ieee_mut(&ieee_addr)
                 && !matches!(

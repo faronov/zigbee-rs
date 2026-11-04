@@ -425,6 +425,20 @@ impl RoutingTable {
         }
     }
 
+    /// Remove every normal route to `addr` or through `addr` as next hop: the
+    /// address no longer names a device. Many-to-one routes keep their own
+    /// failure path (R22 §3.6.3.7.1), so their tombstones stay meaningful.
+    pub fn remove_through(&mut self, addr: ShortAddress) {
+        for entry in self
+            .routes
+            .iter_mut()
+            .filter(|r| r.active && !r.many_to_one && (r.destination == addr || r.next_hop == addr))
+        {
+            entry.active = false;
+            entry.status = RouteStatus::Inactive;
+        }
+    }
+
     /// Add a pending route discovery.
     #[allow(clippy::result_unit_err)]
     pub fn add_discovery(&mut self, discovery: RouteDiscovery) -> Result<(), ()> {
