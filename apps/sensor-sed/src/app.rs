@@ -378,16 +378,25 @@ where
             .record(DiagnosticEvent::JoinBackoff { delay_ms });
     }
 
-    /// Backoff jitter source: the platform entropy source, or the low bits
-    /// of the monotonic clock on a backend without one (jitter only needs to
-    /// de-synchronize devices, not to be unpredictable).
+    /// Backoff jitter source.
+    ///
+    /// Jitter only needs to de-synchronize devices, not to be unpredictable,
+    /// so this mixes the local IEEE address with the monotonic clock instead
+    /// of calling the MAC entropy source: on some backends (TLSR8258) that
+    /// source is a CTR-DRBG which would link a software AES into every
+    /// sleepy image.
     fn random_u16(&mut self) -> u16 {
-        let mac = self.node.device_mut().mac_mut();
-        let mut bytes = [0u8; 2];
-        if mac.fill_random(&mut bytes).is_err() {
-            bytes = (mac.monotonic_micros() as u16).to_le_bytes();
-        }
-        u16::from_le_bytes(bytes)
+        let device = self.node.device_mut();
+        let ieee = device.bdb().zdo().nwk().nib().ieee_address;
+        let now = u64::from(device.mac_mut().monotonic_micros());
+        let mut x = u64::from_le_bytes(ieee) ^ now ^ ((self.join_backoff_ms as u64) << 32);
+        // splitmix64 finaliser.
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^= x >> 31;
+        x as u16
     }
 
     /// Restart the backoff sequence at the product's initial delay.
