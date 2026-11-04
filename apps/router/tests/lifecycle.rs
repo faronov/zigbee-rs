@@ -5587,6 +5587,97 @@ fn repeated_secure_rejoin_failure_resets_and_clears_parent_state() {
     }));
 }
 
+static NEVER_RESET_POLICY: RouterPolicy = RouterPolicy {
+    max_receive_slice_us: 1_000_000,
+    join_retry_initial_ms: 5_000,
+    join_retry_max_ms: 20_000,
+    secure_rejoin_failure_limit: 0,
+};
+
+#[test]
+fn default_router_policy_never_self_resets() {
+    assert_eq!(RouterPolicy::DEFAULT.secure_rejoin_failure_limit, 0);
+    assert!(RouterPolicy::DEFAULT.is_valid());
+    assert!(!RouterPolicy::DEFAULT.secure_rejoin_limit_reached(u8::MAX));
+    assert!(!REJOIN_POLICY.secure_rejoin_limit_reached(1));
+    assert!(REJOIN_POLICY.secure_rejoin_limit_reached(2));
+}
+
+#[test]
+fn unlimited_secure_rejoin_backs_off_and_keeps_parent_state() {
+    let mut child_table = PersistentChildTable::new(EXTENDED_PAN_ID);
+    child_table
+        .push(PersistentChild {
+            ieee_address: [0x66; 8],
+            short_address: 0x5678,
+            rx_on_when_idle: false,
+            security_capable: true,
+            is_router: false,
+            end_device_timeout: 8,
+            removal_pending: false,
+            removal_attempts: 0,
+            reassignment_address: None,
+            departure_pending: false,
+        })
+        .unwrap();
+    let mut profile = profile();
+    let mut device = parent_device(&mut profile);
+    let mut security = security_store(true);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let parts = RouterParts::new(
+        NoStatus,
+        TestSupervisor::default(),
+        RecordingDiagnostics::default(),
+    );
+    let mut app = ParentRouterApp::<_, _, _, _, _, _, _, NoObserver>::new(
+        node,
+        PersistentChildren::new(CountingChildStore::with_table(child_table)),
+        &NEVER_RESET_POLICY,
+        parts,
+    )
+    .unwrap();
+
+    block_on(app.initialize()).unwrap();
+    assert!(app.node().device().secure_rejoin_pending());
+
+    // Runtime-driven retries are released only on the router backoff:
+    // 5 s, 10 s, then capped at 20 s, never at the runtime's 5 s cadence.
+    let mut last_us = app.node().device().mac().monotonic_micros();
+    let mut gaps_s = Vec::new();
+    for _ in 0..200 {
+        let events = block_on(app.step()).unwrap();
+        if matches!(
+            events.tick,
+            Some(StackEvent::CommissioningComplete { success: false })
+        ) {
+            let now_us = app.node().device().mac().monotonic_micros();
+            gaps_s.push(now_us.wrapping_sub(last_us).div_ceil(1_000_000));
+            last_us = now_us;
+            if gaps_s.len() == 5 {
+                break;
+            }
+        }
+        assert!(
+            app.node().device().secure_rejoin_pending(),
+            "a never-reset router must keep its secured rejoin pending"
+        );
+    }
+    assert_eq!(gaps_s, [5, 10, 20, 20, 20]);
+    assert!(app.node().device().secure_rejoin_pending());
+    assert_eq!(
+        app.children().store().stores,
+        0,
+        "an unlimited rejoin must never clear the durable child snapshot"
+    );
+    assert_eq!(app.children().store().table.as_ref().unwrap().len(), 1);
+    assert!(!app.parts().diagnostics.events.iter().any(|event| {
+        matches!(
+            event,
+            DiagnosticEvent::SecureRejoinLimitReached { .. } | DiagnosticEvent::FactoryReset
+        )
+    }));
+}
+
 #[cfg(feature = "trust-center")]
 mod key_power_cuts {
     use super::*;

@@ -84,7 +84,13 @@ can keep a battery device awake, via `SensorPolicy::recovery`
   product: the network is kept until a user action (long press) or a Leave
   from the network. A non-zero limit restores the old give-up behaviour.
 
-Router and always-on end-device apps (`apps/router`) are unchanged.
+Router and always-on end-device apps (`apps/router`) follow the same rule:
+`RouterPolicy::secure_rejoin_failure_limit` defaults to `0` (never reset) in
+`RouterPolicy::DEFAULT` and every product, and a pending secured rejoin is
+released only on the `join_retry_initial_ms`..`join_retry_max_ms` exponential
+backoff instead of the runtime's fixed 5 s retry. A non-zero limit is an
+opt-in give-up. Host-tested in `apps/router/tests/lifecycle.rs`
+(`unlimited_secure_rejoin_backs_off_and_keeps_parent_state`).
 
 Status: host-tested (`apps/sensor-sed/tests/lifecycle.rs`); the AEM proof
 of the sleep floor between attempts is a hardware gate.

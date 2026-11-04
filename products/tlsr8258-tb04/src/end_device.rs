@@ -20,14 +20,14 @@ pub const SW_BUILD: &str = "0.1.0";
 /// in two roles.
 pub const DEVICE_EUI_OFFSET: u8 = 0x45; // 'E' for End Device
 
-/// 20 ms receive slices; 15..60 s commissioning retry; three failed secured
-/// rejoins fall back to fresh commissioning (the repository-wide always-on
-/// End Device policy).
+/// 20 ms receive slices; 15..60 s commissioning retry; failed secured
+/// rejoins retry on that backoff and never reset the network on their own
+/// (the repository-wide always-on End Device policy).
 pub static END_DEVICE_POLICY: RouterPolicy = RouterPolicy {
     max_receive_slice_us: 20_000,
     join_retry_initial_ms: 15_000,
     join_retry_max_ms: 60_000,
-    secure_rejoin_failure_limit: 3,
+    secure_rejoin_failure_limit: 0,
 };
 
 pub type EndDeviceProfile = DeviceProfile<RangeExtender>;

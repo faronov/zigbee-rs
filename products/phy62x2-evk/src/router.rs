@@ -65,12 +65,13 @@ const _: () = assert!(APS_TABLE_JOURNAL_SECTOR_SIZE.is_multiple_of(PHYSICAL_ERAS
 const _: () = assert!(CHILD_TABLE_PARTITION_START >= 0x0003_A000);
 
 /// Same bounded receive slice as the end device; 5..60 s commissioning
-/// retry; three failed secured rejoins fall back to fresh commissioning.
+/// retry; failed secured rejoins are retried on that backoff and never reset
+/// the network on their own (only Leave or a user reset does).
 pub static ROUTER_POLICY: RouterPolicy = RouterPolicy {
     max_receive_slice_us: 20_000,
     join_retry_initial_ms: 5_000,
     join_retry_max_ms: 60_000,
-    secure_rejoin_failure_limit: 3,
+    secure_rejoin_failure_limit: 0,
 };
 
 pub type RouterProfile = DeviceProfile<RangeExtender>;
