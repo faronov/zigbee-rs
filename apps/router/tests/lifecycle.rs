@@ -1170,8 +1170,19 @@ fn assert_bind_store_failure_recovers_after_reboot(aps_secured: bool) {
         vec![vec![9, 0]]
     );
     assert_eq!(outbound_aps_ack_count(reboot.node().device().mac()), 1);
+    assert!(
+        reboot
+            .node()
+            .device()
+            .bdb()
+            .zdo()
+            .nwk()
+            .security()
+            .has_frame_counter_for_key(&COORDINATOR_IEEE, 0),
+        "the accepted request's NWK floor is held in RAM"
+    );
     drop(reboot);
-    assert_eq!(nwk_replay_count(&mut security), 1);
+    assert_eq!(nwk_replay_count(&mut security), 0);
 }
 
 #[test]
@@ -1253,12 +1264,14 @@ fn secured_bind_and_unbind_retry_each_durable_boundary_without_reapplying() {
     use zigbee_runtime::binding_persistence::BindingPersistenceError;
 
     for unbind in [false, true] {
-        for failure in 0..3 {
+        // 0: APS-table snapshot failure, 2: APS replay-floor failure. The
+        // former NWK replay-floor boundary (1) no longer exists: incoming NWK
+        // floors are RAM-only and cannot fail durably.
+        for failure in [0, 2] {
             let mut p = profile();
             let mut device = parent_device(&mut p);
             let mut security = FailingApsReplayStore {
                 inner: security_store(false),
-                fail_next_nwk_replay: failure == 1,
                 fail_next_aps_replay: failure == 2,
                 ..Default::default()
             };
@@ -1320,12 +1333,7 @@ fn secured_bind_and_unbind_retry_each_durable_boundary_without_reapplying() {
             store
                 .visit_replay_counters(&mut |floor| floors.push(floor))
                 .unwrap();
-            assert_eq!(floors.len(), usize::from(failure == 2));
-            assert!(
-                floors
-                    .iter()
-                    .all(|floor| matches!(floor, PersistentReplayCounter::Nwk(_)))
-            );
+            assert!(floors.is_empty(), "{floors:?}");
 
             // Even a caller bypassing app.step cannot overwrite the held
             // request with another receive while persistence is pending.
@@ -1388,7 +1396,8 @@ fn secured_bind_and_unbind_retry_each_durable_boundary_without_reapplying() {
             store
                 .visit_replay_counters(&mut |floor| floors.push(floor))
                 .unwrap();
-            assert_eq!(floors.len(), 2);
+            assert_eq!(floors.len(), 1, "{floors:?}");
+            assert!(matches!(floors[0], PersistentReplayCounter::Aps(_)));
         }
     }
 }
@@ -1468,7 +1477,6 @@ impl ApsTableStore for FailingApsStore {
 struct FailingApsReplayStore {
     inner: RamSecurityStateStore,
     fail_next_aps_replay: bool,
-    fail_next_nwk_replay: bool,
     fail_next_tombstone: bool,
     fail_replay_visit: Option<Rc<Cell<bool>>>,
 }
@@ -1502,10 +1510,6 @@ impl SecurityStateStore for FailingApsReplayStore {
     ) -> Result<(), SecurityStoreError> {
         if self.fail_next_aps_replay && matches!(replay, PersistentReplayCounter::Aps(_)) {
             self.fail_next_aps_replay = false;
-            return Err(SecurityStoreError::Hardware);
-        }
-        if self.fail_next_nwk_replay && matches!(replay, PersistentReplayCounter::Nwk(_)) {
-            self.fail_next_nwk_replay = false;
             return Err(SecurityStoreError::Hardware);
         }
         self.inner.commit_replay_counter(replay)
@@ -1588,6 +1592,8 @@ fn aps_replay_count(store: &mut impl SecurityStateStore) -> usize {
     count
 }
 
+/// Incoming NWK replay floors are RAM-only. The RAM test store records
+/// anything committed, so a non-zero count means the runtime wrote one.
 fn nwk_replay_count(store: &mut impl SecurityStateStore) -> usize {
     let mut count = 0;
     store
@@ -2750,11 +2756,14 @@ fn child_reassignment_store_failure_reboots_without_releasing_response() {
     assert_ne!(child.short_address, CHILD_SHORT);
     assert!(child.reassignment_address.is_none());
     drop(rebooted);
-    assert_eq!(nwk_replay_count(&mut security), 1);
+    assert_eq!(nwk_replay_count(&mut security), 0);
 }
 
+/// The reassignment intent is durable before the Rejoin Response leaves; the
+/// accepted frame's NWK floor is RAM-only, so no replay write can block the
+/// response, and the same frame is still rejected for the rest of the boot.
 #[test]
-fn secured_reassignment_response_waits_for_replay_commit_after_durable_intent() {
+fn secured_reassignment_response_follows_durable_intent_with_a_ram_replay_floor() {
     const CHILD_IEEE: [u8; 8] = [0x63; 8];
     const CHILD_SHORT: u16 = 0x5633;
 
@@ -2765,7 +2774,6 @@ fn secured_reassignment_response_waits_for_replay_commit_after_durable_intent() 
     let child_store = FaultChildStore::with_table(table);
     let mut security = FailingApsReplayStore {
         inner: RamSecurityStateStore::new(),
-        fail_next_nwk_replay: true,
         ..Default::default()
     };
     security.store(&commissioned_router_state(false)).unwrap();
@@ -2781,45 +2789,23 @@ fn secured_reassignment_response_waits_for_replay_commit_after_durable_intent() 
     .unwrap();
 
     block_on(app.initialize()).unwrap();
-    let mac = app.node_mut().device_mut().mac_mut();
-    mac.set_rx_delay_us(0);
-    mac.enqueue_rx(McpsDataIndication {
+    let conflict = || McpsDataIndication {
         src_address: MacAddress::Short(PanId(PAN_ID), ShortAddress::COORDINATOR),
         dst_address: MacAddress::Short(PanId(PAN_ID), ShortAddress(SHORT_ADDRESS)),
         lqi: 220,
         payload: child_conflict_frame(CHILD_SHORT, 31),
         security_use: false,
-    });
+    };
+    let mac = app.node_mut().device_mut().mac_mut();
+    mac.set_rx_delay_us(0);
+    mac.enqueue_rx(conflict());
     mac.clear_tx_history();
 
-    assert!(matches!(
-        block_on(app.step()),
-        Err(RouterAppError::Node(
-            zigbee_runtime::node::NodeError::Persistence(SecurityStoreError::Hardware)
-        ))
-    ));
-    assert!(
-        child_store
-            .table()
-            .unwrap()
-            .pending_reassignment()
-            .is_some(),
-        "the response intent is durable before the replay floor"
-    );
-    assert_eq!(
-        outbound_nwk_command_count(app.node().device().mac(), NwkCommandId::RejoinResponse),
-        0,
-        "the response remains blocked while replay persistence is failing"
-    );
-    app.node_mut()
-        .device_mut()
-        .mac_mut()
-        .set_rx_delay_us(u32::MAX);
     block_on(app.step()).unwrap();
     assert_eq!(
         outbound_nwk_command_count(app.node().device().mac(), NwkCommandId::RejoinResponse),
         1,
-        "retry commits replay before releasing the one durable response"
+        "the durable reassignment releases exactly one response"
     );
     assert!(
         child_store
@@ -2828,8 +2814,31 @@ fn secured_reassignment_response_waits_for_replay_commit_after_durable_intent() 
             .pending_reassignment()
             .is_none()
     );
+
+    // Same boot: the RAM floor rejects a replay of the accepted frame.
+    let mac = app.node_mut().device_mut().mac_mut();
+    mac.clear_tx_history();
+    mac.set_rx_delay_us(0);
+    mac.enqueue_rx(conflict());
+    let rejections = app
+        .node()
+        .device()
+        .nwk_rx_security_stats()
+        .replay_rejections;
+    block_on(app.step()).unwrap();
+    assert_eq!(
+        app.node()
+            .device()
+            .nwk_rx_security_stats()
+            .replay_rejections,
+        rejections + 1
+    );
+    assert_eq!(
+        outbound_nwk_command_count(app.node().device().mac(), NwkCommandId::RejoinResponse),
+        0
+    );
     drop(app);
-    assert_eq!(nwk_replay_count(&mut security), 1);
+    assert_eq!(nwk_replay_count(&mut security), 0);
 }
 
 #[test]
@@ -3135,8 +3144,10 @@ fn child_departure_store_failure_reboots_without_device_left_notification() {
     assert_eq!(nwk_replay_count(&mut security), 0);
 }
 
+/// The departure intent is durable before Update-Device(device left) is
+/// submitted; the child's NWK floor is RAM-only and needs no journal write.
 #[test]
-fn child_departure_replay_failure_blocks_device_left_until_retry() {
+fn child_departure_releases_device_left_without_a_nwk_replay_write() {
     const CHILD_IEEE: [u8; 8] = [0x66; 8];
     const CHILD_SHORT: u16 = 0x5666;
 
@@ -3147,7 +3158,6 @@ fn child_departure_replay_failure_blocks_device_left_until_retry() {
     let child_store = FaultChildStore::with_table(table);
     let mut security = FailingApsReplayStore {
         inner: RamSecurityStateStore::new(),
-        fail_next_nwk_replay: true,
         ..Default::default()
     };
     security.store(&commissioned_router_state(false)).unwrap();
@@ -3174,20 +3184,7 @@ fn child_departure_replay_failure_blocks_device_left_until_retry() {
     });
     mac.clear_tx_history();
 
-    assert!(matches!(
-        block_on(app.step()),
-        Err(RouterAppError::Node(
-            zigbee_runtime::node::NodeError::Persistence(SecurityStoreError::Hardware)
-        ))
-    ));
-    assert!(child_store.table().unwrap().pending_departure().is_some());
-    assert!(
-        outbound_unacked_aps_command_counters(
-            app.node().device().mac(),
-            ApsCommandId::UpdateDevice
-        )
-        .is_empty()
-    );
+    block_on(app.step()).unwrap();
 
     app.node_mut()
         .device_mut()
@@ -3316,16 +3313,25 @@ fn remove_children_cascade_store_failure_reboots_before_child_or_parent_action()
                 | DiagnosticEvent::SecureRejoinPending { .. }
         )
     }));
-    drop(rebooted);
-    assert_eq!(
-        nwk_replay_sources(&mut security),
-        vec![COORDINATOR_IEEE],
-        "the accepted parent Leave floor remains valid while the router may rejoin the same network"
+    assert!(
+        rebooted
+            .node()
+            .device()
+            .bdb()
+            .zdo()
+            .nwk()
+            .security()
+            .has_frame_counter_for_key(&COORDINATOR_IEEE, 0),
+        "the accepted parent Leave floor remains valid in RAM while the router may rejoin the same network"
     );
+    drop(rebooted);
+    assert_eq!(nwk_replay_count(&mut security), 0);
 }
 
+/// The leave-cascade intent is durable before the children and the parent
+/// act; the parent's NWK floor is RAM-only and needs no journal write.
 #[test]
-fn remove_children_cascade_replay_failure_blocks_child_and_parent_action_until_retry() {
+fn remove_children_cascade_acts_after_durable_intent_without_a_nwk_replay_write() {
     const CHILD_IEEE: [u8; 8] = [0x68; 8];
     const CHILD_SHORT: u16 = 0x5688;
 
@@ -3336,7 +3342,6 @@ fn remove_children_cascade_replay_failure_blocks_child_and_parent_action_until_r
     let child_store = FaultChildStore::with_table(table);
     let mut security = FailingApsReplayStore {
         inner: RamSecurityStateStore::new(),
-        fail_next_nwk_replay: true,
         ..Default::default()
     };
     security.store(&commissioned_router_state(false)).unwrap();
@@ -3367,25 +3372,7 @@ fn remove_children_cascade_replay_failure_blocks_child_and_parent_action_until_r
     });
     mac.clear_tx_history();
 
-    assert!(matches!(
-        block_on(app.step()),
-        Err(RouterAppError::Node(
-            zigbee_runtime::node::NodeError::Persistence(SecurityStoreError::Hardware)
-        ))
-    ));
-    assert!(child_store.table().unwrap().leave_cascade_pending());
-    assert_eq!(
-        outbound_nwk_command_count(app.node().device().mac(), NwkCommandId::Leave),
-        0
-    );
-    assert!(
-        outbound_unacked_aps_command_counters(
-            app.node().device().mac(),
-            ApsCommandId::UpdateDevice
-        )
-        .is_empty()
-    );
-    assert!(app.node().device().is_joined());
+    block_on(app.step()).unwrap();
 
     app.node_mut()
         .device_mut()
@@ -3411,11 +3398,7 @@ fn remove_children_cascade_replay_failure_blocks_child_and_parent_action_until_r
         )
     }));
     drop(app);
-    assert_eq!(
-        nwk_replay_sources(&mut security),
-        vec![COORDINATOR_IEEE],
-        "the accepted parent Leave floor remains valid while the router may rejoin the same network"
-    );
+    assert_eq!(nwk_replay_count(&mut security), 0);
 }
 
 #[test]
@@ -6093,9 +6076,12 @@ mod key_power_cuts {
         let result = receive_announce(&mut running, 1);
         let trace = cuts.borrow_mut().finish(result);
         assert_eq!(pending(&mut running), fail_at.is_some());
-        let replay_committed =
-            nwk_replay_sources(running.node_mut().device_and_security_store_mut().1)
-                .contains(&CHILD);
+        // Incoming NWK floors are RAM-only: nothing about the announcement
+        // reaches the security journal.
+        assert!(
+            !nwk_replay_sources(running.node_mut().device_and_security_store_mut().1)
+                .contains(&CHILD)
+        );
         let tc = std::mem::take(running.trust_center_mut().store_mut());
         drop(running);
         stores.tc = tc;
@@ -6111,12 +6097,10 @@ mod key_power_cuts {
             "neither restore nor a second MAC delivery may close the intent"
         );
         if fail_at.is_some() {
+            // The reboot forgot the RAM NWK floor, so the same announcement
+            // is fresh again and completes the still-durable intent once.
             receive_announce(&mut recovered, 1).unwrap();
-            assert_eq!(
-                pending(&mut recovered),
-                replay_committed,
-                "an already committed announcement must not authenticate again"
-            );
+            assert!(!pending(&mut recovered));
             receive_announce(&mut recovered, 2).unwrap();
         }
         assert!(!pending(&mut recovered));
@@ -6147,9 +6131,12 @@ mod key_power_cuts {
     }
 
     #[test]
-    fn sleepy_initial_completion_recovers_at_every_replay_and_tc_commit() {
+    fn sleepy_initial_completion_recovers_at_every_tc_commit() {
         let control = initial_completion_cut(None);
-        assert!(control.contains(&Journal::Replay));
+        assert!(
+            !control.contains(&Journal::Replay),
+            "incoming NWK floors are RAM-only: {control:?}"
+        );
         assert!(control.contains(&Journal::TrustCenter));
         assert!(control.len() <= 16, "keep the sweep bounded: {control:?}");
         for index in 0..control.len() {

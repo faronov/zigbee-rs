@@ -189,7 +189,7 @@ never shorter than that parent's configured forwarding window.
 Parent products use separate stores:
 
 - `SecurityStateJournal` for network keys, outgoing counter reservations, and
-  incoming NWK/APS replay floors;
+  incoming APS replay floors (incoming NWK floors are RAM-only);
 - `ChildTableJournal` for child identity/configuration snapshots.
 - an `ApsTableStore` for network-bound bindings, groups, and application link
   keys when the product selects `PersistentApsTables<A>`.
@@ -243,6 +243,15 @@ TLSR8258 TB-04 partitions:
 
 The nRF always-on End Device has only its security journal; it has no router
 or child storage.
+
+Incoming NWK replay floors are RAM-only (see
+[NV Storage](nv-storage.md#incoming-nwk-replay-floors-are-ram-only)), so
+relayed and neighbour traffic does not write the journal; only APS-secured
+frames append replay records. When the 64-entry router replay table is full,
+a router evicts only a floor whose sender has been silent for the stale
+timeout (default one hour, `NwkSecurity::set_replay_stale_timeout_secs`) and
+is neither its parent nor a child; otherwise the new sender is refused and
+counted in `replay_table_full`.
 
 The legacy 4 KiB-per-sector journal geometry is not a production Coordinator
 default. With the full router replay table it leaves only 12 append commits

@@ -1192,11 +1192,12 @@ impl<M: MacDriver> NwkLayer<M> {
                         }
                     };
                 if sec_hdr.source_address != parent_ieee
-                    || !self.security.check_frame_counter_for_key(
+                    || self.incoming_replay_admission(
                         &sec_hdr.source_address,
                         sec_hdr.key_seq_number,
                         sec_hdr.frame_counter,
-                    )
+                        Some(&parent_ieee),
+                    ) != crate::security::ReplayAdmission::Fresh
                 {
                     log::warn!(
                         "[NWK] Rejoin RX #{}: replay or source mismatch (fc={})",
@@ -1244,11 +1245,9 @@ impl<M: MacDriver> NwkLayer<M> {
                             );
                             continue;
                         }
-                        self.security.commit_frame_counter_for_key(
-                            &sec_hdr.source_address,
-                            sec_hdr.key_seq_number,
-                            sec_hdr.frame_counter,
-                        );
+                        if !self.commit_replay_floor(replay, Some(&parent_ieee)) {
+                            continue;
+                        }
                         v
                     }
                     None => {
@@ -2648,6 +2647,151 @@ mod tests {
             nwk.security().check_frame_counter(&PARENT_IEEE, 9),
             "a late indirect response must not be authenticated"
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn a_secure_rejoin_admits_a_new_parent_to_a_full_end_device_replay_table() {
+        const DEVICE_IEEE: IeeeAddress = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
+        const OLD_PARENT_IEEE: IeeeAddress = [0x0A; 8];
+        const NEW_PARENT_IEEE: IeeeAddress = [0x00, 0x12, 0x4B, 0x00, 0x01, 0xAA, 0xBB, 0xCC];
+        const KEY: [u8; 16] = [0x5A; 16];
+        const PAN_ID: PanId = PanId(0xDFE9);
+        const OLD_ADDRESS: ShortAddress = ShortAddress(0x07D6);
+        const NEW_ADDRESS: ShortAddress = ShortAddress(0x1234);
+        const OLD_PARENT_ADDRESS: ShortAddress = ShortAddress(0x0A0A);
+        const NEW_PARENT_ADDRESS: ShortAddress = ShortAddress(0xBA0F);
+
+        fn block_on<F: core::future::Future>(future: F) -> F::Output {
+            use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+            use std::boxed::Box;
+
+            fn no_op(_: *const ()) {}
+            fn clone(_: *const ()) -> RawWaker {
+                RawWaker::new(core::ptr::null(), &VTABLE)
+            }
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+
+            let waker = unsafe { Waker::from_raw(clone(core::ptr::null())) };
+            let mut context = Context::from_waker(&waker);
+            let mut future = Box::pin(future);
+            loop {
+                if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                    return output;
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        let network = NetworkDescriptor {
+            extended_pan_id: [0xAA; 8],
+            pan_id: PAN_ID,
+            logical_channel: 15,
+            stack_profile: 2,
+            zigbee_version: 2,
+            beacon_order: 15,
+            superframe_order: 15,
+            permit_joining: false,
+            router_capacity: true,
+            end_device_capacity: true,
+            update_id: 0,
+            lqi: 200,
+            router_address: NEW_PARENT_ADDRESS,
+            depth: 1,
+        };
+        let response = {
+            let header = NwkHeader {
+                frame_control: NwkFrameControl {
+                    frame_type: NwkFrameType::Command as u8,
+                    protocol_version: 2,
+                    discover_route: 0,
+                    multicast: false,
+                    security: true,
+                    source_route: false,
+                    dst_ieee_present: true,
+                    src_ieee_present: true,
+                    end_device_initiator: false,
+                },
+                dst_addr: OLD_ADDRESS,
+                src_addr: NEW_PARENT_ADDRESS,
+                radius: 1,
+                seq_number: 0x42,
+                dst_ieee: Some(DEVICE_IEEE),
+                src_ieee: Some(NEW_PARENT_IEEE),
+                multicast_control: None,
+                source_route: None,
+            };
+            let security = crate::security::NwkSecurityHeader {
+                security_control: crate::security::NwkSecurityHeader::ZIGBEE_DEFAULT,
+                frame_counter: 77,
+                source_address: NEW_PARENT_IEEE,
+                key_seq_number: 0,
+            };
+            let mut buf = [0u8; 128];
+            let header_len = header.serialize(&mut buf);
+            let aad_len = header_len + security.serialize(&mut buf[header_len..]);
+            let plaintext = [0x07, NEW_ADDRESS.0 as u8, (NEW_ADDRESS.0 >> 8) as u8, 0x00];
+            let encrypted = crate::security::NwkSecurity::new()
+                .encrypt(&buf[..aad_len], &plaintext, &KEY, &security)
+                .unwrap();
+            buf[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+            buf[header_len] &= !0x07;
+            MacFrame::from_slice(&buf[..aad_len + encrypted.len()]).unwrap()
+        };
+
+        let mut mac = MockMac::new(DEVICE_IEEE);
+        mac.enqueue_poll_response(response);
+        let mut nwk = crate::NwkLayer::new(mac, DeviceType::EndDevice);
+        nwk.set_rx_on_when_idle(false);
+        {
+            let nib = nwk.nib_mut();
+            nib.extended_pan_id = network.extended_pan_id;
+            nib.pan_id = PAN_ID;
+            nib.network_address = OLD_ADDRESS;
+            nib.logical_channel = network.logical_channel;
+            nib.ieee_address = DEVICE_IEEE;
+            nib.security_enabled = true;
+            nib.active_key_seq_number = 0;
+            nib.outgoing_frame_counter = 0x100;
+            nib.outgoing_frame_counter_limit = 0x200;
+        }
+        nwk.security_mut().set_network_key(KEY, 0);
+        let mut old_parent =
+            crate::neighbor::NeighborEntry::new_from_annce(OLD_PARENT_ADDRESS, OLD_PARENT_IEEE);
+        old_parent.relationship = crate::neighbor::Relationship::Parent;
+        old_parent.active = true;
+        nwk.neighbors.add_or_update(old_parent).unwrap();
+        // The old parent's floor was admitted first, then other neighbours
+        // filled every remaining slot: the new parent has no free slot.
+        assert!(
+            nwk.security_mut()
+                .commit_frame_counter(&OLD_PARENT_IEEE, 10)
+        );
+        for i in 1..crate::security::MAX_FRAME_COUNTER_ENTRIES {
+            assert!(
+                nwk.security_mut()
+                    .commit_frame_counter(&[i as u8 + 0x10; 8], 10)
+            );
+        }
+
+        assert_eq!(
+            block_on(nwk.nlme_join(&network, JoinMethod::Rejoin)).unwrap(),
+            NEW_ADDRESS
+        );
+        // The new parent replaced the earliest-admitted floor (the former
+        // parent, now an ordinary neighbour) and is authoritative.
+        assert!(!nwk.security().check_frame_counter(&NEW_PARENT_IEEE, 77));
+        assert!(nwk.security().check_frame_counter(&NEW_PARENT_IEEE, 78));
+        assert!(
+            !nwk.security()
+                .has_frame_counter_for_key(&OLD_PARENT_IEEE, 0)
+        );
+        for i in 1..crate::security::MAX_FRAME_COUNTER_ENTRIES {
+            assert!(
+                nwk.security()
+                    .has_frame_counter_for_key(&[i as u8 + 0x10; 8], 0)
+            );
+        }
     }
 
     #[test]

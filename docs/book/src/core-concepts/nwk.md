@@ -794,7 +794,7 @@ The current version-5 child journal also owns wire-visible child lifecycle
 ordering:
 
 1. commit a reassignment, departure, Remove-Device, or remove-children intent;
-2. commit the authenticated incoming NWK replay floor;
+2. record the authenticated incoming NWK replay floor (RAM only);
 3. only then send a Rejoin Response, Update-Device, child Leave, ACK, or relay.
 
 For sleepy children, a queued Leave is tagged in the indirect queue. The live
@@ -893,8 +893,20 @@ previous/staged) to support seamless key rotation.
 
 The NWK security module maintains a **frame counter table** that maps each
 sender's IEEE address and network-key sequence to the last seen frame counter
-(64 entries with `router`, 16 otherwise; when full, the least recently updated
-non-parent/non-child source is evicted).  When a secured frame arrives:
+(64 entries with `router`, 16 otherwise).  The table is the only authority for
+incoming NWK counters: it is never written to flash and is forgotten on
+reboot (the EmberZNet/ZBOSS/Z-Stack trade-off; see
+[NV storage](../advanced/nv-storage.md#incoming-nwk-replay-floors-are-ram-only)).
+An end device keeps one slot for its parent (or the new parent during a
+secure rejoin): other new senders are refused once only that slot is left,
+and the parent may replace the earliest-admitted non-parent floor of a full
+table.  A router keeps slots reserved for its parent and children, may
+reclaim floors of the retained previous network key (which seals that key for
+the rest of the boot), and may evict a floor only after its sender has been
+silent for the configurable stale timeout (default one hour); parent and
+child floors are never evicted.  A refused new sender is counted in
+`replay_table_full`, separately from `replay_rejections`.  When a secured
+frame arrives:
 
 1. `check_frame_counter(source, counter)` — verifies the counter is strictly
    greater than the last seen value
@@ -921,8 +933,8 @@ The NWK layer handles the "mesh" in Zigbee mesh networking:
 
 Most of this happens transparently when you call `device.start()` and run the
 event loop.  The NWK layer's internal state (NIB, neighbor table, routing table,
-security keys) can be inspected for debugging; the network identity, keys and
-frame counters are persisted through the runtime's crash-safe
+security keys) can be inspected for debugging; the network identity, keys,
+outgoing frame-counter reservations and incoming APS replay floors are persisted through the runtime's crash-safe
 `SecurityStateStore` journal (`start_or_resume_with_security_store()`), and
 router children through the separate child store — see
 [NV storage](../advanced/nv-storage.md).  The older item-by-item

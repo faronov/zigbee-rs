@@ -47,7 +47,7 @@ the nRF52 `ed` bins are `AlwaysOnEndDeviceApp` on an end-device
 
 | area | implemented and host-tested | hardware/certification status |
 |---|---|---|
-| NWK security | dual Network Keys, key sequence changes, outgoing reservations, incoming replay floors, key-retirement tombstones and fail-closed restore | target flash durability and power-cut tests remain per platform |
+| NWK security | dual Network Keys, key sequence changes, outgoing reservations, RAM-only incoming NWK replay floors, durable incoming APS replay floors, key-retirement tombstones and fail-closed restore | target flash durability and power-cut tests remain per platform |
 | join and rejoin | centralized and distributed selection, secured-first persisted rejoin, centralized-only fallback and provisional-parent application gate | prior representative End Device hardware evidence exists; current exact-image and multi-router fallback captures remain open |
 | routing | route discovery/repair, relay, many-to-one, source routing, broadcast transactions and Link Status | Telink relay/Link Status have hardware evidence; broader topology HIL remains open |
 | maintenance | Network Report/Update, PAN conflict transition, address reassignment, Device Announce and authenticated lifecycle replay ordering | packet-level multi-router conflict tests remain open |

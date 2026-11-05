@@ -21,11 +21,23 @@
 //!
 //! # Replay-log geometry and endurance
 //!
-//! Authenticated incoming NWK and APS frames append an exact replay floor
-//! before protocol or application side effects. One 128-byte slot contains
-//! four committed replay entries. A rollover writes the active replay-domain
-//! snapshot first and the security-state record last, so a power cut cannot
-//! activate a partial generation.
+//! Authenticated incoming APS frames append an exact replay floor before
+//! protocol or application side effects. One 128-byte slot contains four
+//! committed replay entries.
+//!
+//! Incoming **NWK** replay floors are not journaled. Like EmberZNet, ZBOSS
+//! and Z-Stack, the stack keeps them in RAM only (the NWK replay table is
+//! their authority for the boot); appending one per accepted frame cost a
+//! busy router several flash commits per second and a sector erase about
+//! every minute. [`SecurityStateStore::commit_replay_counter`] accepts an NWK
+//! floor as a no-op. Replay kind 0 (NWK) entries written by older firmware
+//! still decode, but the scan skips them, so they are never restored and the
+//! next generation (snapshot or rollover) drops them. No format change or
+//! factory reset is needed. Outgoing counters stay store-ahead reservations.
+//!
+//! A rollover writes the active replay-domain snapshot first and the
+//! security-state record last, so a power cut cannot activate a partial
+//! generation.
 //!
 //! Every generation number is written once. If a marginal commit nevertheless
 //! leaves two committed records with the same generation, the scan resolves
@@ -33,12 +45,15 @@
 //! (see `resolve_duplicate_generation`).
 //!
 //! The default 4 KiB logical sector has 32 slots and can represent all 112
-//! replay domains of a router build, but a completely populated snapshot uses
-//! 28 replay slots plus one state slot. Only three slots (12 frame commits)
-//! then remain before the next erase/rollover. Products with many peers,
-//! especially parent routers and coordinators, must select substantially
-//! larger logical sectors and verify flash endurance for their traffic rate.
-//! A 16 KiB logical sector means a 32 KiB two-sector partition.
+//! replay domains `MAX_PERSISTENT_REPLAY_COUNTERS` reserves for a Trust
+//! Center build, but a completely populated snapshot uses 28 replay slots
+//! plus one state slot. Only three slots (12 frame commits) then remain
+//! before the next erase/rollover. Since only APS domains are journaled, a
+//! snapshot holds at most the APS key-table and global-replay domains in
+//! practice; products with many APS peers (coordinators, application link
+//! keys) must still select larger logical sectors and verify flash endurance
+//! for their APS traffic rate. A 16 KiB logical sector means a 32 KiB
+//! two-sector partition.
 //!
 //! # Product tag
 //!
@@ -659,6 +674,12 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
                 let Some(update) = Self::decode_replay_entry(entry) else {
                     break;
                 };
+                // Incoming NWK floors are RAM-only. Entries written by older
+                // firmware are skipped: never restored, never re-snapshotted,
+                // so the next generation retires them in place.
+                if matches!(update, PersistentReplayCounter::Nwk(_)) {
+                    continue;
+                }
                 Self::merge_replay(&mut self.cached_replay, update)?;
             }
         }
@@ -953,6 +974,60 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE>
     }
 }
 
+impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE> {
+    /// Append (or roll over with) one durable APS replay floor.
+    ///
+    /// Kept out of line so the RAM-only NWK early return does not change the
+    /// append path's code generation or stack frame.
+    #[inline(never)]
+    fn append_durable_replay_counter(
+        &mut self,
+        replay: PersistentReplayCounter,
+    ) -> Result<(), SecurityStoreError> {
+        let Some(located) = self.current()? else {
+            return Err(SecurityStoreError::NotFound);
+        };
+        if !located.state.commissioned {
+            return Err(SecurityStoreError::Corrupt);
+        }
+        self.ensure_replay_cache(&located)?;
+        if self
+            .cached_replay
+            .iter()
+            .find(|stored| stored.same_domain(&replay))
+            .is_some_and(|stored| stored.counter() >= replay.counter())
+        {
+            return Ok(());
+        }
+
+        if let Some((slot, index, initialize)) =
+            self.find_replay_append_position(located.sector, located.generation)?
+        {
+            let result = (|| {
+                if initialize {
+                    self.write_replay_header(located.sector, slot, located.generation)?;
+                }
+                self.write_replay_entry(located.sector, slot, index, replay)
+            })();
+            if result.is_ok() {
+                Self::merge_replay(&mut self.cached_replay, replay)?;
+            } else {
+                self.cached_replay.clear();
+                self.replay_generation = None;
+            }
+            return result;
+        }
+
+        let generation = located
+            .generation
+            .checked_add(1)
+            .ok_or(SecurityStoreError::GenerationExhausted)?;
+        // `merge_replay` leaves the cache untouched when it fails.
+        Self::merge_replay(&mut self.cached_replay, replay)?;
+        self.commit_generation(Some(located.sector), true, generation, &located.state)
+    }
+}
+
 impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
     for SecurityStateJournal<S, SECTOR_SIZE>
 {
@@ -1009,47 +1084,12 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> SecurityStateStore
         &mut self,
         replay: PersistentReplayCounter,
     ) -> Result<(), SecurityStoreError> {
-        let Some(located) = self.current()? else {
-            return Err(SecurityStoreError::NotFound);
-        };
-        if !located.state.commissioned {
-            return Err(SecurityStoreError::Corrupt);
-        }
-        self.ensure_replay_cache(&located)?;
-        if self
-            .cached_replay
-            .iter()
-            .find(|stored| stored.same_domain(&replay))
-            .is_some_and(|stored| stored.counter() >= replay.counter())
-        {
+        // Incoming NWK floors are RAM-only (the live NWK replay table is
+        // their authority); persisting them wore out the journal.
+        if matches!(replay, PersistentReplayCounter::Nwk(_)) {
             return Ok(());
         }
-
-        if let Some((slot, index, initialize)) =
-            self.find_replay_append_position(located.sector, located.generation)?
-        {
-            let result = (|| {
-                if initialize {
-                    self.write_replay_header(located.sector, slot, located.generation)?;
-                }
-                self.write_replay_entry(located.sector, slot, index, replay)
-            })();
-            if result.is_ok() {
-                Self::merge_replay(&mut self.cached_replay, replay)?;
-            } else {
-                self.cached_replay.clear();
-                self.replay_generation = None;
-            }
-            return result;
-        }
-
-        let generation = located
-            .generation
-            .checked_add(1)
-            .ok_or(SecurityStoreError::GenerationExhausted)?;
-        // `merge_replay` leaves the cache untouched when it fails.
-        Self::merge_replay(&mut self.cached_replay, replay)?;
-        self.commit_generation(Some(located.sector), true, generation, &located.state)
+        self.append_durable_replay_counter(replay)
     }
 
     fn tombstone_replay_counters(
@@ -1120,6 +1160,10 @@ mod tests {
     struct MockFlash {
         data: [u8; SECURITY_JOURNAL_SECTOR_SIZE * 2],
         programs_before_failure: Option<usize>,
+        /// Successful program operations (wear/latency instrumentation).
+        programs: usize,
+        /// Successful erase operations (wear instrumentation).
+        erases: usize,
     }
 
     impl MockFlash {
@@ -1127,6 +1171,8 @@ mod tests {
             Self {
                 data: [0xFF; SECURITY_JOURNAL_SECTOR_SIZE * 2],
                 programs_before_failure: None,
+                programs: 0,
+                erases: 0,
             }
         }
 
@@ -1185,6 +1231,7 @@ mod tests {
                 }
                 *old &= *new;
             }
+            self.programs += 1;
             Ok(())
         }
 
@@ -1199,6 +1246,7 @@ mod tests {
                 return Err(NorFlashErrorKind::NotAligned);
             }
             self.data[start..end].fill(0xFF);
+            self.erases += 1;
             Ok(())
         }
     }
@@ -1237,10 +1285,29 @@ mod tests {
         hash
     }
 
-    fn nwk_replay(counter: u32) -> PersistentReplayCounter {
-        nwk_replay_for([0x33; 8], key_fingerprint(&[3; 16]), counter)
+    /// A durable (APS Trust Center link-key) replay domain used by the
+    /// generic journal mechanics tests.
+    fn durable_replay(counter: u32) -> PersistentReplayCounter {
+        durable_replay_for([0x33; 8], key_fingerprint(&[3; 16]), counter)
     }
 
+    fn durable_replay_for(
+        partner: [u8; 8],
+        key_fingerprint: u32,
+        counter: u32,
+    ) -> PersistentReplayCounter {
+        PersistentReplayCounter::Aps(zigbee_aps::security::ApsReplayCounter {
+            origin: zigbee_aps::security::ApsReplayOrigin::KeyPair {
+                partner,
+                key_type: zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+            },
+            key_fingerprint,
+            counter,
+        })
+    }
+
+    /// An incoming NWK replay domain. The current firmware never journals
+    /// these; older firmware did (entry kind 0).
     fn nwk_replay_for(
         source: [u8; 8],
         key_fingerprint: u32,
@@ -1815,8 +1882,8 @@ mod tests {
         let mut journal =
             SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
         journal.store(&commissioned_state()).unwrap();
-        journal.commit_replay_counter(nwk_replay(7)).unwrap();
-        journal.commit_replay_counter(nwk_replay(9)).unwrap();
+        journal.commit_replay_counter(durable_replay(7)).unwrap();
+        journal.commit_replay_counter(durable_replay(9)).unwrap();
         let aps = PersistentReplayCounter::Aps(zigbee_aps::security::ApsReplayCounter {
             origin: zigbee_aps::security::ApsReplayOrigin::PreconfiguredGlobal {
                 source: [0x44; 8],
@@ -1832,7 +1899,7 @@ mod tests {
             .visit_replay_counters(&mut |entry| restored.push(entry).unwrap())
             .unwrap();
         assert_eq!(restored.len(), 2);
-        assert!(restored.contains(&nwk_replay(9)));
+        assert!(restored.contains(&durable_replay(9)));
         assert!(restored.contains(&aps));
     }
 
@@ -1843,15 +1910,15 @@ mod tests {
         let network_fingerprint = key_fingerprint(&[3; 16]);
         let application_fingerprint = key_fingerprint(&[6; 16]);
         let global_fingerprint = key_fingerprint(&zigbee_aps::security::DEFAULT_TC_LINK_KEY);
-        let removed_nwk = nwk_replay_for(removed, network_fingerprint, 7);
-        let retained_nwk = nwk_replay_for(retained, network_fingerprint, 8);
+        let removed_tclk = durable_replay_for(removed, network_fingerprint, 7);
+        let retained_tclk = durable_replay_for(retained, network_fingerprint, 8);
         let removed_aps = aps_key_pair_replay(removed, application_fingerprint, 3);
         let retained_global = aps_global_replay(removed, global_fingerprint, 4);
 
         let mut journal =
             SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
         journal.store(&commissioned_state()).unwrap();
-        for replay in [removed_nwk, retained_nwk, removed_aps, retained_global] {
+        for replay in [removed_tclk, retained_tclk, removed_aps, retained_global] {
             journal.commit_replay_counter(replay).unwrap();
         }
         journal
@@ -1868,9 +1935,9 @@ mod tests {
             .visit_replay_counters(&mut |entry| restored.push(entry).unwrap())
             .unwrap();
         assert_eq!(restored.len(), 2);
-        assert!(restored.contains(&retained_nwk));
+        assert!(restored.contains(&retained_tclk));
         assert!(restored.contains(&retained_global));
-        assert!(!restored.contains(&removed_nwk));
+        assert!(!restored.contains(&removed_tclk));
         assert!(!restored.contains(&removed_aps));
     }
 
@@ -1878,15 +1945,15 @@ mod tests {
     fn key_replay_tombstone_removes_only_matching_domains() {
         let retired_fingerprint = key_fingerprint(&[6; 16]);
         let retained_fingerprint = key_fingerprint(&[7; 16]);
-        let removed_nwk = nwk_replay_for([0x41; 8], retired_fingerprint, 7);
+        let removed_tclk = durable_replay_for([0x41; 8], retired_fingerprint, 7);
         let removed_aps = aps_key_pair_replay([0x42; 8], retired_fingerprint, 3);
-        let retained_nwk = nwk_replay_for([0x43; 8], retained_fingerprint, 8);
+        let retained_tclk = durable_replay_for([0x43; 8], retained_fingerprint, 8);
         let retained_aps = aps_key_pair_replay([0x44; 8], retained_fingerprint, 4);
 
         let mut journal =
             SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
         journal.store(&commissioned_state()).unwrap();
-        for replay in [removed_nwk, removed_aps, retained_nwk, retained_aps] {
+        for replay in [removed_tclk, removed_aps, retained_tclk, retained_aps] {
             journal.commit_replay_counter(replay).unwrap();
         }
         journal
@@ -1903,9 +1970,9 @@ mod tests {
             .visit_replay_counters(&mut |entry| restored.push(entry).unwrap())
             .unwrap();
         assert_eq!(restored.len(), 2);
-        assert!(restored.contains(&retained_nwk));
+        assert!(restored.contains(&retained_tclk));
         assert!(restored.contains(&retained_aps));
-        assert!(!restored.contains(&removed_nwk));
+        assert!(!restored.contains(&removed_tclk));
         assert!(!restored.contains(&removed_aps));
     }
 
@@ -1946,12 +2013,12 @@ mod tests {
         let shared_fingerprint = key_fingerprint(&[6; 16]);
         let removed_pair = aps_key_pair_replay([0x45; 8], shared_fingerprint, 3);
         let retained_pair = aps_key_pair_replay([0x46; 8], shared_fingerprint, 4);
-        let removed_nwk = nwk_replay_for([0x47; 8], key_fingerprint(&[3; 16]), 7);
+        let removed_tclk = durable_replay_for([0x47; 8], key_fingerprint(&[3; 16]), 7);
 
         let mut journal =
             SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
         journal.store(&commissioned_state()).unwrap();
-        for replay in [removed_pair, retained_pair, removed_nwk] {
+        for replay in [removed_pair, retained_pair, removed_tclk] {
             journal.commit_replay_counter(replay).unwrap();
         }
         assert_eq!(
@@ -1975,7 +2042,7 @@ mod tests {
 
     #[test]
     fn torn_replay_retention_keeps_the_previous_generation() {
-        let removed = nwk_replay_for([0x51; 8], key_fingerprint(&[3; 16]), 7);
+        let removed = durable_replay_for([0x51; 8], key_fingerprint(&[3; 16]), 7);
         let retained = aps_key_pair_replay([0x52; 8], key_fingerprint(&[6; 16]), 3);
         let mut journal =
             SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
@@ -2007,7 +2074,7 @@ mod tests {
     #[test]
     fn torn_replay_tombstone_keeps_the_previous_generation() {
         let removed = [0x51; 8];
-        let removed_replay = nwk_replay_for(removed, key_fingerprint(&[3; 16]), 7);
+        let removed_replay = durable_replay_for(removed, key_fingerprint(&[3; 16]), 7);
         let retained_replay = aps_key_pair_replay([0x52; 8], key_fingerprint(&[6; 16]), 3);
         let mut journal =
             SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
@@ -2041,11 +2108,11 @@ mod tests {
         let mut journal =
             SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
         journal.store(&commissioned_state()).unwrap();
-        journal.commit_replay_counter(nwk_replay(7)).unwrap();
+        journal.commit_replay_counter(durable_replay(7)).unwrap();
 
         journal.storage_mut().programs_before_failure = Some(1);
         assert_eq!(
-            journal.commit_replay_counter(nwk_replay(8)),
+            journal.commit_replay_counter(durable_replay(8)),
             Err(SecurityStoreError::Hardware)
         );
         journal.storage_mut().programs_before_failure = None;
@@ -2053,7 +2120,7 @@ mod tests {
         journal
             .visit_replay_counters(&mut |entry| restored.push(entry).unwrap())
             .unwrap();
-        assert_eq!(restored.as_slice(), &[nwk_replay(7)]);
+        assert_eq!(restored.as_slice(), &[durable_replay(7)]);
     }
 
     #[test]
@@ -2063,12 +2130,14 @@ mod tests {
         journal.store(&commissioned_state()).unwrap();
         let capacity = (SECURITY_JOURNAL_SLOTS_PER_SECTOR - 1) * REPLAY_ENTRIES_PER_SLOT;
         for counter in 1..=capacity as u32 {
-            journal.commit_replay_counter(nwk_replay(counter)).unwrap();
+            journal
+                .commit_replay_counter(durable_replay(counter))
+                .unwrap();
         }
 
         journal.storage_mut().programs_before_failure = Some(3);
         assert_eq!(
-            journal.commit_replay_counter(nwk_replay(capacity as u32 + 1)),
+            journal.commit_replay_counter(durable_replay(capacity as u32 + 1)),
             Err(SecurityStoreError::Hardware)
         );
         journal.storage_mut().programs_before_failure = None;
@@ -2076,7 +2145,7 @@ mod tests {
         journal
             .visit_replay_counters(&mut |entry| restored.push(entry).unwrap())
             .unwrap();
-        assert_eq!(restored.as_slice(), &[nwk_replay(capacity as u32)]);
+        assert_eq!(restored.as_slice(), &[durable_replay(capacity as u32)]);
     }
 
     #[test]
@@ -2084,7 +2153,7 @@ mod tests {
         let mut journal =
             SecurityStateJournal::new(MockFlash::new(), 0, SECURITY_JOURNAL_SECTOR_SIZE as u32);
         journal.store(&commissioned_state()).unwrap();
-        journal.commit_replay_counter(nwk_replay(7)).unwrap();
+        journal.commit_replay_counter(durable_replay(7)).unwrap();
         journal.store(&PersistentSecurityState::empty()).unwrap();
 
         journal.storage_mut();
@@ -2216,7 +2285,9 @@ mod tests {
         // Enough replay entries to force at least two rollovers.
         let capacity = (SECURITY_JOURNAL_SLOTS_PER_SECTOR - 1) * REPLAY_ENTRIES_PER_SLOT;
         for counter in 1..=(capacity as u32 * 3) {
-            journal.commit_replay_counter(nwk_replay(counter)).unwrap();
+            journal
+                .commit_replay_counter(durable_replay(counter))
+                .unwrap();
         }
         for counter in 2..=(SECURITY_JOURNAL_SLOTS_PER_SECTOR as u32 + 2) {
             let mut next = commissioned_state();
@@ -2284,8 +2355,8 @@ mod tests {
             SECURITY_JOURNAL_SECTOR_SIZE as u32,
         );
         journal.store(&commissioned_state()).unwrap();
-        journal.commit_replay_counter(nwk_replay(7)).unwrap();
-        journal.commit_replay_counter(nwk_replay(9)).unwrap();
+        journal.commit_replay_counter(durable_replay(7)).unwrap();
+        journal.commit_replay_counter(durable_replay(9)).unwrap();
         assert_eq!(journal.storage_mut().rejected, 0);
     }
 
@@ -2305,7 +2376,7 @@ mod tests {
     #[test]
     fn hw04_failed_in_place_replay_commits_never_expose_the_staged_cache() {
         let removed = [0x51; 8];
-        let removed_replay = nwk_replay_for(removed, key_fingerprint(&[3; 16]), 7);
+        let removed_replay = durable_replay_for(removed, key_fingerprint(&[3; 16]), 7);
         let retained_replay = aps_key_pair_replay([0x52; 8], key_fingerprint(&[6; 16]), 3);
         let seeded = || {
             let mut journal =
@@ -2369,7 +2440,9 @@ mod tests {
         journal.store(&commissioned_state()).unwrap();
         let capacity = (SECURITY_JOURNAL_SLOTS_PER_SECTOR - 1) * REPLAY_ENTRIES_PER_SLOT;
         for counter in 1..=capacity as u32 {
-            journal.commit_replay_counter(nwk_replay(counter)).unwrap();
+            journal
+                .commit_replay_counter(durable_replay(counter))
+                .unwrap();
         }
         let other = aps_key_pair_replay([0x52; 8], key_fingerprint(&[6; 16]), 3);
         for failure_after in 0..6 {
@@ -2381,12 +2454,217 @@ mod tests {
             journal.storage_mut().programs_before_failure = None;
             assert_eq!(
                 replay_entries(&mut journal).as_slice(),
-                &[nwk_replay(capacity as u32)]
+                &[durable_replay(capacity as u32)]
             );
         }
         assert_eq!(journal.commit_replay_counter(other), Ok(()));
         let entries = replay_entries(&mut journal);
         assert_eq!(entries.len(), 2);
         assert!(entries.contains(&other));
+    }
+
+    type TestJournal = SecurityStateJournal<MockFlash, SECURITY_JOURNAL_SECTOR_SIZE>;
+
+    fn test_journal(flash: MockFlash) -> TestJournal {
+        SecurityStateJournal::new(flash, 0, SECURITY_JOURNAL_SECTOR_SIZE as u32)
+    }
+
+    /// Append one incoming NWK replay entry exactly as firmware before the
+    /// RAM-only NWK change did (`commit_replay_counter` wrote entry kind 0).
+    /// Returns `false` once the active sector has no free entry left.
+    fn legacy_commit_nwk(journal: &mut TestJournal, replay: PersistentReplayCounter) -> bool {
+        assert!(matches!(replay, PersistentReplayCounter::Nwk(_)));
+        let located = journal.current().unwrap().unwrap();
+        let Some((slot, index, initialize)) = journal
+            .find_replay_append_position(located.sector, located.generation)
+            .unwrap()
+        else {
+            return false;
+        };
+        if initialize {
+            journal
+                .write_replay_header(located.sector, slot, located.generation)
+                .unwrap();
+        }
+        journal
+            .write_replay_entry(located.sector, slot, index, replay)
+            .unwrap();
+        true
+    }
+
+    /// Every decodable replay entry of the active generation, read straight
+    /// from flash (including entries the scan ignores).
+    fn raw_replay_entries(
+        journal: &mut TestJournal,
+    ) -> heapless::Vec<PersistentReplayCounter, { SECURITY_JOURNAL_SLOTS_PER_SECTOR * 4 }> {
+        let located = journal.current().unwrap().unwrap();
+        let mut entries = heapless::Vec::new();
+        let mut record = [0u8; SECURITY_JOURNAL_SLOT_SIZE];
+        for slot in 0..TestJournal::SLOTS_PER_SECTOR {
+            journal
+                .read_slot(located.sector, slot, &mut record)
+                .unwrap();
+            if TestJournal::replay_header_generation(&record) != Some(located.generation) {
+                continue;
+            }
+            for index in 0..REPLAY_ENTRIES_PER_SLOT {
+                match TestJournal::decode_replay_entry(
+                    &record[TestJournal::replay_entry_range(index)],
+                ) {
+                    Some(entry) => entries.push(entry).unwrap(),
+                    None => break,
+                }
+            }
+        }
+        entries
+    }
+
+    fn generation(journal: &mut TestJournal) -> u32 {
+        journal.current().unwrap().unwrap().generation
+    }
+
+    /// The hardware wear bug: every accepted NWK frame used to append a
+    /// journal entry. NWK floors are RAM-only now; committing one must not
+    /// program or erase flash, however many sources or counters arrive.
+    #[test]
+    fn nwk_replay_commit_never_programs_or_erases_flash() {
+        let mut journal = test_journal(MockFlash::new());
+        journal.store(&commissioned_state()).unwrap();
+        let generation_before = generation(&mut journal);
+        let programs = journal.storage_mut().programs;
+        let erases = journal.storage_mut().erases;
+        let image = journal.storage_mut().data;
+
+        let fingerprint = key_fingerprint(&[3; 16]);
+        for counter in 1..=(4 * SECURITY_JOURNAL_SLOTS_PER_SECTOR as u32) {
+            let source = [0x10 + (counter % 40) as u8; 8];
+            journal
+                .commit_replay_counter(nwk_replay_for(source, fingerprint, counter))
+                .unwrap();
+        }
+
+        assert_eq!(journal.storage_mut().programs, programs);
+        assert_eq!(journal.storage_mut().erases, erases);
+        assert!(journal.storage_mut().data == image);
+        assert_eq!(generation(&mut journal), generation_before);
+        assert!(replay_entries(&mut journal).is_empty());
+    }
+
+    /// APS incoming floors stay durable: they are programmed immediately and
+    /// survive a reboot.
+    #[test]
+    fn aps_replay_commit_still_appends_and_survives_reboot() {
+        let mut journal = test_journal(MockFlash::new());
+        journal.store(&commissioned_state()).unwrap();
+        let programs = journal.storage_mut().programs;
+        let tclk = durable_replay(5);
+        let global = aps_global_replay([0x44; 8], key_fingerprint(&[9; 16]), 6);
+        journal.commit_replay_counter(tclk).unwrap();
+        journal.commit_replay_counter(global).unwrap();
+        assert!(journal.storage_mut().programs > programs);
+
+        let mut rebooted = test_journal(journal.into_storage());
+        let restored = replay_entries(&mut rebooted);
+        assert_eq!(restored.len(), 2);
+        assert!(restored.contains(&tclk));
+        assert!(restored.contains(&global));
+    }
+
+    /// A journal written by the previous image (kind-0 NWK entries mixed with
+    /// APS entries, sector nearly full) boots on the new image without a
+    /// factory reset: the commissioned state loads unchanged, APS floors are
+    /// restored, NWK entries are never reported, new APS appends land after
+    /// the legacy entries, and the next rollover drops the legacy NWK entries.
+    #[test]
+    fn legacy_nwk_replay_entries_are_ignored_and_retired_on_rollover() {
+        let state = commissioned_state();
+        let fingerprint = key_fingerprint(&[3; 16]);
+        let tclk = durable_replay(5);
+
+        // Old image: commissioned state, one APS floor, many NWK appends.
+        let mut old = test_journal(MockFlash::new());
+        old.store(&state).unwrap();
+        assert!(legacy_commit_nwk(
+            &mut old,
+            nwk_replay_for([0x21; 8], fingerprint, 100)
+        ));
+        old.commit_replay_counter(tclk).unwrap();
+        assert!(legacy_commit_nwk(
+            &mut old,
+            nwk_replay_for([0x22; 8], fingerprint, 200)
+        ));
+        let old_generation = generation(&mut old);
+
+        // New image boots on the same flash.
+        let mut new = test_journal(old.into_storage());
+        assert_eq!(new.load().unwrap(), Some(state));
+        assert_eq!(generation(&mut new), old_generation);
+        assert_eq!(replay_entries(&mut new).as_slice(), &[tclk]);
+        let raw = raw_replay_entries(&mut new);
+        assert_eq!(
+            raw.iter()
+                .filter(|entry| matches!(entry, PersistentReplayCounter::Nwk(_)))
+                .count(),
+            2
+        );
+
+        // An APS append in the legacy generation lands after the old entries.
+        let tclk = durable_replay(6);
+        new.commit_replay_counter(tclk).unwrap();
+        assert_eq!(generation(&mut new), old_generation);
+        assert_eq!(replay_entries(&mut new).as_slice(), &[tclk]);
+
+        // Fill the remaining space the way the old image did, then force
+        // the next APS commit to roll over.
+        let mut counter = 300;
+        let mut old_again = test_journal(new.into_storage());
+        while legacy_commit_nwk(
+            &mut old_again,
+            nwk_replay_for([0x23; 8], fingerprint, counter),
+        ) {
+            counter += 1;
+        }
+        let mut new = test_journal(old_again.into_storage());
+        assert_eq!(replay_entries(&mut new).as_slice(), &[tclk]);
+        let tclk = durable_replay(7);
+        new.commit_replay_counter(tclk).unwrap();
+        assert_eq!(generation(&mut new), old_generation + 1);
+
+        let mut rebooted = test_journal(new.into_storage());
+        assert_eq!(rebooted.load().unwrap(), Some(state));
+        assert_eq!(replay_entries(&mut rebooted).as_slice(), &[tclk]);
+        assert_eq!(raw_replay_entries(&mut rebooted).as_slice(), &[tclk]);
+    }
+
+    /// A journal whose only replay entries are legacy NWK entries resumes with
+    /// no replay floors; NWK commits on it still never touch flash, and
+    /// retention/tombstones see nothing to compact.
+    #[test]
+    fn nwk_only_legacy_journal_resumes_without_rewriting() {
+        let state = commissioned_state();
+        let fingerprint = key_fingerprint(&[3; 16]);
+        let mut old = test_journal(MockFlash::new());
+        old.store(&state).unwrap();
+        for counter in 1..=6 {
+            assert!(legacy_commit_nwk(
+                &mut old,
+                nwk_replay_for([0x30 + counter as u8; 8], fingerprint, counter)
+            ));
+        }
+
+        let mut new = test_journal(old.into_storage());
+        assert_eq!(new.load().unwrap(), Some(state));
+        assert!(replay_entries(&mut new).is_empty());
+        let programs = new.storage_mut().programs;
+        let erases = new.storage_mut().erases;
+        new.commit_replay_counter(nwk_replay_for([0x31; 8], fingerprint, 99))
+            .unwrap();
+        assert_eq!(
+            new.tombstone_replay_counters(ReplayCounterTombstone::KeyFingerprint(fingerprint)),
+            Ok(())
+        );
+        assert_eq!(new.retain_replay_counters(&|_| false), Ok(0));
+        assert_eq!(new.storage_mut().programs, programs);
+        assert_eq!(new.storage_mut().erases, erases);
     }
 }

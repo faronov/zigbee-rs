@@ -20,6 +20,23 @@ pub const MAX_FRAME_COUNTER_ENTRIES: usize = 64;
 #[cfg(not(feature = "router"))]
 pub const MAX_FRAME_COUNTER_ENTRIES: usize = 16;
 
+/// Default silence, in seconds, after which a router may evict a replay
+/// floor that is neither its parent's nor a child's (one hour).
+#[cfg(feature = "router")]
+pub const DEFAULT_REPLAY_STALE_SECS: u16 = 3_600;
+
+/// Outcome of checking an incoming NWK frame counter before MIC verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayAdmission {
+    /// The counter is newer than the recorded floor, or a new source fits.
+    Fresh,
+    /// The counter is not strictly greater than the recorded floor.
+    Replay,
+    /// A new source cannot be recorded without forgetting a protected or
+    /// recently heard floor, so it is refused (fail closed).
+    TableFull,
+}
+
 /// Serialized length of the NWK security auxiliary header.
 ///
 /// security control (1) + frame counter (4) + source IEEE (8) + key sequence (1).
@@ -133,7 +150,22 @@ pub struct NwkSecurity {
     pub(crate) activation_pending: bool,
     /// Incoming frame counter table (for replay protection).
     /// Maps source IEEE address and network-key sequence to the last counter.
+    ///
+    /// This table is the *only* authority for incoming NWK replay floors:
+    /// they are deliberately not persisted (see `docs/book/src/advanced/
+    /// nv-storage.md`). It therefore never forgets a floor under capacity
+    /// pressure — see [`Self::check_frame_counter_reserving`].
     frame_counter_table: heapless::Vec<FrameCounterEntry, MAX_FRAME_COUNTER_ENTRIES>,
+    /// The retained previous key has given up at least one replay floor to
+    /// make room for a current-key source, so it admits no new sources until
+    /// the installed key set changes. A reclaimed source can then never be
+    /// re-admitted at an old counter.
+    #[cfg(feature = "router")]
+    previous_key_replay_sealed: bool,
+    /// Silence after which an unprotected floor may be evicted to admit a
+    /// new source (see [`Self::set_replay_stale_timeout_secs`]).
+    #[cfg(feature = "router")]
+    replay_stale_secs: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +173,10 @@ struct FrameCounterEntry {
     source: IeeeAddress,
     key_sequence: u8,
     counter: u32,
+    /// Seconds since this floor last advanced (saturating). Fits the
+    /// structure's padding, so routers pay no RAM for it.
+    #[cfg(feature = "router")]
+    silent_secs: u16,
 }
 
 impl NwkSecurity {
@@ -150,6 +186,45 @@ impl NwkSecurity {
             staged_key_sequence: None,
             activation_pending: false,
             frame_counter_table: heapless::Vec::new(),
+            #[cfg(feature = "router")]
+            previous_key_replay_sealed: false,
+            #[cfg(feature = "router")]
+            replay_stale_secs: DEFAULT_REPLAY_STALE_SECS,
+        }
+    }
+
+    /// Re-open the retained previous key to new replay sources after the
+    /// installed key set changed.
+    #[inline]
+    fn unseal_previous_key(&mut self) {
+        #[cfg(feature = "router")]
+        {
+            self.previous_key_replay_sealed = false;
+        }
+    }
+
+    /// Set how long a floor must be silent before a router may evict it to
+    /// admit a new source. Floors of the parent and children are never
+    /// evicted. `u16::MAX` (about 18 h) is the longest supported silence.
+    #[cfg(feature = "router")]
+    pub fn set_replay_stale_timeout_secs(&mut self, secs: u16) {
+        self.replay_stale_secs = secs;
+    }
+
+    /// Current stale-floor eviction threshold in seconds.
+    #[cfg(feature = "router")]
+    pub fn replay_stale_timeout_secs(&self) -> u16 {
+        self.replay_stale_secs
+    }
+
+    /// Advance the silence of every recorded floor by `elapsed_secs`.
+    ///
+    /// Called from the router's once-per-second NWK maintenance; a commit
+    /// resets the floor's silence to zero.
+    #[cfg(feature = "router")]
+    pub fn age_replay_floors(&mut self, elapsed_secs: u16) {
+        for entry in self.frame_counter_table.iter_mut() {
+            entry.silent_secs = entry.silent_secs.saturating_add(elapsed_secs);
         }
     }
 
@@ -160,6 +235,7 @@ impl NwkSecurity {
         self.staged_key_sequence = None;
         self.activation_pending = false;
         self.frame_counter_table.clear();
+        self.unseal_previous_key();
     }
 
     /// Set the active network key.
@@ -188,6 +264,7 @@ impl NwkSecurity {
                 previous.active = false;
             }
             self.staged_key_sequence = None;
+            self.unseal_previous_key();
             return;
         }
 
@@ -328,6 +405,7 @@ impl NwkSecurity {
                 previous.active = false;
             }
             self.staged_key_sequence = None;
+            self.unseal_previous_key();
             return true;
         }
         false
@@ -380,6 +458,7 @@ impl NwkSecurity {
     }
 
     fn retain_frame_counters_for_installed_keys(&mut self) {
+        self.unseal_previous_key();
         let active_sequence = self.keys[0].as_ref().map(|entry| entry.seq_number);
         let alternate_sequence = self.keys[1].as_ref().map(|entry| entry.seq_number);
         self.frame_counter_table.retain(|entry| {
@@ -404,92 +483,326 @@ impl NwkSecurity {
 
     /// Check an incoming counter in the replay domain of one network key.
     ///
-    /// A source without an entry is always admissible: when the table is
-    /// full, the verified commit evicts the least-recently-updated entry (see
-    /// [`Self::commit_frame_counter_for_key_protecting`]) rather than locking
-    /// every new neighbour out for the lifetime of the key.
+    /// Conservative form of the admission check: no slots are reserved and
+    /// no floor counts as evictable, so a full table refuses a new domain.
     pub fn check_frame_counter_for_key(
         &self,
         source: &IeeeAddress,
         key_sequence: u8,
         counter: u32,
     ) -> bool {
-        self.frame_counter_table
+        #[cfg(feature = "router")]
+        let admission =
+            self.check_frame_counter_reserving(source, key_sequence, counter, || 0, |_| true);
+        #[cfg(not(feature = "router"))]
+        let admission = self.replay_admission(source, key_sequence, counter, None);
+        admission == ReplayAdmission::Fresh
+    }
+
+    /// Check an incoming counter WITHOUT committing it (end-device build).
+    ///
+    /// A known `(source, key_sequence)` domain admits only a strictly greater
+    /// counter (R22 §4.3.1.2). Incoming NWK floors are RAM-only, so this
+    /// table is their sole authority for the rest of the boot. One slot is
+    /// kept for `parent` while it has no floor under `key_sequence`: any
+    /// other new domain is admitted only if a slot remains beyond that
+    /// reservation. The parent itself takes a free slot or, in a full table,
+    /// the earliest-admitted floor of another source (see
+    /// [`Self::commit_frame_counter_for_key_with_parent`]). Anything else
+    /// that does not fit is refused (fail closed).
+    ///
+    /// `parent` is the current parent, or the new parent during a secure
+    /// rejoin; `None` reserves nothing and replaces nothing.
+    #[cfg(not(feature = "router"))]
+    pub fn replay_admission(
+        &self,
+        source: &IeeeAddress,
+        key_sequence: u8,
+        counter: u32,
+        parent: Option<&IeeeAddress>,
+    ) -> ReplayAdmission {
+        match self
+            .frame_counter_table
             .iter()
             .find(|e| e.source == *source && e.key_sequence == key_sequence)
-            .is_none_or(|entry| counter > entry.counter)
+        {
+            Some(entry) if counter > entry.counter => ReplayAdmission::Fresh,
+            Some(_) => ReplayAdmission::Replay,
+            None if self.leaf_admits_new_domain(source, key_sequence, parent) => {
+                ReplayAdmission::Fresh
+            }
+            None => ReplayAdmission::TableFull,
+        }
+    }
+
+    /// Whether a new `(source, key_sequence)` domain fits the end-device
+    /// table under the parent-slot rule of [`Self::replay_admission`].
+    #[cfg(not(feature = "router"))]
+    fn leaf_admits_new_domain(
+        &self,
+        source: &IeeeAddress,
+        key_sequence: u8,
+        parent: Option<&IeeeAddress>,
+    ) -> bool {
+        let free = MAX_FRAME_COUNTER_ENTRIES - self.frame_counter_table.len();
+        match parent {
+            Some(parent) if parent == source => {
+                free > 0 || self.frame_counter_table.iter().any(|e| e.source != *parent)
+            }
+            Some(parent) => {
+                let reserved = usize::from(!self.has_frame_counter_for_key(parent, key_sequence));
+                free > reserved
+            }
+            None => free > 0,
+        }
+    }
+
+    /// Check an incoming counter WITHOUT committing it (router build).
+    ///
+    /// A known `(source, key_sequence)` domain admits only a strictly greater
+    /// counter (R22 §4.3.1.2). An unknown domain is admitted only while the
+    /// table can record its floor: a free slot, a reclaimable floor of the
+    /// retained *previous* key, or a stale floor (see
+    /// [`Self::commit_frame_counter_for_key_protecting`]). More than
+    /// `reserved()` such slots must remain, so the caller keeps room for its
+    /// parent and children (`reserved` is only evaluated for a new domain).
+    ///
+    /// `protect` names the sources whose floors are never evicted (the
+    /// parent and children). A new domain that does not fit is refused with
+    /// [`ReplayAdmission::TableFull`] (fail closed).
+    #[cfg(feature = "router")]
+    pub fn check_frame_counter_reserving(
+        &self,
+        source: &IeeeAddress,
+        key_sequence: u8,
+        counter: u32,
+        reserved: impl FnOnce() -> usize,
+        protect: impl Fn(&IeeeAddress) -> bool,
+    ) -> ReplayAdmission {
+        if let Some(entry) = self
+            .frame_counter_table
+            .iter()
+            .find(|e| e.source == *source && e.key_sequence == key_sequence)
+        {
+            return if counter > entry.counter {
+                ReplayAdmission::Fresh
+            } else {
+                ReplayAdmission::Replay
+            };
+        }
+        let Some(reclaim_from) = self.reclaimable_key_sequence(key_sequence) else {
+            return ReplayAdmission::TableFull;
+        };
+        let reclaimable = reclaim_from.map_or(0, |previous| {
+            self.frame_counter_table
+                .iter()
+                .filter(|e| e.key_sequence == previous)
+                .count()
+        });
+        let available = MAX_FRAME_COUNTER_ENTRIES - self.frame_counter_table.len() + reclaimable;
+        let reserved = reserved();
+        if available > reserved {
+            return ReplayAdmission::Fresh;
+        }
+        // Only now pay for the protection lookups: count stale floors (other
+        // than the reclaimable ones already counted) until enough are found.
+        let stale = self
+            .frame_counter_table
+            .iter()
+            .filter(|e| {
+                Some(e.key_sequence) != reclaim_from
+                    && e.silent_secs >= self.replay_stale_secs
+                    && !protect(&e.source)
+            })
+            .take(reserved + 1 - available)
+            .count();
+        if available + stale > reserved {
+            ReplayAdmission::Fresh
+        } else {
+            ReplayAdmission::TableFull
+        }
     }
 
     /// Commit frame counter after successful MIC verification.
     /// Must only be called after decrypt/verify succeeds.
-    pub fn commit_frame_counter(&mut self, source: &IeeeAddress, counter: u32) {
+    pub fn commit_frame_counter(&mut self, source: &IeeeAddress, counter: u32) -> bool {
         let key_sequence = self.active_key().map(|entry| entry.seq_number).unwrap_or(0);
-        self.commit_frame_counter_for_key(source, key_sequence, counter);
+        self.commit_frame_counter_for_key(source, key_sequence, counter)
     }
 
     /// Commit a verified counter in the replay domain of one network key.
+    ///
+    /// Returns `false`, recording nothing, when a new domain does not fit.
+    /// No floor is evicted by this form; see
+    /// [`Self::commit_frame_counter_for_key_protecting`] on routers.
     pub fn commit_frame_counter_for_key(
         &mut self,
         source: &IeeeAddress,
         key_sequence: u8,
         counter: u32,
-    ) {
-        self.commit_frame_counter_for_key_protecting(source, key_sequence, counter, &|_| false);
+    ) -> bool {
+        #[cfg(feature = "router")]
+        {
+            self.commit_frame_counter_for_key_protecting(source, key_sequence, counter, |_| true)
+        }
+        #[cfg(not(feature = "router"))]
+        {
+            self.commit_frame_counter_for_key_with_parent(source, key_sequence, counter, None)
+        }
     }
 
-    /// Commit a verified counter, evicting a stale entry when the table is
-    /// full.
+    /// Commit a verified counter, keeping one slot for the parent
+    /// (end-device build).
     ///
-    /// The table is kept in least-recently-updated order: every commit moves
-    /// its entry to the back. Eviction takes the front-most entry whose source
-    /// `protect` does not claim (the NWK layer protects its parent and
-    /// children), falling back to the overall least-recently-updated entry.
+    /// Returns `false`, recording nothing, when a new domain does not fit the
+    /// rule of [`Self::replay_admission`]. When the table is full, a new
+    /// domain of `parent` replaces the earliest-admitted floor of any other
+    /// source; the parent's own floors are never replaced.
     ///
-    /// Replay implications: entries are created only here, i.e. after MIC
-    /// verification, so only holders of the network key can churn the table;
-    /// unauthenticated frames can never evict anything. NWK security is
-    /// hop-by-hop, so sources are one-hop neighbours. An evicted neighbour's
-    /// next frame re-creates its entry at that counter, so frames it sent
-    /// before the eviction could be replayed in that window. Choosing the
-    /// least-recently-heard, non-parent/non-child source keeps this window
-    /// on the least active link instead of refusing every new neighbour for
-    /// the life of the key, which the previous reject-when-full policy did.
+    /// The replaced source re-enters at whatever counter it next presents,
+    /// so one earlier frame of it could be replayed. An end device receives
+    /// unicasts only through its parent, so this is limited to broadcasts
+    /// heard directly from other neighbours.
+    #[cfg(not(feature = "router"))]
+    pub fn commit_frame_counter_for_key_with_parent(
+        &mut self,
+        source: &IeeeAddress,
+        key_sequence: u8,
+        counter: u32,
+        parent: Option<&IeeeAddress>,
+    ) -> bool {
+        if let Some(entry) = self
+            .frame_counter_table
+            .iter_mut()
+            .find(|e| e.source == *source && e.key_sequence == key_sequence)
+        {
+            entry.counter = entry.counter.max(counter);
+            return true;
+        }
+        // A refusal is reported by the caller (`replay_table_full`).
+        if !self.leaf_admits_new_domain(source, key_sequence, parent) {
+            return false;
+        }
+        if self.frame_counter_table.is_full() {
+            // Only the parent is admitted to a full table, and only when a
+            // floor of another source exists; insertion order makes the
+            // first such floor the earliest admitted.
+            if let Some(index) = self
+                .frame_counter_table
+                .iter()
+                .position(|e| e.source != *source)
+            {
+                log::warn!("[NWK] Replay table full — parent replaces the oldest other floor");
+                self.frame_counter_table.remove(index);
+            }
+        }
+        self.frame_counter_table
+            .push(FrameCounterEntry {
+                source: *source,
+                key_sequence,
+                counter,
+            })
+            .is_ok()
+    }
+
+    /// Commit a verified counter, making room for a new domain if needed
+    /// (router build).
+    ///
+    /// Returns `false`, recording nothing, when a new domain does not fit.
+    /// A full table makes room, in order, by:
+    /// 1. giving up a floor of the retained previous key (never the active or
+    ///    a staged key), then sealing that key against new sources so the
+    ///    reclaimed source cannot be re-admitted under it;
+    /// 2. evicting the longest-silent floor whose source has been silent for
+    ///    at least the stale timeout and that `protect` does not claim (the
+    ///    NWK layer protects its parent and children).
+    ///
+    /// An evicted source re-enters at whatever counter it next presents, so
+    /// frames it sent before falling silent could be replayed once. The
+    /// window is limited to neighbours unheard for the whole timeout.
+    #[cfg(feature = "router")]
     pub fn commit_frame_counter_for_key_protecting(
         &mut self,
         source: &IeeeAddress,
         key_sequence: u8,
         counter: u32,
-        protect: &dyn Fn(&IeeeAddress) -> bool,
-    ) {
-        let table = &mut self.frame_counter_table;
-        let mut entry = FrameCounterEntry {
+        protect: impl Fn(&IeeeAddress) -> bool,
+    ) -> bool {
+        if let Some(entry) = self
+            .frame_counter_table
+            .iter_mut()
+            .find(|e| e.source == *source && e.key_sequence == key_sequence)
+        {
+            entry.counter = entry.counter.max(counter);
+            entry.silent_secs = 0;
+            return true;
+        }
+        let Some(reclaim_from) = self.reclaimable_key_sequence(key_sequence) else {
+            log::warn!("[NWK] Replay table: previous key sealed — refusing a new source");
+            return false;
+        };
+        let entry = FrameCounterEntry {
             source: *source,
             key_sequence,
             counter,
+            silent_secs: 0,
         };
-        let from = match table
-            .iter()
-            .position(|e| e.source == *source && e.key_sequence == key_sequence)
-        {
-            Some(index) => {
-                entry.counter = entry.counter.max(table[index].counter);
-                index
-            }
-            None if table.is_full() => {
-                log::warn!("[NWK] Replay table full — evicting least recently heard source");
-                table.iter().position(|e| !protect(&e.source)).unwrap_or(0)
-            }
-            None => {
-                let _ = table.push(entry);
-                return;
-            }
-        };
-        // Move the refreshed (or replacing) entry to the most-recent end.
-        let last = table.len() - 1;
-        for index in from..last {
-            table[index] = table[index + 1].clone();
+        if self.frame_counter_table.push(entry.clone()).is_ok() {
+            return true;
         }
-        table[last] = entry;
+        if let Some(slot) = reclaim_from.and_then(|previous| {
+            self.frame_counter_table
+                .iter_mut()
+                .find(|e| e.key_sequence == previous)
+        }) {
+            log::warn!("[NWK] Replay table full — retiring a previous-key floor");
+            *slot = entry;
+            self.previous_key_replay_sealed = true;
+            return true;
+        }
+        let stale_secs = self.replay_stale_secs;
+        let Some(slot) = self
+            .frame_counter_table
+            .iter_mut()
+            .filter(|e| e.silent_secs >= stale_secs && !protect(&e.source))
+            .max_by_key(|e| e.silent_secs)
+        else {
+            log::warn!("[NWK] Replay table full — refusing a new source");
+            return false;
+        };
+        log::warn!(
+            "[NWK] Replay table full — evicting a floor silent for {}s",
+            slot.silent_secs
+        );
+        *slot = entry;
+        true
+    }
+
+    /// Admission rule for a new domain under `key_sequence`.
+    ///
+    /// `None`: refused, because the retained previous key is sealed.
+    /// `Some(Some(previous))`: the domain may reclaim a floor of the
+    /// retained previous key when the table is full. `Some(None)`: free slots
+    /// only — there is no previous key, or the newcomer belongs to it.
+    #[cfg(feature = "router")]
+    fn reclaimable_key_sequence(&self, key_sequence: u8) -> Option<Option<u8>> {
+        let previous = self.keys[1]
+            .as_ref()
+            .map(|entry| entry.seq_number)
+            .filter(|sequence| self.staged_key_sequence != Some(*sequence));
+        match previous {
+            Some(previous) if previous == key_sequence => {
+                (!self.previous_key_replay_sealed).then_some(None)
+            }
+            previous => Some(previous),
+        }
+    }
+
+    /// Whether `(source, key_sequence)` already has a recorded floor.
+    pub fn has_frame_counter_for_key(&self, source: &IeeeAddress, key_sequence: u8) -> bool {
+        self.frame_counter_table
+            .iter()
+            .any(|e| e.source == *source && e.key_sequence == key_sequence)
     }
 
     /// Restore a durable replay floor only when the installed key still
@@ -501,8 +814,7 @@ impl NwkSecurity {
         if zigbee_crypto::key_fingerprint(&key.key) != replay.key_fingerprint {
             return false;
         }
-        self.commit_frame_counter_for_key(&replay.source, replay.key_sequence, replay.counter);
-        true
+        self.commit_frame_counter_for_key(&replay.source, replay.key_sequence, replay.counter)
     }
 
     /// Encrypt a NWK frame payload using AES-128-CCM*.
@@ -859,36 +1171,382 @@ mod tests {
     }
 
     #[test]
-    fn a_full_replay_table_evicts_the_least_recently_heard_unprotected_source() {
+    fn a_full_replay_table_never_forgets_a_floor() {
         let mut security = NwkSecurity::new();
         security.set_network_key([0x11; 16], 1);
         let source = |i: usize| [i as u8 + 1; 8];
         for i in 0..MAX_FRAME_COUNTER_ENTRIES {
-            security.commit_frame_counter_for_key(&source(i), 1, 100);
+            assert!(security.commit_frame_counter_for_key(&source(i), 1, 100));
         }
-        // Source 0 (the parent) and source 1 are heard again, so source 2 is
-        // the least recently heard; the parent is also protected.
-        security.commit_frame_counter_for_key(&source(1), 1, 101);
-        let parent = source(0);
 
-        // A new neighbour is admitted rather than locked out forever.
+        // A new source is refused (fail closed) instead of evicting anyone.
         let newcomer = [0xF0; 8];
-        assert!(security.check_frame_counter_for_key(&newcomer, 1, 5));
-        security.commit_frame_counter_for_key_protecting(&newcomer, 1, 5, &|s| *s == parent);
-
         assert!(!security.check_frame_counter_for_key(&newcomer, 1, 5));
-        // The parent kept its floor although it is now the oldest entry.
-        assert!(!security.check_frame_counter_for_key(&parent, 1, 100));
-        assert!(!security.check_frame_counter_for_key(&source(1), 1, 101));
-        // Source 2 was evicted: its replay floor is gone.
-        assert!(security.check_frame_counter_for_key(&source(2), 1, 1));
-        for i in 3..MAX_FRAME_COUNTER_ENTRIES {
+        assert!(!security.commit_frame_counter_for_key(&newcomer, 1, 5));
+
+        // Every recorded floor survives, and known sources still advance.
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES {
+            assert!(!security.check_frame_counter_for_key(&source(i), 1, 100));
+            assert!(security.check_frame_counter_for_key(&source(i), 1, 101));
+        }
+        assert!(security.commit_frame_counter_for_key(&source(0), 1, 101));
+        assert!(!security.check_frame_counter_for_key(&source(0), 1, 101));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn reserved_slots_keep_room_for_protected_neighbours() {
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        let source = |i: usize| [i as u8 + 1; 8];
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(security.commit_frame_counter_for_key(&source(i), 1, 100));
+        }
+        let stranger = [0xF0; 8];
+        // One free slot, still needed by a parent/child without a floor.
+        assert_eq!(
+            security.check_frame_counter_reserving(&stranger, 1, 5, || 1, |_| false),
+            ReplayAdmission::TableFull
+        );
+        // The protected source itself reserves nothing for itself.
+        assert_eq!(
+            security.check_frame_counter_reserving(&stranger, 1, 5, || 0, |_| false),
+            ReplayAdmission::Fresh
+        );
+    }
+
+    #[test]
+    fn a_replay_and_a_full_table_are_reported_differently() {
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        let source = |i: usize| [i as u8 + 1; 8];
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES {
+            assert!(security.commit_frame_counter_for_key(&source(i), 1, 100));
+        }
+        #[cfg(feature = "router")]
+        let admission = |security: &NwkSecurity, source: &IeeeAddress, counter| {
+            security.check_frame_counter_reserving(source, 1, counter, || 0, |_| false)
+        };
+        #[cfg(not(feature = "router"))]
+        let admission = |security: &NwkSecurity, source: &IeeeAddress, counter| {
+            security.replay_admission(source, 1, counter, None)
+        };
+        assert_eq!(
+            admission(&security, &source(0), 100),
+            ReplayAdmission::Replay
+        );
+        assert_eq!(
+            admission(&security, &source(0), 101),
+            ReplayAdmission::Fresh
+        );
+        assert_eq!(
+            admission(&security, &[0xF0; 8], 1),
+            ReplayAdmission::TableFull
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn an_end_device_keeps_one_replay_slot_for_its_parent() {
+        const PARENT: IeeeAddress = [0xEE; 8];
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(security.commit_frame_counter_for_key_with_parent(
+                &[i as u8 + 1; 8],
+                1,
+                100,
+                Some(&PARENT),
+            ));
+        }
+        // Only the reserved slot is left: another sender is refused as
+        // table-full and is not recorded by a commit either.
+        let stranger = [0xF0; 8];
+        assert_eq!(
+            security.replay_admission(&stranger, 1, 1, Some(&PARENT)),
+            ReplayAdmission::TableFull
+        );
+        assert!(!security.commit_frame_counter_for_key_with_parent(&stranger, 1, 1, Some(&PARENT)));
+        assert!(!security.has_frame_counter_for_key(&stranger, 1));
+
+        // The parent takes the reserved slot without displacing anyone.
+        assert_eq!(
+            security.replay_admission(&PARENT, 1, 1, Some(&PARENT)),
+            ReplayAdmission::Fresh
+        );
+        assert!(security.commit_frame_counter_for_key_with_parent(&PARENT, 1, 1, Some(&PARENT)));
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(security.has_frame_counter_for_key(&[i as u8 + 1; 8], 1));
+        }
+        // A full table still refuses other senders and still reports a
+        // replay of a known one as a replay.
+        assert_eq!(
+            security.replay_admission(&stranger, 1, 1, Some(&PARENT)),
+            ReplayAdmission::TableFull
+        );
+        assert_eq!(
+            security.replay_admission(&PARENT, 1, 1, Some(&PARENT)),
+            ReplayAdmission::Replay
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn the_parent_slot_is_not_held_once_the_parent_has_a_floor() {
+        const PARENT: IeeeAddress = [0xEE; 8];
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        assert!(security.commit_frame_counter_for_key_with_parent(&PARENT, 1, 5, Some(&PARENT)));
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(security.commit_frame_counter_for_key_with_parent(
+                &[i as u8 + 1; 8],
+                1,
+                100,
+                Some(&PARENT),
+            ));
+        }
+        assert!(security.frame_counter_table.is_full());
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn a_parent_replaces_only_the_oldest_non_parent_floor_of_a_full_table() {
+        const PARENT: IeeeAddress = [0xEE; 8];
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        // The parent's key-1 floor was admitted first; then other senders.
+        assert!(security.commit_frame_counter_for_key_with_parent(&PARENT, 1, 5, Some(&PARENT)));
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(security.commit_frame_counter_for_key(&[i as u8 + 1; 8], 1, 100));
+        }
+        assert!(security.frame_counter_table.is_full());
+
+        // A new domain of the parent (here: under a new key sequence) is
+        // admitted and replaces the earliest-admitted *other* floor.
+        assert_eq!(
+            security.replay_admission(&PARENT, 2, 1, Some(&PARENT)),
+            ReplayAdmission::Fresh
+        );
+        assert!(security.commit_frame_counter_for_key_with_parent(&PARENT, 2, 1, Some(&PARENT)));
+        assert!(security.has_frame_counter_for_key(&PARENT, 1));
+        assert!(security.has_frame_counter_for_key(&PARENT, 2));
+        assert!(!security.has_frame_counter_for_key(&[1; 8], 1));
+        for i in 1..MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(security.has_frame_counter_for_key(&[i as u8 + 1; 8], 1));
+        }
+        // The next parent domain takes the next-oldest other floor.
+        assert!(security.commit_frame_counter_for_key_with_parent(&PARENT, 3, 1, Some(&PARENT)));
+        assert!(!security.has_frame_counter_for_key(&[2; 8], 1));
+        assert!(security.has_frame_counter_for_key(&[3; 8], 1));
+        assert!(security.has_frame_counter_for_key(&PARENT, 1));
+
+        // Without a known parent nothing is replaced: the conservative forms
+        // refuse every new domain of a full table.
+        assert!(!security.check_frame_counter_for_key(&PARENT, 4, 1));
+        assert!(!security.commit_frame_counter_for_key(&PARENT, 4, 1));
+        assert!(security.has_frame_counter_for_key(&[3; 8], 1));
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn a_table_holding_only_parent_floors_refuses_even_the_parent() {
+        const PARENT: IeeeAddress = [0xEE; 8];
+        let mut security = NwkSecurity::new();
+        for sequence in 0..MAX_FRAME_COUNTER_ENTRIES as u8 {
+            assert!(security.commit_frame_counter_for_key_with_parent(
+                &PARENT,
+                sequence,
+                1,
+                Some(&PARENT)
+            ));
+        }
+        let next = MAX_FRAME_COUNTER_ENTRIES as u8;
+        assert_eq!(
+            security.replay_admission(&PARENT, next, 1, Some(&PARENT)),
+            ReplayAdmission::TableFull
+        );
+        assert!(!security.commit_frame_counter_for_key_with_parent(
+            &PARENT,
+            next,
+            1,
+            Some(&PARENT)
+        ));
+    }
+
+    /// Fill the table with key-1 floors for sources `1..=MAX`, then let
+    /// `silent` seconds pass for all of them.
+    #[cfg(feature = "router")]
+    fn full_router_table(silent: u16) -> NwkSecurity {
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES {
+            assert!(security.commit_frame_counter_for_key(&[i as u8 + 1; 8], 1, 100));
+        }
+        security.age_replay_floors(silent);
+        security
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_stale_unprotected_floor_is_evicted_for_a_new_source() {
+        let mut security = full_router_table(DEFAULT_REPLAY_STALE_SECS);
+        // Source 1 keeps talking; every other floor has been silent an hour.
+        assert!(security.commit_frame_counter_for_key(&[1; 8], 1, 101));
+        let newcomer = [0xF0; 8];
+        let unprotected = |_: &IeeeAddress| false;
+
+        assert_eq!(
+            security.check_frame_counter_reserving(&newcomer, 1, 5, || 0, unprotected),
+            ReplayAdmission::Fresh
+        );
+        assert!(security.commit_frame_counter_for_key_protecting(&newcomer, 1, 5, unprotected));
+        assert!(security.has_frame_counter_for_key(&newcomer, 1));
+        assert!(!security.check_frame_counter_for_key(&newcomer, 1, 5));
+        // Exactly one stale floor went; the fresh one stayed.
+        let survivors = (0..MAX_FRAME_COUNTER_ENTRIES)
+            .filter(|i| security.has_frame_counter_for_key(&[*i as u8 + 1; 8], 1))
+            .count();
+        assert_eq!(survivors, MAX_FRAME_COUNTER_ENTRIES - 1);
+        assert!(security.has_frame_counter_for_key(&[1; 8], 1));
+        assert!(!security.check_frame_counter_for_key(&[1; 8], 1, 101));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn the_longest_silent_floor_is_evicted_first() {
+        let mut security = full_router_table(0);
+        security.age_replay_floors(DEFAULT_REPLAY_STALE_SECS);
+        // Everyone but source 7 speaks once, then another hour passes.
+        for i in (0..MAX_FRAME_COUNTER_ENTRIES).filter(|i| *i != 6) {
+            assert!(security.commit_frame_counter_for_key(&[i as u8 + 1; 8], 1, 101));
+        }
+        security.age_replay_floors(DEFAULT_REPLAY_STALE_SECS);
+        assert!(security.commit_frame_counter_for_key_protecting(&[0xF0; 8], 1, 5, |_| false));
+        assert!(!security.has_frame_counter_for_key(&[7; 8], 1));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_recently_heard_floor_is_never_evicted() {
+        let mut security = full_router_table(DEFAULT_REPLAY_STALE_SECS - 1);
+        let newcomer = [0xF0; 8];
+        assert_eq!(
+            security.check_frame_counter_reserving(&newcomer, 1, 5, || 0, |_| false),
+            ReplayAdmission::TableFull
+        );
+        assert!(!security.commit_frame_counter_for_key_protecting(&newcomer, 1, 5, |_| false));
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES {
+            assert!(!security.check_frame_counter_for_key(&[i as u8 + 1; 8], 1, 100));
+        }
+        // One more second makes them all stale.
+        security.age_replay_floors(1);
+        assert!(security.commit_frame_counter_for_key_protecting(&newcomer, 1, 5, |_| false));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn parent_and_child_floors_are_never_evicted_even_when_stale() {
+        let mut security = full_router_table(u16::MAX);
+        let newcomer = [0xF0; 8];
+        // Every source is the parent or a child.
+        assert_eq!(
+            security.check_frame_counter_reserving(&newcomer, 1, 5, || 0, |_| true),
+            ReplayAdmission::TableFull
+        );
+        assert!(!security.commit_frame_counter_for_key_protecting(&newcomer, 1, 5, |_| true));
+        // The conservative form never evicts at all.
+        assert!(!security.check_frame_counter_for_key(&newcomer, 1, 5));
+        assert!(!security.commit_frame_counter_for_key(&newcomer, 1, 5));
+        // Only the single unprotected source can give way.
+        let protect = |source: &IeeeAddress| *source != [5; 8];
+        assert!(security.commit_frame_counter_for_key_protecting(&newcomer, 1, 5, protect));
+        assert!(!security.has_frame_counter_for_key(&[5; 8], 1));
+        assert!(!security.commit_frame_counter_for_key_protecting(&[0xF1; 8], 1, 5, protect));
+        for i in (0..MAX_FRAME_COUNTER_ENTRIES).filter(|i| *i != 4) {
+            assert!(security.has_frame_counter_for_key(&[i as u8 + 1; 8], 1));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn the_stale_timeout_is_configurable() {
+        let mut security = full_router_table(0);
+        assert_eq!(
+            security.replay_stale_timeout_secs(),
+            DEFAULT_REPLAY_STALE_SECS
+        );
+        security.set_replay_stale_timeout_secs(60);
+        security.age_replay_floors(59);
+        assert!(!security.commit_frame_counter_for_key_protecting(&[0xF0; 8], 1, 5, |_| false));
+        security.age_replay_floors(1);
+        assert!(security.commit_frame_counter_for_key_protecting(&[0xF0; 8], 1, 5, |_| false));
+        // A longer timeout makes the remaining one-minute-old floors fresh.
+        security.set_replay_stale_timeout_secs(DEFAULT_REPLAY_STALE_SECS);
+        assert!(!security.commit_frame_counter_for_key_protecting(&[0xF1; 8], 1, 5, |_| false));
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn reserved_slots_also_cap_stale_eviction() {
+        let security = full_router_table(DEFAULT_REPLAY_STALE_SECS);
+        let stale_but_two = |source: &IeeeAddress| source[0] > 2;
+        // Two evictable floors: a stranger may take one while one parent/child
+        // still needs room, but not while two still do.
+        assert_eq!(
+            security.check_frame_counter_reserving(&[0xF0; 8], 1, 5, || 1, stale_but_two),
+            ReplayAdmission::Fresh
+        );
+        assert_eq!(
+            security.check_frame_counter_reserving(&[0xF0; 8], 1, 5, || 2, stale_but_two),
+            ReplayAdmission::TableFull
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_full_table_reclaims_only_previous_key_floors_and_seals_that_key() {
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        let source = |i: usize| [i as u8 + 1; 8];
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES {
+            assert!(security.commit_frame_counter_for_key(&source(i), 1, 100));
+        }
+        // Switch to key 2; key 1 stays installed as the previous key.
+        security.set_network_key([0x22; 16], 2);
+        assert_eq!(security.secondary_key().map(|k| k.seq_number), Some(1));
+
+        // A current-key newcomer takes a previous-key floor...
+        assert!(security.check_frame_counter_for_key(&source(0), 2, 200));
+        assert!(security.commit_frame_counter_for_key(&source(0), 2, 200));
+        // ...and the reclaimed previous-key source cannot come back under the
+        // previous key at an old counter, nor can any other new source.
+        assert!(!security.check_frame_counter_for_key(&source(0), 1, 1));
+        assert!(!security.check_frame_counter_for_key(&[0xF0; 8], 1, 1));
+        assert!(!security.commit_frame_counter_for_key(&[0xF0; 8], 1, 1));
+        // Unreclaimed previous-key floors still hold and still advance.
+        for i in 1..MAX_FRAME_COUNTER_ENTRIES {
+            assert!(!security.check_frame_counter_for_key(&source(i), 1, 100));
+            assert!(security.check_frame_counter_for_key(&source(i), 1, 101));
+        }
+        // Current-key floors are never reclaimed.
+        assert!(!security.check_frame_counter_for_key(&source(0), 2, 200));
+    }
+
+    #[test]
+    fn active_and_staged_key_floors_are_never_reclaimed() {
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        let source = |i: usize| [i as u8 + 1; 8];
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES {
+            assert!(security.commit_frame_counter_for_key(&source(i), 1, 100));
+        }
+        assert!(security.stage_network_key([0x22; 16], 2));
+        // The staged key's first sender does not displace an active-key floor.
+        assert!(!security.check_frame_counter_for_key(&[0xF0; 8], 2, 1));
+        assert!(!security.commit_frame_counter_for_key(&[0xF0; 8], 2, 1));
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES {
             assert!(!security.check_frame_counter_for_key(&source(i), 1, 100));
         }
-
-        // Without protection the oldest entry (the parent) goes first.
-        security.commit_frame_counter_for_key(&[0xF1; 8], 1, 1);
-        assert!(security.check_frame_counter_for_key(&parent, 1, 1));
     }
 
     #[test]
