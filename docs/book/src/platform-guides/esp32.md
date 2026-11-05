@@ -232,8 +232,11 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   address on the stack (the panicking function's caller; 0 if none),
   resolve with `addr2line -f -e <elf> 0x4200_0000+offset` against the exact
   ELF; kind 3 profile failure;
-  kind 4 hardware reset without a software cause, payload = SoC reset
-  reason (e.g. 0x0F brownout, 0x07-0x12 watchdogs).
+  kind 4 hardware reset without a software cause, payload = the raw ROM
+  SoC reset reason (e.g. 0x0F brownout, 0x07-0x12 watchdogs). Software,
+  USB and debugger resets (0x03, 0x05, 0x0C, 0x15, 0x16, 0x18 CPU0_JTAG)
+  are planned and never produce kind 4; the code is read from the ROM, not
+  through esp-hal's `SocResetReason`, which has no 0x18 variant.
 - Sleep/reset resilience: before a software reset the cause is left in four
   words of RTC fast memory (`.rtc_fast.persistent`, survives resets, not
   power-on); the next boot notes it as reason 7 and logs one `[boot]` line

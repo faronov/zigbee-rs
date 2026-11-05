@@ -9,7 +9,7 @@
 //! The LP_AON `store*` registers are deliberately not used: `store1` holds
 //! the RTC slow-clock calibration and `store4`/`store9` carry ROM flags.
 
-use sensor_sed_app::{ResetKind, RetainedBoot};
+use sensor_sed_app::ResetKind;
 
 /// Classify the raw SoC reset reason (identical codes on ESP32-C6 and
 /// ESP32-H2, ESP-IDF `soc/reset_reasons.h`).
@@ -30,7 +30,7 @@ pub const fn classify(raw: u32) -> ResetKind {
 mod hardware {
     use super::*;
     use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-    use sensor_sed_app::{BootRecord, RETAINED_WORDS, RapidResetPolicy, ResetCause};
+    use sensor_sed_app::{BootRecord, RETAINED_WORDS, RapidResetPolicy, ResetCause, RetainedBoot};
 
     #[esp_hal::ram(unstable(rtc_fast, persistent))]
     static mut RETAINED: [u32; RETAINED_WORDS] = [0; RETAINED_WORDS];
@@ -57,10 +57,15 @@ mod hardware {
         });
     }
 
-    /// The raw SoC reset reason of this boot (0 if the ROM reports an
-    /// unknown code).
+    /// The raw SoC reset reason of this boot, exactly as the ROM reports
+    /// it.
+    ///
+    /// esp-hal's `SocResetReason` has no variant for every code (it lacks
+    /// CPU0_JTAG, 0x18, which a debugger or flasher reset produces), and
+    /// mapping an unknown code to 0 would misclassify a planned reset as an
+    /// unplanned one and lose the code. The ROM call is read directly.
     pub fn raw_reset_reason() -> u32 {
-        esp_hal::system::reset_reason().map_or(0, |reason| reason as u32)
+        esp_hal::rom::rtc_get_reset_reason(esp_hal::system::Cpu::current() as u32)
     }
 
     /// Consume the previous boot's retained state. Call once, early.

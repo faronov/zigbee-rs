@@ -145,6 +145,11 @@ where
     identify_phase_on: bool,
     interview_done: bool,
     consecutive_rejoin_failures: u8,
+    /// The secure-rejoin failure limit was reached: the durable reset and
+    /// fresh join run at the top of the lifecycle once the failing call
+    /// chain has returned (see
+    /// [`service_fallback_rejoin`](Self::service_fallback_rejoin)).
+    fallback_rejoin_due: bool,
     run_again: Option<(R::Mark, u32)>,
     /// Keep-awake budgets: pending protocol work, OTA, Identify and the
     /// timed fast-poll windows.
@@ -241,6 +246,7 @@ where
             identify_phase_on: false,
             interview_done: false,
             consecutive_rejoin_failures: 0,
+            fallback_rejoin_due: false,
             run_again: None,
             pending_bound: AwakeBound::default(),
             ota_bound: AwakeBound::default(),
@@ -533,6 +539,9 @@ where
     /// short-press action would otherwise be unrecoverable without a power
     /// cycle, so it falls back to the bounded unjoined backoff instead.
     fn enter_factory_new_after_leave(&mut self) {
+        // An explicit leave waits for the user; it must not be followed by
+        // an automatic fresh join that an earlier failure scheduled.
+        self.fallback_rejoin_due = false;
         self.network_up = false;
         self.fast_poll = None;
         self.run_again = None;
@@ -702,6 +711,8 @@ where
         self.node.reset_remote_reporting();
         self.was_fast_polling = true;
         self.consecutive_rejoin_failures = 0;
+        // Any successful join supersedes a scheduled fallback.
+        self.fallback_rejoin_due = false;
         self.clear_parent_loss_evidence();
         self.poll_control_fast = None;
         self.check_in_elapsed_ms = 0;
@@ -925,20 +936,20 @@ where
     /// Start or resume while counting a restored pending secure-rejoin
     /// failure as one real over-the-air attempt.
     ///
-    /// The raw [`join_or_resume`](Self::join_or_resume) remains separate so
-    /// [`rejoin_after_reset`](Self::rejoin_after_reset) can perform its fresh
-    /// post-reset join without creating a recursive async call graph through
-    /// [`record_failed_rejoin`](Self::record_failed_rejoin).
+    /// A failure that reaches the product's limit only schedules the
+    /// fallback; the caller's lifecycle step runs it.
     async fn join_or_resume_with_rejoin_tracking(&mut self) -> bool {
         let was_secure_rejoin_pending = self.node.device().secure_rejoin_pending();
         if self.join_or_resume().await {
             true
-        } else if was_secure_rejoin_pending || self.node.device().secure_rejoin_pending() {
-            // On the first boot call, start_or_resume() restores the pending
-            // flag from the journal before attempting the rejoin, so it only
-            // becomes visible after the failed call returns.
-            self.record_failed_rejoin().await
         } else {
+            if was_secure_rejoin_pending || self.node.device().secure_rejoin_pending() {
+                // On the first boot call, start_or_resume() restores the
+                // pending flag from the journal before attempting the
+                // rejoin, so it only becomes visible after the failed call
+                // returns.
+                self.record_failed_rejoin();
+            }
             false
         }
     }
@@ -957,7 +968,8 @@ where
                 self.resources
                     .diagnostics
                     .record(DiagnosticEvent::SecureRejoinInitializationFailed);
-                self.record_failed_rejoin().await
+                self.record_failed_rejoin();
+                false
             }
             Err(StartError::CommissioningFailed(status)) => {
                 self.resources
@@ -965,7 +977,8 @@ where
                     .record(DiagnosticEvent::SecureRejoinFailed {
                         status: status as u8,
                     });
-                self.record_failed_rejoin().await
+                self.record_failed_rejoin();
+                false
             }
             Err(StartError::PersistenceFailed(error)) => self.persistence_failure(error),
         }
@@ -1006,14 +1019,33 @@ where
         }
     }
 
+    /// Run a fallback that [`record_failed_rejoin`](Self::record_failed_rejoin)
+    /// scheduled. Called only at the top of the lifecycle (the cold start
+    /// and the end of each step), after the call chain that observed the
+    /// failure — tick, control event, secure rejoin — has returned, so the
+    /// fresh-join chain never runs beneath those frames.
+    async fn service_fallback_rejoin(&mut self) {
+        // Success restarts the joined lifecycle (`reset_post_join_state`);
+        // failure leaves a factory-new device whose unjoined backoff the
+        // failing step already owns, exactly as when this ran inline.
+        if core::mem::take(&mut self.fallback_rejoin_due) {
+            self.rejoin_after_reset().await;
+        }
+    }
+
     /// Count one failed secure-rejoin attempt. Only a product that sets a
     /// nonzero `secure_rejoin_failure_limit` falls back to a durable reset
     /// and fresh join once it is reached; the default (`0`) keeps the
     /// network and lets the backoff schedule the next attempt.
     ///
+    /// Reaching the limit only schedules the fallback: it runs from
+    /// [`service_fallback_rejoin`](Self::service_fallback_rejoin) once the
+    /// caller's chain has returned, never nested beneath the failing secure
+    /// rejoin or control event.
+    ///
     /// Both direct `secure_rejoin()` failures and runtime-driven retry
     /// failures use this path, so one over-the-air attempt is counted once.
-    async fn record_failed_rejoin(&mut self) -> bool {
+    fn record_failed_rejoin(&mut self) {
         self.consecutive_rejoin_failures = self.consecutive_rejoin_failures.saturating_add(1);
         let limit = self.policy.secure_rejoin_failure_limit;
         if limit == 0 || self.consecutive_rejoin_failures < limit {
@@ -1022,7 +1054,7 @@ where
                 .record(DiagnosticEvent::SecureRejoinPending {
                     failures: self.consecutive_rejoin_failures,
                 });
-            return false;
+            return;
         }
         self.resources
             .diagnostics
@@ -1030,7 +1062,7 @@ where
                 failures: self.consecutive_rejoin_failures,
             });
         self.consecutive_rejoin_failures = 0;
-        self.rejoin_after_reset().await
+        self.fallback_rejoin_due = true;
     }
 
     /// Read all sensors and update the profile's measurement/battery
@@ -1085,6 +1117,10 @@ where
                 .status
                 .set(SensorStatus::Joined { active: true });
         }
+        // A restored pending rejoin that just reached the failure limit:
+        // reset and join before the first read and default reporting, as
+        // the boot join did when the fallback ran inline.
+        self.service_fallback_rejoin().await;
 
         self.read_sensors(SampleTrigger::ColdStart).await;
 
@@ -1313,10 +1349,9 @@ where
                     .diagnostics
                     .record(DiagnosticEvent::CommissioningComplete { success: false });
                 if self.node.device().secure_rejoin_pending() {
-                    self.record_failed_rejoin().await
-                } else {
-                    false
+                    self.record_failed_rejoin();
                 }
+                false
             }
             StackEvent::DefaultResponse {
                 src_addr,
@@ -1937,6 +1972,7 @@ where
         } else {
             self.service_unjoined().await;
         }
+        self.service_fallback_rejoin().await;
     }
 
     /// Advance one finite wait/service iteration.
@@ -1980,6 +2016,7 @@ where
             self.join_wait_ms = self.join_wait_ms.saturating_sub(waited_ms);
             self.service_unjoined().await;
         }
+        self.service_fallback_rejoin().await;
         Ok(())
     }
 

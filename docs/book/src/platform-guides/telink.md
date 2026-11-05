@@ -308,11 +308,13 @@ Every TB-04 image arms the guard at entry, checks it in its main loop (router
 and End Device on each stack tick, default sensor after each executor step)
 and before every flash erase/program, and fails closed if it is damaged.
 `tools/tlsr8258-firmware.sh` runs the static analyzer gate of each image
-(`tools/tlsr8258-{sensor,ed,router}-stack-gate.args`). The analyzer bounds
-the default sensor at 22,236 B through the app-level rejoin-failure fallback
-(`SensorApp::record_failed_rejoin` -> steering -> network discovery -> radio
-TX) and the End Device at 19,096 B; both exceeded or nearly filled the
-previous 20 KiB stack. Hardware paint of the default sensor on the old 20 KiB
+(`tools/tlsr8258-{sensor,ed,router}-stack-gate.args`). The analyzer bounded
+the default sensor at 22,236 B through the app-level rejoin-failure fallback,
+then nested under the failing secure rejoin (`SensorApp::record_failed_rejoin`
+-> steering -> network discovery -> radio TX), and the End Device at 19,096 B;
+both exceeded or nearly filled the previous 20 KiB stack. The fallback now
+runs from the top of the lifecycle (`SensorApp::service_fallback_rejoin`),
+which bounds it at 19,404 B and the default sensor's worst path at 20,644 B. Hardware paint of the default sensor on the old 20 KiB
 layout measured 15,136 B (fresh join and interview, CCM* decrypt), 13,472 B
 (cold resume) and 13,788 B (Identify); the rejoin-failure path was not
 exercised on hardware.

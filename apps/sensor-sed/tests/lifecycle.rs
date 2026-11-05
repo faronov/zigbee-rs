@@ -2148,6 +2148,10 @@ struct Script {
     /// Offer a permit-join beacon and successful association response, so
     /// any network search the app starts would succeed.
     beacon: bool,
+    /// Frames the parent already holds before the cold start.
+    preload: Vec<MacFrame>,
+    /// Data transmissions that fail (no ACK) before any succeeds.
+    tx_failures: u32,
     steps: usize,
     /// Emulate a reset-on-wake platform: each iteration's sleep is taken by
     /// the platform (time advances by the request) and the app resumes with
@@ -2164,6 +2168,8 @@ impl Script {
             batches: Vec::new(),
             reasons: Vec::new(),
             beacon: false,
+            preload: Vec::new(),
+            tx_failures: 0,
             steps,
             reset_on_wake: false,
         }
@@ -2197,6 +2203,10 @@ fn run_scenario<A: sensor_sed_app::UserActionPolicy, const MODULUS: u64>(
             status: AssociationStatus::Success,
         });
     }
+    for frame in script.preload {
+        device.mac_mut().enqueue_poll_response(frame);
+    }
+    device.mac_mut().set_tx_failures(script.tx_failures);
 
     {
         let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
@@ -3760,4 +3770,146 @@ fn a_zero_failure_limit_keeps_the_legacy_reset() {
         |_, _| {},
         Some((&failing, RECOVERABLE)),
     );
+}
+
+/// Gives up on the stored network after the first failed secure rejoin.
+static ONE_REJOIN_POLICY: SensorPolicy = SensorPolicy {
+    secure_rejoin_failure_limit: 1,
+    ..BASE_POLICY
+};
+
+/// Failed data requests that make one restored-network rejoin fail without
+/// polling the parent: the secured rejoin request, its retry and the
+/// Trust Center rejoin request. Later transmissions (Device_annce of the
+/// fresh join) succeed.
+const ONE_REJOIN_TX_FAILURES: u32 = 3;
+
+fn position(run: &Scenario, wanted: impl Fn(&DiagnosticEvent) -> bool) -> usize {
+    run.diagnostics
+        .iter()
+        .position(wanted)
+        .unwrap_or_else(|| panic!("event missing: {:?}", run.diagnostics))
+}
+
+/// The fallback scheduled by the cold start's failed rejoin runs once the
+/// initial join attempt has returned, joins afresh and only then configures
+/// default reporting for the new network.
+#[test]
+fn rejoin_limit_in_the_cold_start_joins_afresh_after_the_attempt_returns() {
+    let mut stored = commissioned_state(0x02);
+    stored.rejoin_pending = true;
+    let mut script = Script::new(&ONE_REJOIN_POLICY, 2).with_beacon();
+    script.stored = Some(stored);
+    script.tx_failures = ONE_REJOIN_TX_FAILURES;
+    // The parent delivers the Transport-Key to the fresh join; the failed
+    // rejoin never polls, so it cannot consume it.
+    script.preload = vec![transport_key_frame()];
+    let run = run_scenario::<_, { 1 << 32 }>(script, NoUserAction);
+
+    assert!(run.joined, "{:?}", run.diagnostics);
+    let limit = position(&run, |event| {
+        *event == DiagnosticEvent::SecureRejoinLimitReached { failures: 1 }
+    });
+    let joined = position(&run, |event| {
+        matches!(event, DiagnosticEvent::JoinedOrResumed { .. })
+    });
+    let reporting = position(&run, |event| {
+        *event == DiagnosticEvent::DefaultReportingConfigured
+    });
+    assert!(
+        limit < joined && joined < reporting,
+        "{:?}",
+        run.diagnostics
+    );
+    assert_eq!(
+        run.count(|event| matches!(event, DiagnosticEvent::SecureRejoinPending { .. })),
+        0
+    );
+    assert_eq!(run.attempts(), 0, "no backoff retry was needed");
+    // The fresh join starts its fast-poll window.
+    assert_eq!(run.waits[0].sleep_depth, SleepDepth::Active);
+}
+
+/// A limit reached inside a step (runtime-driven rejoin retry) is serviced
+/// after that step's own failure handling returned: the step first records
+/// its join backoff, then the fresh join supersedes that backoff.
+#[test]
+fn rejoin_limit_in_a_step_joins_afresh_after_the_step_handled_the_failure() {
+    let mut stored = commissioned_state(0x02);
+    stored.rejoin_pending = true;
+    let mut script = Script::new(&BASE_POLICY, 8).with_beacon();
+    script.stored = Some(stored);
+    // Both counted rejoins (cold start and the retry) fail without polling.
+    script.tx_failures = 2 * ONE_REJOIN_TX_FAILURES;
+    script.batches = (0..8).map(|_| vec![transport_key_frame()]).collect();
+    let run = run_scenario::<_, { 1 << 32 }>(script, NoUserAction);
+
+    assert!(run.joined, "{:?}", run.diagnostics);
+    let limit = position(&run, |event| {
+        *event == DiagnosticEvent::SecureRejoinLimitReached { failures: 2 }
+    });
+    let step_backoff = limit
+        + run.diagnostics[limit..]
+            .iter()
+            .position(|event| matches!(event, DiagnosticEvent::JoinBackoff { .. }))
+            .expect("the failing step schedules its backoff");
+    let joined = position(&run, |event| {
+        matches!(event, DiagnosticEvent::JoinedOrResumed { .. })
+    });
+    assert!(
+        limit < step_backoff && step_backoff < joined,
+        "{:?}",
+        run.diagnostics
+    );
+    assert_eq!(
+        run.count(|event| matches!(event, DiagnosticEvent::JoinedOrResumed { .. })),
+        1
+    );
+    // The backoff the failing step scheduled is never slept: the device
+    // fast-polls its new parent instead.
+    let DiagnosticEvent::JoinBackoff { delay_ms } = run.diagnostics[step_backoff] else {
+        unreachable!()
+    };
+    assert!(
+        run.waits.iter().all(|wait| wait.timeout_ms != delay_ms),
+        "{:?}",
+        run.waits
+    );
+    assert_eq!(
+        run.waits.last().map(|wait| wait.sleep_depth),
+        Some(SleepDepth::Active),
+        "{:?}",
+        run.waits
+    );
+}
+
+/// A fallback join that fails leaves a factory-new device on the ordinary
+/// unjoined backoff. The fallback runs once per reached limit; it is not
+/// re-armed by the retries that follow.
+#[test]
+fn failed_fallback_join_falls_back_to_the_unjoined_backoff_once() {
+    let mut stored = commissioned_state(0x02);
+    stored.rejoin_pending = true;
+    let mut script = Script::new(&ONE_REJOIN_POLICY, 3).with_beacon();
+    script.stored = Some(stored);
+    // No Transport-Key is ever delivered, so every fresh join fails.
+    let run = run_scenario::<_, { 1 << 32 }>(script, NoUserAction);
+
+    assert!(!run.joined);
+    assert_eq!(
+        run.commissioned,
+        Some(false),
+        "the stored network was reset"
+    );
+    assert_eq!(
+        run.count(|event| matches!(event, DiagnosticEvent::SecureRejoinLimitReached { .. })),
+        1,
+        "{:?}",
+        run.diagnostics
+    );
+    assert_eq!(
+        run.count(|event| matches!(event, DiagnosticEvent::JoinedOrResumed { .. })),
+        0
+    );
+    assert_eq!(&run.backoffs()[..3], &[100, 200, 400]);
 }
