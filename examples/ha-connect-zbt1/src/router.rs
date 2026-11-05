@@ -191,6 +191,15 @@ fn log_summary(app: &App) {
         ack.rx_restart_fail,
         ack.max_turnaround_us
     );
+    let security = nwk.rx_security_stats();
+    log::info!(
+        "[ZBT1] nwk-sec secured {} ok {} replay {} replay-table-full {} mic-fail {}",
+        security.secured_frames,
+        security.decrypt_successes,
+        security.replay_rejections,
+        security.replay_table_full,
+        security.decrypt_failures
+    );
     for child in neighbors.children() {
         log::info!(
             "[ZBT1]  child 0x{:04X} rx_on={} lqi={}",

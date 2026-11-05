@@ -897,10 +897,14 @@ sender's IEEE address and network-key sequence to the last seen frame counter
 incoming NWK counters: it is never written to flash and is forgotten on
 reboot (the EmberZNet/ZBOSS/Z-Stack trade-off; see
 [NV storage](../advanced/nv-storage.md#incoming-nwk-replay-floors-are-ram-only)).
-It never evicts a floor within a boot: when full, a new sender is refused,
-slots stay reserved for parents and children, and only floors of the retained
-previous network key may be reclaimed, which seals that key for the rest of
-the boot.  When a secured frame arrives:
+An end device never evicts a floor within a boot: when full, a new sender is
+refused.  A router keeps slots reserved for its parent and children, may
+reclaim floors of the retained previous network key (which seals that key for
+the rest of the boot), and may evict a floor only after its sender has been
+silent for the configurable stale timeout (default one hour); parent and
+child floors are never evicted.  A refused new sender is counted in
+`replay_table_full`, separately from `replay_rejections`.  When a secured
+frame arrives:
 
 1. `check_frame_counter(source, counter)` — verifies the counter is strictly
    greater than the last seen value

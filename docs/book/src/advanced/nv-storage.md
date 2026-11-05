@@ -50,12 +50,21 @@ replay table (`zigbee_nwk::security`, `MAX_FRAME_COUNTER_ENTRIES`: 64 in
   sequence number, never by the routed NWK originator;
 - the R22 incoming check (frame counter strictly greater than the floor) is
   unchanged and the floor only moves forward within a boot;
-- the table never evicts a floor. When it is full, a new sender is refused
-  (counted in `replay_rejections`) instead of forgetting an existing floor.
-  Slots are reserved for parents and children that have no floor yet, and the
-  only reclaimable floors are those of the retained *previous* network key;
-  reclaiming one seals that key so frames under it are refused for the rest
-  of the boot;
+- an end-device build (`router` feature off) never evicts a floor: when the
+  table is full, a new sender is refused (fail closed);
+- a `router` build makes room for a new sender, in this order: a free slot;
+  a floor of the retained *previous* network key (reclaiming one seals that
+  key so new senders under it are refused for the rest of the boot); the
+  longest-silent floor whose sender has not been heard for the stale timeout
+  (`NwkSecurity::set_replay_stale_timeout_secs`, default
+  `DEFAULT_REPLAY_STALE_SECS` = 3,600 s, at most `u16::MAX` s). Floors of the
+  parent and of children are never evicted, and free or evictable slots stay
+  reserved for a parent or child that has no floor yet. If nothing qualifies,
+  the new sender is refused (fail closed). The silence clock runs in router
+  NWK maintenance (one-second ticks) and resets on every accepted frame;
+- a refused new sender is counted in `NwkRxSecurityStats::replay_table_full`
+  and logged as `Replay table full — refusing new source`, separately from a
+  real replay (`replay_rejections`, `Frame counter replay`);
 - floors for a key sequence are dropped only when that key is removed or its
   material is replaced. A key update whose snapshot fails to commit keeps the
   active key's floors and fences further receive until the snapshot commits;
@@ -67,6 +76,14 @@ floor, a reboot lets an attacker replay one NWK frame that was captured under
 the current network key. APS-secured traffic (Trust Center commands, key
 transport, application-link-key data) stays protected by its durable APS
 floors, and the device's own outgoing counters stay store-ahead reserved.
+
+Stale eviction on routers has the same shape of trade-off within a boot: an
+evicted sender re-enters at the counter of its next frame, so one frame it
+sent before falling silent for the whole timeout could be replayed once. The
+parent and children, whose traffic the device serves, are never exposed this
+way. The alternative, refusing every new neighbour for the rest of the boot
+once a dense network has filled the table, would cut a long-running router
+off from legitimate new links.
 
 The reason is flash endurance. Persisting every newer NWK counter appended
 one journal record per accepted secured frame. On a Home Assistant Connect

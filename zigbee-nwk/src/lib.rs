@@ -160,6 +160,9 @@ pub struct NwkRxSecurityStats {
     pub security_header_parse_failures: u32,
     pub missing_keys: u32,
     pub replay_rejections: u32,
+    /// New sources refused because the RAM replay table had no room (not a
+    /// replay): see `docs/book/src/advanced/nv-storage.md`.
+    pub replay_table_full: u32,
     pub decrypt_successes: u32,
     pub decrypt_failures: u32,
 }
@@ -940,6 +943,8 @@ impl<M: MacDriver> NwkLayer<M> {
         for _ in 0..elapsed_secs {
             self.neighbors.age_tick();
         }
+        #[cfg(feature = "router")]
+        self.security.age_replay_floors(elapsed_secs);
     }
 
     /// Periodic router maintenance — call every second from the runtime tick.
@@ -978,6 +983,10 @@ impl<M: MacDriver> NwkLayer<M> {
                 log::warn!("[NWK] Unauthenticated child 0x{:04X} expired", child.0);
             }
         }
+
+        // Replay-floor silence feeds stale-floor eviction (router only).
+        #[cfg(feature = "router")]
+        self.security.age_replay_floors(elapsed_secs);
 
         // Route ages are wall-clock seconds, not maintenance-call counts.
         self.routing.age_by(elapsed_secs);

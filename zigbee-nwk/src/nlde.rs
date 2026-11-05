@@ -1214,38 +1214,88 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Admission already reserved room for a new domain, so this only fails
     /// if that invariant was broken; the floor is then reported and the frame
     /// refused rather than silently accepted without a floor.
-    fn commit_replay_floor(&mut self, replay: crate::security::NwkReplayCounter) -> bool {
+    pub(crate) fn commit_replay_floor(
+        &mut self,
+        replay: crate::security::NwkReplayCounter,
+    ) -> bool {
+        #[cfg(feature = "router")]
+        let recorded = {
+            let neighbors = &self.neighbors;
+            self.security.commit_frame_counter_for_key_protecting(
+                &replay.source,
+                replay.key_sequence,
+                replay.counter,
+                |source| replay_protected(neighbors, source),
+            )
+        };
+        #[cfg(not(feature = "router"))]
         let recorded = self.security.commit_frame_counter_for_key(
             &replay.source,
             replay.key_sequence,
             replay.counter,
         );
         if !recorded {
+            self.rx_security_stats.replay_table_full =
+                self.rx_security_stats.replay_table_full.wrapping_add(1);
             log::error!("[NWK] Replay floor could not be recorded");
         }
         recorded
     }
 
+    /// Admission check for an incoming NWK frame counter, before MIC
+    /// verification.
+    ///
+    /// A router may evict only stale floors of sources other than its parent
+    /// and children, and with `reserve_for_neighbours` also keeps room for
+    /// the parent and children that have no floor yet (a rejoin admits its
+    /// new parent without that reservation). An end device admits a new
+    /// source only into a free slot.
+    pub(crate) fn incoming_replay_admission(
+        &self,
+        source: &IeeeAddress,
+        key_sequence: u8,
+        counter: u32,
+        reserve_for_neighbours: bool,
+    ) -> crate::security::ReplayAdmission {
+        #[cfg(feature = "router")]
+        {
+            self.security.check_frame_counter_reserving(
+                source,
+                key_sequence,
+                counter,
+                || {
+                    if reserve_for_neighbours {
+                        self.replay_slots_reserved_for(source, key_sequence)
+                    } else {
+                        0
+                    }
+                },
+                |protected| replay_protected(&self.neighbors, protected),
+            )
+        }
+        #[cfg(not(feature = "router"))]
+        {
+            let _ = reserve_for_neighbours;
+            self.security
+                .replay_admission(source, key_sequence, counter)
+        }
+    }
+
     /// Replay-table slots a new domain from `source` must leave free.
     ///
-    /// The table never evicts a floor, so the parent and children (the links
-    /// this device exists to serve) are protected by reservation instead: a
+    /// Floors of the parent and children (the links this device exists to
+    /// serve) are never evicted, and they are protected by reservation too: a
     /// source that is neither may not take the slots still needed by a parent
     /// or child that has no floor under `key_sequence` yet.
+    #[cfg(feature = "router")]
     fn replay_slots_reserved_for(&self, source: &IeeeAddress, key_sequence: u8) -> usize {
-        let protected = |entry: &crate::neighbor::NeighborEntry| {
-            matches!(
-                entry.relationship,
-                crate::neighbor::Relationship::Parent | crate::neighbor::Relationship::Child
-            )
-        };
-        if self.neighbors.find_by_ieee(source).is_some_and(protected) {
+        if replay_protected(&self.neighbors, source) {
             return 0;
         }
         self.neighbors
             .iter()
             .filter(|entry| {
-                protected(entry)
+                is_replay_protected_neighbor(entry)
                     && !self
                         .security
                         .has_frame_counter_for_key(&entry.ieee_address, key_sequence)
@@ -1860,16 +1910,28 @@ impl<M: MacDriver> NwkLayer<M> {
 
         // Step 1: check the replay window WITHOUT committing. A new source
         // must also fit the non-evicting RAM replay table.
-        if !self.security.check_frame_counter_reserving(
+        match self.incoming_replay_admission(
             &sec_hdr.source_address,
             sec_hdr.key_seq_number,
             sec_hdr.frame_counter,
-            || self.replay_slots_reserved_for(&sec_hdr.source_address, sec_hdr.key_seq_number),
+            true,
         ) {
-            self.rx_security_stats.replay_rejections =
-                self.rx_security_stats.replay_rejections.wrapping_add(1);
-            log::warn!("[NWK] Frame counter replay from 0x{:04X}", src.0);
-            return None;
+            crate::security::ReplayAdmission::Fresh => {}
+            crate::security::ReplayAdmission::Replay => {
+                self.rx_security_stats.replay_rejections =
+                    self.rx_security_stats.replay_rejections.wrapping_add(1);
+                log::warn!("[NWK] Frame counter replay from 0x{:04X}", src.0);
+                return None;
+            }
+            crate::security::ReplayAdmission::TableFull => {
+                self.rx_security_stats.replay_table_full =
+                    self.rx_security_stats.replay_table_full.wrapping_add(1);
+                log::warn!(
+                    "[NWK] Replay table full — refusing new source 0x{:04X}",
+                    src.0
+                );
+                return None;
+            }
         }
 
         // Step 2: rebuild the AAD (NWK header || auxiliary header) with the
@@ -4325,6 +4387,26 @@ impl<M: MacDriver> NwkLayer<M> {
     }
 }
 
+/// Whether a neighbour's incoming NWK replay floor is protected: the parent
+/// and authenticated children are never evicted and always have room
+/// reserved.
+#[cfg(feature = "router")]
+fn is_replay_protected_neighbor(entry: &crate::neighbor::NeighborEntry) -> bool {
+    matches!(
+        entry.relationship,
+        crate::neighbor::Relationship::Parent | crate::neighbor::Relationship::Child
+    )
+}
+
+/// Whether the replay floor of `source` (auxiliary-header sender IEEE) is
+/// protected; see [`is_replay_protected_neighbor`].
+#[cfg(feature = "router")]
+fn replay_protected(neighbors: &crate::neighbor::NeighborTable, source: &IeeeAddress) -> bool {
+    neighbors
+        .find_by_ieee(source)
+        .is_some_and(is_replay_protected_neighbor)
+}
+
 /// Process a source route relay list to determine the next hop.
 ///
 /// The relay closest to the destination is `relay_list[0]` and the relay
@@ -5318,7 +5400,6 @@ mod tests {
     }
 
     /// Copy a recorded transmission out of the mock MAC history.
-    #[cfg(feature = "router")]
     fn recorded_frame(nwk: &NwkLayer<MockMac>, index: usize) -> heapless::Vec<u8, 128> {
         heapless::Vec::from_slice(nwk.mac.tx_history()[index].payload.as_slice())
             .expect("recorded frame fits")
@@ -8430,6 +8511,99 @@ mod tests {
         send_scheduled_relays(&mut relay);
         assert_eq!(relay.rx_security_stats().replay_rejections, 1);
         assert_eq!(relay.mac.tx_history().len(), 1);
+    }
+
+    /// Fill `nwk`'s RAM replay table with floors for sources `[1; 8]` ..
+    /// `[MAX; 8]` under the shared key.
+    fn fill_replay_table(nwk: &mut NwkLayer<MockMac>) {
+        for i in 0..crate::security::MAX_FRAME_COUNTER_ENTRIES {
+            assert!(
+                nwk.security
+                    .commit_frame_counter_for_key(&[i as u8 + 1; 8], KEY_SEQ, 100)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_router_evicts_only_stale_floors_of_non_parent_non_child_sources() {
+        let on_air = secured_frame_on_air(ShortAddress::BROADCAST, &[0x5A, 0xA5]);
+        let mut router = secured_node(DeviceType::Router, ShortAddress(0x6666), DEST_IEEE);
+        fill_replay_table(&mut router);
+        for (short, ieee, relationship) in [
+            (0x0001, [1u8; 8], crate::neighbor::Relationship::Parent),
+            (0x0002, [2u8; 8], crate::neighbor::Relationship::Child),
+        ] {
+            let mut entry =
+                crate::neighbor::NeighborEntry::new_from_annce(ShortAddress(short), ieee);
+            entry.relationship = relationship;
+            entry.active = true;
+            router.neighbors.add_or_update(entry).unwrap();
+        }
+        // The parent and child have been silent for hours; every other
+        // source was heard just now.
+        router.tick_router_maintenance(u16::MAX);
+        for i in 2..crate::security::MAX_FRAME_COUNTER_ENTRIES {
+            assert!(
+                router
+                    .security
+                    .commit_frame_counter_for_key(&[i as u8 + 1; 8], KEY_SEQ, 101)
+            );
+        }
+
+        // Nothing is evictable: the new source is refused as table-full, not
+        // as a replay, and the protected floors survive.
+        assert!(block_on(router.process_incoming_nwk_frame(&on_air, 42)).is_none());
+        let stats = router.rx_security_stats();
+        assert_eq!(stats.replay_table_full, 1);
+        assert_eq!(stats.replay_rejections, 0);
+        assert_eq!(stats.decrypt_successes, 0);
+        assert!(router.security.has_frame_counter_for_key(&[1; 8], KEY_SEQ));
+        assert!(router.security.has_frame_counter_for_key(&[2; 8], KEY_SEQ));
+
+        // After the stale timeout the other sources become evictable and the
+        // newcomer is admitted, still without touching the parent or child.
+        router.tick_router_maintenance(crate::security::DEFAULT_REPLAY_STALE_SECS);
+        assert!(block_on(router.process_incoming_nwk_frame(&on_air, 42)).is_some());
+        assert_eq!(router.rx_security_stats().decrypt_successes, 1);
+        assert!(
+            router
+                .security
+                .has_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ)
+        );
+        assert!(router.security.has_frame_counter_for_key(&[1; 8], KEY_SEQ));
+        assert!(router.security.has_frame_counter_for_key(&[2; 8], KEY_SEQ));
+
+        // The newcomer's floor is now authoritative: the same frame replays.
+        assert!(block_on(router.process_incoming_nwk_frame(&on_air, 42)).is_none());
+        let stats = router.rx_security_stats();
+        assert_eq!(stats.replay_rejections, 1);
+        assert_eq!(stats.replay_table_full, 1);
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn an_end_device_refuses_a_new_source_when_its_replay_table_is_full() {
+        const DEVICE: ShortAddress = ShortAddress(0x6666);
+        let mut origin = secured_node(DeviceType::EndDevice, ORIGIN, ORIGIN_IEEE);
+        block_on(origin.nlde_data_request(DEVICE, 5, &[0x5A, 0xA5], true, false))
+            .expect("the originator secures and sends the frame");
+        let on_air = recorded_frame(&origin, 0);
+        let mut device = secured_node(DeviceType::EndDevice, DEVICE, [0xC0; 8]);
+        fill_replay_table(&mut device);
+        device.tick_end_device_maintenance(u16::MAX);
+
+        assert!(block_on(device.process_incoming_nwk_frame(&on_air, 42)).is_none());
+        let stats = device.rx_security_stats();
+        assert_eq!(stats.replay_table_full, 1);
+        assert_eq!(stats.replay_rejections, 0);
+        for i in 0..crate::security::MAX_FRAME_COUNTER_ENTRIES {
+            assert!(
+                !device
+                    .security
+                    .check_frame_counter_for_key(&[i as u8 + 1; 8], KEY_SEQ, 100)
+            );
+        }
     }
 
     #[test]

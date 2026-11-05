@@ -1192,11 +1192,12 @@ impl<M: MacDriver> NwkLayer<M> {
                         }
                     };
                 if sec_hdr.source_address != parent_ieee
-                    || !self.security.check_frame_counter_for_key(
+                    || self.incoming_replay_admission(
                         &sec_hdr.source_address,
                         sec_hdr.key_seq_number,
                         sec_hdr.frame_counter,
-                    )
+                        false,
+                    ) != crate::security::ReplayAdmission::Fresh
                 {
                     log::warn!(
                         "[NWK] Rejoin RX #{}: replay or source mismatch (fc={})",
@@ -1244,11 +1245,9 @@ impl<M: MacDriver> NwkLayer<M> {
                             );
                             continue;
                         }
-                        self.security.commit_frame_counter_for_key(
-                            &sec_hdr.source_address,
-                            sec_hdr.key_seq_number,
-                            sec_hdr.frame_counter,
-                        );
+                        if !self.commit_replay_floor(replay) {
+                            continue;
+                        }
                         v
                     }
                     None => {
