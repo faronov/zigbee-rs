@@ -96,6 +96,7 @@ const DETERMINISTIC_RECOVERY: sensor_sed_app::RecoveryPolicy = sensor_sed_app::R
     max_identify_awake_ms: 0,
     max_fast_poll_ms: 0,
     missed_report_grace_ms: 0,
+    sleep_failure_limit: 0,
 };
 
 const NO_STATUS_POLICY: SensorPolicy = SensorPolicy {
@@ -161,6 +162,17 @@ struct RecordingWake<'a, const MODULUS: u64 = { 1 << 32 }> {
     waits: &'a RefCell<Vec<WaitRequest>>,
     poll_counts_at_wait: &'a RefCell<Vec<u32>>,
     delay_calls: &'a Cell<u32>,
+    /// Non-active waits that still fail (without elapsed time) before
+    /// sleeping works again, and the error they return.
+    failing_sleeps: Option<&'a Cell<u32>>,
+    failure: WaitFailure,
+}
+
+/// Scripted [`RecordingWake`] error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WaitFailure {
+    recoverable: bool,
+    code: u32,
 }
 
 impl<'a, const MODULUS: u64> RecordingWake<'a, MODULUS> {
@@ -180,13 +192,26 @@ impl<'a, const MODULUS: u64> RecordingWake<'a, MODULUS> {
             waits,
             poll_counts_at_wait,
             delay_calls,
+            failing_sleeps: None,
+            failure: WaitFailure {
+                recoverable: true,
+                code: 0,
+            },
         }
     }
 }
 
 impl<const MODULUS: u64> WakeController<MockMac> for RecordingWake<'_, MODULUS> {
     type Mark = u32;
-    type Error = ();
+    type Error = WaitFailure;
+
+    fn is_recoverable(error: &WaitFailure) -> bool {
+        error.recoverable
+    }
+
+    fn error_code(error: &WaitFailure) -> u32 {
+        error.code
+    }
 
     fn mark(&self) -> Self::Mark {
         self.now
@@ -208,6 +233,13 @@ impl<const MODULUS: u64> WakeController<MockMac> for RecordingWake<'_, MODULUS> 
         let index = self.waits.borrow().len();
         self.waits.borrow_mut().push(request);
         self.poll_counts_at_wait.borrow_mut().push(mac.poll_count());
+        if let Some(failing) = self.failing_sleeps
+            && request.sleep_depth != SleepDepth::Active
+            && failing.get() > 0
+        {
+            failing.set(failing.get() - 1);
+            return Err(self.failure);
+        }
         let scripted = self
             .reasons
             .iter()
@@ -292,6 +324,10 @@ impl Supervisor for RecordingSupervisor<'_> {
 
     fn reset(&mut self) -> ! {
         panic!("unexpected reset")
+    }
+
+    fn reset_with_cause(&mut self, cause: sensor_sed_app::ResetCause) -> ! {
+        panic!("reset with cause {:#010x}", cause.word())
     }
 }
 
@@ -3110,7 +3146,24 @@ fn run_bounded<O>(
     ota: O,
     stimulus: impl FnOnce(&mut ZigbeeDevice<MockMac, EndDevice>),
     steps: usize,
+    each_step: impl FnMut(usize, &mut ZigbeeDevice<MockMac, EndDevice>),
+) -> BoundRun
+where
+    O: for<'s> OtaLifecycle<MockMac, CountingStore<'s>, TestProfile>,
+{
+    run_bounded_with(policy, profile, ota, stimulus, steps, each_step, None)
+}
+
+/// [`run_bounded`] whose non-active waits fail with `failure` while the
+/// shared count is non-zero (set it from `stimulus` to start after warm-up).
+fn run_bounded_with<O>(
+    policy: &'static SensorPolicy,
+    profile: TestProfile,
+    ota: O,
+    stimulus: impl FnOnce(&mut ZigbeeDevice<MockMac, EndDevice>),
+    steps: usize,
     mut each_step: impl FnMut(usize, &mut ZigbeeDevice<MockMac, EndDevice>),
+    failing_sleeps: Option<(&Cell<u32>, WaitFailure)>,
 ) -> BoundRun
 where
     O: for<'s> OtaLifecycle<MockMac, CountingStore<'s>, TestProfile>,
@@ -3132,7 +3185,11 @@ where
     let mut updates = Vec::new();
     {
         let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
-        let wake = RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+        let mut wake = RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+        if let Some((count, failure)) = failing_sleeps {
+            wake.failing_sleeps = Some(count);
+            wake.failure = failure;
+        }
         let mut app = SensorApp::new(
             node,
             policy,
@@ -3569,4 +3626,138 @@ fn pending_work_bound_and_restore_feed_the_anomaly_record() {
     let record = run.updates[0];
     let bytes: [u8; sensor_sed_app::ANOMALY_RECORD_LEN] = record.encode();
     assert_eq!(sensor_sed_app::AnomalyRecord::decode(&bytes), Some(record));
+}
+
+static SLEEP_FAILURE_POLICY: SensorPolicy = SensorPolicy {
+    slow_sleep_depth: SleepDepth::Idle,
+    fast_sleep_depth: SleepDepth::Idle,
+    recovery: sensor_sed_app::RecoveryPolicy {
+        sleep_failure_limit: 3,
+        ..DETERMINISTIC_RECOVERY
+    },
+    ..BASE_POLICY
+};
+
+const RECOVERABLE: WaitFailure = WaitFailure {
+    recoverable: true,
+    code: 0x0400_0003,
+};
+
+#[test]
+fn isolated_sleep_failures_finish_the_iteration_awake_without_reset() {
+    let failing = Cell::new(0);
+    let run = run_bounded_with(
+        &SLEEP_FAILURE_POLICY,
+        test_profile(),
+        NoOta,
+        |_| failing.set(2),
+        10,
+        |_, _| {},
+        Some((&failing, RECOVERABLE)),
+    );
+    let after = run.after();
+    // Each failed sleep is retried as an active wait of the same length.
+    assert_eq!(after[0].sleep_depth, SleepDepth::Idle);
+    assert_eq!(after[1].sleep_depth, SleepDepth::Active);
+    assert_eq!(after[1].timeout_ms, after[0].timeout_ms);
+    assert_eq!(after[2].sleep_depth, SleepDepth::Idle);
+    assert_eq!(after[3].sleep_depth, SleepDepth::Active);
+    // Below the limit sleep resumes and nothing is recorded.
+    assert!(after[4..].iter().all(|w| w.sleep_depth == SleepDepth::Idle));
+    assert_eq!(
+        run.anomalies(sensor_sed_app::AnomalyReason::SleepDisabled),
+        0
+    );
+    assert_eq!(
+        run.diagnostics
+            .iter()
+            .filter(|e| matches!(e, DiagnosticEvent::WakeFailed))
+            .count(),
+        2
+    );
+    assert!(run.joined);
+}
+
+#[test]
+fn consecutive_sleep_failures_disable_sleep_and_record_the_error() {
+    let failing = Cell::new(0);
+    let run = run_bounded_with(
+        &SLEEP_FAILURE_POLICY,
+        test_profile(),
+        NoOta,
+        |_| failing.set(u32::MAX),
+        10,
+        |_, _| {},
+        Some((&failing, RECOVERABLE)),
+    );
+    let after = run.after();
+    // Three failed attempts, each followed by an active retry; afterwards
+    // every wait is active and the device keeps running.
+    let idle = after
+        .iter()
+        .filter(|w| w.sleep_depth == SleepDepth::Idle)
+        .count();
+    assert_eq!(idle, 3);
+    assert!(
+        after[6..]
+            .iter()
+            .all(|w| w.sleep_depth == SleepDepth::Active)
+    );
+    assert_eq!(
+        run.anomalies(sensor_sed_app::AnomalyReason::SleepDisabled),
+        1
+    );
+    assert_eq!(run.updates.len(), 1);
+    assert_eq!(
+        run.record.last,
+        Some(sensor_sed_app::AnomalyReason::SleepDisabled)
+    );
+    assert_eq!(
+        run.record.last_cause,
+        sensor_sed_app::ResetCause::wake(RECOVERABLE.code).word()
+    );
+    assert!(run.joined);
+}
+
+#[test]
+#[should_panic(expected = "reset with cause 0x17000000")]
+fn unrecoverable_sleep_failure_resets_with_its_code() {
+    let failing = Cell::new(0);
+    run_bounded_with(
+        &SLEEP_FAILURE_POLICY,
+        test_profile(),
+        NoOta,
+        |_| failing.set(1),
+        4,
+        |_, _| {},
+        Some((
+            &failing,
+            WaitFailure {
+                recoverable: false,
+                code: 0x0700_0000,
+            },
+        )),
+    );
+}
+
+#[test]
+#[should_panic(expected = "reset with cause 0x14000003")]
+fn a_zero_failure_limit_keeps_the_legacy_reset() {
+    static POLICY: SensorPolicy = SensorPolicy {
+        recovery: sensor_sed_app::RecoveryPolicy {
+            sleep_failure_limit: 0,
+            ..DETERMINISTIC_RECOVERY
+        },
+        ..SLEEP_FAILURE_POLICY
+    };
+    let failing = Cell::new(0);
+    run_bounded_with(
+        &POLICY,
+        test_profile(),
+        NoOta,
+        |_| failing.set(1),
+        4,
+        |_, _| {},
+        Some((&failing, RECOVERABLE)),
+    );
 }

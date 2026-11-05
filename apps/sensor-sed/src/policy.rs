@@ -171,13 +171,22 @@ pub struct RecoveryPolicy {
     /// plus this grace. Requires [`report_aps_ack`](Self::report_aps_ack).
     /// `0` disables the detector.
     pub missed_report_grace_ms: u32,
+    /// Consecutive failed low-power waits (a sleep transition the platform
+    /// reports as recoverable) after which the device stays at
+    /// [`SleepDepth::Active`] for the rest of the boot and records
+    /// [`AnomalyReason::SleepDisabled`](crate::AnomalyReason::SleepDisabled).
+    /// Earlier failures finish their iteration with an active wait. A
+    /// non-recoverable failure, or any failure when this is `0`, resets
+    /// through the supervisor with the error as the retained reset cause.
+    pub sleep_failure_limit: u8,
 }
 
 impl RecoveryPolicy {
     /// Recommended battery-sensor recovery: 15-minute backoff cap, 25 %
     /// jitter, rejoin after three strikes, 30-second pending-work bound,
     /// two-hour OTA, two-minute Identify and ten-minute fast-poll bounds,
-    /// and a two-minute missed-report grace.
+    /// a two-minute missed-report grace, and sleep disabled for the boot
+    /// after three consecutive failed sleep transitions.
     pub const DEFAULT: Self = Self {
         join_retry_max_ms: 15 * 60 * 1_000,
         join_retry_jitter_pct: 25,
@@ -188,6 +197,7 @@ impl RecoveryPolicy {
         max_identify_awake_ms: 2 * 60 * 1_000,
         max_fast_poll_ms: 10 * 60 * 1_000,
         missed_report_grace_ms: 2 * 60 * 1_000,
+        sleep_failure_limit: 3,
     };
 
     pub const fn is_valid(&self) -> bool {

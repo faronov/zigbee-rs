@@ -80,6 +80,7 @@ use crate::measurement::{SampleTrigger, SensorMeasurement, SensorProfile};
 use crate::ota::{OtaActivationOutcome, OtaEventOutcome, OtaLifecycle, is_ota_event};
 use crate::parts::{SensorSedParts, SensorSedResources};
 use crate::policy::{self, SensorPolicy, ShortPressAction, SleepDepth, UserActionPolicy};
+use crate::reset_cause::ResetCause;
 
 type SensorNode<'a, M, S, P> = ZigbeeNode<'a, M, S, P, EndDevice>;
 
@@ -166,6 +167,10 @@ where
     /// whether the product has not yet seen the latest change.
     anomalies: AnomalyRecord,
     anomaly_dirty: bool,
+    /// Consecutive recoverable sleep-transition failures.
+    sleep_failures: u8,
+    /// Low-power waits are disabled for the rest of this boot.
+    sleep_disabled: bool,
     /// Runtime APS end-to-end failure count seen at the previous check.
     seen_aps_ack_failures: u8,
     /// Joined poll intervals in force: the policy's, or the profile's Poll
@@ -248,6 +253,8 @@ where
             prev_ack_failures: 0,
             anomalies: AnomalyRecord::EMPTY,
             anomaly_dirty: false,
+            sleep_failures: 0,
+            sleep_disabled: false,
             seen_aps_ack_failures: 0,
             slow_poll_ms: policy.slow_poll_ms,
             fast_poll_ms: policy.fast_poll_ms,
@@ -282,11 +289,46 @@ where
 
     fn note_anomaly(&mut self, reason: AnomalyReason) {
         self.anomalies.note(reason);
+        self.anomaly_noted(reason);
+    }
+
+    fn anomaly_noted(&mut self, reason: AnomalyReason) {
         self.anomaly_dirty = true;
         self.resources.diagnostics.record(DiagnosticEvent::Anomaly {
             reason,
             total: self.anomalies.total,
         });
+    }
+
+    /// Note the previous boot's unplanned reset, carried by the product (see
+    /// [`crate::reset_cause`]), after
+    /// [`restore_anomalies`](Self::restore_anomalies). A cause equal to the
+    /// newest recorded one is not noted again, so a reset loop changes the
+    /// record (and the product's flash copy) once per distinct cause.
+    pub fn note_reset(&mut self, cause: ResetCause) {
+        if self.anomalies.note_reset(cause.word()) {
+            self.anomaly_noted(AnomalyReason::Reset);
+        }
+    }
+
+    /// Keep every remaining wait of this boot at [`SleepDepth::Active`], for
+    /// a product whose rapid-reset guard tripped. `record` notes
+    /// [`AnomalyReason::SleepDisabled`] with `cause` (the carried reset
+    /// cause, if any); pass `false` when this burst was already recorded.
+    pub fn disable_sleep(&mut self, record: bool, cause: Option<ResetCause>) {
+        self.sleep_disabled = true;
+        if record {
+            self.anomalies.note_with_cause(
+                AnomalyReason::SleepDisabled,
+                cause.map_or(0, ResetCause::word),
+            );
+            self.anomaly_noted(AnomalyReason::SleepDisabled);
+        }
+    }
+
+    /// Whether low-power waits are disabled for the rest of this boot.
+    pub const fn sleep_disabled(&self) -> bool {
+        self.sleep_disabled
     }
 
     /// The Zigbee device, for composition roots that add product services
@@ -528,12 +570,51 @@ where
     }
 
     #[inline(never)]
-    fn wake_failure(&mut self) -> ! {
+    fn wake_failure(&mut self, code: u32) -> ! {
+        self.resources.status.set(SensorStatus::Fault);
+        self.resources
+            .supervisor
+            .reset_with_cause(ResetCause::wake(code))
+    }
+
+    /// A low-power wait failed. A recoverable failure finishes this
+    /// iteration with an active wait; `sleep_failure_limit` consecutive ones
+    /// disable low-power waits for the boot and record the error. Anything
+    /// else resets with the error as the retained cause.
+    #[inline(never)]
+    async fn recover_wake_failure(&mut self, error: W::Error, timeout_ms: u32) -> WakeReason {
+        let code = W::error_code(&error);
         self.resources
             .diagnostics
             .record(DiagnosticEvent::WakeFailed);
-        self.resources.status.set(SensorStatus::Fault);
-        self.resources.supervisor.reset()
+        let limit = self.policy.recovery.sleep_failure_limit;
+        if limit == 0 || !W::is_recoverable(&error) {
+            self.wake_failure(code);
+        }
+        self.sleep_failures = self.sleep_failures.saturating_add(1);
+        if self.sleep_failures >= limit && !self.sleep_disabled {
+            self.sleep_disabled = true;
+            self.anomalies
+                .note_with_cause(AnomalyReason::SleepDisabled, ResetCause::wake(code).word());
+            self.anomaly_noted(AnomalyReason::SleepDisabled);
+        }
+        let result = {
+            let mac = self.node.device_mut().mac_mut();
+            self.resources
+                .wake
+                .wait(
+                    mac,
+                    WaitRequest {
+                        timeout_ms,
+                        sleep_depth: SleepDepth::Active,
+                    },
+                )
+                .await
+        };
+        match result {
+            Ok(reason) => reason,
+            Err(error) => self.wake_failure(W::error_code(&error)),
+        }
     }
 
     #[inline(never)]
@@ -560,7 +641,9 @@ where
                     .diagnostics
                     .record(DiagnosticEvent::ProfileFailure(error));
                 self.resources.status.set(SensorStatus::Fault);
-                self.resources.supervisor.reset()
+                self.resources
+                    .supervisor
+                    .reset_with_cause(ResetCause::profile())
             }
         }
     }
@@ -1775,7 +1858,10 @@ where
 
     async fn step_initialized(&mut self) {
         let joined = self.node.device().is_joined();
-        let (poll_ms, in_fast_poll, sleep_depth) = self.next_wait_ms();
+        let (poll_ms, in_fast_poll, mut sleep_depth) = self.next_wait_ms();
+        if self.sleep_disabled {
+            sleep_depth = SleepDepth::Active;
+        }
 
         // Log transition from fast→slow poll.
         if !joined {
@@ -1818,8 +1904,13 @@ where
                 .await
         };
         let wake_reason = match wait_result {
-            Ok(wake_reason) => wake_reason,
-            Err(_) => self.wake_failure(),
+            Ok(wake_reason) => {
+                if sleep_depth != SleepDepth::Active {
+                    self.sleep_failures = 0;
+                }
+                wake_reason
+            }
+            Err(error) => self.recover_wake_failure(error, poll_ms).await,
         };
         self.resources.supervisor.heartbeat();
         if !joined {

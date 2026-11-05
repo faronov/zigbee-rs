@@ -133,6 +133,9 @@ mod thermometer {
             max_fast_poll_ms: int(&mut values, "max_fast_poll_ms", 0, 86_400_000),
             missed_report_grace_ms: int(&mut values, "missed_report_grace_ms", 0, 86_400_000),
             anomaly_max_writes_per_boot: int(&mut values, "anomaly_max_writes_per_boot", 0, 255),
+            sleep_failure_limit: int(&mut values, "sleep_failure_limit", 0, 255),
+            rapid_reset_limit: int(&mut values, "rapid_reset_limit", 0, 255),
+            rapid_reset_window_ms: int(&mut values, "rapid_reset_window_ms", 1_000, 3_600_000),
             sleep_xtal_off: boolean(&mut values, "sleep_xtal_off"),
             sleep_rc_fast_off: boolean(&mut values, "sleep_rc_fast_off"),
             fresh_join_fast_ms: int(&mut values, "fresh_join_fast_ms", 1, 3_600_000),
@@ -180,6 +183,9 @@ mod thermometer {
         max_fast_poll_ms: i64,
         missed_report_grace_ms: i64,
         anomaly_max_writes_per_boot: i64,
+        sleep_failure_limit: i64,
+        rapid_reset_limit: i64,
+        rapid_reset_window_ms: i64,
         sleep_xtal_off: bool,
         sleep_rc_fast_off: bool,
         fresh_join_fast_ms: i64,
@@ -312,6 +318,9 @@ mod thermometer {
                  pub const MISSED_REPORT_GRACE_MS: u32 = {missed_grace};\n\
                  #[allow(dead_code)]\n\
                  pub const ANOMALY_MAX_WRITES_PER_BOOT: u8 = {anomaly_writes};\n\
+                 pub const SLEEP_FAILURE_LIMIT: u8 = {sleep_failures};\n\
+                 pub const RAPID_RESET_LIMIT: u8 = {rapid_limit};\n\
+                 pub const RAPID_RESET_WINDOW_MS: u32 = {rapid_window};\n\
                  pub const SLEEP_XTAL_OFF: bool = {xtal_off};\n\
                  pub const SLEEP_RC_FAST_OFF: bool = {fosc_off};\n\
                  #[allow(dead_code)]\n\
@@ -354,6 +363,9 @@ mod thermometer {
                 max_fast = self.max_fast_poll_ms,
                 missed_grace = self.missed_report_grace_ms,
                 anomaly_writes = self.anomaly_max_writes_per_boot,
+                sleep_failures = self.sleep_failure_limit,
+                rapid_limit = self.rapid_reset_limit,
+                rapid_window = self.rapid_reset_window_ms,
                 xtal_off = self.sleep_xtal_off,
                 fosc_off = self.sleep_rc_fast_off,
                 log_level = self.log_level,

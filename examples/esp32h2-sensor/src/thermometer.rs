@@ -71,12 +71,66 @@ type Parts = SensorSedParts<
 type App =
     SensorApp<'static, EspSoftMac<'static>, product::storage::SecurityStore, ThermoProfile, Parts>;
 
-/// Quiet builds carry no panic formatter or console: reset and let the
-/// security journal resume the network.
+/// Quiet builds carry no panic formatter or console: record a panic-site
+/// hint for the next boot's anomaly record, reset and let the security
+/// journal resume the network. `PanicInfo::location` is deliberately not
+/// read (it would keep every panic `Location` and path string, ~35 KB).
 #[cfg(feature = "quiet")]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
+    let site = panic_site();
+    thermometer_platform::record_reset(sensor_sed_app::ResetCause::panic_site(site));
     esp_hal::system::software_reset()
+}
+
+/// Flash-code offset (from `0x4200_0000`) of the panicking function's saved
+/// return address, 0 if it is not found within 64 stack words.
+///
+/// With `panic = "abort"` and an unused `PanicInfo` the `core::panicking`
+/// shims are frameless calls, so the panicking call site itself is lost.
+/// The handler's frame holds its own return address into `panic_fmt` (the
+/// entry `ra`, read below before any call); the next word above it that
+/// lies in the code window (above `_rodata_end`) is the return address the
+/// panicking function saved, i.e. a call site in its caller. It is a
+/// heuristic hint (a code pointer in a local can precede it): resolve it
+/// against the exact ELF with `addr2line -f -e <elf> <0x4200_0000+offset>`.
+#[cfg(feature = "quiet")]
+#[inline(always)]
+fn panic_site() -> u32 {
+    const CODE_BASE: usize = 0x4200_0000;
+    const CODE_END: usize = 0x4280_0000;
+    const SCAN_WORDS: usize = 64;
+    unsafe extern "C" {
+        static _rodata_end: u32;
+        static _stack_start: u32;
+    }
+    let entry_ra: usize;
+    let sp: usize;
+    // SAFETY: register reads only; inlined into the handler before it
+    // makes any call, so `ra` is still the handler's return address.
+    unsafe {
+        core::arch::asm!("mv {}, ra", out(reg) entry_ra, options(nomem, nostack));
+        core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack));
+    }
+    let code = core::ptr::addr_of!(_rodata_end) as usize..CODE_END;
+    let stack_top = core::ptr::addr_of!(_stack_start) as usize;
+    let mut past_handler = false;
+    let mut at = sp;
+    for _ in 0..SCAN_WORDS {
+        if at + 4 > stack_top {
+            break;
+        }
+        // SAFETY: an aligned word between the live stack pointer and the
+        // top of the stack region.
+        let word = unsafe { core::ptr::read_volatile(at as *const usize) };
+        at += 4;
+        if !past_handler {
+            past_handler = word == entry_ra;
+        } else if code.contains(&word) && word & 1 == 0 {
+            return (word - CODE_BASE) as u32;
+        }
+    }
+    0
 }
 
 /// Unrecoverable startup failure. Spin rather than reset so a bad partition
@@ -173,6 +227,12 @@ fn main() -> ! {
     #[cfg(not(feature = "quiet"))]
     thermometer_platform::console::init();
     product::time_driver::init(peripherals.SYSTIMER);
+    // Consume the previous boot's reset cause and rapid-reset count before
+    // anything below can reset again.
+    let boot = product::reset_cause::boot(sensor_sed_app::RapidResetPolicy {
+        limit: config::RAPID_RESET_LIMIT,
+        window_ms: config::RAPID_RESET_WINDOW_MS,
+    });
 
     // Quiet builds also suppress the ROM bootloader banner on later resets.
     let rtc = esp_hal::rtc_cntl::Rtc::new(peripherals.LPWR);
@@ -229,14 +289,14 @@ fn main() -> ! {
     let Ok(app) = SensorApp::new(node, &POLICY, parts) else {
         halt()
     };
-    block_on(run(APP.init(app)))
+    block_on(run(APP.init(app), boot))
 }
 
 /// Restore the anomaly record → `initialize` → restore the persisted
 /// reporting configuration and Poll Control values → `step` forever,
 /// persisting a changed configuration (and a new anomaly) after each
 /// iteration.
-async fn run(app: &'static mut App) -> ! {
+async fn run(app: &'static mut App, boot: sensor_sed_app::BootRecord) -> ! {
     #[cfg(feature = "anomaly-record")]
     let mut anomalies = product::anomaly::anomaly_store(config::ANOMALY_MAX_WRITES_PER_BOOT);
     #[cfg(feature = "anomaly-record")]
@@ -244,6 +304,24 @@ async fn run(app: &'static mut App) -> ! {
         app.restore_anomalies(record);
         publish_anomalies(app, &record);
     }
+    // After the restore (which clears the pending update), so a carried
+    // cause is published and persisted by the first loop iteration.
+    if let Some(cause) = boot.carried {
+        app.note_reset(cause);
+    }
+    if boot.guard_tripped {
+        app.disable_sleep(boot.guard_first_trip, boot.carried);
+    }
+    log::info!(
+        "[boot] reset 0x{:02X} cause 0x{:08X} rapid {} sleep {}",
+        product::reset_cause::raw_reset_reason(),
+        boot.carried.map_or(0, sensor_sed_app::ResetCause::word),
+        boot.rapid_resets,
+        if boot.guard_tripped { "off" } else { "on" },
+    );
+    let stable_at = embassy_time::Instant::now()
+        + embassy_time::Duration::from_millis(u64::from(config::RAPID_RESET_WINDOW_MS));
+    let mut stable = false;
     if app.initialize().await.is_err() {
         halt()
     }
@@ -258,6 +336,10 @@ async fn run(app: &'static mut App) -> ! {
     }
     loop {
         let _ = app.step().await;
+        if !stable && embassy_time::Instant::now() >= stable_at {
+            product::reset_cause::mark_stable();
+            stable = true;
+        }
         #[cfg(feature = "anomaly-record")]
         if let Some(record) = app.take_anomaly_update() {
             publish_anomalies(app, &record);

@@ -69,6 +69,8 @@ pub mod policy;
 pub mod profile;
 #[cfg(all(target_os = "none", feature = "reporting-persist"))]
 pub mod reporting;
+#[cfg(feature = "sed")]
+pub mod reset_cause;
 #[cfg(feature = "roles")]
 pub mod router;
 pub mod sleep;

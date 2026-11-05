@@ -33,6 +33,7 @@ pub mod measurement;
 pub mod ota;
 pub mod parts;
 pub mod policy;
+pub mod reset_cause;
 
 pub use anomaly::{
     ANOMALY_RECORD_LEN, AnomalyJournal, AnomalyReason, AnomalyRecord, AwakeBound, BoundStep,
@@ -60,4 +61,7 @@ pub use policy::{
     MAX_WAIT_MS, NoUserAction, PARENT_INDIRECT_HOLD_MARGIN_MS, PARENT_INDIRECT_HOLD_MIN_MS,
     RESPONSIVE_SLOW_POLL_MS, RecoveryPolicy, SensorPolicy, ShortPressAction, SleepDepth,
     StatusPolicy, ToggleJoinAction, UserActionPolicy,
+};
+pub use reset_cause::{
+    BootRecord, RETAINED_WORDS, RapidResetPolicy, ResetCause, ResetKind, RetainedBoot,
 };

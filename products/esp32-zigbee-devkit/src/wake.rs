@@ -13,6 +13,23 @@ trait SleepCycle {
     fn restore(&mut self, report: Option<&SleepReport>) -> Result<(), Self::Error>;
 }
 
+/// Stable diagnostic encoding of a wake error: variant in bits 24..31, a
+/// variant-specific detail in bits 0..23. Recorded in retained memory and the
+/// anomaly record, so the numbering must not change.
+pub mod wake_code {
+    pub const UNSUPPORTED_DEPTH: u32 = 1;
+    pub const SLEEP_NOT_CONFIGURED: u32 = 2;
+    pub const GPIO: u32 = 3;
+    pub const HARDWARE: u32 = 4;
+    pub const UNEXPECTED_WAKE: u32 = 5;
+    pub const REPEATED_REJECTION: u32 = 6;
+    pub const RADIO_WAKE: u32 = 7;
+
+    pub const fn encode(variant: u32, detail: u32) -> u32 {
+        (variant << 24) | (detail & 0x00FF_FFFF)
+    }
+}
+
 fn run_cycle<C: SleepCycle>(cycle: &mut C) -> Result<Option<SleepReport>, C::Error> {
     if !cycle.suspend()? {
         return Ok(None);
@@ -138,8 +155,10 @@ mod hardware {
             let gpio = self.button.wakeup_enable(false, WakeEvent::LowLevel);
             self.button.clear_interrupt();
             let radio = self.mac.wake();
-            gpio.map_err(WakeError::Gpio)?;
-            radio.map_err(|_| WakeError::RadioWake)
+            // A radio that failed to wake must never be reported as the
+            // recoverable GPIO error, so check it first.
+            radio.map_err(|_| WakeError::RadioWake)?;
+            gpio.map_err(WakeError::Gpio)
         }
     }
 
@@ -156,6 +175,36 @@ mod hardware {
     impl<'button, 'radio> WakeController<EspSoftMac<'radio>> for SensorWake<'button> {
         type Mark = Instant;
         type Error = WakeError;
+
+        /// `run_cycle` always restores the radio and returns a restore error
+        /// in preference to an entry error, so every error except
+        /// `RadioWake` leaves the MAC awake and usable for an active wait.
+        fn is_recoverable(error: &WakeError) -> bool {
+            !matches!(error, WakeError::RadioWake)
+        }
+
+        fn error_code(error: &WakeError) -> u32 {
+            use super::wake_code::*;
+            match *error {
+                WakeError::UnsupportedDepth(depth) => encode(UNSUPPORTED_DEPTH, depth as u32),
+                WakeError::SleepNotConfigured => encode(SLEEP_NOT_CONFIGURED, 0),
+                WakeError::Gpio(WakeConfigError::EdgeTriggeringNotSupported) => encode(GPIO, 1),
+                WakeError::Gpio(_) => encode(GPIO, 0),
+                WakeError::Hardware(error) => encode(
+                    HARDWARE,
+                    match error {
+                        SleepError::UnsupportedClock => 1,
+                        SleepError::UnsupportedConfiguration => 2,
+                        SleepError::InvalidCalibration => 3,
+                        SleepError::InvalidDuration => 4,
+                        SleepError::InvalidCounter => 5,
+                    },
+                ),
+                WakeError::UnexpectedWake(cause) => encode(UNEXPECTED_WAKE, cause),
+                WakeError::RepeatedRejection(cause) => encode(REPEATED_REJECTION, cause),
+                WakeError::RadioWake => encode(RADIO_WAKE, 0),
+            }
+        }
 
         fn mark(&self) -> Instant {
             Instant::now()

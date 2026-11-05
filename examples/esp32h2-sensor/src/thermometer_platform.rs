@@ -6,7 +6,7 @@
 use embassy_time::Instant;
 use esp32_zigbee_devkit_product as product;
 use esp_hal::peripherals::USB_DEVICE;
-use sensor_sed_app::{DiagnosticEvent, Diagnostics, Supervisor};
+use sensor_sed_app::{DiagnosticEvent, Diagnostics, ResetCause, Supervisor};
 
 use crate::thermometer_profile::config;
 
@@ -36,6 +36,21 @@ impl Supervisor for ThermoSupervisor {
     fn reset(&mut self) -> ! {
         esp_hal::system::software_reset()
     }
+
+    fn reset_with_cause(&mut self, cause: ResetCause) -> ! {
+        record_reset(cause);
+        esp_hal::system::software_reset()
+    }
+}
+
+/// Leave `cause` for the next boot's anomaly record. A boot that already
+/// outlived the rapid-reset window is marked stable first, even if its run
+/// loop never got the chance (the failure happened inside a long wait).
+pub fn record_reset(cause: ResetCause) {
+    if Instant::now().as_millis() >= u64::from(config::RAPID_RESET_WINDOW_MS) {
+        product::reset_cause::mark_stable();
+    }
+    product::reset_cause::record(cause);
 }
 
 /// USB-Serial-JTAG pad state.

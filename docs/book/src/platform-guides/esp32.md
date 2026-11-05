@@ -207,17 +207,41 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   `max_active_ms`, `max_ota_awake_ms`, `max_identify_awake_ms`,
   `max_fast_poll_ms` and `missed_report_grace_ms` (see the power guide).
   `anomaly-record` (enabled by `thermometer`) journals the record in the
-  two-sector `0x3F6000..0x3F8000` window only when a limit fires (at most
+  two-sector `0x3F6000..0x3F8000` window only when it changes (at most
   `anomaly_max_writes_per_boot` writes per boot) and serves it from a
-  minimal Diagnostics (0x0B05) server on the endpoint: `0x0000`
-  (`NumberOfResets`, u16) = total anomalies, `0x0001`
-  (`PersistentMemoryWrites`, u32) = summary word: bits 0-7 last reason
-  code, bits 8-15 reasons seen (bit `code - 1`), bits 16-23 the last
-  reason's count, bits 24-31 the record format (1). Reason codes: 1
-  pending work, 2 OTA, 3 Identify, 4 fast-poll windows, 5 missed report,
-  6 parent-loss rejoin. The standard IDs are reused with this meaning;
-  `0x0000` reports on change only. Read both from ZHA
+  minimal Diagnostics (0x0B05) server on the endpoint, each attribute with
+  its standard data type:
+  `0x0000` (`NumberOfResets`, uint16) = total anomalies;
+  `0x0001` (`PersistentMemoryWrites`, uint16) = summary: bits 0-7 last
+  reason code, bits 8-15 reasons seen (bit `code - 1`);
+  `0x0100` (`MacRxBcast`, uint32) = last cause word (below);
+  `0x0101`/`0x0102` (`MacTxBcast`/`MacRxUcast`, uint32) = per-reason
+  counts, one saturating byte per reason, reasons 1-4 / 5-8, LE.
+  Reason codes: 1 pending work, 2 OTA, 3 Identify, 4 fast-poll windows,
+  5 missed report, 6 parent-loss rejoin, 7 unplanned reset of the previous
+  boot, 8 light sleep disabled. The standard IDs are reused with this
+  meaning; `0x0000` reports on change only. Read them from ZHA
   (Manage Zigbee device → Clusters → Diagnostic → Read attribute).
+- Cause word (reasons 7 and 8): bits 28-31 kind, 0-27 payload. Kind 1 wake
+  error, payload = variant << 24 | detail (1 unsupported depth, 2 sleep not
+  configured, 3 GPIO wake config, 4 HAL sleep error 1-5 =
+  UnsupportedClock/UnsupportedConfiguration/InvalidCalibration/
+  InvalidDuration/InvalidCounter, 5 unexpected PMU wake cause, 6 repeated
+  PMU rejection with the reject cause, 7 radio wake failure); kind 2 panic,
+  payload = flash-code offset from `0x4200_0000` of the first return
+  address on the stack (the panicking function's caller; 0 if none),
+  resolve with `addr2line -f -e <elf> 0x4200_0000+offset` against the exact
+  ELF; kind 3 profile failure;
+  kind 4 hardware reset without a software cause, payload = SoC reset
+  reason (e.g. 0x0F brownout, 0x07-0x12 watchdogs).
+- Sleep/reset resilience: before a software reset the cause is left in four
+  words of RTC fast memory (`.rtc_fast.persistent`, survives resets, not
+  power-on); the next boot notes it as reason 7 and logs one `[boot]` line
+  in non-quiet builds. A failed light sleep is retried as an active wait;
+  after `sleep_failure_limit` consecutive failures the boot stays awake and
+  records reason 8 with the wake error. After `rapid_reset_limit` boots in a
+  row shorter than `rapid_reset_window_ms`, the next boot keeps light sleep
+  off and records reason 8 once (cause = carried reset cause).
 - Light sleep stops XTAL and RC_FAST (`sleep_xtal_off`,
   `sleep_rc_fast_off`) and applies ESP-IDF's light-sleep analog settings
   (see `vendor/esp-hal/LOCAL-PATCHES.md`). CPU, top, modem and flash

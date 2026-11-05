@@ -68,6 +68,7 @@ pub static POLICY: SensorPolicy = SensorPolicy {
         max_identify_awake_ms: config::MAX_IDENTIFY_AWAKE_MS,
         max_fast_poll_ms: config::MAX_FAST_POLL_MS,
         missed_report_grace_ms: config::MISSED_REPORT_GRACE_MS,
+        sleep_failure_limit: config::SLEEP_FAILURE_LIMIT,
     },
     ..product::policy::SENSOR_POLICY
 };

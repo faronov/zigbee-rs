@@ -114,11 +114,26 @@ max_fast_poll_ms = 600000
 # and every report forced due. 0 disables; needs report_aps_ack.
 missed_report_grace_ms = 120000
 
+# --- sleep and reset resilience --------------------------------------------
+# Consecutive failed light-sleep attempts (each retried as an active wait)
+# after which the device stays awake for the rest of the boot and records
+# reason 8 (sleep disabled) with the error code. 0 = reset on the first
+# failure (the pre-fix behaviour; a reset loop when sleep keeps failing).
+sleep_failure_limit = 3
+# Boots in a row that end (any reset) before `rapid_reset_window_ms` of
+# uptime, after which the next boot keeps light sleep off and records
+# reason 8 once. Counted in RTC memory, cleared by a power cycle or a boot
+# that outlives the window. 0 disables the guard.
+rapid_reset_limit = 3
+rapid_reset_window_ms = 60000
+
 # --- anomaly record --------------------------------------------------------
-# The record (last reason, reasons seen, per-reason counts) is journaled in
-# `zbnv` only when a limit fires, at most this many times per boot (no flash
-# wear in normal operation; 0 = never write). It is readable as Diagnostics
-# (0x0B05) attributes 0x0000 (total) and 0x0001 (summary word).
+# The record (last reason, reasons seen, per-reason counts, last cause) is
+# journaled in `zbnv` only when it changes, at most this many times per boot
+# (no flash wear in normal operation; 0 = never write). Diagnostics (0x0B05):
+# 0x0000 uint16 total, 0x0001 uint16 summary (bits 0-7 last reason, 8-15
+# reasons seen), 0x0100 uint32 last cause word, 0x0101/0x0102 uint32
+# per-reason counts (one byte each, reasons 1-4 / 5-8, LE).
 anomaly_max_writes_per_boot = 8
 
 # --- power ---------------------------------------------------------------

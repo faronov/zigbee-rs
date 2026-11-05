@@ -79,6 +79,14 @@ impl<M: MacDriver, W: WakeController<M>> WakeController<M> for DiagWake<W> {
     type Mark = W::Mark;
     type Error = W::Error;
 
+    fn is_recoverable(error: &Self::Error) -> bool {
+        W::is_recoverable(error)
+    }
+
+    fn error_code(error: &Self::Error) -> u32 {
+        W::error_code(error)
+    }
+
     fn mark(&self) -> Self::Mark {
         self.inner.mark()
     }

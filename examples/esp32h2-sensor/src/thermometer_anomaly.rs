@@ -3,18 +3,21 @@
 //! server, so a field device that hit a keep-awake limit can be inspected
 //! from the coordinator without a UART.
 //!
-//! Two standard Diagnostics attribute IDs carry the record (ZHA/zigpy know
-//! both names, so the generic "read attribute" tooling shows them):
+//! Standard Diagnostics attribute IDs carry the record, each with the
+//! standard's data type (ZHA/zigpy decode them by that type, so the generic
+//! "read attribute" tooling shows them):
 //!
-//! | Attribute | Standard name            | Meaning here                     |
-//! |-----------|--------------------------|----------------------------------|
-//! | `0x0000`  | `NumberOfResets` (u16)   | total anomalies recorded         |
-//! | `0x0001`  | `PersistentMemoryWrites` (u32) | [`AnomalyRecord::summary_word`] |
+//! | Attribute | Standard name                     | Meaning here                          |
+//! |-----------|-----------------------------------|---------------------------------------|
+//! | `0x0000`  | `NumberOfResets` (uint16)         | total anomalies recorded              |
+//! | `0x0001`  | `PersistentMemoryWrites` (uint16) | [`AnomalyRecord::summary_word`]: bits 0–7 last reason, 8–15 reasons seen |
+//! | `0x0100`  | `MacRxBcast` (uint32)             | [`AnomalyRecord::last_cause`]: reset/sleep-failure cause word |
+//! | `0x0101`  | `MacTxBcast` (uint32)             | per-reason counts, reasons 1–4 (one byte each, LE) |
+//! | `0x0102`  | `MacRxUcast` (uint32)             | per-reason counts, reasons 5–8 (one byte each, LE) |
 //!
-//! The summary word packs the last reason, the set of reasons seen and the
-//! per-reason counts (see `sensor_sed_app::anomaly`). `0x0000` reports on
-//! change only (no periodic report), so a fired limit reaches the
-//! coordinator without extra traffic in normal operation.
+//! `0x0000` reports on change only (no periodic report), so a recorded
+//! anomaly reaches the coordinator without extra traffic in normal
+//! operation.
 
 use sensor_sed_app::AnomalyRecord;
 use zigbee_mac::MacDriver;
@@ -29,10 +32,19 @@ use zigbee_zcl::{AttributeId, ClusterId, CommandId, ZclStatus};
 
 pub const ATTR_ANOMALY_TOTAL: AttributeId = AttributeId(0x0000);
 pub const ATTR_ANOMALY_SUMMARY: AttributeId = AttributeId(0x0001);
+pub const ATTR_ANOMALY_LAST_CAUSE: AttributeId = AttributeId(0x0100);
+pub const ATTR_ANOMALY_COUNTS_LOW: AttributeId = AttributeId(0x0101);
+pub const ATTR_ANOMALY_COUNTS_HIGH: AttributeId = AttributeId(0x0102);
+
+const U32_ATTRIBUTES: [AttributeId; 3] = [
+    ATTR_ANOMALY_LAST_CAUSE,
+    ATTR_ANOMALY_COUNTS_LOW,
+    ATTR_ANOMALY_COUNTS_HIGH,
+];
 
 /// Read-only Diagnostics server holding the anomaly record.
 pub struct AnomalyDiagnostics {
-    store: AttributeStore<2>,
+    store: AttributeStore<5>,
 }
 
 impl AnomalyDiagnostics {
@@ -50,22 +62,42 @@ impl AnomalyDiagnostics {
         let _ = store.register(
             AttributeDefinition {
                 id: ATTR_ANOMALY_SUMMARY,
-                data_type: ZclDataType::U32,
+                data_type: ZclDataType::U16,
                 access: AttributeAccess::ReadOnly,
                 name: "",
             },
-            ZclValue::U32(0),
+            ZclValue::U16(0),
         );
+        for id in U32_ATTRIBUTES {
+            let _ = store.register(
+                AttributeDefinition {
+                    id,
+                    data_type: ZclDataType::U32,
+                    access: AttributeAccess::ReadOnly,
+                    name: "",
+                },
+                ZclValue::U32(0),
+            );
+        }
         Self { store }
     }
 
     /// Publish `record`; the reporting engine sends the changed total.
     pub fn publish(&mut self, record: &AnomalyRecord) {
-        let total = u16::try_from(record.total).unwrap_or(u16::MAX);
-        let _ = self.store.set_raw(ATTR_ANOMALY_TOTAL, ZclValue::U16(total));
         let _ = self
             .store
-            .set_raw(ATTR_ANOMALY_SUMMARY, ZclValue::U32(record.summary_word()));
+            .set_raw(ATTR_ANOMALY_TOTAL, ZclValue::U16(record.total));
+        let _ = self
+            .store
+            .set_raw(ATTR_ANOMALY_SUMMARY, ZclValue::U16(record.summary_word()));
+        let values = [
+            record.last_cause,
+            record.counts_word(0),
+            record.counts_word(1),
+        ];
+        for (id, value) in U32_ATTRIBUTES.into_iter().zip(values) {
+            let _ = self.store.set_raw(id, ZclValue::U32(value));
+        }
     }
 }
 

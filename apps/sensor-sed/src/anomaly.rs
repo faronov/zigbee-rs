@@ -8,8 +8,9 @@
 //!
 //! The record is deliberately tiny and platform independent: a product that
 //! has no console can persist it (see [`AnomalyRecord::encode`]) on the rare
-//! occasions it changes and expose it as a readable ZCL attribute
-//! ([`AnomalyRecord::summary_word`]).
+//! occasions it changes and expose it as readable ZCL attributes
+//! ([`AnomalyRecord::summary_word`], [`AnomalyRecord::counts_word`] and
+//! [`AnomalyRecord::last_cause`]).
 
 /// Why the shared lifecycle intervened.
 #[repr(u8)]
@@ -31,11 +32,21 @@ pub enum AnomalyReason {
     MissedReport = 5,
     /// Parent-loss evidence reached `parent_loss_strikes`; a rejoin started.
     ParentLoss = 6,
+    /// The previous boot ended in an unplanned reset; the product carried
+    /// its cause ([`crate::ResetCause`]) into
+    /// [`AnomalyRecord::last_cause`].
+    Reset = 7,
+    /// Low-power waits were disabled for the rest of the boot: either
+    /// `sleep_failure_limit` consecutive sleep transitions failed (the last
+    /// wait error is in [`AnomalyRecord::last_cause`]), or the product's
+    /// rapid-reset guard tripped (see [`crate::reset_cause`]).
+    SleepDisabled = 8,
 }
 
 impl AnomalyReason {
-    /// Number of distinct reasons (codes `1..=COUNT`).
-    pub const COUNT: usize = 6;
+    /// Number of distinct reasons (codes `1..=COUNT`). At most 8, so the
+    /// seen mask fits the summary's high byte.
+    pub const COUNT: usize = 8;
 
     pub const fn code(self) -> u8 {
         self as u8
@@ -49,6 +60,8 @@ impl AnomalyReason {
             4 => Self::FastPoll,
             5 => Self::MissedReport,
             6 => Self::ParentLoss,
+            7 => Self::Reset,
+            8 => Self::SleepDisabled,
             _ => return None,
         })
     }
@@ -137,24 +150,33 @@ impl AwakeBound {
 }
 
 /// Saturating anomaly counters: the last reason, a mask of every reason
-/// seen, a total and one count per reason.
+/// seen, a total, one count per reason and the cause word of the latest
+/// reset or sleep-disable anomaly.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AnomalyRecord {
     pub total: u16,
     pub last: Option<AnomalyReason>,
     pub counts: [u8; AnomalyReason::COUNT],
+    /// [`crate::ResetCause::word`] of the latest [`AnomalyReason::Reset`] or
+    /// [`AnomalyReason::SleepDisabled`] (`0` = none recorded).
+    pub last_cause: u32,
 }
 
 /// Fixed size of one encoded record (a whole number of 4-byte flash words).
-pub const ANOMALY_RECORD_LEN: usize = 16;
+pub const ANOMALY_RECORD_LEN: usize = 32;
 const ANOMALY_MAGIC: [u8; 2] = [0xA7, 0x5E];
-const ANOMALY_VERSION: u8 = 1;
+/// Version 2: 32-byte slot with eight reasons and the cause word. Version 1
+/// (16-byte) slots decode as invalid; the journal then starts afresh.
+const ANOMALY_VERSION: u8 = 2;
+const COUNTS_AT: usize = 6;
+const CAUSE_AT: usize = COUNTS_AT + AnomalyReason::COUNT;
 
 impl AnomalyRecord {
     pub const EMPTY: Self = Self {
         total: 0,
         last: None,
         counts: [0; AnomalyReason::COUNT],
+        last_cause: 0,
     };
 
     pub fn note(&mut self, reason: AnomalyReason) {
@@ -162,6 +184,26 @@ impl AnomalyRecord {
         self.last = Some(reason);
         let count = &mut self.counts[reason.index()];
         *count = count.saturating_add(1);
+    }
+
+    /// [`note`](Self::note) `reason` and remember `cause` (a
+    /// [`crate::ResetCause::word`]) as [`last_cause`](Self::last_cause).
+    pub fn note_with_cause(&mut self, reason: AnomalyReason, cause: u32) {
+        self.note(reason);
+        self.last_cause = cause;
+    }
+
+    /// Note an unplanned reset carried over from the previous boot, unless
+    /// it repeats the newest entry (same reason and cause). A reset loop
+    /// therefore changes the record, and costs a flash write, once per
+    /// distinct cause rather than once per boot. Returns whether the record
+    /// changed.
+    pub fn note_reset(&mut self, cause: u32) -> bool {
+        if self.last == Some(AnomalyReason::Reset) && self.last_cause == cause {
+            return false;
+        }
+        self.note_with_cause(AnomalyReason::Reset, cause);
+        true
     }
 
     pub const fn count(&self, reason: AnomalyReason) -> u8 {
@@ -179,18 +221,21 @@ impl AnomalyRecord {
         mask
     }
 
-    /// Compact attribute form: bits 0–7 last reason code (0 = none), bits
-    /// 8–15 [`seen_mask`](Self::seen_mask), bits 16–23 the count of the last
-    /// reason, bits 24–31 the record format version.
-    pub fn summary_word(&self) -> u32 {
-        let (code, count) = match self.last {
-            Some(reason) => (reason.code(), self.count(reason)),
-            None => (0, 0),
-        };
-        u32::from(code)
-            | u32::from(self.seen_mask()) << 8
-            | u32::from(count) << 16
-            | u32::from(ANOMALY_VERSION) << 24
+    /// 16-bit attribute form: bits 0–7 last reason code (0 = none), bits
+    /// 8–15 [`seen_mask`](Self::seen_mask).
+    pub fn summary_word(&self) -> u16 {
+        u16::from(self.last.map_or(0, AnomalyReason::code)) | u16::from(self.seen_mask()) << 8
+    }
+
+    /// Four per-reason counts packed little-endian into one 32-bit
+    /// attribute value: `group` 0 covers codes 1–4 (code 1 in bits 0–7),
+    /// `group` 1 codes 5–8.
+    pub fn counts_word(&self, group: usize) -> u32 {
+        let mut bytes = [0u8; 4];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = self.counts.get(group * 4 + index).copied().unwrap_or(0);
+        }
+        u32::from_le_bytes(bytes)
     }
 
     /// Encode as one self-checking [`ANOMALY_RECORD_LEN`]-byte slot.
@@ -200,7 +245,8 @@ impl AnomalyRecord {
         slot[2] = ANOMALY_VERSION;
         slot[3] = self.last.map_or(0, AnomalyReason::code);
         slot[4..6].copy_from_slice(&self.total.to_le_bytes());
-        slot[6..6 + AnomalyReason::COUNT].copy_from_slice(&self.counts);
+        slot[COUNTS_AT..CAUSE_AT].copy_from_slice(&self.counts);
+        slot[CAUSE_AT..CAUSE_AT + 4].copy_from_slice(&self.last_cause.to_le_bytes());
         let crc = crc16(&slot[..ANOMALY_RECORD_LEN - 2]);
         slot[ANOMALY_RECORD_LEN - 2..].copy_from_slice(&crc.to_le_bytes());
         slot
@@ -224,11 +270,14 @@ impl AnomalyRecord {
             code => Some(AnomalyReason::from_code(code)?),
         };
         let mut counts = [0u8; AnomalyReason::COUNT];
-        counts.copy_from_slice(&slot[6..6 + AnomalyReason::COUNT]);
+        counts.copy_from_slice(&slot[COUNTS_AT..CAUSE_AT]);
+        let mut cause = [0u8; 4];
+        cause.copy_from_slice(&slot[CAUSE_AT..CAUSE_AT + 4]);
         Some(Self {
             total: u16::from_le_bytes([slot[4], slot[5]]),
             last,
             counts,
+            last_cause: u32::from_le_bytes(cause),
         })
     }
 }
@@ -369,7 +418,7 @@ mod tests {
     #[test]
     fn record_counts_saturate_and_summarise() {
         let mut record = AnomalyRecord::EMPTY;
-        assert_eq!(record.summary_word(), u32::from(ANOMALY_VERSION) << 24);
+        assert_eq!(record.summary_word(), 0);
         record.note(AnomalyReason::Ota);
         for _ in 0..300 {
             record.note(AnomalyReason::MissedReport);
@@ -378,10 +427,31 @@ mod tests {
         assert_eq!(record.count(AnomalyReason::Ota), 1);
         assert_eq!(record.count(AnomalyReason::MissedReport), u8::MAX);
         assert_eq!(record.seen_mask(), 0b1_0010);
-        assert_eq!(
-            record.summary_word(),
-            5 | 0b1_0010 << 8 | 0xFF << 16 | u32::from(ANOMALY_VERSION) << 24
-        );
+        // A uint16 attribute: last reason in the low byte, mask above it.
+        assert_eq!(record.summary_word(), 5 | 0b1_0010 << 8);
+        assert_eq!(record.counts_word(0), 1 << 8);
+        assert_eq!(record.counts_word(1), 0xFF);
+        record.note_with_cause(AnomalyReason::SleepDisabled, 0x1234_5678);
+        assert_eq!(record.summary_word(), 8 | 0b1001_0010 << 8);
+        assert_eq!(record.counts_word(1), 0xFF | 1 << 24);
+        assert_eq!(record.last_cause, 0x1234_5678);
+    }
+
+    #[test]
+    fn repeated_reset_cause_is_noted_once_per_change() {
+        let mut record = AnomalyRecord::EMPTY;
+        assert!(record.note_reset(0x1000_0042));
+        // The same loop iterating again does not change the record.
+        for _ in 0..100 {
+            assert!(!record.note_reset(0x1000_0042));
+        }
+        assert_eq!(record.count(AnomalyReason::Reset), 1);
+        // A different cause, or an unrelated anomaly in between, does.
+        assert!(record.note_reset(0x2000_0001));
+        record.note(AnomalyReason::MissedReport);
+        assert!(record.note_reset(0x2000_0001));
+        assert_eq!(record.count(AnomalyReason::Reset), 3);
+        assert_eq!(record.total, 4);
     }
 
     #[test]
@@ -389,6 +459,7 @@ mod tests {
         let mut record = AnomalyRecord::EMPTY;
         record.note(AnomalyReason::PendingWork);
         record.note(AnomalyReason::ParentLoss);
+        record.note_with_cause(AnomalyReason::Reset, 0xDEAD_BEEF);
         let slot = record.encode();
         assert_eq!(AnomalyRecord::decode(&slot), Some(record));
         assert_eq!(
@@ -414,12 +485,22 @@ mod tests {
             assert_eq!(AnomalyReason::from_code(code).unwrap().code(), code);
         }
         assert_eq!(AnomalyReason::from_code(0), None);
-        assert_eq!(AnomalyReason::from_code(7), None);
+        assert_eq!(AnomalyReason::from_code(9), None);
     }
 
-    /// 2 × 64-byte erase blocks of NOR flash in RAM, counting operations.
+    #[test]
+    fn version_1_slots_are_not_misread() {
+        // A 16-byte v1 slot followed by erased flash.
+        let mut slot = [0xFFu8; ANOMALY_RECORD_LEN];
+        slot[..16].copy_from_slice(&[
+            0xA7, 0x5E, 1, 5, 1, 0, 0, 0, 0, 0, 1, 0, 0x12, 0x34, 0x56, 0x78,
+        ]);
+        assert_eq!(AnomalyRecord::decode(&slot), None);
+    }
+
+    /// 4 × 64-byte erase blocks of NOR flash in RAM, counting operations.
     struct RamFlash {
-        bytes: [u8; 128],
+        bytes: [u8; 256],
         erases: u32,
         writes: u32,
         /// Bytes of the next write that land before a simulated power loss.
@@ -429,7 +510,7 @@ mod tests {
     impl RamFlash {
         fn new() -> Self {
             Self {
-                bytes: [0xFF; 128],
+                bytes: [0xFF; 256],
                 erases: 0,
                 writes: 0,
                 tear_next_write: None,
@@ -509,8 +590,8 @@ mod tests {
         }
         let mut journal = AnomalyJournal::new(flash, 0);
         assert_eq!(journal.load().unwrap().total, 20);
-        // Only block boundaries were erased (one erase per 4 slots).
-        assert_eq!(journal.flash.erases, 5);
+        // Only block boundaries were erased (one erase per 2 slots).
+        assert_eq!(journal.flash.erases, 10);
     }
 
     #[test]
@@ -535,7 +616,7 @@ mod tests {
         let _ = journal.load();
         let first = noted(&[AnomalyReason::Identify]);
         journal.store(&first).unwrap();
-        journal.flash.tear_next_write = Some(6);
+        journal.flash.tear_next_write = Some(12);
         journal
             .store(&noted(&[AnomalyReason::Identify, AnomalyReason::Ota]))
             .unwrap();

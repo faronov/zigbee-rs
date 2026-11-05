@@ -50,6 +50,12 @@ and H2 `soc/regi2c_bias.h`. These are references, not linked IDF dependencies.
   modem and VDD_SDIO (flash) domains remain powered: CPU/top need REGDMA
   retention, modem power-down would lose 802.15.4 MAC/coex init, and flash
   power-down needs RAM-resident sleep code — none of these are implemented.
+- H2 HP_SLEEP clock power sets `i2c_iso_en`/`i2c_retention` (bits 26/27) with
+  `xpd_bbpll=0`, as IDF v5.5.1 `PMU_SLEEP_POWER_CONFIG_DEFAULT` does; the
+  first port wrote the whole register with both clear, so the analog-I2C
+  (BBPLL) configuration was not retained across sleep. LP_SLEEP keeps
+  `bod_source_sel=0`/`vddbat_mode=0`: IDF selects the VBAT brownout source
+  only for VBAT-powered deep sleep (`pmu_sleep.c`), never for light sleep.
 - Use calibrated Q19 RTC periods and checked 48-bit timer arithmetic. Handle H2
   ECO2 RC_FAST calibration division, including REF_TICK enable/restoration.
   Detect zero/invalid calibration and restore clocks before returning an error.

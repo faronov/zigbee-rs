@@ -197,6 +197,12 @@ impl PowerSleepConfig {
         self.hp_sys.dig_power.set_cpu_pd_en(pd_flags.pd_cpu());
         self.hp_sys.dig_power.set_top_pd_en(pd_flags.pd_top());
 
+        // ESP-IDF v5.5.1 H2 `PMU_SLEEP_POWER_CONFIG_DEFAULT`: isolate and
+        // retain the analog I2C (BBPLL/bias) registers while BBPLL is off.
+        // `apply()` writes the whole register, so leaving these clear drops
+        // the BBPLL configuration that flash-resident code needs after wake.
+        self.hp_sys.clk.set_i2c_iso_en(true);
+        self.hp_sys.clk.set_i2c_retention(true);
         self.hp_sys.clk.set_xpd_bbpll(false);
 
         self.hp_sys.xtal.set_xpd_xtal(pd_flags.pd_xtal().not());
@@ -206,8 +212,11 @@ impl PowerSleepConfig {
         self.lp_sys_active.clk_power.set_xpd_fosc(true);
 
         self.lp_sys_sleep.dig_power.set_mem_dslp(true);
+        // ESP-IDF selects the VBAT brownout source only for deep sleep powered
+        // by VBAT (`pmu_sleep.c`, `RTC_SLEEP_POWER_BY_VBAT`); light sleep keeps
+        // the default VDD brownout source.
         self.lp_sys_sleep.dig_power.set_vddbat_mode(0);
-        self.lp_sys_sleep.dig_power.set_bod_source_sel(true);
+        self.lp_sys_sleep.dig_power.set_bod_source_sel(false);
 
         self.lp_sys_sleep
             .clk_power
