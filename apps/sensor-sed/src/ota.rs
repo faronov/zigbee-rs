@@ -95,6 +95,14 @@ where
     /// of activating directly. This keeps the reset-causing operation behind
     /// the application's durable checkpoint.
     fn activate(&mut self, node: &mut ZigbeeNode<'_, M, S, P>) -> OtaActivationOutcome;
+
+    /// Abandon the running session because it kept the chip awake longer
+    /// than [`RecoveryPolicy::max_ota_awake_ms`](crate::RecoveryPolicy::max_ota_awake_ms).
+    ///
+    /// Afterwards [`is_active`](Self::is_active) must report `false`. A
+    /// partially staged image may be kept for a later resume, but nothing
+    /// may be activated.
+    fn abort(&mut self, node: &mut ZigbeeNode<'_, M, S, P>);
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -139,6 +147,9 @@ where
     fn activate(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) -> OtaActivationOutcome {
         OtaActivationOutcome::Failed
     }
+
+    /// Never active, so there is never a session to abort.
+    fn abort(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) {}
 }
 
 pub const fn is_ota_event(event: &StackEvent) -> bool {

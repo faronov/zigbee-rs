@@ -319,7 +319,7 @@ same extended PAN ID.
 |---|---|---|
 | nRF52840 DK sensor/always-on End Device | `0xFE000..0x100000` | UF2 variants use board-specific product maps |
 | nRF52833 sensor | `0x7E000..0x80000` | — |
-| ESP32-C6/H2 | `0x3FE000..0x400000` | OTA slots and `otadata` are separate product partitions; `reporting-persist` images add a reporting journal (Configure Reporting records plus client-changed Poll Control values) at `0x3F4000..0x3F6000` |
+| ESP32-C6/H2 | `0x3FE000..0x400000` | OTA slots and `otadata` are separate product partitions; `reporting-persist` images add a reporting journal (Configure Reporting records plus client-changed Poll Control values) at `0x3F4000..0x3F6000`; `anomaly-record` images (the H2 thermometer) add the sleepy-sensor anomaly journal at `0x3F6000..0x3F8000`, written only when a keep-awake limit fires |
 | BL702 XT-ZB1 | `0xFE000..0x100000` | `bl702-boot` `0x02000..0x10000`, MCUboot primary `0x10000..0x87000`, OTA secondary `0x87000..0xFE000` |
 | CC2340R5 | `0x7E000..0x80000` | — |
 | PHY6222 | `0x7E000..0x80000` | — |

@@ -203,6 +203,21 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   Long/Short Poll Interval a coordinator changed are journalled in the
   same snapshot (same window and extended-PAN binding) and restored after a
   reset only if they still fit the profile's limits.
+- Keep-awake limits and the anomaly record: `thermometer.toml` sets
+  `max_active_ms`, `max_ota_awake_ms`, `max_identify_awake_ms`,
+  `max_fast_poll_ms` and `missed_report_grace_ms` (see the power guide).
+  `anomaly-record` (enabled by `thermometer`) journals the record in the
+  two-sector `0x3F6000..0x3F8000` window only when a limit fires (at most
+  `anomaly_max_writes_per_boot` writes per boot) and serves it from a
+  minimal Diagnostics (0x0B05) server on the endpoint: `0x0000`
+  (`NumberOfResets`, u16) = total anomalies, `0x0001`
+  (`PersistentMemoryWrites`, u32) = summary word: bits 0-7 last reason
+  code, bits 8-15 reasons seen (bit `code - 1`), bits 16-23 the last
+  reason's count, bits 24-31 the record format (1). Reason codes: 1
+  pending work, 2 OTA, 3 Identify, 4 fast-poll windows, 5 missed report,
+  6 parent-loss rejoin. The standard IDs are reused with this meaning;
+  `0x0000` reports on change only. Read both from ZHA
+  (Manage Zigbee device → Clusters → Diagnostic → Read attribute).
 - Light sleep stops XTAL and RC_FAST (`sleep_xtal_off`,
   `sleep_rc_fast_off`) and applies ESP-IDF's light-sleep analog settings
   (see `vendor/esp-hal/LOCAL-PATCHES.md`). CPU, top, modem and flash
@@ -225,6 +240,8 @@ The checked 4 MiB table is:
 0x3F0000..0x400000  zbnv
 0x3F0000..0x3F2000  router child table within zbnv (router image only)
 0x3F2000..0x3F4000  router APS table within zbnv (router image only)
+0x3F4000..0x3F6000  reporting journal within zbnv (reporting-persist)
+0x3F6000..0x3F8000  anomaly journal within zbnv (anomaly-record)
 0x3FE000..0x400000  security journal within zbnv
 ```
 

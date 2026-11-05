@@ -23,6 +23,10 @@ extern crate alloc;
 esp_bootloader_esp_idf::esp_app_desc!();
 
 mod chip_temperature;
+#[cfg(feature = "anomaly-record")]
+mod thermometer_anomaly;
+#[cfg(not(feature = "quiet"))]
+mod thermometer_diag;
 mod thermometer_platform;
 mod thermometer_profile;
 
@@ -47,8 +51,15 @@ use thermometer_profile::{config, DieThermometer, ThermoProfile, POLICY};
 #[cfg(not(feature = "quiet"))]
 use esp_backtrace as _;
 
+/// `quiet` uses the product wake controller directly; other builds wrap it
+/// in the wait-loop summary.
+#[cfg(feature = "quiet")]
+type Wake = SensorWake<'static>;
+#[cfg(not(feature = "quiet"))]
+type Wake = thermometer_diag::DiagWake<SensorWake<'static>>;
+
 type Parts = SensorSedParts<
-    SensorWake<'static>,
+    Wake,
     NoStatus,
     DieThermometer,
     NoBattery,
@@ -202,7 +213,10 @@ fn main() -> ! {
     static APP: StaticCell<App> = StaticCell::new();
     let (device, security, profile) = compose(peripherals.IEEE802154, peripherals.AES);
     let parts = SensorSedParts {
+        #[cfg(feature = "quiet")]
         wake: SensorWake::new(button, sleep),
+        #[cfg(not(feature = "quiet"))]
+        wake: thermometer_diag::DiagWake::new(SensorWake::new(button, sleep)),
         status: NoStatus,
         environment: DieThermometer::new(sensor),
         battery: NoBattery,
@@ -218,10 +232,18 @@ fn main() -> ! {
     block_on(run(APP.init(app)))
 }
 
-/// `initialize` → restore the persisted reporting configuration and Poll
-/// Control values → `step` forever, persisting a changed configuration after
-/// each iteration.
+/// Restore the anomaly record → `initialize` → restore the persisted
+/// reporting configuration and Poll Control values → `step` forever,
+/// persisting a changed configuration (and a new anomaly) after each
+/// iteration.
 async fn run(app: &'static mut App) -> ! {
+    #[cfg(feature = "anomaly-record")]
+    let mut anomalies = product::anomaly::anomaly_store(config::ANOMALY_MAX_WRITES_PER_BOOT);
+    #[cfg(feature = "anomaly-record")]
+    if let Ok(record) = anomalies.load() {
+        app.restore_anomalies(record);
+        publish_anomalies(app, &record);
+    }
     if app.initialize().await.is_err() {
         halt()
     }
@@ -236,6 +258,14 @@ async fn run(app: &'static mut App) -> ! {
     }
     loop {
         let _ = app.step().await;
+        #[cfg(feature = "anomaly-record")]
+        if let Some(record) = app.take_anomaly_update() {
+            publish_anomalies(app, &record);
+            // Rare by construction (a fired limit) and capped per boot by
+            // `anomaly_max_writes_per_boot`; a failed write only loses the
+            // persistent copy, the attributes still carry it.
+            let _ = anomalies.store(&record);
+        }
         #[cfg(feature = "reporting-persist")]
         if let Some(persistence) = reporting.as_mut() {
             let (device, poll_control) = app.device_and_poll_control_mut();
@@ -249,4 +279,13 @@ async fn run(app: &'static mut App) -> ! {
             }
         }
     }
+}
+
+#[cfg(feature = "anomaly-record")]
+fn publish_anomalies(app: &mut App, record: &sensor_sed_app::AnomalyRecord) {
+    app.profile_mut()
+        .inner_mut()
+        .component_mut()
+        .anomalies_mut()
+        .publish(record);
 }

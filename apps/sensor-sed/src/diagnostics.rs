@@ -3,6 +3,7 @@
 use zigbee_runtime::profile::ProfileError;
 use zigbee_runtime::security_store::SecurityStoreError;
 
+use crate::anomaly::AnomalyReason;
 use crate::environment::EnvironmentReading;
 
 /// Semantic lifecycle diagnostics emitted by [`crate::SensorApp`].
@@ -44,6 +45,12 @@ pub enum DiagnosticEvent {
     /// outlived its bound) reached the product limit; a rejoin starts.
     ParentLossSuspected {
         strikes: u8,
+    },
+    /// A keep-awake limit or a parent-loss detector fired; `total` is the
+    /// running anomaly count (see [`crate::AnomalyRecord`]).
+    Anomaly {
+        reason: AnomalyReason,
+        total: u16,
     },
     Environment(EnvironmentReading),
     EnvironmentReadFailed,

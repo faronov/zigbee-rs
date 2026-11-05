@@ -51,7 +51,13 @@
 //! - Parent loss that MAC acknowledgements cannot reveal (a parent that
 //!   acknowledges polls but delivers nothing) is detected from APS
 //!   end-to-end failures and from pending protocol work that outlives
-//!   `RecoveryPolicy::max_active_ms`; either starts the staged rejoin.
+//!   `RecoveryPolicy::max_active_ms`; either starts the staged rejoin. A
+//!   report that is due by its maximum interval but was not acknowledged
+//!   counts as the same evidence.
+//! - Every keep-awake reason (pending work, OTA, Identify, timed fast-poll
+//!   windows) is bounded by its own `RecoveryPolicy` limit; a fired limit
+//!   forces the reason to release the chip and is recorded in the
+//!   [`AnomalyRecord`] a product may persist and expose.
 //! - Construction rejects a device whose runtime automatic parent polling is
 //!   still enabled, so the bounded manual poll window has exactly one owner.
 
@@ -62,7 +68,9 @@ use zigbee_runtime::role::EndDevice;
 use zigbee_runtime::security_store::SecurityStateStore;
 use zigbee_zcl::ClusterId;
 use zigbee_zcl::clusters::poll_control::{CMD_CHECK_IN, FastPollEvent};
+use zigbee_zcl::foundation::reporting::ReportDirection;
 
+use crate::anomaly::{AnomalyReason, AnomalyRecord, AwakeBound, BoundStep};
 use crate::battery::BatterySource;
 use crate::capabilities::{
     SensorStatus, StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
@@ -137,14 +145,27 @@ where
     interview_done: bool,
     consecutive_rejoin_failures: u8,
     run_again: Option<(R::Mark, u32)>,
-    /// Start of the current pending-work period (or of the last strike once
-    /// the period exceeded `max_active_ms`).
-    pending_since: Option<R::Mark>,
-    /// Pending work outlived `max_active_ms`: it no longer forces the chip
-    /// awake until it clears.
-    pending_expired: bool,
-    /// Parent-loss strikes from bounded pending work since the last APS ACK.
+    /// Keep-awake budgets: pending protocol work, OTA, Identify and the
+    /// timed fast-poll windows.
+    pending_bound: AwakeBound,
+    ota_bound: AwakeBound,
+    identify_bound: AwakeBound,
+    fast_bound: AwakeBound,
+    /// When the budgets were last advanced (once per joined wait request).
+    last_bound_check: R::Mark,
+    /// Parent-loss strikes from bounded pending work and missed reports
+    /// since the last APS ACK.
     active_bound_strikes: u8,
+    /// Measured time since the last end-to-end proof (an APS ACK).
+    report_proof_ms: u32,
+    /// APS ACK table state at the previous budget check, to recognise an
+    /// acknowledgement between two checks.
+    prev_ack_pending: bool,
+    prev_ack_failures: u8,
+    /// Anomalies recorded since boot (plus any the product restored), and
+    /// whether the product has not yet seen the latest change.
+    anomalies: AnomalyRecord,
+    anomaly_dirty: bool,
     /// Runtime APS end-to-end failure count seen at the previous check.
     seen_aps_ack_failures: u8,
     /// Joined poll intervals in force: the policy's, or the profile's Poll
@@ -216,9 +237,17 @@ where
             interview_done: false,
             consecutive_rejoin_failures: 0,
             run_again: None,
-            pending_since: None,
-            pending_expired: false,
+            pending_bound: AwakeBound::default(),
+            ota_bound: AwakeBound::default(),
+            identify_bound: AwakeBound::default(),
+            fast_bound: AwakeBound::default(),
+            last_bound_check: now,
             active_bound_strikes: 0,
+            report_proof_ms: 0,
+            prev_ack_pending: false,
+            prev_ack_failures: 0,
+            anomalies: AnomalyRecord::EMPTY,
+            anomaly_dirty: false,
             seen_aps_ack_failures: 0,
             slow_poll_ms: policy.slow_poll_ms,
             fast_poll_ms: policy.fast_poll_ms,
@@ -227,6 +256,37 @@ where
             last_poll_control: now,
             initialized: false,
         })
+    }
+
+    /// Anomalies recorded so far (see [`crate::anomaly`]).
+    pub const fn anomalies(&self) -> &AnomalyRecord {
+        &self.anomalies
+    }
+
+    /// Seed the anomaly counters from a product's persistent copy, before
+    /// [`initialize`](Self::initialize).
+    pub fn restore_anomalies(&mut self, record: AnomalyRecord) {
+        self.anomalies = record;
+        self.anomaly_dirty = false;
+    }
+
+    /// The anomaly record once after each change, for a product that
+    /// persists or publishes it. A product that does neither never calls it.
+    pub fn take_anomaly_update(&mut self) -> Option<AnomalyRecord> {
+        if core::mem::take(&mut self.anomaly_dirty) {
+            Some(self.anomalies)
+        } else {
+            None
+        }
+    }
+
+    fn note_anomaly(&mut self, reason: AnomalyReason) {
+        self.anomalies.note(reason);
+        self.anomaly_dirty = true;
+        self.resources.diagnostics.record(DiagnosticEvent::Anomaly {
+            reason,
+            total: self.anomalies.total,
+        });
     }
 
     /// The Zigbee device, for composition roots that add product services
@@ -238,6 +298,12 @@ where
     /// Mutable access to the Zigbee device; see [`device`](Self::device).
     pub fn device_mut(&mut self) -> &mut zigbee_runtime::ZigbeeDevice<M, EndDevice> {
         self.node.device_mut()
+    }
+
+    /// The application profile, for composition roots that publish product
+    /// state (for example the anomaly record) in its clusters.
+    pub fn profile_mut(&mut self) -> &mut P {
+        self.node.profile_mut()
     }
 
     /// The Zigbee device together with the profile's Poll Control server,
@@ -563,40 +629,142 @@ where
         self.node.device_mut().clear_aps_ack_failures();
         self.seen_aps_ack_failures = 0;
         self.active_bound_strikes = 0;
-        self.pending_since = None;
-        self.pending_expired = false;
+        self.pending_bound.reset();
+        self.report_proof_ms = 0;
+        self.prev_ack_pending = false;
+        self.prev_ack_failures = 0;
     }
 
-    /// Whether pending protocol work may still force the chip awake.
+    /// Advance every keep-awake budget by the time measured since the last
+    /// joined wait request and apply the fired limits. `windows` tells
+    /// whether a timed fast-poll window is still open (expired ones are
+    /// already cleared, so a single window ending on time never fires).
+    /// Returns whether pending work, OTA and Identify may still keep the
+    /// chip awake, and whether the fast-poll limit closed the windows.
     ///
-    /// Work that persists for `max_active_ms` stops forcing the active wait
-    /// and fast cadence until it clears, and every further `max_active_ms` it
-    /// persists counts as one parent-loss strike. The first measurement is
-    /// taken at the fast cadence and later ones at most one slow wait apart,
-    /// both far inside the narrowest platform counter.
-    fn pending_work_within_bound(&mut self, pending: bool) -> bool {
-        if !pending {
-            self.pending_since = None;
-            self.pending_expired = false;
-            return false;
-        }
-        let max_ms = self.policy.recovery.max_active_ms;
-        if max_ms == 0 {
-            return true;
-        }
-        match self.pending_since {
-            None => {
-                self.pending_since = Some(self.mark());
-                !self.pending_expired
+    /// - pending work: every further `max_active_ms` it persists counts one
+    ///   parent-loss strike;
+    /// - OTA: the session is aborted;
+    /// - Identify: it keeps running but no longer holds the fast poll;
+    /// - fast-poll windows: they are closed.
+    fn apply_awake_bounds(&mut self, now: W::Mark, windows: bool) -> (bool, bool, bool, bool) {
+        let delta_ms = W::elapsed_ms(now, self.last_bound_check);
+        self.last_bound_check = now;
+        let recovery = &self.policy.recovery;
+
+        self.sample_report_proof(delta_ms);
+
+        let pending = self.node.device().has_pending_protocol_work();
+        let pending = match self
+            .pending_bound
+            .step(pending, delta_ms, recovery.max_active_ms)
+        {
+            BoundStep::Fired => {
+                self.active_bound_strikes = self.active_bound_strikes.saturating_add(1);
+                self.note_anomaly(AnomalyReason::PendingWork);
+                false
             }
-            Some(since) if self.elapsed_ms(since) < max_ms => !self.pending_expired,
-            Some(_) => {
-                self.pending_since = Some(self.mark());
-                self.pending_expired = true;
+            // Persisting work keeps earning strikes, recorded once.
+            BoundStep::Refired => {
                 self.active_bound_strikes = self.active_bound_strikes.saturating_add(1);
                 false
             }
+            step => step.allows(),
+        };
+
+        let ota = O::ENABLED && self.resources.ota.is_active(self.node.profile());
+        let ota = match self
+            .ota_bound
+            .step(ota, delta_ms, recovery.max_ota_awake_ms)
+        {
+            BoundStep::Fired => {
+                self.resources.ota.abort(&mut self.node);
+                self.ota_bound.reset();
+                self.note_anomaly(AnomalyReason::Ota);
+                false
+            }
+            step => step.allows(),
+        };
+
+        let identifying = self.node.device().is_identifying(self.endpoint);
+        let identifying =
+            match self
+                .identify_bound
+                .step(identifying, delta_ms, recovery.max_identify_awake_ms)
+            {
+                BoundStep::Fired => {
+                    self.note_anomaly(AnomalyReason::Identify);
+                    false
+                }
+                step => step.allows(),
+            };
+
+        let windows_closed = self
+            .fast_bound
+            .step(windows, delta_ms, recovery.max_fast_poll_ms)
+            == BoundStep::Fired;
+        if windows_closed {
+            self.fast_poll = None;
+            self.poll_control_fast = None;
+            self.fast_bound.reset();
+            self.note_anomaly(AnomalyReason::FastPoll);
         }
+        (pending, ota, identifying, windows_closed)
+    }
+
+    /// Missed-report detector.
+    ///
+    /// An APS ACK is end-to-end proof. One is recognised when the ACK table
+    /// stops waiting without a new exhausted-retry failure, or when the
+    /// failure count returns to zero. Without proof for the shortest
+    /// configured reporting maximum interval plus `missed_report_grace_ms`
+    /// a report was due but not acknowledged: that counts one parent-loss
+    /// strike, and every report is forced due so the next tick produces
+    /// fresh evidence (an ACK, or an APS failure).
+    fn sample_report_proof(&mut self, delta_ms: u32) {
+        let aps = self.node.device().bdb().zdo().aps();
+        let ack_pending = aps.has_pending_ack();
+        let failures = aps.consecutive_ack_failures();
+        let acked = (self.prev_ack_pending && !ack_pending && failures <= self.prev_ack_failures)
+            || (failures == 0 && self.prev_ack_failures != 0);
+        self.prev_ack_pending = ack_pending;
+        self.prev_ack_failures = failures;
+
+        let grace_ms = self.policy.recovery.missed_report_grace_ms;
+        let max_interval_s = if grace_ms == 0 {
+            None
+        } else {
+            self.shortest_report_max_interval_s()
+        };
+        let Some(max_interval_s) = max_interval_s.filter(|_| !acked) else {
+            self.report_proof_ms = 0;
+            return;
+        };
+        self.report_proof_ms = self.report_proof_ms.saturating_add(delta_ms);
+        let window_ms = (u32::from(max_interval_s) * 1_000).saturating_add(grace_ms);
+        if self.report_proof_ms >= window_ms {
+            self.report_proof_ms = 0;
+            self.active_bound_strikes = self.active_bound_strikes.saturating_add(1);
+            self.node.device_mut().reporting_mut().force_all_due();
+            self.note_anomaly(AnomalyReason::MissedReport);
+        }
+    }
+
+    /// Shortest periodic maximum interval among this endpoint's reporting
+    /// configurations, if any attribute reports periodically.
+    fn shortest_report_max_interval_s(&self) -> Option<u16> {
+        self.node
+            .device()
+            .reporting()
+            .configs()
+            .filter(|(endpoint, _, config)| {
+                *endpoint == self.endpoint
+                    && config.direction == ReportDirection::Send
+                    && config.max_interval != 0
+                    && config.max_interval != 0xFFFF
+            })
+            .map(|(_, _, config)| config.max_interval)
+            .min()
     }
 
     /// Start the staged rejoin once parent-loss evidence reaches the
@@ -621,6 +789,7 @@ where
         self.resources
             .diagnostics
             .record(DiagnosticEvent::ParentLossSuspected { strikes });
+        self.note_anomaly(AnomalyReason::ParentLoss);
         self.clear_parent_loss_evidence();
         if self.secure_rejoin().await {
             self.reset_post_join_state();
@@ -1431,15 +1600,17 @@ where
             if let Some(watchdog_ms) = self.resources.supervisor.max_wait_ms() {
                 wait_ms = shorten(wait_ms, watchdog_ms);
             }
+            self.last_bound_check = self.mark();
             return (wait_ms.max(1), false, self.policy.slow_sleep_depth);
         }
 
         let now = self.mark();
-        let identifying = self.node.device().is_identifying(self.endpoint);
-        let ota_active = O::ENABLED && self.resources.ota.is_active(self.node.profile());
-        let fast_poll_remaining_ms = self.fast_poll_remaining_ms();
-        let pending_protocol_work =
-            self.pending_work_within_bound(self.node.device().has_pending_protocol_work());
+        let mut fast_poll_remaining_ms = self.fast_poll_remaining_ms();
+        let (pending_protocol_work, ota_active, identifying, windows_closed) =
+            self.apply_awake_bounds(now, fast_poll_remaining_ms.is_some());
+        if windows_closed {
+            fast_poll_remaining_ms = None;
+        }
         let in_fast_poll =
             fast_poll_remaining_ms.is_some() || identifying || ota_active || pending_protocol_work;
         let mut wait_ms = if in_fast_poll {

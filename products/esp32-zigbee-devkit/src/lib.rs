@@ -47,6 +47,8 @@ compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 #[cfg(not(any(feature = "esp32c6", feature = "esp32h2")))]
 compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 
+#[cfg(all(target_os = "none", feature = "anomaly-record"))]
+pub mod anomaly;
 pub mod chip_temperature;
 #[cfg(feature = "roles")]
 pub mod end_device;
@@ -54,7 +56,11 @@ pub mod end_device;
 pub mod executor;
 #[cfg(all(
     target_os = "none",
-    any(feature = "roles", feature = "reporting-persist")
+    any(
+        feature = "roles",
+        feature = "reporting-persist",
+        feature = "anomaly-record"
+    )
 ))]
 mod flash_window;
 pub mod migration;

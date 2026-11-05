@@ -14,6 +14,7 @@ groups = ["zigbee-runtime/groups"]
 ota = ["zigbee-runtime/ota"]
 
 [dependencies]
+embedded-storage = { workspace = true }
 zigbee-mac = { path = "../../zigbee-mac" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["sleepy-end-device", "finding-binding-target"] }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

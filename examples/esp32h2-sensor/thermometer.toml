@@ -85,18 +85,53 @@ check_in_response_ms = 8000
 join_retry_ms = 15000
 join_retry_max_ms = 900000
 join_retry_jitter_pct = 25
-# Parent-loss evidence (exhausted APS-acknowledged reports, or pending
-# work that outlived `max_active_ms`) that starts the staged rejoin
-# (current channel, all channels, Trust Center). 0 disables.
+# Parent-loss evidence (exhausted APS-acknowledged reports, pending work
+# that outlived `max_active_ms`, or a missed report) that starts the staged
+# rejoin (current channel, all channels, Trust Center). 0 disables.
 parent_loss_strikes = 3
-# Longest time pending protocol work may keep the chip awake (0 = no bound).
-max_active_ms = 30000
 # Request APS acknowledgements for unicast reports (end-to-end delivery
 # evidence for parent-loss detection; costs about one extra poll per report).
 report_aps_ack = true
+
+# --- keep-awake limits ---------------------------------------------------
+# Every reason that keeps the radio up or the CPU out of light sleep has a
+# limit (0 = unbounded). When one fires the device goes back to its slow
+# sleep and the reason is recorded in the anomaly record.
+# Pending protocol work (APS ACK wait, queued responses, key exchange); a
+# fired limit is also one parent-loss strike, repeated while it persists.
+max_active_ms = 30000
+# An OTA session (query/download/verify/activate wait); a fired limit
+# aborts it (a suspended download stays resumable). A full image at 48-byte
+# blocks takes roughly 25-45 min, so this must stay well above that.
+max_ota_awake_ms = 7200000
+# Identify keeps the fast poll; afterwards it still runs, on the slow poll.
+max_identify_awake_ms = 120000
+# Back-to-back timed fast-poll windows (join/interview, resume, button,
+# Poll Control fast poll and check-in response); must cover each of them.
+max_fast_poll_ms = 600000
+# No APS-acknowledged traffic for the shortest configured reporting maximum
+# interval plus this grace counts as a missed report: one parent-loss strike
+# and every report forced due. 0 disables; needs report_aps_ack.
+missed_report_grace_ms = 120000
+
+# --- anomaly record --------------------------------------------------------
+# The record (last reason, reasons seen, per-reason counts) is journaled in
+# `zbnv` only when a limit fires, at most this many times per boot (no flash
+# wear in normal operation; 0 = never write). It is readable as Diagnostics
+# (0x0B05) attributes 0x0000 (total) and 0x0001 (summary word).
+anomaly_max_writes_per_boot = 8
 
 # --- power ---------------------------------------------------------------
 # With no USB host seen within this window after boot, the USB Serial/JTAG
 # pad (and its D+ pull-up) is switched off until the next reset. 0 keeps USB
 # powered. Recovery: reset with USB attached (or hold BOOT while resetting).
 usb_host_wait_ms = 1000
+
+# --- diagnostics -----------------------------------------------------------
+# Console log level for builds without `quiet` (off, error, warn, info, debug,
+# trace). `quiet` builds link no logger and ignore it. Logs go to the USB
+# Serial/JTAG console when a host is attached, otherwise to UART0 (GPIO24).
+log_level = "info"
+# Period of the wait-loop summary line (wait requests, sleep depth and wake
+# outcomes) in builds without `quiet`; 0 disables it.
+diag_summary_ms = 10000

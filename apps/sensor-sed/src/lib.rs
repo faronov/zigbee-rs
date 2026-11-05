@@ -23,6 +23,7 @@
 
 #![no_std]
 
+pub mod anomaly;
 pub mod app;
 pub mod battery;
 pub mod capabilities;
@@ -33,6 +34,9 @@ pub mod ota;
 pub mod parts;
 pub mod policy;
 
+pub use anomaly::{
+    ANOMALY_RECORD_LEN, AnomalyJournal, AnomalyReason, AnomalyRecord, AwakeBound, BoundStep,
+};
 pub use app::{FindingBindingTargetError, SensorApp, SensorAppError, SensorLifecycleError};
 pub use battery::{
     BatteryReading, BatterySource, BlockingBattery, BlockingBatterySource, FixedBattery, NoBattery,

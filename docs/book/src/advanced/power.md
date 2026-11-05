@@ -80,6 +80,26 @@ can keep a battery device awake, via `SensorPolicy::recovery`
   up to `join_retry_max_ms` (15 min), shortened by up to
   `join_retry_jitter_pct` (25 %). The device waits at its slow depth
   (radio off) for the whole delay, not in a radio-on retry loop.
+- **Keep-awake limits.** Every reason that holds the fast poll or the
+  `Active` depth has a limit in `RecoveryPolicy` (`0` = unbounded):
+  pending work `max_active_ms` (30 s; each further period it persists is
+  another strike), an OTA session `max_ota_awake_ms` (2 h; the session is
+  aborted through `OtaLifecycle::abort`, a suspended download stays
+  resumable), Identify `max_identify_awake_ms` (2 min; Identify then runs on
+  the slow poll) and back-to-back timed fast-poll windows
+  `max_fast_poll_ms` (10 min; the windows are closed). A window that ends
+  on time never fires.
+- **Missed reports.** With `report_aps_ack`, no APS-acknowledged traffic
+  for the shortest periodic reporting maximum interval plus
+  `missed_report_grace_ms` (2 min) counts one strike and forces every
+  report due, so the next tick produces fresh evidence.
+- **Anomaly record.** Each fired limit, missed report and parent-loss
+  rejoin is counted in `AnomalyRecord` (last reason, reasons seen,
+  saturating per-reason counts). `SensorApp::take_anomaly_update` hands a
+  product the changed record; `AnomalyJournal` appends it to a NOR window
+  only then, at most N writes per boot, so normal operation writes nothing.
+  The ESP32-H2 thermometer journals it in `zbnv` and publishes it as
+  Diagnostics (0x0B05) attributes.
 - **No self factory reset.** `secure_rejoin_failure_limit = 0` on every SED
   product: the network is kept until a user action (long press) or a Leave
   from the network. A non-zero limit restores the old give-up behaviour.

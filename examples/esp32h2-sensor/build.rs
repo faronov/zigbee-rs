@@ -128,6 +128,11 @@ mod thermometer {
             parent_loss_strikes: int(&mut values, "parent_loss_strikes", 0, 255),
             max_active_ms: int(&mut values, "max_active_ms", 0, i64::from(MAX_SLOW_POLL_MS)),
             report_aps_ack: boolean(&mut values, "report_aps_ack"),
+            max_ota_awake_ms: int(&mut values, "max_ota_awake_ms", 0, 86_400_000),
+            max_identify_awake_ms: int(&mut values, "max_identify_awake_ms", 0, 86_400_000),
+            max_fast_poll_ms: int(&mut values, "max_fast_poll_ms", 0, 86_400_000),
+            missed_report_grace_ms: int(&mut values, "missed_report_grace_ms", 0, 86_400_000),
+            anomaly_max_writes_per_boot: int(&mut values, "anomaly_max_writes_per_boot", 0, 255),
             sleep_xtal_off: boolean(&mut values, "sleep_xtal_off"),
             sleep_rc_fast_off: boolean(&mut values, "sleep_rc_fast_off"),
             fresh_join_fast_ms: int(&mut values, "fresh_join_fast_ms", 1, 3_600_000),
@@ -135,6 +140,8 @@ mod thermometer {
             button_fast_poll_ms: int(&mut values, "button_fast_poll_ms", 1, 600_000),
             sample_every_polls: int(&mut values, "sample_every_polls", 1, 1_000),
             usb_host_wait_ms: int(&mut values, "usb_host_wait_ms", 0, 10_000),
+            log_level: log_level(&mut values, "log_level"),
+            diag_summary_ms: int(&mut values, "diag_summary_ms", 0, 3_600_000),
         };
         if let Some(unknown) = values.keys().next() {
             panic!("{}: unknown key `{unknown}`", path.display());
@@ -168,6 +175,11 @@ mod thermometer {
         parent_loss_strikes: i64,
         max_active_ms: i64,
         report_aps_ack: bool,
+        max_ota_awake_ms: i64,
+        max_identify_awake_ms: i64,
+        max_fast_poll_ms: i64,
+        missed_report_grace_ms: i64,
+        anomaly_max_writes_per_boot: i64,
         sleep_xtal_off: bool,
         sleep_rc_fast_off: bool,
         fresh_join_fast_ms: i64,
@@ -175,6 +187,8 @@ mod thermometer {
         button_fast_poll_ms: i64,
         sample_every_polls: i64,
         usb_host_wait_ms: i64,
+        log_level: &'static str,
+        diag_summary_ms: i64,
     }
 
     impl Config {
@@ -239,6 +253,23 @@ mod thermometer {
                 self.join_retry_ms <= self.join_retry_max_ms,
                 "join_retry_ms must not exceed join_retry_max_ms"
             );
+            assert!(
+                self.missed_report_grace_ms == 0 || self.report_aps_ack,
+                "missed_report_grace_ms needs report_aps_ack (the ACK is the delivery proof)"
+            );
+            assert!(
+                self.max_fast_poll_ms == 0
+                    || [
+                        self.fresh_join_fast_ms,
+                        self.restored_fast_ms,
+                        self.button_fast_poll_ms,
+                        self.fast_poll_timeout_max_ms,
+                        self.check_in_response_ms,
+                    ]
+                    .iter()
+                    .all(|window| *window <= self.max_fast_poll_ms),
+                "max_fast_poll_ms must be 0 or cover every configured fast-poll window"
+            );
         }
 
         fn render(&self) -> String {
@@ -275,8 +306,18 @@ mod thermometer {
                  pub const PARENT_LOSS_STRIKES: u8 = {strikes};\n\
                  pub const MAX_ACTIVE_MS: u32 = {max_active};\n\
                  pub const REPORT_APS_ACK: bool = {aps_ack};\n\
+                 pub const MAX_OTA_AWAKE_MS: u32 = {max_ota};\n\
+                 pub const MAX_IDENTIFY_AWAKE_MS: u32 = {max_identify};\n\
+                 pub const MAX_FAST_POLL_MS: u32 = {max_fast};\n\
+                 pub const MISSED_REPORT_GRACE_MS: u32 = {missed_grace};\n\
+                 #[allow(dead_code)]\n\
+                 pub const ANOMALY_MAX_WRITES_PER_BOOT: u8 = {anomaly_writes};\n\
                  pub const SLEEP_XTAL_OFF: bool = {xtal_off};\n\
-                 pub const SLEEP_RC_FAST_OFF: bool = {fosc_off};\n",
+                 pub const SLEEP_RC_FAST_OFF: bool = {fosc_off};\n\
+                 #[allow(dead_code)]\n\
+                 pub const LOG_LEVEL: log::LevelFilter = log::LevelFilter::{log_level};\n\
+                 #[allow(dead_code)]\n\
+                 pub const DIAG_SUMMARY_MS: u32 = {diag_summary_ms};\n",
                 model = self.model,
                 ota = self.ota_image_type,
                 role = self.role_tag,
@@ -308,8 +349,15 @@ mod thermometer {
                 strikes = self.parent_loss_strikes,
                 max_active = self.max_active_ms,
                 aps_ack = self.report_aps_ack,
+                max_ota = self.max_ota_awake_ms,
+                max_identify = self.max_identify_awake_ms,
+                max_fast = self.max_fast_poll_ms,
+                missed_grace = self.missed_report_grace_ms,
+                anomaly_writes = self.anomaly_max_writes_per_boot,
                 xtal_off = self.sleep_xtal_off,
                 fosc_off = self.sleep_rc_fast_off,
+                log_level = self.log_level,
+                diag_summary_ms = self.diag_summary_ms,
             )
         }
     }
@@ -373,6 +421,19 @@ mod thermometer {
             "true" => true,
             "false" => false,
             other => panic!("`{key}` = `{other}` must be true or false"),
+        }
+    }
+
+    /// `log::LevelFilter` variant name for a console log level.
+    fn log_level(values: &mut BTreeMap<String, String>, key: &str) -> &'static str {
+        match string(values, key).as_str() {
+            "off" => "Off",
+            "error" => "Error",
+            "warn" => "Warn",
+            "info" => "Info",
+            "debug" => "Debug",
+            "trace" => "Trace",
+            other => panic!("`{key}` = `{other}` must be off, error, warn, info, debug or trace"),
         }
     }
 

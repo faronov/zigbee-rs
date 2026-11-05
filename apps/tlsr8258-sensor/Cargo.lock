@@ -139,6 +139,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 name = "sensor-sed-app"
 version = "0.1.0"
 dependencies = [
+ "embedded-storage",
  "zigbee-mac",
  "zigbee-runtime",
  "zigbee-zcl",

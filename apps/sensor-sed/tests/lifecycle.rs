@@ -92,6 +92,10 @@ const DETERMINISTIC_RECOVERY: sensor_sed_app::RecoveryPolicy = sensor_sed_app::R
     parent_loss_strikes: 0,
     max_active_ms: 0,
     report_aps_ack: false,
+    max_ota_awake_ms: 0,
+    max_identify_awake_ms: 0,
+    max_fast_poll_ms: 0,
+    missed_report_grace_ms: 0,
 };
 
 const NO_STATUS_POLICY: SensorPolicy = SensorPolicy {
@@ -440,6 +444,10 @@ where
         self.activated.set(self.activated.get().saturating_add(1));
         OtaActivationOutcome::Activated
     }
+
+    fn abort(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) {
+        unreachable!("never active");
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -532,6 +540,10 @@ impl<M: MacDriver, S: SecurityStateStore, P: ApplicationProfile> OtaLifecycle<M,
         );
         self.activated.set(self.activated.get() + 1);
         OtaActivationOutcome::Activated
+    }
+
+    fn abort(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) {
+        unreachable!("the OTA bound is disabled in these tests");
     }
 }
 
@@ -3007,4 +3019,554 @@ fn poll_control_server_drives_check_in_and_fast_poll() {
         "{:?}",
         &waits.borrow()[refused..]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Keep-awake bounds and the anomaly record
+// ---------------------------------------------------------------------------
+
+/// OTA lifecycle whose session never finishes on its own (a server that
+/// keeps answering WAIT_FOR_DATA, or a lost block response).
+struct StuckOta<'a> {
+    active: &'a Cell<bool>,
+    aborts: &'a Cell<u32>,
+}
+
+impl<M, S, P> OtaLifecycle<M, S, P> for StuckOta<'_>
+where
+    M: MacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+{
+    const ENABLED: bool = true;
+
+    fn is_active(&self, _profile: &P) -> bool {
+        self.active.get()
+    }
+
+    fn next_deadline_ms(&self, _profile: &P) -> Option<u32> {
+        None
+    }
+
+    async fn handle_event(
+        &mut self,
+        _node: &mut ZigbeeNode<'_, M, S, P>,
+        _event: &StackEvent,
+    ) -> OtaEventOutcome {
+        OtaEventOutcome::NotHandled
+    }
+
+    async fn service(
+        &mut self,
+        _node: &mut ZigbeeNode<'_, M, S, P>,
+        _elapsed_secs: u16,
+    ) -> OtaServiceOutcome {
+        OtaServiceOutcome::IDLE
+    }
+
+    fn activate(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) -> OtaActivationOutcome {
+        unreachable!("the stuck session never completes");
+    }
+
+    fn abort(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) {
+        self.active.set(false);
+        self.aborts.set(self.aborts.get() + 1);
+    }
+}
+
+struct BoundRun {
+    waits: Vec<WaitRequest>,
+    /// Index of the first wait after `stimulus` ran.
+    from: usize,
+    diagnostics: Vec<DiagnosticEvent>,
+    record: sensor_sed_app::AnomalyRecord,
+    /// Records handed out by `take_anomaly_update`.
+    updates: Vec<sensor_sed_app::AnomalyRecord>,
+    joined: bool,
+    commissioned: bool,
+}
+
+impl BoundRun {
+    fn after(&self) -> &[WaitRequest] {
+        &self.waits[self.from..]
+    }
+
+    fn anomalies(&self, reason: sensor_sed_app::AnomalyReason) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(
+                |event| matches!(event, DiagnosticEvent::Anomaly { reason: r, .. } if *r == reason),
+            )
+            .count()
+    }
+}
+
+/// Restore a commissioned sensor, let the restored fast window expire, run
+/// `stimulus` once against the joined device, then step `steps` times while
+/// `each_step` may feed the device.
+fn run_bounded<O>(
+    policy: &'static SensorPolicy,
+    profile: TestProfile,
+    ota: O,
+    stimulus: impl FnOnce(&mut ZigbeeDevice<MockMac, EndDevice>),
+    steps: usize,
+    mut each_step: impl FnMut(usize, &mut ZigbeeDevice<MockMac, EndDevice>),
+) -> BoundRun
+where
+    O: for<'s> OtaLifecycle<MockMac, CountingStore<'s>, TestProfile>,
+{
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::with_state(commissioned_state(0x02), &store_calls);
+    let mut profile = profile;
+    let mut device = test_device(&profile, policy);
+    let from;
+    let record;
+    let mut updates = Vec::new();
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake = RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+        let mut app = SensorApp::new(
+            node,
+            policy,
+            parts(
+                wake,
+                RecordingStatus { events: &status },
+                ota,
+                &environment_samples,
+                &battery_samples,
+                &heartbeats,
+                &diagnostics,
+            ),
+        )
+        .unwrap();
+        block_on(app.initialize()).unwrap();
+        for _ in 0..20 {
+            block_on(app.step()).unwrap();
+            updates.extend(app.take_anomaly_update());
+        }
+        assert!(app.device().is_joined());
+        stimulus(app.device_mut());
+        from = waits.borrow().len();
+        for step in 0..steps {
+            each_step(step, app.device_mut());
+            block_on(app.step()).unwrap();
+            updates.extend(app.take_anomaly_update());
+        }
+        record = *app.anomalies();
+    }
+    let commissioned = store
+        .load()
+        .unwrap()
+        .is_some_and(|state| state.commissioned);
+    BoundRun {
+        waits: waits.into_inner(),
+        from,
+        diagnostics: diagnostics.into_inner(),
+        record,
+        updates,
+        joined: device.is_joined(),
+        commissioned,
+    }
+}
+
+static OTA_BOUND_POLICY: SensorPolicy = SensorPolicy {
+    fast_sleep_depth: SleepDepth::Idle,
+    recovery: sensor_sed_app::RecoveryPolicy {
+        max_ota_awake_ms: 200,
+        ..DETERMINISTIC_RECOVERY
+    },
+    ..BASE_POLICY
+};
+
+#[test]
+fn a_stuck_ota_session_is_aborted_after_its_awake_limit() {
+    let active = Cell::new(false);
+    let aborts = Cell::new(0);
+    let run = run_bounded(
+        &OTA_BOUND_POLICY,
+        test_profile(),
+        StuckOta {
+            active: &active,
+            aborts: &aborts,
+        },
+        |_| active.set(true),
+        60,
+        |_, _| {},
+    );
+    let after = run.after();
+    let awake: Vec<_> = after
+        .iter()
+        .take_while(|wait| wait.sleep_depth == SleepDepth::Active)
+        .collect();
+    assert!(!awake.is_empty(), "OTA first keeps the radio awake");
+    assert!(
+        awake.iter().map(|wait| wait.timeout_ms).sum::<u32>() <= 200 + 10,
+        "but only for max_ota_awake_ms: {after:?}"
+    );
+    assert_eq!(aborts.get(), 1, "the stuck session is aborted once");
+    assert!(!active.get());
+    assert!(
+        after[awake.len()..]
+            .iter()
+            .all(|wait| wait.sleep_depth != SleepDepth::Active)
+    );
+    assert!(
+        after
+            .iter()
+            .rev()
+            .take(5)
+            .all(|wait| wait.timeout_ms == 1_000),
+        "back on the slow poll: {after:?}"
+    );
+    assert_eq!(run.anomalies(sensor_sed_app::AnomalyReason::Ota), 1);
+    assert_eq!(run.record.count(sensor_sed_app::AnomalyReason::Ota), 1);
+    assert_eq!(run.record.total, 1);
+    assert_eq!(
+        run.updates,
+        vec![run.record],
+        "one durable update per anomaly"
+    );
+    assert!(run.joined, "an aborted OTA is not parent-loss evidence");
+}
+
+static IDENTIFY_BOUND_POLICY: SensorPolicy = SensorPolicy {
+    recovery: sensor_sed_app::RecoveryPolicy {
+        max_identify_awake_ms: 500,
+        ..DETERMINISTIC_RECOVERY
+    },
+    ..BASE_POLICY
+};
+
+fn identify_frame(seconds: u16, frame_counter: u32) -> MacFrame {
+    let frame_control = ZclFrameHeader::build_frame_control(
+        ZclFrameType::ClusterSpecific,
+        false,
+        ClusterDirection::ClientToServer,
+        true,
+    );
+    zcl_data_frame(
+        ClusterId::IDENTIFY,
+        frame_control,
+        frame_counter as u8,
+        0x00,
+        &seconds.to_le_bytes(),
+        frame_counter,
+    )
+}
+
+#[test]
+fn identify_holds_fast_poll_only_for_its_awake_limit() {
+    let run = run_bounded(
+        &IDENTIFY_BOUND_POLICY,
+        test_profile(),
+        NoOta,
+        |device| {
+            device
+                .mac_mut()
+                .enqueue_poll_response(identify_frame(600, 0x50))
+        },
+        200,
+        |_, _| {},
+    );
+    let after = run.after();
+    let fast = after
+        .iter()
+        .filter(|wait| wait.timeout_ms == BASE_POLICY.fast_poll_ms)
+        .count();
+    assert!(fast > 10, "Identify first polls fast: {after:?}");
+    let fast_ms: u32 = after
+        .iter()
+        .filter(|wait| wait.timeout_ms == BASE_POLICY.fast_poll_ms)
+        .map(|wait| wait.timeout_ms)
+        .sum();
+    assert!(fast_ms <= 500 + 2 * BASE_POLICY.fast_poll_ms, "{after:?}");
+    assert!(
+        after
+            .iter()
+            .rev()
+            .take(20)
+            .all(|wait| wait.timeout_ms == 1_000),
+        "the device still identifies, but on the slow poll: {after:?}"
+    );
+    assert_eq!(run.anomalies(sensor_sed_app::AnomalyReason::Identify), 1);
+    assert_eq!(run.record.count(sensor_sed_app::AnomalyReason::Identify), 1);
+    assert!(run.joined);
+}
+
+#[test]
+fn a_short_identify_never_reaches_its_limit() {
+    let run = run_bounded(
+        &IDENTIFY_BOUND_POLICY,
+        test_profile(),
+        NoOta,
+        |device| {
+            device
+                .mac_mut()
+                .enqueue_poll_response(identify_frame(0, 0x50))
+        },
+        50,
+        |_, _| {},
+    );
+    assert_eq!(run.record.total, 0, "{:?}", run.diagnostics);
+    assert!(run.updates.is_empty());
+}
+
+static FAST_WINDOW_BOUND_POLICY: SensorPolicy = SensorPolicy {
+    recovery: sensor_sed_app::RecoveryPolicy {
+        max_fast_poll_ms: 3_000,
+        ..DETERMINISTIC_RECOVERY
+    },
+    ..BASE_POLICY
+};
+
+#[test]
+fn a_requested_fast_poll_window_is_cut_at_its_limit() {
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::with_state(commissioned_state(0x02), &store_calls);
+    let mut profile = DeviceProfile::new(
+        1,
+        0x0104,
+        DeviceId::TEMPERATURE_SENSOR,
+        PolledEnvironment {
+            inner: TemperatureHumidityBattery::new(
+                TemperatureRange {
+                    min_centi_celsius: -4_000,
+                    max_centi_celsius: 12_500,
+                },
+                BatteryDescriptor {
+                    size: 4,
+                    quantity: 2,
+                    rated_voltage_100mv: 15,
+                },
+                EnvironmentalReporting::default(),
+            ),
+            poll_control: PollControlCluster::with_config(PollControlConfig {
+                // No check-in: only the requested window keeps the radio up.
+                check_in_interval: 0,
+                ..POLL_CONTROL_CONFIG
+            }),
+        },
+    );
+    let mut device = test_device(&profile, &FAST_WINDOW_BOUND_POLICY);
+    let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+    let wake = RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+    let mut app = SensorApp::new(
+        node,
+        &FAST_WINDOW_BOUND_POLICY,
+        parts(
+            wake,
+            RecordingStatus { events: &status },
+            NoOta,
+            &environment_samples,
+            &battery_samples,
+            &heartbeats,
+            &diagnostics,
+        ),
+    )
+    .unwrap();
+    block_on(app.initialize()).unwrap();
+    for _ in 0..20 {
+        block_on(app.step()).unwrap();
+    }
+    // Check-in Response asking for 40 qs (10 s) of fast poll.
+    app.device_mut()
+        .mac_mut()
+        .enqueue_poll_response(poll_control_frame(0x00, &[1, 40, 0], 0x40));
+    let from = waits.borrow().len();
+    for _ in 0..80 {
+        block_on(app.step()).unwrap();
+    }
+    let record = *app.anomalies();
+    drop(app);
+    let waits = waits.borrow().clone();
+    let after = &waits[from..];
+    let fast_ms: u32 = after
+        .iter()
+        .filter(|wait| wait.timeout_ms == 250)
+        .map(|wait| wait.timeout_ms)
+        .sum();
+    assert!(
+        (2_750..=3_500).contains(&fast_ms),
+        "fast poll lasts max_fast_poll_ms, not 10 s: {fast_ms} {after:?}"
+    );
+    assert!(
+        after
+            .iter()
+            .rev()
+            .take(10)
+            .all(|wait| wait.timeout_ms == 2_000)
+    );
+    assert_eq!(record.count(sensor_sed_app::AnomalyReason::FastPoll), 1);
+    assert!(diagnostics.borrow().iter().any(|event| matches!(
+        event,
+        DiagnosticEvent::Anomaly {
+            reason: sensor_sed_app::AnomalyReason::FastPoll,
+            total: 1
+        }
+    )));
+}
+
+#[test]
+fn restored_fast_window_ending_on_time_is_not_an_anomaly() {
+    static POLICY: SensorPolicy = SensorPolicy {
+        restored_fast_ms: 400,
+        recovery: sensor_sed_app::RecoveryPolicy {
+            max_fast_poll_ms: 400,
+            max_identify_awake_ms: 400,
+            max_ota_awake_ms: 400,
+            max_active_ms: 400,
+            ..DETERMINISTIC_RECOVERY
+        },
+        ..BASE_POLICY
+    };
+    let run = run_bounded(&POLICY, test_profile(), NoOta, |_| {}, 30, |_, _| {});
+    assert_eq!(run.record.total, 0, "{:?}", run.diagnostics);
+    assert!(run.updates.is_empty());
+}
+
+/// Temperature reported at least every 2 s; the rest never periodically.
+fn fast_reporting_profile() -> TestProfile {
+    DeviceProfile::new(
+        1,
+        0x0104,
+        DeviceId::TEMPERATURE_SENSOR,
+        TemperatureHumidityBattery::new(
+            TemperatureRange {
+                min_centi_celsius: -4_000,
+                max_centi_celsius: 12_500,
+            },
+            BatteryDescriptor {
+                size: 4,
+                quantity: 2,
+                rated_voltage_100mv: 15,
+            },
+            EnvironmentalReporting {
+                temperature_min_secs: 1,
+                temperature_max_secs: 2,
+                humidity_max_secs: 0xFFFF,
+                battery_max_secs: 0xFFFF,
+                ..EnvironmentalReporting::default()
+            },
+        ),
+    )
+}
+
+static MISSED_REPORT_POLICY: SensorPolicy = SensorPolicy {
+    secure_rejoin_failure_limit: 0,
+    join_retry_ms: 6_000,
+    recovery: sensor_sed_app::RecoveryPolicy {
+        report_aps_ack: true,
+        parent_loss_strikes: 2,
+        missed_report_grace_ms: 1_000,
+        ..DETERMINISTIC_RECOVERY
+    },
+    ..BASE_POLICY
+};
+
+#[test]
+fn reports_that_are_never_acknowledged_count_as_parent_loss() {
+    // The parent still ACKs polls at the MAC level, but nothing ever
+    // returns end to end.
+    let run = run_bounded(
+        &MISSED_REPORT_POLICY,
+        fast_reporting_profile(),
+        NoOta,
+        |_| {},
+        2_000,
+        |_, _| {},
+    );
+    assert!(
+        run.anomalies(sensor_sed_app::AnomalyReason::MissedReport) >= 1,
+        "{:?}",
+        run.diagnostics
+    );
+    assert!(
+        run.diagnostics
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::ParentLossSuspected { .. })),
+        "{:?}",
+        run.diagnostics
+    );
+    assert!(run.record.count(sensor_sed_app::AnomalyReason::ParentLoss) >= 1);
+    assert!(!run.joined, "the staged rejoin started");
+    assert!(run.commissioned, "the network is kept");
+}
+
+#[test]
+fn acknowledged_traffic_is_proof_and_never_a_missed_report() {
+    let mut counter = 0x10u8;
+    let run = run_bounded(
+        &MISSED_REPORT_POLICY,
+        fast_reporting_profile(),
+        NoOta,
+        |_| {},
+        60,
+        |step, device| {
+            let aps = device.bdb_mut().zdo_mut().aps_mut();
+            // Every pending ACK (reports included) comes back promptly.
+            if step % 2 == 0 {
+                counter = counter.wrapping_add(1);
+                aps.register_ack_pending(counter, 0x0000, &[0, 1, 2]);
+            } else {
+                for c in 0..=u8::MAX {
+                    aps.confirm_ack(0x0000, c);
+                }
+            }
+        },
+    );
+    assert_eq!(
+        run.anomalies(sensor_sed_app::AnomalyReason::MissedReport),
+        0,
+        "{:?}",
+        run.diagnostics
+    );
+    assert!(run.joined);
+}
+
+#[test]
+fn pending_work_bound_and_restore_feed_the_anomaly_record() {
+    static POLICY: SensorPolicy = SensorPolicy {
+        fast_sleep_depth: SleepDepth::Idle,
+        recovery: sensor_sed_app::RecoveryPolicy {
+            parent_loss_strikes: 0,
+            max_active_ms: 50,
+            ..DETERMINISTIC_RECOVERY
+        },
+        ..BASE_POLICY
+    };
+    let run = run_bounded(
+        &POLICY,
+        test_profile(),
+        NoOta,
+        |device| {
+            device
+                .bdb_mut()
+                .zdo_mut()
+                .aps_mut()
+                .register_ack_pending(0x77, 0x0000, &[0, 1, 2]);
+        },
+        20,
+        |_, _| {},
+    );
+    assert_eq!(run.anomalies(sensor_sed_app::AnomalyReason::PendingWork), 1);
+    assert_eq!(run.updates.len(), 1);
+    let record = run.updates[0];
+    let bytes: [u8; sensor_sed_app::ANOMALY_RECORD_LEN] = record.encode();
+    assert_eq!(sensor_sed_app::AnomalyRecord::decode(&bytes), Some(record));
 }

@@ -308,6 +308,14 @@ where
             }
         }
     }
+
+    fn abort(&mut self, node: &mut ZigbeeNode<'_, M, S, WithOta<P, Efr32FirmwareWriter>>) {
+        // The shared keep-awake bound gave up on this session: return the
+        // manager to idle (a suspended download stays resumable) and drop
+        // any half-finished activation request.
+        node.profile_mut().ota_mut().end_session();
+        self.session = OtaSession::new();
+    }
 }
 
 fn validate_write(

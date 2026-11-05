@@ -185,6 +185,7 @@ dependencies = [
 name = "sensor-sed-app"
 version = "0.1.0"
 dependencies = [
+ "embedded-storage",
  "zigbee-mac",
  "zigbee-runtime",
  "zigbee-zcl",

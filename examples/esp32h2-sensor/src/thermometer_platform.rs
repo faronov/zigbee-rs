@@ -103,6 +103,6 @@ pub mod console {
 
     pub fn init() {
         let _ = log::set_logger(&LOGGER);
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(crate::thermometer_profile::config::LOG_LEVEL);
     }
 }

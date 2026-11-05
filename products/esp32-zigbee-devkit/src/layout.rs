@@ -138,6 +138,14 @@ pub const REPORTING_OFFSET: u32 = APS_TABLE_OFFSET + APS_TABLE_SIZE;
 /// Size of the reporting journal (two 4 KiB sectors).
 pub const REPORTING_SIZE: u32 = 2 * SECTOR_SIZE;
 
+/// Sleepy-sensor anomaly record journal (keep-awake limits that fired),
+/// directly after the reporting journal. Written only when a limit fires,
+/// at most a configured number of times per boot. Only images built with
+/// `anomaly-record` open it.
+pub const ANOMALY_OFFSET: u32 = REPORTING_OFFSET + REPORTING_SIZE;
+/// Size of the anomaly journal (two 4 KiB sectors).
+pub const ANOMALY_SIZE: u32 = 2 * SECTOR_SIZE;
+
 /// Exact entries required by the OTA writer and the ESP-IDF bootloader.
 pub(crate) const EXPECTED_PARTITIONS: [PartitionSpec; 4] = [
     PartitionSpec::new(0x01, 0x00, OTADATA_OFFSET, OTADATA_SIZE, b"otadata"),
@@ -218,6 +226,9 @@ const _: () = assert!(APS_TABLE_OFFSET + APS_TABLE_SIZE <= NV_OFFSET);
 const _: () = assert!(REPORTING_OFFSET.is_multiple_of(SECTOR_SIZE));
 const _: () = assert!(APS_TABLE_OFFSET + APS_TABLE_SIZE <= REPORTING_OFFSET);
 const _: () = assert!(REPORTING_OFFSET + REPORTING_SIZE <= NV_OFFSET);
+const _: () = assert!(ANOMALY_OFFSET.is_multiple_of(SECTOR_SIZE));
+const _: () = assert!(REPORTING_OFFSET + REPORTING_SIZE <= ANOMALY_OFFSET);
+const _: () = assert!(ANOMALY_OFFSET + ANOMALY_SIZE <= NV_OFFSET);
 
 #[cfg(test)]
 mod tests {
@@ -345,6 +356,7 @@ mod tests {
             (CHILD_TABLE_OFFSET, CHILD_TABLE_SIZE),
             (APS_TABLE_OFFSET, APS_TABLE_SIZE),
             (REPORTING_OFFSET, REPORTING_SIZE),
+            (ANOMALY_OFFSET, ANOMALY_SIZE),
             (NV_OFFSET, NV_SIZE),
         ];
         for (index, (start, size)) in windows.iter().enumerate() {
@@ -356,8 +368,13 @@ mod tests {
             }
         }
         assert_eq!(
-            (CHILD_TABLE_OFFSET, APS_TABLE_OFFSET, REPORTING_OFFSET),
-            (0x003F_0000, 0x003F_2000, 0x003F_4000)
+            (
+                CHILD_TABLE_OFFSET,
+                APS_TABLE_OFFSET,
+                REPORTING_OFFSET,
+                ANOMALY_OFFSET
+            ),
+            (0x003F_0000, 0x003F_2000, 0x003F_4000, 0x003F_6000)
         );
     }
 

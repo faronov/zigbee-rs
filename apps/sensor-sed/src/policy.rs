@@ -152,17 +152,42 @@ pub struct RecoveryPolicy {
     /// parent that acknowledges at the MAC level but delivers nothing end to
     /// end is detected. Costs one extra poll per report.
     pub report_aps_ack: bool,
+    /// Longest an OTA session (query, download, verification, activation
+    /// wait) may keep the chip at the fast cadence with the radio on. The
+    /// stalled session is then aborted through
+    /// [`OtaLifecycle::abort`](crate::OtaLifecycle::abort); a later query
+    /// may resume it. `0` leaves OTA unbounded.
+    pub max_ota_awake_ms: u32,
+    /// Longest Identify may keep the fast poll. Afterwards Identify keeps
+    /// running at the normal cadence until it ends. `0` leaves it unbounded.
+    pub max_identify_awake_ms: u32,
+    /// Longest uninterrupted run of timed fast-poll windows (commissioning
+    /// and interview grace, Poll Control fast poll, control events). When it
+    /// fires the windows are closed. `0` leaves the windows unbounded; a
+    /// non-zero value must cover the longest configured window.
+    pub max_fast_poll_ms: u32,
+    /// Count a missed report as one parent-loss strike: no acknowledged
+    /// report within the shortest configured reporting maximum interval
+    /// plus this grace. Requires [`report_aps_ack`](Self::report_aps_ack).
+    /// `0` disables the detector.
+    pub missed_report_grace_ms: u32,
 }
 
 impl RecoveryPolicy {
     /// Recommended battery-sensor recovery: 15-minute backoff cap, 25 %
-    /// jitter, rejoin after three strikes, 30-second pending-work bound.
+    /// jitter, rejoin after three strikes, 30-second pending-work bound,
+    /// two-hour OTA, two-minute Identify and ten-minute fast-poll bounds,
+    /// and a two-minute missed-report grace.
     pub const DEFAULT: Self = Self {
         join_retry_max_ms: 15 * 60 * 1_000,
         join_retry_jitter_pct: 25,
         parent_loss_strikes: 3,
         max_active_ms: 30_000,
         report_aps_ack: true,
+        max_ota_awake_ms: 2 * 60 * 60 * 1_000,
+        max_identify_awake_ms: 2 * 60 * 1_000,
+        max_fast_poll_ms: 10 * 60 * 1_000,
+        missed_report_grace_ms: 2 * 60 * 1_000,
     };
 
     pub const fn is_valid(&self) -> bool {
@@ -170,6 +195,7 @@ impl RecoveryPolicy {
             && self.join_retry_max_ms <= JOIN_RETRY_MAX_MS
             && self.join_retry_jitter_pct <= MAX_JOIN_RETRY_JITTER_PCT
             && self.max_active_ms <= MAX_WAIT_MS
+            && (self.missed_report_grace_ms == 0 || self.report_aps_ack)
     }
 
     /// `delay_ms` shortened by a share of up to `join_retry_jitter_pct`
@@ -199,6 +225,10 @@ impl SensorPolicy {
             && self.join_retry_ms != 0
             && self.recovery.is_valid()
             && self.join_retry_ms <= self.recovery.join_retry_max_ms
+            && (self.recovery.max_fast_poll_ms == 0
+                || (self.recovery.max_fast_poll_ms >= self.fresh_join_fast_ms
+                    && self.recovery.max_fast_poll_ms >= self.restored_fast_ms
+                    && self.recovery.max_fast_poll_ms >= self.interview_complete_grace_ms))
             && self.announce_retry_ms != 0
             && self.interview_complete_grace_ms != 0
             && self.button.debounce_ms != 0

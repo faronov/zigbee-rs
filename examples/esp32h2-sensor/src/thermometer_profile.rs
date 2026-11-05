@@ -64,6 +64,10 @@ pub static POLICY: SensorPolicy = SensorPolicy {
         parent_loss_strikes: config::PARENT_LOSS_STRIKES,
         max_active_ms: config::MAX_ACTIVE_MS,
         report_aps_ack: config::REPORT_APS_ACK,
+        max_ota_awake_ms: config::MAX_OTA_AWAKE_MS,
+        max_identify_awake_ms: config::MAX_IDENTIFY_AWAKE_MS,
+        max_fast_poll_ms: config::MAX_FAST_POLL_MS,
+        missed_report_grace_ms: config::MISSED_REPORT_GRACE_MS,
     },
     ..product::policy::SENSOR_POLICY
 };
@@ -89,10 +93,13 @@ const _: () = assert!(config::LONG_POLL_MAX_QS * 250 <= sensor_sed_app::policy::
 const _: () = assert!(POLICY.is_valid_for_status(false));
 const _: () = assert!(config::SLOW_POLL_MS <= sensor_sed_app::policy::MAX_WAIT_MS);
 
-/// Basic + Identify + Poll Control + Temperature Measurement server.
+/// Basic + Identify + Poll Control + Temperature Measurement server, plus
+/// the anomaly-record Diagnostics server in `anomaly-record` builds.
 pub struct Thermometer {
     temperature: TemperatureCluster,
     poll_control: PollControlCluster,
+    #[cfg(feature = "anomaly-record")]
+    anomalies: crate::thermometer_anomaly::AnomalyDiagnostics,
 }
 
 impl Thermometer {
@@ -105,7 +112,14 @@ impl Thermometer {
                 config::MAX_MEASURED_CENTI_C,
             ),
             poll_control: PollControlCluster::with_config(POLL_CONTROL),
+            #[cfg(feature = "anomaly-record")]
+            anomalies: crate::thermometer_anomaly::AnomalyDiagnostics::new(),
         }
+    }
+
+    #[cfg(feature = "anomaly-record")]
+    pub fn anomalies_mut(&mut self) -> &mut crate::thermometer_anomaly::AnomalyDiagnostics {
+        &mut self.anomalies
     }
 
     pub fn set_temperature(&mut self, centi_celsius: i16) {
@@ -115,11 +129,14 @@ impl Thermometer {
 
 impl ProfileComponent for Thermometer {
     fn configure_endpoint(&self, endpoint: EndpointBuilder) -> EndpointBuilder {
-        endpoint
+        let endpoint = endpoint
             .cluster_server(ClusterId::BASIC)
             .cluster_server(ClusterId::IDENTIFY)
             .cluster_server(ClusterId::POLL_CONTROL)
-            .cluster_server(self.temperature.cluster_id())
+            .cluster_server(self.temperature.cluster_id());
+        #[cfg(feature = "anomaly-record")]
+        let endpoint = endpoint.cluster_server(ClusterId::DIAGNOSTICS);
+        endpoint
     }
 
     fn collect_clusters<'a>(
@@ -131,6 +148,13 @@ impl ProfileComponent for Thermometer {
             .push(ClusterRef {
                 endpoint,
                 cluster: &mut self.temperature,
+            })
+            .map_err(|_| ProfileError::TooManyClusters)?;
+        #[cfg(feature = "anomaly-record")]
+        clusters
+            .push(ClusterRef {
+                endpoint,
+                cluster: &mut self.anomalies,
             })
             .map_err(|_| ProfileError::TooManyClusters)?;
         clusters
@@ -152,6 +176,8 @@ impl ProfileComponent for Thermometer {
         endpoint: u8,
         device: &mut ZigbeeDevice<M, R>,
     ) -> Result<(), ProfileError> {
+        #[cfg(feature = "anomaly-record")]
+        crate::thermometer_anomaly::configure_reporting(endpoint, device)?;
         device
             .reporting_mut()
             .configure_for_cluster(
