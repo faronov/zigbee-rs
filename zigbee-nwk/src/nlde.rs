@@ -1146,7 +1146,7 @@ impl<M: MacDriver> NwkLayer<M> {
     pub async fn complete_lifecycle_persistence(&mut self) {
         if let Some((replay, _)) = self.pending_lifecycle_replay.take() {
             // Admission reserved this domain's slot; a failure is logged.
-            let _ = self.commit_replay_floor(replay);
+            let _ = self.commit_replay_floor(replay, None);
             self.security.activation_pending = false;
         }
         if let Some((source, sequence)) = self.pending_lifecycle_btr.take() {
@@ -1206,7 +1206,7 @@ impl<M: MacDriver> NwkLayer<M> {
             log::error!("[NWK] Replay-counter commit hook refused the frame");
             return false;
         }
-        self.commit_replay_floor(replay)
+        self.commit_replay_floor(replay, None)
     }
 
     /// Record a verified incoming counter in the RAM-only replay authority.
@@ -1214,12 +1214,17 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Admission already reserved room for a new domain, so this only fails
     /// if that invariant was broken; the floor is then reported and the frame
     /// refused rather than silently accepted without a floor.
+    ///
+    /// `rejoin_parent` names the new parent while a secure rejoin response is
+    /// verified; otherwise an end device protects its current parent.
     pub(crate) fn commit_replay_floor(
         &mut self,
         replay: crate::security::NwkReplayCounter,
+        rejoin_parent: Option<&IeeeAddress>,
     ) -> bool {
         #[cfg(feature = "router")]
         let recorded = {
+            let _ = rejoin_parent;
             let neighbors = &self.neighbors;
             self.security.commit_frame_counter_for_key_protecting(
                 &replay.source,
@@ -1229,11 +1234,17 @@ impl<M: MacDriver> NwkLayer<M> {
             )
         };
         #[cfg(not(feature = "router"))]
-        let recorded = self.security.commit_frame_counter_for_key(
-            &replay.source,
-            replay.key_sequence,
-            replay.counter,
-        );
+        let recorded = {
+            let parent = rejoin_parent
+                .copied()
+                .or_else(|| self.neighbors.parent().map(|entry| entry.ieee_address));
+            self.security.commit_frame_counter_for_key_with_parent(
+                &replay.source,
+                replay.key_sequence,
+                replay.counter,
+                parent.as_ref(),
+            )
+        };
         if !recorded {
             self.rx_security_stats.replay_table_full =
                 self.rx_security_stats.replay_table_full.wrapping_add(1);
@@ -1246,16 +1257,18 @@ impl<M: MacDriver> NwkLayer<M> {
     /// verification.
     ///
     /// A router may evict only stale floors of sources other than its parent
-    /// and children, and with `reserve_for_neighbours` also keeps room for
-    /// the parent and children that have no floor yet (a rejoin admits its
-    /// new parent without that reservation). An end device admits a new
-    /// source only into a free slot.
+    /// and children, and outside a rejoin also keeps room for the parent and
+    /// children that have no floor yet (a rejoin admits its new parent
+    /// without that reservation). An end device keeps one slot for its
+    /// parent — `rejoin_parent` during a secure rejoin, else the current
+    /// parent — which may also replace the oldest other floor of a full
+    /// table; other new sources need a free slot beyond that reservation.
     pub(crate) fn incoming_replay_admission(
         &self,
         source: &IeeeAddress,
         key_sequence: u8,
         counter: u32,
-        reserve_for_neighbours: bool,
+        rejoin_parent: Option<&IeeeAddress>,
     ) -> crate::security::ReplayAdmission {
         #[cfg(feature = "router")]
         {
@@ -1264,7 +1277,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 key_sequence,
                 counter,
                 || {
-                    if reserve_for_neighbours {
+                    if rejoin_parent.is_none() {
                         self.replay_slots_reserved_for(source, key_sequence)
                     } else {
                         0
@@ -1275,9 +1288,10 @@ impl<M: MacDriver> NwkLayer<M> {
         }
         #[cfg(not(feature = "router"))]
         {
-            let _ = reserve_for_neighbours;
+            let parent =
+                rejoin_parent.or_else(|| self.neighbors.parent().map(|entry| &entry.ieee_address));
             self.security
-                .replay_admission(source, key_sequence, counter)
+                .replay_admission(source, key_sequence, counter, parent)
         }
     }
 
@@ -1914,7 +1928,7 @@ impl<M: MacDriver> NwkLayer<M> {
             &sec_hdr.source_address,
             sec_hdr.key_seq_number,
             sec_hdr.frame_counter,
-            true,
+            None,
         ) {
             crate::security::ReplayAdmission::Fresh => {}
             crate::security::ReplayAdmission::Replay => {
@@ -8602,6 +8616,79 @@ mod tests {
                 !device
                     .security
                     .check_frame_counter_for_key(&[i as u8 + 1; 8], KEY_SEQ, 100)
+            );
+        }
+    }
+
+    /// An end device at 0x6666 whose parent is `parent_ieee`, plus a frame
+    /// secured by `ORIGIN_IEEE` for it.
+    #[cfg(not(feature = "router"))]
+    fn end_device_with_parent(parent_ieee: IeeeAddress) -> (NwkLayer<MockMac>, std::vec::Vec<u8>) {
+        const DEVICE: ShortAddress = ShortAddress(0x6666);
+        let mut origin = secured_node(DeviceType::EndDevice, ORIGIN, ORIGIN_IEEE);
+        block_on(origin.nlde_data_request(DEVICE, 5, &[0x5A, 0xA5], true, false))
+            .expect("the originator secures and sends the frame");
+        let on_air = recorded_frame(&origin, 0);
+        let mut device = secured_node(DeviceType::EndDevice, DEVICE, [0xC0; 8]);
+        let mut parent = crate::neighbor::NeighborEntry::new_from_annce(ORIGIN, parent_ieee);
+        parent.relationship = crate::neighbor::Relationship::Parent;
+        parent.active = true;
+        device.neighbors.add_or_update(parent).unwrap();
+        (device, on_air.to_vec())
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn an_end_device_admits_its_parent_into_a_full_replay_table() {
+        let (mut device, on_air) = end_device_with_parent(ORIGIN_IEEE);
+        fill_replay_table(&mut device);
+
+        assert!(block_on(device.process_incoming_nwk_frame(&on_air, 42)).is_some());
+        let stats = device.rx_security_stats();
+        assert_eq!(stats.decrypt_successes, 1);
+        assert_eq!(stats.replay_table_full, 0);
+        // The earliest-admitted other floor made room; the rest survive.
+        assert!(!device.security.has_frame_counter_for_key(&[1; 8], KEY_SEQ));
+        for i in 1..crate::security::MAX_FRAME_COUNTER_ENTRIES {
+            assert!(
+                device
+                    .security
+                    .has_frame_counter_for_key(&[i as u8 + 1; 8], KEY_SEQ)
+            );
+        }
+        // The parent's floor is authoritative: the same frame now replays.
+        assert!(block_on(device.process_incoming_nwk_frame(&on_air, 42)).is_none());
+        assert_eq!(device.rx_security_stats().replay_rejections, 1);
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn an_end_device_keeps_the_parent_slot_from_other_senders() {
+        let (mut device, on_air) = end_device_with_parent([0xAB; 8]);
+        for i in 0..crate::security::MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(
+                device
+                    .security
+                    .commit_frame_counter_for_key(&[i as u8 + 1; 8], KEY_SEQ, 100)
+            );
+        }
+
+        // ORIGIN is not the parent, and only the parent's slot is left.
+        assert!(block_on(device.process_incoming_nwk_frame(&on_air, 42)).is_none());
+        let stats = device.rx_security_stats();
+        assert_eq!(stats.replay_table_full, 1);
+        assert_eq!(stats.replay_rejections, 0);
+        assert_eq!(stats.decrypt_successes, 0);
+        assert!(
+            !device
+                .security
+                .has_frame_counter_for_key(&ORIGIN_IEEE, KEY_SEQ)
+        );
+        for i in 0..crate::security::MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(
+                device
+                    .security
+                    .has_frame_counter_for_key(&[i as u8 + 1; 8], KEY_SEQ)
             );
         }
     }

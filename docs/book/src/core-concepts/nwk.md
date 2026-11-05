@@ -897,8 +897,10 @@ sender's IEEE address and network-key sequence to the last seen frame counter
 incoming NWK counters: it is never written to flash and is forgotten on
 reboot (the EmberZNet/ZBOSS/Z-Stack trade-off; see
 [NV storage](../advanced/nv-storage.md#incoming-nwk-replay-floors-are-ram-only)).
-An end device never evicts a floor within a boot: when full, a new sender is
-refused.  A router keeps slots reserved for its parent and children, may
+An end device keeps one slot for its parent (or the new parent during a
+secure rejoin): other new senders are refused once only that slot is left,
+and the parent may replace the earliest-admitted non-parent floor of a full
+table.  A router keeps slots reserved for its parent and children, may
 reclaim floors of the retained previous network key (which seals that key for
 the rest of the boot), and may evict a floor only after its sender has been
 silent for the configurable stale timeout (default one hour); parent and

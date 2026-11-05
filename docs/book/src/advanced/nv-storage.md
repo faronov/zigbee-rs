@@ -50,8 +50,17 @@ replay table (`zigbee_nwk::security`, `MAX_FRAME_COUNTER_ENTRIES`: 64 in
   sequence number, never by the routed NWK originator;
 - the R22 incoming check (frame counter strictly greater than the floor) is
   unchanged and the floor only moves forward within a boot;
-- an end-device build (`router` feature off) never evicts a floor: when the
-  table is full, a new sender is refused (fail closed);
+- an end-device build (`router` feature off) keeps one slot for its parent
+  (the current parent, or the new parent while a secure rejoin response is
+  verified) as long as the parent has no floor under that key sequence. Any
+  other new sender needs a free slot beyond that reservation and is otherwise
+  refused (fail closed). The parent takes the reserved slot or, when the
+  table is full (for example after a rejoin to a new parent or a key switch),
+  replaces the earliest-admitted floor of another sender; parent floors are
+  never replaced. The replaced sender re-enters at the next counter it
+  presents, so one earlier frame of it could be replayed. An end device
+  receives unicasts only through its parent, so that window is limited to
+  broadcasts heard directly from other neighbours;
 - a `router` build makes room for a new sender, in this order: a free slot;
   a floor of the retained *previous* network key (reclaiming one seals that
   key so new senders under it are refused for the rest of the boot); the

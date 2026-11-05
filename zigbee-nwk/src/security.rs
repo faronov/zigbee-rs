@@ -495,23 +495,31 @@ impl NwkSecurity {
         let admission =
             self.check_frame_counter_reserving(source, key_sequence, counter, || 0, |_| true);
         #[cfg(not(feature = "router"))]
-        let admission = self.replay_admission(source, key_sequence, counter);
+        let admission = self.replay_admission(source, key_sequence, counter, None);
         admission == ReplayAdmission::Fresh
     }
 
     /// Check an incoming counter WITHOUT committing it (end-device build).
     ///
     /// A known `(source, key_sequence)` domain admits only a strictly greater
-    /// counter (R22 §4.3.1.2). An unknown domain is admitted only into a free
-    /// slot: incoming NWK floors are RAM-only, so this table is their sole
-    /// authority for the rest of the boot and never forgets one. A new
-    /// domain that does not fit is refused (fail closed).
+    /// counter (R22 §4.3.1.2). Incoming NWK floors are RAM-only, so this
+    /// table is their sole authority for the rest of the boot. One slot is
+    /// kept for `parent` while it has no floor under `key_sequence`: any
+    /// other new domain is admitted only if a slot remains beyond that
+    /// reservation. The parent itself takes a free slot or, in a full table,
+    /// the earliest-admitted floor of another source (see
+    /// [`Self::commit_frame_counter_for_key_with_parent`]). Anything else
+    /// that does not fit is refused (fail closed).
+    ///
+    /// `parent` is the current parent, or the new parent during a secure
+    /// rejoin; `None` reserves nothing and replaces nothing.
     #[cfg(not(feature = "router"))]
     pub fn replay_admission(
         &self,
         source: &IeeeAddress,
         key_sequence: u8,
         counter: u32,
+        parent: Option<&IeeeAddress>,
     ) -> ReplayAdmission {
         match self
             .frame_counter_table
@@ -520,8 +528,32 @@ impl NwkSecurity {
         {
             Some(entry) if counter > entry.counter => ReplayAdmission::Fresh,
             Some(_) => ReplayAdmission::Replay,
-            None if self.frame_counter_table.is_full() => ReplayAdmission::TableFull,
-            None => ReplayAdmission::Fresh,
+            None if self.leaf_admits_new_domain(source, key_sequence, parent) => {
+                ReplayAdmission::Fresh
+            }
+            None => ReplayAdmission::TableFull,
+        }
+    }
+
+    /// Whether a new `(source, key_sequence)` domain fits the end-device
+    /// table under the parent-slot rule of [`Self::replay_admission`].
+    #[cfg(not(feature = "router"))]
+    fn leaf_admits_new_domain(
+        &self,
+        source: &IeeeAddress,
+        key_sequence: u8,
+        parent: Option<&IeeeAddress>,
+    ) -> bool {
+        let free = MAX_FRAME_COUNTER_ENTRIES - self.frame_counter_table.len();
+        match parent {
+            Some(parent) if parent == source => {
+                free > 0 || self.frame_counter_table.iter().any(|e| e.source != *parent)
+            }
+            Some(parent) => {
+                let reserved = usize::from(!self.has_frame_counter_for_key(parent, key_sequence));
+                free > reserved
+            }
+            None => free > 0,
         }
     }
 
@@ -615,27 +647,62 @@ impl NwkSecurity {
         }
         #[cfg(not(feature = "router"))]
         {
-            if let Some(entry) = self
-                .frame_counter_table
-                .iter_mut()
-                .find(|e| e.source == *source && e.key_sequence == key_sequence)
-            {
-                entry.counter = entry.counter.max(counter);
-                return true;
-            }
-            let recorded = self
-                .frame_counter_table
-                .push(FrameCounterEntry {
-                    source: *source,
-                    key_sequence,
-                    counter,
-                })
-                .is_ok();
-            if !recorded {
-                log::warn!("[NWK] Replay table full — refusing a new source");
-            }
-            recorded
+            self.commit_frame_counter_for_key_with_parent(source, key_sequence, counter, None)
         }
+    }
+
+    /// Commit a verified counter, keeping one slot for the parent
+    /// (end-device build).
+    ///
+    /// Returns `false`, recording nothing, when a new domain does not fit the
+    /// rule of [`Self::replay_admission`]. When the table is full, a new
+    /// domain of `parent` replaces the earliest-admitted floor of any other
+    /// source; the parent's own floors are never replaced.
+    ///
+    /// The replaced source re-enters at whatever counter it next presents,
+    /// so one earlier frame of it could be replayed. An end device receives
+    /// unicasts only through its parent, so this is limited to broadcasts
+    /// heard directly from other neighbours.
+    #[cfg(not(feature = "router"))]
+    pub fn commit_frame_counter_for_key_with_parent(
+        &mut self,
+        source: &IeeeAddress,
+        key_sequence: u8,
+        counter: u32,
+        parent: Option<&IeeeAddress>,
+    ) -> bool {
+        if let Some(entry) = self
+            .frame_counter_table
+            .iter_mut()
+            .find(|e| e.source == *source && e.key_sequence == key_sequence)
+        {
+            entry.counter = entry.counter.max(counter);
+            return true;
+        }
+        // A refusal is reported by the caller (`replay_table_full`).
+        if !self.leaf_admits_new_domain(source, key_sequence, parent) {
+            return false;
+        }
+        if self.frame_counter_table.is_full() {
+            // Only the parent is admitted to a full table, and only when a
+            // floor of another source exists; insertion order makes the
+            // first such floor the earliest admitted.
+            if let Some(index) = self
+                .frame_counter_table
+                .iter()
+                .position(|e| e.source != *source)
+            {
+                log::warn!("[NWK] Replay table full — parent replaces the oldest other floor");
+                self.frame_counter_table.remove(index);
+            }
+        }
+        self.frame_counter_table
+            .push(FrameCounterEntry {
+                source: *source,
+                key_sequence,
+                counter,
+            })
+            .is_ok()
     }
 
     /// Commit a verified counter, making room for a new domain if needed
@@ -1162,7 +1229,7 @@ mod tests {
         };
         #[cfg(not(feature = "router"))]
         let admission = |security: &NwkSecurity, source: &IeeeAddress, counter| {
-            security.replay_admission(source, 1, counter)
+            security.replay_admission(source, 1, counter, None)
         };
         assert_eq!(
             admission(&security, &source(0), 100),
@@ -1176,6 +1243,134 @@ mod tests {
             admission(&security, &[0xF0; 8], 1),
             ReplayAdmission::TableFull
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn an_end_device_keeps_one_replay_slot_for_its_parent() {
+        const PARENT: IeeeAddress = [0xEE; 8];
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(security.commit_frame_counter_for_key_with_parent(
+                &[i as u8 + 1; 8],
+                1,
+                100,
+                Some(&PARENT),
+            ));
+        }
+        // Only the reserved slot is left: another sender is refused as
+        // table-full and is not recorded by a commit either.
+        let stranger = [0xF0; 8];
+        assert_eq!(
+            security.replay_admission(&stranger, 1, 1, Some(&PARENT)),
+            ReplayAdmission::TableFull
+        );
+        assert!(!security.commit_frame_counter_for_key_with_parent(&stranger, 1, 1, Some(&PARENT)));
+        assert!(!security.has_frame_counter_for_key(&stranger, 1));
+
+        // The parent takes the reserved slot without displacing anyone.
+        assert_eq!(
+            security.replay_admission(&PARENT, 1, 1, Some(&PARENT)),
+            ReplayAdmission::Fresh
+        );
+        assert!(security.commit_frame_counter_for_key_with_parent(&PARENT, 1, 1, Some(&PARENT)));
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(security.has_frame_counter_for_key(&[i as u8 + 1; 8], 1));
+        }
+        // A full table still refuses other senders and still reports a
+        // replay of a known one as a replay.
+        assert_eq!(
+            security.replay_admission(&stranger, 1, 1, Some(&PARENT)),
+            ReplayAdmission::TableFull
+        );
+        assert_eq!(
+            security.replay_admission(&PARENT, 1, 1, Some(&PARENT)),
+            ReplayAdmission::Replay
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn the_parent_slot_is_not_held_once_the_parent_has_a_floor() {
+        const PARENT: IeeeAddress = [0xEE; 8];
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        assert!(security.commit_frame_counter_for_key_with_parent(&PARENT, 1, 5, Some(&PARENT)));
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(security.commit_frame_counter_for_key_with_parent(
+                &[i as u8 + 1; 8],
+                1,
+                100,
+                Some(&PARENT),
+            ));
+        }
+        assert!(security.frame_counter_table.is_full());
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn a_parent_replaces_only_the_oldest_non_parent_floor_of_a_full_table() {
+        const PARENT: IeeeAddress = [0xEE; 8];
+        let mut security = NwkSecurity::new();
+        security.set_network_key([0x11; 16], 1);
+        // The parent's key-1 floor was admitted first; then other senders.
+        assert!(security.commit_frame_counter_for_key_with_parent(&PARENT, 1, 5, Some(&PARENT)));
+        for i in 0..MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(security.commit_frame_counter_for_key(&[i as u8 + 1; 8], 1, 100));
+        }
+        assert!(security.frame_counter_table.is_full());
+
+        // A new domain of the parent (here: under a new key sequence) is
+        // admitted and replaces the earliest-admitted *other* floor.
+        assert_eq!(
+            security.replay_admission(&PARENT, 2, 1, Some(&PARENT)),
+            ReplayAdmission::Fresh
+        );
+        assert!(security.commit_frame_counter_for_key_with_parent(&PARENT, 2, 1, Some(&PARENT)));
+        assert!(security.has_frame_counter_for_key(&PARENT, 1));
+        assert!(security.has_frame_counter_for_key(&PARENT, 2));
+        assert!(!security.has_frame_counter_for_key(&[1; 8], 1));
+        for i in 1..MAX_FRAME_COUNTER_ENTRIES - 1 {
+            assert!(security.has_frame_counter_for_key(&[i as u8 + 1; 8], 1));
+        }
+        // The next parent domain takes the next-oldest other floor.
+        assert!(security.commit_frame_counter_for_key_with_parent(&PARENT, 3, 1, Some(&PARENT)));
+        assert!(!security.has_frame_counter_for_key(&[2; 8], 1));
+        assert!(security.has_frame_counter_for_key(&[3; 8], 1));
+        assert!(security.has_frame_counter_for_key(&PARENT, 1));
+
+        // Without a known parent nothing is replaced: the conservative forms
+        // refuse every new domain of a full table.
+        assert!(!security.check_frame_counter_for_key(&PARENT, 4, 1));
+        assert!(!security.commit_frame_counter_for_key(&PARENT, 4, 1));
+        assert!(security.has_frame_counter_for_key(&[3; 8], 1));
+    }
+
+    #[test]
+    #[cfg(not(feature = "router"))]
+    fn a_table_holding_only_parent_floors_refuses_even_the_parent() {
+        const PARENT: IeeeAddress = [0xEE; 8];
+        let mut security = NwkSecurity::new();
+        for sequence in 0..MAX_FRAME_COUNTER_ENTRIES as u8 {
+            assert!(security.commit_frame_counter_for_key_with_parent(
+                &PARENT,
+                sequence,
+                1,
+                Some(&PARENT)
+            ));
+        }
+        let next = MAX_FRAME_COUNTER_ENTRIES as u8;
+        assert_eq!(
+            security.replay_admission(&PARENT, next, 1, Some(&PARENT)),
+            ReplayAdmission::TableFull
+        );
+        assert!(!security.commit_frame_counter_for_key_with_parent(
+            &PARENT,
+            next,
+            1,
+            Some(&PARENT)
+        ));
     }
 
     /// Fill the table with key-1 floors for sources `1..=MAX`, then let
