@@ -756,7 +756,10 @@ impl<M: MacDriver> NwkLayer<M> {
                 security: secured,
                 source_route: false,
                 dst_ieee_present: true,
-                src_ieee_present: false,
+                // R22 §3.4.7.2: the parent's own IEEE address rides in the
+                // header so the child can tie the new parent's short address
+                // to its EUI (and §3.6.1.9.1 asks it of every NWK command).
+                src_ieee_present: true,
                 end_device_initiator: false,
             },
             dst_addr: request_address,
@@ -764,7 +767,7 @@ impl<M: MacDriver> NwkLayer<M> {
             radius: 1,
             seq_number: sequence,
             dst_ieee: Some(child_ieee),
-            src_ieee: None,
+            src_ieee: Some(self.nib.ieee_address),
             multicast_control: None,
             source_route: None,
         };
@@ -935,7 +938,9 @@ impl<M: MacDriver> NwkLayer<M> {
                 security: self.nib.security_enabled,
                 source_route: false,
                 dst_ieee_present: true,
-                src_ieee_present: false,
+                // R22 §3.4.12.2: the source IEEE address of the issuing
+                // parent is mandatory.
+                src_ieee_present: true,
                 end_device_initiator: false,
             },
             dst_addr: child,
@@ -943,7 +948,7 @@ impl<M: MacDriver> NwkLayer<M> {
             radius: 1,
             seq_number: sequence,
             dst_ieee: Some(child_ieee),
-            src_ieee: None,
+            src_ieee: Some(self.nib.ieee_address),
             multicast_control: None,
             source_route: None,
         };
@@ -12361,6 +12366,10 @@ mod tests {
         let (header, consumed) = NwkHeader::parse(bytes).expect("the response parses");
         assert_eq!(header.dst_addr, ORIGIN);
         assert_eq!(header.dst_ieee, Some(ORIGIN_IEEE));
+        // R22 §3.4.7.2: the parent's own IEEE address is in the header.
+        assert!(header.frame_control.src_ieee_present);
+        assert_eq!(header.src_addr, OUR_ADDR);
+        assert_eq!(header.src_ieee, Some(parent.nib.ieee_address));
         assert_eq!(header.radius, 1);
         assert!(!header.frame_control.security);
         assert_eq!(
@@ -12666,6 +12675,9 @@ mod tests {
         let (header, _, payload) = decrypt_recorded(&recorded);
         assert!(header.frame_control.security);
         assert_eq!(header.dst_addr, ORIGIN);
+        assert_eq!(header.dst_ieee, Some(ORIGIN_IEEE));
+        assert!(header.frame_control.src_ieee_present);
+        assert_eq!(header.src_ieee, Some(RELAY_IEEE));
         assert_eq!(header.radius, 1);
         assert_eq!(
             payload.as_slice(),
@@ -13235,6 +13247,12 @@ mod tests {
 
         let record = &parent.mac.tx_history()[0];
         assert!(record.indirect, "a sleepy child response is indirect");
+        let (header, _) = NwkHeader::parse(record.payload.as_slice()).expect("the response parses");
+        assert_eq!(header.dst_addr, ORIGIN);
+        assert_eq!(header.dst_ieee, Some(ORIGIN_IEEE));
+        // R22 §3.4.12.2: the issuing parent's IEEE address is mandatory.
+        assert!(header.frame_control.src_ieee_present);
+        assert_eq!(header.src_ieee, Some(parent.nib.ieee_address));
         assert_eq!(
             decrypted_command_body(record.payload.as_slice()).as_slice(),
             &[

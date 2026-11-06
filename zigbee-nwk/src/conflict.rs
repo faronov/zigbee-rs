@@ -1144,6 +1144,10 @@ mod tests {
         let bytes = record.payload.as_slice();
         let (header, consumed) = NwkHeader::parse(bytes).expect("the status frame parses");
         assert_eq!(header.dst_addr, ShortAddress::BROADCAST_RX_ON_WHEN_IDLE);
+        // R22 §3.4.3.2 / §3.6.1.9.1: the status carries the originator's IEEE
+        // address, which is what lets receivers attribute the old address.
+        assert!(header.frame_control.src_ieee_present);
+        assert_eq!(header.src_ieee, Some(OUR_IEEE));
         assert_eq!(bytes[consumed], NwkCommandId::NetworkStatus as u8);
         assert_eq!(
             &bytes[consumed + 1..consumed + 4],
@@ -1195,6 +1199,12 @@ mod tests {
             header.dst_addr,
             ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
             "R22 §3.6.1.9.3: broadcast to 0xFFFD",
+        );
+        assert!(header.frame_control.src_ieee_present);
+        assert_eq!(
+            header.src_ieee,
+            Some(OUR_IEEE),
+            "R22 §3.4.3.2: the reporting router's IEEE address is in the header",
         );
         assert_eq!(bytes[consumed], NwkCommandId::NetworkStatus as u8);
         assert_eq!(
