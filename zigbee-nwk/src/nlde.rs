@@ -756,7 +756,10 @@ impl<M: MacDriver> NwkLayer<M> {
                 security: secured,
                 source_route: false,
                 dst_ieee_present: true,
-                src_ieee_present: false,
+                // R22 §3.4.7.2: the parent's own IEEE address rides in the
+                // header so the child can tie the new parent's short address
+                // to its EUI (and §3.6.1.9.1 asks it of every NWK command).
+                src_ieee_present: true,
                 end_device_initiator: false,
             },
             dst_addr: request_address,
@@ -764,7 +767,7 @@ impl<M: MacDriver> NwkLayer<M> {
             radius: 1,
             seq_number: sequence,
             dst_ieee: Some(child_ieee),
-            src_ieee: None,
+            src_ieee: Some(self.nib.ieee_address),
             multicast_control: None,
             source_route: None,
         };
@@ -935,7 +938,9 @@ impl<M: MacDriver> NwkLayer<M> {
                 security: self.nib.security_enabled,
                 source_route: false,
                 dst_ieee_present: true,
-                src_ieee_present: false,
+                // R22 §3.4.12.2: the source IEEE address of the issuing
+                // parent is mandatory.
+                src_ieee_present: true,
                 end_device_initiator: false,
             },
             dst_addr: child,
@@ -943,7 +948,7 @@ impl<M: MacDriver> NwkLayer<M> {
             radius: 1,
             seq_number: sequence,
             dst_ieee: Some(child_ieee),
-            src_ieee: None,
+            src_ieee: Some(self.nib.ieee_address),
             multicast_control: None,
             source_route: None,
         };
@@ -3274,6 +3279,12 @@ impl<M: MacDriver> NwkLayer<M> {
                 if status.status_code != crate::frames::NetworkStatusCommand::ADDRESS_CONFLICT {
                     return None;
                 }
+                // Mirrors the receive handler: an end device's report changes
+                // nothing, so it must not schedule lifecycle persistence.
+                #[cfg(feature = "router")]
+                if self.address_conflict_reporter_is_end_device(src) {
+                    return None;
+                }
                 if status.destination == self.nib.network_address {
                     Some(NwkLifecyclePersistence::SecurityState)
                 } else {
@@ -4393,7 +4404,7 @@ impl<M: MacDriver> NwkLayer<M> {
             // R22 §3.6.1.9.3 — the network is being told that two devices hold
             // the address in the destination field.
             crate::frames::NetworkStatusCommand::ADDRESS_CONFLICT => {
-                return self.handle_network_status_address_conflict(ns.destination);
+                return self.handle_network_status_address_conflict(src, ns.destination);
             }
             _ => {}
         }
@@ -10384,6 +10395,72 @@ mod tests {
         }
     }
 
+    /// Soak regression: an authenticated sleepy end device child sent a
+    /// Network Status 0x0D naming its parent router's address right after
+    /// rejoining, and the router renumbered itself. An end device is never
+    /// the reporter R22 §3.6.1.9.3 lets move a router, so the report must
+    /// change nothing and must not schedule lifecycle persistence; the same
+    /// report from a router still does both.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_end_device_child_cannot_renumber_its_parent_with_a_conflict_status() {
+        let body = [
+            crate::frames::NetworkStatusCommand::ADDRESS_CONFLICT,
+            (OUR_ADDR.0 & 0xFF) as u8,
+            (OUR_ADDR.0 >> 8) as u8,
+        ];
+        let mut payload = [0u8; 32];
+        let payload_len = command_payload(NwkCommandId::NetworkStatus, &body, &mut payload);
+
+        for reporter_type in [
+            crate::neighbor::NeighborDeviceType::EndDevice,
+            crate::neighbor::NeighborDeviceType::Router,
+        ] {
+            for dst in [ShortAddress::BROADCAST_RX_ON_WHEN_IDLE, OUR_ADDR] {
+                let mut router = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+                router.set_lifecycle_persistence_enabled(true);
+                let mut entry = crate::neighbor::NeighborEntry::new_from_annce(ORIGIN, ORIGIN_IEEE);
+                entry.device_type = reporter_type;
+                if reporter_type == crate::neighbor::NeighborDeviceType::EndDevice {
+                    entry.relationship = crate::neighbor::Relationship::Child;
+                }
+                router.neighbors.add_or_update(entry).unwrap();
+
+                let on_air = frame_with_network_key(
+                    &frame(NwkFrameType::Command, ORIGIN, dst),
+                    &payload[..payload_len],
+                    NETWORK_KEY,
+                    KEY_SEQ,
+                    50,
+                );
+                assert!(block_on(router.process_incoming_nwk_frame(&on_air, 42)).is_none());
+
+                if reporter_type == crate::neighbor::NeighborDeviceType::EndDevice {
+                    assert_eq!(router.take_command_outcome(), None, "dst=0x{:04X}", dst.0);
+                    assert_eq!(router.nib.network_address, OUR_ADDR);
+                    assert!(
+                        router.pending_lifecycle_replay().is_none(),
+                        "an ignored report must not demand a persistence snapshot",
+                    );
+                } else {
+                    assert_eq!(
+                        router.take_command_outcome(),
+                        Some(NwkCommandOutcome::AddressConflict {
+                            previous: OUR_ADDR,
+                            resolution: crate::conflict::AddressConflictResolution::NewLocalAddress,
+                        }),
+                        "dst=0x{:04X}",
+                        dst.0,
+                    );
+                    assert_eq!(
+                        router.pending_lifecycle_replay().map(|(_, kind)| kind),
+                        Some(NwkLifecyclePersistence::SecurityState),
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     #[cfg(feature = "router")]
     fn a_network_update_from_a_non_manager_is_not_relayed() {
@@ -12289,6 +12366,10 @@ mod tests {
         let (header, consumed) = NwkHeader::parse(bytes).expect("the response parses");
         assert_eq!(header.dst_addr, ORIGIN);
         assert_eq!(header.dst_ieee, Some(ORIGIN_IEEE));
+        // R22 §3.4.7.2: the parent's own IEEE address is in the header.
+        assert!(header.frame_control.src_ieee_present);
+        assert_eq!(header.src_addr, OUR_ADDR);
+        assert_eq!(header.src_ieee, Some(parent.nib.ieee_address));
         assert_eq!(header.radius, 1);
         assert!(!header.frame_control.security);
         assert_eq!(
@@ -12594,6 +12675,9 @@ mod tests {
         let (header, _, payload) = decrypt_recorded(&recorded);
         assert!(header.frame_control.security);
         assert_eq!(header.dst_addr, ORIGIN);
+        assert_eq!(header.dst_ieee, Some(ORIGIN_IEEE));
+        assert!(header.frame_control.src_ieee_present);
+        assert_eq!(header.src_ieee, Some(RELAY_IEEE));
         assert_eq!(header.radius, 1);
         assert_eq!(
             payload.as_slice(),
@@ -13163,6 +13247,12 @@ mod tests {
 
         let record = &parent.mac.tx_history()[0];
         assert!(record.indirect, "a sleepy child response is indirect");
+        let (header, _) = NwkHeader::parse(record.payload.as_slice()).expect("the response parses");
+        assert_eq!(header.dst_addr, ORIGIN);
+        assert_eq!(header.dst_ieee, Some(ORIGIN_IEEE));
+        // R22 §3.4.12.2: the issuing parent's IEEE address is mandatory.
+        assert!(header.frame_control.src_ieee_present);
+        assert_eq!(header.src_ieee, Some(parent.nib.ieee_address));
         assert_eq!(
             decrypted_command_body(record.payload.as_slice()).as_slice(),
             &[

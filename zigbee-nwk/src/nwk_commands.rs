@@ -1476,4 +1476,78 @@ mod tests {
             "the failed link waits for the coordinator's next Link Status",
         );
     }
+
+    /// The NWK commands each device originated, with its header checked
+    /// against R22 §3.6.1.9.1 and the per-command §3.4.x.2 rules: the source
+    /// IEEE address flag is set and the field holds the originator's address.
+    fn originated_commands(nwk: &NwkLayer<MockMac>, ieee: IeeeAddress) -> std::vec::Vec<u8> {
+        nwk.mac()
+            .tx_history()
+            .iter()
+            .map(|record| {
+                let bytes = record.payload.as_slice();
+                let (header, consumed) = NwkHeader::parse(bytes).expect("the command parses");
+                let command = bytes[consumed];
+                assert!(
+                    header.frame_control.src_ieee_present,
+                    "command 0x{command:02X} sets the source IEEE address flag",
+                );
+                assert_eq!(header.src_addr, nwk.nib().network_address);
+                assert_eq!(
+                    header.src_ieee,
+                    Some(ieee),
+                    "command 0x{command:02X} carries the originator's IEEE address",
+                );
+                command
+            })
+            .collect()
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn every_command_a_router_originates_carries_its_ieee_address() {
+        const OUR_IEEE: IeeeAddress = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        const PEER: ShortAddress = ShortAddress(0x2222);
+        let mut router = node(DeviceType::Router);
+        router.nib_mut().ieee_address = OUR_IEEE;
+        neighbour(&mut router, PEER, NeighborDeviceType::Router, 1, 1);
+
+        block_on(router.send_leave_request(PEER, false, false)).unwrap();
+        block_on(router.send_route_request(ShortAddress(0x4444), 0)).unwrap();
+        block_on(router.send_network_status(
+            PEER,
+            NetworkStatusCommand::NO_ROUTE_AVAILABLE,
+            ShortAddress(0x4444),
+        ))
+        .unwrap();
+        block_on(router.send_route_record(PEER, &[])).unwrap();
+        block_on(router.send_link_status()).unwrap();
+
+        assert_eq!(
+            originated_commands(&router, OUR_IEEE),
+            [
+                NwkCommandId::Leave as u8,
+                NwkCommandId::RouteRequest as u8,
+                NwkCommandId::NetworkStatus as u8,
+                NwkCommandId::RouteRecord as u8,
+                NwkCommandId::LinkStatus as u8,
+            ],
+        );
+    }
+
+    #[test]
+    fn an_end_device_timeout_request_carries_the_requesters_ieee_address() {
+        // R22 §3.4.11.2.
+        const OUR_IEEE: IeeeAddress = [0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88];
+        let mut end_device = node(DeviceType::EndDevice);
+        end_device.nib_mut().ieee_address = OUR_IEEE;
+        end_device.nib_mut().parent_address = ShortAddress(0x0000);
+
+        block_on(end_device.send_ed_timeout_request()).unwrap();
+
+        assert_eq!(
+            originated_commands(&end_device, OUR_IEEE),
+            [NwkCommandId::EdTimeoutRequest as u8],
+        );
+    }
 }
