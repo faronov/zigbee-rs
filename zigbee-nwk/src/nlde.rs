@@ -69,17 +69,20 @@ pub enum NwkIndication<'a> {
 /// immediately after `process_incoming_nwk_frame`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NwkCommandOutcome {
-    /// The parent sent a Leave *request* addressed to this device.
+    /// An authorized Leave *request* was addressed to this device.
     LeaveRequested {
-        /// Sender of the Leave command (always our parent — enforced on RX).
+        /// Sender of the Leave command: our parent or, for a router, the
+        /// coordinator (enforced on RX).
         src: ShortAddress,
         /// Rejoin bit: the device is expected to rejoin the same network.
         rejoin: bool,
         /// Remove-children bit from the Leave command.
         remove_children: bool,
     },
-    /// Our parent announced that it is leaving the network, so the current
-    /// parent relationship is gone and connectivity must be re-established.
+    /// Our parent announced that it is leaving the network, so connectivity
+    /// must be re-established. Reported to an end device, and to a router
+    /// only when the parent also removed its children; any other router
+    /// stays joined.
     ParentLeft {
         /// Address of the parent that announced the leave.
         src: ShortAddress,
@@ -3254,7 +3257,7 @@ impl<M: MacDriver> NwkLayer<M> {
             NwkCommandId::Leave => {
                 let leave = crate::frames::LeaveCommand::parse(payload.get(1..)?)?;
                 if leave.request {
-                    (dst == self.nib.network_address && src == self.nib.parent_address).then_some(
+                    self.leave_request_authorized(src, dst).then_some(
                         if leave.remove_children && self.can_route() {
                             NwkLifecyclePersistence::ChildState
                         } else {
@@ -3262,7 +3265,8 @@ impl<M: MacDriver> NwkLayer<M> {
                         },
                     )
                 } else if src == self.nib.parent_address {
-                    Some(NwkLifecyclePersistence::SecurityState)
+                    self.parent_leave_ends_membership(leave.remove_children)
+                        .then_some(NwkLifecyclePersistence::SecurityState)
                 } else {
                     self.neighbors.find_by_short(src).and_then(|entry| {
                         matches!(
@@ -3665,10 +3669,38 @@ impl<M: MacDriver> NwkLayer<M> {
         }
     }
 
+    /// Whether a Leave *request* from `src` to `dst` may remove this device.
+    ///
+    /// R22 §3.6.1.10.3.1: a coordinator ignores Leave requests, as does any
+    /// device for a broadcast one, so the request must be unicast to us. An
+    /// end device accepts it only from its parent. A router may accept it
+    /// without regard to the relationship; this stack narrows that to the
+    /// parent it joined through or the coordinator, which is the Trust
+    /// Center of a centralized network. The parent counts only while it is
+    /// a unicast address: a router whose parent left has none.
+    fn leave_request_authorized(&self, src: ShortAddress, dst: ShortAddress) -> bool {
+        if self.device_type == DeviceType::Coordinator || dst != self.nib.network_address {
+            return false;
+        }
+        let parent = self.nib.parent_address;
+        (is_unicast_address(parent) && src == parent)
+            || (self.device_type == DeviceType::Router && src == ShortAddress::COORDINATOR)
+    }
+
+    /// Whether our parent's Leave *indication* ends our own membership.
+    ///
+    /// R22 §3.6.1.10.3: an end device whose parent left must find a new
+    /// parent. A router does not depend on the device it joined through and
+    /// leaves only when that parent also removed its children; otherwise it
+    /// just forgets the departed neighbour.
+    fn parent_leave_ends_membership(&self, remove_children: bool) -> bool {
+        self.device_type == DeviceType::EndDevice || remove_children
+    }
+
     /// Handle incoming NWK Leave command.
     ///
-    /// A Leave *request* is only honoured from the current parent and only
-    /// when addressed to this device. A Leave *indication* (a device
+    /// A Leave *request* is honoured only as described by
+    /// [`Self::leave_request_authorized`]. A Leave *indication* (a device
     /// announcing that it left) is honoured when addressed to this device or
     /// to the rx-on-when-idle broadcast address.
     fn handle_nwk_leave(
@@ -3691,7 +3723,7 @@ impl<M: MacDriver> NwkLayer<M> {
         );
 
         if leave.request {
-            if dst != self.nib.network_address || src != self.nib.parent_address {
+            if !self.leave_request_authorized(src, dst) {
                 log::warn!(
                     "[NWK] Ignoring unauthorized leave request src=0x{:04X} dst=0x{:04X}",
                     src.0,
@@ -3738,6 +3770,18 @@ impl<M: MacDriver> NwkLayer<M> {
         #[cfg(feature = "router")]
         self.forget_routes_for(src);
         if src == self.nib.parent_address {
+            if !self.parent_leave_ends_membership(leave.remove_children) {
+                // The router stays on the network with its keys and address.
+                // The departed parent's address may be reassigned, so it must
+                // no longer authorize Leave requests or serve as tree hop.
+                log::info!(
+                    "[NWK] Parent 0x{:04X} left; router stays joined without a parent",
+                    src.0
+                );
+                self.nib.parent_address = ShortAddress(0xFFFF);
+                self.nib.parent_link_provisional = false;
+                return None;
+            }
             self.joined = false;
             self.nib.reset_end_device_timeout_negotiation();
             self.nib.device_announce_pending = false;
@@ -7882,6 +7926,200 @@ mod tests {
             })
         );
         assert!(!nwk.is_joined());
+    }
+
+    /// Deliver one unsecured NWK Leave command and return the lifecycle
+    /// persistence it was classified for and the outcome it produced.
+    fn deliver_leave(
+        nwk: &mut NwkLayer<MockMac>,
+        src: ShortAddress,
+        dst: ShortAddress,
+        leave: crate::frames::LeaveCommand,
+    ) -> (Option<NwkLifecyclePersistence>, Option<NwkCommandOutcome>) {
+        let mut payload = [0u8; 32];
+        let payload_len = command_payload(NwkCommandId::Leave, &[leave.serialize()], &mut payload);
+        let persistence = nwk.classify_lifecycle_command(src, dst, &payload[..payload_len]);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(NwkFrameType::Command, src, dst),
+            &payload[..payload_len],
+            &mut buf,
+        );
+        assert!(block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)).is_none());
+        (persistence, nwk.take_command_outcome())
+    }
+
+    const LEAVE_INDICATION: crate::frames::LeaveCommand = crate::frames::LeaveCommand {
+        remove_children: false,
+        request: false,
+        rejoin: false,
+    };
+
+    const fn leave_request(rejoin: bool) -> crate::frames::LeaveCommand {
+        crate::frames::LeaveCommand {
+            remove_children: false,
+            request: true,
+            rejoin,
+        }
+    }
+
+    /// R22 §3.6.1.10.3: a router does not depend on the device it joined
+    /// through. Its parent's Leave indication only removes that neighbour;
+    /// the router keeps its network and needs neither a rejoin nor a
+    /// persistence checkpoint. The departed parent's address may be reused,
+    /// so it no longer authorizes a Leave request.
+    #[test]
+    fn router_stays_joined_when_its_parent_leaves() {
+        for rejoin in [false, true] {
+            let mut nwk = node(DeviceType::Router, OUR_ADDR);
+            nwk.nib.parent_address = PEER;
+            let leave = crate::frames::LeaveCommand {
+                rejoin,
+                ..LEAVE_INDICATION
+            };
+
+            let (persistence, outcome) = deliver_leave(
+                &mut nwk,
+                PEER,
+                ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
+                leave,
+            );
+
+            assert_eq!(persistence, None);
+            assert_eq!(outcome, None, "the router keeps its network");
+            assert!(nwk.is_joined());
+            assert_eq!(nwk.nib.parent_address, ShortAddress(0xFFFF));
+
+            let (persistence, outcome) =
+                deliver_leave(&mut nwk, PEER, OUR_ADDR, leave_request(false));
+            assert_eq!(persistence, None);
+            assert_eq!(outcome, None, "a reused parent address is not authority");
+            assert!(nwk.is_joined());
+        }
+    }
+
+    /// R22 §3.6.1.10.3: a router whose parent left *and* removed its
+    /// children leaves as well; the runtime turns that into a secured rejoin.
+    #[test]
+    fn router_leaves_when_its_parent_removes_its_children() {
+        let mut nwk = node(DeviceType::Router, OUR_ADDR);
+        let leave = crate::frames::LeaveCommand {
+            remove_children: true,
+            ..LEAVE_INDICATION
+        };
+
+        let (persistence, outcome) = deliver_leave(
+            &mut nwk,
+            ShortAddress::COORDINATOR,
+            ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
+            leave,
+        );
+
+        assert_eq!(persistence, Some(NwkLifecyclePersistence::SecurityState));
+        assert_eq!(
+            outcome,
+            Some(NwkCommandOutcome::ParentLeft {
+                src: ShortAddress::COORDINATOR
+            })
+        );
+        assert!(!nwk.is_joined());
+    }
+
+    /// An end device always needs a new parent once its parent left.
+    #[test]
+    fn end_device_parent_leave_is_classified_for_persistence() {
+        let mut nwk = node(DeviceType::EndDevice, OUR_ADDR);
+        let (persistence, outcome) = deliver_leave(
+            &mut nwk,
+            ShortAddress::COORDINATOR,
+            ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
+            LEAVE_INDICATION,
+        );
+        assert_eq!(persistence, Some(NwkLifecyclePersistence::SecurityState));
+        assert!(matches!(
+            outcome,
+            Some(NwkCommandOutcome::ParentLeft { .. })
+        ));
+        assert!(!nwk.is_joined());
+    }
+
+    /// A router accepts a Leave request from the parent it joined through
+    /// and from the coordinator (the centralized Trust Center), with either
+    /// rejoin value; the rejoin bit is passed through unchanged.
+    #[test]
+    fn router_accepts_leave_requests_from_its_parent_or_the_coordinator() {
+        for src in [PEER, ShortAddress::COORDINATOR] {
+            for rejoin in [false, true] {
+                let mut nwk = node(DeviceType::Router, OUR_ADDR);
+                nwk.nib.parent_address = PEER;
+
+                let (persistence, outcome) =
+                    deliver_leave(&mut nwk, src, OUR_ADDR, leave_request(rejoin));
+
+                assert_eq!(persistence, Some(NwkLifecyclePersistence::SecurityState));
+                assert_eq!(
+                    outcome,
+                    Some(NwkCommandOutcome::LeaveRequested {
+                        src,
+                        rejoin,
+                        remove_children: false,
+                    })
+                );
+                assert!(!nwk.is_joined());
+            }
+        }
+    }
+
+    /// Only the parent may ask an end device to leave (R22 §3.6.1.10.3.1),
+    /// and no device honours a Leave request from an unrelated router.
+    #[test]
+    fn leave_requests_from_outside_the_authorized_set_are_ignored() {
+        for (device_type, src) in [
+            (DeviceType::EndDevice, ShortAddress::COORDINATOR),
+            (DeviceType::EndDevice, FAR),
+            (DeviceType::Router, FAR),
+        ] {
+            let mut nwk = node(device_type, OUR_ADDR);
+            nwk.nib.parent_address = PEER;
+            let (persistence, outcome) =
+                deliver_leave(&mut nwk, src, OUR_ADDR, leave_request(false));
+            assert_eq!(persistence, None);
+            assert_eq!(outcome, None);
+            assert!(nwk.is_joined());
+        }
+    }
+
+    /// R22 §3.6.1.10.3.1: a broadcast Leave request is dropped by every
+    /// device, and a coordinator drops any Leave request.
+    #[test]
+    fn broadcast_leave_requests_and_coordinator_leave_requests_are_ignored() {
+        for dst in [
+            ShortAddress::BROADCAST,
+            ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
+        ] {
+            let mut nwk = node(DeviceType::Router, OUR_ADDR);
+            let (persistence, outcome) = deliver_leave(
+                &mut nwk,
+                ShortAddress::COORDINATOR,
+                dst,
+                leave_request(false),
+            );
+            assert_eq!(persistence, None);
+            assert_eq!(outcome, None);
+            assert!(nwk.is_joined());
+        }
+
+        let mut coordinator = node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        coordinator.nib.parent_address = ShortAddress(0xFFFF);
+        let (persistence, outcome) = deliver_leave(
+            &mut coordinator,
+            PEER,
+            ShortAddress::COORDINATOR,
+            leave_request(false),
+        );
+        assert_eq!(persistence, None);
+        assert_eq!(outcome, None);
+        assert!(coordinator.is_joined());
     }
 
     #[test]

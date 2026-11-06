@@ -6402,3 +6402,263 @@ fn exhausted_device_annce_backs_off_instead_of_resetting_in_a_tight_loop() {
         1
     );
 }
+
+// ── NWK Leave authority (R22 §3.6.1.10.3 / §3.6.1.10.4) ─────────────────
+
+/// A neighbouring router that is not this router's parent.
+const OTHER_ROUTER: ShortAddress = ShortAddress(0x5555);
+const OTHER_ROUTER_IEEE: [u8; 8] = [0x02, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55];
+
+/// Never gives up a secured rejoin within any test horizon, independently of
+/// the default give-up limit of the policy under test.
+static PATIENT_REJOIN_POLICY: RouterPolicy = RouterPolicy {
+    max_receive_slice_us: 20_000,
+    join_retry_initial_ms: 5_000,
+    join_retry_max_ms: 60_000,
+    secure_rejoin_failure_limit: u8::MAX,
+};
+
+fn leave_frame(
+    source: ShortAddress,
+    source_ieee: [u8; 8],
+    destination: ShortAddress,
+    leave: LeaveCommand,
+    counter: u32,
+) -> MacFrame {
+    let command = [NwkCommandId::Leave as u8, leave.serialize()];
+    secured_nwk_frame(
+        NwkFrameType::Command,
+        source,
+        source_ieee,
+        destination,
+        counter as u8,
+        counter,
+        &command,
+    )
+}
+
+type LeaveTestApp<'a> = RelayRouterApp<
+    'a,
+    MockMac,
+    RamSecurityStateStore,
+    TestProfile,
+    RecordingStatus,
+    TestSupervisor,
+    RecordingDiagnostics,
+>;
+
+fn deliver(
+    app: &mut LeaveTestApp<'_>,
+    source: ShortAddress,
+    frame: MacFrame,
+) -> router_app::StepEvents {
+    let mac = app.node_mut().device_mut().mac_mut();
+    mac.set_rx_delay_us(0);
+    mac.enqueue_rx(McpsDataIndication {
+        src_address: MacAddress::Short(PanId(PAN_ID), source),
+        dst_address: MacAddress::Short(PanId(PAN_ID), ShortAddress(SHORT_ADDRESS)),
+        lqi: 220,
+        payload: frame,
+        security_use: false,
+    });
+    block_on(app.step()).unwrap()
+}
+
+/// Let the application run with an idle radio for `steps` service slices.
+fn run_idle(app: &mut LeaveTestApp<'_>, steps: usize) {
+    app.node_mut()
+        .device_mut()
+        .mac_mut()
+        .set_rx_delay_us(u32::MAX);
+    for _ in 0..steps {
+        block_on(app.step()).unwrap();
+    }
+}
+
+fn factory_resets(events: &[DiagnosticEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, DiagnosticEvent::FactoryReset))
+        .count()
+}
+
+/// Regression: a router used to treat its join parent's Leave indication as
+/// the loss of its own network, start a secured rejoin and, once that failed
+/// `secure_rejoin_failure_limit` times, factory-reset. R22 §3.6.1.10.3 keeps a
+/// router on the network unless that parent also removed its children.
+#[test]
+fn router_keeps_its_network_when_its_parent_leaves() {
+    let mut profile = profile();
+    let mut device = relay_device(&mut profile);
+    let mut security = security_store(false);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let parts = RouterParts::new(
+        RecordingStatus::default(),
+        TestSupervisor::default(),
+        RecordingDiagnostics::default(),
+    );
+    let mut app = RelayRouterApp::new(node, NoChildren, &RouterPolicy::DEFAULT, parts).unwrap();
+    block_on(app.initialize()).unwrap();
+    assert!(app.node().device().is_joined());
+
+    let parent_left = LeaveCommand {
+        remove_children: false,
+        request: false,
+        rejoin: false,
+    };
+    let events = deliver(
+        &mut app,
+        ShortAddress::COORDINATOR,
+        leave_frame(
+            ShortAddress::COORDINATOR,
+            COORDINATOR_IEEE,
+            ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
+            parent_left,
+            61,
+        ),
+    );
+    assert!(events.incoming.is_none());
+    // Well past the default policy's three 5 s rejoin retries.
+    run_idle(&mut app, 3_000);
+
+    assert!(app.node().device().is_joined());
+    let state = app.node_mut().load_security_state().unwrap().unwrap();
+    assert!(state.commissioned);
+    assert!(!state.rejoin_pending);
+    assert_eq!(state.network_key, NETWORK_KEY);
+    assert_eq!(state.short_address, SHORT_ADDRESS);
+    let diagnostics = &app.parts().diagnostics.events;
+    assert_eq!(factory_resets(diagnostics), 0);
+    assert!(!diagnostics.iter().any(|event| matches!(
+        event,
+        DiagnosticEvent::StackEvent(_) | DiagnosticEvent::SecureRejoinFailed { .. }
+    )));
+}
+
+/// R22 §3.6.1.10.4: Leave with rejoin = 1 keeps every network attribute.
+/// While the rejoin keeps failing the runtime retries on its timer and the
+/// stored network, key and rejoin intent stay intact; only the product's
+/// explicit give-up limit may ever discard them.
+#[test]
+fn leave_with_rejoin_keeps_network_state_while_the_rejoin_fails() {
+    let mut profile = profile();
+    let mut device = relay_device(&mut profile);
+    let mut security = security_store(false);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let parts = RouterParts::new(
+        RecordingStatus::default(),
+        TestSupervisor::default(),
+        RecordingDiagnostics::default(),
+    );
+    let mut app = RelayRouterApp::new(node, NoChildren, &PATIENT_REJOIN_POLICY, parts).unwrap();
+    block_on(app.initialize()).unwrap();
+
+    let events = deliver(
+        &mut app,
+        ShortAddress::COORDINATOR,
+        leave_request_frame(true, 61),
+    );
+    assert!(matches!(events.incoming, Some(StackEvent::RejoinRequested)));
+    // About a minute of an unreachable network.
+    run_idle(&mut app, 3_000);
+
+    let state = app.node_mut().load_security_state().unwrap().unwrap();
+    assert!(
+        state.commissioned,
+        "rejoin = 1 must not discard the network"
+    );
+    assert!(state.rejoin_pending);
+    assert_eq!(state.network_key, NETWORK_KEY);
+    assert_eq!(state.extended_pan_id, EXTENDED_PAN_ID);
+    assert!(state.tclk_present);
+    let diagnostics = &app.parts().diagnostics.events;
+    assert_eq!(factory_resets(diagnostics), 0);
+    let retries = diagnostics
+        .iter()
+        .filter(|event| matches!(event, DiagnosticEvent::SecureRejoinRetryFailed { .. }))
+        .count();
+    assert!(retries >= 2, "the rejoin is retried ({retries})");
+    assert!(
+        retries <= 13,
+        "retries are paced by the 5 s timer, not a tight loop ({retries})"
+    );
+}
+
+/// Without a router parent in the way the coordinator, which is the Trust
+/// Center, still removes a router with Leave rejoin = 0 and the router
+/// commits factory-new state, as for a Leave from its parent.
+#[test]
+fn trust_center_leave_without_rejoin_removes_a_router_behind_another_router() {
+    let mut profile = profile();
+    let mut device = relay_device(&mut profile);
+    let mut security = RamSecurityStateStore::new();
+    let mut state = commissioned_router_state(false);
+    state.parent_address = OTHER_ROUTER.0;
+    state.depth = 2;
+    security.store(&state).unwrap();
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let parts = RouterParts::new(
+        RecordingStatus::default(),
+        TestSupervisor::default(),
+        RecordingDiagnostics::default(),
+    );
+    let mut app = RelayRouterApp::new(node, NoChildren, &FAST_RETRY_POLICY, parts).unwrap();
+    block_on(app.initialize()).unwrap();
+    assert!(app.node().device().is_joined());
+
+    let events = deliver(&mut app, OTHER_ROUTER, leave_request_frame(false, 61));
+
+    assert!(matches!(events.incoming, Some(StackEvent::LeaveRequested)));
+    assert!(!app.node().device().is_joined());
+    assert!(
+        !app.node_mut()
+            .load_security_state()
+            .unwrap()
+            .unwrap()
+            .commissioned
+    );
+}
+
+/// A Leave request from a router that is neither our parent nor the Trust
+/// Center has no authority over this router and changes nothing.
+#[test]
+fn leave_request_from_an_unrelated_router_is_ignored() {
+    let mut profile = profile();
+    let mut device = relay_device(&mut profile);
+    let mut security = security_store(false);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let parts = RouterParts::new(
+        RecordingStatus::default(),
+        TestSupervisor::default(),
+        RecordingDiagnostics::default(),
+    );
+    let mut app = RelayRouterApp::new(node, NoChildren, &RouterPolicy::DEFAULT, parts).unwrap();
+    block_on(app.initialize()).unwrap();
+
+    for rejoin in [false, true] {
+        let leave = LeaveCommand {
+            remove_children: false,
+            request: true,
+            rejoin,
+        };
+        let events = deliver(
+            &mut app,
+            OTHER_ROUTER,
+            leave_frame(
+                OTHER_ROUTER,
+                OTHER_ROUTER_IEEE,
+                ShortAddress(SHORT_ADDRESS),
+                leave,
+                61 + u32::from(rejoin),
+            ),
+        );
+        assert!(events.incoming.is_none());
+    }
+    run_idle(&mut app, 500);
+
+    assert!(app.node().device().is_joined());
+    let state = app.node_mut().load_security_state().unwrap().unwrap();
+    assert!(state.commissioned);
+    assert!(!state.rejoin_pending);
+    assert_eq!(factory_resets(&app.parts().diagnostics.events), 0);
+}
