@@ -7,7 +7,7 @@ pub enum RetainedSleepError {
     /// The current CPU/bus configuration cannot be restored by this backport.
     UnsupportedClock,
     /// An RTC calibration failed or produced an invalid period.
-    InvalidCalibration,
+    InvalidCalibration(CalibrationFailure),
     /// The wake duration is zero or exceeds the unambiguous 48-bit interval.
     InvalidDuration,
     /// Only timer and digital GPIO wake are supported by the retained entry.
@@ -15,6 +15,19 @@ pub enum RetainedSleepError {
     /// This entry does not power down CPU, memory, flash or peripherals. Only
     /// the oscillators accepted by [`RetainedPowerDown`] for the chip may stop.
     UnsupportedPowerConfiguration,
+}
+
+/// Which RTC calibration step rejected a retained sleep (local extension).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum CalibrationFailure {
+    /// The boot-time RTC slow-clock period (`LP_AON.store1`) is zero.
+    SlowClockPeriodZero,
+    /// The TIMG0 RC_FAST calibration timed out: no divided RC_FAST ticks
+    /// were counted (`rtc_cali_timeout`, result 0).
+    FastClockTimeout,
+    /// The RC_FAST calibration completed with an implausible period.
+    FastClockOutOfRange,
 }
 
 /// Oscillators a retained light sleep may stop (local backport extension).
@@ -153,7 +166,9 @@ pub(crate) fn h2_light_sleep_analog(power_down: u32, fuses: &DbiasFuses) -> Slee
 
 pub(crate) fn timer_ticks(us: u128, period: u32) -> Result<u64, RetainedSleepError> {
     if period == 0 {
-        return Err(RetainedSleepError::InvalidCalibration);
+        return Err(RetainedSleepError::InvalidCalibration(
+            CalibrationFailure::SlowClockPeriodZero,
+        ));
     }
     let scaled = us
         .checked_mul(1 << 19)
@@ -170,16 +185,47 @@ pub(crate) fn calibrated_period(
     xtal_mhz: u32,
     cycles: u32,
 ) -> Result<u32, RetainedSleepError> {
-    if xtal_cycles == 0 || xtal_mhz == 0 || cycles == 0 {
-        return Err(RetainedSleepError::InvalidCalibration);
+    const OUT_OF_RANGE: RetainedSleepError =
+        RetainedSleepError::InvalidCalibration(CalibrationFailure::FastClockOutOfRange);
+    if xtal_cycles == 0 {
+        // `calibrate_internal` returns 0 only on `rtc_cali_timeout`.
+        return Err(RetainedSleepError::InvalidCalibration(
+            CalibrationFailure::FastClockTimeout,
+        ));
+    }
+    if xtal_mhz == 0 || cycles == 0 {
+        return Err(OUT_OF_RANGE);
     }
 
     let divider = u64::from(xtal_mhz) * u64::from(cycles);
     let period = ((u64::from(xtal_cycles) << 19) + divider / 2 - 1) / divider;
     if period == 0 || period > u64::from(u32::MAX) {
-        return Err(RetainedSleepError::InvalidCalibration);
+        return Err(OUT_OF_RANGE);
     }
     Ok(period as u32)
+}
+
+/// RC_FAST period (µs << 19) bounds: 1..40 MHz. The nominal H2 (8 MHz,
+/// period 65536) and C6 (17.5 MHz, ~29959) clocks sit well inside; a wrong
+/// REF_TICK divider or a stuck counter does not.
+#[cfg_attr(not(esp32h2), allow(dead_code))]
+pub(crate) const FAST_CLOCK_PERIOD_RANGE: core::ops::RangeInclusive<u32> =
+    ((1 << 19) / 40)..=(1 << 19);
+
+/// [`calibrated_period`] for RC_FAST, rejecting implausible frequencies.
+#[cfg_attr(not(esp32h2), allow(dead_code))]
+pub(crate) fn fast_clock_period(
+    xtal_cycles: u32,
+    xtal_mhz: u32,
+    cycles: u32,
+) -> Result<u32, RetainedSleepError> {
+    let period = calibrated_period(xtal_cycles, xtal_mhz, cycles)?;
+    if !FAST_CLOCK_PERIOD_RANGE.contains(&period) {
+        return Err(RetainedSleepError::InvalidCalibration(
+            CalibrationFailure::FastClockOutOfRange,
+        ));
+    }
+    Ok(period)
 }
 
 pub(crate) const fn divided_fast_clock(h2: bool, revision: u16) -> bool {
@@ -220,25 +266,39 @@ mod tests {
         assert_eq!(timer_ticks(0, 1), Err(RetainedSleepError::InvalidDuration));
         assert_eq!(
             timer_ticks(1, 0),
-            Err(RetainedSleepError::InvalidCalibration)
+            Err(RetainedSleepError::InvalidCalibration(
+                CalibrationFailure::SlowClockPeriodZero
+            ))
         );
     }
 
+    const TIMEOUT: RetainedSleepError =
+        RetainedSleepError::InvalidCalibration(CalibrationFailure::FastClockTimeout);
+    const OUT_OF_RANGE: RetainedSleepError =
+        RetainedSleepError::InvalidCalibration(CalibrationFailure::FastClockOutOfRange);
+
     #[test]
     fn calibration_failure_is_not_a_plausible_period() {
-        for args in [
-            (0, 32, 2048),
-            (1, 0, 2048),
-            (1, 32, 0),
-            (1, u32::MAX, u32::MAX),
-        ] {
-            assert_eq!(
-                calibrated_period(args.0, args.1, args.2),
-                Err(RetainedSleepError::InvalidCalibration)
-            );
+        assert_eq!(calibrated_period(0, 32, 2048), Err(TIMEOUT));
+        for args in [(1, 0, 2048), (1, 32, 0), (1, u32::MAX, u32::MAX)] {
+            assert_eq!(calibrated_period(args.0, args.1, args.2), Err(OUT_OF_RANGE));
         }
         assert_eq!(calibrated_period(8192, 32, 2048), Ok(1 << 16));
         assert_eq!(calibrated_period(256, 32, 64), Ok(1 << 16));
+    }
+
+    #[test]
+    fn fast_clock_period_distinguishes_timeout_and_implausible_results() {
+        // H2 ECO2+: 64 divided ticks = 2048 RC_FAST cycles at 8 MHz is 8192
+        // XTAL cycles, `>> 5` = 256 -> period 65536 (0.125 us).
+        assert_eq!(fast_clock_period(256, 32, 64), Ok(1 << 16));
+        // C6 at 17.5 MHz, 64 ticks: 3657 XTAL(40 MHz) cycles >> 5 = 114.
+        assert!(fast_clock_period(117, 40, 64).is_ok());
+        assert_eq!(fast_clock_period(0, 32, 64), Err(TIMEOUT));
+        // A stuck or undivided counter: below 1 MHz or above 40 MHz.
+        assert_eq!(fast_clock_period(1, 32, 64), Err(OUT_OF_RANGE));
+        assert_eq!(fast_clock_period(256 * 40, 32, 64), Err(OUT_OF_RANGE));
+        assert_eq!(*FAST_CLOCK_PERIOD_RANGE.end(), 1 << 19);
     }
 
     #[test]

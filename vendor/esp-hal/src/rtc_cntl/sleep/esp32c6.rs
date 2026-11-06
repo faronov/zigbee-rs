@@ -648,7 +648,9 @@ impl SleepTimeConfig {
         // TODO: do an actual calibration instead of a read
         let slowclk_period = unsafe { lp_aon().store1().read().data().bits() };
         if slowclk_period == 0 {
-            return Err(super::RetainedSleepError::InvalidCalibration);
+            return Err(super::RetainedSleepError::InvalidCalibration(
+                super::CalibrationFailure::SlowClockPeriodZero,
+            ));
         }
 
         // Calibrate rtc fast clock, only PMU supported chips sleep process is needed.

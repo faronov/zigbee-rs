@@ -29,9 +29,21 @@ use accounting::*;
 pub enum SleepError {
     UnsupportedClock,
     UnsupportedConfiguration,
-    InvalidCalibration,
+    InvalidCalibration(CalibrationFault),
     InvalidDuration,
     InvalidCounter,
+}
+
+/// Which RTC calibration step failed (mirrors the HAL's `CalibrationFailure`;
+/// kept local so this module stays host-testable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationFault {
+    /// The RTC slow-clock period is zero.
+    SlowPeriodZero,
+    /// The RC_FAST calibration timed out.
+    FastTimeout,
+    /// The RC_FAST calibration result is implausible.
+    FastOutOfRange,
 }
 
 /// Multiple sources can assert simultaneously; do not discard either bit.
@@ -76,7 +88,9 @@ mod accounting {
     impl Calibration {
         pub(super) fn new(period: u32) -> Result<Self, SleepError> {
             if period == 0 {
-                return Err(SleepError::InvalidCalibration);
+                return Err(SleepError::InvalidCalibration(
+                    CalibrationFault::SlowPeriodZero,
+                ));
             }
             Ok(Self(period))
         }
@@ -311,7 +325,14 @@ mod hardware {
         use esp_hal::rtc_cntl::sleep::RetainedSleepError;
         match error {
             RetainedSleepError::UnsupportedClock => SleepError::UnsupportedClock,
-            RetainedSleepError::InvalidCalibration => SleepError::InvalidCalibration,
+            RetainedSleepError::InvalidCalibration(failure) => {
+                use esp_hal::rtc_cntl::sleep::CalibrationFailure;
+                SleepError::InvalidCalibration(match failure {
+                    CalibrationFailure::SlowClockPeriodZero => CalibrationFault::SlowPeriodZero,
+                    CalibrationFailure::FastClockTimeout => CalibrationFault::FastTimeout,
+                    CalibrationFailure::FastClockOutOfRange => CalibrationFault::FastOutOfRange,
+                })
+            }
             RetainedSleepError::InvalidDuration => SleepError::InvalidDuration,
             RetainedSleepError::UnsupportedWakeSource
             | RetainedSleepError::UnsupportedPowerConfiguration => {
@@ -331,7 +352,9 @@ mod tests {
     fn calibration_and_duration_fail_closed() {
         assert!(matches!(
             Calibration::new(0),
-            Err(SleepError::InvalidCalibration)
+            Err(SleepError::InvalidCalibration(
+                CalibrationFault::SlowPeriodZero
+            ))
         ));
         let cal = Calibration::new(10 << 19).unwrap();
         assert_eq!(cal.duration_ticks(0), Err(SleepError::InvalidDuration));

@@ -133,3 +133,66 @@ impl<M: MacDriver, W: WakeController<M>> WakeController<M> for DiagWake<W> {
         self.inner.delay_ms(duration_ms).await
     }
 }
+
+/// Boot light-sleep self-test (`sleep_selftest`): real PMU sleeps through the
+/// production backend before the radio starts, results logged afterwards.
+#[cfg(feature = "light-sleep")]
+pub fn sleep_selftest(sleep: Option<&mut esp32_zigbee_devkit_product::sleep::LightSleep<'_>>) {
+    use esp32_zigbee_devkit_product::sleep::{SleepError, SleepStatus};
+    use esp32_zigbee_devkit_product::wake::{boot_sleep_selftest, wake_code};
+
+    if !config::SLEEP_SELFTEST {
+        return;
+    }
+    let Some(sleep) = sleep else {
+        log::warn!("[selftest] light sleep not configured");
+        return;
+    };
+    // Read-only: wafer revision, REF_TICK dividers (fosc_tick_num must be
+    // 255 for the ECO2+ RC_FAST calibration) and the boot RTC slow period.
+    let tick = esp_hal::peripherals::PCR::regs().ctrl_tick_conf().read();
+    log::info!(
+        "[selftest] chip v{}.{} ctrl_tick_conf 0x{:08X} (fosc_tick_num {}, xtal_tick_num {}) slow period 0x{:08X}; {} x {} ms",
+        esp_hal::efuse::Efuse::major_chip_version(),
+        esp_hal::efuse::Efuse::minor_chip_version(),
+        tick.bits(),
+        tick.fosc_tick_num().bits(),
+        tick.xtal_tick_num().bits(),
+        esp_hal::peripherals::LP_AON::regs().store1().read().bits(),
+        config::SLEEP_SELFTEST_COUNT,
+        config::SLEEP_SELFTEST_MS,
+    );
+    let delay = esp_hal::delay::Delay::new();
+    // Let the console drain before the clocks stop.
+    delay.delay_millis(100);
+    let mut results: [Option<Result<(u64, SleepStatus), SleepError>>;
+        config::SLEEP_SELFTEST_COUNT] = [None; config::SLEEP_SELFTEST_COUNT];
+    for result in &mut results {
+        // SAFETY: called from `main` before the radio, flash writers and the
+        // executor exist; the console was drained above.
+        let outcome =
+            unsafe { boot_sleep_selftest(sleep, u64::from(config::SLEEP_SELFTEST_MS) * 1_000) };
+        *result = Some(outcome.map(|report| (report.elapsed_us, report.status)));
+        delay.delay_millis(100);
+    }
+    // The USB host re-enumerates the device after the stopped periods.
+    delay.delay_millis(3_000);
+    for (index, result) in results.iter().enumerate() {
+        match result {
+            Some(Ok((elapsed_us, status))) => log::info!(
+                "[selftest] sleep {}: OK, RTC {} us, {:?}",
+                index + 1,
+                elapsed_us,
+                status
+            ),
+            Some(Err(error)) => log::warn!(
+                "[selftest] sleep {}: error 0x{:08X} {:?}",
+                index + 1,
+                0x1000_0000
+                    | wake_code::encode(wake_code::HARDWARE, wake_code::hardware_detail(*error)),
+                error
+            ),
+            None => {}
+        }
+    }
+}

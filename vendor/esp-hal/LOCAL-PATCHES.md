@@ -85,7 +85,28 @@ and H2 `soc/regi2c_bias.h`. These are references, not linked IDF dependencies.
 - Use calibrated Q19 RTC periods and checked 48-bit timer arithmetic. Handle H2
   ECO2 RC_FAST calibration division, including REF_TICK enable/restoration.
   Detect zero/invalid calibration and restore clocks before returning an error.
-  Retain H2 RC32K as well as XTAL32K/RC_FAST, including when RC32K is the slow clock.
+- `RetainedSleepError::InvalidCalibration(CalibrationFailure)` names the failed
+  step: `SlowClockPeriodZero` (`LP_AON.store1` or the timer period is 0),
+  `FastClockTimeout` (TIMG0 RC_FAST calibration returned 0, i.e.
+  `rtc_cali_timeout`), `FastClockOutOfRange` (H2: RC_FAST period outside
+  1..40 MHz, or an arithmetic overflow). C6 keeps the generic period check.
+- H2 RC_FAST calibration sets `PCR.ctrl_tick_conf.fosc_tick_num = 255` before
+  every RC_FAST measurement, and `rtc::init` sets it at boot, as IDF v5.5.1
+  `clk_ll_rc_fast_tick_conf()` (`REG_FOSC_TICK_NUM`, "enable a division of 32
+  to the fosc clock") does in `rtc_clk_cal_internal`; the C6 init already did.
+  A v1.2 (ECO2+) H2 read back the reset value 7, and every light-sleep attempt
+  failed with `InvalidCalibration` (cause `0x14000003`).
+- H2 `calibrate_internal` restores RC_FAST and RC32K like IDF: after the
+  measurement, the digital gate and then the oscillator are switched off again
+  if the calibration had enabled them (upstream re-set them only when they had
+  been on, which never turned them off). C6 is unchanged.
+- H2 `calibrate_internal` no longer forces `icg_hp_xtal32k` and the XTAL32K and
+  RC32K oscillators on (the upstream "very hacky" block, kept for C6); only the
+  oscillator being calibrated is enabled. H2 light sleep programs LP_ACTIVE and
+  LP_SLEEP `xpd_xtal32k`/`xpd_rc32k` as IDF `PMU_SLEEP_POWER_CONFIG_DEFAULT`
+  does with `PMU_SLEEP_PD_XTAL32K`/`PMU_SLEEP_PD_RC32K`: on only for the
+  oscillator that is the RTC slow clock (off for RC_SLOW). Before, both ran in
+  active and sleep (XTAL32K shares GPIO13/14 with the pads).
 - Correct SYSTIMER high-word reload (`>> 32`, not `<< 32`) for all existing
   setter branches.
 

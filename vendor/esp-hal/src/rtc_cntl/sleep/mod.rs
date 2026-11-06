@@ -41,7 +41,7 @@ pub(crate) mod clock_restore;
 #[cfg(any(esp32c6, esp32h2))]
 pub(crate) mod retained;
 #[cfg(any(esp32c6, esp32h2))]
-pub use retained::{RetainedPowerDown, RetainedSleepError};
+pub use retained::{CalibrationFailure, RetainedPowerDown, RetainedSleepError};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 /// Level at which a wake-up event is triggered

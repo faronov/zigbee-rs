@@ -161,6 +161,12 @@ pub(crate) fn init() {
             .modify(|_, w| w.ana_wait_target().bits(1700));
     }
 
+    // clk_ll_rc_fast_tick_conf (as the C6 init does); `calibrate_internal`
+    // also sets it before each RC_FAST calibration.
+    PCR::regs()
+        .ctrl_tick_conf()
+        .modify(|_, w| unsafe { w.fosc_tick_num().bits(crate::clock::H2_FOSC_TICK_NUM) });
+
     RtcClock::set_fast_freq(RtcFastClock::RcFast);
     RtcClock::set_slow_freq(RtcSlowClock::RcSlow);
 }

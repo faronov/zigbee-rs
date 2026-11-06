@@ -256,6 +256,11 @@ fn main() -> ! {
         let _rtc = rtc;
         None
     };
+    // `sleep_selftest`: real light sleeps before the radio exists.
+    #[cfg(all(feature = "light-sleep", not(feature = "quiet")))]
+    let mut sleep = sleep;
+    #[cfg(all(feature = "light-sleep", not(feature = "quiet")))]
+    thermometer_diag::sleep_selftest(sleep.as_mut());
 
     let button = Input::new(
         peripherals.GPIO9,

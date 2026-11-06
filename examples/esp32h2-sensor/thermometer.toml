@@ -150,3 +150,14 @@ log_level = "info"
 # Period of the wait-loop summary line (wait requests, sleep depth and wake
 # outcomes) in builds without `quiet`; 0 disables it.
 diag_summary_ms = 10000
+# Boot light-sleep self-test (non-`quiet` builds with `light-sleep` only;
+# the build rejects it otherwise). Before the radio starts, the boot runs
+# `sleep_selftest_count` timer-only light sleeps of `sleep_selftest_ms`
+# through the production backend, even with USB attached, then logs chip
+# revision, PCR ctrl_tick_conf, the RTC slow period and per sleep the result
+# (OK or the cause word), the RTC-measured duration and the wake cause, and
+# continues normally. The USB-Serial-JTAG host loses the device while the
+# clocks are stopped; the lines are printed ~3 s later, after it returns.
+sleep_selftest = false
+sleep_selftest_count = 3
+sleep_selftest_ms = 200

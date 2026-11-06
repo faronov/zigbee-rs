@@ -1,13 +1,14 @@
 use core::ops::Not;
 
 use super::retained::{
+    CalibrationFailure,
     DbiasFuses,
     PD_RC_FAST,
     PD_XTAL,
     RetainedSleepError,
     SleepAnalog,
-    calibrated_period,
     divided_fast_clock,
+    fast_clock_period,
     h2_light_sleep_analog,
     timer_ticks,
 };
@@ -164,6 +165,23 @@ impl DigitalSleepConfig {
     }
 }
 
+/// Which 32 kHz oscillators the RTC slow clock needs powered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Slow32kUse {
+    xtal32k: bool,
+    rc32k: bool,
+}
+
+impl Slow32kUse {
+    fn of(slow: crate::clock::RtcSlowClock) -> Self {
+        use crate::clock::RtcSlowClock;
+        Self {
+            xtal32k: matches!(slow, RtcSlowClock::_32kXtal),
+            rc32k: matches!(slow, RtcSlowClock::_32kRc),
+        }
+    }
+}
+
 /// Configuration for controlling the power settings of high-power and low-power
 /// systems during sleep modes.
 #[derive(Clone, Copy)]
@@ -184,11 +202,12 @@ impl PowerSleepConfig {
             lp_sys_active: LpSysPower::default(),
             lp_sys_sleep: LpSysPower::default(),
         };
-        this.apply_flags(pd_flags);
+        let slow_32k = Slow32kUse::of(crate::clock::RtcClock::slow_freq());
+        this.apply_flags(pd_flags, slow_32k);
         this
     }
 
-    fn apply_flags(&mut self, pd_flags: PowerDownFlags) {
+    fn apply_flags(&mut self, pd_flags: PowerDownFlags, slow_32k: Slow32kUse) {
         // PMU_SLEEP_POWER_CONFIG_DEFAULT
         self.hp_sys
             .dig_power
@@ -207,8 +226,15 @@ impl PowerSleepConfig {
 
         self.hp_sys.xtal.set_xpd_xtal(pd_flags.pd_xtal().not());
 
-        self.lp_sys_active.clk_power.set_xpd_xtal32k(true);
-        self.lp_sys_active.clk_power.set_xpd_rc32k(true);
+        // ESP-IDF v5.5.1 `PMU_SLEEP_POWER_CONFIG_DEFAULT` with
+        // `PMU_SLEEP_PD_XTAL32K`/`PMU_SLEEP_PD_RC32K` set unless the domain is
+        // forced on, which IDF does only when that oscillator is the RTC slow
+        // clock. LP_ACTIVE is the register `clk_ll_xtal32k_enable` uses, so
+        // this also stops them for the awake periods after the first sleep.
+        self.lp_sys_active
+            .clk_power
+            .set_xpd_xtal32k(slow_32k.xtal32k);
+        self.lp_sys_active.clk_power.set_xpd_rc32k(slow_32k.rc32k);
         self.lp_sys_active.clk_power.set_xpd_fosc(true);
 
         self.lp_sys_sleep.dig_power.set_mem_dslp(true);
@@ -220,8 +246,8 @@ impl PowerSleepConfig {
 
         self.lp_sys_sleep
             .clk_power
-            .set_xpd_xtal32k(pd_flags.pd_xtal32k().not());
-        self.lp_sys_sleep.clk_power.set_xpd_rc32k(true);
+            .set_xpd_xtal32k(slow_32k.xtal32k && pd_flags.pd_xtal32k().not());
+        self.lp_sys_sleep.clk_power.set_xpd_rc32k(slow_32k.rc32k);
         self.lp_sys_sleep
             .clk_power
             .set_xpd_fosc(pd_flags.pd_rc_fast().not());
@@ -456,13 +482,15 @@ impl SleepTimeConfig {
         }
 
         let xtal_cycles = RtcClock::calibrate_internal(RtcCalSel::RcFast, slowclk_cycles);
-        calibrated_period(xtal_cycles, xtal_freq, slowclk_cycles)
+        fast_clock_period(xtal_cycles, xtal_freq, slowclk_cycles)
     }
 
     fn new() -> Result<Self, RetainedSleepError> {
         let slowclk_period = unsafe { lp_aon().store1().read().data().bits() };
         if slowclk_period == 0 {
-            return Err(RetainedSleepError::InvalidCalibration);
+            return Err(RetainedSleepError::InvalidCalibration(
+                CalibrationFailure::SlowClockPeriodZero,
+            ));
         }
 
         // Calibrate rtc fast clock, only PMU supported chips sleep process is needed.

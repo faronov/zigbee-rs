@@ -224,9 +224,11 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   (Manage Zigbee device → Clusters → Diagnostic → Read attribute).
 - Cause word (reasons 7 and 8): bits 28-31 kind, 0-27 payload. Kind 1 wake
   error, payload = variant << 24 | detail (1 unsupported depth, 2 sleep not
-  configured, 3 GPIO wake config, 4 HAL sleep error 1-5 =
-  UnsupportedClock/UnsupportedConfiguration/InvalidCalibration/
-  InvalidDuration/InvalidCounter, 5 unexpected PMU wake cause, 6 repeated
+  configured, 3 GPIO wake config, 4 HAL sleep error: 1 UnsupportedClock,
+  2 UnsupportedConfiguration, 4 InvalidDuration, 5 InvalidCounter, and
+  InvalidCalibration as 6 RTC slow-clock period 0, 7 RC_FAST calibration
+  timeout, 8 RC_FAST result out of range (3 = unspecified calibration
+  failure, written only by older firmware); 5 unexpected PMU wake cause, 6 repeated
   PMU rejection with the reject cause, 7 radio wake failure); kind 2 panic,
   payload = flash-code offset from `0x4200_0000` of the first return
   address on the stack (the panicking function's caller; 0 if none),
@@ -256,6 +258,20 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   dividers, sleeps on XTAL and restores FLASH_PLL after recalibrating BBPLL,
   as IDF's `rtc_clk_cpu_freq_set_config` does. The code from the sleep
   request to the clock restore runs entirely from RAM/ROM.
+- RC_FAST calibration: H2 ECO2+ (wafer v1.2 on the test board) measures
+  RC_FAST through the REF_TICK /32 divider, which needs
+  `PCR.ctrl_tick_conf.fosc_tick_num = 255` (IDF `REG_FOSC_TICK_NUM`). The
+  reset value 7 made every sleep fail with `InvalidCalibration`; the HAL
+  now sets it at init and before each RC_FAST calibration, and switches
+  RC_FAST/RC32K back off afterwards when it had to enable them. XTAL32K and
+  RC32K are no longer kept running (the slow clock is RC_SLOW).
+- Boot self-test: `sleep_selftest = true` (non-`quiet` builds with
+  `light-sleep`, e.g. `H2_THERMO_SLEEP_SELFTEST=true cargo build --release
+  --bin esp32h2-thermometer --features thermometer,light-sleep`) runs
+  `sleep_selftest_count` timer-only light sleeps of `sleep_selftest_ms`
+  through the production backend before the radio starts, even with USB
+  attached, and logs chip revision, `ctrl_tick_conf`, the slow period and
+  per sleep OK/cause word, the RTC-measured duration and the wake cause.
 
 Status: build- and host-tested. Join, interview, reporting persistence,
 Poll Control check-in and the current floor with oscillator power-down

@@ -145,6 +145,9 @@ mod thermometer {
             usb_host_wait_ms: int(&mut values, "usb_host_wait_ms", 0, 10_000),
             log_level: log_level(&mut values, "log_level"),
             diag_summary_ms: int(&mut values, "diag_summary_ms", 0, 3_600_000),
+            sleep_selftest: boolean(&mut values, "sleep_selftest"),
+            sleep_selftest_count: int(&mut values, "sleep_selftest_count", 1, 10),
+            sleep_selftest_ms: int(&mut values, "sleep_selftest_ms", 20, 10_000),
         };
         if let Some(unknown) = values.keys().next() {
             panic!("{}: unknown key `{unknown}`", path.display());
@@ -195,6 +198,9 @@ mod thermometer {
         usb_host_wait_ms: i64,
         log_level: &'static str,
         diag_summary_ms: i64,
+        sleep_selftest: bool,
+        sleep_selftest_count: i64,
+        sleep_selftest_ms: i64,
     }
 
     impl Config {
@@ -276,6 +282,14 @@ mod thermometer {
                     .all(|window| *window <= self.max_fast_poll_ms),
                 "max_fast_poll_ms must be 0 or cover every configured fast-poll window"
             );
+            // The results exist only as log lines, and only the PMU backend
+            // can be exercised.
+            assert!(
+                !self.sleep_selftest
+                    || (env::var_os("CARGO_FEATURE_QUIET").is_none()
+                        && env::var_os("CARGO_FEATURE_LIGHT_SLEEP").is_some()),
+                "sleep_selftest needs the `light-sleep` feature and a build without `quiet`"
+            );
         }
 
         fn render(&self) -> String {
@@ -326,7 +340,13 @@ mod thermometer {
                  #[allow(dead_code)]\n\
                  pub const LOG_LEVEL: log::LevelFilter = log::LevelFilter::{log_level};\n\
                  #[allow(dead_code)]\n\
-                 pub const DIAG_SUMMARY_MS: u32 = {diag_summary_ms};\n",
+                 pub const DIAG_SUMMARY_MS: u32 = {diag_summary_ms};\n\
+                 #[allow(dead_code)]\n\
+                 pub const SLEEP_SELFTEST: bool = {selftest};\n\
+                 #[allow(dead_code)]\n\
+                 pub const SLEEP_SELFTEST_COUNT: usize = {selftest_count};\n\
+                 #[allow(dead_code)]\n\
+                 pub const SLEEP_SELFTEST_MS: u32 = {selftest_ms};\n",
                 model = self.model,
                 ota = self.ota_image_type,
                 role = self.role_tag,
@@ -370,6 +390,9 @@ mod thermometer {
                 fosc_off = self.sleep_rc_fast_off,
                 log_level = self.log_level,
                 diag_summary_ms = self.diag_summary_ms,
+                selftest = self.sleep_selftest,
+                selftest_count = self.sleep_selftest_count,
+                selftest_ms = self.sleep_selftest_ms,
             )
         }
     }
