@@ -249,6 +249,13 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   `sleep_rc_fast_off`) and applies ESP-IDF's light-sleep analog settings
   (see `vendor/esp-hal/LOCAL-PATCHES.md`). CPU, top, modem and flash
   domains stay powered.
+- CPU clock: the ESP-IDF bootloader leaves the H2 CPU on FLASH_PLL
+  (64 MHz from BBPLL, source 3). Earlier HAL code rejected that source, so
+  every sleep failed with `UnsupportedClock` (cause `0x14000001`, reason 8)
+  and the device drew a constant ~26 mA. The HAL now saves source and
+  dividers, sleeps on XTAL and restores FLASH_PLL after recalibrating BBPLL,
+  as IDF's `rtc_clk_cpu_freq_set_config` does. The code from the sleep
+  request to the clock restore runs entirely from RAM/ROM.
 
 Status: build- and host-tested. Join, interview, reporting persistence,
 Poll Control check-in and the current floor with oscillator power-down

@@ -315,9 +315,17 @@ impl SavedClockConfig {
         .map(Self)
     }
 
+    /// Re-select the saved CPU source and dividers after sleep, as IDF
+    /// v5.5.1 `rtc_clk_cpu_freq_set_config` does with the configuration
+    /// saved by `rtc_clk_cpu_freq_get_config`: for PLL and FLASH_PLL (64 MHz,
+    /// derived from BBPLL) the CPU was on XTAL, so BBPLL is re-enabled and
+    /// recalibrated at 96 MHz before the source switch.
+    ///
+    /// In RAM: MSPI (flash) can be clocked from BBPLL, which is powered down
+    /// in HP_SLEEP and recalibrated here.
     #[crate::ram]
     pub(crate) fn restore(self) {
-        if self.0.source == 1 {
+        if self.0.needs_bbpll() {
             esp32h2_rtc_bbpll_enable();
             esp32h2_rtc_bbpll_configure(XtalClock::_32M, PllClock::Pll96MHz);
         }
@@ -352,6 +360,7 @@ impl SavedClockConfig {
     }
 }
 
+#[inline(always)]
 pub(crate) fn restore_sleep_bias() {
     // ESP-IDF v5.5.1 pmu_sleep_finish / soc/regi2c_bias.h: low-temperature fix.
     regi2c_write_mask(0x6a, 0, 0, 7, 4, 8);

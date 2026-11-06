@@ -27,6 +27,32 @@ and H2 `soc/regi2c_bias.h`. These are references, not linked IDF dependencies.
   and ROM delay frequency; re-enable/recalibrate PLL when required. Restore the
   ADC power-detect setting and apply Espressif's post-wake low-temperature bias fix.
   H2 PLL/I2C restoration code is placed in RAM because MSPI can depend on BBPLL.
+- H2 CPU source FLASH_PLL (`soc_clk_sel = 3`, 64 MHz derived from the 96 MHz
+  BBPLL) is accepted for light sleep. The ESP-IDF 2nd-stage bootloader leaves
+  the CPU on it (`CPU /1`, `AHB /2`), so before this change every sleep attempt
+  returned `UnsupportedClock` and the device never slept. The PAC labels value 3
+  reserved; IDF v5.5.1 `clk_tree_ll.h` defines it. As IDF does
+  (`esp_sleep_start`: `rtc_clk_cpu_freq_get_config`,
+  `rtc_clk_cpu_freq_set_xtal_for_sleep`, then `rtc_clk_cpu_freq_set_config` after
+  wake), the source and CPU/AHB dividers are saved, the CPU runs on XTAL /1 in
+  sleep, and on wake BBPLL is re-enabled and recalibrated to 96 MHz for source 1
+  **or** 3. Then the saved dividers, source 3, bus latch and 64 MHz ROM delay are
+  replayed. The clock is never forced to 96 MHz PLL. Other combinations
+  (`cpu_div` not dividing 64, AHB above 32 MHz, AHB not a multiple of CPU) still
+  return `UnsupportedClock` before any register is touched.
+- The H2 sleep request, the wake/reject wait, the bias/analog restore and the
+  CPU clock restore run in one `#[ram]` function (`sleep_and_restore_clocks`),
+  with `pmu()`/`lp_aon()`/`restore_sleep_bias`/`SavedSleepAnalog::restore`
+  inlined. No flash instruction or `.rodata` fetch happens between the sleep
+  request and the restored CPU source; the only external calls are RAM
+  functions and the ROM `ets_delay_us`/`ets_update_cpu_frequency`. This is
+  stricter than IDF, which keeps `esp_sleep_start` in flash unless
+  `CONFIG_PM_SLP_IRAM_OPT` is set. Verified by disassembling the linked
+  thermometer ELF. The only flash target in the RAM path is the unreachable
+  `regi2c_enable_block` invalid-block panic.
+- esp-hal's `Clocks` still reports the 96 MHz configuration that `esp_hal::init`
+  requested, while the CPU runs at 64 MHz on FLASH_PLL. This predates the patch
+  and is unchanged; sleep timing uses the RTC/SYSTIMER, not `Clocks`.
 - Preserve C6 inactive CPU/AHB divider banks and the existing MSPI divider,
   rather than replacing the application's flash-clock configuration on wake.
   Explicitly configure PMU CPU stall and digital-watchdog pause for both chips.

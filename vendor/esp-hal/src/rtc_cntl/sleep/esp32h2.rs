@@ -559,10 +559,12 @@ impl Default for RtcSleepConfig {
     }
 }
 
+#[inline(always)]
 unsafe fn pmu<'a>() -> &'a esp32h2::pmu::RegisterBlock {
     unsafe { &*esp32h2::PMU::ptr() }
 }
 
+#[inline(always)]
 unsafe fn lp_aon<'a>() -> &'a esp32h2::lp_aon::RegisterBlock {
     unsafe { &*esp32h2::LP_AON::ptr() }
 }
@@ -728,54 +730,8 @@ impl RtcSleepConfig {
 
         param.apply();
 
-        // pmu_sleep_start
-
-        unsafe {
-            // lp_aon_hal_inform_wakeup_type - tells ROM which wakeup stub to run
-            lp_aon()
-                .store9()
-                .modify(|r, w| w.bits(r.bits() & !0x01 | self.deep as u32));
-
-            // pmu_ll_hp_set_wakeup_enable
-            pmu().slp_wakeup_cntl2().write(|w| w.bits(wakeup_mask));
-
-            // pmu_ll_hp_set_reject_enable
-            pmu().slp_wakeup_cntl1().modify(|_, w| {
-                w.slp_reject_en()
-                    .bit(true)
-                    .sleep_reject_ena()
-                    .bits(reject_mask)
-            });
-
-            pmu().int_clr().write(|w| {
-                w.soc_wakeup() // pmu_ll_hp_clear_wakeup_intr_status
-                    .clear_bit_by_one()
-                    .soc_sleep_reject() // pmu_ll_hp_clear_reject_intr_status
-                    .clear_bit_by_one()
-            });
-
-            // pmu_ll_hp_clear_reject_cause
-            pmu()
-                .slp_wakeup_cntl4()
-                .write(|w| w.slp_reject_cause_clr().bit(true));
-
-            // Start entry into sleep mode
-
-            // pmu_ll_hp_set_sleep_enable
-            pmu().slp_wakeup_cntl0().write(|w| w.sleep_req().bit(true));
-
-            loop {
-                let int_raw = pmu().int_raw().read();
-                if int_raw.soc_wakeup().bit_is_set() || int_raw.soc_sleep_reject().bit_is_set() {
-                    break;
-                }
-            }
-        }
-        restore_sleep_bias();
-        if let Some(saved) = saved_analog {
-            saved.restore();
-        }
-        clock.restore();
+        // pmu_sleep_start .. rtc_clk_cpu_freq_set_config, without leaving RAM.
+        sleep_and_restore_clocks(self.deep, wakeup_mask, reject_mask, saved_analog, clock);
         saradc
             .ctrl()
             .modify(|_, w| w.saradc2_pwdet_drv().bit(adc_power_detect));
@@ -784,6 +740,70 @@ impl RtcSleepConfig {
 
     /// Cleans up after sleep
     pub(crate) fn finish_sleep(&self) {}
+}
+
+/// Enter PMU sleep, wait for wake or rejection, and restore the analog and
+/// CPU clock state, all from RAM.
+///
+/// HP_SLEEP powers BBPLL down; on H2 the MSPI (flash) clock can be derived
+/// from it, and `SavedClockConfig::restore` recalibrates it. No flash code
+/// runs between the sleep request and the restored CPU source, so a cache
+/// miss cannot fetch through an unsettled flash clock. Every callee is
+/// `#[ram]`, inlined, or in ROM; the linked ELF is checked for flash calls.
+#[crate::ram]
+fn sleep_and_restore_clocks(
+    deep: bool,
+    wakeup_mask: u32,
+    reject_mask: u32,
+    saved_analog: Option<SavedSleepAnalog>,
+    clock: SavedClockConfig,
+) {
+    unsafe {
+        // lp_aon_hal_inform_wakeup_type - tells ROM which wakeup stub to run
+        lp_aon()
+            .store9()
+            .modify(|r, w| w.bits(r.bits() & !0x01 | deep as u32));
+
+        // pmu_ll_hp_set_wakeup_enable
+        pmu().slp_wakeup_cntl2().write(|w| w.bits(wakeup_mask));
+
+        // pmu_ll_hp_set_reject_enable
+        pmu().slp_wakeup_cntl1().modify(|_, w| {
+            w.slp_reject_en()
+                .bit(true)
+                .sleep_reject_ena()
+                .bits(reject_mask)
+        });
+
+        pmu().int_clr().write(|w| {
+            w.soc_wakeup() // pmu_ll_hp_clear_wakeup_intr_status
+                .clear_bit_by_one()
+                .soc_sleep_reject() // pmu_ll_hp_clear_reject_intr_status
+                .clear_bit_by_one()
+        });
+
+        // pmu_ll_hp_clear_reject_cause
+        pmu()
+            .slp_wakeup_cntl4()
+            .write(|w| w.slp_reject_cause_clr().bit(true));
+
+        // Start entry into sleep mode
+
+        // pmu_ll_hp_set_sleep_enable
+        pmu().slp_wakeup_cntl0().write(|w| w.sleep_req().bit(true));
+
+        loop {
+            let int_raw = pmu().int_raw().read();
+            if int_raw.soc_wakeup().bit_is_set() || int_raw.soc_sleep_reject().bit_is_set() {
+                break;
+            }
+        }
+    }
+    restore_sleep_bias();
+    if let Some(saved) = saved_analog {
+        saved.restore();
+    }
+    clock.restore();
 }
 
 fn dbias_fuses() -> DbiasFuses {
@@ -857,6 +877,7 @@ impl SavedSleepAnalog {
         ])
     }
 
+    #[inline(always)]
     fn restore(self) {
         let pmu = unsafe { pmu() };
         let [bias, regulator0, regulator1, lp_bias, lp_regulator0, lp_regulator1] = self.0;
