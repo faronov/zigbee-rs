@@ -122,6 +122,10 @@ and H2 `soc/regi2c_bias.h`. These are references, not linked IDF dependencies.
   `sleep_deep`) before a register changes. GPIO digital-hold isolation is
   not implemented (IDF only does it when digital hold is enabled). Used only
   by the `esp32h2-floor-lab` image to measure board quiescent current.
+  Lab-tested on one Waveshare ESP32-H2-Zero (chip v1.2, WSTK AEM at 3.3 V):
+  10 consecutive 30.0 s timer wakes, each a clean reboot; the board draws
+  0.73 mA in deep sleep, so that figure bounds the chip's deep-sleep
+  current but does not qualify it.
 - Correct SYSTIMER high-word reload (`>> 32`, not `<< 32`) for all existing
   setter branches.
 

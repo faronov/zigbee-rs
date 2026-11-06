@@ -290,7 +290,11 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   power trace separates board quiescent current from chip sleep
   configuration. H2 deep sleep is a local esp-hal backport (timer wake
   only, see `vendor/esp-hal/LOCAL-PATCHES.md`); production images do not
-  link it.
+  link it. On the H2-Zero (WSTK AEM, 3.3 V) the lab measured light sleep
+  1.10 mA (= the production floor), 0.97 mA with GPIO8 isolated, 1.18 mA
+  with GPIO8 driven low and 0.73 mA in deep sleep: most of the floor is
+  board quiescent current (the WS2812 on unswitched 3V3 is the prime
+  suspect; removing it is the definitive test).
 
 Status: join, interview, temperature reporting, the anomaly record and
 retained light sleep with XTAL/RC_FAST off are lab-tested on one H2 board
