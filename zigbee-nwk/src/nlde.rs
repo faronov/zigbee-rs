@@ -3274,6 +3274,12 @@ impl<M: MacDriver> NwkLayer<M> {
                 if status.status_code != crate::frames::NetworkStatusCommand::ADDRESS_CONFLICT {
                     return None;
                 }
+                // Mirrors the receive handler: an end device's report changes
+                // nothing, so it must not schedule lifecycle persistence.
+                #[cfg(feature = "router")]
+                if self.address_conflict_reporter_is_end_device(src) {
+                    return None;
+                }
                 if status.destination == self.nib.network_address {
                     Some(NwkLifecyclePersistence::SecurityState)
                 } else {
@@ -4393,7 +4399,7 @@ impl<M: MacDriver> NwkLayer<M> {
             // R22 §3.6.1.9.3 — the network is being told that two devices hold
             // the address in the destination field.
             crate::frames::NetworkStatusCommand::ADDRESS_CONFLICT => {
-                return self.handle_network_status_address_conflict(ns.destination);
+                return self.handle_network_status_address_conflict(src, ns.destination);
             }
             _ => {}
         }
@@ -10381,6 +10387,72 @@ mod tests {
                 1,
                 "the broadcast transaction record suppresses the duplicate",
             );
+        }
+    }
+
+    /// Soak regression: an authenticated sleepy end device child sent a
+    /// Network Status 0x0D naming its parent router's address right after
+    /// rejoining, and the router renumbered itself. An end device is never
+    /// the reporter R22 §3.6.1.9.3 lets move a router, so the report must
+    /// change nothing and must not schedule lifecycle persistence; the same
+    /// report from a router still does both.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_end_device_child_cannot_renumber_its_parent_with_a_conflict_status() {
+        let body = [
+            crate::frames::NetworkStatusCommand::ADDRESS_CONFLICT,
+            (OUR_ADDR.0 & 0xFF) as u8,
+            (OUR_ADDR.0 >> 8) as u8,
+        ];
+        let mut payload = [0u8; 32];
+        let payload_len = command_payload(NwkCommandId::NetworkStatus, &body, &mut payload);
+
+        for reporter_type in [
+            crate::neighbor::NeighborDeviceType::EndDevice,
+            crate::neighbor::NeighborDeviceType::Router,
+        ] {
+            for dst in [ShortAddress::BROADCAST_RX_ON_WHEN_IDLE, OUR_ADDR] {
+                let mut router = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+                router.set_lifecycle_persistence_enabled(true);
+                let mut entry = crate::neighbor::NeighborEntry::new_from_annce(ORIGIN, ORIGIN_IEEE);
+                entry.device_type = reporter_type;
+                if reporter_type == crate::neighbor::NeighborDeviceType::EndDevice {
+                    entry.relationship = crate::neighbor::Relationship::Child;
+                }
+                router.neighbors.add_or_update(entry).unwrap();
+
+                let on_air = frame_with_network_key(
+                    &frame(NwkFrameType::Command, ORIGIN, dst),
+                    &payload[..payload_len],
+                    NETWORK_KEY,
+                    KEY_SEQ,
+                    50,
+                );
+                assert!(block_on(router.process_incoming_nwk_frame(&on_air, 42)).is_none());
+
+                if reporter_type == crate::neighbor::NeighborDeviceType::EndDevice {
+                    assert_eq!(router.take_command_outcome(), None, "dst=0x{:04X}", dst.0);
+                    assert_eq!(router.nib.network_address, OUR_ADDR);
+                    assert!(
+                        router.pending_lifecycle_replay().is_none(),
+                        "an ignored report must not demand a persistence snapshot",
+                    );
+                } else {
+                    assert_eq!(
+                        router.take_command_outcome(),
+                        Some(NwkCommandOutcome::AddressConflict {
+                            previous: OUR_ADDR,
+                            resolution: crate::conflict::AddressConflictResolution::NewLocalAddress,
+                        }),
+                        "dst=0x{:04X}",
+                        dst.0,
+                    );
+                    assert_eq!(
+                        router.pending_lifecycle_replay().map(|(_, kind)| kind),
+                        Some(NwkLifecyclePersistence::SecurityState),
+                    );
+                }
+            }
         }
     }
 

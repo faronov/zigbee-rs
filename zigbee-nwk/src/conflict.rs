@@ -22,6 +22,11 @@
 //! calling in. An unauthenticated "conflict" would otherwise be a one-frame
 //! denial of service against any device in radio range.
 //!
+//! Authentication proves membership, not role. A Network Status `0x0D` from a
+//! device this node knows to be an end device is ignored: R22 §3.6.1.9.3 only
+//! lets routers and the coordinator announce a conflict on another device's
+//! address, and an end device resolves its own conflict by rejoining.
+//!
 //! # Roles
 //!
 //! Detection of a conflict on the *local* address, and the resulting rejoin,
@@ -289,10 +294,35 @@ impl<M: MacDriver> NwkLayer<M> {
         }
     }
 
-    /// Handle a received Network Status command with status code `0x0D`
-    /// (R22 §3.6.1.9.3).
+    /// Whether `reporter` is a device this node knows to be an end device, and
+    /// so cannot be the source of an actionable address-conflict report.
     ///
-    /// Three cases, in order:
+    /// R22 §3.6.1.9.3 gives the duty to announce a conflict on *another*
+    /// device's address to a coordinator or router. The only status an end
+    /// device may send names its own previous address, and it resolves that
+    /// conflict itself by rejoining; R23 §3.6.1.10.5 goes further and says an
+    /// end device shall not resolve any conflict at all. An end device's
+    /// status therefore never obliges anybody else to move. EmberZNet sleepy
+    /// end devices have been seen sending one that names their new parent
+    /// right after a rejoin, with no second holder of that address anywhere
+    /// in the network; honouring it renumbers a healthy router.
+    ///
+    /// A reporter that is not in the neighbour table cannot be classified and
+    /// is trusted: a router that detects a conflict may be many hops away from
+    /// either holder of the address.
+    #[cfg(feature = "router")]
+    pub(crate) fn address_conflict_reporter_is_end_device(&self, reporter: ShortAddress) -> bool {
+        self.neighbors.find_by_short(reporter).is_some_and(|entry| {
+            entry.device_type == crate::neighbor::NeighborDeviceType::EndDevice
+        })
+    }
+
+    /// Handle a received Network Status command with status code `0x0D`
+    /// (R22 §3.6.1.9.3) from `reporter`.
+    ///
+    /// A report from a known end device is ignored entirely (see
+    /// [`Self::address_conflict_reporter_is_end_device`]). Otherwise three
+    /// cases, in order:
     ///
     /// * the offending address is ours — we must change it, and we do *not*
     ///   rebroadcast, because the network has already been told;
@@ -302,11 +332,23 @@ impl<M: MacDriver> NwkLayer<M> {
     ///   identical broadcast of our own is cancelled.
     pub(crate) fn handle_network_status_address_conflict(
         &mut self,
+        reporter: ShortAddress,
         offending: ShortAddress,
     ) -> Option<NwkCommandOutcome> {
         if !self.address_conflict_detection_enabled() || !is_unicast_address(offending) {
             return None;
         }
+        #[cfg(feature = "router")]
+        if self.address_conflict_reporter_is_end_device(reporter) {
+            log::warn!(
+                "[NWK] Ignoring address conflict on 0x{:04X} reported by end device 0x{:04X}",
+                offending.0,
+                reporter.0,
+            );
+            return None;
+        }
+        #[cfg(not(feature = "router"))]
+        let _ = reporter;
 
         if offending == self.nib.network_address {
             let previous = self.nib.network_address;
@@ -997,6 +1039,61 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "router")]
+    fn an_end_device_report_never_moves_a_router_or_reassigns_a_child() {
+        // R22 §3.6.1.9.3 gives the conflict announcement for another device's
+        // address to routers and the coordinator; R23 §3.6.1.10.5 forbids end
+        // devices from resolving conflicts at all.
+        let mut parent = node(DeviceType::Router);
+        end_device_child(&mut parent, CHILD, CHILD_IEEE);
+        let other_child = ShortAddress(0x5555);
+        end_device_child(&mut parent, other_child, [0x55; 8]);
+
+        for offending in [OUR_ADDR, other_child, CHILD] {
+            deliver(
+                &mut parent,
+                CHILD,
+                NwkCommandId::NetworkStatus,
+                &address_conflict_body(offending),
+            );
+            assert_eq!(
+                parent.take_command_outcome(),
+                None,
+                "an end device report on 0x{:04X} is not acted on",
+                offending.0,
+            );
+        }
+        assert_eq!(parent.nib().network_address, OUR_ADDR);
+        block_on(parent.mac_mut().delay_micros(MAX_BROADCAST_JITTER_US));
+        block_on(parent.process_pending_routing());
+        assert!(
+            parent.mac().tx_history().is_empty(),
+            "an ignored report starts no announcement of our own",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_report_from_beyond_the_neighbour_table_still_moves_a_router() {
+        // The router that detects a conflict may be many hops from both
+        // holders, so a reporter we cannot classify is not refused.
+        let mut router = node(DeviceType::Router);
+        deliver(
+            &mut router,
+            ShortAddress(0x6666),
+            NwkCommandId::NetworkStatus,
+            &address_conflict_body(OUR_ADDR),
+        );
+        assert_eq!(
+            router.take_command_outcome(),
+            Some(NwkCommandOutcome::AddressConflict {
+                previous: OUR_ADDR,
+                resolution: AddressConflictResolution::NewLocalAddress,
+            }),
+        );
+    }
+
+    #[test]
     fn an_end_device_resolves_its_own_conflict_by_rejoining() {
         let mut end_device = node(DeviceType::EndDevice);
         router_neighbour(&mut end_device, PEER, PEER_IEEE);
@@ -1062,7 +1159,7 @@ mod tests {
         // R22 §3.6.1.9: detection is only enabled when nwkUniqueAddr is FALSE,
         // which tree addressing turns off, so nothing is reported at all.
         assert_eq!(
-            router.handle_network_status_address_conflict(OUR_ADDR),
+            router.handle_network_status_address_conflict(PEER, OUR_ADDR),
             None,
         );
     }
