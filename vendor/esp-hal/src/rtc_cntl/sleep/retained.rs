@@ -164,6 +164,37 @@ pub(crate) fn h2_light_sleep_analog(power_down: u32, fuses: &DbiasFuses) -> Slee
     analog
 }
 
+/// ESP-IDF v5.5.1 H2 `pmu_sleep_config_default` deep-sleep analog branch:
+/// `PMU_SLEEP_ANALOG_DSLP_CONFIG_DEFAULT` (unnamed fields are zero) with the
+/// LP sleep dbias from `get_slp_lp_dbias()`.
+#[cfg_attr(not(esp32h2), allow(dead_code))]
+pub(crate) fn h2_deep_sleep_analog(fuses: &DbiasFuses) -> SleepAnalog {
+    SleepAnalog {
+        hp_xpd_trx: false,    // PMU_XPD_TRX_SLEEP_DEFAULT
+        hp_pd_cur: false,     // PMU_PD_CUR_SLEEP_ON
+        hp_bias_sleep: false, // PMU_BIASSLP_SLEEP_ON
+        hp_xpd: false,        // PMU_HP_XPD_DEEPSLEEP
+        hp_dbias: 0,
+        hp_drv_b: 0,
+        lp_pd_cur: true,     // PMU_PD_CUR_SLEEP_DEFAULT
+        lp_bias_sleep: true, // PMU_BIASSLP_SLEEP_DEFAULT
+        lp_slp_xpd: false,   // PMU_LP_SLP_XPD_SLEEP_DEFAULT
+        lp_slp_dbias: 0,     // PMU_LP_SLP_DBIAS_SLEEP_DEFAULT
+        lp_xpd: true,        // PMU_LP_XPD_SLEEP_DEFAULT
+        lp_dbias: fuses.slp_lp(),
+        lp_drv_b: 7, // PMU_LP_DRVB_DEEPSLEEP
+    }
+}
+
+/// H2 deep sleep accepts only the LP timer wake (PMU wake bit 4).
+#[cfg_attr(not(esp32h2), allow(dead_code))]
+pub(crate) fn validate_deep(wake: u16) -> Result<(), RetainedSleepError> {
+    if wake != 1 << 4 {
+        return Err(RetainedSleepError::UnsupportedWakeSource);
+    }
+    Ok(())
+}
+
 pub(crate) fn timer_ticks(us: u128, period: u32) -> Result<u64, RetainedSleepError> {
     if period == 0 {
         return Err(RetainedSleepError::InvalidCalibration(
@@ -392,6 +423,33 @@ mod tests {
             (blank.act_hp(), blank.act_lp(), blank.slp_lp()),
             (17, 31, 6)
         );
+    }
+
+    #[test]
+    fn deep_sleep_analog_matches_the_idf_dslp_default() {
+        let fused = DbiasFuses {
+            blk_minor: 3,
+            ..UNFUSED
+        };
+        let deep = h2_deep_sleep_analog(&fused);
+        // HP regulator off, HP current/bias kept on, as IDF's DSLP default.
+        assert!(!deep.hp_xpd_trx && !deep.hp_pd_cur && !deep.hp_bias_sleep && !deep.hp_xpd);
+        assert_eq!((deep.hp_dbias, deep.hp_drv_b), (0, 0));
+        // LP regulator on at the fused 0.7 V sleep dbias, driver 7.
+        assert!(deep.lp_pd_cur && deep.lp_bias_sleep && !deep.lp_slp_xpd && deep.lp_xpd);
+        assert_eq!((deep.lp_slp_dbias, deep.lp_dbias, deep.lp_drv_b), (0, 9, 7));
+        assert_eq!(h2_deep_sleep_analog(&UNFUSED).lp_dbias, 6);
+    }
+
+    #[test]
+    fn deep_sleep_accepts_only_the_timer_wake() {
+        assert_eq!(validate_deep(1 << 4), Ok(()));
+        for wake in [0, 1 << 2, (1 << 4) | (1 << 2), 1 << 6] {
+            assert_eq!(
+                validate_deep(wake),
+                Err(RetainedSleepError::UnsupportedWakeSource)
+            );
+        }
     }
 
     #[test]

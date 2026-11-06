@@ -24,6 +24,13 @@ name = "esp32h2-thermometer"
 path = "src/thermometer.rs"
 required-features = ["thermometer"]
 
+# Sleep-floor lab (no Zigbee, `floor_lab.toml`, see `src/floor_lab.rs`):
+#   cargo build --release --no-default-features --features floor-lab --bin esp32h2-floor-lab
+[[bin]]
+name = "esp32h2-floor-lab"
+path = "src/floor_lab.rs"
+required-features = ["floor-lab"]
+
 [[bin]]
 name = "esp32h2-ed"
 path = "src/ed.rs"
@@ -90,6 +97,8 @@ thermometer = ["sed", "dep:zigbee-aps", "reporting-persist", "anomaly-record"]
 anomaly-record = ["dep:heapless", "esp32-zigbee-devkit-product/anomaly-record"]
 # Keep coordinator Configure Reporting across resets (product `zbnv` journal).
 reporting-persist = ["esp32-zigbee-devkit-product/reporting-persist"]
+# Board/chip sleep-floor lab binary; no Zigbee stack, never a product image.
+floor-lab = []
 # Compile out all `log` output; the thermometer bin then links no console.
 quiet = ["log/max_level_off", "log/release_max_level_off"]
 

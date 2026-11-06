@@ -58,8 +58,8 @@ and H2 `soc/regi2c_bias.h`. These are references, not linked IDF dependencies.
   Explicitly configure PMU CPU stall and digital-watchdog pause for both chips.
 - Add `unsafe Rtc::sleep_light_retained`, with typed admission/calibration errors.
   It accepts only timer/digital-GPIO wake and rejects all power-down flags.
-  It does not run C6's unrelated EXT1 pad cleanup. H2 deep sleep and powered-down
-  CPU/top-domain configurations are not supported by this backport.
+  It does not run C6's unrelated EXT1 pad cleanup. Powered-down CPU/top-domain
+  light-sleep configurations are not supported by this backport.
 - Add opt-in `unsafe Rtc::sleep_light_retained_power_down(RetainedPowerDown, ..)`
   (`sleep_light_retained` = `RetainedPowerDown::NONE`). **H2 only**: it may stop
   XTAL (`xtal`) and RC_FAST (`rc_fast`) and then programs the HP_SLEEP/LP_SLEEP
@@ -107,6 +107,21 @@ and H2 `soc/regi2c_bias.h`. These are references, not linked IDF dependencies.
   does with `PMU_SLEEP_PD_XTAL32K`/`PMU_SLEEP_PD_RC32K`: on only for the
   oscillator that is the RTC slow clock (off for RC_SLOW). Before, both ran in
   active and sleep (XTAL32K shares GPIO13/14 with the pads).
+- H2 deep sleep (`Rtc::sleep_deep`, now enabled for `esp32h2`), LP timer
+  wake only: `RtcSleepConfig::start_sleep` routes `deep` to a separate
+  `start_deep_sleep`, so the retained light-sleep admission (which still
+  rejects `deep`) is unchanged. It follows IDF v5.5.1 `esp_deep_sleep_start`
+  → `pmu_sleep_init(dslp)` → `pmu_sleep_start`: all `PMU_SLEEP_PD_*` power
+  flags (top, CPU, modem, VDD_SDIO, XTAL, RC_FAST, XTAL32K) from
+  `RtcSleepConfig::apply`, `PMU_SLEEP_DIGITAL_DSLP_CONFIG_DEFAULT` (ICG 0,
+  pad sleep select off), `PMU_SLEEP_ANALOG_DSLP_CONFIG_DEFAULT` (HP regulator
+  off; LP regulator on at the `DSLP_DBIAS` sleep dbias, driver 7), the same
+  timing parameters, no reject sources and `store9` deep flag; the CPU spins
+  until the request takes effect, and the timer wake resets the chip. Any
+  other wake source fails with `UnsupportedWakeSource` (a panic through
+  `sleep_deep`) before a register changes. GPIO digital-hold isolation is
+  not implemented (IDF only does it when digital hold is enabled). Used only
+  by the `esp32h2-floor-lab` image to measure board quiescent current.
 - Correct SYSTIMER high-word reload (`>> 32`, not `<< 32`) for all existing
   setter branches.
 

@@ -403,7 +403,10 @@ impl<'d> Rtc<'d> {
     ///
     /// You can use the [`#[esp_hal::ram(persistent)]`][procmacros::ram]
     /// attribute to persist a variable though deep sleep.
-    #[cfg(any(esp32, esp32s2, esp32s3, esp32c3, esp32c6, esp32c2))]
+    ///
+    /// ESP32-H2 (local backport): only [`sleep::TimerWakeupSource`] is
+    /// accepted; any other source panics before power state changes.
+    #[cfg(any(esp32, esp32s2, esp32s3, esp32c3, esp32c6, esp32c2, esp32h2))]
     pub fn sleep_deep(&mut self, wake_sources: &[&dyn WakeSource]) -> ! {
         let config = RtcSleepConfig::deep();
         self.sleep(&config, wake_sources);

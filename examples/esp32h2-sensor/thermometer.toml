@@ -45,6 +45,14 @@ fast_poll_ms = 250
 # Light sleep (radio off) between fast polls too. false keeps the CPU awake
 # between fast polls (lowest command latency during interview/OTA).
 fast_poll_light_sleep = true
+# Receive window after a data poll is ACKed with Frame Pending (ms,
+# 10..=1000). The parent sends the buffered frame right after its ACK; the
+# IEEE 802.15.4 worst case for that (macMaxFrameTotalWaitTime: minBE 3,
+# maxBE 5, 4 CSMA backoffs, longest frame) is 1986 symbols = 31.8 ms. A
+# frame that comes later stays queued at the parent and is fetched by the
+# next fast poll (pending APS ACKs keep the device in fast poll). Joining
+# keeps the backend's 250 ms association window.
+poll_response_wait_ms = 32
 # Oscillators stopped during light sleep (ESP-IDF's light-sleep default is
 # both off). XTAL off also lowers the retained HP domain to 0.6 V and stops
 # SYSTIMER (compensated from the calibrated RTC). false = keep running.

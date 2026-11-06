@@ -9,8 +9,10 @@ use super::retained::{
     SleepAnalog,
     divided_fast_clock,
     fast_clock_period,
+    h2_deep_sleep_analog,
     h2_light_sleep_analog,
     timer_ticks,
+    validate_deep,
 };
 use crate::{
     efuse::Efuse,
@@ -676,7 +678,48 @@ impl RtcSleepConfig {
     ///
     /// This backport rejects non-retained configurations before changing clocks.
     pub(crate) fn start_sleep(&self, wakeup_triggers: WakeTriggers) {
+        if self.deep {
+            match unwrap!(self.start_deep_sleep(wakeup_triggers)) {}
+        }
         unwrap!(self.start_sleep_checked(wakeup_triggers));
+    }
+
+    /// ESP-IDF v5.5.1 H2 deep sleep (`esp_deep_sleep_start` ->
+    /// `pmu_sleep_init(dslp)` -> `pmu_sleep_start`), LP timer wake only.
+    ///
+    /// Local backport. Every HP domain, flash power, XTAL, RC_FAST and the
+    /// 32 kHz oscillators are powered down (`RtcSleepConfig::apply`); wake is
+    /// a chip reset through the ROM. Returns only when the request is refused
+    /// before any power state changed.
+    fn start_deep_sleep(
+        &self,
+        wakeup_triggers: WakeTriggers,
+    ) -> Result<core::convert::Infallible, RetainedSleepError> {
+        validate_deep(wakeup_triggers.0)?;
+        let clock = SavedClockConfig::try_save().ok_or(RetainedSleepError::UnsupportedClock)?;
+        rtc_clk_cpu_freq_set_xtal();
+        // Needs to happen after rtc_clk_cpu_freq_set_xtal, as for light sleep.
+        let time = match SleepTimeConfig::light_sleep(self.pd_flags) {
+            Ok(time) => time,
+            Err(error) => {
+                clock.restore();
+                return Err(error);
+            }
+        };
+        // pmu_sleep_config_default(dslp) + pmu_sleep_init(dslp)
+        let power = PowerSleepConfig::defaults(self.pd_flags);
+        power.apply();
+        DigitalSleepConfig::defaults_deep_sleep().apply();
+        AnalogSleepConfig::defaults_deep_sleep().apply();
+        apply_sleep_analog(&h2_deep_sleep_analog(&dbias_fuses()));
+        ParamSleepConfig::defaults(time, power.hp_sys.xtal.xpd_xtal()).apply();
+
+        // Deep sleep has no reject sources (ESP-IDF passes none for dslp).
+        sleep_and_restore_clocks(true, wakeup_triggers.0 as u32, 0, None, clock);
+        // The wake is a reset. As ESP-IDF, spin while the request lands.
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
     pub(crate) fn start_sleep_checked(

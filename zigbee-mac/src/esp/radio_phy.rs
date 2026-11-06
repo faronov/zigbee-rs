@@ -328,6 +328,9 @@ pub struct EspRadioPhy<'a> {
     /// ordinary frames for the stack and are delivered first by
     /// [`RadioPhy::receive`].
     parked: ParkedRx,
+    /// Data-poll Frame Pending window; see
+    /// [`Self::with_poll_response_wait_us`].
+    poll_response_wait_us: u32,
 }
 
 impl<'a> EspRadioPhy<'a> {
@@ -347,9 +350,24 @@ impl<'a> EspRadioPhy<'a> {
             rx_on_when_idle: false,
             aes_engine: None,
             parked: ParkedRx::new(),
+            poll_response_wait_us: <Self as RadioPhy>::POLL_RESPONSE_WAIT_US,
         };
         this.rearm_receive();
         this
+    }
+
+    /// Override the data-poll response window (microseconds, non-zero).
+    ///
+    /// After a data poll is ACKed with Frame Pending the receiver stays on
+    /// this long for the buffered frame. The default is the hardware-proven
+    /// 250 ms. A sleepy product may shorten it: the parent normally sends
+    /// the frame right after the ACK, and a frame that arrives later stays
+    /// queued at the parent for the next poll. Association polls keep the
+    /// 250 ms default.
+    #[must_use]
+    pub fn with_poll_response_wait_us(mut self, wait_us: core::num::NonZeroU32) -> Self {
+        self.poll_response_wait_us = wait_us.get();
+        self
     }
 
     /// Install the exclusively-owned AES accelerator after two startup KATs.
@@ -653,6 +671,10 @@ impl RadioPhy for EspRadioPhy<'_> {
     /// EUI-64 source, which retrieves Rejoin Responses / Transport-Keys a
     /// parent queued by extended address.
     const POLL_EXTENDED_FALLBACK: bool = true;
+
+    fn poll_response_wait_us(&self) -> u32 {
+        self.poll_response_wait_us
+    }
 
     fn capabilities(&self) -> PhyCapabilities {
         PhyCapabilities {

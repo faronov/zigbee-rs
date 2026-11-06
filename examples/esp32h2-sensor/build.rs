@@ -6,6 +6,7 @@
 //!
 //! With the `thermometer` feature, `thermometer.toml` (or the file named by
 //! `H2_THERMO_CONFIG`) is validated and emitted as constants; see that file.
+//! With `floor-lab`, `floor_lab.toml` (or `H2_FLOOR_CONFIG`) likewise.
 
 use std::{env, fs, path::PathBuf};
 
@@ -27,6 +28,10 @@ fn main() {
     if env::var_os("CARGO_FEATURE_THERMOMETER").is_some() {
         fs::write(out.join("thermometer_config.rs"), thermometer::generate())
             .expect("write generated thermometer configuration");
+    }
+    if env::var_os("CARGO_FEATURE_FLOOR_LAB").is_some() {
+        fs::write(out.join("floor_lab_config.rs"), floor_lab::generate())
+            .expect("write generated floor-lab configuration");
     }
 }
 
@@ -85,6 +90,7 @@ mod thermometer {
             ),
             fast_poll_ms: int(&mut values, "fast_poll_ms", 250, 7_500),
             fast_poll_light_sleep: boolean(&mut values, "fast_poll_light_sleep"),
+            poll_response_wait_ms: int(&mut values, "poll_response_wait_ms", 10, 1_000),
             check_in_interval_s: int(&mut values, "check_in_interval_s", 0, 0x006E_0000 / 4),
             check_in_interval_min_s: int(
                 &mut values,
@@ -168,6 +174,7 @@ mod thermometer {
         slow_poll_ms: i64,
         fast_poll_ms: i64,
         fast_poll_light_sleep: bool,
+        poll_response_wait_ms: i64,
         check_in_interval_s: i64,
         check_in_interval_min_s: i64,
         long_poll_min_ms: i64,
@@ -311,6 +318,7 @@ mod thermometer {
                  pub const SAMPLE_EVERY_POLLS: u32 = {every};\n\
                  pub const USB_HOST_WAIT_MS: u32 = {usb};\n\
                  pub const FAST_POLL_LIGHT_SLEEP: bool = {fast_light};\n\
+                 pub const POLL_RESPONSE_WAIT_US: u32 = {poll_wait_us};\n\
                  pub const CHECK_IN_INTERVAL_QS: u32 = {check_in};\n\
                  pub const CHECK_IN_INTERVAL_MIN_QS: u32 = {check_in_min};\n\
                  pub const LONG_POLL_INTERVAL_QS: u32 = {long_qs};\n\
@@ -363,6 +371,7 @@ mod thermometer {
                 every = self.sample_every_polls,
                 usb = self.usb_host_wait_ms,
                 fast_light = self.fast_poll_light_sleep,
+                poll_wait_us = self.poll_response_wait_ms * 1_000,
                 check_in = self.check_in_interval_s * 4,
                 check_in_min = self.check_in_interval_min_s * 4,
                 long_qs = self.slow_poll_ms / QS_MS,
@@ -398,7 +407,7 @@ mod thermometer {
     }
 
     /// `key = value` lines; `#` starts a comment outside strings.
-    fn parse(text: &str, path: &Path) -> BTreeMap<String, String> {
+    pub(super) fn parse(text: &str, path: &Path) -> BTreeMap<String, String> {
         let mut values = BTreeMap::new();
         for (number, line) in text.lines().enumerate() {
             let line = strip_comment(line).trim();
@@ -480,6 +489,80 @@ mod thermometer {
             None => parse_u32(raw).map(i64::from),
         }
         .unwrap_or_else(|_| panic!("`{key}` = `{raw}` is not an integer"));
+        assert!(
+            (min..=max).contains(&value),
+            "`{key}` = {value} is outside {min}..={max}"
+        );
+        value
+    }
+}
+
+/// Sleep-floor lab profile (`floor_lab.toml`, overrides `H2_FLOOR_<KEY>`).
+mod floor_lab {
+    use super::parse_u32;
+    use std::{collections::BTreeMap, env, fs, path::PathBuf};
+
+    pub fn generate() -> String {
+        println!("cargo:rerun-if-env-changed=H2_FLOOR_CONFIG");
+        let path = env::var_os("H2_FLOOR_CONFIG").map_or_else(
+            || {
+                PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
+                    .join("floor_lab.toml")
+            },
+            PathBuf::from,
+        );
+        println!("cargo:rerun-if-changed={}", path.display());
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read floor-lab config {}: {e}", path.display()));
+        let mut v = super::thermometer::parse(&text, &path);
+        let out = format!(
+            "pub const USB_HOST_WAIT_MS: u32 = {};\n\
+             pub const USB_DUMP_INTERVAL_MS: u32 = {};\n\
+             pub const SLEEP_XTAL_OFF: bool = {};\n\
+             pub const SLEEP_RC_FAST_OFF: bool = {};\n\
+             pub const LIGHT_DEFAULT_S: u64 = {};\n\
+             pub const LIGHT_ISOLATED_S: u64 = {};\n\
+             pub const LIGHT_DRIVE_LOW_S: u64 = {};\n\
+             pub const DEEP_S: u64 = {};\n\
+             pub const MARKER_MS: u32 = {};\n",
+            int(&mut v, "usb_host_wait_ms", 100, 10_000),
+            int(&mut v, "usb_dump_interval_ms", 1_000, 60_000),
+            boolean(&mut v, "sleep_xtal_off"),
+            boolean(&mut v, "sleep_rc_fast_off"),
+            int(&mut v, "light_default_s", 5, 600),
+            int(&mut v, "light_isolated_s", 5, 600),
+            int(&mut v, "light_drive_low_s", 5, 600),
+            int(&mut v, "deep_s", 5, 3_600),
+            int(&mut v, "marker_ms", 100, 5_000),
+        );
+        if let Some(key) = v.keys().next() {
+            panic!("{}: unknown key `{key}`", path.display());
+        }
+        out
+    }
+
+    fn take(values: &mut BTreeMap<String, String>, key: &str) -> String {
+        let variable = format!("H2_FLOOR_{}", key.to_ascii_uppercase());
+        println!("cargo:rerun-if-env-changed={variable}");
+        let from_file = values.remove(key);
+        env::var(&variable)
+            .ok()
+            .or(from_file)
+            .unwrap_or_else(|| panic!("floor-lab config is missing `{key}`"))
+    }
+
+    fn boolean(values: &mut BTreeMap<String, String>, key: &str) -> bool {
+        match take(values, key).trim() {
+            "true" => true,
+            "false" => false,
+            other => panic!("`{key}` = `{other}` must be true or false"),
+        }
+    }
+
+    fn int(values: &mut BTreeMap<String, String>, key: &str, min: u32, max: u32) -> u32 {
+        let raw = take(values, key);
+        let value =
+            parse_u32(&raw).unwrap_or_else(|_| panic!("`{key}` = `{raw}` is not an integer"));
         assert!(
             (min..=max).contains(&value),
             "`{key}` = {value} is outside {min}..={max}"

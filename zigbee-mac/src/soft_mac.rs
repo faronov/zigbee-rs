@@ -12,7 +12,8 @@
 //! * the transmit path through the [`RadioPhy::Tx`] marker type
 //!   ([`SoftwareTx`], [`AckWaitTx`], [`FullTx`]): only the selected path is
 //!   compiled, and its future has exactly the size that path needs;
-//! * poll policy through [`RadioPhy::POLL_RESPONSE_WAIT_US`] and
+//! * poll policy through [`RadioPhy::poll_response_wait_us`] (default
+//!   [`RadioPhy::POLL_RESPONSE_WAIT_US`]) and
 //!   [`RadioPhy::POLL_EXTENDED_FALLBACK`];
 //! * the parent role through the `R` type parameter ([`EndDevice`] is a
 //!   zero-sized type, [`Parent`] owns const-generic queues);
@@ -965,7 +966,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             if ack.frame_pending
                 && self
                     .listen(
-                        P::POLL_RESPONSE_WAIT_US.min(timeout_us - elapsed),
+                        self.phy.poll_response_wait_us().min(timeout_us - elapsed),
                         Want::PollResponse,
                     )
                     .await?
@@ -1634,6 +1635,8 @@ mod tests {
         tx_duration_us: u32,
         /// `timeout_us` of every `receive` call.
         rx_timeouts: heapless::Vec<u32, 8>,
+        /// Runtime data-poll response window, if overridden.
+        poll_wait_us: Option<u32>,
     }
 
     impl<T: TxOffload, const FALLBACK: bool, const POWER: i8> TestPhy<T, FALLBACK, POWER> {
@@ -1665,6 +1668,7 @@ mod tests {
                 rx_on_when_idle: None,
                 tx_duration_us: 0,
                 rx_timeouts: heapless::Vec::new(),
+                poll_wait_us: None,
             }
         }
     }
@@ -1675,6 +1679,10 @@ mod tests {
         type Tx = T;
         const POLL_EXTENDED_FALLBACK: bool = FALLBACK;
         const DEFAULT_TX_POWER_DBM: i8 = POWER;
+
+        fn poll_response_wait_us(&self) -> u32 {
+            self.poll_wait_us.unwrap_or(Self::POLL_RESPONSE_WAIT_US)
+        }
 
         fn capabilities(&self) -> PhyCapabilities {
             self.capabilities
@@ -2394,6 +2402,29 @@ mod tests {
         assert_eq!(confirm.status, AssociationStatus::Success);
         assert_eq!(confirm.short_address, ShortAddress(0x5678));
         assert_eq!(core.phy().tx_attempts, 2);
+    }
+
+    #[test]
+    fn association_poll_keeps_the_backend_window_when_data_polls_are_shortened() {
+        let mut core = core();
+        core.phy_mut().poll_wait_us = Some(1_000);
+        let response = association_response(0x44, ShortAddress(0x5678), 0);
+        for frame in [
+            Some(PhyRxFrame::from_slice(&[0x02, 0x00, 0x01], 255).unwrap()),
+            None,
+            // Poll ACK with Frame Pending.
+            Some(PhyRxFrame::from_slice(&[0x12, 0x00, 0x02], 255).unwrap()),
+            Some(PhyRxFrame::from_slice(&response, 210).unwrap()),
+        ] {
+            core.phy_mut().rx_frames.push_back(Ok(frame)).unwrap();
+        }
+
+        let confirm = block_on(core.associate(associate_request())).unwrap();
+
+        assert_eq!(confirm.status, AssociationStatus::Success);
+        let timeouts = &core.phy().rx_timeouts;
+        assert!(timeouts.contains(&<TestPhy as RadioPhy>::POLL_RESPONSE_WAIT_US));
+        assert!(!timeouts.contains(&1_000));
     }
 
     #[test]
@@ -3752,6 +3783,52 @@ mod tests {
 
         assert_eq!(frame.as_slice(), [0xEE]);
         // 10 ms budget - 4 ms transmit, below POLL_RESPONSE_WAIT_US (30 ms).
+        assert_eq!(core.phy().rx_timeouts.last(), Some(&6_000));
+    }
+
+    #[test]
+    fn poll_listens_for_the_backend_default_window_after_frame_pending() {
+        let mut core = associated_core();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(pending_ack())))
+            .unwrap();
+
+        assert!(block_on(core.poll_within(1_000_000)).unwrap().is_none());
+
+        assert_eq!(
+            core.phy().rx_timeouts.last(),
+            Some(&<TestPhy as RadioPhy>::POLL_RESPONSE_WAIT_US)
+        );
+    }
+
+    #[test]
+    fn poll_listens_for_the_runtime_configured_window_after_frame_pending() {
+        let mut core = associated_core();
+        core.phy_mut().poll_wait_us = Some(12_000);
+        let rx = &mut core.phy_mut().rx_frames;
+        rx.push_back(Ok(Some(pending_ack()))).unwrap();
+        rx.push_back(Ok(Some(unicast_data(0x70, 0x0000, 0x5678, 0xEE))))
+            .unwrap();
+
+        let frame = block_on(core.poll_within(1_000_000)).unwrap().unwrap();
+
+        assert_eq!(frame.as_slice(), [0xEE]);
+        assert_eq!(core.phy().rx_timeouts.last(), Some(&12_000));
+    }
+
+    #[test]
+    fn poll_runtime_window_is_still_capped_at_the_callers_deadline() {
+        let mut core = associated_core();
+        core.phy_mut().poll_wait_us = Some(250_000);
+        core.phy_mut().tx_duration_us = 4_000;
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(pending_ack())))
+            .unwrap();
+
+        assert!(block_on(core.poll_within(10_000)).unwrap().is_none());
+
         assert_eq!(core.phy().rx_timeouts.last(), Some(&6_000));
     }
 

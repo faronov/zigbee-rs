@@ -147,7 +147,13 @@ fn build_mac(
     aes: esp_hal::peripherals::AES<'static>,
 ) -> EspSoftMac<'static> {
     let ieee802154 = esp_radio::ieee802154::Ieee802154::new(radio);
-    let mut phy = EspRadioPhy::new(ieee802154, esp_radio::ieee802154::Config::default());
+    const POLL_WAIT_US: core::num::NonZeroU32 =
+        match core::num::NonZeroU32::new(config::POLL_RESPONSE_WAIT_US) {
+            Some(wait_us) => wait_us,
+            None => panic!("poll_response_wait_ms must be non-zero"),
+        };
+    let mut phy = EspRadioPhy::new(ieee802154, esp_radio::ieee802154::Config::default())
+        .with_poll_response_wait_us(POLL_WAIT_US);
     if phy.install_aes_engine(aes).is_err() {
         halt()
     }

@@ -126,6 +126,7 @@ The unused methods keep their `Unsupported` defaults.
 | item | default | use it when |
 |---|---|---|
 | `const POLL_RESPONSE_WAIT_US` | 30 ms | How long to wait for indirect data after an ACK with FP=1. nRF uses 1.5 s, the value proven on hardware with the legacy MAC. |
+| `fn poll_response_wait_us(&self)` | `POLL_RESPONSE_WAIT_US` | Runtime override of the data-poll window only (association keeps the constant). `EspRadioPhy::with_poll_response_wait_us` sets it from product configuration; the H2 thermometer uses 32 ms (`poll_response_wait_ms`, 802.15.4 macMaxFrameTotalWaitTime = 1986 symbols = 31.8 ms) instead of the ESP backend's 250 ms. |
 | `const POLL_EXTENDED_FALLBACK` | `false` | Retry an empty short-source poll once with the EUI-64. EmberZNet parents queue a Rejoin Response or Transport-Key by EUI-64. |
 | `const DEFAULT_TX_POWER_DBM` | `0` | The `phyTransmitPower` that a default-PIB MLME-RESET restores. CC2340 uses its 5 dBm product default, ESP32-C6/H2 the 10 dBm esp-radio default. Otherwise NWK's cold-start reset drops the radio to 0 dBm. |
 | `set_ack_frame_pending(src, on)` / `clear_ack_frame_pending()` | `Unsupported` / no-op | A parent with `hardware_auto_ack` must arm FP in the hardware or ISR source-match table. |
@@ -382,7 +383,7 @@ To find growth:
   as the legacy `NrfMac` did, because embassy-nrf exposes no ED primitive.
 - **Hard-bounded poll.** `mlme_poll_timeout` (`SoftMacCore::poll_within`)
   checks the deadline after each Data Request and cuts the poll-response
-  window at it (`POLL_RESPONSE_WAIT_US.min(remaining)`). A frame that
+  window at it (`poll_response_wait_us().min(remaining)`). A frame that
   arrives later is not consumed: it stays in pending RX or with the radio
   for the next receive, because a radio that acknowledges in hardware or in
   its ISR has already acknowledged it. The Data Request transmit itself

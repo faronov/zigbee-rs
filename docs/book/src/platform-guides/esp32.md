@@ -273,9 +273,29 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   attached, and logs chip revision, `ctrl_tick_conf`, the slow period and
   per sleep OK/cause word, the RTC-measured duration and the wake cause.
 
-Status: build- and host-tested. Join, interview, reporting persistence,
-Poll Control check-in and the current floor with oscillator power-down
-are **hardware gates still open**.
+- Poll-response window: `poll_response_wait_ms` (default 32, range
+  10..=1000) bounds how long a data poll listens after an ACK with Frame
+  Pending. 32 ms covers 802.15.4 macMaxFrameTotalWaitTime (1986 symbols,
+  31.8 ms); the ESP backend default stays 250 ms for association. A frame
+  the parent sends later stays queued there and is fetched by the next poll;
+  pending APS/ZDO work keeps the 250 ms fast poll. On the WSTK capture of
+  `573f44f` each report spent ~250 ms in RX after an empty FP=1 ACK
+  (~6 mC of the ~8.2 mC report event).
+- Sleep-floor lab: `esp32h2-floor-lab` (`--no-default-features --features
+  floor-lab`, `floor_lab.toml`) starts no radio. With a USB host it dumps
+  the PMU sleep, pad, USB and clock registers before and after one light
+  sleep; without a host it disables the USB pad and cycles light sleep
+  (LED DIN untouched, isolated, driven low) and an LP-timer deep sleep, so a
+  power trace separates board quiescent current from chip sleep
+  configuration. H2 deep sleep is a local esp-hal backport (timer wake
+  only, see `vendor/esp-hal/LOCAL-PATCHES.md`); production images do not
+  link it.
+
+Status: join, interview, temperature reporting, the anomaly record and
+retained light sleep with XTAL/RC_FAST off are lab-tested on one H2 board
+(WSTK AEM: polls every 29.8 s, but a flat 1.10 mA sleep floor, so ~1.13 mA
+average). The expected tens-of-uA floor, reporting persistence across a
+power cycle and Poll Control check-in remain **hardware gates**.
 
 ## Product-owned flash layout
 
