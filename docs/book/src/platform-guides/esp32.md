@@ -292,15 +292,44 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   only, see `vendor/esp-hal/LOCAL-PATCHES.md`); production images do not
   link it. On the H2-Zero (WSTK AEM, 3.3 V) the lab measured light sleep
   1.10 mA (= the production floor), 0.97 mA with GPIO8 isolated, 1.18 mA
-  with GPIO8 driven low and 0.73 mA in deep sleep: most of the floor is
-  board quiescent current (the WS2812 on unswitched 3V3 is the prime
-  suspect; removing it is the definitive test).
+  with GPIO8 driven low and 0.73 mA in deep sleep.
+- **Known board limit (Waveshare ESP32-H2-Zero):** ~0.73 mA flows even in
+  deep sleep, so it is board quiescent current, not chip configuration. The
+  WS2812 sits on the unswitched 3V3 rail and the LDO may be back-fed from
+  VMCU; the two cannot be told apart without rework, and no rework is
+  planned (the parts are too small). Battery estimates for this board must
+  include it. Firmware work on the light-sleep configuration is measured as
+  **B − D** (lab phase B, light sleep with GPIO8 isolated, minus phase D,
+  deep sleep), which cancels the board current: ≈240 µA at `22674da`
+  against ~80 µA expected from the datasheet light/deep difference.
+- Sleep pad isolation: `sleep_isolate_gpio_mask` (bit n = GPIOn) lists the
+  pads the thermometer does not use. Once at boot they are switched to
+  GPIO function, output/input/pulls disabled in both the active and the
+  sleep pad configuration, and `SLP_SEL` set, like ESP-IDF's
+  `esp_sleep_config_gpio_isolate()` + `esp_sleep_enable_gpio_switch()` but
+  limited to an explicit mask. The default `0x02407DFF` covers GPIO0-8,
+  10-14, 22 and 25 on the H2-Zero (GPIO8 = WS2812 DIN, isolated like lab
+  phase B). The build refuses GPIO9 (BOOT/Poll Control button), the flash
+  pads GPIO15-20 and USB GPIO26/27 (also checked in
+  `products/esp32-zigbee-devkit::pad_isolation`), and UART0 GPIO23/24
+  unless `quiet`. A driver that claims a pad later reconfigures it.
+- HP_SLEEP PMU parity with ESP-IDF v5.5.1: the H2 init writes the
+  `PMU_HP_SLEEP_*_CONFIG_DEFAULT` values IDF sets once and its sleep path
+  never rewrites (HP APB clock gates closed, the dedicated sleep memory and
+  logic regulators off), and light sleep gates the HP function clocks
+  (`icg_func = 0`, IDF `get_sleep_clock_icg_flags()`). The reset values
+  kept both sleep regulators on and every clock gate open. The modem ICG
+  code IDF leaves unconfigured on H2 is not written. Effect on B − D is a
+  **hardware gate**.
 
 Status: join, interview, temperature reporting, the anomaly record and
 retained light sleep with XTAL/RC_FAST off are lab-tested on one H2 board
 (WSTK AEM: polls every 29.8 s, but a flat 1.10 mA sleep floor, so ~1.13 mA
-average). The expected tens-of-uA floor, reporting persistence across a
-power cycle and Poll Control check-in remain **hardware gates**.
+average; 0.73 mA of it is the H2-Zero board limit above). Pad isolation and
+the HP_SLEEP parity values are built but not yet measured. A tens-of-uA
+floor needs a different board; on the H2-Zero the target is B − D near
+80 µA. Reporting persistence across a power cycle and Poll Control check-in
+remain **hardware gates**.
 
 ## Product-owned flash layout
 

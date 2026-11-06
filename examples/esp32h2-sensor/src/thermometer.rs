@@ -1,7 +1,8 @@
 //! # ESP32-H2 thermometer (sleepy end device)
 //!
 //! Battery thermometer that drives no status hardware (lab board: the
-//! Waveshare ESP32-H2-Zero, whose WS2812 on GPIO8 is left untouched): one
+//! Waveshare ESP32-H2-Zero, whose WS2812 DIN on GPIO8 is only isolated with
+//! the other unused pads, `sleep_isolate_gpio_mask`): one
 //! Home Automation Temperature Sensor endpoint with Basic, Identify,
 //! Temperature Measurement (eFuse-calibrated die temperature) and the OTA
 //! Upgrade client. Reporting defaults, poll and sample cadence,
@@ -48,6 +49,12 @@ use zigbee_zcl::clusters::basic::PowerSource;
 use chip_temperature::H2TemperatureSensor;
 use thermometer_platform::{ThermoDiagnostics, ThermoSupervisor};
 use thermometer_profile::{config, DieThermometer, ThermoProfile, POLICY};
+
+/// Unused pads isolated at boot; flash/USB pads fail the build here.
+const UNUSED_PADS: product::pad_isolation::UnusedPads =
+    product::pad_isolation::UnusedPads::checked(config::SLEEP_ISOLATE_GPIO_MASK);
+// GPIO9 is the BOOT button and GPIO wake source below.
+const _: () = assert!(!UNUSED_PADS.contains(9));
 
 #[cfg(not(feature = "quiet"))]
 use esp_backtrace as _;
@@ -263,6 +270,9 @@ fn main() -> ! {
         let _rtc = rtc;
         None
     };
+    // SAFETY: no pad in the set is used by this image (build-checked: not
+    // flash, USB, the button or the console UART); before the first sleep.
+    unsafe { UNUSED_PADS.apply() };
     // `sleep_selftest`: real light sleeps before the radio exists.
     #[cfg(all(feature = "light-sleep", not(feature = "quiet")))]
     let mut sleep = sleep;

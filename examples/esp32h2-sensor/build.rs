@@ -149,6 +149,7 @@ mod thermometer {
             button_fast_poll_ms: int(&mut values, "button_fast_poll_ms", 1, 600_000),
             sample_every_polls: int(&mut values, "sample_every_polls", 1, 1_000),
             usb_host_wait_ms: int(&mut values, "usb_host_wait_ms", 0, 10_000),
+            sleep_isolate_gpio_mask: int(&mut values, "sleep_isolate_gpio_mask", 0, 0x0FFF_FFFF),
             log_level: log_level(&mut values, "log_level"),
             diag_summary_ms: int(&mut values, "diag_summary_ms", 0, 3_600_000),
             sleep_selftest: boolean(&mut values, "sleep_selftest"),
@@ -203,6 +204,7 @@ mod thermometer {
         button_fast_poll_ms: i64,
         sample_every_polls: i64,
         usb_host_wait_ms: i64,
+        sleep_isolate_gpio_mask: i64,
         log_level: &'static str,
         diag_summary_ms: i64,
         sleep_selftest: bool,
@@ -289,6 +291,17 @@ mod thermometer {
                     .all(|window| *window <= self.max_fast_poll_ms),
                 "max_fast_poll_ms must be 0 or cover every configured fast-poll window"
             );
+            // Pads the firmware itself uses; flash and USB pads are refused
+            // again (with the chip facts) by `product::pad_isolation`.
+            assert!(
+                self.sleep_isolate_gpio_mask & (1 << 9) == 0,
+                "sleep_isolate_gpio_mask must not include GPIO9 (BOOT button / GPIO wake)"
+            );
+            assert!(
+                env::var_os("CARGO_FEATURE_QUIET").is_some()
+                    || self.sleep_isolate_gpio_mask & ((1 << 23) | (1 << 24)) == 0,
+                "sleep_isolate_gpio_mask must not include UART0 (GPIO23/24) in builds with a console"
+            );
             // The results exist only as log lines, and only the PMU backend
             // can be exercised.
             assert!(
@@ -317,6 +330,7 @@ mod thermometer {
                  pub const BUTTON_FAST_POLL_MS: u32 = {button};\n\
                  pub const SAMPLE_EVERY_POLLS: u32 = {every};\n\
                  pub const USB_HOST_WAIT_MS: u32 = {usb};\n\
+                 pub const SLEEP_ISOLATE_GPIO_MASK: u32 = {isolate:#010X};\n\
                  pub const FAST_POLL_LIGHT_SLEEP: bool = {fast_light};\n\
                  pub const POLL_RESPONSE_WAIT_US: u32 = {poll_wait_us};\n\
                  pub const CHECK_IN_INTERVAL_QS: u32 = {check_in};\n\
@@ -370,6 +384,7 @@ mod thermometer {
                 button = self.button_fast_poll_ms,
                 every = self.sample_every_polls,
                 usb = self.usb_host_wait_ms,
+                isolate = self.sleep_isolate_gpio_mask,
                 fast_light = self.fast_poll_light_sleep,
                 poll_wait_us = self.poll_response_wait_ms * 1_000,
                 check_in = self.check_in_interval_s * 4,

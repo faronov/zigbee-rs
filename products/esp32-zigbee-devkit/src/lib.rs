@@ -14,6 +14,8 @@
 //!   OTA composed in only where a backend for it exists.
 //! * [`chip_temperature`] — ESP-IDF-equivalent TSENS range selection and
 //!   per-chip eFuse calibration for the on-die temperature source.
+//! * [`pad_isolation`] — ESP-IDF-style isolation of the GPIO pads a product
+//!   declares unused (ESP32-H2), for light-sleep current.
 //!
 //! Both supported chips own a two-slot OTA partition table and firmware
 //! writer:
@@ -64,6 +66,8 @@ pub mod executor;
 ))]
 mod flash_window;
 pub mod migration;
+#[cfg(feature = "esp32h2")]
+pub mod pad_isolation;
 #[cfg(feature = "sed")]
 pub mod policy;
 pub mod profile;

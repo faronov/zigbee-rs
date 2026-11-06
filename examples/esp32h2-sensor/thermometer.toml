@@ -149,6 +149,17 @@ anomaly_max_writes_per_boot = 8
 # pad (and its D+ pull-up) is switched off until the next reset. 0 keeps USB
 # powered. Recovery: reset with USB attached (or hold BOOT while resetting).
 usb_host_wait_ms = 1000
+# GPIO pads isolated once at boot, before the first sleep: output, input
+# buffer and pulls off, muxed to GPIO, and switched to an isolated sleep
+# configuration in light sleep (ESP-IDF's sleep GPIO isolation). Bit n =
+# GPIOn; name only pads nothing on the board drives and no firmware uses.
+# Refused by the build: flash pads (GPIO15..=20), USB (GPIO26/27), the
+# BOOT/wake button (GPIO9) and, in builds with a console, UART0 (GPIO23/24).
+# 0 disables. Waveshare ESP32-H2-Zero: GPIO8 is the WS2812 DIN (R1 10k
+# pull-up; its reset-state input buffer cost ~128 uA in light sleep, floor
+# lab phase A - B); GPIO0-7, 10-14, 22 and 25 are unconnected header pads
+# or not bonded out. GPIO21 and UART0 (GPIO23/24) are left as they are.
+sleep_isolate_gpio_mask = 0x02407DFF
 
 # --- diagnostics -----------------------------------------------------------
 # Console log level for builds without `quiet` (off, error, warn, info, debug,
