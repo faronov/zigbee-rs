@@ -149,6 +149,24 @@ pub(crate) fn init() {
                 .hp_sleep_icg_slp_sel()
                 .set_bit()
         });
+        // ESP-IDF v5.5.1 `pmu_hp_system_init(HP_SLEEP)`
+        // (PMU_HP_SLEEP_CLOCK/ANALOG_CONFIG_DEFAULT) values that its sleep
+        // entry never rewrites: APB clock gates closed and the dedicated
+        // sleep memory/logic regulators off (the main HP regulator, set per
+        // sleep, retains the domain). The reset values (APB gates open,
+        // both sleep regulators on at dbias 8) are not an ESP-IDF state.
+        pmu.hp_sleep_icg_hp_apb()
+            .write(|w| w.hp_sleep_dig_icg_apb_en().bits(0));
+        pmu.hp_sleep_hp_regulator0().modify(|_, w| {
+            w.hp_sleep_hp_regulator_slp_mem_xpd()
+                .clear_bit()
+                .hp_sleep_hp_regulator_slp_logic_xpd()
+                .clear_bit()
+                .hp_sleep_hp_regulator_slp_mem_dbias()
+                .bits(0)
+                .hp_sleep_hp_regulator_slp_logic_dbias()
+                .bits(0)
+        });
         pmu.hp_active_hp_sys_cntl().modify(|_, w| {
             w.hp_active_dig_cpu_stall()
                 .clear_bit()

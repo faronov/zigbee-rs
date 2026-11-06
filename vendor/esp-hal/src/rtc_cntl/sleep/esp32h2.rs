@@ -130,7 +130,12 @@ impl DigitalSleepConfig {
 
                 cfg
             },
-            icg_func: 0xffff_ffff, // TODO: ESP-IDF determines this using get_sleep_clock_icg_flags
+            // ESP-IDF v5.5.1 `get_sleep_clock_icg_flags()`: a bit is set
+            // only while UART wake, LEDC sleep mode or the BLE-on-WiFi power
+            // clock holds a reference; none exists here, so light sleep
+            // gates every HP function clock and, with `icg_func == 0`,
+            // `apply` leaves the HP_SLEEP sysclk gate off as IDF does.
+            icg_func: 0,
             deep_sleep: false,
         }
     }

@@ -126,6 +126,27 @@ and H2 `soc/regi2c_bias.h`. These are references, not linked IDF dependencies.
   10 consecutive 30.0 s timer wakes, each a clean reboot; the board draws
   0.73 mA in deep sleep, so that figure bounds the chip's deep-sleep
   current but does not qualify it.
+- H2 HP_SLEEP clock-gate and sleep-regulator parity with IDF v5.5.1. The H2
+  PMU init now writes what IDF's `pmu_hp_system_init(HP_SLEEP)` sets once
+  from `PMU_HP_SLEEP_CLOCK_CONFIG_DEFAULT`/`PMU_HP_SLEEP_ANALOG_CONFIG_DEFAULT`
+  and its sleep entry never rewrites: `hp_sleep_icg_hp_apb = 0` (reset
+  value: every APB gate open) and `hp_sleep_hp_regulator0`
+  `slp_mem_xpd`/`slp_logic_xpd`/`slp_mem_dbias`/`slp_logic_dbias = 0`
+  (reset value `0x8447_0000`: both dedicated sleep regulators on at dbias
+  8). The main `xpd`/`dbias` and `hp_sleep_bias` stay programmed per sleep
+  by `apply_sleep_analog` as before; HP_SLEEP and LP_SLEEP `xpd_bias` reset
+  to 0, which already is IDF's value. H2 light sleep uses `icg_func = 0`
+  instead of the upstream `0xffff_ffff` TODO, matching IDF
+  `get_sleep_clock_icg_flags()`, which is 0 unless UART/LEDC sleep wake or
+  the BLE-on-WiFi power clock holds a reference (none here); with
+  `icg_func == 0` the HP_SLEEP sysclk gate stays off as in IDF
+  `pmu_sleep_init`. Timer and digital GPIO wake do not need the IOMUX gate
+  (IDF ungates it only for UART wake and LEDC sleep mode). Conscious
+  difference: `hp_sleep_icg_modem` stays 0 (IDF default code 2); H2 IDF
+  leaves the modem ICG maps unconfigured and the code needs `imm` update
+  bits esp-hal does not drive, so it is not changed blind. C6 is unchanged.
+  Built and host-checked only; light-sleep success and its effect on the
+  board's light-minus-deep current are **hardware gates**.
 - Correct SYSTIMER high-word reload (`>> 32`, not `<< 32`) for all existing
   setter branches.
 
