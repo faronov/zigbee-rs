@@ -174,8 +174,9 @@ the product writer changes `otadata` and resets.
 ### ESP32-H2 thermometer SED (`thermometer`, `quiet`)
 
 `esp32h2-thermometer` is a temperature-only Sleepy End Device for battery and
-current measurements on boards without status hardware (the ESP32-H2
-SuperMini). Endpoint 1 carries Basic, Identify, Poll Control (0x0020) and
+current measurements on boards whose status hardware it does not drive (the
+Waveshare ESP32-H2-Zero; its WS2812 on GPIO8 stays dark and untouched).
+Endpoint 1 carries Basic, Identify, Poll Control (0x0020) and
 Temperature Measurement (0x0402) fed by the eFuse-calibrated die sensor.
 Every policy value — identity, reporting defaults, poll/fast-poll periods,
 sampling cadence, Poll Control limits, rejoin backoff, the Active-time

@@ -1,9 +1,10 @@
 //! # ESP32-H2 thermometer (sleepy end device)
 //!
-//! Battery thermometer for boards without a status LED (e.g. the ESP32-H2
-//! SuperMini): one Home Automation Temperature Sensor endpoint with Basic,
-//! Identify, Temperature Measurement (eFuse-calibrated die temperature) and
-//! the OTA Upgrade client. Reporting defaults, poll and sample cadence,
+//! Battery thermometer that drives no status hardware (lab board: the
+//! Waveshare ESP32-H2-Zero, whose WS2812 on GPIO8 is left untouched): one
+//! Home Automation Temperature Sensor endpoint with Basic, Identify,
+//! Temperature Measurement (eFuse-calibrated die temperature) and the OTA
+//! Upgrade client. Reporting defaults, poll and sample cadence,
 //! identity and the USB policy come from `thermometer.toml`; Configure
 //! Reporting from the coordinator overrides the reporting defaults.
 //!
