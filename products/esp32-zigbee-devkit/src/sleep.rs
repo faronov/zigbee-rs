@@ -310,14 +310,23 @@ mod hardware {
                 systimer_before,
                 systimer_after,
                 SystemTimer::ticks_per_second(),
-                sleep_status(wake.rejected, wake.reject_cause, wake.wake_cause, gpio_wakeup),
+                sleep_status(
+                    wake.rejected,
+                    wake.reject_cause,
+                    wake.wake_cause,
+                    gpio_wakeup,
+                ),
             )?;
             report.top_powered_down = wake.top_powered_down;
             Ok(report)
         }
 
         #[cfg(feature = "esp32h2")]
-        unsafe fn enter(&mut self, duration_us: u64, gpio_wakeup: bool) -> Result<Wake, SleepError> {
+        unsafe fn enter(
+            &mut self,
+            duration_us: u64,
+            gpio_wakeup: bool,
+        ) -> Result<Wake, SleepError> {
             let top_pd = self.mode == SleepMode::TopPowerDown;
             let ext1 = match (gpio_wakeup && top_pd, self.ext1) {
                 (false, _) => None,
@@ -344,7 +353,11 @@ mod hardware {
         }
 
         #[cfg(feature = "esp32c6")]
-        unsafe fn enter(&mut self, duration_us: u64, gpio_wakeup: bool) -> Result<Wake, SleepError> {
+        unsafe fn enter(
+            &mut self,
+            duration_us: u64,
+            gpio_wakeup: bool,
+        ) -> Result<Wake, SleepError> {
             use esp_hal::rtc_cntl::sleep::{GpioWakeupSource, TimerWakeupSource};
 
             let wake_timer = TimerWakeupSource::new(core::time::Duration::from_micros(duration_us));
