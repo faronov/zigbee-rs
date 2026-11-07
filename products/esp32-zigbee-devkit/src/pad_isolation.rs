@@ -21,6 +21,21 @@
 //! pads are refused rather than isolated, so neither the flash-resident
 //! code nor the USB console/flashing path depends on sleep pad behaviour.
 //!
+//! With the TOP domain powered down in light sleep the PMU leaves
+//! `dig_pad_slp_sel` clear (ESP-IDF `PMU_SLEEP_DIGITAL_LSLP_CONFIG_DEFAULT`)
+//! and IO_MUX/GPIO lose power, so neither the sleep nor the active
+//! configuration reaches the pads. `apply` therefore also latches every
+//! isolated pad with the always-on per-pad hold (`LP_AON_GPIO_HOLD0`,
+//! ESP-IDF `gpio_ll_hold_en`, bit n = GPIOn per `GPIO_HOLD_MASK`); ESP-IDF
+//! notes the LP_AON hold as the only way to keep a pad state across TOP
+//! power-down. The hold is set after the isolated configuration is written,
+//! so the latched state is the isolated one, and it is harmless without TOP
+//! power-down because the latched and sleep configurations are equal.
+//!
+//! The hold survives every reset except power-on. An image that later
+//! drives one of these pads must release its hold bit first; `esp-hal` does
+//! not do that when it configures a pin.
+//!
 //! A pad isolated here and later claimed by an `esp-hal` driver is
 //! reconfigured by that driver (`init_gpio` clears `FUN_IE` and `SLP_SEL`),
 //! so a stale mask cannot silently isolate an owned pin; it is still a
@@ -97,7 +112,8 @@ impl UnusedPads {
     /// Output driver off; active and sleep input buffer and pulls off; the
     /// pad muxed to GPIO (ESP-IDF's deep-sleep isolation notes the bottom
     /// current rises otherwise) and switched to its (isolated) sleep
-    /// configuration in sleep.
+    /// configuration in sleep; then held (`LP_AON_GPIO_HOLD0`) so the
+    /// isolated state also survives TOP power-down.
     ///
     /// # Safety
     ///
@@ -139,6 +155,11 @@ impl UnusedPads {
             }
             pad += 1;
         }
+        // Latch only after the isolated configuration is in place; bits of
+        // pads outside the set are left alone.
+        esp_hal::peripherals::LP_AON::regs()
+            .gpio_hold0()
+            .modify(|r, w| unsafe { w.gpio_hold0().bits(r.gpio_hold0().bits() | self.0) });
     }
 }
 

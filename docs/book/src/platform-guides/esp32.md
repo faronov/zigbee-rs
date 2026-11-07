@@ -256,9 +256,11 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   (`vendor/esp-hal/LOCAL-PATCHES.md`; C6 still uses the backport). With
   `sleep_mode = "retained"` (default) CPU, top, modem and flash domains
   stay powered. `sleep_mode = "top_pd"` (`--features top-pd`,
-  **experimental, not yet run on hardware**) powers TOP, CPU and modem off
-  and retains ~5.3 KiB of registers in RAM, aiming at the datasheet ~25 µA
-  light-sleep floor; the BOOT button then wakes through EXT1.
+  **experimental**) powers TOP, CPU and modem off and retains ~5.3 KiB of
+  registers in RAM, aiming at the datasheet ~25 µA light-sleep floor; the
+  BOOT button then wakes through EXT1. With TOP off the PMU leaves
+  `dig_pad_slp_sel` clear and IO_MUX/GPIO lose power, so the isolated pads
+  are also latched with the always-on `LP_AON_GPIO_HOLD0` pad hold (below).
   `tools/esp32h2-sleep-ram-check.py` checks in CI that the sleep/restore
   path never reaches flash.
 - CPU clock: the ESP-IDF bootloader leaves the H2 CPU on FLASH_PLL
@@ -335,7 +337,13 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   phase B). The build refuses GPIO9 (BOOT/Poll Control button), the flash
   pads GPIO15-20 and USB GPIO26/27 (also checked in
   `products/esp32-zigbee-devkit::pad_isolation`), and UART0 GPIO23/24
-  unless `quiet`. A driver that claims a pad later reconfigures it.
+  unless `quiet`. A driver that claims a pad later reconfigures it. After
+  isolating, the same pads are latched with the per-pad hold
+  (`LP_AON_GPIO_HOLD0`, ESP-IDF `gpio_ll_hold_en`), the only pad state that
+  survives TOP power-down; without it the `top_pd` floor on the H2-Zero was
+  1.00-1.02 mA instead of the retained 0.80 mA (`1b0a72c`, WSTK AEM). The
+  hold survives every reset except power-on, so an image that drives one of
+  these pads must release its hold bit first (`esp-hal` does not).
 - HP_SLEEP PMU parity with ESP-IDF v5.5.1: the H2 init writes the
   `PMU_HP_SLEEP_*_CONFIG_DEFAULT` values IDF sets once and its sleep path
   never rewrites (HP APB clock gates closed, the dedicated sleep memory and
@@ -349,8 +357,12 @@ Status: join, interview, temperature reporting, the anomaly record and
 retained light sleep with XTAL/RC_FAST off are lab-tested on one H2 board
 through the esp-hal backport path (WSTK AEM, `61b0f8a`: polls every
 29.75 s at ~557 µC, a 0.802 mA sleep floor and ~823 µA average; 0.73 mA of
-it is the H2-Zero board limit above). The same retained mode through
-`esp32h2-sleep`, and the `top_pd` mode, are built and host-tested only. A tens-of-uA
+it is the H2-Zero board limit above). The retained mode through
+`esp32h2-sleep` passed the USB selftest. `top_pd` (`1b0a72c`) is lab-tested
+on the WSTK AEM for 1 h: no boot loop, every 29.8 s poll answered after
+TOP/modem power-down, reports delivered, polls ~514 µC and reports ~2.0 mC
+(as retained), but a 1.023 mA floor and ~1,057 µA average because the pad
+isolation was not held; the pad-hold fix is built and not yet measured. A tens-of-uA
 floor needs a different board; on the H2-Zero the target is B − D near
 80 µA. Reporting persistence across a power cycle and Poll Control check-in
 remain **hardware gates**.

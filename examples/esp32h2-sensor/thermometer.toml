@@ -167,7 +167,9 @@ anomaly_max_writes_per_boot = 8
 usb_host_wait_ms = 1000
 # GPIO pads isolated once at boot, before the first sleep: output, input
 # buffer and pulls off, muxed to GPIO, and switched to an isolated sleep
-# configuration in light sleep (ESP-IDF's sleep GPIO isolation). Bit n =
+# configuration in light sleep (ESP-IDF's sleep GPIO isolation), then
+# latched with the LP_AON pad hold so the state also survives
+# sleep_mode = "top_pd" (the hold persists until power-on). Bit n =
 # GPIOn; name only pads nothing on the board drives and no firmware uses.
 # Refused by the build: flash pads (GPIO15..=20), USB (GPIO26/27), the
 # BOOT/wake button (GPIO9) and, in builds with a console, UART0 (GPIO23/24).

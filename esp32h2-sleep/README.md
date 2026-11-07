@@ -91,7 +91,7 @@ power-down flow.
 | SYSTIMER period mode | always toggled | only when set | conscious |
 | Restore point | after clock restore, flash usable | before any flash access | conscious, required by in-crate stub |
 | MWDT flash-boot | TIMG0 only | TIMG0 and TIMG1 | conscious |
-| Pad hold / GPIO isolation in TOP PD | none for H2 | none | **risk**: floating pads may raise the floor |
+| Pad hold / GPIO isolation in TOP PD | none for H2 | product latches its isolated pads with `LP_AON_GPIO_HOLD0` (`pad_isolation`) | measured: without the hold the H2-Zero `top_pd` floor was 1.02 mA vs 0.80 mA retained; fix not yet measured |
 | ROM wake path and flash/cache | ROM-internal | assumed not to touch flash before the stub | **risk**: hardware gate |
 | TSENS DAC trim (regi2c) | re-applied by driver | re-applied per read | covered |
 | UART0 retention | optional module | none | **risk** for logging builds only |
