@@ -12,8 +12,8 @@ use crate::entry::{check_fixed_entry, check_vector_table};
 use crate::flash::{BootFlash, BootFlashError};
 use crate::sim::{Cut, SimFlash};
 use crate::{
-    BootConfig, BootError, BootEvent, Bootable, ImageError, Layout, Platform, Trial, TrustedKey,
-    Update, image_end, launch,
+    BootConfig, BootError, BootEvent, Bootable, ERASE_STEP, ImageError, Layout, Platform, Trial,
+    TrustedKey, Update, image_end, launch,
 };
 
 const KEY: [u8; 64] = *include_bytes!("../../../mcuboot-image/tests/vectors/test-key.xy");
@@ -100,6 +100,7 @@ impl Platform for Recorder {
 
     fn kick_watchdog(&mut self) {
         self.kicks += 1;
+        watchdog::kick();
     }
 
     fn decided(&mut self, outcome: &Result<Bootable, BootError>) {
@@ -167,7 +168,7 @@ fn no_request_starts_the_primary() {
     let bootable = platform.outcome.unwrap().unwrap();
     assert_eq!(bootable.update, Update::None);
     assert_eq!(platform.prepared, Some(bootable));
-    assert_eq!(platform.events, [BootEvent::Validating]);
+    assert_eq!(platform.events, [BootEvent::Validating, BootEvent::Busy]);
     assert_eq!(platform.kicks, platform.events.len());
     assert_eq!(flash.operations(), 0);
 }
@@ -452,6 +453,114 @@ fn trial_boots_then_unconfirmed_or_confirmed() {
     assert_protected_intact(&flash);
 }
 
+/// Flash work (bytes read, programmed or erased) between two watchdog
+/// kicks, metered per test thread.
+mod watchdog {
+    use std::cell::Cell;
+
+    use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
+
+    thread_local! {
+        static SINCE: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+        static WORST: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub fn kick() {
+        SINCE.set((0, 0));
+    }
+
+    /// Worst `(read + programmed, erased)` bytes between two kicks since the
+    /// last call.
+    pub fn take_worst() -> (usize, usize) {
+        kick();
+        WORST.replace((0, 0))
+    }
+
+    fn add(io: usize, erased: usize) {
+        let (a, b) = SINCE.get();
+        let since = (a + io, b + erased);
+        SINCE.set(since);
+        let (w, e) = WORST.get();
+        WORST.set((w.max(since.0), e.max(since.1)));
+    }
+
+    pub struct Metered<F>(pub F);
+
+    impl<F: ErrorType> ErrorType for Metered<F> {
+        type Error = F::Error;
+    }
+
+    impl<F: ReadNorFlash> ReadNorFlash for Metered<F> {
+        const READ_SIZE: usize = F::READ_SIZE;
+        fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), F::Error> {
+            add(bytes.len(), 0);
+            self.0.read(offset, bytes)
+        }
+        fn capacity(&self) -> usize {
+            self.0.capacity()
+        }
+    }
+
+    impl<F: NorFlash> NorFlash for Metered<F> {
+        const WRITE_SIZE: usize = F::WRITE_SIZE;
+        const ERASE_SIZE: usize = F::ERASE_SIZE;
+        fn erase(&mut self, from: u32, to: u32) -> Result<(), F::Error> {
+            add(0, (to - from) as usize);
+            self.0.erase(from, to)
+        }
+        fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), F::Error> {
+            add(bytes.len(), 0);
+            self.0.write(offset, bytes)
+        }
+    }
+}
+
+/// Boot like [`boot_with`], returning the worst flash work between two
+/// watchdog kicks.
+fn boot_metered(flash: &mut Flash, config: &BootConfig<'_>) -> (Option<u32>, (usize, usize)) {
+    let mut platform = Recorder::default();
+    let mut guarded = BootFlash::for_config(
+        watchdog::Metered(core::mem::replace(flash, Flash::new(SECTOR as usize))),
+        config,
+    );
+    watchdog::take_worst();
+    let entry = launch(&mut guarded, config, &mut platform);
+    let worst = watchdog::take_worst();
+    *flash = guarded.into_inner().0;
+    (entry, worst)
+}
+
+/// The engine kicks before every full validation, so no stretch between two
+/// kicks reads more than one image (plus small trailer and log reads), even
+/// on paths that validate both slots or the primary twice (downgrade check,
+/// install verify, trial accounting).
+#[test]
+fn watchdog_never_waits_longer_than_one_validation() {
+    // One validation of the largest image reads it once; allow the small
+    // magic, header and status-log reads around it (a second validation
+    // without a kick would double the figure).
+    let bound = V2.len() + 128;
+    let cases: [(&str, Flash, &BootConfig<'_>); 5] = [
+        ("plain", device(V1, None, false), &CONFIG),
+        ("install", device(V1, Some(V2), true), &TRIAL),
+        ("downgrade", device(V2, Some(V1), true), &CONFIG),
+        ("rejected", device(V1, Some(TI_V2), true), &CONFIG),
+        ("padded", device(V1, Some(V2_PAD), false), &CONFIG),
+    ];
+    for (name, mut flash, config) in cases {
+        let (entry, (io, erased)) = boot_metered(&mut flash, config);
+        assert!(entry.is_some(), "{name}");
+        assert!(
+            io <= bound,
+            "{name}: {io} bytes between kicks (bound {bound})"
+        );
+        assert!(
+            erased <= ERASE_STEP.max(SECTOR) as usize,
+            "{name}: {erased} bytes erased between kicks"
+        );
+    }
+}
+
 #[cfg(feature = "swap-move")]
 mod swap {
     use super::*;
@@ -519,6 +628,24 @@ mod swap {
             },
             true,
         );
+    }
+
+    #[test]
+    fn swap_watchdog_never_waits_longer_than_one_validation() {
+        let mut flash = device(V1, Some(V2), true);
+        let (entry, (io, erased)) = boot_metered(&mut flash, &SWAP);
+        assert!(entry.is_some());
+        assert!(io <= V2.len() + 128, "install: {io}");
+        assert!(erased <= 2 * SECTOR as usize, "install: {erased}");
+        // Expire the trial: the last boot validates both slots and reverts.
+        for _ in 0..2 {
+            boot_with(&mut flash, &SWAP);
+        }
+        let (entry, (io, erased)) = boot_metered(&mut flash, &SWAP);
+        assert!(entry.is_some());
+        assert_eq!(primary_version(&flash).0, 1);
+        assert!(io <= V2.len() + 128, "revert: {io}");
+        assert!(erased <= 2 * SECTOR as usize, "revert: {erased}");
     }
 
     #[test]

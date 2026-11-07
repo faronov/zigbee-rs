@@ -47,8 +47,8 @@ mod tests;
 pub use embedded_storage;
 use embedded_storage::nor_flash::NorFlash;
 pub use mcuboot_image::{
-    self, BootConfig, BootError, BootEvent, Bootable, ImageError, ImageVersion, Layout, LoaderInfo,
-    Mode, Trial, TrustedKey, Update, loader_block,
+    self, BootConfig, BootError, BootEvent, Bootable, ERASE_STEP, ImageError, ImageVersion, Layout,
+    LoaderInfo, Mode, Trial, TrustedKey, Update, loader_block,
 };
 
 /// The chip-specific half of a loader.

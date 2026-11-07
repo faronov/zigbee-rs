@@ -102,6 +102,7 @@ impl Reporter {
                 }
             }
             BootEvent::Validating | BootEvent::Dropping => self.end_line(console),
+            BootEvent::Busy => {}
             #[cfg(feature = "swap-move")]
             BootEvent::Reverting => self.line(console, b"reverting update "),
         }

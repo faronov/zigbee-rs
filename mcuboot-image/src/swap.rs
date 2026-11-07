@@ -43,9 +43,9 @@ use embedded_storage::nor_flash::NorFlash;
 
 use crate::boot::{
     BootConfig, BootError, BootEvent, Bootable, Layout, Request, Trial, Update, account_boot,
-    bootable, copy, erase_sector, examine_request, validate_primary,
+    bootable, copy, erase_sector, examine_request, validate_primary, validate_slot,
 };
-use crate::image::{ImageError, validate};
+use crate::image::ImageError;
 use crate::status::{Log, LogState, MAX_STEP, MAX_UNIT, Record, unit};
 
 const MAGIC: [u8; 8] = *b"ZRSSWAP1";
@@ -290,12 +290,11 @@ pub(crate) fn boot<F: NorFlash>(
                 update = dropped;
             }
             Request::Install(candidate) => {
-                let extent =
-                    match validate(flash, layout.primary, layout.max_image_len(), config.keys) {
-                        Ok(primary) => primary.end,
-                        Err(ImageError::Flash) => return Err(BootError::Flash),
-                        Err(_) => layout.max_image_len(),
-                    };
+                let extent = match validate_slot(flash, config, layout.primary, progress) {
+                    Ok(primary) => primary.end,
+                    Err(ImageError::Flash) => return Err(BootError::Flash),
+                    Err(_) => layout.max_image_len(),
+                };
                 let sectors = candidate.end.max(extent).div_ceil(layout.sector_size);
                 progress(BootEvent::Erasing);
                 let mut active = start(flash, layout, status, current.as_ref(), false, sectors)?;
@@ -314,13 +313,13 @@ pub(crate) fn boot<F: NorFlash>(
     {
         let expired = active.state.attempts >= u16::from(config.trial_boots);
         let broken = !expired
-            && match validate(flash, layout.primary, layout.max_image_len(), config.keys) {
+            && match validate_slot(flash, config, layout.primary, progress) {
                 Ok(_) => false,
                 Err(ImageError::Flash) => return Err(BootError::Flash),
                 Err(_) => true,
             };
         if expired || broken {
-            match validate(flash, layout.secondary, layout.max_image_len(), config.keys) {
+            match validate_slot(flash, config, layout.secondary, progress) {
                 Ok(_) => {
                     progress(BootEvent::Reverting);
                     let mut revert = start(

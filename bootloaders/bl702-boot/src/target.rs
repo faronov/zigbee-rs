@@ -1,6 +1,8 @@
 //! Target-only hand-over: the BL702 [`Platform`] of the core sequence.
 
 use bl702_hal::flash::{XipFlash, invalidate_xip_cache};
+use bl702_hal::peripherals::Wdt;
+use bl702_hal::watchdog::{self, Period, Watchdog};
 use zrs_boot_core::{BootError, BootEvent, Bootable, Layout, Platform, image_end};
 
 use crate::{
@@ -8,19 +10,31 @@ use crate::{
     write_version,
 };
 
+const _: () = assert!(crate::WATCHDOG_MAX_MS == watchdog::MAX_PERIOD_MS);
+
 /// Run one boot decision and start the application, or report the failure
 /// and halt.
 ///
 /// `flash` must be the physical XIP flash (ROM routines, physical offsets).
 /// Clocks are expected in the ROM boot state, which the application assumes
-/// as well; the loader changes no clock or power setting.
-pub fn run(flash: XipFlash, config: &Config, console: &mut impl Console) -> ! {
+/// as well; the loader changes no clock or power setting. With
+/// [`Config::watchdog`] set, `wdt` is armed for the decision and disarmed
+/// before the jump or the halt.
+pub fn run(flash: XipFlash, config: &Config, mut wdt: Wdt, console: &mut impl Console) -> ! {
     let mut flash = BootFlash::for_config(flash, &config.boot);
     let mut shell = Bl702 {
         config,
         console,
         reporter: reporter(),
+        watchdog: None,
     };
+    if watchdog::take_reset_flag(&mut wdt) {
+        shell.line(b"watchdog reset\r\n");
+    }
+    shell.watchdog = config
+        .watchdog
+        .and_then(|period| Period::from_ms(period.get()))
+        .map(|period| Watchdog::arm(wdt, period));
     zrs_boot_core::run(&mut flash, &config.boot, &mut shell)
 }
 
@@ -28,6 +42,15 @@ struct Bl702<'a, C> {
     config: &'a Config,
     console: &'a mut C,
     reporter: Reporter,
+    watchdog: Option<Watchdog>,
+}
+
+impl<C> Bl702<'_, C> {
+    fn disarm(&mut self) {
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.disarm();
+        }
+    }
 }
 
 impl<C: Console> Bl702<'_, C> {
@@ -39,6 +62,12 @@ impl<C: Console> Bl702<'_, C> {
 impl<C: Console> Platform for Bl702<'_, C> {
     fn progress(&mut self, event: BootEvent) {
         self.reporter.event(&mut *self.console, event);
+    }
+
+    fn kick_watchdog(&mut self) {
+        if let Some(watchdog) = self.watchdog.as_mut() {
+            watchdog.kick();
+        }
     }
 
     fn decided(&mut self, outcome: &Result<Bootable, BootError>) {
@@ -93,6 +122,8 @@ impl<C: Console> Platform for Bl702<'_, C> {
     }
 
     unsafe fn start(&mut self, entry: u32) -> ! {
+        // The application does not service the watchdog.
+        self.disarm();
         // SAFETY: `prepare` checked that the validated image's entry is the
         // address the application is linked at and invalidated the cache;
         // no interrupt has been enabled by the loader.
@@ -100,6 +131,9 @@ impl<C: Console> Platform for Bl702<'_, C> {
     }
 
     fn fail(&mut self) -> ! {
+        // Halt for good: a watchdog reset loop would rerun a failing
+        // install and wear the primary slot.
+        self.disarm();
         self.line(b"halted\r\n");
         halt()
     }

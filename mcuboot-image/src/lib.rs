@@ -34,8 +34,8 @@ pub mod writer;
 mod tests;
 
 pub use boot::{
-    BootConfig, BootError, BootEvent, Bootable, Layout, Mode, Trial, TrialState, Update, boot,
-    confirm, trial_log_area, trial_state,
+    BootConfig, BootError, BootEvent, Bootable, COPY_CHUNK, ERASE_STEP, Layout, Mode, Trial,
+    TrialState, Update, boot, confirm, trial_log_area, trial_state,
 };
 pub use image::{
     ImageError, ImageHeader, ImageVersion, KeySet, MAX_TRUSTED_KEYS, TrustedKey, ValidImage,

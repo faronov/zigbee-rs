@@ -59,6 +59,8 @@ jobs:
         run: python3 -m unittest discover -s tools -p 'test_mac_footprint.py' -v
       - name: Test BL702 static stack gate
         run: python3 -m unittest discover -s tools -p 'test_bl702_stack_gate.py' -v
+      - name: Test BL702 loader soak monitor
+        run: python3 -m unittest discover -s tools -p 'test_bl702_soak_monitor.py' -v
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -129,10 +131,12 @@ jobs:
             manifest: bootloaders/cc2340r5-boot/Cargo.toml
             workspace: bootloaders/cc2340r5-boot
             features: ""
-          - name: CC2340R5 loader shell (Ed25519, swap-move)
+          # Ed25519 does not fit the 16 KiB loader: that feature must fail
+          # the build (checked in the CC2340 firmware job).
+          - name: CC2340R5 loader shell (swap-move)
             manifest: bootloaders/cc2340r5-boot/Cargo.toml
             workspace: bootloaders/cc2340r5-boot
-            features: ed25519,swap-move
+            features: swap-move
           # Workspace member; the power-cut simulator and the compact
           # SHA-256 path are feature-gated.
           - name: Bootloader core (power-cut simulation)
@@ -1266,6 +1270,14 @@ jobs:
             cargo clippy --release --locked --target riscv32imc-unknown-none-elf \
               --features "$role" --bin "bl702-$role" -- -D warnings
           done
+      # LAB ONLY loader power-cut soak: compiled and linted so it cannot rot;
+      # never packaged or published by CI.
+      - name: Build and check BL702 loader soak (lab only)
+        working-directory: examples/bl702-sensor
+        run: |
+          cargo build --release --locked --features ota-soak --bin bl702-ota-soak
+          cargo clippy --release --locked --target riscv32imc-unknown-none-elf \
+            --features ota-soak --bin bl702-ota-soak -- -D warnings
           DIR=target/riscv32imc-unknown-none-elf/release
           ../../tools/check-role-symbols.sh leaf "$DIR/bl702-sensor" "$DIR/bl702-ed"
           ../../tools/check-role-symbols.sh parent "$DIR/bl702-router"
@@ -1428,7 +1440,15 @@ jobs:
           cargo clippy --locked --target thumbv6m-none-eabi \
             --manifest-path bootloaders/cc2340r5-boot/Cargo.toml -- -D warnings
           cargo clippy --locked --target thumbv6m-none-eabi \
-            --manifest-path bootloaders/cc2340r5-boot/Cargo.toml --all-features -- -D warnings
+            --manifest-path bootloaders/cc2340r5-boot/Cargo.toml --features swap-move -- -D warnings
+          # Ed25519 must be refused with an explanation, not built.
+          if cargo build --locked --target thumbv6m-none-eabi \
+            --manifest-path bootloaders/cc2340r5-boot/Cargo.toml --features ed25519 \
+            2> "$RUNNER_TEMP/cc2340-ed25519.log"; then
+            echo "cc2340r5-boot built with feature ed25519; it must fail" >&2
+            exit 1
+          fi
+          grep -q 'Ed25519 is not supported on CC2340R5' "$RUNNER_TEMP/cc2340-ed25519.log"
       - name: Build CC2340 explicit fallback mode
         working-directory: examples/cc2340-sensor
         run: |

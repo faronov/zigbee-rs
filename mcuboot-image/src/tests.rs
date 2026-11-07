@@ -675,3 +675,91 @@ mod writer {
 }
 
 mod trial;
+
+/// Records erase calls; reads return erased flash.
+struct EraseLog(Vec<(u32, u32)>);
+
+impl ErrorType for EraseLog {
+    type Error = MockError;
+}
+
+impl ReadNorFlash for EraseLog {
+    const READ_SIZE: usize = 1;
+    fn read(&mut self, _offset: u32, bytes: &mut [u8]) -> Result<(), MockError> {
+        bytes.fill(0xFF);
+        Ok(())
+    }
+    fn capacity(&self) -> usize {
+        usize::MAX
+    }
+}
+
+impl NorFlash for EraseLog {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = 0x800;
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), MockError> {
+        self.0.push((from, to));
+        Ok(())
+    }
+    fn write(&mut self, _offset: u32, _bytes: &[u8]) -> Result<(), MockError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn install_erase_is_split_into_aligned_steps_with_a_kick_each() {
+    use crate::boot::{ERASE_STEP, erase_range};
+    // (sector size, from, to, expected erase calls)
+    type Case = (u32, u32, u32, &'static [(u32, u32)]);
+    let cases: [Case; 3] = [
+        // 64 KiB steps aligned to absolute addresses (block erases stay usable).
+        (
+            0x1000,
+            0x1000,
+            0x31000,
+            &[
+                (0x1000, 0x10000),
+                (0x10000, 0x20000),
+                (0x20000, 0x30000),
+                (0x30000, 0x31000),
+            ],
+        ),
+        // A sector that does not divide the step: one sector per step.
+        (
+            0x3000,
+            0x3000,
+            0xC000,
+            &[(0x3000, 0x6000), (0x6000, 0x9000), (0x9000, 0xC000)],
+        ),
+        // A sector larger than the step.
+        (
+            0x20000,
+            0x20000,
+            0x60000,
+            &[(0x20000, 0x40000), (0x40000, 0x60000)],
+        ),
+    ];
+    for (sector, from, to, expected) in cases {
+        let layout = Layout {
+            primary: from,
+            secondary: to,
+            slot_size: to - from,
+            sector_size: sector,
+        };
+        let mut flash = EraseLog(Vec::new());
+        let mut busy = 0;
+        erase_range(&mut flash, &layout, from, to, &mut |event| {
+            assert_eq!(event, BootEvent::Busy);
+            busy += 1;
+        })
+        .unwrap();
+        assert_eq!(flash.0, expected);
+        assert_eq!(busy, expected.len());
+        assert!(
+            flash
+                .0
+                .iter()
+                .all(|&(a, b)| b - a <= ERASE_STEP.max(sector))
+        );
+    }
+}

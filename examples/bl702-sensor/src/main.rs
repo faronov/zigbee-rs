@@ -118,6 +118,7 @@ async fn sensor(application: hal::ApplicationResources) {
         pwm,
         uart1,
         aes,
+        wdt: _,
         other_pins,
     } = application;
     let battery = hal::SupplyBattery::new(adc);

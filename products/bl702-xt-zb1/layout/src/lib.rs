@@ -144,6 +144,9 @@ mod tests {
         assert_eq!(TRUSTED_KEYS[0], mcuboot_image::TrustedKey::new(OWN_KEY_XY));
     }
 
+    // The build script refuses anything else; this catches a script edit.
+    const _: () = assert!(BOOT_WATCHDOG_MS <= 63_999);
+
     #[test]
     fn trial_log_stays_clear_of_the_image_and_the_magic() {
         let (start, end) = mcuboot_image::trial_log_area(&MCUBOOT);

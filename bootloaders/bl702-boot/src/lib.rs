@@ -25,6 +25,15 @@
 //! With nothing bootable it reports on the console and halts; a power cycle
 //! retries. Recovery is reflashing over the ROM's UART/USB ISP.
 //!
+//! With [`Config::watchdog`] set, the TIMER-block watchdog is armed in
+//! reset mode for the whole boot decision and kicked at every engine
+//! progress step (each full validation, 64 KiB erase step and 256-byte copy
+//! chunk), so a hang anywhere in the loader resets the chip and the resumable
+//! install carries on. It is disarmed (and the TIMER clock configuration
+//! restored) before the jump and before halting on a failure, so the
+//! application is not required to service it and a persistent failure does
+//! not turn into a reset loop that rewrites the primary slot.
+//!
 //! This crate keeps only what is BL702-specific: the XIP mapping, the
 //! fixed `riscv-rt` entry offset, the console prefix and the target
 //! hand-over in `target`.
@@ -48,6 +57,34 @@ pub const HEADER_SIZE: u32 = 0x100;
 /// Prefix of every console line.
 pub const LOG_PREFIX: &[u8] = b"bl702-boot: ";
 
+/// Longest loader watchdog period (16-bit match at 1024 Hz).
+pub const WATCHDOG_MAX_MS: u32 = 63_999;
+
+/// A loader watchdog period in milliseconds, `1..=`[`WATCHDOG_MAX_MS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchdogMs(u32);
+
+impl WatchdogMs {
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// The loader watchdog setting for `period_ms`: `0` leaves the watchdog
+/// off. Evaluated in a `static`/`const`, an out-of-range period fails the
+/// build.
+pub const fn watchdog_ms(period_ms: u32) -> Option<WatchdogMs> {
+    assert!(
+        period_ms <= WATCHDOG_MAX_MS,
+        "loader watchdog period exceeds 63999 ms"
+    );
+    if period_ms == 0 {
+        None
+    } else {
+        Some(WatchdogMs(period_ms))
+    }
+}
+
 /// Loader configuration supplied by the product.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -59,6 +96,8 @@ pub struct Config {
     pub img_start: u32,
     /// Start of the flash XIP window.
     pub xip_base: u32,
+    /// Loader watchdog period, or `None` to leave it off.
+    pub watchdog: Option<WatchdogMs>,
 }
 
 impl Config {
@@ -126,10 +165,22 @@ mod tests {
             boot: BootConfig::overwrite(LAYOUT, &KEYS),
             img_start: 0x2000,
             xip_base: 0x2300_0000,
+            watchdog: None,
         };
         assert_eq!(config.xip_address(0x2000), Some(0x2300_0000));
         assert_eq!(config.xip_address(0x10100), Some(0x2300_E100));
         assert_eq!(config.xip_address(0x1000), None);
+    }
+
+    #[test]
+    fn watchdog_setting() {
+        assert_eq!(watchdog_ms(0), None);
+        assert_eq!(watchdog_ms(16_000).map(WatchdogMs::get), Some(16_000));
+        assert_eq!(
+            watchdog_ms(WATCHDOG_MAX_MS).map(WatchdogMs::get),
+            Some(WATCHDOG_MAX_MS)
+        );
+        assert!(std::panic::catch_unwind(|| watchdog_ms(WATCHDOG_MAX_MS + 1)).is_err());
     }
 
     #[test]

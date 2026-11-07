@@ -11,8 +11,9 @@ publish = false
 [workspace]
 
 [features]
-# Also accept Ed25519-signed images.
-ed25519 = ["zrs-boot-core/ed25519"]
+# Not supported: the Ed25519 verifier does not fit the 16 KiB loader
+# region. Enabling it fails the build with an explanation.
+ed25519 = []
 # Swap-move install keeping the previous image for revert of an
 # unconfirmed update (needs two status sectors in the layout).
 swap-move = ["zrs-boot-core/swap-move"]

@@ -29,6 +29,12 @@
 //! unconfirmed after that many boots keeps booting and is reported as
 //! [`Trial::Unconfirmed`]. [`Mode::SwapMove`] (feature `swap-move`) keeps
 //! the previous image in the secondary slot and reverts to it.
+//!
+//! **Watchdog.** `progress` is called before every long step: each full
+//! image validation, each [`ERASE_STEP`] of an install erase and each
+//! [`COPY_CHUNK`] copied. A loader that kicks its watchdog there needs a
+//! period longer than the longest single step (one full-slot validation or
+//! one `ERASE_STEP` erase), not the whole install.
 
 use embedded_storage::nor_flash::NorFlash;
 
@@ -37,7 +43,11 @@ use crate::status::{Log, LogState, Record};
 use crate::trailer::{MagicState, read_magic};
 
 /// Copy unit; bounded stack use.
-const COPY_CHUNK: usize = 256;
+pub const COPY_CHUNK: usize = 256;
+/// Largest erase between two progress calls: one 64 KiB block (or one
+/// sector, if larger). Aligned steps keep block erases available to drivers
+/// that use them.
+pub const ERASE_STEP: u32 = 64 * 1024;
 
 /// Two equally sized slots in one flash device, by absolute address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +152,9 @@ pub enum BootEvent {
         total: u32,
     },
     Dropping,
+    /// A long step continues (a full validation or an erase step starts);
+    /// nothing to show. Kick a watchdog here.
+    Busy,
     /// A revert to the previous image starts (or resumes).
     #[cfg(feature = "swap-move")]
     Reverting,
@@ -227,12 +240,7 @@ pub(crate) fn validate_primary<F: NorFlash>(
     progress: &mut impl FnMut(BootEvent),
 ) -> Result<ValidImage, BootError> {
     progress(BootEvent::Validating);
-    match validate(
-        flash,
-        config.layout.primary,
-        config.layout.max_image_len(),
-        config.keys,
-    ) {
+    match validate_slot(flash, config, config.layout.primary, progress) {
         Ok(image) => Ok(image),
         Err(ImageError::Flash) => Err(BootError::Flash),
         Err(primary) => Err(BootError::NoBootableImage { primary, update }),
@@ -289,10 +297,10 @@ pub(crate) fn examine_request<F: NorFlash>(
     }
     progress(BootEvent::Validating);
     Ok(
-        match validate(flash, layout.secondary, layout.max_image_len(), config.keys) {
+        match validate_slot(flash, config, layout.secondary, progress) {
             Err(ImageError::Flash) => return Err(BootError::Flash),
             Err(error) => Request::Drop(Update::Rejected(error)),
-            Ok(candidate) if is_downgrade(flash, config, &candidate)? => {
+            Ok(candidate) if is_downgrade(flash, config, &candidate, progress)? => {
                 Request::Drop(Update::Downgrade)
             }
             Ok(candidate) => Request::Install(candidate),
@@ -331,6 +339,7 @@ fn is_downgrade<F: NorFlash>(
     flash: &mut F,
     config: &BootConfig<'_>,
     candidate: &ValidImage,
+    progress: &mut impl FnMut(BootEvent),
 ) -> Result<bool, BootError> {
     let layout = &config.layout;
     let claimed = ImageHeader::read(flash, layout.primary).map_err(|_| BootError::Flash)?;
@@ -343,7 +352,7 @@ fn is_downgrade<F: NorFlash>(
     }) {
         return Ok(false);
     }
-    match validate(flash, layout.primary, layout.max_image_len(), config.keys) {
+    match validate_slot(flash, config, layout.primary, progress) {
         Ok(primary) => Ok(candidate
             .header
             .version
@@ -372,10 +381,13 @@ fn install<F: NorFlash>(
             layout.sector_size,
         )?;
     }
-    let erase_end = layout.primary + layout.round_up(total);
-    flash
-        .erase(layout.primary, erase_end)
-        .map_err(|_| BootError::Flash)?;
+    erase_range(
+        flash,
+        layout,
+        layout.primary,
+        layout.primary + layout.round_up(total),
+        progress,
+    )?;
 
     copy(
         flash,
@@ -388,7 +400,7 @@ fn install<F: NorFlash>(
     )?;
 
     progress(BootEvent::Validating);
-    match validate(flash, layout.primary, layout.max_image_len(), config.keys) {
+    match validate_slot(flash, config, layout.primary, progress) {
         Ok(copy) if copy.digest == image.digest => {}
         Err(ImageError::Flash) => return Err(BootError::Flash),
         _ => return Err(BootError::CopyCorrupt),
@@ -432,6 +444,43 @@ pub(crate) fn copy<F: NorFlash>(
                 .map_err(|_| BootError::Flash)?;
         }
         offset += chunk as u32;
+    }
+    Ok(())
+}
+
+/// Validate the image in `slot`, reporting [`BootEvent::Busy`] first: a
+/// watchdog sees at most one full validation between two kicks.
+pub(crate) fn validate_slot<F: NorFlash>(
+    flash: &mut F,
+    config: &BootConfig<'_>,
+    slot: u32,
+    progress: &mut impl FnMut(BootEvent),
+) -> Result<ValidImage, ImageError> {
+    progress(BootEvent::Busy);
+    validate(flash, slot, config.layout.max_image_len(), config.keys)
+}
+
+/// Erase the sector-aligned `[from, to)` in [`ERASE_STEP`]-aligned steps
+/// (one sector each if sectors are larger, or do not divide the step),
+/// reporting [`BootEvent::Busy`] before each step.
+pub(crate) fn erase_range<F: NorFlash>(
+    flash: &mut F,
+    layout: &Layout,
+    from: u32,
+    to: u32,
+    progress: &mut impl FnMut(BootEvent),
+) -> Result<(), BootError> {
+    let step = if ERASE_STEP.is_multiple_of(layout.sector_size) {
+        ERASE_STEP
+    } else {
+        layout.sector_size
+    };
+    let mut start = from;
+    while start < to {
+        let end = core::cmp::min(to, start - start % step + step);
+        progress(BootEvent::Busy);
+        flash.erase(start, end).map_err(|_| BootError::Flash)?;
+        start = end;
     }
     Ok(())
 }

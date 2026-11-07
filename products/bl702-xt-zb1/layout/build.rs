@@ -16,6 +16,12 @@
 //! `BL702_BOOT_TRIAL_BOOTS` (0..=255, default 3) is how many boots an
 //! installed image may take before the loader reports it unconfirmed;
 //! `0` disables trial accounting.
+//!
+//! `BL702_BOOT_WATCHDOG_MS` (0..=63999, default 16000) is the loader
+//! watchdog period; `0` leaves the watchdog off. The default covers the
+//! longest step between two kicks (one full-slot validation, or one 64 KiB
+//! erase, at the ROM's 32 MHz clock) several times over, also with the
+//! tolerance of the uncalibrated 32 kHz RC clock.
 
 use std::env;
 use std::fs;
@@ -76,6 +82,17 @@ fn main() {
         Err(_) => 3,
     };
 
+    println!("cargo:rerun-if-env-changed=BL702_BOOT_WATCHDOG_MS");
+    let watchdog_ms: u32 = match env::var("BL702_BOOT_WATCHDOG_MS") {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .ok()
+            .filter(|ms| *ms <= 63_999)
+            .unwrap_or_else(|| panic!("BL702_BOOT_WATCHDOG_MS={value} is not 0..=63999")),
+        Err(_) => 16_000,
+    };
+
     let mut text = format!(
         "/// Public half (`X || Y`) of the primary key the bootloader trusts.\n\
          pub const OWN_KEY_XY: [u8; 64] = {xy:?};\n\
@@ -89,7 +106,9 @@ fn main() {
     text.push_str(&format!(
         "];\n\
          /// Boots an installed image may take before it counts as unconfirmed.\n\
-         pub const BOOT_TRIAL_BOOTS: u8 = {trial_boots};\n"
+         pub const BOOT_TRIAL_BOOTS: u8 = {trial_boots};\n\
+         /// Loader watchdog period in milliseconds (0 = off).\n\
+         pub const BOOT_WATCHDOG_MS: u32 = {watchdog_ms};\n"
     ));
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("keys.rs");
     fs::write(&out, text).expect("write keys.rs");

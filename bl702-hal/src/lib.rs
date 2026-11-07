@@ -24,6 +24,7 @@ pub mod pwm;
 pub mod spi;
 pub mod timer;
 pub mod uart;
+pub mod watchdog;
 
 pub use peripherals::Peripherals;
 

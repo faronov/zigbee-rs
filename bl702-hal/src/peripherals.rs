@@ -32,6 +32,8 @@ token!(Spi0);
 token!(Timer0);
 token!(Uart0);
 token!(Uart1);
+// The TIMER block's watchdog channel (see `crate::watchdog`).
+token!(Wdt);
 
 /// All uniquely owned chip resources.
 pub struct Peripherals {
@@ -48,6 +50,7 @@ pub struct Peripherals {
     pub timer0: Timer0,
     pub uart0: Uart0,
     pub uart1: Uart1,
+    pub wdt: Wdt,
 }
 
 #[cfg(target_arch = "riscv32")]
@@ -109,6 +112,7 @@ impl Peripherals {
             timer0: Timer0::new(),
             uart0: Uart0::new(),
             uart1: Uart1::new(),
+            wdt: Wdt::new(),
         }
     }
 }

@@ -20,7 +20,7 @@ use bl702_hal::Peripherals;
 use bl702_hal::clock::Clocks;
 use bl702_hal::gpio::Pin;
 use bl702_hal::peripherals::{
-    Adc, Aes, Efuse, Flash, I2c0, Power, Pwm, Spi0, Timer0, Uart0, Uart1,
+    Adc, Aes, Efuse, Flash, I2c0, Power, Pwm, Spi0, Timer0, Uart0, Uart1, Wdt,
 };
 use bl702_hal::uart::{ConfigError as UartConfigError, Uart0Tx};
 
@@ -100,6 +100,9 @@ pub struct Resources {
     /// silicon; the persistence/security policy that consumes it lives in the
     /// product/composition root.
     pub aes: Aes,
+    /// Watchdog channel of the TIMER block; the bootloader arms it, the
+    /// application currently leaves it unused.
+    pub wdt: Wdt,
     pub other_pins: OtherPins,
 }
 
@@ -127,6 +130,8 @@ pub struct ApplicationResources {
     pub uart1: Uart1,
     /// SEC_ENG AES-128 accelerator token (see [`Resources::aes`]).
     pub aes: Aes,
+    /// Watchdog channel token (see [`Resources::wdt`]).
+    pub wdt: Wdt,
     pub other_pins: OtherPins,
 }
 
@@ -154,6 +159,7 @@ impl Resources {
                 pwm: self.pwm,
                 uart1: self.uart1,
                 aes: self.aes,
+                wdt: self.wdt,
                 other_pins: self.other_pins,
             },
         )
@@ -220,6 +226,7 @@ impl Resources {
             pwm: peripherals.pwm,
             uart1: peripherals.uart1,
             aes: peripherals.aes,
+            wdt: peripherals.wdt,
             other_pins: OtherPins {
                 p0,
                 p1,
@@ -265,6 +272,7 @@ mod tests {
             pwm,
             uart1,
             aes,
+            wdt,
             other_pins,
         } = resources;
 
@@ -279,7 +287,7 @@ mod tests {
             mosi: _,
             miso: _,
         } = spi_or_usb;
-        let _ = (adc, flash, power, pwm, uart1, aes, other_pins);
+        let _ = (adc, flash, power, pwm, uart1, aes, wdt, other_pins);
     }
 
     #[test]

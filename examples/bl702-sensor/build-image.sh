@@ -23,6 +23,11 @@ REPO="$(cd ../.. && pwd)"
 #
 # TEST ONLY: BL702_OTA_VERSION_OVERRIDE=MM.mm.pp builds an otherwise
 # identical image with another version (e.g. a "v2" for a bench OTA test).
+#
+# LAB ONLY: BL702_LAB_SOAK=1 builds the loader power-cut soak
+# (src/bin/ota_soak.rs) into $TARGET_DIR/ota-soak instead. It needs a
+# version override above every image it will be tested against, and its
+# OTA file must never be published.
 
 PYTHON="${PYTHON:-python3}"
 OTA_TOOL="$REPO/tools/bl702_ota.py"
@@ -39,7 +44,17 @@ if [[ -n "${BL702_OTA_VERSION_OVERRIDE:-}" ]]; then
     echo "WARNING: TEST-ONLY version override ${BL702_OTA_VERSION_OVERRIDE}; never publish this build" >&2
 fi
 
-if [[ "${BL702_DIAGNOSTIC_LOG:-0}" == "1" ]]; then
+if [[ "${BL702_LAB_SOAK:-0}" == "1" ]]; then
+    if [[ -z "${BL702_OTA_VERSION_OVERRIDE:-}" ]]; then
+        echo "BL702_LAB_SOAK=1 needs BL702_OTA_VERSION_OVERRIDE" >&2
+        exit 1
+    fi
+    echo "WARNING: LAB-ONLY loader soak image; never publish this build" >&2
+    LABEL=lab-soak
+    ELF="$TARGET_DIR/bl702-ota-soak"
+    OUT_DIR="$TARGET_DIR/ota-soak"
+    cargo build --release --locked --features ota-soak --bin bl702-ota-soak
+elif [[ "${BL702_DIAGNOSTIC_LOG:-0}" == "1" ]]; then
     LABEL=diagnostic
     cargo build --release --locked --no-default-features --features diagnostic-logging
 else

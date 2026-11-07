@@ -10,7 +10,8 @@
 //! counts trial boots until the application confirms an installed image,
 //! and starts it at XIP `0x2300E100`. Status lines go to the
 //! monitor UART (GPIO14, 2 Mbaud); with nothing bootable it halts until the
-//! next reset.
+//! next reset. The TIMER watchdog (`BL702_BOOT_WATCHDOG_MS`, default 16 s)
+//! resets a hung decision and is off again before the application starts.
 //!
 //! The 64-byte [`LOADER_INFO`] block at physical `0xFFC0` (`LoaderKeys`,
 //! then the `LoaderInfo` record at `0xFFE0`) tells the application that it
@@ -24,7 +25,9 @@ use bl702_boot::{Config, Console};
 use bl702_hal::flash::XipFlash;
 use bl702_hal::uart::Uart0Tx;
 use bl702_xt_zb1::{ONBOARD_FLASH_CAPACITY, Resources};
-use bl702_xt_zb1_layout::{BOOT_CONFIG, LOADER_START, LOADER_VERSION, TRUSTED_KEYS, XIP_BASE};
+use bl702_xt_zb1_layout::{
+    BOOT_CONFIG, BOOT_WATCHDOG_MS, LOADER_START, LOADER_VERSION, TRUSTED_KEYS, XIP_BASE,
+};
 use panic_halt as _;
 
 /// LoaderKeys record ("ZRSKEYS1", ids of the extra trusted keys; erased
@@ -38,6 +41,7 @@ static CONFIG: Config = Config {
     boot: BOOT_CONFIG,
     img_start: LOADER_START,
     xip_base: XIP_BASE,
+    watchdog: bl702_boot::watchdog_ms(BOOT_WATCHDOG_MS),
 };
 
 struct Uart(Option<Uart0Tx<14, 15>>);
@@ -65,7 +69,7 @@ fn main() -> ! {
     // SAFETY: plain read of an initialized static.
     let _ = unsafe { core::ptr::read_volatile(&LOADER_INFO[0]) };
     match XipFlash::new(application.flash, ONBOARD_FLASH_CAPACITY) {
-        Ok(flash) => bl702_boot::run(flash, &CONFIG, &mut console),
+        Ok(flash) => bl702_boot::run(flash, &CONFIG, application.wdt, &mut console),
         Err(_) => {
             console.write(b"bl702-boot: flash config error\r\nbl702-boot: halted\r\n");
             halt()

@@ -82,18 +82,48 @@ pub const fn trial_log_area(layout) -> (u32, u32);   // overwrite-mode log, for 
     program outside the two slots and, in swap-move mode, outside the two
     status sectors. The loader, the boot header and the persistence
     partitions are therefore unreachable.
-  - The BL702 shell uses `BootFlash`. The CC2340 shell still uses its
-    unguarded `InternalFlash` (an open decision).
+  - Both shells (BL702 and CC2340R5) wrap their driver in `BootFlash`.
 - **Page size** is `Layout::sector_size`, the largest erase unit of the two
   slots.
 - **Jump to the application.** `prepare` performs the entry check and
   cache invalidation, then `start` jumps. The core never calls `start`
   with anything that `prepare` did not return for the image validated in
   the same boot.
-- **Watchdog.** `kick_watchdog` runs before every progress event. No
-  current loader arms a watchdog. Validating a full slot is one step that
-  emits no events, so an armed watchdog must outlast one full-slot
-  validation.
+- **Watchdog.** `kick_watchdog` runs before every progress event. The
+  engine emits enough events that the longest unkicked step is bounded:
+  - `Copying` after every 256-byte chunk (`COPY_CHUNK`);
+  - `Busy` before every full-slot validation (`validate_slot`) and before
+    every erase step. Slot erases are split into `ERASE_STEP` (64 KiB)
+    aligned steps, or one sector per step when the sector size does not
+    divide 64 KiB.
+
+  The longest gap is therefore one full-slot validation (SHA-256 over the
+  image plus one signature check) or one 64 KiB erase. A host test meters
+  the flash I/O between kicks for plain boots, installs, downgrades,
+  rejected requests, padded images and swap-move install/revert, and fails
+  if any gap exceeds one validation (mutation-checked).
+
+  | loader | config | default | range | after the loader |
+  |---|---|---|---|---|
+  | BL702 | `BL702_BOOT_WATCHDOG_MS` (layout build script) | 16,000 ms | 0 (off) or 1..=63,999 | disarmed before the jump and before the `halted` loop |
+  | CC2340R5 | `Config::watchdog` (`watchdog_ms()`) | product choice; keep `None` until the app feeds it | 1..=131,071,000 ms | **cannot be stopped**; kicked once before the jump, so the app gets a full period |
+
+  - **BL702** uses the TIMER block's watchdog on the 32 kHz clock with
+    divider 32 (1,024 ticks/s, 16-bit match). An out-of-range value fails
+    the build. The loader prints `watchdog reset` when the previous reset
+    came from the watchdog (WSR.WTS, then cleared). Disarming before the
+    halt keeps a broken device from reset-looping and wearing flash.
+  - **Default 16 s rationale (BL702).** At the ROM's 32 MHz, one full-slot
+    validation (software SHA-256 over at most `0x76000` bytes plus P-256)
+    is estimated at 2–3 s and a 64 KiB erase at 1–2 s. 16 s gives at
+    least 5× margin and covers RC32K tolerance. This is **not measured**:
+    the BL702 hardware run times the loader lines.
+  - **CC2340R5** uses the CKMD watchdog (`WDTCNT`, stall on debug halt).
+    The current `cc2340-sensor` does not feed a watchdog, so a product
+    that arms it in the loader would reset its application every period.
+    Products keep `watchdog: None` until the application feeds it.
+  - If the BL702 32 kHz clock does not run, the watchdog never fires
+    (fails open). Whether WSR.WTS survives a watchdog reset is unverified.
 - **Crypto accelerator** (later phase, optional). This would be an
   `ImageCrypto` trait for streaming SHA-256 and signature verification,
   with the software path as the default and as the host-test reference.
@@ -140,9 +170,11 @@ pub const fn trial_log_area(layout) -> (u32, u32);   // overwrite-mode log, for 
   BL702 field devices use it and keep working.
 - **Optional: Ed25519** (feature `ed25519` on `mcuboot-image`, the core and
   both shells, using `ed25519-compact` with `opt_size`). The verifier is
-  large; see the [size budget](#size-budget). It fits BL702's 56 KiB
-  loader region but not a 16 KiB Cortex-M region. Making it fit there
-  needs a compact 32-bit-limb verifier (an open decision).
+  large; see the [size budget](#size-budget). It is supported **only on
+  loaders with a large region (BL702, 56 KiB)**. On 16 KiB loaders the
+  feature is a build error: `cc2340r5-boot --features ed25519` fails with
+  `compile_error!` ("Ed25519 is not supported on CC2340R5 … P-256 only"),
+  and CI checks that it keeps failing. There is no compact verifier.
 - **Keys are build-time inputs, never constants in the core or shell
   crates.**
   - A product's layout crate reads them and builds `BootConfig::keys`. The
@@ -373,6 +405,33 @@ The BL702 growth breaks down as:
 - the validation path with a key set: about +80 B;
 - the 64-byte loader block, up from 32 bytes.
 
+**Phase 2 step 2: loader watchdog and the CC2340 slot guard.** The deltas
+are against Phase 2 step 1. The CC2340 rows are the size harness; there is
+no product loader yet. Its step 1 column was re-measured from `5e29b18` in
+the same harness; the step 1 table above differs from it by 4 to 28 bytes.
+
+| loader | step 1 | step 2 | delta |
+|---|---|---|---|
+| BL702, watchdog armed (default 16,000 ms) | 15,286 B | **15,834 B** (`.text` 13,808, `.rodata` 1,416) | **+548 B** |
+| BL702, `BL702_BOOT_WATCHDOG_MS=0` | 15,286 B | 15,674 B | +388 B |
+| BL702, `ed25519` + watchdog | 41,306 B | 41,850 B | +544 B (fits 57,280) |
+| CC2340 overwrite, watchdog `None` | 9,400 B | 9,880 B | +480 B (about 124 B is `BootFlash`) |
+| CC2340 overwrite, watchdog armed | 9,400 B | 9,952 B | +552 B |
+| CC2340 `swap-move`, watchdog `None` | 10,876 B | 11,332 B | +456 B |
+| CC2340 `swap-move`, watchdog armed | 10,876 B | 11,400 B | +524 B |
+| CC2340 `ed25519` | 28,540 B | build error | n/a |
+
+- **RAM.** BL702 loader `.data` (572 B) and `.bss` (1 B) are unchanged.
+- **Disarmed growth.** Even with the watchdog compiled out or set to
+  `None`, the images grow. The cause is the engine's `Busy` events and
+  64 KiB erase steps, and on CC2340 the `BootFlash` monomorphization
+  (`validate_slot<BootFlash>` and `run<BootFlash>`).
+- **Applications.** `bl702-sensor` (225,070 B), `bl702-ed` (191,918 B) and
+  `bl702-router` (311,950 B) are unchanged in flash and RAM. The
+  sensor's stack gates still pass.
+- **Lab soak.** The lab-only `bl702-ota-soak` is 237,546 B file-backed,
+  and its `.bss` is 18 B. CI builds and lints it but never publishes it.
+
 Ed25519 costs about 26 KB on RV32 and 19 KB on Cortex-M0+. Most of that
 is `ed25519-compact`'s fiat 64-bit-limb field arithmetic: `carry_mul` is
 4.4 KB and `carry_square` 3 KB on RV32. Loader stack use with Ed25519 has
@@ -441,117 +500,215 @@ loader's worst-case stack (P-256 and Ed25519) is still open.
      host and target, with default features and with `ed25519,swap-move`;
    - `mcuboot-image` with both feature sets;
    - the BL702 product loader, including `--features ed25519`;
-   - the CC2340 shell for thumbv6m with `--all-features`;
-   - the BL702 sensor static stack gate.
-4. **Hardware**, one chip at a time; see the BL702 plan below.
+   - the CC2340 shell for thumbv6m, with default features and with
+     `swap-move`;
+   - a negative build: CC2340 with `--features ed25519` must fail with
+     "Ed25519 is not supported on CC2340R5";
+   - the BL702 sensor static stack gate;
+   - the lab-only `bl702-ota-soak` build and clippy, and the
+     `tools/test_bl702_soak_monitor.py` classifier tests.
+4. **Watchdog gap meter** (core tests). A simulated watchdog counts flash
+   operations between `Busy` events. The replays fail if any validation
+   or erase step runs without a kick in front of it. This was
+   mutation-checked: deleting either kick fails the test.
+5. **Hardware**, one chip at a time; see the BL702 plan below.
 
 ## BL702 hardware re-validation plan
 
 **Nothing below has been run.** Each flashing step needs the user's
 approval first.
 
-**Target.** One XT-ZB1 already commissioned to the lab's ZHA network, with:
+### Device and lab facts (checked read-only)
 
-- the loader UART on GPIO14 at 2 Mbaud;
-- ISP over CH340 (`bflb`; BOOT/GPIO28 held at plug-in);
-- serial ports `cu.usbserial-14130` and `cu.usbserial-1430`.
+- **Device.** ZHA's XT-ZB1 is IEEE `7c:b9:4c:61:98:b9:00:00`, NWK
+  `0xE8E2`. It runs the **router** role image:
+  - model `XT-ZB1-Router`, mains-powered;
+  - endpoint 1 with only Basic and Identify, and **no OTA client
+    cluster**;
+  - Basic `sw_build_id` `0.1.0`, date code `20260402`.
+- **Which commit it runs.** `SW_BUILD` is the crate version, not a git
+  hash, so Zigbee and the UART banner cannot prove commit `bff2377`. The
+  device is only consistent with it. Proof needs an ISP readback compared
+  with a local `bff2377` router build.
+- **On-flash state.**
+  - The newest ISP backup predates the router flash. It shows the **v1**
+    loader (one key, `LoaderInfo` at `0xFFE0`).
+  - The router keeps its child and APS journals at
+    `0xF9000..0xFD000`, **inside the secondary slot**.
+  - The security journal at `0xFE000` is shared by every role.
+  - Moving to the sensor role keeps only the outgoing frame-counter
+    limits, so **the sensor needs one fresh commissioning**. It steers by
+    itself when factory-new, with a 15 s retry that backs off to 15 min.
+- **OTA provider.** ZHA has a local provider configured:
+  `zigpy_config.ota.extra_providers` of type `advanced`, path
+  `/config/zigpy_ota`, with `zigpy.ota` debug logging.
+  - The directory still holds a stale
+    `1234-0702-25000101-bl702-xt-zb1-diagnostic-0.1.1.zigbee`. Move it
+    out before the run.
+  - No XT-ZB1 update entity exists yet, because the router has no OTA
+    client.
+- **hwlab.**
+  - Only *fake* `PowerSource` devices are registered, and there is no
+    PPK2. **Power cuts are manual.**
+  - ISP (`bflb`) runs over the BL702's own USB with BOOT (GPIO28) held at
+    plug-in.
+  - The loader and app UART is GPIO14 at 2 Mbaud on a CH340
+    (`cu.usbserial-1430` or `-14130`).
 
-### Lab capability (checked read-only)
+### Images
 
-- hwlab's `device_list` and `capability_registry` show only *fake*
-  `PowerSource` devices and no PPK2. **hwlab cannot cut power to the
-  BL702 today.**
-- hwlab's `uart` (including DTR/RTS line control) and the `bflb` ISP path
-  (REAL_HW_VERIFIED for XT-ZB1) are available.
+All images are signed with the production key, with
+`BL702_BOOT_TRIAL_BOOTS=3` and the default 16 s loader watchdog. The
+versions are TEST-ONLY overrides, so none of them may be published.
+
+| image | build | purpose |
+|---|---|---|
+| N = 0.2.0 sensor | `BL702_OTA_VERSION_OVERRIDE=0.2.0 ./build-image.sh` | ISP #1, `-full.bin` |
+| N+1 = 0.2.1 sensor | `…=0.2.1` | OTA through ZHA |
+| soak 0.2.2 | `BL702_LAB_SOAK=1 …=0.2.2` | OTA through ZHA, then the loop |
+| final 0.2.3 sensor | `…=0.2.3` | ISP #2, `-full.bin` |
+
+The final image must be **newer than the soak**. A soak request may
+still be staged when the run ends; against 0.2.3 it is refused as a
+downgrade and dropped, instead of re-installing the soak.
+
+### The loader soak (`bl702-ota-soak`, lab only)
+
+- **The loop.** On every boot the soak:
+  1. confirms itself;
+  2. prints CRC-32s of the loader region (`0x0..0x10000`) and the
+     security journal (`0xFE000..0x100000`);
+  3. waits one second;
+  4. re-stages its own signed image into the secondary slot through the
+     product `SlotWriter`;
+  5. requests an install and resets.
+
+  The loader then erases the primary and copies the image back. An equal
+  version is not a downgrade.
+- **Why it exists.** Every boot is a full install, so a cut at any moment
+  lands in the loader's validation, erase or copy, or in the app's
+  re-staging. The user does not have to time anything.
+- **Size.** A padding blob makes the image about as large as the sensor
+  (237,958 B signed), so the copy time is realistic.
+- **Monitoring.** `tools/bl702_soak_monitor.py` reads the UART and
+  classifies every reset:
+  - `cycle`: the soak re-armed and reset, with no cut;
+  - `cut-copy`, `cut-install`, `cut-loader`, `cut-app`, `cut-staging`.
+- **Failure criteria.** The monitor fails the run on:
+  - `soak: FAIL`;
+  - any loader error (`no bootable image`, `installed copy corrupt`,
+    `flash error`, `update rejected`, `halted`);
+  - a loader watchdog reset;
+  - a changed loader or journal CRC;
+  - no UART output for 30 s while powered (a possible brick).
+- **Pass criteria.** At least 50 cuts, including cuts during the copy.
 
 ### Steps
 
-1. **Back up the device.** Read the whole 1 MiB flash over ISP: loader,
-   slots, journal and the v1 `LoaderInfo`. Keep the file as the recovery
-   image.
-2. **Build.** Run `build-image.sh` twice: version N (for example 0.2.0) and
-   N+1 (0.2.1). Both use the production key and `BL702_BOOT_TRIAL_BOOTS=3`.
-   Then run `bl702_ota.py check` on the N+1 `.zigbee` file.
-3. **Flash the v2 loader and image N** over ISP (`-full.bin` at `0x0`;
-   it covers `0x0..0x87000`, so the journal is kept).
-   - **Expected:** `bl702-boot: v2`, then `app v0.2.0+0`, then **no**
-     trial lines (a factory-flashed image is permanent).
-   - The device rejoins ZHA with its existing network state. That checks
-     that the journal survived.
-4. **OTA N→N+1 through ZHA.** Serve the file with the zigpy local
-   provider (`/config/zigpy_ota/index.json`) and install it from the
-   update entity.
-   - **Expected UART:** `installing update ……`, `update installed`,
-     `trial boot 1`, `app v0.2.1+0`.
-   - The device rejoins and its next report is APS-acknowledged. After
-     that, a power cycle shows **no** `trial boot` line (confirmed).
-   - ZHA shows the new version. The NWK frame counter keeps increasing
-     across the reset (check with a sniffer capture).
-5. **Negative checks.** Each is one OTA.
-   - An image signed with a wrong key is declined by the app channel. If
-     it is forced in, the loader rejects it with `bad signature`.
-   - An N−1 image is refused as a downgrade.
-6. **Power cuts during the copy, 50 or more.**
-   - **Arming.** For each cycle, re-arm the request: serve an alternating
-     N+1/N+2 pair with distinct builds, or re-stage the same N+1 by
-     re-downloading.
-   - **Timing.** The copy starts at the `installing update` line. Cut
-     power at a random delay of 0–2 s after that line; the copy of a
-     ~225 KB image takes roughly 1–2 s, so measure it in the first run.
-     Spread the cuts over the erase and the copy, and over the `Done`
-     write and the request drop.
-   - **Expected after each cut:** the next boot prints `installing
-     update` again (or `update installed` if the cut came after the
-     copy), then `trial boot 1`, the app version, and a rejoin without a
-     new commissioning.
-   - **Failure criteria:** no UART output, `no bootable image: …`,
-     `halted`, a fresh commissioning, a frame-counter regression, or an
-     ISP-only recovery.
-   - **Logging.** Record each cycle with its delay and the observed
+1. **ISP #1 (user holds BOOT).**
+   - Read back the whole 1 MiB flash. This is the recovery image, and it
+     also identifies the router build.
+   - Program the N `-full.bin` (`0x0..0x87000`: the v2 loader, its key
+     block and the sensor).
+   - Blank the secondary slot `0x87000..0xFE000` with `0xFF`. This
+     removes the router journals and any stale request.
+   - Leave `0xFE000..0x100000` (the journal) untouched.
+   - **Expected:** `bl702-boot: v2`, then `app v0.2.0+0`, and no trial
      lines.
-7. **Trial expiry.** Install an image whose app never confirms (a
-   test-only build with `report_aps_ack` off and no join, or the network
-   powered down).
-   - **Expected:** `trial boot 1..3`, then `image unconfirmed` on every
-     later boot, and no flash writes. Overwrite has no revert, so this
-     checks only that the device stays bootable.
-8. **Recovery path.** Restore the step 1 backup over ISP and check that
-   the device rejoins.
+2. **Commission.** The agent opens permit-join in ZHA (the "XT-ZB1"
+   device entry changes from the router model to the sensor). The sensor
+   joins by itself.
+3. **OTA N→N+1 through ZHA.**
+   - Put the 0.2.1 file in `/config/zigpy_ota`, wait for the first query
+     (about 300 s after boot), and install it from the update entity.
+   - **Expected:** `installing update`, `update installed`,
+     `trial boot 1`, `app v0.2.1+0`, then a rejoin and an APS-acknowledged
+     report.
+   - Power-cycling once afterwards shows no `trial boot` line.
+4. **Serve the soak (0.2.2) through ZHA.** This reuses the same OTA path
+   with no extra ISP. From then on the board cycles by itself, about
+   once every 3–5 s (to be measured). The agent runs
+   `tools/bl702_soak_monitor.py --port … --log …`.
+5. **Power cuts (one user session).** The user unplugs and replugs at
+   random moments until the agent says stop; see below. The agent stops
+   at ≥ 50 cuts with some during the copy, or at the first failure.
+6. **ISP #2 (user holds BOOT).**
+   - Read back and compare the loader region and the journal with the
+     step 1 readback. They must match the soak's CRC line.
+   - Program the final 0.2.3 `-full.bin`.
+   - **Expected:**
+     - one `update rejected: downgrade`, if a soak request was staged;
+     - then `app v0.2.3+0`;
+     - the sensor resumes on the network **without** commissioning;
+     - its frame counter keeps increasing (sniffer).
+7. **Negative and trial checks** (optional, through ZHA):
+   - a wrong-key image is declined;
+   - an N−1 image is refused;
+   - an image that never confirms boots `trial boot 1..3`, then
+     `image unconfirmed`.
+8. **Recovery** (only if something fails): restore the step 1 readback
+   over ISP.
+
+The UART timestamps from step 5 give the real validation and copy times.
+They show whether the 16 s watchdog default has the margin assumed in
+[the watchdog notes](#core-api); before this run the margin is
+not measured.
 
 ### What the user must do by hand
 
-- **Approve each flashing step** (steps 3, 4 and 8).
-- **Provide power control for step 6.** Choose one of:
-  - a USB power relay or switchable hub port that the lab can drive;
-  - a PPK2 attached and registered in hwlab;
-  - cutting power by hand on a prompted random delay. Manual cuts land
-    with roughly 100–300 ms of human jitter, which is acceptable because
-    the copy window is longer.
-- **Enter ISP mode.** Hold BOOT (GPIO28) while plugging in, for the
-  backup (step 1) and for recovery.
-- **Confirm the setup.** Check that the XT-ZB1 is the one commissioned to
-  ZHA and that the ZHA local OTA provider is configured. Changing
-  `extra_providers` needs a Home Assistant restart.
+- **Before the run:**
+  - Confirm the cabling. Which USB connector powers the board? There
+    must be **one** power path.
+  - The CH340 adapter must not feed VCC, and its TX should not
+    back-power the BL702 through GPIO15. If it does, cuts are not clean;
+    in that case connect only GND, TX and RX, or note it.
+  - Approve each flash, moving the stale OTA file, and replacing the
+    router with the sensor in ZHA.
+- **ISP #1 and ISP #2:** hold BOOT (GPIO28) while plugging the BL702's
+  USB in, then release it. Do nothing else; the agent drives ISP.
+- **Steps 2–4:** nothing.
+- **Step 5, one session:**
+  - unplug at random moments, never in a rhythm;
+  - wait about 2 s with the board unpowered;
+  - plug back in;
+  - vary the time powered between about 0.5 s and 6 s;
+  - repeat until the agent says **stop**.
+
+  Each cut takes about 5–10 s, so 50+ cuts take about 5–10 minutes. The
+  agent reports the count as it goes, and says **stop at once** if it
+  sees a stall or failure.
 
 ## Open decisions
 
-1. **Ed25519 on 16 KiB loaders.** Either keep Ed25519 BL702-only (or
-   large-region-only), or write a compact 32-bit-limb verifier, estimated
-   at 4–6 KB.
-2. **CC2340 `BootFlash`.** Should the CC2340 shell adopt the slot guard?
-   It is required before swap-move is enabled there.
-3. **Watchdog.** Should loaders arm one, and with what period? It must
-   outlast a full-slot validation.
-4. **Trial expiry in overwrite mode.** Keep booting and report it (the
-   current behaviour), or additionally refuse further OTA until a confirm?
-5. **Swap-move per product.** Which of CC2340, nRF52 and MG21/MG22 turn
+Resolved in Phase 2 step 2:
+
+- Ed25519 is BL702-only; on CC2340 it is a build error.
+- CC2340 uses `BootFlash`.
+- Loaders arm a watchdog (BL702 default 16 s).
+- An expired trial in overwrite mode keeps booting and is reported.
+
+Still open:
+
+1. **CC2340 watchdog default.** The CC2340 WDT cannot be stopped once
+   armed, and `cc2340-sensor` does not feed it. Product configs therefore
+   keep `watchdog: None` until the app feeds the watchdog; then they arm
+   it with a period that covers a full-slot validation.
+2. **Swap-move per product.** Which of CC2340, nRF52 and MG21/MG22 turn
    it on, and with how many trial boots.
+3. **BL702 run approvals:**
+   - the soak image;
+   - replacing the ZHA router with the sensor;
+   - moving the stale 0.1.1 OTA file;
+   - the two ISP sessions.
 
 ## Proposed Phase 2 order
 
-1. **Done (host only):** the brick fix, trial/confirm, multi-key,
-   optional Ed25519 and opt-in swap-move.
-   **Next:** BL702 hardware re-validation (above).
+1. **Done (host only):**
+   - the brick fix, trial/confirm, multi-key, optional Ed25519 and opt-in
+     swap-move;
+   - the loader watchdog, the CC2340 `BootFlash` guard and the lab soak.
+
+   **Next:** the BL702 hardware run (above).
 2. **CC2340R5:** a product loader binary (`BootFlash`, overwrite and
    swap-move builds) and a `SlotWriter`-based product OTA path.
    Hardware: SWD install, boot, OTA, power cuts, and a swap-move revert.
