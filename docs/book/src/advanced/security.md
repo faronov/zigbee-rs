@@ -119,6 +119,23 @@ The constant `NwkSecurityHeader::ZIGBEE_DEFAULT` (`0x2D`) encodes:
 - Key Identifier = 1 (Network Key)
 - Extended Nonce = 1 (source address present)
 
+### Unsecured Frames on a Secured Network
+
+While NWK security is enabled, `process_incoming_nwk_frame` drops every NWK
+frame whose security sub-field is clear before the frame can reach APS, ZDO
+or ZCL, advance a replay floor, or be relayed. Unicast and broadcast frames,
+and commands and data frames, are all dropped. APS security does not stand in
+for NWK security. Only two unsecured forms are admitted:
+
+- a router-local Rejoin Request (radius 1, addressed to this router), which
+  the router answers under its rejoin policy;
+- before any network key is active, a unicast APS command frame (the pre-key
+  Transport-Key). APS then applies its per-command policy.
+
+A Trust Center rejoin clears the NWK key material and disables NWK security
+before it waits for its Transport-Key, so that path is unaffected. Networks
+with NWK security disabled still receive unsecured data.
+
 ### Replay Protection
 
 Each device maintains a per-source frame counter table. Incoming frames are
