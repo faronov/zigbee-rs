@@ -68,11 +68,14 @@ SHA, ECC, RMT, LEDC. Users must reconfigure them after a wake with
 1. Save CPU frames, CSRs and every region (after the switch to XTAL).
 2. `LP_AON_STORE8` = `esp32h2_sleep_cpu_restore`; save the critical frame.
 3. Request sleep. A reject returns with nothing lost.
-4. Wake: the ROM jumps to the restore stub. In order: PCR, MWDT0/1
-   flash-boot off, modem clocks, sleep bias fix, analog, CPU clock (BBPLL),
-   SPI1/SPI0, IO_MUX/GPIO, INTMTX, HP_SYSTEM, TEE (+ M4 mode), HP_APM,
-   SYSTIMER, BTBB, 802.15.4 MAC, USJ CONF0, CPU frames/CSRs; invalidate and
-   resume the I-cache; return to the caller.
+4. Wake: the ROM jumps to the restore stub (critical frame). In order:
+   non-critical CSRs and CPU frames (first, as in IDF: the power-down
+   clears `mpcer`/`mpcmr`, and the ROM `ets_delay_us` used by the clock
+   restore spins on that cycle counter), PCR, MWDT0/1 flash-boot off, modem
+   clocks, sleep bias fix, analog, CPU clock (BBPLL), SPI1/SPI0,
+   IO_MUX/GPIO, INTMTX, HP_SYSTEM, TEE (+ M4 mode), HP_APM, SYSTIMER, BTBB,
+   802.15.4 MAC, USJ CONF0; invalidate and resume the I-cache; return to
+   the caller.
 
 The radio is suspended by the product before sleep and resumed after it
 (`enable_phy` = `phy_wakeup_init` + digital restore): the IDF modem

@@ -556,6 +556,12 @@ pub(super) unsafe fn sleep_top_pd(
         }
     } else {
         // Woken through the ROM and the restore stub, at XTAL.
+        // CPU domain first, as IDF's `esp_sleep_cpu_retention` does before
+        // `pmu_sleep_finish`: the power-down reset `mpcer`/`mpcmr`, which
+        // stops the cycle counter the ROM `ets_delay_us` spins on (the
+        // clock restore below would never return).
+        noncritical_csrs!(restore_csrs, (frame!(csr)));
+        crate::__h2_cpu_regions!(restore_regions, (frame!(cpu)));
         crate::__h2_pcr_regions!(restore_regions, (frame!(pcr)));
         latch_bus_clock();
         // `misc_modules_wake_prepare`: the flash-boot MWDT comes back armed.
@@ -585,8 +591,8 @@ pub(super) unsafe fn sleep_top_pd(
         }
     };
 
-    noncritical_csrs!(restore_csrs, (frame!(csr)));
-    crate::__h2_cpu_regions!(restore_regions, (frame!(cpu)));
+    // A reject (or a wake with the CPU powered) lost nothing; a power-down
+    // wake restored the CPU domain on entry to its branch.
     if outcome.powered_down {
         cache_invalidate_all();
     }
