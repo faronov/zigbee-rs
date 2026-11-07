@@ -542,18 +542,30 @@ approval first.
 - **OTA provider.** ZHA has a local provider configured:
   `zigpy_config.ota.extra_providers` of type `advanced`, path
   `/config/zigpy_ota`, with `zigpy.ota` debug logging.
-  - The directory still holds a stale
-    `1234-0702-25000101-bl702-xt-zb1-diagnostic-0.1.1.zigbee`. Move it
-    out before the run.
+  - The stale `1234-0702-25000101-bl702-xt-zb1-diagnostic-0.1.1.zigbee`
+    was moved to `/config/zigpy_ota_backup/`. The backup folder is a
+    sibling, not a subfolder: the provider scans its path recursively.
+  - zigpy caches the provider index for 24 h
+    (`INDEX_EXPIRATION_TIME`). After adding a file, reload the ZHA
+    config entry, or the new file may not be offered until the cache
+    expires.
   - No XT-ZB1 update entity exists yet, because the router has no OTA
     client.
 - **hwlab.**
   - Only *fake* `PowerSource` devices are registered, and there is no
     PPK2. **Power cuts are manual.**
-  - ISP (`bflb`) runs over the BL702's own USB with BOOT (GPIO28) held at
-    plug-in.
-  - The loader and app UART is GPIO14 at 2 Mbaud on a CH340
-    (`cu.usbserial-1430` or `-14130`).
+- **Cabling.** The XT-ZB1 has two micro-USB connectors.
+  - The CH340 USB-UART (`cu.usbserial-1430` or `-14130`) is the **only**
+    power path in normal operation. It also carries the loader and app
+    UART (GPIO14 TX, GPIO15 RX, 2 Mbaud). A power cut therefore means
+    unplugging the USB-UART, and the serial port disappears with it.
+  - The right micro-USB is the BL702's own USB. ISP (`bflb`) runs there,
+    with BOOT (GPIO28) held at plug-in, while the ROM enumerates as a
+    CDC device.
+  - Each ISP session swaps cables: unplug the USB-UART, then hold BOOT
+    and plug in the chip USB. Afterwards, unplug the chip USB and plug
+    the USB-UART back into **the same host port**. macOS names
+    `cu.usbserial-*` by USB location.
 
 ### Images
 
@@ -591,16 +603,26 @@ downgrade and dropped, instead of re-installing the soak.
 - **Size.** A padding blob makes the image about as large as the sensor
   (237,958 B signed), so the copy time is realistic.
 - **Monitoring.** `tools/bl702_soak_monitor.py` reads the UART and
-  classifies every reset:
-  - `cycle`: the soak re-armed and reset, with no cut;
-  - `cut-copy`, `cut-install`, `cut-loader`, `cut-app`, `cut-staging`.
+  classifies every reset.
+  - The power cut removes the USB-UART, so the monitor treats a
+    vanished port as the cut, not as silence. It polls for the port to
+    re-enumerate and reopens it with DTR and RTS deasserted (RTS drives
+    the XT-ZB1 reset).
+  - Each cut is classified by the phase it interrupted: `cut-boot`,
+    `cut-loader`, `cut-copy`, `cut-install`, `cut-app`, `cut-staging`
+    or `cut-rearmed`.
+  - `cycle`: the soak re-armed and reset, with no cut.
+  - `reset-<phase>`: any other banner without a port loss. It is
+    reported but is not a failure.
 - **Failure criteria.** The monitor fails the run on:
   - `soak: FAIL`;
   - any loader error (`no bootable image`, `installed copy corrupt`,
     `flash error`, `update rejected`, `halted`);
   - a loader watchdog reset;
   - a changed loader or journal CRC;
-  - no UART output for 30 s while powered (a possible brick).
+  - no `soak: crc` line within 60 s after the port returns (a possible
+    brick);
+  - no UART output for 30 s while the port is present.
 - **Pass criteria.** At least 50 cuts, including cuts during the copy.
 
 ### Steps
@@ -619,8 +641,9 @@ downgrade and dropped, instead of re-installing the soak.
    device entry changes from the router model to the sensor). The sensor
    joins by itself.
 3. **OTA N→N+1 through ZHA.**
-   - Put the 0.2.1 file in `/config/zigpy_ota`, wait for the first query
-     (about 300 s after boot), and install it from the update entity.
+   - Put the 0.2.1 file in `/config/zigpy_ota`, reload the ZHA config
+     entry so zigpy re-reads the index, wait for the first query (about
+     300 s after boot), and install it from the update entity.
    - **Expected:** `installing update`, `update installed`,
      `trial boot 1`, `app v0.2.1+0`, then a rejoin and an APS-acknowledged
      report.
@@ -657,20 +680,21 @@ not measured.
 ### What the user must do by hand
 
 - **Before the run:**
-  - Confirm the cabling. Which USB connector powers the board? There
-    must be **one** power path.
-  - The CH340 adapter must not feed VCC, and its TX should not
-    back-power the BL702 through GPIO15. If it does, cuts are not clean;
-    in that case connect only GND, TX and RX, or note it.
+  - Confirmed: the CH340 USB-UART is the single power path.
   - Approve each flash, moving the stale OTA file, and replacing the
     router with the sensor in ZHA.
-- **ISP #1 and ISP #2:** hold BOOT (GPIO28) while plugging the BL702's
-  USB in, then release it. Do nothing else; the agent drives ISP.
+- **ISP #1 and ISP #2:**
+  1. unplug the USB-UART;
+  2. hold BOOT (GPIO28) while plugging in the right (chip) micro-USB,
+     then release it;
+  3. wait while the agent drives ISP;
+  4. when told, unplug the chip USB and plug the USB-UART back into the
+     same host port.
 - **Steps 2–4:** nothing.
 - **Step 5, one session:**
-  - unplug at random moments, never in a rhythm;
+  - unplug the USB-UART at random moments, never in a rhythm;
   - wait about 2 s with the board unpowered;
-  - plug back in;
+  - plug it back into the same host port;
   - vary the time powered between about 0.5 s and 6 s;
   - repeat until the agent says **stop**.
 
