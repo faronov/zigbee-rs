@@ -431,6 +431,7 @@ mod tests {
                     42
                 },
                 status,
+                top_powered_down: false,
             }))
         }
         fn restore(&mut self, report: Option<&SleepReport>) -> Result<(), Self::Error> {
