@@ -2,10 +2,6 @@
 
 use sensor_sed_app::{ButtonPolicy, ForceReportAction, SensorPolicy, SleepDepth, StatusPolicy};
 
-/// OTA traffic and a fresh coordinator interview use the proven 120-second
-/// fast-poll window.
-pub const OTA_KEEP_AWAKE_MS: u32 = 120_000;
-
 pub const USER_ACTIONS: ForceReportAction = ForceReportAction;
 
 pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
@@ -70,6 +66,5 @@ mod tests {
         assert_eq!(SENSOR_POLICY.fresh_join_fast_ms, 120_000);
         assert_eq!(SENSOR_POLICY.restored_fast_ms, 60_000);
         assert_eq!(SENSOR_POLICY.interview_complete_grace_ms, 5_000);
-        assert_eq!(OTA_KEEP_AWAKE_MS, SENSOR_POLICY.fresh_join_fast_ms);
     }
 }

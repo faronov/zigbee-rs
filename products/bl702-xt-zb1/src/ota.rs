@@ -57,8 +57,6 @@ pub const FILE_VERSION_PREFIX: u8 = 0x25;
 /// First client query after joining, then one per day.
 pub const FIRST_QUERY_DELAY_SECS: u32 = 300;
 pub const QUERY_INTERVAL_SECS: u32 = 24 * 60 * 60;
-/// Fast-poll window after OTA traffic.
-pub const OTA_KEEP_AWAKE_MS: u32 = 120_000;
 /// The OTA server: the coordinator's endpoint 1 (Zigbee2MQTT, ZHA).
 pub const OTA_SERVER: (u16, u8) = (0x0000, 1);
 /// Image Block Request size.
@@ -300,9 +298,7 @@ where
             }
         }
 
-        let active = OtaSession::is_active(manager);
         AppOtaEventOutcome::Handled {
-            keep_awake_ms: active.then_some(OTA_KEEP_AWAKE_MS),
             activation_pending: self.session.activation_pending()
                 || matches!(event, StackEvent::OtaComplete),
         }
@@ -327,7 +323,7 @@ where
         Self::log_status(status.as_ref());
 
         OtaServiceOutcome {
-            keep_awake_ms: (queried || status.is_some()).then_some(OTA_KEEP_AWAKE_MS),
+            progressed: queried || status.is_some(),
             activation_pending: self.session.activation_pending(),
         }
     }

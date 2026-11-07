@@ -1172,11 +1172,15 @@ where
         };
     }
 
-    fn apply_ota_outcome(&mut self, keep_awake_ms: Option<u32>, activation_pending: bool) {
+    /// Mark OTA traffic and run a requested activation.
+    ///
+    /// No timed fast-poll window is opened: the fast poll is held by the
+    /// session itself ([`OtaLifecycle::is_active`] in
+    /// [`next_wait_ms`](Self::next_wait_ms)), so a Query Next Image Response
+    /// without an image, a declined notify, a timeout or a failure returns
+    /// the device to its slow poll on the next iteration.
+    fn apply_ota_outcome(&mut self, activation_pending: bool) {
         self.resources.status.set(SensorStatus::Ota);
-        if let Some(duration_ms) = keep_awake_ms {
-            self.start_fast_poll(duration_ms);
-        }
         if activation_pending {
             // Activation may reset immediately. Persist network keys and
             // security counters before handing control back to the product.
@@ -1201,13 +1205,10 @@ where
                     .record(DiagnosticEvent::UnexpectedOtaEvent);
                 Some(false)
             }
-            OtaEventOutcome::Handled {
-                keep_awake_ms,
-                activation_pending,
-            } => {
-                self.apply_ota_outcome(keep_awake_ms, activation_pending);
-                // OTA owns its deadline; do not replace it with the generic
-                // commissioning-activity window.
+            OtaEventOutcome::Handled { activation_pending } => {
+                self.apply_ota_outcome(activation_pending);
+                // OTA traffic must not open the generic commissioning
+                // window either; the session alone holds the fast poll.
                 Some(false)
             }
         }
@@ -1523,8 +1524,8 @@ where
                 .ota
                 .service(&mut self.node, tick_elapsed.saturating_add(precharged_secs))
                 .await;
-            if ota.keep_awake_ms.is_some() || ota.activation_pending {
-                self.apply_ota_outcome(ota.keep_awake_ms, ota.activation_pending);
+            if ota.progressed || ota.activation_pending {
+                self.apply_ota_outcome(ota.activation_pending);
             }
         }
 
@@ -1774,7 +1775,18 @@ where
             wait_ms = shorten(wait_ms, watchdog_ms);
         }
 
-        let sleep_depth = if ota_active || pending_protocol_work {
+        // Waiting only for APS ACKs of frames already on air needs no CPU:
+        // the ACK is fetched by the next fast poll and the retry timer runs
+        // on the monotonic clock. Light-sleep through it at the fast-poll
+        // depth (never deeper than Idle), on the same fast cadence.
+        let ack_wait_only =
+            pending_protocol_work && !ota_active && self.node.device().awaits_aps_ack_only();
+        let sleep_depth = if ack_wait_only {
+            match self.policy.fast_sleep_depth {
+                SleepDepth::Retention => SleepDepth::Idle,
+                depth => depth,
+            }
+        } else if ota_active || pending_protocol_work {
             SleepDepth::Active
         } else if in_fast_poll {
             self.policy.fast_sleep_depth

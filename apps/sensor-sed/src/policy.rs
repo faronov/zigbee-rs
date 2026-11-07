@@ -108,6 +108,11 @@ pub struct SensorPolicy {
     pub button: ButtonPolicy,
     pub status: StatusPolicy,
     /// Wait depth while joined and the fast-poll window is active.
+    ///
+    /// Also used (capped at [`SleepDepth::Idle`]) between the fast polls
+    /// that wait only for the APS acknowledgement of an already transmitted
+    /// unicast, such as an acknowledged attribute report. Other pending
+    /// protocol work and an active OTA session keep the CPU awake.
     pub fast_sleep_depth: SleepDepth,
     /// Wait depth while joined in the steady-state slow-poll period, and
     /// while unjoined between commissioning attempts or while waiting for

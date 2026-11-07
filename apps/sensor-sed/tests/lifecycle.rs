@@ -418,7 +418,6 @@ impl SecurityStateStore for CountingStore<'_> {
 }
 
 struct RecordingOta<'a> {
-    keep_awake_ms: u32,
     seen_raw_command: &'a Cell<bool>,
     activated: &'a Cell<u32>,
     loads_at_handle: &'a Cell<u32>,
@@ -458,7 +457,6 @@ where
             self.seen_raw_command.set(true);
             self.loads_at_handle.set(self.load_calls.get());
             OtaEventOutcome::Handled {
-                keep_awake_ms: Some(self.keep_awake_ms),
                 activation_pending: true,
             }
         } else {
@@ -538,7 +536,6 @@ impl<M: MacDriver, S: SecurityStateStore, P: ApplicationProfile> OtaLifecycle<M,
         {
             self.request(node);
             OtaEventOutcome::Handled {
-                keep_awake_ms: Some(250),
                 activation_pending: true,
             }
         } else {
@@ -554,7 +551,7 @@ impl<M: MacDriver, S: SecurityStateStore, P: ApplicationProfile> OtaLifecycle<M,
         if self.trigger == ActivationTrigger::Service && !self.requested.get() {
             self.request(node);
             OtaServiceOutcome {
-                keep_awake_ms: Some(250),
+                progressed: true,
                 activation_pending: true,
             }
         } else {
@@ -1824,7 +1821,8 @@ fn secure_rejoin_request_recovers_through_the_mock_parent() {
     )));
 }
 
-fn check_raw_ota_routing(keep_awake_ms: u32) {
+#[test]
+fn raw_ota_command_is_handled_before_generic_matching_and_activation_is_checkpointed() {
     let waits = RefCell::new(Vec::new());
     let poll_counts = RefCell::new(Vec::new());
     let delay_calls = Cell::new(0);
@@ -1854,7 +1852,6 @@ fn check_raw_ota_routing(keep_awake_ms: u32) {
             &delay_calls,
         );
         let ota = RecordingOta {
-            keep_awake_ms,
             seen_raw_command: &seen_raw_command,
             activated: &activated,
             loads_at_handle: &loads_at_handle,
@@ -1876,27 +1873,25 @@ fn check_raw_ota_routing(keep_awake_ms: u32) {
         )
         .unwrap();
         block_on(app.initialize()).unwrap();
-        block_on(app.step()).unwrap();
-        for _ in 0..keep_awake_ms.div_ceil(BASE_POLICY.fast_poll_ms) {
+        while waits
+            .borrow()
+            .last()
+            .is_none_or(|wait| wait.sleep_depth == SleepDepth::Active)
+        {
+            assert!(waits.borrow().len() < 100, "{:?}", waits.borrow());
             block_on(app.step()).unwrap();
         }
-        assert!(
-            waits
-                .borrow()
-                .iter()
-                .all(|wait| wait.sleep_depth == SleepDepth::Active),
-            "generic event handling must not shorten the OTA keep-awake window: {:?}",
-            waits.borrow()
-        );
+        let waits = waits.borrow();
+        let (last, fast) = waits.split_last().unwrap();
+        // The OTA event (handled during the first poll) neither shortens nor
+        // extends the restored-network window, and opens no window of its
+        // own: the session is idle, so the slow poll follows on time.
         assert_eq!(
-            waits
-                .borrow()
-                .iter()
-                .map(|wait| wait.timeout_ms)
-                .sum::<u32>(),
-            BASE_POLICY.fast_poll_ms + keep_awake_ms
+            fast.iter().map(|wait| wait.timeout_ms).sum::<u32>(),
+            BASE_POLICY.restored_fast_ms,
+            "{waits:?}"
         );
-        block_on(app.step()).unwrap();
+        assert_eq!(last.sleep_depth, BASE_POLICY.slow_sleep_depth);
     }
 
     assert!(
@@ -1920,13 +1915,6 @@ fn check_raw_ota_routing(keep_awake_ms: u32) {
             ..
         } if *cluster_id == ClusterId::OTA_UPGRADE.0
     )));
-}
-
-#[test]
-fn raw_ota_command_is_handled_before_generic_matching_and_activation_is_checkpointed() {
-    for keep_awake_ms in [25, 250] {
-        check_raw_ota_routing(keep_awake_ms);
-    }
 }
 
 fn check_ota_activation_checkpoints(trigger: ActivationTrigger) {
@@ -2820,23 +2808,27 @@ fn pending_work_is_bounded_and_persisting_work_starts_the_rejoin() {
     let waits = waits.into_inner();
     let diagnostics = diagnostics.into_inner();
     let after = &waits[pending_from..];
-    let active: Vec<_> = after
+    // Only an APS ACK is outstanding: the fast cadence polls for it, but the
+    // chip light-sleeps between polls at the fast-poll depth.
+    let fast: Vec<_> = after
         .iter()
-        .take_while(|wait| wait.sleep_depth == SleepDepth::Active)
+        .take_while(|wait| wait.timeout_ms == BOUNDED_ACTIVE_POLICY.fast_poll_ms)
         .collect();
+    assert!(!fast.is_empty(), "pending work first gets the fast cadence");
     assert!(
-        !active.is_empty(),
-        "pending work first gets the fast active wait"
+        fast.iter()
+            .all(|wait| wait.sleep_depth == BOUNDED_ACTIVE_POLICY.fast_sleep_depth),
+        "an ACK-only wait sleeps at the fast-poll depth: {after:?}"
     );
     assert!(
-        active.iter().map(|wait| wait.timeout_ms).sum::<u32>() <= 50 + 10,
+        fast.iter().map(|wait| wait.timeout_ms).sum::<u32>() <= 50 + 10,
         "but no longer than max_active_ms: {after:?}"
     );
     assert!(
-        after[active.len()..]
+        after
             .iter()
             .all(|wait| wait.sleep_depth != SleepDepth::Active),
-        "the expired work never forces the chip awake again: {after:?}"
+        "an ACK wait never forces the chip awake: {after:?}"
     );
     assert!(
         diagnostics
@@ -3912,4 +3904,219 @@ fn failed_fallback_join_falls_back_to_the_unjoined_backoff_once() {
         0
     );
     assert_eq!(&run.backoffs()[..3], &[100, 200, 400]);
+}
+
+// ---------------------------------------------------------------------------
+// APS-ACK waits and the OTA session window
+// ---------------------------------------------------------------------------
+
+/// Only an outstanding APS ACK is "ACK-only" work; any other exchange keeps
+/// the CPU-awake classification.
+#[test]
+fn only_an_outstanding_aps_ack_is_ack_only_work() {
+    let profile = test_profile();
+    let mut device = test_device(&profile, &BASE_POLICY);
+    assert!(!device.has_pending_protocol_work());
+    assert!(!device.awaits_aps_ack_only());
+
+    assert!(
+        device
+            .bdb_mut()
+            .zdo_mut()
+            .aps_mut()
+            .register_ack_pending(0x77, 0x0000, &[0, 1, 2])
+            .is_some()
+    );
+    assert!(device.has_pending_protocol_work());
+    assert!(device.awaits_aps_ack_only());
+
+    device.user_action(zigbee_runtime::UserAction::Rejoin);
+    assert!(device.has_pending_protocol_work());
+    assert!(
+        !device.awaits_aps_ack_only(),
+        "a queued user action needs the CPU"
+    );
+}
+
+fn ack_wait_policy(fast_sleep_depth: SleepDepth) -> &'static SensorPolicy {
+    Box::leak(Box::new(SensorPolicy {
+        fast_sleep_depth,
+        ..BASE_POLICY
+    }))
+}
+
+/// Waiting for an APS ACK keeps the fast poll cadence that fetches it, but
+/// sleeps at the fast-poll depth (never deeper than Idle) between polls.
+#[test]
+fn an_aps_ack_wait_sleeps_between_fast_polls() {
+    for (fast_depth, expected) in [
+        (SleepDepth::Idle, SleepDepth::Idle),
+        (SleepDepth::Active, SleepDepth::Active),
+        (SleepDepth::Retention, SleepDepth::Idle),
+    ] {
+        let policy = ack_wait_policy(fast_depth);
+        let run = run_bounded(
+            policy,
+            test_profile(),
+            NoOta,
+            |device| {
+                assert!(
+                    device
+                        .bdb_mut()
+                        .zdo_mut()
+                        .aps_mut()
+                        .register_ack_pending(0x77, 0x0000, &[0, 1, 2])
+                        .is_some()
+                );
+            },
+            3,
+            |_, _| {},
+        );
+        let after = run.after();
+        assert_eq!(after.len(), 3, "{after:?}");
+        for wait in after {
+            assert_eq!(
+                *wait,
+                WaitRequest {
+                    timeout_ms: BASE_POLICY.fast_poll_ms,
+                    sleep_depth: expected,
+                },
+                "{fast_depth:?}: {after:?}"
+            );
+        }
+    }
+}
+
+/// An ACK wait polls the parent on every fast-cadence timer wake, so the
+/// acknowledgement is fetched; once it has arrived the device returns to
+/// the slow poll.
+#[test]
+fn an_aps_ack_wait_polls_on_every_fast_wake() {
+    let policy = ack_wait_policy(SleepDepth::Idle);
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::with_state(commissioned_state(0x02), &store_calls);
+    let mut profile = test_profile();
+    let mut device = test_device(&profile, policy);
+    let from;
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake = RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+        let mut app = SensorApp::new(
+            node,
+            policy,
+            parts(
+                wake,
+                RecordingStatus { events: &status },
+                NoOta,
+                &environment_samples,
+                &battery_samples,
+                &heartbeats,
+                &diagnostics,
+            ),
+        )
+        .unwrap();
+        block_on(app.initialize()).unwrap();
+        for _ in 0..20 {
+            block_on(app.step()).unwrap();
+        }
+        assert!(
+            app.device_mut()
+                .bdb_mut()
+                .zdo_mut()
+                .aps_mut()
+                .register_ack_pending(0x77, 0x0000, &[0, 1, 2])
+                .is_some()
+        );
+        from = waits.borrow().len();
+        for _ in 0..3 {
+            block_on(app.step()).unwrap();
+        }
+        // The ACK arrives with the third poll.
+        assert!(
+            app.device_mut()
+                .bdb_mut()
+                .zdo_mut()
+                .aps_mut()
+                .confirm_ack(0x0000, 0x77)
+        );
+        for _ in 0..2 {
+            block_on(app.step()).unwrap();
+        }
+    }
+    let waits = waits.into_inner();
+    let polls = poll_counts.into_inner();
+    let after = &waits[from..];
+    assert!(
+        after[..3]
+            .iter()
+            .all(|wait| wait.timeout_ms == policy.fast_poll_ms
+                && wait.sleep_depth == SleepDepth::Idle),
+        "{after:?}"
+    );
+    for index in from + 1..from + 3 {
+        assert!(
+            polls[index] > polls[index - 1],
+            "every fast timer wake polls the parent: {polls:?}"
+        );
+    }
+    assert!(
+        after[3..]
+            .iter()
+            .all(|wait| wait.timeout_ms == policy.slow_poll_ms
+                && wait.sleep_depth == policy.slow_sleep_depth),
+        "the acknowledged device is back on the slow poll: {after:?}"
+    );
+}
+
+/// An OTA session keeps the CPU awake only while it is active: when the
+/// server answers Query Next Image with NO_IMAGE_AVAILABLE (or any failure)
+/// the session goes idle and the slow poll resumes at once, without a tail.
+#[test]
+fn an_ended_ota_session_leaves_no_fast_poll_tail() {
+    let active = Cell::new(false);
+    let aborts = Cell::new(0);
+    let run = run_bounded(
+        &BASE_POLICY,
+        test_profile(),
+        StuckOta {
+            active: &active,
+            aborts: &aborts,
+        },
+        // Image Notify: the session queries the server.
+        |_| active.set(true),
+        8,
+        // The server's NO_IMAGE_AVAILABLE response ends the session.
+        |step, _| {
+            if step == 3 {
+                active.set(false);
+            }
+        },
+    );
+    let after = run.after();
+    assert!(
+        after[..3].iter().all(|wait| *wait
+            == WaitRequest {
+                timeout_ms: BASE_POLICY.fast_poll_ms,
+                sleep_depth: SleepDepth::Active,
+            }),
+        "the active session fast-polls awake: {after:?}"
+    );
+    assert!(
+        after[3..].iter().all(|wait| *wait
+            == WaitRequest {
+                timeout_ms: BASE_POLICY.slow_poll_ms,
+                sleep_depth: BASE_POLICY.slow_sleep_depth,
+            }),
+        "no window outlives the session: {after:?}"
+    );
+    assert_eq!(aborts.get(), 0);
+    assert_eq!(run.record.total, 0, "an ended session is no anomaly");
 }

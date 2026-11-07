@@ -1093,6 +1093,20 @@ impl<M: MacDriver> ApsLayer<M> {
         if self.fragment_tx.is_some() {
             return true;
         }
+        self.unicast_ack_pending()
+    }
+
+    /// Whether unfragmented unicasts wait for their acknowledgement and no
+    /// fragmented transmission is in progress.
+    pub fn awaits_unicast_ack_only(&self) -> bool {
+        #[cfg(feature = "fragmentation")]
+        if self.fragment_tx.is_some() {
+            return false;
+        }
+        self.unicast_ack_pending()
+    }
+
+    fn unicast_ack_pending(&self) -> bool {
         self.ack_table
             .iter()
             .any(|entry| entry.active && !entry.confirmed)

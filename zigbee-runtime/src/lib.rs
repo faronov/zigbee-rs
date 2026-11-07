@@ -10428,11 +10428,27 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// Protocol exchanges which must stay responsive instead of entering a
     /// long radio-off wait. Hardware queue/ACK quiescence is checked by the MAC.
     pub fn has_pending_protocol_work(&self) -> bool {
+        self.has_pending_exchange_work() || self.bdb.zdo().aps().has_pending_ack()
+    }
+
+    /// Whether the only pending protocol work is waiting for APS
+    /// acknowledgements of unicasts that are already on air.
+    ///
+    /// Such a wait needs no CPU between parent polls: the acknowledgement
+    /// is queued at the parent and fetched by the next poll, and the APS
+    /// retransmission timer runs on the monotonic clock
+    /// ([`zigbee_aps::APS_ACK_WAIT_DURATION_US`]), so a sleepy device may
+    /// light-sleep through it. A fragmented transmission, a key exchange, a
+    /// rejoin, a user action or queued responses are not included.
+    pub fn awaits_aps_ack_only(&self) -> bool {
+        !self.has_pending_exchange_work() && self.bdb.zdo().aps().awaits_unicast_ack_only()
+    }
+
+    fn has_pending_exchange_work(&self) -> bool {
         self.bdb.tclk_exchange_active()
             || self.secure_rejoin_pending()
             || self.pending_action.is_some()
             || !self.pending_responses.is_empty()
-            || self.bdb.zdo().aps().has_pending_ack()
     }
 
     /// Request (or stop requesting) an APS acknowledgement on unicast

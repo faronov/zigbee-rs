@@ -19,7 +19,6 @@ use zigbee_runtime::profile::{ApplicationProfile, WithOta};
 use zigbee_runtime::security_store::SecurityStateStore;
 
 use crate::ENDPOINT;
-use crate::policy::OTA_KEEP_AWAKE_MS;
 
 /// Logging and policy wrapper around the shared [`OtaSession`] transport.
 pub struct OtaTransport {
@@ -97,19 +96,16 @@ where
                 // product lifecycle total over every OTA StackEvent.
                 self.log_status(Some(event));
                 AppOtaEventOutcome::Handled {
-                    keep_awake_ms: Some(OTA_KEEP_AWAKE_MS),
                     activation_pending: self.session.activation_pending()
                         || matches!(event, StackEvent::OtaComplete),
                 }
             }
             RuntimeOtaEventOutcome::Ignored => AppOtaEventOutcome::Handled {
-                keep_awake_ms: Some(OTA_KEEP_AWAKE_MS),
                 activation_pending: self.session.activation_pending(),
             },
             RuntimeOtaEventOutcome::Consumed(status) => {
                 self.log_status(status.as_ref());
                 AppOtaEventOutcome::Handled {
-                    keep_awake_ms: Some(OTA_KEEP_AWAKE_MS),
                     activation_pending: self.session.activation_pending(),
                 }
             }
@@ -130,7 +126,7 @@ where
         self.log_status(status.as_ref());
 
         OtaServiceOutcome {
-            keep_awake_ms: status.as_ref().map(|_| OTA_KEEP_AWAKE_MS),
+            progressed: status.is_some(),
             activation_pending: self.session.activation_pending(),
         }
     }

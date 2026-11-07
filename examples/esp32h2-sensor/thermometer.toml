@@ -38,12 +38,16 @@ report_change_centi_c = 50
 # power-on value. Must stay below the parent's child timeout (the stack
 # requests the 256-minute default). Multiple of 250 ms.
 slow_poll_ms = 30000
-# Poll period while joining, interviewing, identifying, receiving OTA or
-# with pending APS/ZDO transactions; also the Poll Control
-# ShortPollInterval. Multiple of 250 ms.
+# Poll period while joining, interviewing, identifying, during an active
+# OTA session or with pending APS/ZDO transactions; also the Poll Control
+# ShortPollInterval. Multiple of 250 ms. An OTA session holds it only while
+# active: a NO_IMAGE_AVAILABLE (or any failed) Query Next Image Response or
+# a response timeout ends it at once, with no timed tail.
 fast_poll_ms = 250
 # Light sleep (radio off) between fast polls too. false keeps the CPU awake
-# between fast polls (lowest command latency during interview/OTA).
+# between fast polls (lowest command latency during interview/OTA). Waiting
+# only for an APS ACK (e.g. after a report) light-sleeps at this depth too;
+# the ACK is fetched by the next fast poll.
 fast_poll_light_sleep = true
 # Receive window after a data poll is ACKed with Frame Pending (ms,
 # 10..=1000). The parent sends the buffered frame right after its ACK; the
@@ -64,6 +68,10 @@ restored_fast_ms = 60000
 # Fast-poll window after the interview completes and after a BOOT press
 # (force report), so queued commands from the coordinator can be delivered.
 button_fast_poll_ms = 10000
+# Device_annce retries after a join or rejoin: interval (1000..=600000 ms)
+# and count (0..=255). Each retry shortens one slow wait.
+announce_retry_ms = 8000
+announce_retries = 5
 # Die temperature sample on every Nth slow-poll wake (sampling shares the
 # poll wake; it never schedules its own).
 sample_every_polls = 1

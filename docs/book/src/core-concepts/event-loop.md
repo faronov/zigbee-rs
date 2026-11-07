@@ -44,11 +44,16 @@ Each step computes the earliest deadline among:
 - reporting/interview grace;
 - rejoin and Device Announce retry;
 - status/Identify phase when status hardware exists;
-- OTA service and keep-awake window;
+- OTA service deadline;
 - watchdog maximum wait.
 
 It selects the product's `fast_sleep_depth` or `slow_sleep_depth` only while
-joined and OTA-idle. Otherwise it requests `Active`.
+joined and OTA-idle. An active OTA session or pending protocol work requests
+`Active` on the fast cadence, except that work consisting only of APS ACKs
+for unicasts already on air (`ZigbeeDevice::awaits_aps_ack_only`) sleeps at
+`fast_sleep_depth` (capped at `Idle`): the next fast poll fetches the ACK and
+the retry timer runs on the monotonic clock. OTA has no timed window of its
+own; the fast poll ends when `OtaLifecycle::is_active` turns false.
 
 The `WakeController` performs the atomic MAC prepare/wait/restore operation and
 returns `WakeReason::{Button, Timer, Activity}` (`Activity`: pending

@@ -31,13 +31,21 @@ pub trait NonOtaProfile: ApplicationProfile {}
 
 impl<C: NonOtaComponent> NonOtaProfile for DeviceProfile<C> {}
 
+/// Result of offering one stack event to the OTA lifecycle.
+///
+/// There is deliberately no keep-awake duration: the shared application
+/// keeps the fast poll (and the CPU) up exactly while
+/// [`OtaLifecycle::is_active`] reports a session — query sent, download,
+/// verification, activation wait — bounded by
+/// [`RecoveryPolicy::max_ota_awake_ms`](crate::RecoveryPolicy::max_ota_awake_ms).
+/// A Query Next Image Response with NO_IMAGE_AVAILABLE or any other
+/// non-success status, a declined Image Notify (QueryJitter), a response
+/// timeout or a failure all end the session and with it the fast poll on
+/// the next service iteration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtaEventOutcome {
     NotHandled,
-    Handled {
-        keep_awake_ms: Option<u32>,
-        activation_pending: bool,
-    },
+    Handled { activation_pending: bool },
     Unexpected,
 }
 
@@ -47,15 +55,19 @@ pub enum OtaActivationOutcome {
     Failed,
 }
 
+/// Result of one [`OtaLifecycle::service`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OtaServiceOutcome {
-    pub keep_awake_ms: Option<u32>,
+    /// The service call produced OTA traffic or a status change (a query,
+    /// progress, a failure); it marks the status indicator, nothing else.
+    /// The fast poll follows [`OtaLifecycle::is_active`].
+    pub progressed: bool,
     pub activation_pending: bool,
 }
 
 impl OtaServiceOutcome {
     pub const IDLE: Self = Self {
-        keep_awake_ms: None,
+        progressed: false,
         activation_pending: false,
     };
 }
@@ -73,6 +85,10 @@ where
 {
     const ENABLED: bool;
 
+    /// Whether an OTA session is in progress. While true the shared
+    /// application fast-polls with the CPU awake; it must turn false as soon
+    /// as the session ends for any reason (no image, non-success status,
+    /// declined notify, timeout, failure, abort).
     fn is_active(&self, profile: &P) -> bool;
     fn next_deadline_ms(&self, profile: &P) -> Option<u32>;
 

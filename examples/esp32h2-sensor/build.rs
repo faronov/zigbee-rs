@@ -147,6 +147,8 @@ mod thermometer {
             fresh_join_fast_ms: int(&mut values, "fresh_join_fast_ms", 1, 3_600_000),
             restored_fast_ms: int(&mut values, "restored_fast_ms", 1, 3_600_000),
             button_fast_poll_ms: int(&mut values, "button_fast_poll_ms", 1, 600_000),
+            announce_retry_ms: int(&mut values, "announce_retry_ms", 1_000, 600_000),
+            announce_retries: int(&mut values, "announce_retries", 0, 255),
             sample_every_polls: int(&mut values, "sample_every_polls", 1, 1_000),
             usb_host_wait_ms: int(&mut values, "usb_host_wait_ms", 0, 10_000),
             sleep_isolate_gpio_mask: int(&mut values, "sleep_isolate_gpio_mask", 0, 0x0FFF_FFFF),
@@ -202,6 +204,8 @@ mod thermometer {
         fresh_join_fast_ms: i64,
         restored_fast_ms: i64,
         button_fast_poll_ms: i64,
+        announce_retry_ms: i64,
+        announce_retries: i64,
         sample_every_polls: i64,
         usb_host_wait_ms: i64,
         sleep_isolate_gpio_mask: i64,
@@ -328,6 +332,8 @@ mod thermometer {
                  pub const FRESH_JOIN_FAST_MS: u32 = {fresh};\n\
                  pub const RESTORED_FAST_MS: u32 = {restored};\n\
                  pub const BUTTON_FAST_POLL_MS: u32 = {button};\n\
+                 pub const ANNOUNCE_RETRY_MS: u32 = {annce_ms};\n\
+                 pub const ANNOUNCE_RETRIES: u8 = {annce_retries};\n\
                  pub const SAMPLE_EVERY_POLLS: u32 = {every};\n\
                  pub const USB_HOST_WAIT_MS: u32 = {usb};\n\
                  pub const SLEEP_ISOLATE_GPIO_MASK: u32 = {isolate:#010X};\n\
@@ -382,6 +388,8 @@ mod thermometer {
                 fresh = self.fresh_join_fast_ms,
                 restored = self.restored_fast_ms,
                 button = self.button_fast_poll_ms,
+                annce_ms = self.announce_retry_ms,
+                annce_retries = self.announce_retries,
                 every = self.sample_every_polls,
                 usb = self.usb_host_wait_ms,
                 isolate = self.sleep_isolate_gpio_mask,

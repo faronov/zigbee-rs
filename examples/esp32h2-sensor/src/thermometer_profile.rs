@@ -42,6 +42,8 @@ pub static POLICY: SensorPolicy = SensorPolicy {
     fresh_join_fast_ms: config::FRESH_JOIN_FAST_MS,
     restored_fast_ms: config::RESTORED_FAST_MS,
     interview_complete_grace_ms: config::BUTTON_FAST_POLL_MS,
+    announce_retry_ms: config::ANNOUNCE_RETRY_MS,
+    announce_retries: config::ANNOUNCE_RETRIES,
     button: ButtonPolicy {
         long_press_ms: product::policy::SENSOR_POLICY.button.long_press_ms,
         debounce_ms: product::policy::SENSOR_POLICY.button.debounce_ms,

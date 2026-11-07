@@ -281,7 +281,19 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   the parent sends later stays queued there and is fetched by the next poll;
   pending APS/ZDO work keeps the 250 ms fast poll. On the WSTK capture of
   `573f44f` each report spent ~250 ms in RX after an empty FP=1 ACK
-  (~6 mC of the ~8.2 mC report event).
+  (~6 mC of the ~8.2 mC report event); `014d77b` (32 ms window) still held
+  the CPU awake for the 250 ms until the poll that fetches the report's APS
+  ACK. Since then a wait for APS ACKs only light-sleeps at the fast-poll
+  depth (`fast_poll_light_sleep`), keeping the 250 ms cadence and the
+  fetching poll; ZDO responses, key exchanges, rejoins and fragmented
+  transfers still wait awake.
+- OTA: an active session (query, download, verify, activation wait) holds
+  the fast poll awake, bounded by `max_ota_awake_ms`. A NO_IMAGE_AVAILABLE
+  or failed Query Next Image Response, or the runtime's 120 s response
+  timeout, ends the session and the slow poll resumes at once; the former
+  fixed 120 s `OTA_KEEP_AWAKE_MS` tail (~213 mC on the `014d77b` capture,
+  triggered by ZHA's Image Notify) is gone. Device_annce retries are
+  `announce_retry_ms`/`announce_retries` in `thermometer.toml`.
 - Sleep-floor lab: `esp32h2-floor-lab` (`--no-default-features --features
   floor-lab`, `floor_lab.toml`) starts no radio. With a USB host it dumps
   the PMU sleep, pad, USB and clock registers before and after one light

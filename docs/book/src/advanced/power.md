@@ -81,7 +81,10 @@ can keep a battery device awake, via `SensorPolicy::recovery`
   `join_retry_jitter_pct` (25 %). The device waits at its slow depth
   (radio off) for the whole delay, not in a radio-on retry loop.
 - **Keep-awake limits.** Every reason that holds the fast poll or the
-  `Active` depth has a limit in `RecoveryPolicy` (`0` = unbounded):
+  `Active` depth has a limit in `RecoveryPolicy` (`0` = unbounded). Waiting
+  only for APS ACKs keeps the fast poll but sleeps at `fast_sleep_depth`
+  (at most `Idle`) between polls; an OTA session holds the fast poll only
+  while `OtaLifecycle::is_active` (no timed tail after the session ends):
   pending work `max_active_ms` (30 s; each further period it persists is
   another strike), an OTA session `max_ota_awake_ms` (2 h; the session is
   aborted through `OtaLifecycle::abort`, a suspended download stays
