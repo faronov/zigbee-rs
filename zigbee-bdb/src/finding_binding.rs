@@ -1122,6 +1122,41 @@ mod tests {
         );
     }
 
+    /// PROTO-01 reachability: a malformed/adversarial peer answers our Single
+    /// IEEE_addr_req with a 12-octet frame carrying `NumAssocDev = 0`. R22
+    /// requires a Single response to omit NumAssocDev, StartIndex and
+    /// NWKAddrAssocDevList, so this is not a conformant reply; it proves the
+    /// initiator's parser cannot panic on it. F&B only consumes the IEEE
+    /// address, so the current tolerant behaviour lets the stage advance.
+    #[test]
+    fn a_twelve_octet_ieee_addr_rsp_from_the_target_does_not_panic_finding_binding() {
+        let mut bdb = fb_ready_bdb();
+        assert_eq!(block_on(bdb.finding_binding_initiator(LOCAL_EP)), Ok(()));
+        make_target_routable_without_cached_ieee(&mut bdb);
+        let _ = bdb.fb_identify_responses.push((TARGET_SHORT.0, TARGET_EP));
+        assert!(!block_on(bdb.tick_finding_binding(FB_WINDOW_SECONDS)));
+        assert!(!block_on(bdb.tick_finding_binding(0)));
+        assert!(matches!(bdb.fb_stage, FbStage::AwaitIeee { .. }));
+
+        let slot = await_slot(&bdb);
+        let tsn = bdb.zdo().pending_tsn(slot).unwrap();
+        let mut rsp = [0u8; 12];
+        rsp[0] = ZdpStatus::Success as u8;
+        rsp[1..9].copy_from_slice(&TARGET_IEEE);
+        rsp[9..11].copy_from_slice(&TARGET_SHORT.0.to_le_bytes());
+        rsp[11] = 0; // NumAssocDev = 0, no StartIndex, no list
+        assert!(deliver_zdp_response(
+            &mut bdb,
+            TARGET_SHORT,
+            zigbee_zdo::IEEE_ADDR_RSP,
+            tsn,
+            &rsp,
+        ));
+
+        assert!(!block_on(bdb.tick_finding_binding(0)));
+        assert_eq!(bdb.fb_stage, FbStage::RequestSimpleDesc);
+    }
+
     #[test]
     fn async_ieee_and_simple_desc_responses_create_the_expected_binding() {
         let mut bdb = fb_ready_bdb();
