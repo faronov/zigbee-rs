@@ -2,10 +2,6 @@
 
 use sensor_sed_app::{ButtonPolicy, ForceReportAction, SensorPolicy, SleepDepth, StatusPolicy};
 
-/// OTA traffic and a fresh coordinator interview use the proven 120-second
-/// fast-poll window.
-pub const OTA_KEEP_AWAKE_MS: u32 = 120_000;
-
 pub const USER_ACTIONS: ForceReportAction = ForceReportAction;
 
 pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
@@ -18,7 +14,7 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     join_retry_ms: 15_000,
     announce_retry_ms: 8_000,
     announce_retries: 5,
-    secure_rejoin_failure_limit: 4,
+    secure_rejoin_failure_limit: 0,
     interview_complete_grace_ms: 5_000,
     button: ButtonPolicy {
         long_press_ms: Some(3_000),
@@ -35,6 +31,7 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     // without an EM2 transition. Only steady-state polling enters EM2.
     fast_sleep_depth: SleepDepth::Active,
     slow_sleep_depth: SleepDepth::Retention,
+    recovery: sensor_sed_app::RecoveryPolicy::DEFAULT,
 };
 
 #[cfg(test)]
@@ -69,6 +66,5 @@ mod tests {
         assert_eq!(SENSOR_POLICY.fresh_join_fast_ms, 120_000);
         assert_eq!(SENSOR_POLICY.restored_fast_ms, 60_000);
         assert_eq!(SENSOR_POLICY.interview_complete_grace_ms, 5_000);
-        assert_eq!(OTA_KEEP_AWAKE_MS, SENSOR_POLICY.fresh_join_fast_ms);
     }
 }

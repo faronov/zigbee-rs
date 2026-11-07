@@ -657,6 +657,8 @@ mod tests {
         assert_eq!(&frames[1][8..10], &[0x02, 1]);
         assert_eq!(&frames[1][10..], &data[64..128]);
         assert!(aps.has_pending_ack());
+        // Fragment windows are driven by the CPU, not by a parent poll.
+        assert!(!aps.awaits_unicast_ack_only());
 
         // A partial ACK (block 1 missing) resends block 1 only.
         receive(&mut aps, &ack_frame(counter, 0, 0b1111_1101));
@@ -686,6 +688,7 @@ mod tests {
         assert_eq!(done.aps_counter, counter);
         assert!(!aps.fragmented_tx_active());
         assert!(!aps.has_pending_ack());
+        assert!(!aps.awaits_unicast_ack_only());
     }
 
     /// Without acknowledgements the lowest unacknowledged block is resent

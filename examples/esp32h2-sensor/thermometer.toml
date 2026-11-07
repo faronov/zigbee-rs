@@ -1,0 +1,190 @@
+# ESP32-H2 thermometer SED build profile (`--features thermometer`).
+#
+# `build.rs` validates these values and turns them into constants; nothing in
+# `src/thermometer*.rs` repeats them. Override any key for one build with
+# `H2_THERMO_<KEY>` (upper case), e.g. `H2_THERMO_REPORT_MAX_S=600`, or point
+# `H2_THERMO_CONFIG` at another file with the same keys.
+#
+# Integers accept decimal or 0x-prefixed hex. Strings use double quotes.
+
+# --- identity -----------------------------------------------------------
+# Basic cluster ModelIdentifier (ASCII, at most 32 bytes).
+model = "ESP32-H2-Thermometer"
+# Zigbee OTA image type: distinct from the H2 sensor image (0x0002) so an
+# OTA server never offers the environmental-sensor image to this product.
+ota_image_type = 0x0012
+# Security-journal role tag: a different tag never resumes the network
+# state written by another image (router 0x5201, ED 0x5202, the original
+# sensor image writes none).
+role_tag = 0x5203
+
+# --- Temperature Measurement (0x0402) ------------------------------------
+# Min/MaxMeasuredValue in 0.01 degC. The die sensor is configured for its
+# -10..80 degC range.
+min_measured_centi_c = -1000
+max_measured_centi_c = 8000
+
+# Default Send-direction reporting of MeasuredValue for a fresh network. A
+# ZCL Configure Reporting (e.g. ZHA's interview) replaces it; with the
+# `reporting-persist` feature (part of `thermometer`) the replacement is
+# journaled in flash and restored after a reset on the same network.
+# ZCL semantics: max 0 = no periodic report, max 0xFFFF = reporting off.
+report_min_s = 30
+report_max_s = 300
+report_change_centi_c = 50
+
+# --- polling and sampling ------------------------------------------------
+# Joined slow (sleepy) parent poll, and the Poll Control LongPollInterval
+# power-on value. Must stay below the parent's child timeout (the stack
+# requests the 256-minute default). Multiple of 250 ms.
+slow_poll_ms = 30000
+# Poll period while joining, interviewing, identifying, during an active
+# OTA session or with pending APS/ZDO transactions; also the Poll Control
+# ShortPollInterval. Multiple of 250 ms. An OTA session holds it only while
+# active: a NO_IMAGE_AVAILABLE (or any failed) Query Next Image Response or
+# a response timeout ends it at once, with no timed tail.
+fast_poll_ms = 250
+# Light sleep (radio off) between fast polls too. false keeps the CPU awake
+# between fast polls (lowest command latency during interview/OTA). Waiting
+# only for an APS ACK (e.g. after a report) light-sleeps at this depth too;
+# the ACK is fetched by the next fast poll.
+fast_poll_light_sleep = true
+# Receive window after a data poll is ACKed with Frame Pending (ms,
+# 10..=1000). The parent sends the buffered frame right after its ACK; the
+# IEEE 802.15.4 worst case for that (macMaxFrameTotalWaitTime: minBE 3,
+# maxBE 5, 4 CSMA backoffs, longest frame) is 1986 symbols = 31.8 ms. A
+# frame that comes later stays queued at the parent and is fetched by the
+# next fast poll (pending APS ACKs keep the device in fast poll). Joining
+# keeps the backend's 250 ms association window.
+poll_response_wait_ms = 32
+# Oscillators stopped during light sleep (ESP-IDF's light-sleep default is
+# both off). XTAL off also lowers the retained HP domain to 0.6 V and stops
+# SYSTIMER (compensated from the calibrated RTC). false = keep running.
+sleep_xtal_off = true
+sleep_rc_fast_off = true
+# Fast-poll windows after a fresh join (ZHA interview) and after a resume.
+fresh_join_fast_ms = 120000
+restored_fast_ms = 60000
+# Fast-poll window after the interview completes and after a BOOT press
+# (force report), so queued commands from the coordinator can be delivered.
+button_fast_poll_ms = 10000
+# Device_annce retries after a join or rejoin: interval (1000..=600000 ms)
+# and count (0..=255). Each retry shortens one slow wait.
+announce_retry_ms = 8000
+announce_retries = 5
+# Die temperature sample on every Nth slow-poll wake (sampling shares the
+# poll wake; it never schedules its own).
+sample_every_polls = 1
+
+# --- Poll Control (0x0020) ---------------------------------------------
+# Periodic Check-in to the bound client (ZHA binds it and writes 55 min at
+# its configure step). 0 disables check-ins.
+check_in_interval_s = 3600
+# Smallest CheckInInterval a client may write.
+check_in_interval_min_s = 300
+# Range a client may set with SetLongPollInterval. The minimum keeps the
+# battery budget (ZHA asks for 6 s on every check-in; it is refused); the
+# maximum is the shared application's longest bounded sleep (60 s).
+long_poll_min_ms = 30000
+long_poll_max_ms = 60000
+# FastPollTimeout attribute default and the largest a client may request.
+fast_poll_timeout_ms = 10000
+fast_poll_timeout_max_ms = 60000
+# Fast-poll period after each Check-in, waiting for the Check-in Response.
+check_in_response_ms = 8000
+
+# --- recovery ------------------------------------------------------------
+# First rejoin/commissioning retry delay; doubles per failed attempt up to
+# the cap, each delay shortened by up to `join_retry_jitter_pct` percent.
+# The device sleeps (radio off) for the whole delay and keeps its network:
+# only a user factory reset or a Leave from the network clears it.
+join_retry_ms = 15000
+join_retry_max_ms = 900000
+join_retry_jitter_pct = 25
+# Parent-loss evidence (exhausted APS-acknowledged reports, pending work
+# that outlived `max_active_ms`, or a missed report) that starts the staged
+# rejoin (current channel, all channels, Trust Center). 0 disables.
+parent_loss_strikes = 3
+# Request APS acknowledgements for unicast reports (end-to-end delivery
+# evidence for parent-loss detection; costs about one extra poll per report).
+report_aps_ack = true
+
+# --- keep-awake limits ---------------------------------------------------
+# Every reason that keeps the radio up or the CPU out of light sleep has a
+# limit (0 = unbounded). When one fires the device goes back to its slow
+# sleep and the reason is recorded in the anomaly record.
+# Pending protocol work (APS ACK wait, queued responses, key exchange); a
+# fired limit is also one parent-loss strike, repeated while it persists.
+max_active_ms = 30000
+# An OTA session (query/download/verify/activate wait); a fired limit
+# aborts it (a suspended download stays resumable). A full image at 48-byte
+# blocks takes roughly 25-45 min, so this must stay well above that.
+max_ota_awake_ms = 7200000
+# Identify keeps the fast poll; afterwards it still runs, on the slow poll.
+max_identify_awake_ms = 120000
+# Back-to-back timed fast-poll windows (join/interview, resume, button,
+# Poll Control fast poll and check-in response); must cover each of them.
+max_fast_poll_ms = 600000
+# No APS-acknowledged traffic for the shortest configured reporting maximum
+# interval plus this grace counts as a missed report: one parent-loss strike
+# and every report forced due. 0 disables; needs report_aps_ack.
+missed_report_grace_ms = 120000
+
+# --- sleep and reset resilience --------------------------------------------
+# Consecutive failed light-sleep attempts (each retried as an active wait)
+# after which the device stays awake for the rest of the boot and records
+# reason 8 (sleep disabled) with the error code. 0 = reset on the first
+# failure (the pre-fix behaviour; a reset loop when sleep keeps failing).
+sleep_failure_limit = 3
+# Boots in a row that end (any reset) before `rapid_reset_window_ms` of
+# uptime, after which the next boot keeps light sleep off and records
+# reason 8 once. Counted in RTC memory, cleared by a power cycle or a boot
+# that outlives the window. 0 disables the guard.
+rapid_reset_limit = 3
+rapid_reset_window_ms = 60000
+
+# --- anomaly record --------------------------------------------------------
+# The record (last reason, reasons seen, per-reason counts, last cause) is
+# journaled in `zbnv` only when it changes, at most this many times per boot
+# (no flash wear in normal operation; 0 = never write). Diagnostics (0x0B05):
+# 0x0000 uint16 total, 0x0001 uint16 summary (bits 0-7 last reason, 8-15
+# reasons seen), 0x0100 uint32 last cause word, 0x0101/0x0102 uint32
+# per-reason counts (one byte each, reasons 1-4 / 5-8, LE).
+anomaly_max_writes_per_boot = 8
+
+# --- power ---------------------------------------------------------------
+# With no USB host seen within this window after boot, the USB Serial/JTAG
+# pad (and its D+ pull-up) is switched off until the next reset. 0 keeps USB
+# powered. Recovery: reset with USB attached (or hold BOOT while resetting).
+usb_host_wait_ms = 1000
+# GPIO pads isolated once at boot, before the first sleep: output, input
+# buffer and pulls off, muxed to GPIO, and switched to an isolated sleep
+# configuration in light sleep (ESP-IDF's sleep GPIO isolation). Bit n =
+# GPIOn; name only pads nothing on the board drives and no firmware uses.
+# Refused by the build: flash pads (GPIO15..=20), USB (GPIO26/27), the
+# BOOT/wake button (GPIO9) and, in builds with a console, UART0 (GPIO23/24).
+# 0 disables. Waveshare ESP32-H2-Zero: GPIO8 is the WS2812 DIN (R1 10k
+# pull-up; its reset-state input buffer cost ~128 uA in light sleep, floor
+# lab phase A - B); GPIO0-7, 10-14, 22 and 25 are unconnected header pads
+# or not bonded out. GPIO21 and UART0 (GPIO23/24) are left as they are.
+sleep_isolate_gpio_mask = 0x02407DFF
+
+# --- diagnostics -----------------------------------------------------------
+# Console log level for builds without `quiet` (off, error, warn, info, debug,
+# trace). `quiet` builds link no logger and ignore it. Logs go to the USB
+# Serial/JTAG console when a host is attached, otherwise to UART0 (GPIO24).
+log_level = "info"
+# Period of the wait-loop summary line (wait requests, sleep depth and wake
+# outcomes) in builds without `quiet`; 0 disables it.
+diag_summary_ms = 10000
+# Boot light-sleep self-test (non-`quiet` builds with `light-sleep` only;
+# the build rejects it otherwise). Before the radio starts, the boot runs
+# `sleep_selftest_count` timer-only light sleeps of `sleep_selftest_ms`
+# through the production backend, even with USB attached, then logs chip
+# revision, PCR ctrl_tick_conf, the RTC slow period and per sleep the result
+# (OK or the cause word), the RTC-measured duration and the wake cause, and
+# continues normally. The USB-Serial-JTAG host loses the device while the
+# clocks are stopped; the lines are printed ~3 s later, after it returns.
+sleep_selftest = false
+sleep_selftest_count = 3
+sleep_selftest_ms = 200

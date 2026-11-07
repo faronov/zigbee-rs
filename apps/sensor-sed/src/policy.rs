@@ -96,16 +96,130 @@ pub struct SensorPolicy {
     pub join_retry_ms: u32,
     pub announce_retry_ms: u32,
     pub announce_retries: u8,
+    /// Failed secure-rejoin attempts after which the device gives up its
+    /// network, factory-resets and searches for a new one.
+    ///
+    /// `0` (recommended, see [`RecoveryPolicy`]) never gives up: a
+    /// commissioned sensor keeps its network and retries on the bounded
+    /// backoff until the network returns, a user action resets it, or the
+    /// network removes it with a Leave.
     pub secure_rejoin_failure_limit: u8,
     pub interview_complete_grace_ms: u32,
     pub button: ButtonPolicy,
     pub status: StatusPolicy,
     /// Wait depth while joined and the fast-poll window is active.
+    ///
+    /// Also used (capped at [`SleepDepth::Idle`]) between the fast polls
+    /// that wait only for the APS acknowledgement of an already transmitted
+    /// unicast, such as an acknowledged attribute report. Other pending
+    /// protocol work and an active OTA session keep the CPU awake.
     pub fast_sleep_depth: SleepDepth,
     /// Wait depth while joined in the steady-state slow-poll period, and
     /// while unjoined between commissioning attempts or while waiting for
     /// the user button after an explicit leave.
     pub slow_sleep_depth: SleepDepth,
+    /// Parent-loss detection and rejoin scheduling.
+    pub recovery: RecoveryPolicy,
+}
+
+/// How a commissioned sensor notices a dead parent and how it schedules
+/// its recovery attempts.
+///
+/// Every recovery attempt runs the runtime's staged R22/BDB rejoin (secured
+/// rejoin on the last channel, then on every channel, then the Trust Center
+/// rejoin on a centralized network). Between attempts the device sleeps at
+/// [`SensorPolicy::slow_sleep_depth`] with its radio off; the delay starts at
+/// [`SensorPolicy::join_retry_ms`], doubles after each failure up to
+/// [`join_retry_max_ms`](Self::join_retry_max_ms), and is shortened by a
+/// random jitter so a whole network of sensors that lost the same parent does
+/// not retry in lock step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryPolicy {
+    /// Upper bound of the commissioning/rejoin backoff.
+    pub join_retry_max_ms: u32,
+    /// Each backoff delay is shortened by a random `0..=pct` percent
+    /// (`0` disables jitter; at most 50). Jitter never exceeds the cap.
+    pub join_retry_jitter_pct: u8,
+    /// Consecutive pieces of parent-loss evidence that start a rejoin while
+    /// the device still believes it is joined: acknowledged unicasts that got
+    /// no APS ACK after every retry, and pending protocol work that outlived
+    /// [`max_active_ms`](Self::max_active_ms). `0` disables this detection
+    /// (MAC-level poll failures are still handled by the runtime).
+    pub parent_loss_strikes: u8,
+    /// Longest time pending protocol work (APS ACK wait, Trust Center link
+    /// key exchange, queued responses, a scheduled rejoin) may keep the chip
+    /// awake with the radio on. Afterwards the device returns to its normal
+    /// poll cadence and sleep depth and counts one parent-loss strike. `0`
+    /// leaves pending work unbounded (not recommended for battery devices).
+    /// Must not exceed [`MAX_WAIT_MS`].
+    pub max_active_ms: u32,
+    /// Request an APS acknowledgement on unicast attribute reports so a
+    /// parent that acknowledges at the MAC level but delivers nothing end to
+    /// end is detected. Costs one extra poll per report.
+    pub report_aps_ack: bool,
+    /// Longest an OTA session (query, download, verification, activation
+    /// wait) may keep the chip at the fast cadence with the radio on. The
+    /// stalled session is then aborted through
+    /// [`OtaLifecycle::abort`](crate::OtaLifecycle::abort); a later query
+    /// may resume it. `0` leaves OTA unbounded.
+    pub max_ota_awake_ms: u32,
+    /// Longest Identify may keep the fast poll. Afterwards Identify keeps
+    /// running at the normal cadence until it ends. `0` leaves it unbounded.
+    pub max_identify_awake_ms: u32,
+    /// Longest uninterrupted run of timed fast-poll windows (commissioning
+    /// and interview grace, Poll Control fast poll, control events). When it
+    /// fires the windows are closed. `0` leaves the windows unbounded; a
+    /// non-zero value must cover the longest configured window.
+    pub max_fast_poll_ms: u32,
+    /// Count a missed report as one parent-loss strike: no acknowledged
+    /// report within the shortest configured reporting maximum interval
+    /// plus this grace. Requires [`report_aps_ack`](Self::report_aps_ack).
+    /// `0` disables the detector.
+    pub missed_report_grace_ms: u32,
+    /// Consecutive failed low-power waits (a sleep transition the platform
+    /// reports as recoverable) after which the device stays at
+    /// [`SleepDepth::Active`] for the rest of the boot and records
+    /// [`AnomalyReason::SleepDisabled`](crate::AnomalyReason::SleepDisabled).
+    /// Earlier failures finish their iteration with an active wait. A
+    /// non-recoverable failure, or any failure when this is `0`, resets
+    /// through the supervisor with the error as the retained reset cause.
+    pub sleep_failure_limit: u8,
+}
+
+impl RecoveryPolicy {
+    /// Recommended battery-sensor recovery: 15-minute backoff cap, 25 %
+    /// jitter, rejoin after three strikes, 30-second pending-work bound,
+    /// two-hour OTA, two-minute Identify and ten-minute fast-poll bounds,
+    /// a two-minute missed-report grace, and sleep disabled for the boot
+    /// after three consecutive failed sleep transitions.
+    pub const DEFAULT: Self = Self {
+        join_retry_max_ms: 15 * 60 * 1_000,
+        join_retry_jitter_pct: 25,
+        parent_loss_strikes: 3,
+        max_active_ms: 30_000,
+        report_aps_ack: true,
+        max_ota_awake_ms: 2 * 60 * 60 * 1_000,
+        max_identify_awake_ms: 2 * 60 * 1_000,
+        max_fast_poll_ms: 10 * 60 * 1_000,
+        missed_report_grace_ms: 2 * 60 * 1_000,
+        sleep_failure_limit: 3,
+    };
+
+    pub const fn is_valid(&self) -> bool {
+        self.join_retry_max_ms != 0
+            && self.join_retry_max_ms <= JOIN_RETRY_MAX_MS
+            && self.join_retry_jitter_pct <= MAX_JOIN_RETRY_JITTER_PCT
+            && self.max_active_ms <= MAX_WAIT_MS
+            && (self.missed_report_grace_ms == 0 || self.report_aps_ack)
+    }
+
+    /// `delay_ms` shortened by a share of up to `join_retry_jitter_pct`
+    /// percent selected by `random`, a uniform value in `0..=u16::MAX`.
+    pub const fn jittered_ms(&self, delay_ms: u32, random: u16) -> u32 {
+        let span = (delay_ms as u64 * self.join_retry_jitter_pct as u64) / 100;
+        let cut = (span * random as u64) / u16::MAX as u64;
+        delay_ms - cut as u32
+    }
 }
 
 impl SensorPolicy {
@@ -124,9 +238,13 @@ impl SensorPolicy {
             && (self.slow_poll_ms <= MAX_WAIT_MS || self.sample_interval_ms <= MAX_WAIT_MS)
             && self.wake_duration_ms != 0
             && self.join_retry_ms != 0
-            && self.join_retry_ms <= JOIN_RETRY_MAX_MS
+            && self.recovery.is_valid()
+            && self.join_retry_ms <= self.recovery.join_retry_max_ms
+            && (self.recovery.max_fast_poll_ms == 0
+                || (self.recovery.max_fast_poll_ms >= self.fresh_join_fast_ms
+                    && self.recovery.max_fast_poll_ms >= self.restored_fast_ms
+                    && self.recovery.max_fast_poll_ms >= self.interview_complete_grace_ms))
             && self.announce_retry_ms != 0
-            && self.secure_rejoin_failure_limit != 0
             && self.interview_complete_grace_ms != 0
             && self.button.debounce_ms != 0
             && match self.button.long_press_ms {
@@ -184,8 +302,12 @@ pub const RESPONSIVE_SLOW_POLL_MS: u32 =
 const _: () = assert!(PARENT_INDIRECT_HOLD_MIN_MS <= 0x01F4 * 15_360 / 1_000);
 const _: () = assert!(PARENT_INDIRECT_HOLD_MARGIN_MS < PARENT_INDIRECT_HOLD_MIN_MS);
 
-/// Upper bound of the unjoined commissioning backoff (30 minutes).
+/// Largest configurable backoff cap (30 minutes); see
+/// [`RecoveryPolicy::join_retry_max_ms`].
 pub const JOIN_RETRY_MAX_MS: u32 = 30 * 60 * 1_000;
+
+/// Largest configurable backoff jitter in percent.
+pub const MAX_JOIN_RETRY_JITTER_PCT: u8 = 50;
 
 /// Longest single platform wait.
 ///
@@ -199,13 +321,9 @@ pub const JOIN_RETRY_MAX_MS: u32 = 30 * 60 * 1_000;
 pub const MAX_WAIT_MS: u32 = 60_000;
 
 /// Delay to apply after the next failed attempt, given the delay just used.
-pub const fn next_join_retry_ms(current_ms: u32, initial_ms: u32) -> u32 {
+pub const fn next_join_retry_ms(current_ms: u32, initial_ms: u32, max_ms: u32) -> u32 {
     let doubled = current_ms.saturating_mul(2);
-    let capped = if doubled > JOIN_RETRY_MAX_MS {
-        JOIN_RETRY_MAX_MS
-    } else {
-        doubled
-    };
+    let capped = if doubled > max_ms { max_ms } else { doubled };
     if capped < initial_ms {
         initial_ms
     } else {
@@ -286,30 +404,73 @@ mod tests {
     }
 
     #[test]
-    fn join_backoff_doubles_from_the_initial_delay_to_the_thirty_minute_cap() {
+    fn join_backoff_doubles_from_the_initial_delay_to_the_configured_cap() {
+        let cap = RecoveryPolicy::DEFAULT.join_retry_max_ms;
         let mut delay_ms = 15_000;
-        let mut seen = [0u32; 10];
+        let mut seen = [0u32; 9];
         for slot in &mut seen {
             *slot = delay_ms;
-            delay_ms = next_join_retry_ms(delay_ms, 15_000);
+            delay_ms = next_join_retry_ms(delay_ms, 15_000, cap);
         }
         assert_eq!(
             seen,
             [
-                15_000, 30_000, 60_000, 120_000, 240_000, 480_000, 960_000, 1_800_000, 1_800_000,
-                1_800_000
+                15_000, 30_000, 60_000, 120_000, 240_000, 480_000, 900_000, 900_000, 900_000
             ]
         );
-        assert_eq!(next_join_retry_ms(u32::MAX, 15_000), JOIN_RETRY_MAX_MS);
-        assert_eq!(next_join_retry_ms(0, 15_000), 15_000);
+        assert_eq!(next_join_retry_ms(u32::MAX, 15_000, cap), cap);
+        assert_eq!(next_join_retry_ms(0, 15_000, cap), 15_000);
+        assert_eq!(
+            next_join_retry_ms(1_200_000, 15_000, JOIN_RETRY_MAX_MS),
+            JOIN_RETRY_MAX_MS
+        );
+    }
+
+    #[test]
+    fn jitter_only_shortens_the_delay_within_the_configured_share() {
+        let recovery = RecoveryPolicy::DEFAULT;
+        let cap = recovery.join_retry_max_ms;
+        assert_eq!(recovery.jittered_ms(cap, 0), cap);
+        assert_eq!(recovery.jittered_ms(cap, u16::MAX), cap - cap / 4);
+        for random in [1u16, 999, 0x7FFF, 0xFFFE] {
+            let delay = recovery.jittered_ms(cap, random);
+            assert!(delay <= cap && delay >= cap - cap / 4, "{delay}");
+        }
+        let none = RecoveryPolicy {
+            join_retry_jitter_pct: 0,
+            ..recovery
+        };
+        assert_eq!(none.jittered_ms(cap, u16::MAX), cap);
+        // No overflow at the largest representable delay.
+        let max = RecoveryPolicy {
+            join_retry_jitter_pct: MAX_JOIN_RETRY_JITTER_PCT,
+            ..recovery
+        };
+        assert_eq!(max.jittered_ms(u32::MAX, u16::MAX), u32::MAX - u32::MAX / 2);
     }
 
     #[test]
     fn join_retry_beyond_the_backoff_cap_is_rejected() {
         let mut policy = VALID;
         assert!(policy.is_valid());
-        policy.join_retry_ms = JOIN_RETRY_MAX_MS + 1;
+        policy.join_retry_ms = policy.recovery.join_retry_max_ms + 1;
         assert!(!policy.is_valid());
+    }
+
+    #[test]
+    fn recovery_bounds_are_validated() {
+        let mut policy = VALID;
+        policy.recovery.join_retry_max_ms = JOIN_RETRY_MAX_MS + 1;
+        assert!(!policy.is_valid());
+        policy = VALID;
+        policy.recovery.join_retry_jitter_pct = MAX_JOIN_RETRY_JITTER_PCT + 1;
+        assert!(!policy.is_valid());
+        policy = VALID;
+        policy.recovery.max_active_ms = MAX_WAIT_MS + 1;
+        assert!(!policy.is_valid());
+        policy = VALID;
+        policy.secure_rejoin_failure_limit = 0;
+        assert!(policy.is_valid(), "0 means never give the network up");
     }
 
     #[test]
@@ -360,6 +521,7 @@ mod tests {
         },
         fast_sleep_depth: SleepDepth::Active,
         slow_sleep_depth: SleepDepth::Active,
+        recovery: RecoveryPolicy::DEFAULT,
     };
 
     #[test]

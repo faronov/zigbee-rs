@@ -648,7 +648,9 @@ impl SleepTimeConfig {
         // TODO: do an actual calibration instead of a read
         let slowclk_period = unsafe { lp_aon().store1().read().data().bits() };
         if slowclk_period == 0 {
-            return Err(super::RetainedSleepError::InvalidCalibration);
+            return Err(super::RetainedSleepError::InvalidCalibration(
+                super::CalibrationFailure::SlowClockPeriodZero,
+            ));
         }
 
         // Calibrate rtc fast clock, only PMU supported chips sleep process is needed.
@@ -881,6 +883,11 @@ impl MachineConstants {
 }
 
 impl RtcSleepConfig {
+    /// Add the retained-sleep oscillator power-down request (local backport).
+    pub(crate) fn set_retained_power_down(&mut self, power_down: super::RetainedPowerDown) {
+        self.pd_flags.0 |= power_down.flags();
+    }
+
     /// Returns whether the device is in deep sleep mode.
     pub fn deep_slp(&self) -> bool {
         self.deep
@@ -934,7 +941,8 @@ impl RtcSleepConfig {
         &self,
         wakeup_triggers: WakeTriggers,
     ) -> Result<(), super::RetainedSleepError> {
-        super::retained::validate_retained(self.deep, self.pd_flags.0, wakeup_triggers.0)?;
+        // C6 analog sleep settings are not backported: every oscillator stays on.
+        super::retained::validate_retained(self.deep, self.pd_flags.0, 0, wakeup_triggers.0)?;
         self.start_sleep_inner(wakeup_triggers)
     }
 

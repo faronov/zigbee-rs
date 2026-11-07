@@ -61,13 +61,13 @@ const _: () = assert!(CHILD_TABLE_PARTITION_START.is_multiple_of(SECTOR_SIZE));
 const _: () = assert!(CHILD_JOURNAL_SECTOR_SIZE.is_multiple_of(SECTOR_SIZE as usize));
 const _: () = assert!(APS_TABLE_JOURNAL_SECTOR_SIZE.is_multiple_of(SECTOR_SIZE as usize));
 
-/// 20 ms receive slices; 5..60 s commissioning retry; three failed secured
-/// rejoins fall back to fresh commissioning.
+/// 20 ms receive slices; 5..60 s commissioning retry; failed secured
+/// rejoins retry on that backoff and never reset the network on their own.
 pub static ROUTER_POLICY: RouterPolicy = RouterPolicy {
     max_receive_slice_us: 20_000,
     join_retry_initial_ms: 5_000,
     join_retry_max_ms: 60_000,
-    secure_rejoin_failure_limit: 3,
+    secure_rejoin_failure_limit: 0,
 };
 
 pub type RouterProfile = DeviceProfile<RangeExtender>;

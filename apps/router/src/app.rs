@@ -1425,6 +1425,22 @@ where
             .min(self.policy.join_retry_max_ms);
     }
 
+    /// Hold the next runtime secured-rejoin retry back by the current
+    /// exponential backoff delay and double it up to `join_retry_max_ms`.
+    ///
+    /// The runtime retries a pending secured rejoin on its own short timer;
+    /// without this gate a router whose network is gone (or which never
+    /// gives up, see [`RouterPolicy::secure_rejoin_failure_limit`]) would
+    /// transmit a rejoin request every few seconds indefinitely.
+    fn schedule_secure_rejoin_backoff(&mut self) {
+        let delay_ms = self.retry_delay_ms;
+        self.retry = RetrySchedule::At(self.now_us().wrapping_add(delay_ms.saturating_mul(1_000)));
+        self.retry_delay_ms = self
+            .retry_delay_ms
+            .saturating_mul(2)
+            .min(self.policy.join_retry_max_ms);
+    }
+
     fn schedule_immediate_recommission(&mut self) {
         self.retry_delay_ms = self.policy.join_retry_initial_ms;
         self.retry = RetrySchedule::Due;
@@ -1586,7 +1602,10 @@ where
                     failures: self.secure_rejoin_failures,
                 }),
         }
-        if self.secure_rejoin_failures < self.policy.secure_rejoin_failure_limit {
+        if !self
+            .policy
+            .secure_rejoin_limit_reached(self.secure_rejoin_failures)
+        {
             self.parts
                 .diagnostics
                 .record(DiagnosticEvent::SecureRejoinPending {
@@ -1596,6 +1615,7 @@ where
                 archetype: K::ID,
                 failures: self.secure_rejoin_failures,
             });
+            self.schedule_secure_rejoin_backoff();
             return Ok(());
         }
 
@@ -1954,13 +1974,33 @@ where
         // Evaluate (and consume) the deadline on every unjoined step, also
         // while a secured rejoin is pending, so it cannot age past half range.
         let retry_due = self.retry_due();
-        if !self.node.device().secure_rejoin_pending() && retry_due {
+        let rejoin_pending = self.node.device().secure_rejoin_pending();
+        if !rejoin_pending && retry_due {
             await_out_of_line!(self.attempt_start())?;
             self.parts.supervisor.heartbeat();
             return Ok(events);
         }
+        let mut backoff_elapsed = false;
+        if rejoin_pending && let RetrySchedule::At(deadline) = self.retry {
+            // Secured-rejoin backoff: do not tick (the tick would let the
+            // runtime transmit its next rejoin request) until the deadline.
+            let wait_us = Self::remaining_us(self.now_us(), deadline).min(self.max_wait_us());
+            if wait_us != 0 {
+                await_out_of_line!(self.node.device_mut().mac_mut().delay_micros(wait_us));
+            }
+            self.run_again_deadline_us = None;
+            self.parts.supervisor.heartbeat();
+            if !self.retry_due() {
+                return Ok(events);
+            }
+            backoff_elapsed = true;
+        }
 
-        let wait_us = self.next_wait_us(!self.node.device().secure_rejoin_pending());
+        let wait_us = if backoff_elapsed {
+            0
+        } else {
+            self.next_wait_us(!rejoin_pending)
+        };
         if wait_us != 0 {
             await_out_of_line!(self.node.device_mut().mac_mut().delay_micros(wait_us));
         }

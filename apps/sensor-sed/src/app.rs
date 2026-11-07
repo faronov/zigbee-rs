@@ -44,8 +44,20 @@
 //!   sensor-report cadence, so those additional wakeups cannot advance stack
 //!   timers faster than wall clock.
 //! - Secure-rejoin failures are counted once per boot-time, direct, or
-//!   runtime-driven attempt and fall back to a fresh join after the bounded
-//!   product policy limit.
+//!   runtime-driven attempt. A commissioned device never gives its network
+//!   up on its own unless the product sets a nonzero
+//!   `secure_rejoin_failure_limit`; it retries on the bounded, jittered
+//!   backoff of [`crate::RecoveryPolicy`] and sleeps between attempts.
+//! - Parent loss that MAC acknowledgements cannot reveal (a parent that
+//!   acknowledges polls but delivers nothing) is detected from APS
+//!   end-to-end failures and from pending protocol work that outlives
+//!   `RecoveryPolicy::max_active_ms`; either starts the staged rejoin. A
+//!   report that is due by its maximum interval but was not acknowledged
+//!   counts as the same evidence.
+//! - Every keep-awake reason (pending work, OTA, Identify, timed fast-poll
+//!   windows) is bounded by its own `RecoveryPolicy` limit; a fired limit
+//!   forces the reason to release the chip and is recorded in the
+//!   [`AnomalyRecord`] a product may persist and expose.
 //! - Construction rejects a device whose runtime automatic parent polling is
 //!   still enabled, so the bounded manual poll window has exactly one owner.
 
@@ -54,7 +66,11 @@ use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
 use zigbee_runtime::node::{NodeError, ZigbeeNode};
 use zigbee_runtime::role::EndDevice;
 use zigbee_runtime::security_store::SecurityStateStore;
+use zigbee_zcl::ClusterId;
+use zigbee_zcl::clusters::poll_control::{CMD_CHECK_IN, FastPollEvent};
+use zigbee_zcl::foundation::reporting::ReportDirection;
 
+use crate::anomaly::{AnomalyReason, AnomalyRecord, AwakeBound, BoundStep};
 use crate::battery::BatterySource;
 use crate::capabilities::{
     SensorStatus, StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
@@ -64,6 +80,7 @@ use crate::measurement::{SampleTrigger, SensorMeasurement, SensorProfile};
 use crate::ota::{OtaActivationOutcome, OtaEventOutcome, OtaLifecycle, is_ota_event};
 use crate::parts::{SensorSedParts, SensorSedResources};
 use crate::policy::{self, SensorPolicy, ShortPressAction, SleepDepth, UserActionPolicy};
+use crate::reset_cause::ResetCause;
 
 type SensorNode<'a, M, S, P> = ZigbeeNode<'a, M, S, P, EndDevice>;
 
@@ -128,7 +145,51 @@ where
     identify_phase_on: bool,
     interview_done: bool,
     consecutive_rejoin_failures: u8,
+    /// The secure-rejoin failure limit was reached: the durable reset and
+    /// fresh join run at the top of the lifecycle once the failing call
+    /// chain has returned (see
+    /// [`service_fallback_rejoin`](Self::service_fallback_rejoin)).
+    fallback_rejoin_due: bool,
     run_again: Option<(R::Mark, u32)>,
+    /// Keep-awake budgets: pending protocol work, OTA, Identify and the
+    /// timed fast-poll windows.
+    pending_bound: AwakeBound,
+    ota_bound: AwakeBound,
+    identify_bound: AwakeBound,
+    fast_bound: AwakeBound,
+    /// When the budgets were last advanced (once per joined wait request).
+    last_bound_check: R::Mark,
+    /// Parent-loss strikes from bounded pending work and missed reports
+    /// since the last APS ACK.
+    active_bound_strikes: u8,
+    /// Measured time since the last end-to-end proof (an APS ACK).
+    report_proof_ms: u32,
+    /// APS ACK table state at the previous budget check, to recognise an
+    /// acknowledgement between two checks.
+    prev_ack_pending: bool,
+    prev_ack_failures: u8,
+    /// Anomalies recorded since boot (plus any the product restored), and
+    /// whether the product has not yet seen the latest change.
+    anomalies: AnomalyRecord,
+    anomaly_dirty: bool,
+    /// Consecutive recoverable sleep-transition failures.
+    sleep_failures: u8,
+    /// Low-power waits are disabled for the rest of this boot.
+    sleep_disabled: bool,
+    /// Runtime APS end-to-end failure count seen at the previous check.
+    seen_aps_ack_failures: u8,
+    /// Joined poll intervals in force: the policy's, or the profile's Poll
+    /// Control LongPollInterval/ShortPollInterval when one is fitted.
+    slow_poll_ms: u32,
+    fast_poll_ms: u32,
+    /// Poll Control fast-poll window `(start, duration)`: waiting for a
+    /// Check-in Response, or a client's requested fast-poll period.
+    poll_control_fast: Option<(R::Mark, u32)>,
+    /// Measured time since the last Check-in, accumulated per service like
+    /// [`join_wait_ms`](Self::join_wait_ms) so an hour-long CheckInInterval
+    /// survives narrow platform counters.
+    check_in_elapsed_ms: u32,
+    last_poll_control: R::Mark,
     initialized: bool,
 }
 
@@ -159,6 +220,9 @@ where
             return Err(SensorAppError::InvalidPolicy);
         }
 
+        let mut node = node;
+        node.device_mut()
+            .set_report_aps_ack(policy.recovery.report_aps_ack);
         let now = parts.wake.mark();
         let endpoint = node.profile().endpoint();
         Ok(Self {
@@ -182,9 +246,125 @@ where
             identify_phase_on: false,
             interview_done: false,
             consecutive_rejoin_failures: 0,
+            fallback_rejoin_due: false,
             run_again: None,
+            pending_bound: AwakeBound::default(),
+            ota_bound: AwakeBound::default(),
+            identify_bound: AwakeBound::default(),
+            fast_bound: AwakeBound::default(),
+            last_bound_check: now,
+            active_bound_strikes: 0,
+            report_proof_ms: 0,
+            prev_ack_pending: false,
+            prev_ack_failures: 0,
+            anomalies: AnomalyRecord::EMPTY,
+            anomaly_dirty: false,
+            sleep_failures: 0,
+            sleep_disabled: false,
+            seen_aps_ack_failures: 0,
+            slow_poll_ms: policy.slow_poll_ms,
+            fast_poll_ms: policy.fast_poll_ms,
+            poll_control_fast: None,
+            check_in_elapsed_ms: 0,
+            last_poll_control: now,
             initialized: false,
         })
+    }
+
+    /// Anomalies recorded so far (see [`crate::anomaly`]).
+    pub const fn anomalies(&self) -> &AnomalyRecord {
+        &self.anomalies
+    }
+
+    /// Seed the anomaly counters from a product's persistent copy, before
+    /// [`initialize`](Self::initialize).
+    pub fn restore_anomalies(&mut self, record: AnomalyRecord) {
+        self.anomalies = record;
+        self.anomaly_dirty = false;
+    }
+
+    /// The anomaly record once after each change, for a product that
+    /// persists or publishes it. A product that does neither never calls it.
+    pub fn take_anomaly_update(&mut self) -> Option<AnomalyRecord> {
+        if core::mem::take(&mut self.anomaly_dirty) {
+            Some(self.anomalies)
+        } else {
+            None
+        }
+    }
+
+    fn note_anomaly(&mut self, reason: AnomalyReason) {
+        self.anomalies.note(reason);
+        self.anomaly_noted(reason);
+    }
+
+    fn anomaly_noted(&mut self, reason: AnomalyReason) {
+        self.anomaly_dirty = true;
+        self.resources.diagnostics.record(DiagnosticEvent::Anomaly {
+            reason,
+            total: self.anomalies.total,
+        });
+    }
+
+    /// Note the previous boot's unplanned reset, carried by the product (see
+    /// [`crate::reset_cause`]), after
+    /// [`restore_anomalies`](Self::restore_anomalies). A cause equal to the
+    /// newest recorded one is not noted again, so a reset loop changes the
+    /// record (and the product's flash copy) once per distinct cause.
+    pub fn note_reset(&mut self, cause: ResetCause) {
+        if self.anomalies.note_reset(cause.word()) {
+            self.anomaly_noted(AnomalyReason::Reset);
+        }
+    }
+
+    /// Keep every remaining wait of this boot at [`SleepDepth::Active`], for
+    /// a product whose rapid-reset guard tripped. `record` notes
+    /// [`AnomalyReason::SleepDisabled`] with `cause` (the carried reset
+    /// cause, if any); pass `false` when this burst was already recorded.
+    pub fn disable_sleep(&mut self, record: bool, cause: Option<ResetCause>) {
+        self.sleep_disabled = true;
+        if record {
+            self.anomalies.note_with_cause(
+                AnomalyReason::SleepDisabled,
+                cause.map_or(0, ResetCause::word),
+            );
+            self.anomaly_noted(AnomalyReason::SleepDisabled);
+        }
+    }
+
+    /// Whether low-power waits are disabled for the rest of this boot.
+    pub const fn sleep_disabled(&self) -> bool {
+        self.sleep_disabled
+    }
+
+    /// The Zigbee device, for composition roots that add product services
+    /// (for example reporting persistence) around [`step`](Self::step).
+    pub const fn device(&self) -> &zigbee_runtime::ZigbeeDevice<M, EndDevice> {
+        self.node.device()
+    }
+
+    /// Mutable access to the Zigbee device; see [`device`](Self::device).
+    pub fn device_mut(&mut self) -> &mut zigbee_runtime::ZigbeeDevice<M, EndDevice> {
+        self.node.device_mut()
+    }
+
+    /// The application profile, for composition roots that publish product
+    /// state (for example the anomaly record) in its clusters.
+    pub fn profile_mut(&mut self) -> &mut P {
+        self.node.profile_mut()
+    }
+
+    /// The Zigbee device together with the profile's Poll Control server,
+    /// if fitted, for composition roots that persist both (see
+    /// `zigbee_runtime::reporting_store::ReportingPersistence::restore_with`).
+    pub fn device_and_poll_control_mut(
+        &mut self,
+    ) -> (
+        &mut zigbee_runtime::ZigbeeDevice<M, EndDevice>,
+        Option<&mut zigbee_zcl::clusters::poll_control::PollControlCluster>,
+    ) {
+        let (device, profile) = self.node.device_and_profile_mut();
+        (device, profile.poll_control_mut())
     }
 
     fn mark(&self) -> W::Mark {
@@ -205,13 +385,90 @@ where
     /// [`next_wait_ms`](Self::next_wait_ms)), so an expired window is dropped
     /// long before any platform counter can roll over and alias its start.
     fn fast_poll_remaining_ms(&mut self) -> Option<u32> {
-        let (started, duration_ms) = self.fast_poll?;
-        let elapsed_ms = self.elapsed_ms(started);
+        let now = self.mark();
+        let timed = Self::window_remaining_ms(now, &mut self.fast_poll);
+        let requested = Self::window_remaining_ms(now, &mut self.poll_control_fast);
+        match (timed, requested) {
+            (Some(timed), Some(requested)) => Some(timed.max(requested)),
+            (timed, requested) => timed.or(requested),
+        }
+    }
+
+    fn window_remaining_ms(now: W::Mark, window: &mut Option<(W::Mark, u32)>) -> Option<u32> {
+        let (started, duration_ms) = (*window)?;
+        let elapsed_ms = W::elapsed_ms(now, started);
         if elapsed_ms < duration_ms {
             Some(duration_ms - elapsed_ms)
         } else {
-            self.fast_poll = None;
+            *window = None;
             None
+        }
+    }
+
+    /// Poll Control server (0x0020) duties, when the profile fits one:
+    /// adopt its poll intervals, follow the client's fast-poll decisions and
+    /// send the periodic Check-in, after which the device fast-polls for the
+    /// configured response timeout.
+    async fn service_poll_control(&mut self) {
+        const QS_MS: u32 = 250;
+        let now = self.mark();
+        let elapsed_ms = W::elapsed_ms(now, self.last_poll_control);
+        self.last_poll_control = now;
+        let Some(poll_control) = self.node.profile_mut().poll_control_mut() else {
+            return;
+        };
+        let slow_ms = poll_control
+            .long_poll_interval_qs()
+            .saturating_mul(QS_MS)
+            .min(policy::MAX_WAIT_MS);
+        let fast_ms = (u32::from(poll_control.short_poll_interval_qs()) * QS_MS).min(slow_ms);
+        let event = poll_control.take_fast_poll_event();
+        let check_in_ms = poll_control.check_in_interval_qs().saturating_mul(QS_MS);
+        let response_ms = u32::from(poll_control.check_in_response_timeout_qs()) * QS_MS;
+        if slow_ms != self.slow_poll_ms {
+            // The runtime's sleepy power manager schedules its own polls
+            // from the same interval.
+            self.node
+                .device_mut()
+                .power_mut()
+                .set_mode(zigbee_runtime::power::PowerMode::Sleepy {
+                    poll_interval_ms: slow_ms,
+                    wake_duration_ms: self.policy.wake_duration_ms,
+                });
+        }
+        self.slow_poll_ms = slow_ms;
+        self.fast_poll_ms = fast_ms;
+        match event {
+            Some(FastPollEvent::Start { timeout_qs }) => {
+                self.poll_control_fast = Some((now, u32::from(timeout_qs) * QS_MS));
+            }
+            Some(FastPollEvent::Stop) => self.poll_control_fast = None,
+            None => {}
+        }
+        if check_in_ms == 0 {
+            self.check_in_elapsed_ms = 0;
+            return;
+        }
+        self.check_in_elapsed_ms = self.check_in_elapsed_ms.saturating_add(elapsed_ms);
+        if self.check_in_elapsed_ms < check_in_ms {
+            return;
+        }
+        self.check_in_elapsed_ms = 0;
+        self.checkpoint_security();
+        let sent = self
+            .node
+            .device_mut()
+            .send_bound_cluster_command(
+                self.endpoint,
+                ClusterId::POLL_CONTROL.0,
+                true,
+                CMD_CHECK_IN.0,
+                &[],
+            )
+            .await;
+        self.checkpoint_security();
+        if sent.is_ok() {
+            self.poll_control_fast = Some((self.mark(), response_ms));
         }
     }
 
@@ -224,18 +481,49 @@ where
         !matches!(A::SHORT_PRESS, ShortPressAction::None)
     }
 
-    /// Sleep for the current backoff delay before the next unjoined attempt
-    /// and double the following delay up to the 30-minute cap.
+    /// Sleep for the current (jittered) backoff delay before the next
+    /// unjoined attempt and double the following delay up to the product's
+    /// cap.
     fn schedule_join_backoff(&mut self) {
-        let delay_ms = self.join_backoff_ms;
+        let recovery = self.policy.recovery;
+        let delay_ms = if recovery.join_retry_jitter_pct == 0 {
+            self.join_backoff_ms
+        } else {
+            recovery.jittered_ms(self.join_backoff_ms, self.random_u16())
+        };
         self.join_wait_ms = delay_ms;
-        self.join_backoff_ms = policy::next_join_retry_ms(delay_ms, self.policy.join_retry_ms);
+        self.join_backoff_ms = policy::next_join_retry_ms(
+            self.join_backoff_ms,
+            self.policy.join_retry_ms,
+            recovery.join_retry_max_ms,
+        );
         // Runtime RunAgain hints are serviced by the next attempt's tick; an
         // idle unjoined device must not wake early for them.
         self.run_again = None;
         self.resources
             .diagnostics
             .record(DiagnosticEvent::JoinBackoff { delay_ms });
+    }
+
+    /// Backoff jitter source.
+    ///
+    /// Jitter only needs to de-synchronize devices, not to be unpredictable,
+    /// so this mixes the local IEEE address with the monotonic clock instead
+    /// of calling the MAC entropy source: on some backends (TLSR8258) that
+    /// source is a CTR-DRBG which would link a software AES into every
+    /// sleepy image.
+    fn random_u16(&mut self) -> u16 {
+        let device = self.node.device_mut();
+        let ieee = device.bdb().zdo().nwk().nib().ieee_address;
+        let now = u64::from(device.mac_mut().monotonic_micros());
+        let mut x = u64::from_le_bytes(ieee) ^ now ^ ((self.join_backoff_ms as u64) << 32);
+        // splitmix64 finaliser.
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^= x >> 31;
+        x as u16
     }
 
     /// Restart the backoff sequence at the product's initial delay.
@@ -251,6 +539,9 @@ where
     /// short-press action would otherwise be unrecoverable without a power
     /// cycle, so it falls back to the bounded unjoined backoff instead.
     fn enter_factory_new_after_leave(&mut self) {
+        // An explicit leave waits for the user; it must not be followed by
+        // an automatic fresh join that an earlier failure scheduled.
+        self.fallback_rejoin_due = false;
         self.network_up = false;
         self.fast_poll = None;
         self.run_again = None;
@@ -288,12 +579,51 @@ where
     }
 
     #[inline(never)]
-    fn wake_failure(&mut self) -> ! {
+    fn wake_failure(&mut self, code: u32) -> ! {
+        self.resources.status.set(SensorStatus::Fault);
+        self.resources
+            .supervisor
+            .reset_with_cause(ResetCause::wake(code))
+    }
+
+    /// A low-power wait failed. A recoverable failure finishes this
+    /// iteration with an active wait; `sleep_failure_limit` consecutive ones
+    /// disable low-power waits for the boot and record the error. Anything
+    /// else resets with the error as the retained cause.
+    #[inline(never)]
+    async fn recover_wake_failure(&mut self, error: W::Error, timeout_ms: u32) -> WakeReason {
+        let code = W::error_code(&error);
         self.resources
             .diagnostics
             .record(DiagnosticEvent::WakeFailed);
-        self.resources.status.set(SensorStatus::Fault);
-        self.resources.supervisor.reset()
+        let limit = self.policy.recovery.sleep_failure_limit;
+        if limit == 0 || !W::is_recoverable(&error) {
+            self.wake_failure(code);
+        }
+        self.sleep_failures = self.sleep_failures.saturating_add(1);
+        if self.sleep_failures >= limit && !self.sleep_disabled {
+            self.sleep_disabled = true;
+            self.anomalies
+                .note_with_cause(AnomalyReason::SleepDisabled, ResetCause::wake(code).word());
+            self.anomaly_noted(AnomalyReason::SleepDisabled);
+        }
+        let result = {
+            let mac = self.node.device_mut().mac_mut();
+            self.resources
+                .wake
+                .wait(
+                    mac,
+                    WaitRequest {
+                        timeout_ms,
+                        sleep_depth: SleepDepth::Active,
+                    },
+                )
+                .await
+        };
+        match result {
+            Ok(reason) => reason,
+            Err(error) => self.wake_failure(W::error_code(&error)),
+        }
     }
 
     #[inline(never)]
@@ -320,7 +650,9 @@ where
                     .diagnostics
                     .record(DiagnosticEvent::ProfileFailure(error));
                 self.resources.status.set(SensorStatus::Fault);
-                self.resources.supervisor.reset()
+                self.resources
+                    .supervisor
+                    .reset_with_cause(ResetCause::profile())
             }
         }
     }
@@ -379,6 +711,183 @@ where
         self.node.reset_remote_reporting();
         self.was_fast_polling = true;
         self.consecutive_rejoin_failures = 0;
+        // Any successful join supersedes a scheduled fallback.
+        self.fallback_rejoin_due = false;
+        self.clear_parent_loss_evidence();
+        self.poll_control_fast = None;
+        self.check_in_elapsed_ms = 0;
+        self.last_poll_control = now;
+    }
+
+    fn clear_parent_loss_evidence(&mut self) {
+        self.node.device_mut().clear_aps_ack_failures();
+        self.seen_aps_ack_failures = 0;
+        self.active_bound_strikes = 0;
+        self.pending_bound.reset();
+        self.report_proof_ms = 0;
+        self.prev_ack_pending = false;
+        self.prev_ack_failures = 0;
+    }
+
+    /// Advance every keep-awake budget by the time measured since the last
+    /// joined wait request and apply the fired limits. `windows` tells
+    /// whether a timed fast-poll window is still open (expired ones are
+    /// already cleared, so a single window ending on time never fires).
+    /// Returns whether pending work, OTA and Identify may still keep the
+    /// chip awake, and whether the fast-poll limit closed the windows.
+    ///
+    /// - pending work: every further `max_active_ms` it persists counts one
+    ///   parent-loss strike;
+    /// - OTA: the session is aborted;
+    /// - Identify: it keeps running but no longer holds the fast poll;
+    /// - fast-poll windows: they are closed.
+    fn apply_awake_bounds(&mut self, now: W::Mark, windows: bool) -> (bool, bool, bool, bool) {
+        let delta_ms = W::elapsed_ms(now, self.last_bound_check);
+        self.last_bound_check = now;
+        let recovery = &self.policy.recovery;
+
+        self.sample_report_proof(delta_ms);
+
+        let pending = self.node.device().has_pending_protocol_work();
+        let pending = match self
+            .pending_bound
+            .step(pending, delta_ms, recovery.max_active_ms)
+        {
+            BoundStep::Fired => {
+                self.active_bound_strikes = self.active_bound_strikes.saturating_add(1);
+                self.note_anomaly(AnomalyReason::PendingWork);
+                false
+            }
+            // Persisting work keeps earning strikes, recorded once.
+            BoundStep::Refired => {
+                self.active_bound_strikes = self.active_bound_strikes.saturating_add(1);
+                false
+            }
+            step => step.allows(),
+        };
+
+        let ota = O::ENABLED && self.resources.ota.is_active(self.node.profile());
+        let ota = match self
+            .ota_bound
+            .step(ota, delta_ms, recovery.max_ota_awake_ms)
+        {
+            BoundStep::Fired => {
+                self.resources.ota.abort(&mut self.node);
+                self.ota_bound.reset();
+                self.note_anomaly(AnomalyReason::Ota);
+                false
+            }
+            step => step.allows(),
+        };
+
+        let identifying = self.node.device().is_identifying(self.endpoint);
+        let identifying =
+            match self
+                .identify_bound
+                .step(identifying, delta_ms, recovery.max_identify_awake_ms)
+            {
+                BoundStep::Fired => {
+                    self.note_anomaly(AnomalyReason::Identify);
+                    false
+                }
+                step => step.allows(),
+            };
+
+        let windows_closed = self
+            .fast_bound
+            .step(windows, delta_ms, recovery.max_fast_poll_ms)
+            == BoundStep::Fired;
+        if windows_closed {
+            self.fast_poll = None;
+            self.poll_control_fast = None;
+            self.fast_bound.reset();
+            self.note_anomaly(AnomalyReason::FastPoll);
+        }
+        (pending, ota, identifying, windows_closed)
+    }
+
+    /// Missed-report detector.
+    ///
+    /// An APS ACK is end-to-end proof. One is recognised when the ACK table
+    /// stops waiting without a new exhausted-retry failure, or when the
+    /// failure count returns to zero. Without proof for the shortest
+    /// configured reporting maximum interval plus `missed_report_grace_ms`
+    /// a report was due but not acknowledged: that counts one parent-loss
+    /// strike, and every report is forced due so the next tick produces
+    /// fresh evidence (an ACK, or an APS failure).
+    fn sample_report_proof(&mut self, delta_ms: u32) {
+        let aps = self.node.device().bdb().zdo().aps();
+        let ack_pending = aps.has_pending_ack();
+        let failures = aps.consecutive_ack_failures();
+        let acked = (self.prev_ack_pending && !ack_pending && failures <= self.prev_ack_failures)
+            || (failures == 0 && self.prev_ack_failures != 0);
+        self.prev_ack_pending = ack_pending;
+        self.prev_ack_failures = failures;
+
+        let grace_ms = self.policy.recovery.missed_report_grace_ms;
+        let max_interval_s = if grace_ms == 0 {
+            None
+        } else {
+            self.shortest_report_max_interval_s()
+        };
+        let Some(max_interval_s) = max_interval_s.filter(|_| !acked) else {
+            self.report_proof_ms = 0;
+            return;
+        };
+        self.report_proof_ms = self.report_proof_ms.saturating_add(delta_ms);
+        let window_ms = (u32::from(max_interval_s) * 1_000).saturating_add(grace_ms);
+        if self.report_proof_ms >= window_ms {
+            self.report_proof_ms = 0;
+            self.active_bound_strikes = self.active_bound_strikes.saturating_add(1);
+            self.node.device_mut().reporting_mut().force_all_due();
+            self.note_anomaly(AnomalyReason::MissedReport);
+        }
+    }
+
+    /// Shortest periodic maximum interval among this endpoint's reporting
+    /// configurations, if any attribute reports periodically.
+    fn shortest_report_max_interval_s(&self) -> Option<u16> {
+        self.node
+            .device()
+            .reporting()
+            .configs()
+            .filter(|(endpoint, _, config)| {
+                *endpoint == self.endpoint
+                    && config.direction == ReportDirection::Send
+                    && config.max_interval != 0
+                    && config.max_interval != 0xFFFF
+            })
+            .map(|(_, _, config)| config.max_interval)
+            .min()
+    }
+
+    /// Start the staged rejoin once parent-loss evidence reaches the
+    /// product's strike limit while the device still believes it is joined.
+    ///
+    /// An APS acknowledgement proves end-to-end delivery, so it also clears
+    /// the strikes earned by bounded pending work.
+    async fn check_parent_loss(&mut self) {
+        let limit = self.policy.recovery.parent_loss_strikes;
+        if limit == 0 || !self.node.device().is_joined() {
+            return;
+        }
+        let aps_failures = self.node.device().consecutive_aps_ack_failures();
+        if aps_failures < self.seen_aps_ack_failures {
+            self.active_bound_strikes = 0;
+        }
+        self.seen_aps_ack_failures = aps_failures;
+        let strikes = aps_failures.saturating_add(self.active_bound_strikes);
+        if strikes < limit {
+            return;
+        }
+        self.resources
+            .diagnostics
+            .record(DiagnosticEvent::ParentLossSuspected { strikes });
+        self.note_anomaly(AnomalyReason::ParentLoss);
+        self.clear_parent_loss_evidence();
+        if self.secure_rejoin().await {
+            self.reset_post_join_state();
+        }
     }
 
     /// Attempt to join or silently resume. Every call site other than
@@ -427,20 +936,20 @@ where
     /// Start or resume while counting a restored pending secure-rejoin
     /// failure as one real over-the-air attempt.
     ///
-    /// The raw [`join_or_resume`](Self::join_or_resume) remains separate so
-    /// [`rejoin_after_reset`](Self::rejoin_after_reset) can perform its fresh
-    /// post-reset join without creating a recursive async call graph through
-    /// [`record_failed_rejoin`](Self::record_failed_rejoin).
+    /// A failure that reaches the product's limit only schedules the
+    /// fallback; the caller's lifecycle step runs it.
     async fn join_or_resume_with_rejoin_tracking(&mut self) -> bool {
         let was_secure_rejoin_pending = self.node.device().secure_rejoin_pending();
         if self.join_or_resume().await {
             true
-        } else if was_secure_rejoin_pending || self.node.device().secure_rejoin_pending() {
-            // On the first boot call, start_or_resume() restores the pending
-            // flag from the journal before attempting the rejoin, so it only
-            // becomes visible after the failed call returns.
-            self.record_failed_rejoin().await
         } else {
+            if was_secure_rejoin_pending || self.node.device().secure_rejoin_pending() {
+                // On the first boot call, start_or_resume() restores the
+                // pending flag from the journal before attempting the
+                // rejoin, so it only becomes visible after the failed call
+                // returns.
+                self.record_failed_rejoin();
+            }
             false
         }
     }
@@ -459,7 +968,8 @@ where
                 self.resources
                     .diagnostics
                     .record(DiagnosticEvent::SecureRejoinInitializationFailed);
-                self.record_failed_rejoin().await
+                self.record_failed_rejoin();
+                false
             }
             Err(StartError::CommissioningFailed(status)) => {
                 self.resources
@@ -467,7 +977,8 @@ where
                     .record(DiagnosticEvent::SecureRejoinFailed {
                         status: status as u8,
                     });
-                self.record_failed_rejoin().await
+                self.record_failed_rejoin();
+                false
             }
             Err(StartError::PersistenceFailed(error)) => self.persistence_failure(error),
         }
@@ -508,20 +1019,42 @@ where
         }
     }
 
-    /// Count one failed secure-rejoin attempt and, once the bounded limit is
-    /// reached, fall back to a durable reset and fresh join.
+    /// Run a fallback that [`record_failed_rejoin`](Self::record_failed_rejoin)
+    /// scheduled. Called only at the top of the lifecycle (the cold start
+    /// and the end of each step), after the call chain that observed the
+    /// failure — tick, control event, secure rejoin — has returned, so the
+    /// fresh-join chain never runs beneath those frames.
+    async fn service_fallback_rejoin(&mut self) {
+        // Success restarts the joined lifecycle (`reset_post_join_state`);
+        // failure leaves a factory-new device whose unjoined backoff the
+        // failing step already owns, exactly as when this ran inline.
+        if core::mem::take(&mut self.fallback_rejoin_due) {
+            self.rejoin_after_reset().await;
+        }
+    }
+
+    /// Count one failed secure-rejoin attempt. Only a product that sets a
+    /// nonzero `secure_rejoin_failure_limit` falls back to a durable reset
+    /// and fresh join once it is reached; the default (`0`) keeps the
+    /// network and lets the backoff schedule the next attempt.
+    ///
+    /// Reaching the limit only schedules the fallback: it runs from
+    /// [`service_fallback_rejoin`](Self::service_fallback_rejoin) once the
+    /// caller's chain has returned, never nested beneath the failing secure
+    /// rejoin or control event.
     ///
     /// Both direct `secure_rejoin()` failures and runtime-driven retry
     /// failures use this path, so one over-the-air attempt is counted once.
-    async fn record_failed_rejoin(&mut self) -> bool {
+    fn record_failed_rejoin(&mut self) {
         self.consecutive_rejoin_failures = self.consecutive_rejoin_failures.saturating_add(1);
-        if self.consecutive_rejoin_failures < self.policy.secure_rejoin_failure_limit {
+        let limit = self.policy.secure_rejoin_failure_limit;
+        if limit == 0 || self.consecutive_rejoin_failures < limit {
             self.resources
                 .diagnostics
                 .record(DiagnosticEvent::SecureRejoinPending {
                     failures: self.consecutive_rejoin_failures,
                 });
-            return false;
+            return;
         }
         self.resources
             .diagnostics
@@ -529,7 +1062,7 @@ where
                 failures: self.consecutive_rejoin_failures,
             });
         self.consecutive_rejoin_failures = 0;
-        self.rejoin_after_reset().await
+        self.fallback_rejoin_due = true;
     }
 
     /// Read all sensors and update the profile's measurement/battery
@@ -584,6 +1117,10 @@ where
                 .status
                 .set(SensorStatus::Joined { active: true });
         }
+        // A restored pending rejoin that just reached the failure limit:
+        // reset and join before the first read and default reporting, as
+        // the boot join did when the fallback ran inline.
+        self.service_fallback_rejoin().await;
 
         self.read_sensors(SampleTrigger::ColdStart).await;
 
@@ -635,11 +1172,15 @@ where
         };
     }
 
-    fn apply_ota_outcome(&mut self, keep_awake_ms: Option<u32>, activation_pending: bool) {
+    /// Mark OTA traffic and run a requested activation.
+    ///
+    /// No timed fast-poll window is opened: the fast poll is held by the
+    /// session itself ([`OtaLifecycle::is_active`] in
+    /// [`next_wait_ms`](Self::next_wait_ms)), so a Query Next Image Response
+    /// without an image, a declined notify, a timeout or a failure returns
+    /// the device to its slow poll on the next iteration.
+    fn apply_ota_outcome(&mut self, activation_pending: bool) {
         self.resources.status.set(SensorStatus::Ota);
-        if let Some(duration_ms) = keep_awake_ms {
-            self.start_fast_poll(duration_ms);
-        }
         if activation_pending {
             // Activation may reset immediately. Persist network keys and
             // security counters before handing control back to the product.
@@ -664,13 +1205,10 @@ where
                     .record(DiagnosticEvent::UnexpectedOtaEvent);
                 Some(false)
             }
-            OtaEventOutcome::Handled {
-                keep_awake_ms,
-                activation_pending,
-            } => {
-                self.apply_ota_outcome(keep_awake_ms, activation_pending);
-                // OTA owns its deadline; do not replace it with the generic
-                // commissioning-activity window.
+            OtaEventOutcome::Handled { activation_pending } => {
+                self.apply_ota_outcome(activation_pending);
+                // OTA traffic must not open the generic commissioning
+                // window either; the session alone holds the fast poll.
                 Some(false)
             }
         }
@@ -812,10 +1350,9 @@ where
                     .diagnostics
                     .record(DiagnosticEvent::CommissioningComplete { success: false });
                 if self.node.device().secure_rejoin_pending() {
-                    self.record_failed_rejoin().await
-                } else {
-                    false
+                    self.record_failed_rejoin();
                 }
+                false
             }
             StackEvent::DefaultResponse {
                 src_addr,
@@ -979,6 +1516,7 @@ where
 
         let tick_elapsed = self.take_runtime_elapsed_secs();
         self.tick_and_handle(tick_elapsed).await;
+        self.service_poll_control().await;
 
         if O::ENABLED {
             let ota = self
@@ -986,8 +1524,8 @@ where
                 .ota
                 .service(&mut self.node, tick_elapsed.saturating_add(precharged_secs))
                 .await;
-            if ota.keep_awake_ms.is_some() || ota.activation_pending {
-                self.apply_ota_outcome(ota.keep_awake_ms, ota.activation_pending);
+            if ota.progressed || ota.activation_pending {
+                self.apply_ota_outcome(ota.activation_pending);
             }
         }
 
@@ -1026,6 +1564,8 @@ where
             let _ = self.node.device_mut().send_device_annce().await;
             self.checkpoint_security();
         }
+
+        self.check_parent_loss().await;
     }
 
     /// Double blink shown only while a commissioning attempt actually runs.
@@ -1179,20 +1719,23 @@ where
             if let Some(watchdog_ms) = self.resources.supervisor.max_wait_ms() {
                 wait_ms = shorten(wait_ms, watchdog_ms);
             }
+            self.last_bound_check = self.mark();
             return (wait_ms.max(1), false, self.policy.slow_sleep_depth);
         }
 
         let now = self.mark();
-        let identifying = self.node.device().is_identifying(self.endpoint);
-        let ota_active = O::ENABLED && self.resources.ota.is_active(self.node.profile());
-        let fast_poll_remaining_ms = self.fast_poll_remaining_ms();
-        let pending_protocol_work = self.node.device().has_pending_protocol_work();
+        let mut fast_poll_remaining_ms = self.fast_poll_remaining_ms();
+        let (pending_protocol_work, ota_active, identifying, windows_closed) =
+            self.apply_awake_bounds(now, fast_poll_remaining_ms.is_some());
+        if windows_closed {
+            fast_poll_remaining_ms = None;
+        }
         let in_fast_poll =
             fast_poll_remaining_ms.is_some() || identifying || ota_active || pending_protocol_work;
         let mut wait_ms = if in_fast_poll {
-            self.policy.fast_poll_ms
+            self.fast_poll_ms
         } else {
-            self.policy.slow_poll_ms
+            self.slow_poll_ms
         };
 
         if let Some(remaining_ms) = fast_poll_remaining_ms {
@@ -1232,7 +1775,18 @@ where
             wait_ms = shorten(wait_ms, watchdog_ms);
         }
 
-        let sleep_depth = if ota_active || pending_protocol_work {
+        // Waiting only for APS ACKs of frames already on air needs no CPU:
+        // the ACK is fetched by the next fast poll and the retry timer runs
+        // on the monotonic clock. Light-sleep through it at the fast-poll
+        // depth (never deeper than Idle), on the same fast cadence.
+        let ack_wait_only =
+            pending_protocol_work && !ota_active && self.node.device().awaits_aps_ack_only();
+        let sleep_depth = if ack_wait_only {
+            match self.policy.fast_sleep_depth {
+                SleepDepth::Retention => SleepDepth::Idle,
+                depth => depth,
+            }
+        } else if ota_active || pending_protocol_work {
             SleepDepth::Active
         } else if in_fast_poll {
             self.policy.fast_sleep_depth
@@ -1255,9 +1809,9 @@ where
                 None => true,
                 Some(last_poll) => {
                     let interval_ms = if in_fast_poll {
-                        self.policy.fast_poll_ms
+                        self.fast_poll_ms
                     } else {
-                        self.policy.slow_poll_ms
+                        self.slow_poll_ms
                     };
                     self.elapsed_ms(last_poll) >= interval_ms
                 }
@@ -1351,7 +1905,10 @@ where
 
     async fn step_initialized(&mut self) {
         let joined = self.node.device().is_joined();
-        let (poll_ms, in_fast_poll, sleep_depth) = self.next_wait_ms();
+        let (poll_ms, in_fast_poll, mut sleep_depth) = self.next_wait_ms();
+        if self.sleep_disabled {
+            sleep_depth = SleepDepth::Active;
+        }
 
         // Log transition from fast→slow poll.
         if !joined {
@@ -1394,8 +1951,13 @@ where
                 .await
         };
         let wake_reason = match wait_result {
-            Ok(wake_reason) => wake_reason,
-            Err(_) => self.wake_failure(),
+            Ok(wake_reason) => {
+                if sleep_depth != SleepDepth::Active {
+                    self.sleep_failures = 0;
+                }
+                wake_reason
+            }
+            Err(error) => self.recover_wake_failure(error, poll_ms).await,
         };
         self.resources.supervisor.heartbeat();
         if !joined {
@@ -1422,6 +1984,7 @@ where
         } else {
             self.service_unjoined().await;
         }
+        self.service_fallback_rejoin().await;
     }
 
     /// Advance one finite wait/service iteration.
@@ -1465,6 +2028,7 @@ where
             self.join_wait_ms = self.join_wait_ms.saturating_sub(waited_ms);
             self.service_unjoined().await;
         }
+        self.service_fallback_rejoin().await;
         Ok(())
     }
 

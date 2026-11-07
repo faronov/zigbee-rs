@@ -16,6 +16,21 @@ name = "esp32h2-sensor"
 path = "src/main.rs"
 required-features = ["sed"]
 
+# Battery thermometer build profile (`thermometer.toml`), see
+# `src/thermometer.rs`:
+#   cargo build --release --bin esp32h2-thermometer --features thermometer,light-sleep,quiet
+[[bin]]
+name = "esp32h2-thermometer"
+path = "src/thermometer.rs"
+required-features = ["thermometer"]
+
+# Sleep-floor lab (no Zigbee, `floor_lab.toml`, see `src/floor_lab.rs`):
+#   cargo build --release --no-default-features --features floor-lab --bin esp32h2-floor-lab
+[[bin]]
+name = "esp32h2-floor-lab"
+path = "src/floor_lab.rs"
+required-features = ["floor-lab"]
+
 [[bin]]
 name = "esp32h2-ed"
 path = "src/ed.rs"
@@ -34,6 +49,7 @@ zigbee-runtime = { path = "../../zigbee-runtime", features = ["ota"] }
 sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"], optional = true }
 router-app = { path = "../../apps/router", default-features = false, optional = true }
 zigbee-nwk = { path = "../../zigbee-nwk", optional = true }
+zigbee-aps = { path = "../../zigbee-aps", optional = true }
 esp32-zigbee-devkit-product = { path = "../../products/esp32-zigbee-devkit", features = ["esp32h2"] }
 
 # ESP32-H2 HAL and runtime
@@ -44,6 +60,7 @@ esp-backtrace = { version = "0.14", features = ["esp32h2", "panic-handler", "pri
 esp-println = { version = "0.12", features = ["esp32h2"] }
 esp-alloc = "0.9"
 static_cell = "2"
+heapless = { version = "0.9", optional = true }
 log = "0.4"
 
 # The product supplies the interrupt-driven clock and CPU-idle executor.
@@ -72,6 +89,18 @@ router = [
 ]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
+# Temperature-only sleepy thermometer (`esp32h2-thermometer` bin); its
+# identity, reporting defaults and cadence come from `thermometer.toml`.
+thermometer = ["sed", "dep:zigbee-aps", "reporting-persist", "anomaly-record"]
+# Journal the keep-awake anomaly record in `zbnv` (only when a limit fires)
+# and publish it as Diagnostics (0x0B05) attributes.
+anomaly-record = ["dep:heapless", "esp32-zigbee-devkit-product/anomaly-record"]
+# Keep coordinator Configure Reporting across resets (product `zbnv` journal).
+reporting-persist = ["esp32-zigbee-devkit-product/reporting-persist"]
+# Board/chip sleep-floor lab binary; no Zigbee stack, never a product image.
+floor-lab = []
+# Compile out all `log` output; the thermometer bin then links no console.
+quiet = ["log/max_level_off", "log/release_max_level_off"]
 
 [patch.crates-io]
 esp-hal = { path = "../../vendor/esp-hal" }

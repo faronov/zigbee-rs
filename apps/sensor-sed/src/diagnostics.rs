@@ -3,6 +3,7 @@
 use zigbee_runtime::profile::ProfileError;
 use zigbee_runtime::security_store::SecurityStoreError;
 
+use crate::anomaly::AnomalyReason;
 use crate::environment::EnvironmentReading;
 
 /// Semantic lifecycle diagnostics emitted by [`crate::SensorApp`].
@@ -39,6 +40,17 @@ pub enum DiagnosticEvent {
     },
     SecureRejoinLimitReached {
         failures: u8,
+    },
+    /// Parent-loss evidence (APS end-to-end failures plus pending work that
+    /// outlived its bound) reached the product limit; a rejoin starts.
+    ParentLossSuspected {
+        strikes: u8,
+    },
+    /// A keep-awake limit or a parent-loss detector fired; `total` is the
+    /// running anomaly count (see [`crate::AnomalyRecord`]).
+    Anomaly {
+        reason: AnomalyReason,
+        total: u16,
     },
     Environment(EnvironmentReading),
     EnvironmentReadFailed,
@@ -117,7 +129,8 @@ pub enum DiagnosticEvent {
         attempt: u8,
     },
     /// An unjoined commissioning attempt failed; the next one starts after
-    /// `delay_ms` of sleep (exponential backoff, capped at 30 minutes).
+    /// `delay_ms` of sleep (jittered exponential backoff up to the product's
+    /// `RecoveryPolicy::join_retry_max_ms`).
     JoinBackoff {
         delay_ms: u32,
     },

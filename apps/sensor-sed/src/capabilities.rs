@@ -52,6 +52,20 @@ pub trait WakeController<M: MacDriver> {
 
     async fn wait(&mut self, mac: &mut M, request: WaitRequest) -> Result<WakeReason, Self::Error>;
 
+    /// Whether the MAC is ready for normal operation after `error`, so the
+    /// lifecycle may finish the iteration with an
+    /// [`Active`](SleepDepth::Active) wait instead of resetting. The default
+    /// treats every error as fatal.
+    fn is_recoverable(_error: &Self::Error) -> bool {
+        false
+    }
+
+    /// Stable 28-bit code identifying `error` in the anomaly record and the
+    /// retained reset cause (`0` = unknown).
+    fn error_code(_error: &Self::Error) -> u32 {
+        0
+    }
+
     async fn button_held_for(&mut self, duration_ms: u32) -> bool;
     async fn delay_ms(&mut self, duration_ms: u32);
 }
@@ -98,4 +112,11 @@ pub trait Supervisor {
     fn max_wait_ms(&self) -> Option<u32>;
 
     fn reset(&mut self) -> !;
+
+    /// Reset after storing `cause` where the next boot can read it (see
+    /// [`crate::reset_cause`]). The default drops the cause.
+    fn reset_with_cause(&mut self, cause: crate::ResetCause) -> ! {
+        let _ = cause;
+        self.reset()
+    }
 }

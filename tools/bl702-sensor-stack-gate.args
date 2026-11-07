@@ -15,10 +15,13 @@
 --stack-ceiling
 0x4202C000
 
-# Static worst case: SensorApp tick -> failed-rejoin recovery ->
+# Static worst case was SensorApp tick -> failed-rejoin recovery ->
 # join_or_resume -> secured receive, 20,096 B task + 80 B entry + 112 B
 # interrupt = 20,288 B, a 4,288 B gap (it did not fit the former 15 KiB
-# stack). Not measured on hardware.
+# stack). The reset-and-fresh-join fallback now runs from the top of the
+# lifecycle (service_fallback_rejoin), not nested under the failing
+# secure_rejoin: worst case 15,392 B task, 15,584 B total, 8,992 B gap, and
+# the rejoin chain is back to 8,656 B. Not measured on hardware.
 --min-gap
 4096
 --max-frame

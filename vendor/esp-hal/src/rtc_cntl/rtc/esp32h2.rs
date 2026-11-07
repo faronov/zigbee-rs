@@ -149,6 +149,24 @@ pub(crate) fn init() {
                 .hp_sleep_icg_slp_sel()
                 .set_bit()
         });
+        // ESP-IDF v5.5.1 `pmu_hp_system_init(HP_SLEEP)`
+        // (PMU_HP_SLEEP_CLOCK/ANALOG_CONFIG_DEFAULT) values that its sleep
+        // entry never rewrites: APB clock gates closed and the dedicated
+        // sleep memory/logic regulators off (the main HP regulator, set per
+        // sleep, retains the domain). The reset values (APB gates open,
+        // both sleep regulators on at dbias 8) are not an ESP-IDF state.
+        pmu.hp_sleep_icg_hp_apb()
+            .write(|w| w.hp_sleep_dig_icg_apb_en().bits(0));
+        pmu.hp_sleep_hp_regulator0().modify(|_, w| {
+            w.hp_sleep_hp_regulator_slp_mem_xpd()
+                .clear_bit()
+                .hp_sleep_hp_regulator_slp_logic_xpd()
+                .clear_bit()
+                .hp_sleep_hp_regulator_slp_mem_dbias()
+                .bits(0)
+                .hp_sleep_hp_regulator_slp_logic_dbias()
+                .bits(0)
+        });
         pmu.hp_active_hp_sys_cntl().modify(|_, w| {
             w.hp_active_dig_cpu_stall()
                 .clear_bit()
@@ -160,6 +178,12 @@ pub(crate) fn init() {
         pmu.slp_wakeup_cntl7()
             .modify(|_, w| w.ana_wait_target().bits(1700));
     }
+
+    // clk_ll_rc_fast_tick_conf (as the C6 init does); `calibrate_internal`
+    // also sets it before each RC_FAST calibration.
+    PCR::regs()
+        .ctrl_tick_conf()
+        .modify(|_, w| unsafe { w.fosc_tick_num().bits(crate::clock::H2_FOSC_TICK_NUM) });
 
     RtcClock::set_fast_freq(RtcFastClock::RcFast);
     RtcClock::set_slow_freq(RtcSlowClock::RcSlow);
@@ -244,6 +268,8 @@ bitfield::bitfield! {
 bitfield::bitfield! {
     #[derive(Clone, Copy, Default)]
     pub struct HpClkPower(u32);
+    pub bool, i2c_iso_en, set_i2c_iso_en: 26;
+    pub bool, i2c_retention, set_i2c_retention: 27;
     pub bool, xpd_bbpll, set_xpd_bbpll: 30;
 }
 
@@ -313,9 +339,17 @@ impl SavedClockConfig {
         .map(Self)
     }
 
+    /// Re-select the saved CPU source and dividers after sleep, as IDF
+    /// v5.5.1 `rtc_clk_cpu_freq_set_config` does with the configuration
+    /// saved by `rtc_clk_cpu_freq_get_config`: for PLL and FLASH_PLL (64 MHz,
+    /// derived from BBPLL) the CPU was on XTAL, so BBPLL is re-enabled and
+    /// recalibrated at 96 MHz before the source switch.
+    ///
+    /// In RAM: MSPI (flash) can be clocked from BBPLL, which is powered down
+    /// in HP_SLEEP and recalibrated here.
     #[crate::ram]
     pub(crate) fn restore(self) {
-        if self.0.source == 1 {
+        if self.0.needs_bbpll() {
             esp32h2_rtc_bbpll_enable();
             esp32h2_rtc_bbpll_configure(XtalClock::_32M, PllClock::Pll96MHz);
         }
@@ -350,6 +384,7 @@ impl SavedClockConfig {
     }
 }
 
+#[inline(always)]
 pub(crate) fn restore_sleep_bias() {
     // ESP-IDF v5.5.1 pmu_sleep_finish / soc/regi2c_bias.h: low-temperature fix.
     regi2c_write_mask(0x6a, 0, 0, 7, 4, 8);

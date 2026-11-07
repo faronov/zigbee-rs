@@ -1,5 +1,7 @@
 //! Environmental measurement source and profile-update abstractions.
 
+use zigbee_zcl::clusters::poll_control::PollControlCluster;
+
 use zigbee_runtime::profile::{
     ApplicationProfile, BatteryMeasurement, DeviceProfile, ProfileComponent,
     TemperatureHumidityBattery, TemperatureHumidityMeasurement, TemperatureHumidityPressureBattery,
@@ -55,6 +57,12 @@ pub trait EnvironmentSink {
     fn update_environment(&mut self, measurement: TemperatureHumidityMeasurement);
     fn update_battery(&mut self, measurement: BatteryMeasurement);
     fn update_pressure(&mut self, _tenth_kpa: i16) {}
+    /// The component's Poll Control server, when fitted. The sleepy
+    /// lifecycle then takes its poll intervals, check-ins and fast-poll
+    /// requests from it.
+    fn poll_control_mut(&mut self) -> Option<&mut PollControlCluster> {
+        None
+    }
 }
 
 impl EnvironmentSink for TemperatureHumidityBattery {
@@ -89,6 +97,10 @@ pub trait EnvironmentalSensorProfile: ApplicationProfile {
     fn update_environment(&mut self, measurement: TemperatureHumidityMeasurement);
     fn update_battery(&mut self, measurement: BatteryMeasurement);
     fn update_pressure(&mut self, tenth_kpa: i16);
+    /// See [`EnvironmentSink::poll_control_mut`].
+    fn poll_control_mut(&mut self) -> Option<&mut PollControlCluster> {
+        None
+    }
 }
 
 impl<C> EnvironmentalSensorProfile for DeviceProfile<C>
@@ -105,6 +117,10 @@ where
 
     fn update_pressure(&mut self, tenth_kpa: i16) {
         self.component_mut().update_pressure(tenth_kpa);
+    }
+
+    fn poll_control_mut(&mut self) -> Option<&mut PollControlCluster> {
+        self.component_mut().poll_control_mut()
     }
 }
 
@@ -124,5 +140,9 @@ where
 
     fn update_pressure(&mut self, tenth_kpa: i16) {
         self.inner_mut().update_pressure(tenth_kpa);
+    }
+
+    fn poll_control_mut(&mut self) -> Option<&mut PollControlCluster> {
+        self.inner_mut().poll_control_mut()
     }
 }

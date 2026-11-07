@@ -10,7 +10,7 @@ pub static ALWAYS_ON_END_DEVICE_POLICY: RouterPolicy = RouterPolicy {
     max_receive_slice_us: MAX_RECEIVE_SLICE_US,
     join_retry_initial_ms: 15_000,
     join_retry_max_ms: 60_000,
-    secure_rejoin_failure_limit: 3,
+    secure_rejoin_failure_limit: 0,
 };
 
 /// The ZBT-1 has no button to request commissioning after a Leave (or a
@@ -40,6 +40,7 @@ mod tests {
             ALWAYS_ON_END_DEVICE_POLICY.join_retry_initial_ms
                 <= ALWAYS_ON_END_DEVICE_POLICY.join_retry_max_ms
         );
-        assert!(ALWAYS_ON_END_DEVICE_POLICY.secure_rejoin_failure_limit > 0);
+        // Never self-reset: network state is discarded only by Leave/user.
+        assert_eq!(ALWAYS_ON_END_DEVICE_POLICY.secure_rejoin_failure_limit, 0);
     }
 }

@@ -89,11 +89,11 @@ inside the critical section that esp-radio already takes, before each
 acknowledged transmission and before suspend, but only while
 `macRxOnWhenIdle` is false. Routers and always-on end devices keep every
 frame.
-Router images also
+All images
 convert RSSI to the IEEE 0–255 LQI scale (`zigbee_mac::lqi`) for neighbour
-and link-cost decisions. End-device images keep the radio's raw LQI byte,
-which is not on that scale; converting it there costs 44 bytes of flash, so it
-is not enabled yet.
+and link-cost decisions. The radio's raw LQI byte (about 7–11) maps every
+router to link cost 7, which made end-device rejoin parent selection reject
+every beacon ("none suitable as parent").
 
 **Persistence.** The role images write a role tag (ROUTER `0x5201`,
 END_DEVICE `0x5202`) in the security journal. The SED image writes none, so
@@ -171,6 +171,178 @@ OTA cluster events reach `OtaTransport` before generic application handling.
 When the image is ready, `SensorApp` checkpoints Zigbee security state before
 the product writer changes `otadata` and resets.
 
+### ESP32-H2 thermometer SED (`thermometer`, `quiet`)
+
+`esp32h2-thermometer` is a temperature-only Sleepy End Device for battery and
+current measurements on boards whose status hardware it does not drive (the
+Waveshare ESP32-H2-Zero; its WS2812 on GPIO8 stays dark and untouched).
+Endpoint 1 carries Basic, Identify, Poll Control (0x0020) and
+Temperature Measurement (0x0402) fed by the eFuse-calibrated die sensor.
+Every policy value — identity, reporting defaults, poll/fast-poll periods,
+sampling cadence, Poll Control limits, rejoin backoff, the Active-time
+bound, the oscillator power-down and the USB pad policy — comes from
+`examples/esp32h2-sensor/thermometer.toml` through `build.rs` (override per
+build with `H2_THERMO_<KEY>` or `H2_THERMO_CONFIG`).
+
+```bash
+cd examples/esp32h2-sensor
+cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
+  --bin esp32h2-thermometer --features thermometer,light-sleep,quiet
+```
+
+- `quiet` sets `log` to `max_level_off`; the bin links no console.
+- `reporting-persist` (enabled by `thermometer`) journals the coordinator's
+  Configure Reporting in the product's two-sector `0x3F4000..0x3F6000`
+  window (keyed by extended PAN ID, CRC + commit marker, alternating
+  sectors) and restores it after a reset on the same network. About 4.5 KB
+  of flash: journal scan/commit/erase ≈2.4 KB, snapshot capture/encode
+  ≈0.6 KB, record parse ≈0.4 KB, the rest flash-window glue.
+- Poll Control: periodic Check-in to the bound client, Check-in Response
+  fast poll bounded by `fast_poll_timeout_max_ms`, Fast Poll Stop, and
+  Set Long/Short Poll Interval range-checked against the profile. With
+  `reporting-persist`, CheckInInterval, FastPollTimeout and the
+  Long/Short Poll Interval a coordinator changed are journalled in the
+  same snapshot (same window and extended-PAN binding) and restored after a
+  reset only if they still fit the profile's limits.
+- Keep-awake limits and the anomaly record: `thermometer.toml` sets
+  `max_active_ms`, `max_ota_awake_ms`, `max_identify_awake_ms`,
+  `max_fast_poll_ms` and `missed_report_grace_ms` (see the power guide).
+  `anomaly-record` (enabled by `thermometer`) journals the record in the
+  two-sector `0x3F6000..0x3F8000` window only when it changes (at most
+  `anomaly_max_writes_per_boot` writes per boot) and serves it from a
+  minimal Diagnostics (0x0B05) server on the endpoint, each attribute with
+  its standard data type:
+  `0x0000` (`NumberOfResets`, uint16) = total anomalies;
+  `0x0001` (`PersistentMemoryWrites`, uint16) = summary: bits 0-7 last
+  reason code, bits 8-15 reasons seen (bit `code - 1`);
+  `0x0100` (`MacRxBcast`, uint32) = last cause word (below);
+  `0x0101`/`0x0102` (`MacTxBcast`/`MacRxUcast`, uint32) = per-reason
+  counts, one saturating byte per reason, reasons 1-4 / 5-8, LE.
+  Reason codes: 1 pending work, 2 OTA, 3 Identify, 4 fast-poll windows,
+  5 missed report, 6 parent-loss rejoin, 7 unplanned reset of the previous
+  boot, 8 light sleep disabled. The standard IDs are reused with this
+  meaning; `0x0000` reports on change only. Read them from ZHA
+  (Manage Zigbee device → Clusters → Diagnostic → Read attribute).
+- Cause word (reasons 7 and 8): bits 28-31 kind, 0-27 payload. Kind 1 wake
+  error, payload = variant << 24 | detail (1 unsupported depth, 2 sleep not
+  configured, 3 GPIO wake config, 4 HAL sleep error: 1 UnsupportedClock,
+  2 UnsupportedConfiguration, 4 InvalidDuration, 5 InvalidCounter, and
+  InvalidCalibration as 6 RTC slow-clock period 0, 7 RC_FAST calibration
+  timeout, 8 RC_FAST result out of range (3 = unspecified calibration
+  failure, written only by older firmware); 5 unexpected PMU wake cause, 6 repeated
+  PMU rejection with the reject cause, 7 radio wake failure); kind 2 panic,
+  payload = flash-code offset from `0x4200_0000` of the first return
+  address on the stack (the panicking function's caller; 0 if none),
+  resolve with `addr2line -f -e <elf> 0x4200_0000+offset` against the exact
+  ELF; kind 3 profile failure;
+  kind 4 hardware reset without a software cause, payload = the raw ROM
+  SoC reset reason (e.g. 0x0F brownout, 0x07-0x12 watchdogs). Software,
+  USB and debugger resets (0x03, 0x05, 0x0C, 0x15, 0x16, 0x18 CPU0_JTAG)
+  are planned and never produce kind 4; the code is read from the ROM, not
+  through esp-hal's `SocResetReason`, which has no 0x18 variant.
+- Sleep/reset resilience: before a software reset the cause is left in four
+  words of RTC fast memory (`.rtc_fast.persistent`, survives resets, not
+  power-on); the next boot notes it as reason 7 and logs one `[boot]` line
+  in non-quiet builds. A failed light sleep is retried as an active wait;
+  after `sleep_failure_limit` consecutive failures the boot stays awake and
+  records reason 8 with the wake error. After `rapid_reset_limit` boots in a
+  row shorter than `rapid_reset_window_ms`, the next boot keeps light sleep
+  off and records reason 8 once (cause = carried reset cause).
+- Light sleep stops XTAL and RC_FAST (`sleep_xtal_off`,
+  `sleep_rc_fast_off`) and applies ESP-IDF's light-sleep analog settings
+  (see `vendor/esp-hal/LOCAL-PATCHES.md`). CPU, top, modem and flash
+  domains stay powered.
+- CPU clock: the ESP-IDF bootloader leaves the H2 CPU on FLASH_PLL
+  (64 MHz from BBPLL, source 3). Earlier HAL code rejected that source, so
+  every sleep failed with `UnsupportedClock` (cause `0x14000001`, reason 8)
+  and the device drew a constant ~26 mA. The HAL now saves source and
+  dividers, sleeps on XTAL and restores FLASH_PLL after recalibrating BBPLL,
+  as IDF's `rtc_clk_cpu_freq_set_config` does. The code from the sleep
+  request to the clock restore runs entirely from RAM/ROM.
+- RC_FAST calibration: H2 ECO2+ (wafer v1.2 on the test board) measures
+  RC_FAST through the REF_TICK /32 divider, which needs
+  `PCR.ctrl_tick_conf.fosc_tick_num = 255` (IDF `REG_FOSC_TICK_NUM`). The
+  reset value 7 made every sleep fail with `InvalidCalibration`; the HAL
+  now sets it at init and before each RC_FAST calibration, and switches
+  RC_FAST/RC32K back off afterwards when it had to enable them. XTAL32K and
+  RC32K are no longer kept running (the slow clock is RC_SLOW).
+- Boot self-test: `sleep_selftest = true` (non-`quiet` builds with
+  `light-sleep`, e.g. `H2_THERMO_SLEEP_SELFTEST=true cargo build --release
+  --bin esp32h2-thermometer --features thermometer,light-sleep`) runs
+  `sleep_selftest_count` timer-only light sleeps of `sleep_selftest_ms`
+  through the production backend before the radio starts, even with USB
+  attached, and logs chip revision, `ctrl_tick_conf`, the slow period and
+  per sleep OK/cause word, the RTC-measured duration and the wake cause.
+
+- Poll-response window: `poll_response_wait_ms` (default 32, range
+  10..=1000) bounds how long a data poll listens after an ACK with Frame
+  Pending. 32 ms covers 802.15.4 macMaxFrameTotalWaitTime (1986 symbols,
+  31.8 ms); the ESP backend default stays 250 ms for association. A frame
+  the parent sends later stays queued there and is fetched by the next poll;
+  pending APS/ZDO work keeps the 250 ms fast poll. On the WSTK capture of
+  `573f44f` each report spent ~250 ms in RX after an empty FP=1 ACK
+  (~6 mC of the ~8.2 mC report event); `014d77b` (32 ms window) still held
+  the CPU awake for the 250 ms until the poll that fetches the report's APS
+  ACK. Since then a wait for APS ACKs only light-sleeps at the fast-poll
+  depth (`fast_poll_light_sleep`), keeping the 250 ms cadence and the
+  fetching poll; ZDO responses, key exchanges, rejoins and fragmented
+  transfers still wait awake.
+- OTA: an active session (query, download, verify, activation wait) holds
+  the fast poll awake, bounded by `max_ota_awake_ms`. A NO_IMAGE_AVAILABLE
+  or failed Query Next Image Response, or the runtime's 120 s response
+  timeout, ends the session and the slow poll resumes at once; the former
+  fixed 120 s `OTA_KEEP_AWAKE_MS` tail (~213 mC on the `014d77b` capture,
+  triggered by ZHA's Image Notify) is gone. Device_annce retries are
+  `announce_retry_ms`/`announce_retries` in `thermometer.toml`.
+- Sleep-floor lab: `esp32h2-floor-lab` (`--no-default-features --features
+  floor-lab`, `floor_lab.toml`) starts no radio. With a USB host it dumps
+  the PMU sleep, pad, USB and clock registers before and after one light
+  sleep; without a host it disables the USB pad and cycles light sleep
+  (LED DIN untouched, isolated, driven low) and an LP-timer deep sleep, so a
+  power trace separates board quiescent current from chip sleep
+  configuration. H2 deep sleep is a local esp-hal backport (timer wake
+  only, see `vendor/esp-hal/LOCAL-PATCHES.md`); production images do not
+  link it. On the H2-Zero (WSTK AEM, 3.3 V) the lab measured light sleep
+  1.10 mA (= the production floor), 0.97 mA with GPIO8 isolated, 1.18 mA
+  with GPIO8 driven low and 0.73 mA in deep sleep.
+- **Known board limit (Waveshare ESP32-H2-Zero):** ~0.73 mA flows even in
+  deep sleep, so it is board quiescent current, not chip configuration. The
+  WS2812 sits on the unswitched 3V3 rail and the LDO may be back-fed from
+  VMCU; the two cannot be told apart without rework, and no rework is
+  planned (the parts are too small). Battery estimates for this board must
+  include it. Firmware work on the light-sleep configuration is measured as
+  **B − D** (lab phase B, light sleep with GPIO8 isolated, minus phase D,
+  deep sleep), which cancels the board current: ≈240 µA at `22674da`
+  against ~80 µA expected from the datasheet light/deep difference.
+- Sleep pad isolation: `sleep_isolate_gpio_mask` (bit n = GPIOn) lists the
+  pads the thermometer does not use. Once at boot they are switched to
+  GPIO function, output/input/pulls disabled in both the active and the
+  sleep pad configuration, and `SLP_SEL` set, like ESP-IDF's
+  `esp_sleep_config_gpio_isolate()` + `esp_sleep_enable_gpio_switch()` but
+  limited to an explicit mask. The default `0x02407DFF` covers GPIO0-8,
+  10-14, 22 and 25 on the H2-Zero (GPIO8 = WS2812 DIN, isolated like lab
+  phase B). The build refuses GPIO9 (BOOT/Poll Control button), the flash
+  pads GPIO15-20 and USB GPIO26/27 (also checked in
+  `products/esp32-zigbee-devkit::pad_isolation`), and UART0 GPIO23/24
+  unless `quiet`. A driver that claims a pad later reconfigures it.
+- HP_SLEEP PMU parity with ESP-IDF v5.5.1: the H2 init writes the
+  `PMU_HP_SLEEP_*_CONFIG_DEFAULT` values IDF sets once and its sleep path
+  never rewrites (HP APB clock gates closed, the dedicated sleep memory and
+  logic regulators off), and light sleep gates the HP function clocks
+  (`icg_func = 0`, IDF `get_sleep_clock_icg_flags()`). The reset values
+  kept both sleep regulators on and every clock gate open. The modem ICG
+  code IDF leaves unconfigured on H2 is not written. Effect on B − D is a
+  **hardware gate**.
+
+Status: join, interview, temperature reporting, the anomaly record and
+retained light sleep with XTAL/RC_FAST off are lab-tested on one H2 board
+(WSTK AEM: polls every 29.8 s, but a flat 1.10 mA sleep floor, so ~1.13 mA
+average; 0.73 mA of it is the H2-Zero board limit above). Pad isolation and
+the HP_SLEEP parity values are built but not yet measured. A tens-of-uA
+floor needs a different board; on the H2-Zero the target is B − D near
+80 µA. Reporting persistence across a power cycle and Poll Control check-in
+remain **hardware gates**.
+
 ## Product-owned flash layout
 
 The checked 4 MiB table is:
@@ -184,6 +356,8 @@ The checked 4 MiB table is:
 0x3F0000..0x400000  zbnv
 0x3F0000..0x3F2000  router child table within zbnv (router image only)
 0x3F2000..0x3F4000  router APS table within zbnv (router image only)
+0x3F4000..0x3F6000  reporting journal within zbnv (reporting-persist)
+0x3F6000..0x3F8000  anomaly journal within zbnv (anomaly-record)
 0x3FE000..0x400000  security journal within zbnv
 ```
 
@@ -404,6 +578,10 @@ Open hardware gates:
 - No packet sniffer has confirmed the turnaround timing of individual ACKs.
 - Light sleep is vetoed while the native USB Serial/JTAG session is
   attached. Sleep power needs a cold boot from a power-only supply.
-- Light-sleep current has not been measured.
+- Light-sleep current in normal operation has not been measured. An H2
+  SED that had lost end-to-end delivery through its parent was measured
+  stuck in `Active` at ~26.4 mA (WSTK AEM); the shared recovery changes
+  (bounded Active time, staged rejoin with slept backoff) target that
+  defect and still need an AEM rerun.
 - The H2 ED and sensor role images are build-, layout- and symbol-checked
   only.

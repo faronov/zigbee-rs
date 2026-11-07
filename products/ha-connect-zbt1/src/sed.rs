@@ -28,7 +28,7 @@ pub static SED_POLICY: SensorPolicy = SensorPolicy {
     join_retry_ms: 15_000,
     announce_retry_ms: 8_000,
     announce_retries: 5,
-    secure_rejoin_failure_limit: 4,
+    secure_rejoin_failure_limit: 0,
     interview_complete_grace_ms: 5_000,
     // Unused (no button), but must be valid.
     button: ButtonPolicy {
@@ -45,6 +45,7 @@ pub static SED_POLICY: SensorPolicy = SensorPolicy {
     },
     fast_sleep_depth: SleepDepth::Active,
     slow_sleep_depth: SleepDepth::Retention,
+    recovery: sensor_sed_app::RecoveryPolicy::DEFAULT,
 };
 
 pub type SedProfile = DeviceProfile<RangeExtender>;

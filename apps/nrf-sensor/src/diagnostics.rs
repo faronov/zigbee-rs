@@ -240,6 +240,12 @@ impl Diagnostics for NrfDiagnostics {
                 configured,
                 expected
             ),
+            DiagnosticEvent::ParentLossSuspected { strikes } => {
+                defmt::warn!("Parent loss suspected after {} strikes; rejoining", strikes)
+            }
+            DiagnosticEvent::Anomaly { reason, total } => {
+                defmt::warn!("Anomaly reason {} (total {})", reason.code(), total)
+            }
             DiagnosticEvent::WakeFailed => defmt::error!("Atomic radio wait failed"),
         }
     }

@@ -21,7 +21,7 @@ generic application matching:
 ```rust,ignore
 match ota.handle_event(&mut node, event).await {
     OtaEventOutcome::NotHandled => { /* generic event match */ }
-    OtaEventOutcome::Handled { keep_awake_ms, activation_pending } => { /* ... */ }
+    OtaEventOutcome::Handled { activation_pending } => { /* ... */ }
     OtaEventOutcome::Unexpected => { /* diagnose invalid pairing */ }
 }
 ```
@@ -29,23 +29,30 @@ match ota.handle_event(&mut node, event).await {
 The OTA implementation reports `activation_pending`; it must not reset from
 `handle_event` or `service`. The shared application:
 
-1. extends the active/fast-poll window;
-2. checkpoints network keys and security counters;
-3. calls `OtaLifecycle::activate`.
+1. checkpoints network keys and security counters;
+2. calls `OtaLifecycle::activate`.
 
 This keeps a reset-causing bootloader transition behind the durable security
 checkpoint.
 
-An OTA-handled event retains the lifecycle's explicit `keep_awake_ms` window;
-generic commissioning activity must not replace it with a shorter or longer
-deadline. Periodic OTA service uses the same checkpoint/activation path.
+OTA has no timed keep-awake window. The fast poll (with the CPU awake) is
+held exactly while `OtaLifecycle::is_active` reports a session: query sent,
+download, verification or activation wait. The session itself is bounded by
+`RecoveryPolicy::max_ota_awake_ms` (abort plus anomaly reason 2) and by the
+runtime's response timeout. A Query Next Image Response with
+NO_IMAGE_AVAILABLE or any other non-success status, an Image Notify declined
+by QueryJitter, a response timeout, a failure or an abort ends the session,
+and the device returns to its slow poll on the next service iteration. An
+OTA event never opens, extends or shortens the generic commissioning or
+interview window. Periodic OTA service uses the same checkpoint/activation
+path.
 If reading or writing the security checkpoint fails, the application records
 the persistence fault and stops before invoking activation.
 
 The shared sensor host regressions cover both event-driven and service-driven
 activation, failed checkpoint reads and counter-reservation writes, recovery
-with non-reused counters, and OTA windows shorter and longer than the normal
-commissioning window. These use a real `ZigbeeNode` with `MockMac` and an
+with non-reused counters, an Image Notify answered with NO_IMAGE_AVAILABLE
+(no fast-poll tail), and OTA events that leave the interview window intact. These use a real `ZigbeeNode` with `MockMac` and an
 instrumented store; they do not qualify a physical flash writer or bootloader.
 
 ## Profile pairing

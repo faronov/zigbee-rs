@@ -321,6 +321,23 @@ if poll.tick() { // call every 250 ms (quarter-second)
 }
 ```
 
+`PollControlCluster::with_config(PollControlConfig { .. })` sets the
+power-on attribute values and the ranges a client may write or request
+(check-in minimum, long-poll min/max, fast-poll timeout maximum). Commands
+outside those ranges return `INVALID_VALUE`. `take_fast_poll_event()`
+reports Check-in Response fast-poll starts and Fast Poll Stop to the
+application, which owns the actual poll period. `sensor-sed-app` services
+this through `SensorProfile::poll_control_mut`.
+
+`state()` / `restore_state()` expose the client-changeable values
+(`PollControlState`: CheckInInterval, LongPollInterval, ShortPollInterval,
+FastPollTimeout). `restore_state` validates them together against the
+product's `PollControlConfig` limits and refuses an inconsistent state.
+`zigbee_runtime::reporting_store::ReportingPersistence::{restore_with,
+sync_with}` persists them as an optional 13-byte section of the reporting
+snapshot, bound to the joined extended PAN ID; without a persistence
+backend the values revert to the product defaults after a reset.
+
 ---
 
 ## Green Power (0x0021)

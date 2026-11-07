@@ -7204,6 +7204,38 @@ mod tests {
         );
     }
 
+    /// Unicasts that exhaust every retry count as end-to-end failures until
+    /// an APS ACK proves delivery again (parent-loss evidence for a SED).
+    #[test]
+    #[cfg(feature = "router")]
+    fn exhausted_acknowledged_unicasts_count_until_an_ack_arrives() {
+        let mut aps = aps_node(DeviceType::EndDevice, LOCAL_SHORT);
+        for counter in [0x40, 0x41] {
+            aps.register_ack_pending(counter, 0x0000, &[0xAA])
+                .expect("a free ACK slot");
+            for _ in 0..=3 {
+                advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US);
+                let _ = aps.age_ack_table();
+            }
+        }
+        assert_eq!(aps.consecutive_ack_failures(), 2);
+
+        aps.register_ack_pending(0x42, 0x0000, &[0xAA])
+            .expect("a free ACK slot");
+        assert!(aps.confirm_ack(0x0000, 0x42));
+        assert_eq!(aps.consecutive_ack_failures(), 0);
+
+        aps.register_ack_pending(0x43, 0x0000, &[0xAA])
+            .expect("a free ACK slot");
+        for _ in 0..=3 {
+            advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US);
+            let _ = aps.age_ack_table();
+        }
+        assert_eq!(aps.consecutive_ack_failures(), 1);
+        aps.clear_ack_failures();
+        assert_eq!(aps.consecutive_ack_failures(), 0);
+    }
+
     /// An acknowledgement that arrives inside the wait window ends the
     /// transmission: no retry is ever put on the air and the slot is freed.
     #[test]

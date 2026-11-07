@@ -456,6 +456,16 @@ impl<M: MacDriver> BdbLayer<M> {
         self.tclk_exchange = None;
     }
 
+    /// Select the scan of the next previous-network rejoin: `false` scans
+    /// only the last operating channel, `true` the widened channel sets
+    /// (every 2.4 GHz channel when they add nothing to the last channel).
+    ///
+    /// Each rejoin attempt still flips the selection afterwards; a caller
+    /// that drives an explicit staged schedule sets it before every stage.
+    pub fn set_rejoin_scan_widened(&mut self, widened: bool) {
+        self.rejoin_scan_widened = widened;
+    }
+
     /// Whether an event-driven unique Trust Center link-key exchange is still
     /// running. The runtime uses this to decide when to advance commissioning
     /// security from its tick/poll loop.

@@ -1,0 +1,34 @@
+# ESP32-H2 sleep-floor lab (`esp32h2-floor-lab` bin, `floor-lab` feature).
+# No Zigbee: separates the board's quiescent current from the chip's
+# light-sleep configuration. Every key is required; `H2_FLOOR_<KEY>`
+# overrides a value at build time.
+#
+#   cargo build --release --no-default-features --features floor-lab --bin esp32h2-floor-lab
+#
+# With a USB host (start-of-frame seen within `usb_host_wait_ms`): register
+# dump, one light sleep, dump again, then stay awake and re-dump every
+# `usb_dump_interval_ms` so the board remains flashable.
+#
+# Without a host (WSTK/AEM): the USB pad is disabled as in the thermometer,
+# then each boot runs phases A-D, separated by `marker_ms` CPU-busy markers:
+#   A  light sleep, production oscillator flags, LED DIN (GPIO8) untouched
+#   B  light sleep, GPIO8 input/pulls/output all off
+#   C  light sleep, GPIO8 driven low. On a board with a DIN pull-up to 3V3
+#      (H2-Zero R1 = 10 kOhm) this ADDS ~330 uA: it identifies the pull-up,
+#      it does not reduce the floor.
+#   D  deep sleep (LP timer wake = chip reset, then A again)
+
+# Milliseconds to wait for a USB host before the pad is disabled (100..=10000).
+usb_host_wait_ms = 1000
+# Register re-dump period while a USB host is attached (1000..=60000).
+usb_dump_interval_ms = 5000
+# Oscillators stopped in light sleep; keep equal to thermometer.toml.
+sleep_xtal_off = true
+sleep_rc_fast_off = true
+# Phase lengths in seconds (A, B: 5..=600; C: 5..=600; D: 5..=3600).
+light_default_s = 20
+light_isolated_s = 20
+light_drive_low_s = 10
+deep_s = 30
+# CPU-busy marker between phases, milliseconds (100..=5000).
+marker_ms = 500

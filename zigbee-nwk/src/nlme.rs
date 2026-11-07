@@ -176,6 +176,19 @@ pub struct RejoinParentCriteria {
     pub device_type: DeviceType,
     /// Parent we were attached to. Implementation tie-break only.
     pub previous_parent: Option<ShortAddress>,
+    /// Highest link cost accepted by the current selection pass. Starts at
+    /// [`MAX_PARENT_LINK_COST`]; only [`Self::select`]'s poor-link fallback
+    /// raises it.
+    pub max_link_cost: u8,
+    /// When no candidate meets [`MAX_PARENT_LINK_COST`], retry the selection
+    /// accepting any valid link cost (1..=7), still ranked by depth then cost.
+    ///
+    /// This is an implementation recovery policy, not R22 text: association
+    /// (§3.6.1.4.1) on this stack applies no link-cost gate either, and a
+    /// device whose only reachable parents are marginal is better served by a
+    /// poor parent than by staying orphaned. Every other R22 gate (network,
+    /// capacity, update id) still applies. Enabled by default.
+    pub poor_link_fallback: bool,
 }
 
 impl RejoinParentCriteria {
@@ -195,7 +208,15 @@ impl RejoinParentCriteria {
             nwk_update_id,
             device_type,
             previous_parent: None,
+            max_link_cost: MAX_PARENT_LINK_COST,
+            poor_link_fallback: true,
         }
+    }
+
+    /// Enable or disable the poor-link fallback of [`Self::select`].
+    pub const fn with_poor_link_fallback(mut self, enabled: bool) -> Self {
+        self.poor_link_fallback = enabled;
+        self
     }
 
     /// Prefer `parent` when every other criterion ties.
@@ -220,10 +241,11 @@ impl RejoinParentCriteria {
     /// Link cost of `candidate`, or `None` when it is invalid or unusable.
     ///
     /// A cost of `0` is invalid (link costs start at `1`) and a cost above
-    /// [`MAX_PARENT_LINK_COST`] is too poor to parent us.
+    /// [`Self::max_link_cost`] (normally [`MAX_PARENT_LINK_COST`]) is too poor
+    /// to parent us.
     pub fn link_cost(&self, candidate: &NetworkDescriptor) -> Option<u8> {
         let cost = crate::neighbor::link_cost_from_lqi(candidate.lqi);
-        if cost == 0 || cost > MAX_PARENT_LINK_COST {
+        if cost == 0 || cost > self.max_link_cost {
             return None;
         }
         Some(cost)
@@ -369,7 +391,23 @@ impl RejoinParentCriteria {
     ///
     /// Unsuitable entries are kept at the tail in discovery order rather than
     /// dropped, so callers can still report them as diagnostics.
+    ///
+    /// When no candidate is suitable at [`MAX_PARENT_LINK_COST`] and
+    /// [`Self::poor_link_fallback`] is set, a second pass accepts any valid
+    /// link cost.
     pub fn select(&self, networks: &mut [NetworkDescriptor]) -> usize {
+        let suitable = self.select_pass(networks);
+        if suitable == 0 && self.poor_link_fallback && self.max_link_cost < 7 {
+            return Self {
+                max_link_cost: 7,
+                ..*self
+            }
+            .select_pass(networks);
+        }
+        suitable
+    }
+
+    fn select_pass(&self, networks: &mut [NetworkDescriptor]) -> usize {
         let Some(most_recent_update_id) = self.most_recent_update_id(networks) else {
             return 0;
         };
@@ -1998,6 +2036,38 @@ mod tests {
     }
 
     #[test]
+    fn rejoin_falls_back_to_poor_links_only_when_nothing_better_exists() {
+        // Raw-scale LQI (as the ESP radio used to report) maps to cost 7 for
+        // every router; strict R22 selection would strand the device.
+        let mut poor = [
+            candidate(0x0001, 9, 5, 2, REJOIN_EPID),
+            candidate(0x0002, UNUSABLE_LQI, 5, 2, REJOIN_EPID),
+            candidate(0x0003, UNUSABLE_LQI, 5, 1, OTHER_EPID),
+            candidate_with_capacity(0x0004, UNUSABLE_LQI, 5, 0, false, false),
+        ];
+        let criteria = end_device_criteria(5);
+        assert_eq!(
+            criteria
+                .with_poor_link_fallback(false)
+                .select(&mut poor.clone()),
+            0
+        );
+        // Fallback: other gates still apply, then depth, then link cost.
+        assert_eq!(criteria.select(&mut poor), 2);
+        assert_eq!(poor[0].router_address, ShortAddress(0x0002));
+        assert_eq!(poor[1].router_address, ShortAddress(0x0001));
+
+        // A single strictly usable parent wins outright; poor links are
+        // not mixed in.
+        let mut mixed = [
+            candidate(0x0001, UNUSABLE_LQI, 5, 0, REJOIN_EPID),
+            candidate(0x0002, WEAK_LQI, 5, 3, REJOIN_EPID),
+        ];
+        assert_eq!(criteria.select(&mut mixed), 1);
+        assert_eq!(mixed[0].router_address, ShortAddress(0x0002));
+    }
+
+    #[test]
     fn rejoin_keeps_only_the_most_recent_update_id() {
         let criteria = end_device_criteria(4);
         let mut networks = [
@@ -2038,8 +2108,15 @@ mod tests {
             candidate(0x0003, GOOD_LQI, 0x01, 0, OTHER_EPID),
         ];
         assert_eq!(criteria.most_recent_update_id(&none), None);
+        let mut strict = none.clone();
+        assert_eq!(
+            criteria.with_poor_link_fallback(false).select(&mut strict),
+            0
+        );
+        // The poor-link fallback recovers only the unusable-cost candidate.
         let mut none = none;
-        assert_eq!(criteria.select(&mut none), 0);
+        assert_eq!(criteria.select(&mut none), 1);
+        assert_eq!(none[0].router_address, ShortAddress(0x0002));
     }
 
     // ── Unknown local nwkUpdateId ───────────────────────────

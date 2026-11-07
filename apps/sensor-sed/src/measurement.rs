@@ -15,6 +15,7 @@ use zigbee_runtime::profile::{
     ApplicationProfile, BatteryMeasurement, DeviceProfile, PlantSensor, RangeExtender,
     TemperatureHumidityMeasurement,
 };
+use zigbee_zcl::clusters::poll_control::PollControlCluster;
 
 use crate::diagnostics::{DiagnosticEvent, Diagnostics};
 use crate::environment::{EnvironmentSource, EnvironmentalSensorProfile};
@@ -43,11 +44,20 @@ impl SampleTrigger {
 /// separately sampled [`crate::BatterySource`] reading.
 pub trait SensorProfile: ApplicationProfile {
     fn update_battery(&mut self, measurement: BatteryMeasurement);
+    /// The profile's Poll Control (0x0020) server, when fitted; see
+    /// [`crate::EnvironmentSink::poll_control_mut`].
+    fn poll_control_mut(&mut self) -> Option<&mut PollControlCluster> {
+        None
+    }
 }
 
 impl<P: EnvironmentalSensorProfile> SensorProfile for P {
     fn update_battery(&mut self, measurement: BatteryMeasurement) {
         EnvironmentalSensorProfile::update_battery(self, measurement);
+    }
+
+    fn poll_control_mut(&mut self) -> Option<&mut PollControlCluster> {
+        EnvironmentalSensorProfile::poll_control_mut(self)
     }
 }
 

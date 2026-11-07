@@ -589,6 +589,10 @@ pub struct ApsLayer<M: MacDriver> {
     ack_completions: heapless::Vec<ApsAckHandle, APS_ACK_TABLE_SIZE>,
     /// Identity assigned to the next acknowledged outbound transaction.
     next_ack_generation: u16,
+    /// Acknowledged unicasts that exhausted their retries since the last
+    /// APS ACK arrived (saturating): end-to-end delivery evidence that the
+    /// MAC-level parent acknowledgement cannot provide.
+    consecutive_ack_failures: u8,
     /// Fragment reassembly buffer for incoming fragmented frames
     fragment_rx: fragment::FragmentReassembly,
 }
@@ -632,6 +636,7 @@ impl<M: MacDriver> ApsLayer<M> {
             fragment_tx_confirm: None,
             ack_table: heapless::Vec::new(),
             ack_completions: heapless::Vec::new(),
+            consecutive_ack_failures: 0,
             next_ack_generation: 1,
             fragment_rx: fragment::FragmentReassembly::new(),
         }
@@ -1070,12 +1075,38 @@ impl<M: MacDriver> ApsLayer<M> {
         })
     }
 
+    /// Acknowledged unicasts that failed end to end (no APS ACK after every
+    /// retry) since the last APS ACK arrived or [`Self::clear_ack_failures`].
+    pub fn consecutive_ack_failures(&self) -> u8 {
+        self.consecutive_ack_failures
+    }
+
+    /// Forget accumulated end-to-end failures, e.g. after other evidence
+    /// that the network delivers (an authenticated inbound frame, a rejoin).
+    pub fn clear_ack_failures(&mut self) {
+        self.consecutive_ack_failures = 0;
+    }
+
     /// Whether an outbound unicast still needs its peer's acknowledgement.
     pub fn has_pending_ack(&self) -> bool {
         #[cfg(feature = "fragmentation")]
         if self.fragment_tx.is_some() {
             return true;
         }
+        self.unicast_ack_pending()
+    }
+
+    /// Whether unfragmented unicasts wait for their acknowledgement and no
+    /// fragmented transmission is in progress.
+    pub fn awaits_unicast_ack_only(&self) -> bool {
+        #[cfg(feature = "fragmentation")]
+        if self.fragment_tx.is_some() {
+            return false;
+        }
+        self.unicast_ack_pending()
+    }
+
+    fn unicast_ack_pending(&self) -> bool {
         self.ack_table
             .iter()
             .any(|entry| entry.active && !entry.confirmed)
@@ -1126,6 +1157,7 @@ impl<M: MacDriver> ApsLayer<M> {
                     return false;
                 }
                 entry.confirmed = true;
+                self.consecutive_ack_failures = 0;
                 let handle = ApsAckHandle::new(src_addr, aps_counter, entry.generation);
                 if !self.ack_completions.contains(&handle) {
                     if self.ack_completions.is_full() {
@@ -1271,6 +1303,7 @@ impl<M: MacDriver> ApsLayer<M> {
                 );
                 entry.active = false;
                 entry.original_frame.clear();
+                self.consecutive_ack_failures = self.consecutive_ack_failures.saturating_add(1);
             } else {
                 entry.retries = entry.retries.saturating_sub(1);
                 entry.waiting_since_us = now;

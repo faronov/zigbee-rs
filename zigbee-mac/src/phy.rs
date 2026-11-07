@@ -171,6 +171,16 @@ pub trait RadioPhy {
     /// with Frame Pending set, in microseconds.
     const POLL_RESPONSE_WAIT_US: u32 = 30_000;
 
+    /// Data-poll response window in microseconds: how long
+    /// [`SoftMacCore`](crate::SoftMacCore)'s data poll listens after an ACK
+    /// with Frame Pending set.
+    ///
+    /// Defaults to [`Self::POLL_RESPONSE_WAIT_US`]. A backend may expose a
+    /// product-configured value; association polls keep the constant.
+    fn poll_response_wait_us(&self) -> u32 {
+        Self::POLL_RESPONSE_WAIT_US
+    }
+
     /// After a short-source Data Request returns no frame, repeat the poll
     /// once with the extended source address.
     ///

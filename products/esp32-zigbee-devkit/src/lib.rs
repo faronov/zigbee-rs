@@ -14,6 +14,8 @@
 //!   OTA composed in only where a backend for it exists.
 //! * [`chip_temperature`] — ESP-IDF-equivalent TSENS range selection and
 //!   per-chip eFuse calibration for the on-die temperature source.
+//! * [`pad_isolation`] — ESP-IDF-style isolation of the GPIO pads a product
+//!   declares unused (ESP32-H2), for light-sleep current.
 //!
 //! Both supported chips own a two-slot OTA partition table and firmware
 //! writer:
@@ -47,15 +49,32 @@ compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 #[cfg(not(any(feature = "esp32c6", feature = "esp32h2")))]
 compile_error!("select exactly one of the esp32c6 or esp32h2 features");
 
+#[cfg(all(target_os = "none", feature = "anomaly-record"))]
+pub mod anomaly;
 pub mod chip_temperature;
 #[cfg(feature = "roles")]
 pub mod end_device;
 #[cfg(any(target_os = "none", test))]
 pub mod executor;
+#[cfg(all(
+    target_os = "none",
+    any(
+        feature = "roles",
+        feature = "reporting-persist",
+        feature = "anomaly-record"
+    )
+))]
+mod flash_window;
 pub mod migration;
+#[cfg(feature = "esp32h2")]
+pub mod pad_isolation;
 #[cfg(feature = "sed")]
 pub mod policy;
 pub mod profile;
+#[cfg(all(target_os = "none", feature = "reporting-persist"))]
+pub mod reporting;
+#[cfg(feature = "sed")]
+pub mod reset_cause;
 #[cfg(feature = "roles")]
 pub mod router;
 pub mod sleep;

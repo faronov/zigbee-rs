@@ -44,6 +44,11 @@ sed = ["dep:sensor-sed-app"]
 # router's child/APS journals.
 roles = ["dep:router-app"]
 light-sleep = []
+# Persist ZCL Configure Reporting state in `zbnv` (sleepy sensor images).
+reporting-persist = []
+# Persist the sleepy sensor's anomaly record (fired keep-awake limits) in
+# `zbnv`; written only when a limit fires.
+anomaly-record = ["sed"]
 esp32c6 = ["esp32-zigbee-devkit/esp32c6", "esp-hal/esp32c6", "zigbee-runtime/ota"]
 esp32h2 = ["esp32-zigbee-devkit/esp32h2", "esp-hal/esp32h2", "zigbee-runtime/ota"]
 

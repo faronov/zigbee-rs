@@ -375,6 +375,12 @@ impl Clock for RtcSlowClock {
 #[instability::unstable]
 pub struct RtcClock;
 
+/// ESP-IDF v5.5.1 `REG_FOSC_TICK_NUM` (`hal/clk_tree_ll.h`), written by
+/// `clk_ll_rc_fast_tick_conf()` before every RC_FAST calibration: "enable a
+/// division of 32 to the fosc clock". Reset value 7.
+#[cfg(esp32h2)]
+pub(crate) const H2_FOSC_TICK_NUM: u8 = 255;
+
 /// RTC Watchdog Timer driver.
 impl RtcClock {
     const CAL_FRACT: u32 = 19;
@@ -751,9 +757,14 @@ impl RtcClock {
 
         // TODO: very hacky - icg_hp_xtal32k is already set in the above condition?
         // in ESP-IDF these are not called in this function but the fields are set
+        // H2: ESP-IDF v5.5.1 powers only the oscillator being calibrated; this
+        // block kept XTAL32K (GPIO13/14) and RC32K running for the whole boot
+        // although the H2 slow clock is RC_SLOW. C6 keeps the upstream code.
+        #[cfg(not(esp32h2))]
         LP_CLKRST::regs()
             .clk_to_hp()
             .modify(|_, w| w.icg_hp_xtal32k().set_bit());
+        #[cfg(not(esp32h2))]
         PMU::regs().hp_sleep_lp_ck_power().modify(|_, w| {
             w.hp_sleep_xpd_xtal32k().set_bit();
             w.hp_sleep_xpd_rc32k().set_bit()
@@ -870,6 +881,16 @@ impl RtcClock {
 
         // H2 ECO2's RC_FAST calibration divider belongs to REF_TICK.
         // ESP-IDF v5.5.1 esp32h2/rtc_time.c enables it for the measurement.
+        // `rtc_clk_cal_internal` also calls `clk_ll_rc_fast_tick_conf()` for
+        // RC_FAST, which the divided (/32) ECO2+ measurement relies on. A v1.2
+        // chip read back the reset value 7 and failed every RC_FAST
+        // calibration of the light-sleep path.
+        #[cfg(esp32h2)]
+        if cal_clk == RtcCalSel::RcFast {
+            PCR::regs()
+                .ctrl_tick_conf()
+                .modify(|_, w| unsafe { w.fosc_tick_num().bits(crate::clock::H2_FOSC_TICK_NUM) });
+        }
         #[cfg(esp32h2)]
         let saved_tick_enable = PCR::regs().ctrl_tick_conf().read().tick_enable().bit();
         #[cfg(esp32h2)]
@@ -925,6 +946,23 @@ impl RtcClock {
                 .modify(|_, w| w.icg_hp_xtal32k().clear_bit());
         }
 
+        // ESP-IDF v5.5.1 `rtc_clk_cal_internal`: switch the digital gate and
+        // then the oscillator back off if this calibration turned them on.
+        #[cfg(esp32h2)]
+        if cal_clk == RtcCalSel::RcFast {
+            if !dig_rc_fast_enabled {
+                LP_CLKRST::regs()
+                    .clk_to_hp()
+                    .modify(|_, w| w.icg_hp_fosc().clear_bit());
+            }
+            if !rc_fast_enabled {
+                PMU::regs()
+                    .hp_sleep_lp_ck_power()
+                    .modify(|_, w| w.hp_sleep_xpd_fosc_clk().clear_bit());
+            }
+        }
+        // C6 keeps the upstream (hardware-proven) behaviour unchanged.
+        #[cfg(not(esp32h2))]
         if cal_clk == RtcCalSel::RcFast {
             if rc_fast_enabled {
                 PMU::regs()
@@ -941,6 +979,20 @@ impl RtcClock {
             }
         }
 
+        #[cfg(esp32h2)]
+        if cal_clk == RtcCalSel::_32kRc {
+            if !dig_rc32k_enabled {
+                LP_CLKRST::regs()
+                    .clk_to_hp()
+                    .modify(|_, w| w.icg_hp_osc32k().clear_bit());
+            }
+            if !rc32k_enabled {
+                PMU::regs()
+                    .hp_sleep_lp_ck_power()
+                    .modify(|_, w| w.hp_sleep_xpd_rc32k().clear_bit());
+            }
+        }
+        #[cfg(not(esp32h2))]
         if cal_clk == RtcCalSel::_32kRc {
             if rc32k_enabled {
                 PMU::regs()

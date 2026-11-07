@@ -326,6 +326,18 @@ pub(crate) struct ReportDestination {
     endpoint: u8,
 }
 
+impl ReportDestination {
+    /// Whether an APS acknowledgement may be requested (R22 §2.2.8.4.4:
+    /// never for group or broadcast delivery).
+    fn is_unicast(&self) -> bool {
+        match (self.mode, self.address) {
+            (ApsAddressMode::Extended, _) => true,
+            (ApsAddressMode::Short, ApsAddress::Short(address)) => address.0 < 0xFFF8,
+            _ => false,
+        }
+    }
+}
+
 /// Result of sending a set of collected attribute reports.
 pub(crate) struct ReportSendOutcome {
     /// Report Attributes frames accepted by APS.
@@ -936,6 +948,67 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
         destinations
     }
 
+    /// Send a cluster-specific command from `endpoint` to every bound
+    /// destination of `cluster_id`, resolved like reports (ZCL 2.5.11.2.1:
+    /// with no resolvable binding it goes to the coordinator).
+    ///
+    /// `server_to_client` sets the ZCL direction bit. Default responses are
+    /// disabled: the commands this serves (for example Poll Control
+    /// Check-in) have their own response. Returns the ZCL sequence number
+    /// used, or the last error when no destination took the frame.
+    pub async fn send_bound_cluster_command(
+        &mut self,
+        endpoint: u8,
+        cluster_id: u16,
+        server_to_client: bool,
+        command_id: u8,
+        payload: &[u8],
+    ) -> Result<u8, SendError> {
+        const HEADER: usize = 3;
+        if !self.is_joined() {
+            return Err(SendError::NotJoined);
+        }
+        let mut frame = [0u8; REPORT_FRAME_CAP];
+        let Some(body) = frame.get_mut(HEADER..HEADER + payload.len()) else {
+            return Err(SendError::PayloadTooLong);
+        };
+        body.copy_from_slice(payload);
+        // Cluster-specific, disable default response, optional direction.
+        frame[0] = 0x01 | 0x10 | if server_to_client { 0x08 } else { 0 };
+        let sequence = self.next_zcl_seq();
+        frame[1] = sequence;
+        frame[2] = command_id;
+        let mut last_error = ApsStatus::NoBoundDevice;
+        let mut accepted = false;
+        for dst in self.report_destinations(endpoint, cluster_id).iter() {
+            let req = ApsdeDataRequest {
+                dst_addr_mode: dst.mode,
+                dst_address: dst.address,
+                dst_endpoint: dst.endpoint,
+                profile_id: 0x0104, // Home Automation
+                cluster_id,
+                src_endpoint: endpoint,
+                payload: &frame[..HEADER + payload.len()],
+                tx_options: ApsTxOptions {
+                    use_nwk_key: true,
+                    ..ApsTxOptions::default()
+                },
+                radius: 0,
+                alias_src_addr: None,
+                alias_seq: None,
+            };
+            match self.bdb.zdo_mut().aps_mut().apsde_data_request(&req).await {
+                Ok(_) => accepted = true,
+                Err(e) => last_error = e,
+            }
+        }
+        if accepted {
+            Ok(sequence)
+        } else {
+            Err(SendError::Aps(last_error))
+        }
+    }
+
     /// Send `records` as one or more whole-record Report Attributes frames.
     ///
     /// Sending stops at the first failure; [`ReportSendOutcome::failure`]
@@ -997,6 +1070,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
                     payload: &zcl_buf[..3 + payload_len],
                     tx_options: ApsTxOptions {
                         use_nwk_key: true,
+                        ack_request: self.report_aps_ack && dst.is_unicast(),
                         ..ApsTxOptions::default()
                     },
                     radius: 0,

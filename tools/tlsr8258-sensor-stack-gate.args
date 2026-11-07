@@ -8,9 +8,9 @@
 #
 # Budget history: the image had a 20 KiB SVC stack. HIL paint measured a
 # 15,136 B high-water (fresh join + interview, CCM* decrypt), but this
-# analyzer bounds the app-level rejoin-failure fallback (SensorApp::
-# record_failed_rejoin -> steering -> nlme_network_discovery -> radio TX)
-# at ~22.2 KB, which is reachable in principle. The leaf images therefore
+# analyzer bounded the app-level rejoin-failure fallback, then nested under
+# the failing secure rejoin (SensorApp::record_failed_rejoin -> steering ->
+# nlme_network_discovery -> radio TX), at ~22.4 KB. The leaf images therefore
 # use a 24 KiB SVC stack with a 64 B guard and >= 4 KiB of free RAM between
 # the last static byte and the guard.
 
@@ -29,10 +29,19 @@ _rust_entry
 # on the final ELF (22,236 B) and rounded up to the next 256 B boundary. The
 # rejoin-failure budget also fails if that path stops being reachable or
 # analyzed, so the root worst case can never silently drop it.
+# Re-baselined 22272 -> 22528 for the SED recovery change (staged rejoin,
+# APS-ack strikes, RecoveryPolicy): the app future grew and secure_rejoin()
+# gained a second caller, so it is no longer inlined. Worst path 22,236 ->
+# 22,348 B (+112 B), 2,228 B under the declared 24 KiB SVC stack.
+# Re-targeted and tightened when the reset-and-fresh-join fallback moved out
+# of the failing chain: record_failed_rejoin() now only schedules it, and
+# service_fallback_rejoin() runs it from the top of the lifecycle (cold
+# start, end of a step). Fallback chain 22,428 -> 19,404 B; worst path and
+# steering-rejoin 22,428 -> 20,644 B, 3,932 B under the declared SVC stack.
 --chain-budget
-rejoin-failure=SensorApp<.*>::record_failed_rejoin=22272
+rejoin-failure=SensorApp<.*>::(service_fallback_rejoin|rejoin_after_reset)=19456
 --chain-budget
-steering-rejoin=(start_or_resume_steering|secure_rejoin|rejoin_with|start_fresh_steering|nlme_network_discovery)=22272
+steering-rejoin=(start_or_resume_steering|secure_rejoin|rejoin_with|start_fresh_steering|nlme_network_discovery)=20736
 
 # Reviewed functions with unresolved indirect call sites (dyn FnMut /
 # cluster vtables / flash guard hooks). Same list as the router gate plus the

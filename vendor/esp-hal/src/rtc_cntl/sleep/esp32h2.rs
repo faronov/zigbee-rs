@@ -1,6 +1,19 @@
 use core::ops::Not;
 
-use super::retained::{RetainedSleepError, calibrated_period, divided_fast_clock, timer_ticks};
+use super::retained::{
+    CalibrationFailure,
+    DbiasFuses,
+    PD_RC_FAST,
+    PD_XTAL,
+    RetainedSleepError,
+    SleepAnalog,
+    divided_fast_clock,
+    fast_clock_period,
+    h2_deep_sleep_analog,
+    h2_light_sleep_analog,
+    timer_ticks,
+    validate_deep,
+};
 use crate::{
     efuse::Efuse,
     rtc_cntl::{
@@ -117,7 +130,12 @@ impl DigitalSleepConfig {
 
                 cfg
             },
-            icg_func: 0xffff_ffff, // TODO: ESP-IDF determines this using get_sleep_clock_icg_flags
+            // ESP-IDF v5.5.1 `get_sleep_clock_icg_flags()`: a bit is set
+            // only while UART wake, LEDC sleep mode or the BLE-on-WiFi power
+            // clock holds a reference; none exists here, so light sleep
+            // gates every HP function clock and, with `icg_func == 0`,
+            // `apply` leaves the HP_SLEEP sysclk gate off as IDF does.
+            icg_func: 0,
             deep_sleep: false,
         }
     }
@@ -154,6 +172,23 @@ impl DigitalSleepConfig {
     }
 }
 
+/// Which 32 kHz oscillators the RTC slow clock needs powered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Slow32kUse {
+    xtal32k: bool,
+    rc32k: bool,
+}
+
+impl Slow32kUse {
+    fn of(slow: crate::clock::RtcSlowClock) -> Self {
+        use crate::clock::RtcSlowClock;
+        Self {
+            xtal32k: matches!(slow, RtcSlowClock::_32kXtal),
+            rc32k: matches!(slow, RtcSlowClock::_32kRc),
+        }
+    }
+}
+
 /// Configuration for controlling the power settings of high-power and low-power
 /// systems during sleep modes.
 #[derive(Clone, Copy)]
@@ -174,11 +209,12 @@ impl PowerSleepConfig {
             lp_sys_active: LpSysPower::default(),
             lp_sys_sleep: LpSysPower::default(),
         };
-        this.apply_flags(pd_flags);
+        let slow_32k = Slow32kUse::of(crate::clock::RtcClock::slow_freq());
+        this.apply_flags(pd_flags, slow_32k);
         this
     }
 
-    fn apply_flags(&mut self, pd_flags: PowerDownFlags) {
+    fn apply_flags(&mut self, pd_flags: PowerDownFlags, slow_32k: Slow32kUse) {
         // PMU_SLEEP_POWER_CONFIG_DEFAULT
         self.hp_sys
             .dig_power
@@ -187,22 +223,38 @@ impl PowerSleepConfig {
         self.hp_sys.dig_power.set_cpu_pd_en(pd_flags.pd_cpu());
         self.hp_sys.dig_power.set_top_pd_en(pd_flags.pd_top());
 
+        // ESP-IDF v5.5.1 H2 `PMU_SLEEP_POWER_CONFIG_DEFAULT`: isolate and
+        // retain the analog I2C (BBPLL/bias) registers while BBPLL is off.
+        // `apply()` writes the whole register, so leaving these clear drops
+        // the BBPLL configuration that flash-resident code needs after wake.
+        self.hp_sys.clk.set_i2c_iso_en(true);
+        self.hp_sys.clk.set_i2c_retention(true);
         self.hp_sys.clk.set_xpd_bbpll(false);
 
         self.hp_sys.xtal.set_xpd_xtal(pd_flags.pd_xtal().not());
 
-        self.lp_sys_active.clk_power.set_xpd_xtal32k(true);
-        self.lp_sys_active.clk_power.set_xpd_rc32k(true);
+        // ESP-IDF v5.5.1 `PMU_SLEEP_POWER_CONFIG_DEFAULT` with
+        // `PMU_SLEEP_PD_XTAL32K`/`PMU_SLEEP_PD_RC32K` set unless the domain is
+        // forced on, which IDF does only when that oscillator is the RTC slow
+        // clock. LP_ACTIVE is the register `clk_ll_xtal32k_enable` uses, so
+        // this also stops them for the awake periods after the first sleep.
+        self.lp_sys_active
+            .clk_power
+            .set_xpd_xtal32k(slow_32k.xtal32k);
+        self.lp_sys_active.clk_power.set_xpd_rc32k(slow_32k.rc32k);
         self.lp_sys_active.clk_power.set_xpd_fosc(true);
 
         self.lp_sys_sleep.dig_power.set_mem_dslp(true);
+        // ESP-IDF selects the VBAT brownout source only for deep sleep powered
+        // by VBAT (`pmu_sleep.c`, `RTC_SLEEP_POWER_BY_VBAT`); light sleep keeps
+        // the default VDD brownout source.
         self.lp_sys_sleep.dig_power.set_vddbat_mode(0);
-        self.lp_sys_sleep.dig_power.set_bod_source_sel(true);
+        self.lp_sys_sleep.dig_power.set_bod_source_sel(false);
 
         self.lp_sys_sleep
             .clk_power
-            .set_xpd_xtal32k(pd_flags.pd_xtal32k().not());
-        self.lp_sys_sleep.clk_power.set_xpd_rc32k(true);
+            .set_xpd_xtal32k(slow_32k.xtal32k && pd_flags.pd_xtal32k().not());
+        self.lp_sys_sleep.clk_power.set_xpd_rc32k(slow_32k.rc32k);
         self.lp_sys_sleep
             .clk_power
             .set_xpd_fosc(pd_flags.pd_rc_fast().not());
@@ -378,7 +430,7 @@ impl ParamSleepConfig {
         }
     }
 
-    fn defaults(config: SleepTimeConfig, pd_xtal: bool) -> Self {
+    fn defaults(config: SleepTimeConfig, xpd_xtal: bool) -> Self {
         let mut param = Self::PMU_SLEEP_PARAM_CONFIG_DEFAULT;
 
         // pmu_sleep_param_config_default
@@ -405,7 +457,8 @@ impl ParamSleepConfig {
         // This looks different from esp-idf but it is the same:
         // Both `xtal_stable_wait_cycle` and `xtal_stable_wait_slow_clk_cycle` are
         // u16 variants of the same union
-        param.hp_lp.xtal_stable_wait_cycle = if pd_xtal {
+        // ESP-IDF selects the slow-clock variant when XTAL stays powered.
+        param.hp_lp.xtal_stable_wait_cycle = if xpd_xtal {
             config.us_to_slowclk(machine_constants::LP_XTAL_WAIT_STABLE_TIME_US) as u16
         } else {
             config.us_to_fastclk(machine_constants::HP_XTAL_WAIT_STABLE_TIME_US) as u16
@@ -436,13 +489,15 @@ impl SleepTimeConfig {
         }
 
         let xtal_cycles = RtcClock::calibrate_internal(RtcCalSel::RcFast, slowclk_cycles);
-        calibrated_period(xtal_cycles, xtal_freq, slowclk_cycles)
+        fast_clock_period(xtal_cycles, xtal_freq, slowclk_cycles)
     }
 
     fn new() -> Result<Self, RetainedSleepError> {
         let slowclk_period = unsafe { lp_aon().store1().read().data().bits() };
         if slowclk_period == 0 {
-            return Err(RetainedSleepError::InvalidCalibration);
+            return Err(RetainedSleepError::InvalidCalibration(
+                CalibrationFailure::SlowClockPeriodZero,
+            ));
         }
 
         // Calibrate rtc fast clock, only PMU supported chips sleep process is needed.
@@ -483,11 +538,10 @@ impl SleepTimeConfig {
 
     fn pmu_sleep_calculate_hw_wait_time(&self, pd_flags: PowerDownFlags) -> u32 {
         let lp_clk_switch_time_us = self.slowclk_to_us(machine_constants::LP_CLK_SWITCH_CYCLE);
-        let lp_clk_power_on_wait_time_us = if pd_flags.pd_xtal() {
-            machine_constants::LP_XTAL_WAIT_STABLE_TIME_US
-        } else {
-            self.slowclk_to_us(machine_constants::LP_CLK_POWER_ON_WAIT_CYCLE)
-        };
+        // XTAL is never the RTC fast clock here (RC_FAST is), so it restarts
+        // in HP_SLEEP -> HP_ACTIVE and its wait belongs to the HP side.
+        let lp_clk_power_on_wait_time_us =
+            self.slowclk_to_us(machine_constants::LP_CLK_POWER_ON_WAIT_CYCLE);
 
         let lp_hw_wait_time_us = machine_constants::LP_MIN_SLP_TIME_US
             + machine_constants::LP_ANALOG_WAIT_TIME_US
@@ -503,8 +557,12 @@ impl SleepTimeConfig {
         } else {
             machine_constants::HP_REGDMA_S2A_WORK_TIME_PU_TOP_US
         };
-        let hp_clock_wait_time_us = machine_constants::HP_XTAL_WAIT_STABLE_TIME_US
-            + machine_constants::HP_PLL_WAIT_STABLE_TIME_US;
+        let hp_clock_wait_time_us = if pd_flags.pd_xtal() {
+            machine_constants::HP_XTAL_WAIT_STABLE_TIME_US
+                + machine_constants::HP_PLL_WAIT_STABLE_TIME_US
+        } else {
+            machine_constants::HP_PLL_WAIT_STABLE_TIME_US
+        };
 
         let hp_hw_wait_time_us = machine_constants::HP_ANALOG_WAIT_TIME_US
             + hp_digital_power_up_wait_time_us
@@ -536,10 +594,12 @@ impl Default for RtcSleepConfig {
     }
 }
 
+#[inline(always)]
 unsafe fn pmu<'a>() -> &'a esp32h2::pmu::RegisterBlock {
     unsafe { &*esp32h2::PMU::ptr() }
 }
 
+#[inline(always)]
 unsafe fn lp_aon<'a>() -> &'a esp32h2::lp_aon::RegisterBlock {
     unsafe { &*esp32h2::LP_AON::ptr() }
 }
@@ -586,6 +646,11 @@ mod machine_constants {
 }
 
 impl RtcSleepConfig {
+    /// Add the retained-sleep oscillator power-down request (local backport).
+    pub(crate) fn set_retained_power_down(&mut self, power_down: super::RetainedPowerDown) {
+        self.pd_flags.0 |= power_down.flags();
+    }
+
     /// Returns whether the device is in deep sleep mode.
     pub fn deep_slp(&self) -> bool {
         self.deep
@@ -618,14 +683,60 @@ impl RtcSleepConfig {
     ///
     /// This backport rejects non-retained configurations before changing clocks.
     pub(crate) fn start_sleep(&self, wakeup_triggers: WakeTriggers) {
+        if self.deep {
+            match unwrap!(self.start_deep_sleep(wakeup_triggers)) {}
+        }
         unwrap!(self.start_sleep_checked(wakeup_triggers));
+    }
+
+    /// ESP-IDF v5.5.1 H2 deep sleep (`esp_deep_sleep_start` ->
+    /// `pmu_sleep_init(dslp)` -> `pmu_sleep_start`), LP timer wake only.
+    ///
+    /// Local backport. Every HP domain, flash power, XTAL, RC_FAST and the
+    /// 32 kHz oscillators are powered down (`RtcSleepConfig::apply`); wake is
+    /// a chip reset through the ROM. Returns only when the request is refused
+    /// before any power state changed.
+    fn start_deep_sleep(
+        &self,
+        wakeup_triggers: WakeTriggers,
+    ) -> Result<core::convert::Infallible, RetainedSleepError> {
+        validate_deep(wakeup_triggers.0)?;
+        let clock = SavedClockConfig::try_save().ok_or(RetainedSleepError::UnsupportedClock)?;
+        rtc_clk_cpu_freq_set_xtal();
+        // Needs to happen after rtc_clk_cpu_freq_set_xtal, as for light sleep.
+        let time = match SleepTimeConfig::light_sleep(self.pd_flags) {
+            Ok(time) => time,
+            Err(error) => {
+                clock.restore();
+                return Err(error);
+            }
+        };
+        // pmu_sleep_config_default(dslp) + pmu_sleep_init(dslp)
+        let power = PowerSleepConfig::defaults(self.pd_flags);
+        power.apply();
+        DigitalSleepConfig::defaults_deep_sleep().apply();
+        AnalogSleepConfig::defaults_deep_sleep().apply();
+        apply_sleep_analog(&h2_deep_sleep_analog(&dbias_fuses()));
+        ParamSleepConfig::defaults(time, power.hp_sys.xtal.xpd_xtal()).apply();
+
+        // Deep sleep has no reject sources (ESP-IDF passes none for dslp).
+        sleep_and_restore_clocks(true, wakeup_triggers.0 as u32, 0, None, clock);
+        // The wake is a reset. As ESP-IDF, spin while the request lands.
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
     pub(crate) fn start_sleep_checked(
         &self,
         wakeup_triggers: WakeTriggers,
     ) -> Result<(), RetainedSleepError> {
-        super::retained::validate_retained(self.deep, self.pd_flags.0, wakeup_triggers.0)?;
+        super::retained::validate_retained(
+            self.deep,
+            self.pd_flags.0,
+            PD_XTAL | PD_RC_FAST,
+            wakeup_triggers.0,
+        )?;
         const PMU_EXT1_WAKEUP_EN: u32 = 1 << 1;
         const PMU_GPIO_WAKEUP_EN: u32 = 1 << 2;
         const PMU_LP_TIMER_WAKEUP_EN: u32 = 1 << 4;
@@ -685,54 +796,18 @@ impl RtcSleepConfig {
             DigitalSleepConfig::defaults_light_sleep(self.pd_flags).apply();
             AnalogSleepConfig::defaults_light_sleep().apply();
         }
+        // Oscillator power-down needs ESP-IDF's matching regulator/bias sleep
+        // state. Without it the original retained configuration is untouched.
+        let saved_analog = (!self.deep && self.pd_flags.0 != 0).then(|| {
+            let saved = SavedSleepAnalog::read();
+            apply_sleep_analog(&h2_light_sleep_analog(self.pd_flags.0, &dbias_fuses()));
+            saved
+        });
 
         param.apply();
 
-        // pmu_sleep_start
-
-        unsafe {
-            // lp_aon_hal_inform_wakeup_type - tells ROM which wakeup stub to run
-            lp_aon()
-                .store9()
-                .modify(|r, w| w.bits(r.bits() & !0x01 | self.deep as u32));
-
-            // pmu_ll_hp_set_wakeup_enable
-            pmu().slp_wakeup_cntl2().write(|w| w.bits(wakeup_mask));
-
-            // pmu_ll_hp_set_reject_enable
-            pmu().slp_wakeup_cntl1().modify(|_, w| {
-                w.slp_reject_en()
-                    .bit(true)
-                    .sleep_reject_ena()
-                    .bits(reject_mask)
-            });
-
-            pmu().int_clr().write(|w| {
-                w.soc_wakeup() // pmu_ll_hp_clear_wakeup_intr_status
-                    .clear_bit_by_one()
-                    .soc_sleep_reject() // pmu_ll_hp_clear_reject_intr_status
-                    .clear_bit_by_one()
-            });
-
-            // pmu_ll_hp_clear_reject_cause
-            pmu()
-                .slp_wakeup_cntl4()
-                .write(|w| w.slp_reject_cause_clr().bit(true));
-
-            // Start entry into sleep mode
-
-            // pmu_ll_hp_set_sleep_enable
-            pmu().slp_wakeup_cntl0().write(|w| w.sleep_req().bit(true));
-
-            loop {
-                let int_raw = pmu().int_raw().read();
-                if int_raw.soc_wakeup().bit_is_set() || int_raw.soc_sleep_reject().bit_is_set() {
-                    break;
-                }
-            }
-        }
-        restore_sleep_bias();
-        clock.restore();
+        // pmu_sleep_start .. rtc_clk_cpu_freq_set_config, without leaving RAM.
+        sleep_and_restore_clocks(self.deep, wakeup_mask, reject_mask, saved_analog, clock);
         saradc
             .ctrl()
             .modify(|_, w| w.saradc2_pwdet_drv().bit(adc_power_detect));
@@ -741,4 +816,154 @@ impl RtcSleepConfig {
 
     /// Cleans up after sleep
     pub(crate) fn finish_sleep(&self) {}
+}
+
+/// Enter PMU sleep, wait for wake or rejection, and restore the analog and
+/// CPU clock state, all from RAM.
+///
+/// HP_SLEEP powers BBPLL down; on H2 the MSPI (flash) clock can be derived
+/// from it, and `SavedClockConfig::restore` recalibrates it. No flash code
+/// runs between the sleep request and the restored CPU source, so a cache
+/// miss cannot fetch through an unsettled flash clock. Every callee is
+/// `#[ram]`, inlined, or in ROM; the linked ELF is checked for flash calls.
+#[crate::ram]
+fn sleep_and_restore_clocks(
+    deep: bool,
+    wakeup_mask: u32,
+    reject_mask: u32,
+    saved_analog: Option<SavedSleepAnalog>,
+    clock: SavedClockConfig,
+) {
+    unsafe {
+        // lp_aon_hal_inform_wakeup_type - tells ROM which wakeup stub to run
+        lp_aon()
+            .store9()
+            .modify(|r, w| w.bits(r.bits() & !0x01 | deep as u32));
+
+        // pmu_ll_hp_set_wakeup_enable
+        pmu().slp_wakeup_cntl2().write(|w| w.bits(wakeup_mask));
+
+        // pmu_ll_hp_set_reject_enable
+        pmu().slp_wakeup_cntl1().modify(|_, w| {
+            w.slp_reject_en()
+                .bit(true)
+                .sleep_reject_ena()
+                .bits(reject_mask)
+        });
+
+        pmu().int_clr().write(|w| {
+            w.soc_wakeup() // pmu_ll_hp_clear_wakeup_intr_status
+                .clear_bit_by_one()
+                .soc_sleep_reject() // pmu_ll_hp_clear_reject_intr_status
+                .clear_bit_by_one()
+        });
+
+        // pmu_ll_hp_clear_reject_cause
+        pmu()
+            .slp_wakeup_cntl4()
+            .write(|w| w.slp_reject_cause_clr().bit(true));
+
+        // Start entry into sleep mode
+
+        // pmu_ll_hp_set_sleep_enable
+        pmu().slp_wakeup_cntl0().write(|w| w.sleep_req().bit(true));
+
+        loop {
+            let int_raw = pmu().int_raw().read();
+            if int_raw.soc_wakeup().bit_is_set() || int_raw.soc_sleep_reject().bit_is_set() {
+                break;
+            }
+        }
+    }
+    restore_sleep_bias();
+    if let Some(saved) = saved_analog {
+        saved.restore();
+    }
+    clock.restore();
+}
+
+fn dbias_fuses() -> DbiasFuses {
+    use crate::efuse::{ACTIVE_HP_DBIAS, ACTIVE_LP_DBIAS, DSLP_DBIAS};
+    let (blk_major, blk_minor) = Efuse::block_version();
+    DbiasFuses {
+        blk_major,
+        blk_minor,
+        active_hp: Efuse::read_field_le::<u8>(ACTIVE_HP_DBIAS),
+        active_lp: Efuse::read_field_le::<u8>(ACTIVE_LP_DBIAS),
+        deep_sleep: Efuse::read_field_le::<u8>(DSLP_DBIAS),
+    }
+}
+
+/// `pmu_sleep_analog_init` for the HP_SLEEP/LP_SLEEP PMU states.
+fn apply_sleep_analog(analog: &SleepAnalog) {
+    unsafe {
+        pmu().hp_sleep_bias().modify(|_, w| {
+            w.hp_sleep_xpd_trx()
+                .bit(analog.hp_xpd_trx)
+                .hp_sleep_pd_cur()
+                .bit(analog.hp_pd_cur)
+                .sleep()
+                .bit(analog.hp_bias_sleep)
+        });
+        pmu().hp_sleep_hp_regulator0().modify(|_, w| {
+            w.hp_sleep_hp_regulator_xpd()
+                .bit(analog.hp_xpd)
+                .hp_sleep_hp_regulator_dbias()
+                .bits(analog.hp_dbias)
+        });
+        pmu()
+            .hp_sleep_hp_regulator1()
+            .modify(|_, w| w.hp_sleep_hp_regulator_drv_b().bits(analog.hp_drv_b));
+        pmu().lp_sleep_bias().modify(|_, w| {
+            w.lp_sleep_pd_cur()
+                .bit(analog.lp_pd_cur)
+                .sleep()
+                .bit(analog.lp_bias_sleep)
+        });
+        pmu().lp_sleep_lp_regulator0().modify(|_, w| {
+            w.lp_sleep_lp_regulator_slp_xpd()
+                .bit(analog.lp_slp_xpd)
+                .lp_sleep_lp_regulator_xpd()
+                .bit(analog.lp_xpd)
+                .lp_sleep_lp_regulator_slp_dbias()
+                .bits(analog.lp_slp_dbias)
+                .lp_sleep_lp_regulator_dbias()
+                .bits(analog.lp_dbias)
+        });
+        pmu()
+            .lp_sleep_lp_regulator1()
+            .modify(|_, w| w.lp_sleep_lp_regulator_drv_b().bits(analog.lp_drv_b));
+    }
+}
+
+/// Sleep-state analog registers as they were before an oscillator-off sleep,
+/// so a later oscillator-on sleep keeps the original retained configuration.
+struct SavedSleepAnalog([u32; 6]);
+
+impl SavedSleepAnalog {
+    fn read() -> Self {
+        let pmu = unsafe { pmu() };
+        Self([
+            pmu.hp_sleep_bias().read().bits(),
+            pmu.hp_sleep_hp_regulator0().read().bits(),
+            pmu.hp_sleep_hp_regulator1().read().bits(),
+            pmu.lp_sleep_bias().read().bits(),
+            pmu.lp_sleep_lp_regulator0().read().bits(),
+            pmu.lp_sleep_lp_regulator1().read().bits(),
+        ])
+    }
+
+    #[inline(always)]
+    fn restore(self) {
+        let pmu = unsafe { pmu() };
+        let [bias, regulator0, regulator1, lp_bias, lp_regulator0, lp_regulator1] = self.0;
+        unsafe {
+            pmu.hp_sleep_bias().write(|w| w.bits(bias));
+            pmu.hp_sleep_hp_regulator0().write(|w| w.bits(regulator0));
+            pmu.hp_sleep_hp_regulator1().write(|w| w.bits(regulator1));
+            pmu.lp_sleep_bias().write(|w| w.bits(lp_bias));
+            pmu.lp_sleep_lp_regulator0().write(|w| w.bits(lp_regulator0));
+            pmu.lp_sleep_lp_regulator1().write(|w| w.bits(lp_regulator1));
+        }
+    }
 }

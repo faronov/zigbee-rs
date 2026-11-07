@@ -1,12 +1,13 @@
 //! Shared sleepy-sensor application policy for both ESP32 devkits.
 //!
 //! `light-sleep` opts into retained PMU sleep between slow parent polls.
-//! Fast commissioning/interview and OTA windows remain radio-on.
+//! Fast commissioning/interview windows and OTA sessions remain radio-on.
 
 use sensor_sed_app::{ButtonPolicy, SensorPolicy, SleepDepth, StatusPolicy};
 
-/// Fast-poll extension applied whenever OTA traffic is consumed.
-pub const OTA_KEEP_AWAKE_MS: u32 = 120_000;
+/// Fast-poll window after a fresh join, covering the coordinator interview.
+/// (OTA has no timed window: an active session holds the fast poll.)
+pub const FRESH_JOIN_FAST_MS: u32 = 120_000;
 
 /// Product policy shared by the ESP32-H2 and ESP32-C6 sensor compositions.
 pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
@@ -17,13 +18,13 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     } else {
         30_000
     },
-    fresh_join_fast_ms: OTA_KEEP_AWAKE_MS,
+    fresh_join_fast_ms: FRESH_JOIN_FAST_MS,
     restored_fast_ms: 60_000,
     wake_duration_ms: 500,
     join_retry_ms: 15_000,
     announce_retry_ms: 8_000,
     announce_retries: 5,
-    secure_rejoin_failure_limit: 4,
+    secure_rejoin_failure_limit: 0,
     interview_complete_grace_ms: 5_000,
     button: ButtonPolicy {
         long_press_ms: Some(3_000),
@@ -42,6 +43,7 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     } else {
         SleepDepth::Active
     },
+    recovery: sensor_sed_app::RecoveryPolicy::DEFAULT,
 };
 
 #[cfg(test)]

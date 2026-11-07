@@ -14,7 +14,7 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     join_retry_ms: 5_000,
     announce_retry_ms: 8_000,
     announce_retries: 5,
-    secure_rejoin_failure_limit: 4,
+    secure_rejoin_failure_limit: 0,
     interview_complete_grace_ms: 5_000,
     button: ButtonPolicy {
         long_press_ms: Some(3_000),
@@ -29,6 +29,7 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     },
     fast_sleep_depth: SleepDepth::Idle,
     slow_sleep_depth: SleepDepth::Idle,
+    recovery: sensor_sed_app::RecoveryPolicy::DEFAULT,
 };
 
 #[cfg(test)]

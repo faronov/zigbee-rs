@@ -403,7 +403,10 @@ impl<'d> Rtc<'d> {
     ///
     /// You can use the [`#[esp_hal::ram(persistent)]`][procmacros::ram]
     /// attribute to persist a variable though deep sleep.
-    #[cfg(any(esp32, esp32s2, esp32s3, esp32c3, esp32c6, esp32c2))]
+    ///
+    /// ESP32-H2 (local backport): only [`sleep::TimerWakeupSource`] is
+    /// accepted; any other source panics before power state changes.
+    #[cfg(any(esp32, esp32s2, esp32s3, esp32c3, esp32c6, esp32c2, esp32h2))]
     pub fn sleep_deep(&mut self, wake_sources: &[&dyn WakeSource]) -> ! {
         let config = RtcSleepConfig::deep();
         self.sleep(&config, wake_sources);
@@ -437,11 +440,35 @@ impl<'d> Rtc<'d> {
         &mut self,
         wake_sources: &[&dyn WakeSource],
     ) -> Result<(), sleep::RetainedSleepError> {
+        unsafe { self.sleep_light_retained_power_down(sleep::RetainedPowerDown::NONE, wake_sources) }
+    }
+
+    /// [`Self::sleep_light_retained`] that also stops the selected oscillators.
+    ///
+    /// ESP32-H2 only (C6 returns `UnsupportedPowerConfiguration` for anything
+    /// but [`sleep::RetainedPowerDown::NONE`]). CPU, RAM, top, modem and flash
+    /// domains stay powered. With XTAL stopped the PMU also applies ESP-IDF's
+    /// low-voltage (0.6 V) HP retention and bias power-down for the sleep
+    /// state; SYSTIMER stops, so the caller's RTC-calibrated compensation is
+    /// required, and the radio PHY must be disabled before and re-enabled
+    /// after the call.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::sleep_light_retained`]; additionally no peripheral may rely
+    /// on an XTAL/RC_FAST-derived clock across the sleep.
+    #[cfg(any(esp32c6, esp32h2))]
+    pub unsafe fn sleep_light_retained_power_down(
+        &mut self,
+        power_down: sleep::RetainedPowerDown,
+        wake_sources: &[&dyn WakeSource],
+    ) -> Result<(), sleep::RetainedSleepError> {
         let mut config = RtcSleepConfig::default();
         let mut triggers = WakeTriggers::default();
         for source in wake_sources {
             source.apply(self, &mut triggers, &mut config);
         }
+        config.set_retained_power_down(power_down);
         // Timer/digital GPIO do not configure RTC pads. In particular, do not
         // run C6's legacy EXT1 cleanup on unrelated, previously configured pads.
         config.start_sleep_checked(triggers)

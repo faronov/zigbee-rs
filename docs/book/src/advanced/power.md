@@ -59,6 +59,65 @@ The shared application also shortens the wait for:
 
 `NoStatus::PRESENT = false` removes status-only deadlines.
 
+## Parent loss and rejoin recovery
+
+`sensor-sed-app` (all SED products) bounds how long a lost or broken parent
+can keep a battery device awake, via `SensorPolicy::recovery`
+(`RecoveryPolicy::DEFAULT` unless a product overrides it):
+
+- **Parent-loss evidence.** An APS-acknowledged report that exhausts its
+  retries (`report_aps_ack`), or pending protocol work that outlives
+  `max_active_ms` (30 s), counts one strike; MAC-level poll failures are
+  still handled by the runtime. `parent_loss_strikes` (3) consecutive
+  strikes start a rejoin. This catches a parent that ACKs MAC polls but
+  delivers nothing end to end.
+- **Staged rejoin.** Secure rejoin on the current channel, then on all
+  channels, then a Trust Center rejoin. Parent selection normalises LQI
+  to the IEEE 0–255 scale and, if every candidate exceeds the link-cost
+  limit, retries the selection accepting any valid link cost (still ranked
+  by depth, then cost) rather than rejecting every router.
+- **Backoff.** Each failed attempt doubles the delay from `join_retry_ms`
+  up to `join_retry_max_ms` (15 min), shortened by up to
+  `join_retry_jitter_pct` (25 %). The device waits at its slow depth
+  (radio off) for the whole delay, not in a radio-on retry loop.
+- **Keep-awake limits.** Every reason that holds the fast poll or the
+  `Active` depth has a limit in `RecoveryPolicy` (`0` = unbounded). Waiting
+  only for APS ACKs keeps the fast poll but sleeps at `fast_sleep_depth`
+  (at most `Idle`) between polls; an OTA session holds the fast poll only
+  while `OtaLifecycle::is_active` (no timed tail after the session ends):
+  pending work `max_active_ms` (30 s; each further period it persists is
+  another strike), an OTA session `max_ota_awake_ms` (2 h; the session is
+  aborted through `OtaLifecycle::abort`, a suspended download stays
+  resumable), Identify `max_identify_awake_ms` (2 min; Identify then runs on
+  the slow poll) and back-to-back timed fast-poll windows
+  `max_fast_poll_ms` (10 min; the windows are closed). A window that ends
+  on time never fires.
+- **Missed reports.** With `report_aps_ack`, no APS-acknowledged traffic
+  for the shortest periodic reporting maximum interval plus
+  `missed_report_grace_ms` (2 min) counts one strike and forces every
+  report due, so the next tick produces fresh evidence.
+- **Anomaly record.** Each fired limit, missed report and parent-loss
+  rejoin is counted in `AnomalyRecord` (last reason, reasons seen,
+  saturating per-reason counts). `SensorApp::take_anomaly_update` hands a
+  product the changed record; `AnomalyJournal` appends it to a NOR window
+  only then, at most N writes per boot, so normal operation writes nothing.
+  The ESP32-H2 thermometer journals it in `zbnv` and publishes it as
+  Diagnostics (0x0B05) attributes.
+- **No self factory reset.** `secure_rejoin_failure_limit = 0` on every SED
+  product: the network is kept until a user action (long press) or a Leave
+  from the network. A non-zero limit restores the old give-up behaviour.
+
+Router and always-on end-device apps (`apps/router`) follow the same rule:
+`RouterPolicy::secure_rejoin_failure_limit` defaults to `0` (never reset) in
+`RouterPolicy::DEFAULT` and every product, and a pending secured rejoin is
+released only on the `join_retry_initial_ms`..`join_retry_max_ms` exponential
+backoff instead of the runtime's fixed 5 s retry. A non-zero limit is an
+opt-in give-up. Host-tested in `apps/router/tests/lifecycle.rs`
+(`unlimited_secure_rejoin_backs_off_and_keeps_parent_state`).
+
+Status: host-tested (`apps/sensor-sed/tests/lifecycle.rs`); the AEM proof
+of the sleep floor between attempts is a hardware gate.
+
 ## Current product policies
 
 | product | fast | slow | implementation/status |

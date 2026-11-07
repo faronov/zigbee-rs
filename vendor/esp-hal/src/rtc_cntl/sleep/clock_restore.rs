@@ -76,4 +76,21 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn h2_restores_flash_pll_with_its_bus_divider_and_64_mhz_rom_delay() {
+        // IDF v5.5.1 bootloader state: FLASH_PLL (3), CPU /1, AHB /2.
+        let mut writes = std::vec::Vec::new();
+        h2(0, 1, 3, 64, |reg, value| writes.push((reg, value)));
+        assert_eq!(
+            writes,
+            [
+                (Register::Cpu, 0),
+                (Register::Ahb, 1),
+                (Register::Source, 3),
+                (Register::LatchBus, 1),
+                (Register::RomTicks, 64),
+            ]
+        );
+    }
 }

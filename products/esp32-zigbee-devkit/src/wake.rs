@@ -13,6 +13,39 @@ trait SleepCycle {
     fn restore(&mut self, report: Option<&SleepReport>) -> Result<(), Self::Error>;
 }
 
+/// Stable diagnostic encoding of a wake error: variant in bits 24..31, a
+/// variant-specific detail in bits 0..23. Recorded in retained memory and the
+/// anomaly record, so the numbering must not change.
+pub mod wake_code {
+    pub const UNSUPPORTED_DEPTH: u32 = 1;
+    pub const SLEEP_NOT_CONFIGURED: u32 = 2;
+    pub const GPIO: u32 = 3;
+    pub const HARDWARE: u32 = 4;
+    pub const UNEXPECTED_WAKE: u32 = 5;
+    pub const REPEATED_REJECTION: u32 = 6;
+    pub const RADIO_WAKE: u32 = 7;
+
+    pub const fn encode(variant: u32, detail: u32) -> u32 {
+        (variant << 24) | (detail & 0x00FF_FFFF)
+    }
+
+    /// `HARDWARE` detail. 3 is the unspecified `InvalidCalibration` written
+    /// by older firmware; records from it still decode, new firmware writes
+    /// the specific 6-8 instead.
+    pub const fn hardware_detail(error: crate::sleep::SleepError) -> u32 {
+        use crate::sleep::{CalibrationFault, SleepError};
+        match error {
+            SleepError::UnsupportedClock => 1,
+            SleepError::UnsupportedConfiguration => 2,
+            SleepError::InvalidDuration => 4,
+            SleepError::InvalidCounter => 5,
+            SleepError::InvalidCalibration(CalibrationFault::SlowPeriodZero) => 6,
+            SleepError::InvalidCalibration(CalibrationFault::FastTimeout) => 7,
+            SleepError::InvalidCalibration(CalibrationFault::FastOutOfRange) => 8,
+        }
+    }
+}
+
 fn run_cycle<C: SleepCycle>(cycle: &mut C) -> Result<Option<SleepReport>, C::Error> {
     if !cycle.suspend()? {
         return Ok(None);
@@ -44,6 +77,32 @@ mod hardware {
         /// Re-applying the radio configuration after wake failed. Carries no
         /// payload so the `MacError` Debug formatter is not linked again.
         RadioWake,
+    }
+
+    /// Boot diagnostic: one real PMU light sleep through the production
+    /// backend (same power-down flags, calibration and clock restore), timer
+    /// wake only, ignoring the USB veto. The Embassy alarm is disarmed and the
+    /// measured stopped time is applied to SYSTIMER exactly as in [`SensorWake`].
+    /// The returned report carries the RTC-measured duration and wake status.
+    ///
+    /// # Safety
+    ///
+    /// Call before the radio, flash writers or any other PLL-dependent
+    /// activity starts, with the console flushed. A USB-Serial-JTAG host loses
+    /// the device while the clocks are stopped.
+    pub unsafe fn boot_sleep_selftest(
+        sleep: &mut LightSleep<'_>,
+        duration_us: u64,
+    ) -> Result<crate::sleep::SleepReport, SleepError> {
+        critical_section::with(|cs| {
+            let _ = time_driver::prepare_sleep(cs, u64::MAX);
+            let result = unsafe { sleep.sleep(cs, duration_us, false) };
+            time_driver::resume_after_sleep(
+                cs,
+                result.as_ref().map_or(0, |r| r.missing_systimer_ticks),
+            );
+            result
+        })
     }
 
     /// Owns the button and optional, explicitly selected retained-sleep backend.
@@ -138,8 +197,10 @@ mod hardware {
             let gpio = self.button.wakeup_enable(false, WakeEvent::LowLevel);
             self.button.clear_interrupt();
             let radio = self.mac.wake();
-            gpio.map_err(WakeError::Gpio)?;
-            radio.map_err(|_| WakeError::RadioWake)
+            // A radio that failed to wake must never be reported as the
+            // recoverable GPIO error, so check it first.
+            radio.map_err(|_| WakeError::RadioWake)?;
+            gpio.map_err(WakeError::Gpio)
         }
     }
 
@@ -156,6 +217,27 @@ mod hardware {
     impl<'button, 'radio> WakeController<EspSoftMac<'radio>> for SensorWake<'button> {
         type Mark = Instant;
         type Error = WakeError;
+
+        /// `run_cycle` always restores the radio and returns a restore error
+        /// in preference to an entry error, so every error except
+        /// `RadioWake` leaves the MAC awake and usable for an active wait.
+        fn is_recoverable(error: &WakeError) -> bool {
+            !matches!(error, WakeError::RadioWake)
+        }
+
+        fn error_code(error: &WakeError) -> u32 {
+            use super::wake_code::*;
+            match *error {
+                WakeError::UnsupportedDepth(depth) => encode(UNSUPPORTED_DEPTH, depth as u32),
+                WakeError::SleepNotConfigured => encode(SLEEP_NOT_CONFIGURED, 0),
+                WakeError::Gpio(WakeConfigError::EdgeTriggeringNotSupported) => encode(GPIO, 1),
+                WakeError::Gpio(_) => encode(GPIO, 0),
+                WakeError::Hardware(error) => encode(HARDWARE, hardware_detail(error)),
+                WakeError::UnexpectedWake(cause) => encode(UNEXPECTED_WAKE, cause),
+                WakeError::RepeatedRejection(cause) => encode(REPEATED_REJECTION, cause),
+                WakeError::RadioWake => encode(RADIO_WAKE, 0),
+            }
+        }
 
         fn mark(&self) -> Instant {
             Instant::now()
@@ -285,13 +367,27 @@ mod hardware {
 }
 
 #[cfg(target_os = "none")]
-pub use hardware::{SensorWake, WakeError};
+pub use hardware::{SensorWake, WakeError, boot_sleep_selftest};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sleep::{SleepStatus, WakeCause};
     use std::vec::Vec;
+
+    #[test]
+    fn hardware_cause_words_are_stable_and_calibration_steps_distinct() {
+        use crate::sleep::{CalibrationFault as F, SleepError as E};
+        let word =
+            |e| 0x1000_0000 | wake_code::encode(wake_code::HARDWARE, wake_code::hardware_detail(e));
+        assert_eq!(word(E::UnsupportedClock), 0x1400_0001);
+        assert_eq!(word(E::UnsupportedConfiguration), 0x1400_0002);
+        assert_eq!(word(E::InvalidDuration), 0x1400_0004);
+        assert_eq!(word(E::InvalidCounter), 0x1400_0005);
+        assert_eq!(word(E::InvalidCalibration(F::SlowPeriodZero)), 0x1400_0006);
+        assert_eq!(word(E::InvalidCalibration(F::FastTimeout)), 0x1400_0007);
+        assert_eq!(word(E::InvalidCalibration(F::FastOutOfRange)), 0x1400_0008);
+    }
 
     #[test]
     fn console_must_be_quiet_before_changing_pll_clocks() {

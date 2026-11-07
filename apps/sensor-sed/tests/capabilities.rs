@@ -44,6 +44,7 @@ static POLICY: SensorPolicy = SensorPolicy {
     },
     fast_sleep_depth: SleepDepth::Idle,
     slow_sleep_depth: SleepDepth::Idle,
+    recovery: sensor_sed_app::RecoveryPolicy::DEFAULT,
 };
 
 struct MockWake {

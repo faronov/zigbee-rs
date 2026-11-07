@@ -23,6 +23,7 @@
 
 #![no_std]
 
+pub mod anomaly;
 pub mod app;
 pub mod battery;
 pub mod capabilities;
@@ -32,7 +33,11 @@ pub mod measurement;
 pub mod ota;
 pub mod parts;
 pub mod policy;
+pub mod reset_cause;
 
+pub use anomaly::{
+    ANOMALY_RECORD_LEN, AnomalyJournal, AnomalyReason, AnomalyRecord, AwakeBound, BoundStep,
+};
 pub use app::{FindingBindingTargetError, SensorApp, SensorAppError, SensorLifecycleError};
 pub use battery::{
     BatteryReading, BatterySource, BlockingBattery, BlockingBatterySource, FixedBattery, NoBattery,
@@ -52,7 +57,11 @@ pub use ota::{
 };
 pub use parts::SensorSedParts;
 pub use policy::{
-    ButtonPolicy, ForceReportAction, JoinOnlyAction, NoUserAction, PARENT_INDIRECT_HOLD_MARGIN_MS,
-    PARENT_INDIRECT_HOLD_MIN_MS, RESPONSIVE_SLOW_POLL_MS, SensorPolicy, ShortPressAction,
-    SleepDepth, StatusPolicy, ToggleJoinAction, UserActionPolicy,
+    ButtonPolicy, ForceReportAction, JOIN_RETRY_MAX_MS, JoinOnlyAction, MAX_JOIN_RETRY_JITTER_PCT,
+    MAX_WAIT_MS, NoUserAction, PARENT_INDIRECT_HOLD_MARGIN_MS, PARENT_INDIRECT_HOLD_MIN_MS,
+    RESPONSIVE_SLOW_POLL_MS, RecoveryPolicy, SensorPolicy, ShortPressAction, SleepDepth,
+    StatusPolicy, ToggleJoinAction, UserActionPolicy,
+};
+pub use reset_cause::{
+    BootRecord, RETAINED_WORDS, RapidResetPolicy, ResetCause, ResetKind, RetainedBoot,
 };

@@ -29,9 +29,21 @@ use accounting::*;
 pub enum SleepError {
     UnsupportedClock,
     UnsupportedConfiguration,
-    InvalidCalibration,
+    InvalidCalibration(CalibrationFault),
     InvalidDuration,
     InvalidCounter,
+}
+
+/// Which RTC calibration step failed (mirrors the HAL's `CalibrationFailure`;
+/// kept local so this module stays host-testable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationFault {
+    /// The RTC slow-clock period is zero.
+    SlowPeriodZero,
+    /// The RC_FAST calibration timed out.
+    FastTimeout,
+    /// The RC_FAST calibration result is implausible.
+    FastOutOfRange,
 }
 
 /// Multiple sources can assert simultaneously; do not discard either bit.
@@ -76,7 +88,9 @@ mod accounting {
     impl Calibration {
         pub(super) fn new(period: u32) -> Result<Self, SleepError> {
             if period == 0 {
-                return Err(SleepError::InvalidCalibration);
+                return Err(SleepError::InvalidCalibration(
+                    CalibrationFault::SlowPeriodZero,
+                ));
             }
             Ok(Self(period))
         }
@@ -163,6 +177,8 @@ mod accounting {
 }
 
 #[cfg(target_os = "none")]
+pub use esp_hal::rtc_cntl::sleep::RetainedPowerDown;
+#[cfg(target_os = "none")]
 pub use hardware::LightSleep;
 
 #[cfg(target_os = "none")]
@@ -179,6 +195,7 @@ mod hardware {
         _timer: LP_TIMER<'d>,
         _pmu: PMU<'d>,
         _aon: LP_AON<'d>,
+        power_down: esp_hal::rtc_cntl::sleep::RetainedPowerDown,
     }
 
     impl<'d> LightSleep<'d> {
@@ -188,7 +205,21 @@ mod hardware {
                 _timer: timer,
                 _pmu: pmu,
                 _aon: aon,
+                power_down: esp_hal::rtc_cntl::sleep::RetainedPowerDown::NONE,
             }
+        }
+
+        /// Also stop the selected oscillators during each sleep (H2 only; the
+        /// C6 HAL rejects anything but `NONE` on the first sleep).
+        ///
+        /// Stopping XTAL stops SYSTIMER: [`SleepReport::missing_systimer_ticks`]
+        /// then carries the whole interval, which the caller already applies.
+        pub fn with_power_down(
+            mut self,
+            power_down: esp_hal::rtc_cntl::sleep::RetainedPowerDown,
+        ) -> Self {
+            self.power_down = power_down;
+            self
         }
 
         /// Enter actual PMU light sleep, retaining digital state.
@@ -231,13 +262,19 @@ mod hardware {
                 let rtc_before = rtc_ticks();
                 let wake_timer =
                     TimerWakeupSource::new(core::time::Duration::from_micros(duration_us));
+                let power_down = self.power_down;
                 let result = if gpio_wakeup {
                     unsafe {
-                        self._rtc
-                            .sleep_light_retained(&[&wake_timer, &GpioWakeupSource::new()])
+                        self._rtc.sleep_light_retained_power_down(
+                            power_down,
+                            &[&wake_timer, &GpioWakeupSource::new()],
+                        )
                     }
                 } else {
-                    unsafe { self._rtc.sleep_light_retained(&[&wake_timer]) }
+                    unsafe {
+                        self._rtc
+                            .sleep_light_retained_power_down(power_down, &[&wake_timer])
+                    }
                 };
                 let rtc_after = rtc_ticks();
                 let systimer_after = SystemTimer::unit_value(Unit::Unit0);
@@ -288,7 +325,14 @@ mod hardware {
         use esp_hal::rtc_cntl::sleep::RetainedSleepError;
         match error {
             RetainedSleepError::UnsupportedClock => SleepError::UnsupportedClock,
-            RetainedSleepError::InvalidCalibration => SleepError::InvalidCalibration,
+            RetainedSleepError::InvalidCalibration(failure) => {
+                use esp_hal::rtc_cntl::sleep::CalibrationFailure;
+                SleepError::InvalidCalibration(match failure {
+                    CalibrationFailure::SlowClockPeriodZero => CalibrationFault::SlowPeriodZero,
+                    CalibrationFailure::FastClockTimeout => CalibrationFault::FastTimeout,
+                    CalibrationFailure::FastClockOutOfRange => CalibrationFault::FastOutOfRange,
+                })
+            }
             RetainedSleepError::InvalidDuration => SleepError::InvalidDuration,
             RetainedSleepError::UnsupportedWakeSource
             | RetainedSleepError::UnsupportedPowerConfiguration => {
@@ -308,7 +352,9 @@ mod tests {
     fn calibration_and_duration_fail_closed() {
         assert!(matches!(
             Calibration::new(0),
-            Err(SleepError::InvalidCalibration)
+            Err(SleepError::InvalidCalibration(
+                CalibrationFault::SlowPeriodZero
+            ))
         ));
         let cal = Calibration::new(10 << 19).unwrap();
         assert_eq!(cal.duration_ticks(0), Err(SleepError::InvalidDuration));
