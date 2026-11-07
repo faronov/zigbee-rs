@@ -1,6 +1,6 @@
 //! Status lines on a byte console (typically the product's UART).
 
-use crate::{BootEvent, ImageError, ImageVersion, Update};
+use crate::{BootEvent, ImageError, ImageVersion, Trial, Update};
 
 /// Byte console for loader status lines.
 pub trait Console {
@@ -102,6 +102,8 @@ impl Reporter {
                 }
             }
             BootEvent::Validating | BootEvent::Dropping => self.end_line(console),
+            #[cfg(feature = "swap-move")]
+            BootEvent::Reverting => self.line(console, b"reverting update "),
         }
     }
 
@@ -112,11 +114,27 @@ impl Reporter {
             Update::None => {}
             Update::Installed => self.line(console, b"update installed\r\n"),
             Update::Downgrade => self.line(console, b"update rejected: downgrade\r\n"),
+            #[cfg(feature = "swap-move")]
+            Update::Reverted => self.line(console, b"unconfirmed update reverted\r\n"),
             Update::Rejected(error) => {
                 self.line(console, b"update rejected: ");
                 console.write(image_error_name(error));
                 console.write(b"\r\n");
             }
+        }
+    }
+
+    /// Trial state of the image about to start: a line while it is on
+    /// trial or left unconfirmed, nothing otherwise.
+    pub fn trial(&mut self, console: &mut impl Console, trial: Trial) {
+        match trial {
+            Trial::Testing { boot } => {
+                self.line(console, b"trial boot ");
+                write_decimal(console, u32::from(boot));
+                console.write(b"\r\n");
+            }
+            Trial::Unconfirmed => self.line(console, b"image unconfirmed\r\n"),
+            Trial::Permanent | Trial::Confirmed => {}
         }
     }
 

@@ -81,8 +81,9 @@ flash into 4 KiB sectors:
 | physical | XIP | contents |
 |---|---|---|
 | `0x00000..0x01000` | | boot ROM header (BFNP) of the loader, `img_start` 0x2000 |
-| `0x02000..0x0FFE0` | `0x23000000` | `bl702-xt-zb1-boot` loader |
-| `0x0FFE0..0x10000` | `0x2300DFE0` | LoaderInfo record (key id, loader version) |
+| `0x02000..0x0FFC0` | `0x23000000` | `bl702-xt-zb1-boot` loader |
+| `0x0FFC0..0x0FFE0` | `0x2300DFC0` | LoaderKeys record (extra trusted key ids; erased with one key) |
+| `0x0FFE0..0x10000` | `0x2300DFE0` | LoaderInfo record (primary key id, loader version) |
 | `0x10000..0x87000` | `0x2300E000` | primary slot: MCUboot header 0x100, application at `0x2300E100` |
 | `0x87000..0xFE000` | | secondary slot: OTA download (0x77000) |
 | `0xFE000..0x100000` | | `SecurityStateJournal` (unchanged) |
@@ -92,10 +93,12 @@ The boot ROM maps XIP linearly from `img_start`, so physical `p` runs at
 slot holds the MCUboot trailer, so an image may be at most 0x76000 bytes and
 the application at most 0x75C00.
 
-The loader's ROM-hashed image ends before 0xFFE0: `bflb-mcu-tool` rounds
-`img_len` up (0xE000 to 0xE010), so a loader image covering the whole region
-would make the ROM hash the primary slot's header. The LoaderInfo record is
-therefore placed separately by the release tool.
+The loader's ROM-hashed image ends at or before 0xFFC0: `bflb-mcu-tool`
+rounds `img_len` up (0xE000 to 0xE010), so a loader image covering the whole
+region would make the ROM hash the primary slot's header. The loader records
+are therefore placed separately by the release tool. LoaderInfo stays at
+0xFFE0 (version 1 loaders and the applications built for them read it
+there); loader version 2 adds the LoaderKeys record below it.
 
 The product hands out two restricted views of the one flash device: the
 journal sees only `0xFE000..0x100000`, the OTA writer can erase/program
@@ -161,7 +164,7 @@ BL702_DIAGNOSTIC_LOG=1 ./build-image.sh
 `build-image.sh` builds the application and the loader, packages the
 loader with `bflb-mcu-tool --build`, and runs `tools/bl702_ota.py release`,
 which checks the boot header (magic, 32 MHz XTAL clocks, CRC, image hash,
-`img_start`, end below 0xFFE0), the LoaderInfo key id, the application
+`img_start`, end at or below 0xFFC0), the loader's trusted key ids, the application
 entry and the embedded public key, then writes to
 `target/riscv32imc-unknown-none-elf/release/ota/`:
 

@@ -15,13 +15,13 @@ use crate::{
 /// Clocks are expected in the ROM boot state, which the application assumes
 /// as well; the loader changes no clock or power setting.
 pub fn run(flash: XipFlash, config: &Config, console: &mut impl Console) -> ! {
-    let mut flash = BootFlash::new(flash, &config.layout);
+    let mut flash = BootFlash::for_config(flash, &config.boot);
     let mut shell = Bl702 {
         config,
         console,
         reporter: reporter(),
     };
-    zrs_boot_core::run(&mut flash, &config.layout, &config.key, &mut shell)
+    zrs_boot_core::run(&mut flash, &config.boot, &mut shell)
 }
 
 struct Bl702<'a, C> {
@@ -44,7 +44,10 @@ impl<C: Console> Platform for Bl702<'_, C> {
     fn decided(&mut self, outcome: &Result<Bootable, BootError>) {
         self.reporter.end_line(&mut *self.console);
         match *outcome {
-            Ok(bootable) => self.reporter.update(&mut *self.console, bootable.update),
+            Ok(bootable) => {
+                self.reporter.update(&mut *self.console, bootable.update);
+                self.reporter.trial(&mut *self.console, bootable.trial);
+            }
             Err(BootError::NoBootableImage { primary, update }) => {
                 self.reporter.update(&mut *self.console, update);
                 self.line(b"no bootable image: ");
@@ -53,6 +56,8 @@ impl<C: Console> Platform for Bl702<'_, C> {
             }
             Err(BootError::CopyCorrupt) => self.line(b"installed copy corrupt, request kept\r\n"),
             Err(BootError::Flash) => self.line(b"flash error\r\n"),
+            Err(BootError::StatusFull) => self.line(b"status log full\r\n"),
+            Err(BootError::Config) => self.line(b"bad configuration\r\n"),
         }
     }
 

@@ -129,16 +129,28 @@ jobs:
             manifest: bootloaders/cc2340r5-boot/Cargo.toml
             workspace: bootloaders/cc2340r5-boot
             features: ""
+          - name: CC2340R5 loader shell (Ed25519, swap-move)
+            manifest: bootloaders/cc2340r5-boot/Cargo.toml
+            workspace: bootloaders/cc2340r5-boot
+            features: ed25519,swap-move
           # Workspace member; the power-cut simulator and the compact
           # SHA-256 path are feature-gated.
           - name: Bootloader core (power-cut simulation)
             manifest: bootloaders/core/Cargo.toml
             workspace: .
             features: sim,compact-sha256
+          - name: Bootloader core (Ed25519, swap-move)
+            manifest: bootloaders/core/Cargo.toml
+            workspace: .
+            features: sim,compact-sha256,ed25519,swap-move
           - name: MCUboot image firmware writer
             manifest: mcuboot-image/Cargo.toml
             workspace: .
             features: firmware-writer,compact-sha256
+          - name: MCUboot image (Ed25519, swap-move)
+            manifest: mcuboot-image/Cargo.toml
+            workspace: .
+            features: firmware-writer,compact-sha256,ed25519,swap-move
           - name: ESP32-C6 sensor product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
@@ -1235,7 +1247,9 @@ jobs:
           cargo clippy --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
       - name: Clippy BL702 bootloader
         working-directory: products/bl702-xt-zb1/bootloader
-        run: cargo clippy --release --locked -- -D warnings
+        run: |
+          cargo clippy --release --locked -- -D warnings
+          cargo clippy --release --locked --features ed25519 -- -D warnings
       - name: Build BL702 sensor (release)
         working-directory: examples/bl702-sensor
         run: cargo build --release --locked
@@ -1413,6 +1427,8 @@ jobs:
             --manifest-path bootloaders/cc2340r5-boot/Cargo.toml
           cargo clippy --locked --target thumbv6m-none-eabi \
             --manifest-path bootloaders/cc2340r5-boot/Cargo.toml -- -D warnings
+          cargo clippy --locked --target thumbv6m-none-eabi \
+            --manifest-path bootloaders/cc2340r5-boot/Cargo.toml --all-features -- -D warnings
       - name: Build CC2340 explicit fallback mode
         working-directory: examples/cc2340-sensor
         run: |

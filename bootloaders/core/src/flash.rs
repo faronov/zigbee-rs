@@ -4,10 +4,11 @@ use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
 };
 
-use crate::Layout;
+use crate::{BootConfig, Layout};
 
 /// Flash view used by a loader: reads anywhere, but erases and programs
-/// only inside `[min(primary, secondary), max(primary, secondary) + slot_size)`.
+/// only inside `[min(primary, secondary), max(primary, secondary) + slot_size)`
+/// and, in swap-move mode, the two status sectors.
 ///
 /// The boot header, the loader itself, its `LoaderInfo` record and the
 /// product's persistence partitions therefore cannot be touched by the
@@ -17,21 +18,44 @@ pub struct BootFlash<F> {
     flash: F,
     start: u32,
     end: u32,
+    /// Extra writable `[start, end)`: the swap-move status sectors.
+    status: Option<(u32, u32)>,
 }
 
 impl<F> BootFlash<F> {
+    /// The slots of `layout` only.
     pub fn new(flash: F, layout: &Layout) -> Self {
         let start = core::cmp::min(layout.primary, layout.secondary);
         let end = core::cmp::max(layout.primary, layout.secondary) + layout.slot_size;
-        Self { flash, start, end }
+        Self {
+            flash,
+            start,
+            end,
+            status: None,
+        }
+    }
+
+    /// Everything `config` needs to write: the slots and, in swap-move
+    /// mode, its status sectors.
+    pub fn for_config(flash: F, config: &BootConfig<'_>) -> Self {
+        #[cfg_attr(not(feature = "swap-move"), allow(unused_mut))]
+        let mut view = Self::new(flash, &config.layout);
+        #[cfg(feature = "swap-move")]
+        if let crate::Mode::SwapMove { status } = config.mode {
+            view.status = Some((status, status + 2 * config.layout.sector_size));
+        }
+        view
     }
 
     fn writable(&self, from: u32, len: usize) -> bool {
-        from >= self.start
-            && u32::try_from(len)
-                .ok()
-                .and_then(|len| from.checked_add(len))
-                .is_some_and(|to| to <= self.end)
+        let inside = |(start, end): (u32, u32)| {
+            from >= start
+                && u32::try_from(len)
+                    .ok()
+                    .and_then(|len| from.checked_add(len))
+                    .is_some_and(|to| to <= end)
+        };
+        inside((self.start, self.end)) || self.status.is_some_and(inside)
     }
 
     pub fn into_inner(self) -> F {

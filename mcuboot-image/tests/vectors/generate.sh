@@ -5,6 +5,8 @@
 #
 # TEST-ONLY-ec-p256.pem is a throwaway key committed only so the vectors can
 # be reproduced. It must never sign anything installed on a device.
+# TEST-ONLY-ec-p256-b.pem and TEST-ONLY-ed25519.pem are throwaway keys for
+# the key-rotation and Ed25519 tests, under the same rule.
 # root-ec-p256.pem is MCUboot's public sample key, which TI's SDK (and
 # koptserg's flower bootloader) use; it is read from an MCUboot checkout and
 # not committed here.
@@ -37,4 +39,20 @@ numbers = key.public_key().public_numbers()
 open(sys.argv[2], "wb").write(numbers.x.to_bytes(32, "big") + numbers.y.to_bytes(32, "big"))
 PYEOF
 done
+# Rotation and Ed25519 vectors (added later; regenerated only when missing so
+# the vectors above stay byte-identical).
+[ -f TEST-ONLY-ec-p256-b.pem ] || "$IMGTOOL" keygen -t ecdsa-p256 -k TEST-ONLY-ec-p256-b.pem
+[ -f TEST-ONLY-ed25519.pem ] || "$IMGTOOL" keygen -t ed25519 -k TEST-ONLY-ed25519.pem
+[ -f test-b-v2.bin ] || "$IMGTOOL" sign $COMMON --version 2.0.0 --key TEST-ONLY-ec-p256-b.pem payload.bin test-b-v2.bin
+[ -f test-ed-v2.bin ] || "$IMGTOOL" sign $COMMON --version 2.0.0 --key TEST-ONLY-ed25519.pem payload.bin test-ed-v2.bin
+"$PY" - TEST-ONLY-ec-p256-b.pem test-key-b.xy TEST-ONLY-ed25519.pem test-ed-key.pub <<'PYEOF'
+import sys
+from cryptography.hazmat.primitives import serialization
+def load(path):
+    return serialization.load_pem_private_key(open(path, "rb").read(), None).public_key()
+numbers = load(sys.argv[1]).public_numbers()
+open(sys.argv[2], "wb").write(numbers.x.to_bytes(32, "big") + numbers.y.to_bytes(32, "big"))
+raw = load(sys.argv[3]).public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+open(sys.argv[4], "wb").write(raw)
+PYEOF
 rm payload.bin

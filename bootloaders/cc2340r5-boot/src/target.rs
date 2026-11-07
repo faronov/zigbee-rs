@@ -31,7 +31,7 @@ pub fn run(
         indicator,
         prepare_shutdown: Some(prepare_shutdown),
     };
-    zrs_boot_core::run(&mut flash, &config.layout, &config.key, &mut shell)
+    zrs_boot_core::run(&mut flash, &config.boot, &mut shell)
 }
 
 struct Cc2340<'a, I, S> {

@@ -5,19 +5,24 @@
 //! `--pad`ded full-slot image (koptserg-style OTA files). In both cases the
 //! upgrade request magic is *withheld* while downloading and written only by
 //! [`activate`](FirmwareWriter::activate), after the complete image has been
-//! validated with the trusted key and checked against downgrade prevention.
+//! validated with a trusted key and checked against downgrade prevention.
 //! A reset at any time before activation therefore leaves no request behind.
 //!
 //! Sectors are erased lazily as sequential writes reach them, so the radio
 //! is never blocked for a whole-slot erase. [`erase_slot`] erases the
 //! trailer sector first (dropping any stale request) and then the header
 //! sector.
+//!
+//! [`confirm_image`](FirmwareWriter::confirm_image) confirms the running
+//! image to a loader with trial boots. In [`Mode::SwapMove`] the secondary
+//! slot holds the previous image while the running one is on trial, so
+//! staging a new download is refused until the running image is confirmed.
 
 use embedded_storage::nor_flash::NorFlash;
 use zigbee_runtime::firmware_writer::{FirmwareError, FirmwareWriter};
 
-use crate::boot::Layout;
-use crate::image::{ImageHeader, ImageVersion, TrustedKey, validate};
+use crate::boot::{Layout, Mode, TrialState, confirm, trial_state};
+use crate::image::{ImageHeader, ImageVersion, KeySet, validate_with_set};
 use crate::trailer::{BOOT_MAGIC, MagicState, magic_address};
 
 /// Staging buffer; must be a multiple of the flash write size.
@@ -26,10 +31,12 @@ const STAGE: usize = 64;
 /// Installation policy checked before activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotPolicy {
-    /// The trusted signing key of the bootloader that will install the image.
-    pub key: TrustedKey,
+    /// Keys the bootloader that will install the image trusts.
+    pub keys: KeySet,
     /// Required `hdr_size` (the application vector-table offset).
     pub header_size: u16,
+    /// The loader's install mode (where its trial log lives).
+    pub mode: Mode,
 }
 
 pub struct SlotWriter<F> {
@@ -137,6 +144,16 @@ impl<F: NorFlash> SlotWriter<F> {
 
 impl<F: NorFlash> FirmwareWriter for SlotWriter<F> {
     fn erase_slot(&mut self) -> Result<(), FirmwareError> {
+        #[cfg(feature = "swap-move")]
+        if matches!(self.policy.mode, Mode::SwapMove { .. })
+            && matches!(
+                trial_state(&mut self.flash, &self.layout, self.policy.mode),
+                Ok(TrialState::Testing { .. }) | Err(_)
+            )
+        {
+            // The secondary slot is the revert image.
+            return Err(FirmwareError::EraseFailed);
+        }
         self.reset();
         self.staging = true;
         self.erase_at(self.trailer_offset())?;
@@ -178,11 +195,11 @@ impl<F: NorFlash> FirmwareWriter for SlotWriter<F> {
         if self.written != expected_size {
             return Err(FirmwareError::VerifyFailed);
         }
-        let image = validate(
+        let image = validate_with_set(
             &mut self.flash,
             self.layout.secondary,
             self.layout.max_image_len(),
-            &self.policy.key,
+            &self.policy.keys,
         )
         .map_err(|_| FirmwareError::VerifyFailed)?;
         if image.header.hdr_size != self.policy.header_size || image.end > self.written {
@@ -241,5 +258,20 @@ impl<F: NorFlash> FirmwareWriter for SlotWriter<F> {
         self.erase_at(self.trailer_offset())?;
         self.staging = false;
         Ok(())
+    }
+
+    /// Append the confirm record if the running image is on trial; no
+    /// flash write otherwise.
+    fn confirm_image(&mut self) -> Result<(), FirmwareError> {
+        confirm(&mut self.flash, &self.layout, self.policy.mode)
+            .map(|_| ())
+            .map_err(|_| FirmwareError::WriteFailed)
+    }
+}
+
+impl<F: NorFlash> SlotWriter<F> {
+    /// The trial state of the running image.
+    pub fn trial_state(&mut self) -> Option<TrialState> {
+        trial_state(&mut self.flash, &self.layout, self.policy.mode).ok()
     }
 }

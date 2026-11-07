@@ -15,6 +15,10 @@ mcuboot-image = { version = "0.1.0", path = "../../mcuboot-image" }
 default = []
 # Smaller, slower SHA-256 for size-constrained bootloaders.
 compact-sha256 = ["mcuboot-image/compact-sha256"]
+# Accept Ed25519-signed images (keys of either algorithm may be trusted).
+ed25519 = ["mcuboot-image/ed25519"]
+# Opt-in swap-move install with revert of unconfirmed images.
+swap-move = ["mcuboot-image/swap-move"]
 # Host-only NOR flash simulator with power-cut injection (needs `std`),
 # for chip shells' and products' host tests.
 sim = []

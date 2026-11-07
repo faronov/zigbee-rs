@@ -63,7 +63,8 @@ class LayoutTest(unittest.TestCase):
             self.assertEqual(address % ota.SECTOR_SIZE, 0)
         self.assertEqual(ota.PRIMARY_SLOT + ota.SLOT_SIZE, ota.SECONDARY_SLOT)
         self.assertEqual(ota.SECONDARY_SLOT + ota.SLOT_SIZE, ota.NV_START)
-        self.assertLess(ota.LOADER_INFO_ADDR + ota.LOADER_INFO_LEN, ota.PRIMARY_SLOT + 1)
+        self.assertEqual(ota.LOADER_INFO_ADDR + ota.LOADER_INFO_LEN, ota.PRIMARY_SLOT)
+        self.assertEqual(ota.LOADER_BLOCK_ADDR + 2 * ota.LOADER_INFO_LEN, ota.PRIMARY_SLOT)
 
 
 class VersionTest(unittest.TestCase):
@@ -142,7 +143,7 @@ class BootImageTest(unittest.TestCase):
             ota.check_boot_header(bytes(image))
 
     def test_hashed_range_must_end_before_loader_info(self):
-        too_long = b"\0" * (ota.LOADER_INFO_ADDR - ota.LOADER_START + 0x10)
+        too_long = b"\0" * (ota.LOADER_BLOCK_ADDR - ota.LOADER_START + 0x10)
         with self.assertRaisesRegex(ota.ToolError, "past"):
             ota.check_boot_header(boot_image(too_long))
 
@@ -158,6 +159,39 @@ class LoaderInfoTest(unittest.TestCase):
             ota.decode_loader_info(bytes(record))
 
 
+# mcuboot-image loader_info.rs `multi_key_block_matches_the_release_tool_vector`:
+# loader_block(2, keys 0x11.., 0x22.., 0x33..).
+GOLDEN_BLOCK = bytes.fromhex(
+    "5a52534b4559533102ffffff22222222222222223333333333333333f459b2b6"
+    "5a5253424f4f543101000100020000001111111111111111ffffffff1e93ac18")
+
+
+class LoaderRecordsTest(unittest.TestCase):
+    def test_single_key_section_of_a_version_1_loader(self):
+        self.assertEqual(ota.decode_loader_records(loader_info(b"ABCDEFGH")), [b"ABCDEFGH"])
+
+    def test_single_key_block_with_erased_keys_record(self):
+        block = b"\xff" * 32 + loader_info(b"ABCDEFGH")
+        self.assertEqual(ota.decode_loader_records(block), [b"ABCDEFGH"])
+
+    def test_multi_key_block_from_the_loader(self):
+        self.assertEqual(ota.decode_loader_records(GOLDEN_BLOCK),
+                         [b"\x11" * 8, b"\x22" * 8, b"\x33" * 8])
+
+    def test_damage_is_rejected(self):
+        for index, message in ((20, "LoaderKeys CRC"), (48, "LoaderInfo CRC"), (0, "LoaderKeys")):
+            block = bytearray(GOLDEN_BLOCK)
+            block[index] ^= 1
+            with self.assertRaisesRegex(ota.ToolError, message):
+                ota.decode_loader_records(bytes(block))
+        with self.assertRaisesRegex(ota.ToolError, "unannounced"):
+            ota.decode_loader_records(b"\0" * 32 + loader_info())
+        with self.assertRaisesRegex(ota.ToolError, "lacks"):
+            ota.decode_loader_records(GOLDEN_BLOCK[32:])
+        with self.assertRaisesRegex(ota.ToolError, "not 32 or 64"):
+            ota.decode_loader_records(GOLDEN_BLOCK[:48])
+
+
 class FullImageTest(unittest.TestCase):
     def test_layout(self):
         loader = b"\x97\x01\x00\x00" * 64
@@ -171,6 +205,13 @@ class FullImageTest(unittest.TestCase):
         self.assertEqual(full[ota.LOADER_INFO_ADDR:ota.PRIMARY_SLOT], info)
         self.assertEqual(full[ota.PRIMARY_SLOT:ota.PRIMARY_SLOT + len(app)], app)
         self.assertTrue(all(byte == 0xFF for byte in full[ota.PRIMARY_SLOT + len(app):]))
+
+    def test_multi_key_block_ends_at_the_primary_slot(self):
+        boot = boot_image()
+        full = ota.full_flash_image(boot, GOLDEN_BLOCK, signed_image())
+        self.assertTrue(all(byte == 0xFF for byte in full[len(boot):ota.LOADER_BLOCK_ADDR]))
+        self.assertEqual(full[ota.LOADER_BLOCK_ADDR:ota.PRIMARY_SLOT], GOLDEN_BLOCK)
+        self.assertEqual(full[ota.LOADER_INFO_ADDR:ota.PRIMARY_SLOT], GOLDEN_BLOCK[32:])
 
 
 class IndexTest(unittest.TestCase):

@@ -18,7 +18,8 @@ Flash layout (products/bl702-xt-zb1/layout/src/lib.rs, 4 KiB sectors)::
 
     0x00000  boot ROM header (BFNP) of the loader, img_start 0x2000
     0x02000  bl702-boot loader, runs at XIP 0x23000000
-    0x0FFE0  LoaderInfo record (outside the ROM-hashed loader image)
+    0x0FFC0  LoaderKeys record (extra trusted key ids; erased with one key)
+    0x0FFE0  LoaderInfo record (both outside the ROM-hashed loader image)
     0x10000  primary slot: MCUboot header 0x100, application at 0x2300E100
     0x87000  secondary slot: OTA download
     0xFE000  security journal (never written by this tool)
@@ -26,7 +27,9 @@ Flash layout (products/bl702-xt-zb1/layout/src/lib.rs, 4 KiB sectors)::
 Signing key: `--key`, else `$BL702_OTA_KEY`, else the flower project's own
 key `~/.flower-keys/flower-own-ec-p256.pem`. The private key is never part
 of the repository; the loader and the application embed only its public
-X || Y (`BL702_OTA_KEY_XY`).
+X || Y (`BL702_OTA_KEY_XY`). For key rotation the loader may trust up to
+two more keys (`BL702_OTA_KEY2_XY`, `BL702_OTA_KEY3_XY`); `release` accepts
+a signing key that any of the loader's records names.
 
 Needs the Python standard library, `imgtool` (MCUboot, pinned 2.4.0) and
 `llvm-objcopy` (rustup component llvm-tools).
@@ -53,6 +56,7 @@ REPO = Path(__file__).resolve().parent.parent
 # that these lines match it.
 LOADER_START = 0x2000
 LOADER_INFO_ADDR = 0xFFE0
+LOADER_BLOCK_ADDR = 0xFFC0
 PRIMARY_SLOT = 0x10000
 SECONDARY_SLOT = 0x87000
 SLOT_SIZE = 0x77000
@@ -92,6 +96,9 @@ TLV_SHA256 = 0x10
 TLV_ECDSA_SIG = 0x22
 BOOT_MAGIC = bytes.fromhex("77c295f360d2ef7f3552500f2cb67980")
 LOADER_INFO_MAGIC = b"ZRSBOOT1"
+LOADER_KEYS_MAGIC = b"ZRSKEYS1"
+LOADER_INFO_KEYS = 0x0001  # LoaderInfo flag: a LoaderKeys record precedes it
+MAX_TRUSTED_KEYS = 3
 
 # BL702 boot ROM header (bl702_boot_header.h, bflb-mcu-tool 1.10.0).
 BFNP_MAGIC = b"BFNP"
@@ -214,6 +221,34 @@ def decode_loader_info(record: bytes) -> bytes:
     return record[16:24]
 
 
+def decode_loader_records(section: bytes) -> list[bytes]:
+    """Validate a loader's `.loader_info` section: the 32-byte LoaderInfo
+    record of a single-key loader (version 1), or the 64-byte block of
+    LoaderKeys (erased with one key) and LoaderInfo. Returns the trusted
+    8-byte key ids, the primary key first."""
+    if len(section) not in (LOADER_INFO_LEN, 2 * LOADER_INFO_LEN):
+        raise ToolError(f"loader record section is {len(section)} bytes, not 32 or 64")
+    info = section[-LOADER_INFO_LEN:]
+    ids = [decode_loader_info(info)]
+    flags, = struct.unpack_from("<H", info, 10)
+    if len(section) == LOADER_INFO_LEN:
+        if flags & LOADER_INFO_KEYS:
+            raise ToolError("LoaderInfo announces a LoaderKeys record the section lacks")
+        return ids
+    keys = section[:LOADER_INFO_LEN]
+    if not flags & LOADER_INFO_KEYS:
+        if any(byte != 0xFF for byte in keys):
+            raise ToolError("unannounced data before the LoaderInfo record")
+        return ids
+    count = keys[8]
+    if keys[:8] != LOADER_KEYS_MAGIC or not 1 <= count < MAX_TRUSTED_KEYS:
+        raise ToolError("no LoaderKeys record")
+    if struct.unpack_from("<I", keys, 28)[0] != zlib.crc32(keys[:28]):
+        raise ToolError("LoaderKeys CRC mismatch")
+    ids += [keys[12 + 8 * index:20 + 8 * index] for index in range(count)]
+    return ids
+
+
 def check_boot_header(image: bytes) -> tuple[int, int]:
     """Validate the loader's BFNP boot image from `bflb-mcu-tool --build`;
     returns (img_start, img_len)."""
@@ -230,9 +265,9 @@ def check_boot_header(image: bytes) -> tuple[int, int]:
         raise ToolError(f"boot header img_start 0x{img_start:X} != 0x{LOADER_START:X}")
     end = img_start + img_len
     # The ROM hashes img_len bytes from img_start on every boot: they must
-    # end before the LoaderInfo record and the primary slot.
-    if end > LOADER_INFO_ADDR:
-        raise ToolError(f"ROM-hashed loader image ends at 0x{end:X}, past 0x{LOADER_INFO_ADDR:X}")
+    # end before the loader records and the primary slot.
+    if end > LOADER_BLOCK_ADDR:
+        raise ToolError(f"ROM-hashed loader image ends at 0x{end:X}, past 0x{LOADER_BLOCK_ADDR:X}")
     if len(image) < end:
         raise ToolError("loader boot image is truncated")
     if hashlib.sha256(image[img_start:end]).digest() != image[BFNP_HASH:BFNP_HASH + 32]:
@@ -404,15 +439,16 @@ def check(data: bytes) -> str:
 
 def full_flash_image(boot_image: bytes, loader_info: bytes, signed_app: bytes) -> bytes:
     """Physical 0x0..SECONDARY_SLOT: the loader's boot ROM image, its
-    LoaderInfo record and the signed application in the primary slot,
+    loader records (ending at the primary slot, so LoaderInfo is always at
+    LOADER_INFO_ADDR) and the signed application in the primary slot,
     0xFF elsewhere. Programming it erases neither the secondary slot nor
     the security journal."""
     img_start, img_len = check_boot_header(boot_image)
-    decode_loader_info(loader_info)
+    decode_loader_records(loader_info)
     mcuboot = check_signed(signed_app)
     out = bytearray(b"\xff" * SECONDARY_SLOT)
     out[:img_start + img_len] = boot_image[:img_start + img_len]
-    out[LOADER_INFO_ADDR:LOADER_INFO_ADDR + LOADER_INFO_LEN] = loader_info
+    out[PRIMARY_SLOT - len(loader_info):PRIMARY_SLOT] = loader_info
     out[PRIMARY_SLOT:PRIMARY_SLOT + mcuboot.end] = signed_app[:mcuboot.end]
     return bytes(out)
 
@@ -539,8 +575,8 @@ def cmd_release(args: argparse.Namespace) -> None:
     if loader.entry != XIP_BASE:
         raise ToolError(f"loader entry 0x{loader.entry:08X} != 0x{XIP_BASE:08X}")
     loader_info = loader.section_bytes(".loader_info")
-    if decode_loader_info(loader_info) != xy[:8]:
-        raise ToolError(f"the loader trusts another key than {key}")
+    if xy[:8] not in decode_loader_records(loader_info):
+        raise ToolError(f"the loader does not trust {key}")
     boot_image = Path(args.loader_image).read_bytes()
     check_boot_header(boot_image)
 

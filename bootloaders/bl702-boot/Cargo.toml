@@ -13,6 +13,10 @@ publish = false
 [dependencies]
 zrs-boot-core = { path = "../core", features = ["compact-sha256"] }
 
+[features]
+# Also accept Ed25519-signed images.
+ed25519 = ["zrs-boot-core/ed25519"]
+
 [dev-dependencies]
 zrs-boot-core = { path = "../core", features = ["compact-sha256", "sim"] }
 

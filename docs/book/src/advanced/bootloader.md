@@ -1,37 +1,60 @@
 # Bootloader Core
 
-zigbee-rs ships one pure-Rust bootloader design across platforms. Every
-chip runs the same verified boot sequence. Each chip contributes only a thin
-shell: flash driver, entry check, hand-over and status output. Products own
-the layout, the trusted key and the loader binary.
+zigbee-rs uses one pure-Rust bootloader design on every platform. Every
+chip runs the same verified boot sequence. Each chip adds only a thin
+shell: the flash driver, the entry check, the hand-over and the status
+output. Each product owns its layout, its trusted keys, its trial policy and
+its loader binary.
 
-This page is both the design and its current status. **Phase 1** (this
-revision) extracted the shared core from the two existing loaders with no
-behaviour change. Everything marked *Phase 2* or later is a proposal awaiting
-a decision. It is not an implemented or hardware-proven capability.
+This page is both the design and its current status:
 
-## Current state (Phase 1)
+- **Phase 1** (`0efac9b`) extracted the shared core from the two existing
+  loaders without changing their behaviour.
+- **Phase 2 step 1** (this revision) adds:
+  - the brick fix;
+  - trial boots with an application confirm;
+  - up to three trusted keys;
+  - optional Ed25519;
+  - opt-in swap-move with revert.
+
+  All of it is **host-tested only**. The refactored BL702 loader has not
+  yet been run on hardware; the plan is in
+  [BL702 hardware re-validation](#bl702-hardware-re-validation-plan).
+
+Anything marked *later phase* is a proposal. It is not an implemented or
+hardware-proven capability.
+
+## Current state
 
 | crate | role | validation |
 |---|---|---|
-| `mcuboot-image` | image format, SHA-256 + ECDSA P-256 verification, trailer magic, the overwrite-only install engine (`boot`), `LoaderInfo`, the app-side `SlotWriter` (`firmware-writer`) | host-tested, including power loss after every flash operation |
-| `bootloaders/core` (`zrs-boot-core`) | `Platform` trait and the `launch`/`run` sequence, `BootFlash` slot guard, RISC-V fixed-entry and Cortex-M vector-table checks, console `Reporter`, LED `Indicator`, `sim::SimFlash` power-cut simulator | host-tested (`--features sim`) |
-| `bootloaders/bl702-boot` | BL702 shell: XIP mapping, L1C invalidation, riscv-rt jump, UART lines | host-tested, release-built; production path proven on one XT-ZB1 (0.1.0→0.1.1 OTA, commit `8aeee49`) **before** this refactor; the refactored binary is not yet re-run on hardware |
-| `bootloaders/cc2340r5-boot` | CC2340R5 shell: vector-table check, VTOR/MSP jump, fault blinks and SHUTDOWN | host-tested, thumbv6m build only; no product loader binary exists |
+| `mcuboot-image` | Image format, SHA-256, ECDSA P-256 and optional Ed25519 verification, the install engine (`boot`), the status/trial log, opt-in swap-move, `LoaderInfo` and `LoaderKeys`, and the application-side `SlotWriter` (`firmware-writer`) | Host-tested, including power loss at every flash operation |
+| `bootloaders/core` (`zrs-boot-core`) | The `Platform` trait and the `launch`/`run` sequence, the `BootFlash` slot guard, the RISC-V fixed-entry and Cortex-M vector-table checks, the console `Reporter`, the LED `Indicator`, and the `sim::SimFlash` power-cut simulator | Host-tested (`--features sim`) |
+| `bootloaders/bl702-boot` | BL702 shell: XIP mapping, L1C invalidation, riscv-rt jump, UART lines | Host-tested and release-built. The v1 loader's production path was proven on one XT-ZB1 (0.1.0→0.1.1 OTA, `8aeee49`). The v2 loader (this revision) **has not been run on hardware** |
+| `bootloaders/cc2340r5-boot` | CC2340R5 shell: vector-table check, VTOR/MSP jump, fault blinks, SHUTDOWN | Host-tested; thumbv6m build only. No product loader binary exists |
+| `zigbee-runtime` `FirmwareWriter`/`OtaLifecycle` | `confirm_image` hook; `FirmwareWriter::confirm_image` | Host-tested |
+| `apps/sensor-sed` | Confirms the running image on its first APS-acknowledged report, or once joined when reports are not acknowledged | Host-tested |
 
 ```text
-product loader binary   layout, key (build-time), LoaderInfo placement, console/LEDs
+product loader binary   layout, BootConfig (keys, trial boots, mode), loader block, console/LEDs
         |
 chip shell (*-boot)     impl Platform: entry check, cache/clock hand-over, jump, fail
         |
 zrs-boot-core           launch/run, BootFlash, entry checks, Reporter/Indicator, sim
         |
-mcuboot-image           header/TLV, SHA-256, P-256, trailer, overwrite engine, writer
+mcuboot-image           header/TLV, SHA-256, P-256/Ed25519, status log, overwrite/swap-move, writer
 ```
 
 ## Core API
 
 ```rust,ignore
+pub struct BootConfig<'a> {
+    pub layout: Layout,              // primary, secondary, slot_size, sector_size
+    pub keys: &'a [TrustedKey],      // 1..=MAX_TRUSTED_KEYS (3)
+    pub trial_boots: u8,             // 0 = no trial accounting
+    pub mode: Mode,                  // Overwrite | SwapMove { status } (feature)
+}
+
 pub trait Platform {
     fn progress(&mut self, event: BootEvent);          // status output
     fn kick_watchdog(&mut self) {}                       // before every event
@@ -41,263 +64,502 @@ pub trait Platform {
     fn fail(&mut self) -> !;
 }
 
-pub fn launch<F: NorFlash, P: Platform>(flash, layout, key, platform) -> Option<u32>;
-pub fn run<F: NorFlash, P: Platform>(flash, layout, key, platform) -> !;
+pub fn launch<F: NorFlash, P: Platform>(flash, config: &BootConfig, platform) -> Option<u32>;
+pub fn run<F: NorFlash, P: Platform>(flash, config: &BootConfig, platform) -> !;
+
+// Application side (mcuboot-image):
+pub fn trial_state<F: NorFlash>(flash, layout, mode) -> Result<TrialState, BootError>;
+pub fn confirm<F: NorFlash>(flash, layout, mode) -> Result<TrialState, BootError>;
+pub const fn trial_log_area(layout) -> (u32, u32);   // overwrite-mode log, for flash views
 ```
 
-- **Flash** is any `embedded_storage::nor_flash::NorFlash`. It is not a
-  method of `Platform`, so a HAL's existing driver plugs in directly.
-  `ERASE_SIZE` must divide `Layout::sector_size`. `BootFlash` wraps the
-  driver and refuses any erase or program outside the two slots. The
-  loader, the boot header and the persistence partitions are therefore
-  unreachable from the copy. The BL702 shell uses it. The CC2340 shell
-  keeps its unguarded `InternalFlash` so that Phase 1 changes no
-  behaviour; adopting `BootFlash` there is a Phase 2 item.
-- **Page size** is `Layout::sector_size`, the largest erase unit of the
-  two slots. Write granularity comes from `NorFlash::WRITE_SIZE`.
-- **Jump to the application** is `prepare` (entry check, cache
-  invalidation) followed by `start`. The core never calls `start` with
-  anything `prepare` did not return for the image it validated in the same
-  boot.
-- **Watchdog**: `kick_watchdog` runs before every progress event. No
-  current loader arms a watchdog. Validating a full slot is one step with
-  no events, so an armed watchdog must last longer than one full-slot
-  validation. A per-chunk hook inside `validate` would be a Phase 2
-  `mcuboot-image` change.
-- **Crypto accelerator** (Phase 2, optional): an `ImageCrypto` trait for
-  streaming SHA-256 and P-256 verify, with today's software implementation
-  as the default. Candidate engines exist on BL702 (SEC_ENG), nRF52840
-  (CC310), EFR32MG1 (CRYPTO) and MG21/MG22 (SE/CRYPTOACC). None is used
-  or verified yet. The software path stays the reference, and the host
-  tests compare the two.
+- **Flash.** Flash is any `embedded_storage::nor_flash::NorFlash`. It is
+  not a method of `Platform`, so a HAL's existing driver plugs in
+  directly.
+  - `ERASE_SIZE` must divide `Layout::sector_size`.
+  - `WRITE_SIZE` may be at most 16 bytes; a status record takes one unit.
+  - `BootFlash::for_config` wraps the driver. It refuses any erase or
+    program outside the two slots and, in swap-move mode, outside the two
+    status sectors. The loader, the boot header and the persistence
+    partitions are therefore unreachable.
+  - The BL702 shell uses `BootFlash`. The CC2340 shell still uses its
+    unguarded `InternalFlash` (an open decision).
+- **Page size** is `Layout::sector_size`, the largest erase unit of the two
+  slots.
+- **Jump to the application.** `prepare` performs the entry check and
+  cache invalidation, then `start` jumps. The core never calls `start`
+  with anything that `prepare` did not return for the image validated in
+  the same boot.
+- **Watchdog.** `kick_watchdog` runs before every progress event. No
+  current loader arms a watchdog. Validating a full slot is one step that
+  emits no events, so an armed watchdog must outlast one full-slot
+  validation.
+- **Crypto accelerator** (later phase, optional). This would be an
+  `ImageCrypto` trait for streaming SHA-256 and signature verification,
+  with the software path as the default and as the host-test reference.
+  Candidates: BL702 SEC_ENG, nRF52840 CC310, EFR32 CRYPTO/SE. None is used
+  yet.
 
 ## Image format and versioning
 
-- MCUboot/imgtool images: a `0x100`-byte header (`imgtool --header-size
-  0x100`), with the application vector table or entry at
-  `slot + 0x100`. The TLV area carries `SHA256`, `KEYHASH` and
-  `ECDSA256`. Header flags must be zero: no encrypted, compressed or RAM-load
-  images.
-- The version is `major.minor.revision+build`. The downgrade rule compares
-  `major.minor.revision` and ignores `build`, as MCUboot's
-  `MCUBOOT_DOWNGRADE_PREVENTION` does.
-- The Zigbee OTA file version is `0x25MMmmpp` (major, minor, patch), so
-  ZCL "newer file" decisions and the loader's downgrade rule agree.
-- `LoaderInfo` (32 bytes, "ZRSBOOT1", CRC-32) sits at a product-fixed
-  address. It identifies the loader version and the hash of the trusted
-  key, so the application can refuse an image the loader would reject
-  before downloading it.
+- **MCUboot/imgtool images.**
+  - The header is `0x100` bytes (`imgtool --header-size 0x100`). The
+    application's vector table or entry sits at `slot + 0x100`.
+  - The TLV area carries `SHA256` (`0x10`), `KEYHASH` (`0x01`), and either
+    `ECDSA256` (`0x22`) or `ED25519` (`0x24`, over the SHA-256 digest,
+    not `--pure`).
+  - Header flags must be zero: encrypted, compressed and RAM-load images
+    are refused.
+- **Version.** The format is `major.minor.revision+build`. The downgrade
+  rule compares `major.minor.revision` and ignores `build`, as MCUboot's
+  `MCUBOOT_DOWNGRADE_PREVENTION` does. The Zigbee OTA file version is
+  `0x25MMmmpp`, so ZCL "newer file" decisions and the loader agree.
+- **Loader block.** This is a 64-byte block at the end of the loader
+  region (BL702: `0xFFC0..0x10000`):
+  - `LoaderKeys` ("ZRSKEYS1", CRC-32, `0xFFC0`) holds the 8-byte ids of
+    the extra trusted keys (key 2 and key 3). It stays erased when the
+    loader trusts one key.
+  - `LoaderInfo` ("ZRSBOOT1", 32 bytes, CRC-32, `0xFFE0`) holds the loader
+    version and the hash of the first key. Flag `0x0001` means a
+    `LoaderKeys` record precedes it.
+  - A v1 loader's record (flags `0`, no keys record) decodes as one trusted
+    key, so existing BL702 devices are read correctly.
+- **Key id.** A key's id is the first 8 bytes of the public key (the P-256
+  X coordinate, or the Ed25519 key). The application trusts only the
+  intersection of its build-time keys and the ids the loader publishes.
+  With no loader record it trusts nothing and declines every OTA offer.
+- `mcuboot-image/tests/vectors` holds imgtool-generated golden vectors:
+  P-256 with key A and key B, and Ed25519. Their keys are throwaway files
+  named `TEST-ONLY-*`. `tools/bl702_ota.py` produces the loader block, and
+  a host test pins it against the Rust encoder.
 
 ## Signature scheme and keys
 
-- **Today**: ECDSA P-256 over SHA-256 (`imgtool sign --key ... -t
-  ecdsa-p256`), checked by the compact verify-only `mcuboot_image::p256`.
-  The loader trusts exactly one public key.
+- **Default: ECDSA P-256 over SHA-256** (`imgtool sign -t ecdsa-p256`),
+  verified by the compact verify-only `mcuboot_image::p256`. Existing
+  BL702 field devices use it and keep working.
+- **Optional: Ed25519** (feature `ed25519` on `mcuboot-image`, the core and
+  both shells, using `ed25519-compact` with `opt_size`). The verifier is
+  large; see the [size budget](#size-budget). It fits BL702's 56 KiB
+  loader region but not a 16 KiB Cortex-M region. Making it fit there
+  needs a compact 32-bit-limb verifier (an open decision).
 - **Keys are build-time inputs, never constants in the core or shell
-  crates.** The shells take a `TrustedKey` from the product. The BL702
-  product reads `BL702_OTA_KEY_XY` (hex, or a file path) in
-  `products/bl702-xt-zb1/layout/build.rs`. Its default is the committed
-  *public* key `keys/own-ec-p256.xy.hex`. Private keys never enter the
-  repository. CI generates an ephemeral key for each run, so CI images
-  are test-signed.
-- Every new product loader follows the same pattern: one
-  `<PRODUCT>_OTA_KEY_XY` input, consumed by the product's layout crate. The
-  loader and the application's `SlotWriter` share that key, and so do
-  `LoaderInfo` and the OTA policy.
-- Open decisions: listed below.
+  crates.**
+  - A product's layout crate reads them and builds `BootConfig::keys`. The
+    loader, the application's `SlotWriter` policy and the loader block all
+    use that same list.
+  - BL702 reads `BL702_OTA_KEY_XY` (default: the committed *public* key
+    `keys/own-ec-p256.xy.hex`) and the optional `BL702_OTA_KEY2_XY` and
+    `BL702_OTA_KEY3_XY`. Each value is hex or a file path.
+  - Private keys never enter the repository. CI signs with an ephemeral
+    key generated for each run.
+- **Key selection.** The image's `KEYHASH` TLV selects the matching
+  trusted key, which must also be of the right type. An image signed with
+  any trusted key validates.
 
-## Install strategy: overwrite, swap or ping-pong
+### Key rotation
 
-Today every loader is **overwrite-only**. A pending request is the MCUboot
-magic in the secondary trailer. The application writes it only when
-`FirmwareWriter::activate` succeeds. The loader then:
+Up to three keys per loader allow rotation without bricking devices that
+are behind:
 
-1. validates the secondary image (hash, signature, key hash, flags) and
-   applies the downgrade rule against the primary header;
-2. erases the primary, copies the image in 256-byte chunks, skipping
-   all-`0xFF` chunks, and re-validates the copy;
-3. erases the secondary trailer sector, then the secondary header sector.
+1. **Add the new key.** Build a loader that trusts *old + new*
+   (`<PRODUCT>_OTA_KEY_XY` = old, `<PRODUCT>_OTA_KEY2_XY` = new). Build the
+   application with the same list.
+2. **Keep signing with the old key** until every device you care about
+   runs the old+new loader. An application signed with the old key boots
+   under both the old and the new loader.
+3. **Switch signing to the new key.** Devices on the old+new loader
+   accept the new images. On a device whose loader trusts only the old
+   key, the writer verifies a staged image against only the keys that
+   both the application and the loader trust. An image signed with the new
+   key therefore fails verification before `activate` and never becomes an
+   upgrade request. An application that shares no key with its loader
+   declines every offer (`[ota] offer declined: channel …`).
+4. **Retire the old key** in a later loader. Before doing so, confirm that
+   no device still needs it.
+
+Loaders are not updatable over the air: no loader self-update path exists,
+and none is proposed. Rotation therefore happens at ISP/SWD re-flash or
+factory programming. A BL702 device that still has the v1 loader trusts
+only its single original key. It must keep receiving images signed with
+that key until someone re-flashes it over ISP.
+
+## Install strategy
+
+Overwrite stays the default for every chip. Swap-move is a build-time
+opt-in.
+
+### Overwrite (default)
+
+A pending request is the MCUboot magic in the secondary trailer. The
+application writes it only when `FirmwareWriter::activate` succeeds. The
+loader then:
+
+1. validates the secondary image (hash, signature, key, flags) and applies
+   the downgrade rule (see [Brick fix](#brick-fix));
+2. erases the primary trailer sector (which resets the trial log), erases
+   the primary image sectors and copies the image in 256-byte chunks,
+   skipping all-`0xFF` chunks, then re-validates the copy;
+3. with trial accounting, appends `Done` to the trial log;
+4. erases the secondary trailer sector, then the secondary header sector.
 
 The request survives until the copied primary validates. A power cut at
 any point resumes the copy from the intact secondary on the next boot. A
-rejected request is dropped in the same order, so the drop is also
+rejected request is dropped in the same order, so dropping it is also
 resumable.
 
-Overwrite-only has no rollback. A signed image that crashes after boot
-stays installed until a later OTA replaces it. Options:
+### Trial boots and confirm
 
-| strategy | rollback | extra flash | complexity | fits |
-|---|---|---|---|---|
-| overwrite-only (today) | no | none | lowest; proven on BL702 | every chip; the only option when the secondary is external SPI flash (MG1) |
-| overwrite + confirm flag | no rollback; adds "booted but never confirmed" detection and a retry/recovery policy | one trailer word | low | stepping stone for every chip |
-| swap-move (MCUboot) | yes | one sector per slot plus a status area | high; per-sector state machine, twice the flash wear | CC2340, nRF52, MG21/MG22 if rollback is required |
-| ping-pong (execute in place from either slot) | yes, natively | none | low in the loader; the image must run from either slot | ESP (MMU plus `otadata`); candidates to verify: BL702 (XIP image-offset remap), Telink (ROM dual-boot address) |
+`BootConfig::trial_boots = N` (BL702: `BL702_BOOT_TRIAL_BOOTS`, default 3;
+`0` turns it off). The rules:
 
-**Recommendation for Phase 2:**
+- **Starting the trial.** An image installed by this loader starts on
+  trial (`Done` written).
+- **Counting boots.** Each boot of an unconfirmed image appends `Attempt`
+  and prints `trial boot n`.
+- **Confirming.** The application calls `confirm` (`FirmwareWriter::
+  confirm_image`, driven by `OtaLifecycle::confirm_image`). That appends
+  `Confirmed` only while the image is on trial, at most one flash write.
+- **Expiry in overwrite mode.** After N unconfirmed boots, overwrite has
+  nothing to revert to. The loader prints `image unconfirmed` and keeps
+  booting the image without further writes. The state is visible to the
+  application and to the lab, and a later OTA can replace the image.
+- **Images not installed by this loader.** With no `Done` record, an image
+  is *permanent*. That covers factory images, images installed by a v1
+  loader, and loaders with N = 0. Field devices are never put on trial
+  retroactively.
+- **When `sensor-sed` confirms.** It confirms on the first APS ACK of an
+  attribute report, or as soon as it is joined when reports are not
+  acknowledged. If the write fails, it retries at the next proof.
+  `OtaLifecycle::confirm_image` defaults to `true` (nothing to confirm)
+  for products without a trial log.
 
-- Keep overwrite-only as the default for every chip.
-- Add a confirm flag to the trailer, written by the application after it
-  rejoins its network. The application then reports a "not confirmed"
-  state, which feeds the OTA policy.
-- Evaluate ping-pong on BL702 only after proving the XIP remap on
-  hardware.
-- Treat swap-move as opt-in per product.
+**Where the log lives.** In overwrite mode the log sits at the start of
+the primary slot's trailer sector. That sector never holds image bytes.
+The last 128 bytes stay free for MCUboot trailer fields. On BL702 the
+log is `0x86000..0x86F80`. The application's flash view must allow
+*writes, never erases* there: `storage.rs` `OtaFlash` admits
+`trial_log_area` only.
 
-The decision is per product, and the per-chip table below records it.
+**Record encoding.** A record is a 16-bit code followed by its bitwise
+complement, written as one unit of `max(4, WRITE_SIZE)` bytes.
 
-### Known hazard (characterised, not yet fixed)
+- Records are appended in order. The first erased unit ends the log.
+- An interrupted program only clears bits, and an interrupted erase only
+  sets them. Either way a damaged record fails its complement check; it
+  can never turn into a different valid record.
+- A damaged unit is skipped. After `Done` it counts as a boot attempt, so
+  a trial always ends.
 
-An erase interrupted on the primary header sector can leave the header
-magic intact while the version bytes read higher, because erase only sets
-bits. The engine then applies the downgrade rule against an image that no
-longer validates. It drops the request and nothing is bootable. MCUboot's
-overwrite-only mode compares headers the same way.
-`known_hazard_torn_primary_header_reads_as_a_downgrade` pins the current
-behaviour. The fix changes behaviour, so it is a Phase 2 decision. Two
-options:
+### Swap-move with revert (opt-in: feature `swap-move`, `Mode::SwapMove`)
 
-- apply the downgrade rule only against a primary that validates, and
-  treat an invalid primary as "anything signed may be installed";
-- before erasing the primary, write a `copy-started` mark into the
-  secondary trailer, using MCUboot's trailer field offsets, and skip the
-  downgrade check while the mark is present.
+This mode is for CC2340, nRF52 and EFR32MG21/MG22, whose two slots share
+one internal flash.
+
+- **The exchange.** The slots are exchanged sector by sector through one
+  spare sector, the primary's last. The previous image ends up in the
+  secondary slot. Move steps shift the primary up by one sector, then
+  swap steps exchange the slots. Every step can be repeated after a power
+  cut, and running the exchange again with the same sector count reverts
+  it.
+- **The status area.** Two sectors outside both slots (`Mode::SwapMove {
+  status }`) hold the exchange state.
+  - Each starts with a header: "ZRSSWAP1", generation, revert flag and
+    sector count, each word followed by its complement. It is written in
+    one program operation, so a torn header never validates.
+  - A new exchange erases the *other* sector, so the active record is
+    never erased.
+  - The log after the header holds `Step`, `Done`, `Cleared` and the trial
+    records.
+- **Revert.** The loader reverts when an unconfirmed install has used up
+  its trial boots, or when its copy fails validation while the previous
+  image validates. The loader prints `reverting update` and `unconfirmed
+  update reverted`, and the reverted image is permanent.
+- **Writer protection.** The application's `SlotWriter` refuses to erase
+  the secondary slot while the image is on trial, because that slot holds
+  the revert image.
+- **Cost.** Each exchange costs about three sector writes per image
+  sector, and the status area costs two sectors.
+
+| strategy | rollback | extra flash | state |
+|---|---|---|---|
+| overwrite + trial/confirm (default) | no; unconfirmed images are detected and reported | none (the log is in the existing trailer sector) | host-tested |
+| swap-move (opt-in) | yes, automatic on expiry or a broken install | 2 status sectors + 1 spare sector per slot | host-tested; no product uses it yet |
+| ping-pong (execute in place from either slot) | yes, natively | none | ESP (IDF `otadata`); BL702 and Telink remap not proven; not implemented |
+
+### Brick fix
+
+**The hazard.** Phase 1 applied the downgrade rule to the primary *header*
+alone. Erase only sets bits, so an erase interrupted on the primary header
+sector can leave the magic intact while the version reads higher. The
+request was then dropped as a "downgrade", and nothing bootable remained.
+
+**The fix.** The downgrade rule now applies only against a primary that
+validates fully (hash and signature, using the trusted keys). A primary
+that does not validate, whether torn, erased or signed with an unknown
+key, never blocks a valid pending update. A flash read error still
+aborts the boot rather than being treated as "not a downgrade".
+
+**Tests that pin it:**
+
+- `invalid_primary_never_blocks_a_valid_update` (engine);
+- `torn_primary_header_survives_power_loss_and_installs` (engine);
+- `torn_primary_header_never_blocks_a_valid_update` (core);
+- `torn_primary_install_survives_a_power_cut_at_every_operation` (core).
+
+The last one injects a cut at every flash operation of the torn-header
+install, in each of the three cut modes, and requires the next boots to
+finish the install.
 
 ## Per-chip layouts and field migration
 
-Existing layouts do not change. New layouts are proposals for Phase 2 and
-need the product's linker post-link checks before any firmware uses them.
+Existing layouts do not change. New layouts are proposals for later phases.
+They need the product's post-link checks before any firmware uses them.
 
 | chip / product | today | proposed loader | slots (proposal) | migration |
 |---|---|---|---|---|
-| BL702 XT-ZB1 | `bl702-boot` at `0x2000..0xFFE0`, `LoaderInfo` `0xFFE0`, primary `0x10000..0x87000`, secondary `0x87000..0xFE000`, journal `0xFE000..0x100000` | unchanged | unchanged | none; the refactored loader is binary-compatible with the slots, trailer, key and `LoaderInfo` (reflash over ISP to adopt it) |
-| CC2340R5 | app at `0x0` (504 KiB), journal `0x7E000..0x80000`, `NoOta`; loader crate exists, no product binary | 16 KiB at `0x0` | primary `0x4000`, secondary in the upper half, journal unchanged at `0x7E000` | first install over SWD only; it moves the application, so the journal is kept and the device stays commissioned |
+| BL702 XT-ZB1 | `bl702-boot` at `0x2000..0xFFC0`; loader block `0xFFC0..0x10000` (`LoaderKeys` `0xFFC0`, `LoaderInfo` `0xFFE0`); primary `0x10000..0x87000` (trial log `0x86000..0x86F80`); secondary `0x87000..0xFE000`; journal `0xFE000..0x100000` | v2 loader, overwrite + 3 trial boots, P-256 | unchanged | Re-flash over ISP to adopt it. Slots, trailer, key and `LoaderInfo` stay compatible, and a v1-installed image is permanent. A v2 application on a v1 loader reads one key and never writes the log |
+| CC2340R5 | app at `0x0` (504 KiB), journal `0x7E000..0x80000`, `NoOta`; the loader crate exists, but there is no product binary | 16 KiB at `0x0`; overwrite by default, swap-move opt-in | primary `0x4000`, secondary in the upper half, journal unchanged at `0x7E000` | First install over SWD only. It moves the application but keeps the journal, so the device stays commissioned |
 | nRF52840/52833 bare | app `0x0..0xFE000`, journal `0xFE000`, `NoOta` | 16 KiB at `0x0` | two equal slots below the journal | SWD |
-| nRF52840 UF2 boards | MBR `0x0..0x1000`, app `0x1000..0xF2000`, journal `0xF2000`, UF2 `0xF4000..0xFE000`, MBR params `0xFE000` | zrs loader as the UF2 "application" at `0x1000` (UF2 and MBR untouched) | two slots in `0x5000..0xF2000` | flash the loader and a signed image over UF2; UF2 remains the recovery path |
-| PHY6222 / PB-03F | ROM boots the PHY6 header at `0x10000`, app `0x10100..0x3E000`, `NoOta` | the image the ROM boots | slots after the loader | first prove that ROM boot of a plain image works (open hardware gate) |
-| EFR32MG22 | no bootloader, app at `0x0`, `NoOta` | 16 KiB at `0x0` | internal slots, persistence unchanged | SWD |
+| nRF52840 UF2 boards | MBR `0x0..0x1000`, app `0x1000..0xF2000`, journal `0xF2000`, UF2 `0xF4000..0xFE000`, MBR params `0xFE000` | zrs loader as the UF2 "application" at `0x1000`; UF2 and MBR untouched | two slots in `0x5000..0xF2000` | Flash the loader and a signed image over UF2. UF2 remains the recovery path |
+| PHY6222 / PB-03F | ROM boots the PHY6 header at `0x10000`, app `0x10100..0x3E000`, `NoOta` | the image the ROM boots | slots after the loader | First prove that the ROM boots a plain image (open hardware gate) |
+| EFR32MG22 | no bootloader, app at `0x0`, `NoOta` | 16 KiB at `0x0` | internal slots; persistence unchanged | SWD |
 | EFR32MG21 | Gecko `0x0..0x4000`, app `0x4000..0x74000`, router tables `0x74000..0x7C000`, persistence `0x7C000..0x80000`, `NoOta` | replaces Gecko in `0x0..0x4000` | internal slots below `0x74000` | SWD for development devices; field devices as for MG1 |
-| EFR32MG1 TRADFRI | Gecko `0x0..0x4000`; app `0x4000..0x37000`; journal `0x37000..0x39000`; app NV `0x39000..0x3A000`; NVM3 `0x3A000..0x40000`; OTA staged as GBL in external SPI flash via the bootloader API | replaces Gecko in `0x0..0x4000` | primary internal `0x4000..0x37000`; secondary in **external SPI flash** (USART0) | high risk, see below |
-| ESP32-C6/H2 | IDF second stage, `otadata`, `ota_0`/`ota_1`, `zbnv` | keep IDF | keep | the app-side writer verifies the shared signature before `activate` (Phase 2) |
+| EFR32MG1 TRADFRI | Gecko `0x0..0x4000`; app `0x4000..0x37000`; journal `0x37000..0x39000`; app NV `0x39000..0x3A000`; NVM3 `0x3A000..0x40000`; OTA staged as GBL in external SPI flash | **out of scope until last**, after a sacrificial-board rehearsal | primary internal, secondary in external SPI flash | High risk; see below |
+| ESP32-C6/H2 | IDF second stage, `otadata`, `ota_0`/`ota_1`, `zbnv` | keep IDF | keep | The app-side writer verifies the shared signature before `activate` (later phase) |
 | TLSR8258 | ROM boot, NV `0x70000..0x78000`, `NoOta` | keep ROM dual-boot | keep | as ESP |
 
-### EFR32MG1 leaving the Gecko bootloader
+### EFR32MG1 leaving the Gecko bootloader (deferred)
 
-- **One-way and high risk.** The device can only be updated over the air
-  through Gecko's GBL path. Replacing the bootloader means delivering a
-  GBL whose bootloader-upgrade payload is the zrs loader, or an
-  application that rewrites `0x0..0x4000` itself.
-- A power cut while that region is erased leaves a device that only SWD
+The user deferred this migration until the last phase, after a rehearsal
+on a sacrificial board. The constraints that rehearsal must settle:
+
+- **Risk.** The migration is one-way. The bootloader can only be replaced
+  by a GBL bootloader-upgrade payload, or by an application that rewrites
+  `0x0..0x4000`. A power cut in that window leaves a device that only SWD
   can recover.
-- Series 1 splits the Gecko bootloader into a first stage and a main
-  stage. Before choosing a path, verify against Silicon Labs UG266 and on
-  a sacrificial board whether the first stage verifies, or must keep, the
-  main stage it boots.
-- The secondary slot lives in external SPI flash. The core therefore needs
-  a split-device `NorFlash` adapter (internal primary, external secondary)
-  in Phase 2. The board crate owns the USART0 flash pins. The Gecko API
-  and direct SPI access must never run at the same time.
-- NVM3 (`0x3A000..0x40000`), the journal and the application NV must stay
-  untouched, and `BootFlash` must guard them.
-- Do this chip last, and only after the loader is hardware-proven on MG22
-  or MG21.
+- **Gecko's two stages.** Series 1 splits the Gecko bootloader into a
+  first stage and a main stage. Whether the first stage verifies, or must
+  keep, the main stage it boots has to be checked against UG266 and on
+  hardware.
+- **External secondary slot.** The secondary is in external SPI flash, so
+  the core needs a split-device `NorFlash` adapter. The Gecko API and
+  direct SPI access must never run at the same time.
+- **Protected regions.** NVM3, the journal and the application NV must
+  stay behind `BootFlash`.
 
 ## Size budget
 
-Measured with `llvm-size -A` on release builds. File-backed means
-`.text + .rodata + .data` plus `.vector_table` or `.init.rust`. Before and
-after were built from equal-length worktree paths.
+Measured with `llvm-size -A` on release builds, with equal-length worktree
+paths. File-backed means `.text + .rodata + .data` plus `.vector_table`,
+`.init.rust` and `.loader_info`.
 
-| loader | region | before (`32c17d8`) | after (Phase 1) | delta |
-|---|---|---|---|---|
-| BL702 `bl702-xt-zb1-boot` | `0x2000..0xFFE0` (57,312 B) | 14,070 B (`.text` 12,084, `.rodata` 1,376, `.data` 572, `.init.rust` 38); `.bss` 1 | 14,202 B (`.text` 12,320, `.rodata` 1,272); `.bss` 1 | **+132 B** flash, +0 RAM |
-| CC2340R5 (size harness; no product binary) | 16 KiB | 8,796 B (`.vector_table` 192, `.text` 7,888, `.rodata` 716); `.bss` 4 | 8,828 B (`.text` 7,920) | **+32 B** flash, +0 RAM |
+**Loaders**
 
-The growth comes from three changes:
+| loader | region | `32c17d8` | Phase 1 (`0efac9b`) | Phase 2 step 1 | delta vs Phase 1 |
+|---|---|---|---|---|---|
+| BL702 `bl702-xt-zb1-boot` (P-256) | `0x2000..0xFFC0` (57,280 B) | 14,070 B | 14,202 B | **15,286 B** (`.text` 13,316, `.rodata` 1,360) | **+1,084 B**; `.bss` 1 B (unchanged) |
+| BL702, `--features ed25519` | same | n/a | n/a | 41,306 B (`.text` 37,472, `.rodata` 3,224) | +27,104 B |
+| CC2340R5 size harness (1 key, 3 trial boots) | 16 KiB | 8,796 B | 8,828 B | **9,396 B** | **+568 B**; RAM unchanged |
+| CC2340R5 `swap-move` | 16 KiB | n/a | n/a | 10,848 B | +2,020 B |
+| CC2340R5 `ed25519` | 16 KiB | n/a | n/a | 28,540 B | does **not** fit 16 KiB |
+| CC2340R5 `ed25519,swap-move` | 16 KiB | n/a | n/a | 29,996 B | does **not** fit 16 KiB |
 
-- the shared `Reporter` writes the console prefix as a separate call
-  instead of storing one literal per line;
-- the trait-method split of `fail`;
-- the watchdog-hook closure.
+The BL702 growth breaks down as:
 
-`.rodata` shrank because the prefix is now stored once.
+- the boot sequence with trial accounting: about +460 B;
+- `BootFlash::write` with sub-unit status programming: about +250 B;
+- `Log::append`: about +160 B;
+- the validation path with a key set: about +80 B;
+- the 64-byte loader block, up from 32 bytes.
 
-Budget for new shells: at most 16 KiB of flash for Cortex-M loaders, which
-matches the Gecko and CC2340 loader regions, and BL702's existing region.
-Stack use has not been measured yet. BL702 reserves 15 KiB. Measuring the
-worst-case stack of `validate`, which holds P-256 state, is a Phase 2
-gate.
+Ed25519 costs about 26 KB on RV32 and 19 KB on Cortex-M0+. Most of that
+is `ed25519-compact`'s fiat 64-bit-limb field arithmetic: `carry_mul` is
+4.4 KB and `carry_square` 3 KB on RV32. Loader stack use with Ed25519 has
+not been measured.
+
+**Applications** (the confirm hook and multi-key channel)
+
+| image | flash (file-backed) | RAM (`.data` + `.bss`) | stack |
+|---|---|---|---|
+| BL702 `bl702-sensor` (SED) | 222,922 → 225,070 B (+2,148) | unchanged | worst-case unchanged; boot chain +96 B (within 5,120), OTA chain −48 B |
+| BL702 ED and router images | unchanged | unchanged | unchanged |
+| EFR32MG1 sensor | `.text` +136 B | unchanged | not gated |
+| nRF52840 sensor | `.text` +228 B | unchanged | not gated |
+| CC2340 sensor (no-SDK fallback) | `.text` +48 B | `.bss` −8 B | not gated |
+
+The BL702 loader reserves a 15 KiB stack. A static measurement of the
+loader's worst-case stack (P-256 and Ed25519) is still open.
 
 ## Testing strategy
 
 1. **Host, simulated flash** (`zrs-boot-core`, feature `sim`):
-   - `SimFlash` models NOR semantics: erase sets `0xFF`, programming can
-     only clear bits, the erase and write alignment of the real part is
-     enforced, and `strict()` refuses to reprogram a unit that is not
-     erased.
-   - A power cut can be injected before any erase or program operation, in
-     three modes:
-     - `Before`: nothing happens;
-     - `Half`: a prefix is applied;
-     - `Torn`: noisy bits.
-     After a cut, every operation fails until `power_cycle()`.
-   - `replay_with_cuts` records the operations of a clean boot. It then
-     replays the boot once per operation and per cut mode. After each cut
-     it checks that:
+   - **The flash model.** `SimFlash` models NOR semantics: erase sets
+     `0xFF`, programming only clears bits, the real part's erase and
+     write alignment is enforced, and `strict()` refuses to reprogram a
+     unit that is not erased.
+   - **Cut injection.** A power cut can be injected before any erase or
+     program, in three modes: `Before` (nothing happens), `Half` (a prefix
+     is applied) and `Torn` (noisy bits). After a cut, every operation
+     fails until `power_cycle()`.
+   - **Replays.** `replay_with_cuts` records a clean boot. It then replays
+     the boot once per operation and per cut mode, and checks that:
      - the loader and NV regions are untouched;
      - the next boot finishes the job;
-     - the boot after that is a plain boot.
-   - This covers the install of both a requested and a padded image, and
-     dropping a rejected and a downgrade request.
-   - The same vectors and a second power-loss suite run in `mcuboot-image`.
-2. **Host, shells**: entry and vector checks, the XIP mapping, the BL702
-   console lines byte-for-byte, the indicator blink pattern, and
-   `BootFlash` against the real BL702 map.
+     - the boot after that is a plain boot (or, for trial and swap
+       replays, the expected trial or revert state).
+   - **Core suites** (`bootloaders/core/src/tests.rs`):
+     - install;
+     - dropping a rejected request;
+     - torn-primary install;
+     - trial install;
+     - trial expiry and confirm;
+     - with `swap-move`: install, revert, and a confirmed install kept;
+     - `BootFlash` admitting the status sectors only in swap mode.
+   - **Engine suites** (`mcuboot-image`):
+     - `upgrade_survives_power_loss_at_every_flash_operation`;
+     - `trial_install_survives_power_loss_at_every_operation`;
+     - `confirm_survives_power_loss`;
+     - the swap-move install and revert at every operation;
+     - status records that damage can never forge;
+     - multi-key rotation;
+     - Ed25519 vectors, with and without the feature.
+2. **Host, products and apps**:
+   - **BL702 product.** The channel and writer key intersection, a writer
+     without a loader trusting no key, and an installed image confirming
+     itself through the OTA view. `OtaFlash` admits writes in the trial
+     log only.
+   - **`sensor-sed` lifecycle.**
+     - the first ACK confirms once;
+     - a failed confirm retries;
+     - unacknowledged reports never confirm;
+     - joining confirms when reports are not acknowledged.
+   - **`tools/test_bl702_ota.py`** checks the loader block against the
+     Rust vector.
 3. **Build gates** (CI):
-   - `cargo test` and `clippy -D warnings` for the core (`sim,compact-sha256`)
-     and for each shell, on host and target;
-   - the BL702 product loader, and `build-image.sh` with an ephemeral key;
-   - the CC2340 shell for thumbv6m.
-4. **Hardware**, one chip at a time, using the existing lab, not in Phase 1:
-   1. boot a signed image;
-   2. refuse an unsigned image and a downgrade;
-   3. OTA from a version N to N+1, end to end;
-   4. cut power with a controllable supply at random points during the
-      copy, at least 50 cycles;
-   5. confirm that the commissioned network state and security counters
-      survive.
+   - `cargo test` and `clippy -D warnings` for the core and both shells,
+     host and target, with default features and with `ed25519,swap-move`;
+   - `mcuboot-image` with both feature sets;
+   - the BL702 product loader, including `--features ed25519`;
+   - the CC2340 shell for thumbv6m with `--all-features`;
+   - the BL702 sensor static stack gate.
+4. **Hardware**, one chip at a time; see the BL702 plan below.
+
+## BL702 hardware re-validation plan
+
+**Nothing below has been run.** Each flashing step needs the user's
+approval first.
+
+**Target.** One XT-ZB1 already commissioned to the lab's ZHA network, with:
+
+- the loader UART on GPIO14 at 2 Mbaud;
+- ISP over CH340 (`bflb`; BOOT/GPIO28 held at plug-in);
+- serial ports `cu.usbserial-14130` and `cu.usbserial-1430`.
+
+### Lab capability (checked read-only)
+
+- hwlab's `device_list` and `capability_registry` show only *fake*
+  `PowerSource` devices and no PPK2. **hwlab cannot cut power to the
+  BL702 today.**
+- hwlab's `uart` (including DTR/RTS line control) and the `bflb` ISP path
+  (REAL_HW_VERIFIED for XT-ZB1) are available.
+
+### Steps
+
+1. **Back up the device.** Read the whole 1 MiB flash over ISP: loader,
+   slots, journal and the v1 `LoaderInfo`. Keep the file as the recovery
+   image.
+2. **Build.** Run `build-image.sh` twice: version N (for example 0.2.0) and
+   N+1 (0.2.1). Both use the production key and `BL702_BOOT_TRIAL_BOOTS=3`.
+   Then run `bl702_ota.py check` on the N+1 `.zigbee` file.
+3. **Flash the v2 loader and image N** over ISP (`-full.bin` at `0x0`;
+   it covers `0x0..0x87000`, so the journal is kept).
+   - **Expected:** `bl702-boot: v2`, then `app v0.2.0+0`, then **no**
+     trial lines (a factory-flashed image is permanent).
+   - The device rejoins ZHA with its existing network state. That checks
+     that the journal survived.
+4. **OTA N→N+1 through ZHA.** Serve the file with the zigpy local
+   provider (`/config/zigpy_ota/index.json`) and install it from the
+   update entity.
+   - **Expected UART:** `installing update ……`, `update installed`,
+     `trial boot 1`, `app v0.2.1+0`.
+   - The device rejoins and its next report is APS-acknowledged. After
+     that, a power cycle shows **no** `trial boot` line (confirmed).
+   - ZHA shows the new version. The NWK frame counter keeps increasing
+     across the reset (check with a sniffer capture).
+5. **Negative checks.** Each is one OTA.
+   - An image signed with a wrong key is declined by the app channel. If
+     it is forced in, the loader rejects it with `bad signature`.
+   - An N−1 image is refused as a downgrade.
+6. **Power cuts during the copy, 50 or more.**
+   - **Arming.** For each cycle, re-arm the request: serve an alternating
+     N+1/N+2 pair with distinct builds, or re-stage the same N+1 by
+     re-downloading.
+   - **Timing.** The copy starts at the `installing update` line. Cut
+     power at a random delay of 0–2 s after that line; the copy of a
+     ~225 KB image takes roughly 1–2 s, so measure it in the first run.
+     Spread the cuts over the erase and the copy, and over the `Done`
+     write and the request drop.
+   - **Expected after each cut:** the next boot prints `installing
+     update` again (or `update installed` if the cut came after the
+     copy), then `trial boot 1`, the app version, and a rejoin without a
+     new commissioning.
+   - **Failure criteria:** no UART output, `no bootable image: …`,
+     `halted`, a fresh commissioning, a frame-counter regression, or an
+     ISP-only recovery.
+   - **Logging.** Record each cycle with its delay and the observed
+     lines.
+7. **Trial expiry.** Install an image whose app never confirms (a
+   test-only build with `report_aps_ack` off and no join, or the network
+   powered down).
+   - **Expected:** `trial boot 1..3`, then `image unconfirmed` on every
+     later boot, and no flash writes. Overwrite has no revert, so this
+     checks only that the device stays bootable.
+8. **Recovery path.** Restore the step 1 backup over ISP and check that
+   the device rejoins.
+
+### What the user must do by hand
+
+- **Approve each flashing step** (steps 3, 4 and 8).
+- **Provide power control for step 6.** Choose one of:
+  - a USB power relay or switchable hub port that the lab can drive;
+  - a PPK2 attached and registered in hwlab;
+  - cutting power by hand on a prompted random delay. Manual cuts land
+    with roughly 100–300 ms of human jitter, which is acceptable because
+    the copy window is longer.
+- **Enter ISP mode.** Hold BOOT (GPIO28) while plugging in, for the
+  backup (step 1) and for recovery.
+- **Confirm the setup.** Check that the XT-ZB1 is the one commissioned to
+  ZHA and that the ZHA local OTA provider is configured. Changing
+  `extra_providers` needs a Home Assistant restart.
 
 ## Open decisions
 
-1. **Install strategy per chip:** overwrite-only, overwrite with a
-   confirm flag, swap-move, or ping-pong (BL702, ESP, Telink).
-2. **Signature algorithm.** Keep ECDSA P-256, which imgtool and the
-   proven BL702 key already use, or add Ed25519, which needs a smaller
-   verifier but a different imgtool key type.
-3. **Key handling.** One key or several trusted keys per loader, and
-   rotation. A key change needs a new loader, and no loader self-update
-   path exists or is proposed.
-4. **The torn-header downgrade hazard.** Which fix to apply (see above).
-5. **Watchdog.** Whether loaders arm one, and with what period.
-6. **CC2340 `BootFlash`.** Whether the CC2340 shell adopts the slot guard.
-   It costs a little flash and changes behaviour only for an out-of-slot
-   write.
-7. **The MG1 migration path.** A GBL-delivered loader, or app-side
-   self-replacement. Alternatively, keep Gecko on MG1 permanently and
-   share only the image format and signature.
+1. **Ed25519 on 16 KiB loaders.** Either keep Ed25519 BL702-only (or
+   large-region-only), or write a compact 32-bit-limb verifier, estimated
+   at 4–6 KB.
+2. **CC2340 `BootFlash`.** Should the CC2340 shell adopt the slot guard?
+   It is required before swap-move is enabled there.
+3. **Watchdog.** Should loaders arm one, and with what period? It must
+   outlast a full-slot validation.
+4. **Trial expiry in overwrite mode.** Keep booting and report it (the
+   current behaviour), or additionally refuse further OTA until a confirm?
+5. **Swap-move per product.** Which of CC2340, nRF52 and MG21/MG22 turn
+   it on, and with how many trial boots.
 
 ## Proposed Phase 2 order
 
-1. Engine fixes in `mcuboot-image` and the core: the torn-header hazard
-   and an optional confirm flag. Host tests only. Then re-run the BL702
-   OTA and power-cut tests on hardware with the refactored loader.
-2. A CC2340R5 product loader binary and a `SlotWriter`-based product OTA
-   path. Hardware: SWD install, boot, OTA, power cuts.
-3. nRF52840: first the bare DK layout, then UF2 coexistence. Hardware:
-   both boards.
-4. EFR32MG22 (no bootloader), then MG21 (replacing Gecko over SWD).
-   Hardware: both.
-5. PHY6222, after proving its ROM boot.
-6. ESP32 and Telink: app-side verification of the shared signature
+1. **Done (host only):** the brick fix, trial/confirm, multi-key,
+   optional Ed25519 and opt-in swap-move.
+   **Next:** BL702 hardware re-validation (above).
+2. **CC2340R5:** a product loader binary (`BootFlash`, overwrite and
+   swap-move builds) and a `SlotWriter`-based product OTA path.
+   Hardware: SWD install, boot, OTA, power cuts, and a swap-move revert.
+3. **nRF52840:** the bare DK layout first, then UF2 coexistence.
+   Hardware: both boards.
+4. **EFR32MG22** (no bootloader), then **MG21** (replacing Gecko over
+   SWD). Hardware: both.
+5. **PHY6222**, after proving its ROM boot.
+6. **ESP32 and Telink:** app-side verification of the shared signature
    before activation, with no loader change.
-7. EFR32MG1 leaving Gecko, last, after a sacrificial-board migration
-   rehearsal.
+7. **EFR32MG1 leaving Gecko:** last, after a sacrificial-board rehearsal.

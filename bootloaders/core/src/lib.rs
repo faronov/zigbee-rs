@@ -1,30 +1,34 @@
 //! Chip-independent core of the zigbee-rs bootloaders.
 //!
 //! Every zigbee-rs loader runs the same sequence, implemented once here on
-//! top of [`mcuboot_image`] (image format, signature check and the
-//! overwrite-only install engine):
+//! top of [`mcuboot_image`] (image format, signature check and the install
+//! engine):
 //!
 //! 1. install a pending, valid, non-downgrade image from the secondary slot
-//!    ([`mcuboot_image::boot`], power-fail safe and resumable);
-//! 2. validate the primary image (SHA-256 and ECDSA P-256 signature);
+//!    ([`mcuboot_image::boot`], power-fail safe and resumable; overwrite by
+//!    default, swap-move with revert as the `swap-move` option);
+//! 2. validate the primary image (SHA-256 and an ECDSA P-256 or, with
+//!    feature `ed25519`, Ed25519 signature by one of up to three trusted
+//!    keys) and account a trial boot of an unconfirmed install;
 //! 3. let the chip check the entry of the validated image and start it, or
 //!    report the failure and stop.
 //!
 //! A chip shell (`bootloaders/<chip>-boot`) implements [`Platform`]: status
 //! output, the architecture entry check ([`entry`]), cache or clock
 //! hand-over and the jump. A product's loader binary supplies the slot
-//! [`Layout`], the trusted key (a build-time input, never a constant in
-//! this crate), the flash driver and the status hardware, then calls the
-//! shell.
+//! [`BootConfig`] (layout, trusted keys — build-time inputs, never
+//! constants in this crate — trial boots and install mode), the flash
+//! driver and the status hardware, then calls the shell.
 //!
 //! Shared building blocks:
 //!
 //! * [`flash::BootFlash`] — a flash view that refuses to erase or program
-//!   anything outside the two slots;
+//!   anything outside the two slots (and the swap status area);
 //! * [`entry`] — RISC-V fixed-entry and Cortex-M vector-table checks;
 //! * [`console`] and [`indicator`] — status lines and LED blinking from
 //!   [`BootEvent`]s;
-//! * [`loader_info`] — the identity record applications read;
+//! * [`loader_info`] and [`loader_block`] — the identity records
+//!   applications read;
 //! * `sim` (feature `sim`) — a NOR flash simulator with power-cut
 //!   injection for host tests.
 
@@ -43,8 +47,8 @@ mod tests;
 pub use embedded_storage;
 use embedded_storage::nor_flash::NorFlash;
 pub use mcuboot_image::{
-    self, BootError, BootEvent, Bootable, ImageError, ImageVersion, Layout, LoaderInfo, TrustedKey,
-    Update,
+    self, BootConfig, BootError, BootEvent, Bootable, ImageError, ImageVersion, Layout, LoaderInfo,
+    Mode, Trial, TrustedKey, Update, loader_block,
 };
 
 /// The chip-specific half of a loader.
@@ -105,29 +109,27 @@ pub const fn loader_info(loader_version: u32, key_xy: &[u8; 64]) -> [u8; 32] {
 /// Returns the address to start, if any. Host tests drive this directly.
 pub fn launch<F: NorFlash, P: Platform>(
     flash: &mut F,
-    layout: &Layout,
-    key: &TrustedKey,
+    config: &BootConfig<'_>,
     platform: &mut P,
 ) -> Option<u32> {
-    let outcome = mcuboot_image::boot(flash, layout, key, |event| {
+    let outcome = mcuboot_image::boot(flash, config, |event| {
         platform.kick_watchdog();
         platform.progress(event)
     });
     platform.decided(&outcome);
     outcome
         .ok()
-        .and_then(|bootable| platform.prepare(layout, &bootable))
+        .and_then(|bootable| platform.prepare(&config.layout, &bootable))
 }
 
 /// One complete boot: [`launch`], then [`Platform::start`] or
 /// [`Platform::fail`].
 pub fn run<F: NorFlash, P: Platform>(
     flash: &mut F,
-    layout: &Layout,
-    key: &TrustedKey,
+    config: &BootConfig<'_>,
     platform: &mut P,
 ) -> ! {
-    match launch(flash, layout, key, platform) {
+    match launch(flash, config, platform) {
         // SAFETY: `launch` returns only what `prepare` returned for the
         // image validated in this boot.
         Some(entry) => unsafe { platform.start(entry) },

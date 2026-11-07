@@ -60,7 +60,7 @@ RAW_IMAGE="$ELF.bin"
 
 # The loader's boot ROM image. .loader_info stays out of the ROM-hashed
 # range (see products/bl702-xt-zb1/bootloader/memory.x); the release step
-# places it at physical 0xFFE0.
+# places its 64 bytes (LoaderKeys, then LoaderInfo) at physical 0xFFC0.
 LOADER_RAW="$LOADER_ELF.rom.bin"
 LOADER_IMAGE="$LOADER_ELF.boot.bin"
 "$OBJCOPY" --gap-fill 0xff --remove-section .loader_info -O binary "$LOADER_ELF" "$LOADER_RAW"
@@ -82,8 +82,8 @@ fi
 mv -f firmware.bin "$LOADER_IMAGE"
 
 # Signs the application, checks the boot header (magic, 32 MHz XTAL clocks,
-# CRC, image hash, img_start 0x2000, end below 0xFFE0), the LoaderInfo key
-# and the application entry, then writes the OTA file and the full image.
+# CRC, image hash, img_start 0x2000, end at or below 0xFFC0), the loader's
+# trusted key ids and the application entry, then writes the OTA file and the full image.
 # One build per directory: flash.sh programs the only full image there.
 rm -rf "$OUT_DIR"
 "$PYTHON" "$OTA_TOOL" release \

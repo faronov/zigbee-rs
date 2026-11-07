@@ -322,6 +322,12 @@ impl<F: FirmwareWriter> OtaManager<F> {
         &self.writer
     }
 
+    /// The firmware writer, mutably (for example to confirm the running
+    /// image). Do not use it while a download is in progress.
+    pub fn writer_mut(&mut self) -> &mut F {
+        &mut self.writer
+    }
+
     /// Initiate an OTA image query.
     pub fn start_query(&mut self) -> Option<StackEvent> {
         self.response_wait_secs = 0;

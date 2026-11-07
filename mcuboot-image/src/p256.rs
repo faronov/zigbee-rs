@@ -312,6 +312,11 @@ impl VerifyingKey {
     /// Build a key from big-endian affine `x || y` (64 bytes, the SEC1
     /// uncompressed encoding without its `0x04` prefix). Returns `None`
     /// unless the point is on the curve.
+    ///
+    /// Never inlined: the on-curve check's temporaries must not share a
+    /// frame with the caller's later [`Self::verify_prehash`] call (the
+    /// OTA verify path runs on the application's stack budget).
+    #[inline(never)]
     pub fn from_xy(xy: &[u8; 64]) -> Option<Self> {
         let mut x_bytes = [0u8; 32];
         let mut y_bytes = [0u8; 32];

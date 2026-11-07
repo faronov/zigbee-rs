@@ -2,14 +2,17 @@
 //!
 //! A product's bootloader binary (booted by the mask ROM from the boot
 //! header's `img_start`, executing at the start of the XIP window) provides
-//! the slot [`Layout`], the trusted public key and the XIP mapping, places
-//! [`loader_info`] at a fixed address, and calls `run`. Each boot then runs
+//! the [`BootConfig`] (slot [`Layout`], trusted public keys, trial boots)
+//! and the XIP mapping, places [`loader_block`] (or the single-key
+//! [`loader_info`]) at a fixed address, and calls `run`. Each boot then runs
 //! the core sequence ([`zrs_boot_core::run`]):
 //!
 //! 1. installs a pending, valid, non-downgrade image from the secondary slot
-//!    (power-fail safe and resumable: the request stays armed until the
-//!    copied primary validates);
-//! 2. validates the primary image (SHA-256 and ECDSA P-256 signature);
+//!    by overwrite (power-fail safe and resumable: the request stays armed
+//!    until the copied primary validates);
+//! 2. validates the primary image (SHA-256 and an ECDSA P-256 — or, with
+//!    feature `ed25519`, Ed25519 — signature by a trusted key) and accounts
+//!    a trial boot while an installed image is unconfirmed;
 //! 3. checks the entry point, invalidates the L1C cache that fronts XIP
 //!    (the primary was possibly reprogrammed behind it) and jumps to the
 //!    application's riscv-rt `_start` with interrupts disabled, leaving
@@ -34,8 +37,8 @@ pub use zrs_boot_core::console::{
 pub use zrs_boot_core::entry::EntryError;
 pub use zrs_boot_core::flash::{BootFlash, BootFlashError};
 pub use zrs_boot_core::{
-    BootError, BootEvent, Bootable, ImageError, Layout, LoaderInfo, TrustedKey, Update,
-    loader_info, mcuboot_image,
+    BootConfig, BootError, BootEvent, Bootable, ImageError, Layout, LoaderInfo, Mode, Trial,
+    TrustedKey, Update, loader_block, loader_info, mcuboot_image,
 };
 
 /// Fixed application header size (`imgtool --header-size`): the
@@ -48,8 +51,9 @@ pub const LOG_PREFIX: &[u8] = b"bl702-boot: ";
 /// Loader configuration supplied by the product.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
-    pub layout: Layout,
-    pub key: TrustedKey,
+    /// Slots, trusted keys, trial boots (install mode is always overwrite
+    /// on this chip).
+    pub boot: BootConfig<'static>,
     /// Physical flash offset (boot header `img_start`) that the ROM maps at
     /// [`Config::xip_base`].
     pub img_start: u32,
@@ -114,11 +118,12 @@ mod tests {
         );
     }
 
+    static KEYS: [TrustedKey; 1] = [TrustedKey::new([1; 64])];
+
     #[test]
     fn xip_mapping() {
         let config = Config {
-            layout: LAYOUT,
-            key: TrustedKey::new([1; 64]),
+            boot: BootConfig::overwrite(LAYOUT, &KEYS),
             img_start: 0x2000,
             xip_base: 0x2300_0000,
         };
@@ -192,10 +197,28 @@ mod tests {
     }
 
     #[test]
+    fn trial_lines() {
+        let mut text = Text(Vec::new());
+        let mut reporter = reporter();
+        reporter.trial(&mut text, Trial::Permanent);
+        reporter.trial(&mut text, Trial::Confirmed);
+        reporter.trial(&mut text, Trial::Testing { boot: 2 });
+        reporter.trial(&mut text, Trial::Unconfirmed);
+        assert_eq!(
+            text.0,
+            b"bl702-boot: trial boot 2\r\nbl702-boot: image unconfirmed\r\n"
+        );
+    }
+
+    #[test]
     fn loader_info_identifies_the_key() {
         let key = [0x42; 64];
         let info = LoaderInfo::decode(&loader_info(3, &key)).unwrap();
         assert_eq!(info.loader_version, 3);
         assert!(info.trusts(&key));
+        // The multi-key block ends in the same v1 record.
+        let block = loader_block(3, &[TrustedKey::new(key)]);
+        assert_eq!(block[32..], loader_info(3, &key));
+        assert!(block[..32].iter().all(|byte| *byte == 0xFF));
     }
 }

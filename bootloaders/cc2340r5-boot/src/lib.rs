@@ -1,13 +1,18 @@
 //! CC2340R5 shell of the zigbee-rs bootloader core ([`zrs_boot_core`]).
 //!
 //! A product's bootloader binary (linked at `0x0`, at most 16 KiB) provides
-//! the slot [`Layout`], the trusted public key, the SRAM bounds and a status
-//! [`Indicator`], places [`loader_info`] at a fixed address, and calls
-//! `run`. Each boot then runs the core sequence ([`zrs_boot_core::run`]):
+//! the [`BootConfig`] (slot [`Layout`], trusted public keys, trial boots,
+//! install mode), the SRAM bounds and a status [`Indicator`], places
+//! [`loader_block`] (or the single-key [`loader_info`]) at a fixed address,
+//! and calls `run`. Each boot then runs the core sequence
+//! ([`zrs_boot_core::run`]):
 //!
 //! 1. installs a pending, valid, non-downgrade image from the secondary slot
-//!    ([`mcuboot_image::boot`], power-fail safe and resumable);
-//! 2. validates the primary image (SHA-256 and ECDSA P-256 signature);
+//!    ([`mcuboot_image::boot`], power-fail safe and resumable; overwrite, or
+//!    swap-move with revert of an unconfirmed image under feature
+//!    `swap-move`);
+//! 2. validates the primary image (SHA-256 and an ECDSA P-256 — or, with
+//!    feature `ed25519`, Ed25519 — signature by a trusted key);
 //! 3. checks the application vector table and jumps to it with `VTOR` and
 //!    `MSP` set, leaving clocks, power and interrupts in the ROM boot state.
 //!
@@ -23,8 +28,8 @@
 pub use zrs_boot_core::entry::{VectorError, check_vector_table};
 pub use zrs_boot_core::indicator::{Indicator, indicate};
 pub use zrs_boot_core::{
-    BootError, BootEvent, Bootable, Layout, LoaderInfo, TrustedKey, Update, loader_info,
-    mcuboot_image,
+    BootConfig, BootError, BootEvent, Bootable, Layout, LoaderInfo, Mode, Trial, TrustedKey,
+    Update, loader_block, loader_info, mcuboot_image,
 };
 
 /// Fixed application header size (`imgtool --header-size`): the vector
@@ -34,8 +39,8 @@ pub const HEADER_SIZE: u32 = 0x100;
 /// Loader configuration supplied by the product.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
-    pub layout: Layout,
-    pub key: TrustedKey,
+    /// Slots, trusted keys, trial boots and install mode.
+    pub boot: BootConfig<'static>,
     /// SRAM `[start, end)` for the initial stack pointer check.
     pub ram: (u32, u32),
 }

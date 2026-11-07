@@ -12,8 +12,8 @@ use crate::entry::{check_fixed_entry, check_vector_table};
 use crate::flash::{BootFlash, BootFlashError};
 use crate::sim::{Cut, SimFlash};
 use crate::{
-    BootError, BootEvent, Bootable, ImageError, Layout, Platform, TrustedKey, Update, image_end,
-    launch,
+    BootConfig, BootError, BootEvent, Bootable, ImageError, Layout, Platform, Trial, TrustedKey,
+    Update, image_end, launch,
 };
 
 const KEY: [u8; 64] = *include_bytes!("../../../mcuboot-image/tests/vectors/test-key.xy");
@@ -31,6 +31,7 @@ const HEADER: u32 = 0x100;
 /// 0x0800..0x4800  primary slot
 /// 0x4800..0x8800  secondary slot
 /// 0x8800..0x9000  persistence journal   (protected)
+/// 0x9000..0xA000  swap-move status      (swap tests only)
 /// ```
 const LAYOUT: Layout = Layout {
     primary: 0x0800,
@@ -40,13 +41,16 @@ const LAYOUT: Layout = Layout {
 };
 const LOADER: (u32, u32) = (0, 0x0800);
 const NV: (u32, u32) = (0x8800, 0x9000);
-const FLASH_LEN: usize = 0x9000;
+const FLASH_LEN: usize = 0xA000;
 
 type Flash = SimFlash<{ SECTOR as usize }, 4>;
 
-fn key() -> TrustedKey {
-    TrustedKey::new(KEY)
-}
+static KEYS: [TrustedKey; 1] = [TrustedKey::new(KEY)];
+const CONFIG: BootConfig<'static> = BootConfig::overwrite(LAYOUT, &KEYS);
+const TRIAL: BootConfig<'static> = BootConfig {
+    trial_boots: 3,
+    ..CONFIG
+};
 
 /// A device with a recognisable pattern in both protected regions, `primary`
 /// installed, and `secondary` staged (with the request magic if `request`).
@@ -124,12 +128,16 @@ impl Platform for Recorder {
 
 /// One boot through [`BootFlash`].
 fn boot_once(flash: &mut Flash) -> (Option<u32>, Recorder) {
+    boot_with(flash, &CONFIG)
+}
+
+fn boot_with(flash: &mut Flash, config: &BootConfig<'_>) -> (Option<u32>, Recorder) {
     let mut platform = Recorder::default();
-    let mut guarded = BootFlash::new(
+    let mut guarded = BootFlash::for_config(
         core::mem::replace(flash, Flash::new(SECTOR as usize)),
-        &LAYOUT,
+        config,
     );
-    let entry = launch(&mut guarded, &LAYOUT, &key(), &mut platform);
+    let entry = launch(&mut guarded, config, &mut platform);
     *flash = guarded.into_inner();
     (entry, platform)
 }
@@ -213,7 +221,7 @@ fn refused_entry_and_nothing_bootable_start_nothing() {
         refuse: true,
         ..Recorder::default()
     };
-    assert_eq!(launch(&mut flash, &LAYOUT, &key(), &mut platform), None);
+    assert_eq!(launch(&mut flash, &CONFIG, &mut platform), None);
     assert!(platform.prepared.is_some());
 
     let mut flash = device(&[], None, false);
@@ -280,11 +288,24 @@ fn boot_flash_refuses_everything_outside_the_slots() {
 /// mode, then reboot until something starts. `expect` checks the final
 /// state. Returns the number of operations of the uninterrupted boot.
 fn replay_with_cuts(setup: impl Fn() -> Flash, expect: impl Fn(&mut Flash, &Recorder)) -> usize {
+    replay_config(&CONFIG, setup, expect, true)
+}
+
+/// [`replay_with_cuts`] under `config`. `settles` asks the boot after the
+/// recovery to be a plain boot (no trial boot accounting in between).
+fn replay_config(
+    config: &BootConfig<'_>,
+    setup: impl Fn() -> Flash,
+    expect: impl Fn(&mut Flash, &Recorder),
+    settles: bool,
+) -> usize {
+    let boot_once = |flash: &mut Flash| boot_with(flash, config);
     let mut clean = setup();
+    let before = clean.operations();
     let (entry, platform) = boot_once(&mut clean);
     assert!(entry.is_some());
     expect(&mut clean, &platform);
-    let operations = clean.operations();
+    let operations = clean.operations() - before;
     assert!(operations > 0);
 
     for cut in Cut::ALL {
@@ -305,9 +326,11 @@ fn replay_with_cuts(setup: impl Fn() -> Flash, expect: impl Fn(&mut Flash, &Reco
                 platform.outcome
             );
             expect(&mut flash, &platform);
-            let (again, platform) = boot_once(&mut flash);
-            assert_eq!(again, entry, "{cut:?} at {index}");
-            assert_eq!(platform.outcome.unwrap().unwrap().update, Update::None);
+            if settles {
+                let (again, platform) = boot_once(&mut flash);
+                assert_eq!(again, entry, "{cut:?} at {index}");
+                assert_eq!(platform.outcome.unwrap().unwrap().update, Update::None);
+            }
             assert_protected_intact(&flash);
         }
     }
@@ -345,30 +368,173 @@ fn dropping_a_rejected_request_survives_a_power_cut_at_every_operation() {
     }
 }
 
-/// KNOWN HAZARD, kept as a characterisation test so that fixing it is a
-/// deliberate change (see docs/book/src/advanced/bootloader.md, "Open
-/// decisions").
-///
-/// A primary whose header magic survives an interrupted erase while its
-/// version bytes read higher (erase only sets bits) makes the engine apply
-/// the downgrade rule against an image that no longer validates: the
-/// request is dropped and nothing is bootable. MCUboot's overwrite-only
-/// mode compares against the primary header the same way. Uniform
-/// prefix-erase cuts (the replays above) never produce this state.
+/// The hazard Phase 1 pinned, now fixed: a primary whose header magic
+/// survives an interrupted erase while its version bytes read higher
+/// (erase only sets bits) no longer blocks the update, because the
+/// downgrade rule only applies against a primary that validates fully.
 #[test]
-fn known_hazard_torn_primary_header_reads_as_a_downgrade() {
+fn torn_primary_header_never_blocks_a_valid_update() {
     let mut torn = V1.to_vec();
     torn[20] = 0xFF; // major
     torn[0x200..0x400].fill(0xFF); // partly erased payload
     let mut flash = device(&torn, Some(V2), true);
     let (entry, platform) = boot_once(&mut flash);
-    assert_eq!(entry, None);
-    assert_eq!(
-        platform.outcome,
-        Some(Err(BootError::NoBootableImage {
-            primary: ImageError::HashMismatch,
-            update: Update::Downgrade,
-        }))
-    );
+    assert_eq!(entry, Some(LAYOUT.primary + HEADER));
+    assert_eq!(platform.outcome.unwrap().unwrap().update, Update::Installed);
+    assert_eq!(primary_version(&flash).0, 2);
     assert_eq!(request_state(&mut flash), MagicState::Erased);
+}
+
+/// No brick from any cut in any mode while installing over a torn primary
+/// whose header claims a higher version, with and without trial boots.
+#[test]
+fn torn_primary_install_survives_a_power_cut_at_every_operation() {
+    let mut torn = V2.to_vec();
+    torn[20] = 0xFF;
+    torn[0x200..0x400].fill(0xFF);
+    for config in [CONFIG, TRIAL] {
+        replay_config(
+            &config,
+            || device(&torn, Some(V1), true),
+            |flash, _| {
+                assert_eq!(primary_version(flash).0, 1);
+                assert_ne!(request_state(flash), MagicState::Good);
+            },
+            config.trial_boots == 0,
+        );
+    }
+}
+
+#[test]
+fn trial_install_survives_a_power_cut_at_every_operation() {
+    replay_config(
+        &TRIAL,
+        || device(V1, Some(V2), true),
+        |flash, platform| {
+            assert_eq!(primary_version(flash).0, 2);
+            assert_ne!(request_state(flash), MagicState::Good);
+            let bootable = platform.outcome.unwrap().unwrap();
+            assert!(
+                matches!(bootable.trial, Trial::Testing { boot } if boot <= 3),
+                "{:?}",
+                bootable.trial
+            );
+        },
+        false,
+    );
+}
+
+/// Trial boots end in `Unconfirmed` (overwrite cannot revert) and the
+/// image keeps starting; a confirmed image is never on trial again.
+#[test]
+fn trial_boots_then_unconfirmed_or_confirmed() {
+    use mcuboot_image::{Mode, TrialState, confirm};
+    let mut flash = device(V1, Some(V2), true);
+    for boot in 1..=3 {
+        let (entry, platform) = boot_with(&mut flash, &TRIAL);
+        assert!(entry.is_some());
+        assert_eq!(
+            platform.outcome.unwrap().unwrap().trial,
+            Trial::Testing { boot }
+        );
+    }
+    let (entry, platform) = boot_with(&mut flash, &TRIAL);
+    assert!(entry.is_some());
+    assert_eq!(platform.outcome.unwrap().unwrap().trial, Trial::Unconfirmed);
+    assert_eq!(
+        confirm(&mut flash, &LAYOUT, Mode::Overwrite),
+        Ok(TrialState::Testing { attempts: 3 })
+    );
+    let operations = flash.operations();
+    let (_, platform) = boot_with(&mut flash, &TRIAL);
+    assert_eq!(platform.outcome.unwrap().unwrap().trial, Trial::Confirmed);
+    assert_eq!(flash.operations(), operations);
+    assert_protected_intact(&flash);
+}
+
+#[cfg(feature = "swap-move")]
+mod swap {
+    use super::*;
+    use crate::Mode;
+    use mcuboot_image::{TrialState, confirm};
+
+    const STATUS: u32 = 0x9000;
+    const SWAP: BootConfig<'static> = BootConfig {
+        layout: LAYOUT,
+        keys: &KEYS,
+        trial_boots: 3,
+        mode: Mode::SwapMove { status: STATUS },
+    };
+
+    #[test]
+    fn boot_flash_admits_the_status_sectors_only_in_swap_mode() {
+        let mut flash = BootFlash::for_config(device(V1, None, false), &SWAP);
+        assert_eq!(flash.erase(STATUS, STATUS + 2 * SECTOR), Ok(()));
+        assert_eq!(flash.write(STATUS, &[0; 4]), Ok(()));
+        assert_eq!(
+            flash.erase(STATUS - SECTOR, STATUS),
+            Err(BootFlashError::Protected)
+        );
+        let mut flash = BootFlash::for_config(flash.into_inner(), &CONFIG);
+        assert_eq!(
+            flash.erase(STATUS, STATUS + SECTOR),
+            Err(BootFlashError::Protected)
+        );
+        assert_protected_intact(&flash.into_inner());
+    }
+
+    #[test]
+    fn install_survives_a_power_cut_at_every_operation() {
+        replay_config(
+            &SWAP,
+            || device(V1, Some(V2), true),
+            |flash, platform| {
+                assert_eq!(primary_version(flash).0, 2);
+                assert_ne!(request_state(flash), MagicState::Good);
+                let bootable = platform.outcome.unwrap().unwrap();
+                assert!(matches!(bootable.trial, Trial::Testing { .. }));
+                assert_eq!(flash.range(LAYOUT.secondary, V1.len()), V1);
+            },
+            false,
+        );
+    }
+
+    #[test]
+    fn revert_survives_a_power_cut_at_every_operation() {
+        let unconfirmed = || {
+            let mut flash = device(V1, Some(V2), true);
+            for _ in 0..3 {
+                boot_with(&mut flash, &SWAP);
+            }
+            flash
+        };
+        replay_config(
+            &SWAP,
+            unconfirmed,
+            |flash, platform| {
+                assert_eq!(primary_version(flash).0, 1);
+                let bootable = platform.outcome.unwrap().unwrap();
+                assert_eq!(bootable.trial, Trial::Permanent);
+                assert_eq!(flash.range(LAYOUT.secondary, V2.len()), V2);
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn confirmed_swap_install_is_kept() {
+        let mut flash = device(V1, Some(V2), true);
+        boot_with(&mut flash, &SWAP);
+        assert_eq!(
+            confirm(&mut flash, &LAYOUT, SWAP.mode),
+            Ok(TrialState::Testing { attempts: 1 })
+        );
+        for _ in 0..5 {
+            let (entry, platform) = boot_with(&mut flash, &SWAP);
+            assert!(entry.is_some());
+            assert_eq!(platform.outcome.unwrap().unwrap().trial, Trial::Confirmed);
+        }
+        assert_eq!(primary_version(&flash).0, 2);
+        assert_protected_intact(&flash);
+    }
 }

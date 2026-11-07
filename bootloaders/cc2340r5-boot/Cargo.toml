@@ -10,6 +10,13 @@ publish = false
 # Standalone like cc2340r5-hal; a product's bootloader binary consumes it.
 [workspace]
 
+[features]
+# Also accept Ed25519-signed images.
+ed25519 = ["zrs-boot-core/ed25519"]
+# Swap-move install keeping the previous image for revert of an
+# unconfirmed update (needs two status sectors in the layout).
+swap-move = ["zrs-boot-core/swap-move"]
+
 [dependencies]
 zrs-boot-core = { path = "../core", features = ["compact-sha256"] }
 
