@@ -1,0 +1,20 @@
+[package]
+name = "zrs-boot-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Chip-independent core of the zigbee-rs MCUboot-image bootloaders: boot sequencing, slot-guarded flash, entry checks and status output"
+publish = false
+
+[dependencies]
+embedded-storage = { workspace = true }
+mcuboot-image = { version = "0.1.0", path = "../../mcuboot-image" }
+
+[features]
+default = []
+# Smaller, slower SHA-256 for size-constrained bootloaders.
+compact-sha256 = ["mcuboot-image/compact-sha256"]
+# Host-only NOR flash simulator with power-cut injection (needs `std`),
+# for chip shells' and products' host tests.
+sim = []

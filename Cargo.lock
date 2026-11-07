@@ -2140,3 +2140,11 @@ dependencies = [
  "zigbee-nwk",
  "zigbee-types",
 ]
+
+[[package]]
+name = "zrs-boot-core"
+version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+ "mcuboot-image",
+]

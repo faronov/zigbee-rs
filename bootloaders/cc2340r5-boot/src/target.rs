@@ -1,7 +1,8 @@
-//! Target-only boot flow: install, validate, jump, or fault and shut down.
+//! Target-only hand-over: the CC2340R5 [`Platform`] of the core sequence.
 
 use cc2340r5_hal::flash::InternalFlash;
 use cc2340r5_hal::power;
+use zrs_boot_core::{BootEvent, Bootable, Layout, Platform, image_end};
 
 use crate::{Config, Indicator, check_vector_table, indicate};
 
@@ -25,14 +26,27 @@ pub fn run(
 ) -> ! {
     power::release_io_latch();
 
-    let result = mcuboot_image::boot(&mut flash, &config.layout, &config.key, |event| {
-        indicate(indicator, event)
-    });
-    if let Ok(bootable) = result {
+    let mut shell = Cc2340 {
+        ram: config.ram,
+        indicator,
+        prepare_shutdown: Some(prepare_shutdown),
+    };
+    zrs_boot_core::run(&mut flash, &config.layout, &config.key, &mut shell)
+}
+
+struct Cc2340<'a, I, S> {
+    ram: (u32, u32),
+    indicator: &'a mut I,
+    prepare_shutdown: Option<S>,
+}
+
+impl<I: Indicator, S: FnOnce()> Platform for Cc2340<'_, I, S> {
+    fn progress(&mut self, event: BootEvent) {
+        indicate(self.indicator, event);
+    }
+
+    fn prepare(&mut self, layout: &Layout, bootable: &Bootable) -> Option<u32> {
         let vector_table = bootable.vector_table;
-        let image_end = config.layout.primary
-            + u32::from(bootable.image.header.hdr_size)
-            + bootable.image.header.img_size;
         // SAFETY: the vector table lies inside a validated image in
         // memory-mapped main flash.
         let (initial_sp, reset) = unsafe {
@@ -41,21 +55,36 @@ pub fn run(
                 core::ptr::read_volatile((vector_table + 4) as *const u32),
             )
         };
-        if check_vector_table(initial_sp, reset, vector_table, image_end, config.ram).is_ok() {
-            indicator.off();
-            // SAFETY: the image was validated and its vector table checked;
-            // no interrupt has been enabled by the loader.
-            unsafe { jump(vector_table) }
-        }
+        check_vector_table(
+            initial_sp,
+            reset,
+            vector_table,
+            image_end(layout, bootable),
+            self.ram,
+        )
+        .ok()
+        .map(|()| vector_table)
     }
 
-    for blink in 0..2 * FAULT_BLINKS {
-        indicator.fault(blink.is_multiple_of(2));
-        cortex_m::asm::delay(HALF_PERIOD_CYCLES);
+    unsafe fn start(&mut self, vector_table: u32) -> ! {
+        self.indicator.off();
+        // SAFETY: `prepare` returned this vector table for an image
+        // validated in this boot and checked it; no interrupt has been
+        // enabled by the loader.
+        unsafe { jump(vector_table) }
     }
-    indicator.off();
-    prepare_shutdown();
-    power::shutdown()
+
+    fn fail(&mut self) -> ! {
+        for blink in 0..2 * FAULT_BLINKS {
+            self.indicator.fault(blink.is_multiple_of(2));
+            cortex_m::asm::delay(HALF_PERIOD_CYCLES);
+        }
+        self.indicator.off();
+        if let Some(prepare_shutdown) = self.prepare_shutdown.take() {
+            prepare_shutdown();
+        }
+        power::shutdown()
+    }
 }
 
 /// Point `VTOR` at the application and branch to its reset handler with its

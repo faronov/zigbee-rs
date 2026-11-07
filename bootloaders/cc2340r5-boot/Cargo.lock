@@ -32,7 +32,7 @@ version = "0.1.0"
 dependencies = [
  "cc2340r5-hal",
  "cortex-m",
- "mcuboot-image",
+ "zrs-boot-core",
 ]
 
 [[package]]
@@ -315,4 +315,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de437e2a6208b014ab52972a27e59b33fa2920d3e00fe05026167a1c509d19cc"
 dependencies = [
  "vcell",
+]
+
+[[package]]
+name = "zrs-boot-core"
+version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+ "mcuboot-image",
 ]

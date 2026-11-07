@@ -125,10 +125,16 @@ jobs:
             features: ""
           # Workspace member; its optional firmware-writer and compact
           # SHA-256 paths are not covered by the plain workspace test run.
-          - name: CC2340R5 loader core
+          - name: CC2340R5 loader shell
             manifest: bootloaders/cc2340r5-boot/Cargo.toml
             workspace: bootloaders/cc2340r5-boot
             features: ""
+          # Workspace member; the power-cut simulator and the compact
+          # SHA-256 path are feature-gated.
+          - name: Bootloader core (power-cut simulation)
+            manifest: bootloaders/core/Cargo.toml
+            workspace: .
+            features: sim,compact-sha256
           - name: MCUboot image firmware writer
             manifest: mcuboot-image/Cargo.toml
             workspace: .
