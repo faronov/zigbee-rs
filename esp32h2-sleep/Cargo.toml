@@ -1,0 +1,20 @@
+[package]
+name = "esp32h2-sleep"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "RAM-resident ESP32-H2 PMU light/deep sleep, ported from ESP-IDF v5.5.1"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# The register-level backend only exists for the chip. Host builds compile
+# and test the pure planning, parameter and retention-table modules.
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+esp32h2 = { version = "0.18", default-features = false }
+
+[features]
+default = []
+# Experimental light sleep with the TOP, CPU and modem domains powered down
+# and their registers retained by a CPU copy (`SleepMode::TopPowerDown`).
+# Without it that mode is rejected with `UnsupportedPowerConfiguration`.
+top-pd = []
