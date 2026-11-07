@@ -26,15 +26,13 @@
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-use core::time::Duration;
-
+use esp32h2_sleep::{ChipInfo, PowerDown, Request, SleepError, SleepMode, Wake};
 use esp_backtrace as _;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::peripherals::{
     GPIO, IO_MUX, LP_AON, LP_CLKRST, MODEM_LPCON, MODEM_SYSCON, PCR, PMU, USB_DEVICE,
 };
-use esp_hal::rtc_cntl::sleep::{RetainedPowerDown, RetainedSleepError, TimerWakeupSource};
 use esp_hal::rtc_cntl::Rtc;
 use esp_println::println;
 
@@ -48,22 +46,29 @@ const LED_DIN_GPIO: usize = 8;
 /// BOOT button, external 10 kOhm pull-up on the H2-Zero.
 const BOOT_GPIO: usize = 9;
 
-const POWER_DOWN: RetainedPowerDown = RetainedPowerDown {
+const POWER_DOWN: PowerDown = PowerDown {
     xtal: config::SLEEP_XTAL_OFF,
     rc_fast: config::SLEEP_RC_FAST_OFF,
+};
+
+const LIGHT_MODE: SleepMode = if config::LIGHT_TOP_PD {
+    SleepMode::TopPowerDown
+} else {
+    SleepMode::Retained
 };
 
 #[esp_hal::main]
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
-    let mut rtc = Rtc::new(peripherals.LPWR);
+    let rtc = Rtc::new(peripherals.LPWR);
+    let chip = chip_info();
     let mut led_din = peripherals.GPIO8;
     let delay = Delay::new();
 
     delay.delay_millis(config::USB_HOST_WAIT_MS);
     let host = USB_DEVICE::regs().int_raw().read().sof().bit_is_set();
     if host {
-        usb_session(&mut rtc, &delay)
+        usb_session(&rtc, &chip, &delay)
     }
 
     // Battery/bench power: no console from here on.
@@ -72,29 +77,38 @@ fn main() -> ! {
         .modify(|_, w| w.usb_pad_enable().clear_bit().dp_pullup().clear_bit());
 
     // A: production flags, LED DIN at its reset configuration.
-    let _ = light_sleep(&mut rtc, config::LIGHT_DEFAULT_S);
+    let _ = light_sleep(&chip, config::LIGHT_DEFAULT_S);
     marker(&delay);
     // B: LED DIN input buffer, pulls and output driver off.
     isolate(LED_DIN_GPIO);
-    let _ = light_sleep(&mut rtc, config::LIGHT_ISOLATED_S);
+    let _ = light_sleep(&chip, config::LIGHT_ISOLATED_S);
     marker(&delay);
     // C: LED DIN driven low (pads keep their active state in light sleep).
     {
         let _low = Output::new(led_din.reborrow(), Level::Low, OutputConfig::default());
-        let _ = light_sleep(&mut rtc, config::LIGHT_DRIVE_LOW_S);
+        let _ = light_sleep(&chip, config::LIGHT_DRIVE_LOW_S);
         marker(&delay);
     }
     isolate(LED_DIN_GPIO);
     // D: deep sleep; the LP timer wake resets the chip.
-    rtc.sleep_deep(&[&TimerWakeupSource::new(Duration::from_secs(config::DEEP_S))])
+    // SAFETY: as in `light_sleep`; RAM is lost, the wake is a chip reset.
+    let _refused = critical_section::with(|_| unsafe {
+        esp32h2_sleep::deep_sleep(&chip, config::DEEP_S * 1_000_000)
+    });
+    // Refused before any power state changed: stay CPU-busy on the trace.
+    loop {
+        marker(&delay);
+    }
 }
 
 /// Host attached: register evidence before and after one real light sleep.
-fn usb_session(rtc: &mut Rtc<'_>, delay: &Delay) -> ! {
+fn usb_session(rtc: &Rtc<'_>, chip: &ChipInfo, delay: &Delay) -> ! {
     println!(
-        "[floor] boot: reset {:?}, wake {:?}; light {:?}, A/B/C/D {}/{}/{}/{} s",
+        "[floor] boot: reset {:?}, wake {:?}; chip {:?}; light {:?} {:?}, A/B/C/D {}/{}/{}/{} s",
         esp_hal::system::reset_reason(),
         esp_hal::system::wakeup_cause(),
+        chip,
+        LIGHT_MODE,
         POWER_DOWN,
         config::LIGHT_DEFAULT_S,
         config::LIGHT_ISOLATED_S,
@@ -105,21 +119,14 @@ fn usb_session(rtc: &mut Rtc<'_>, delay: &Delay) -> ! {
     // Let the console drain before the clocks stop.
     delay.delay_millis(100);
     let before = rtc.time_since_boot();
-    let result = light_sleep(rtc, 2);
+    let result = light_sleep(chip, 2);
     let slept = rtc.time_since_boot() - before;
-    let pmu = PMU::regs();
-    let reject = pmu.int_raw().read().soc_sleep_reject().bit_is_set();
-    let wake_status = pmu.slp_wakeup_status0().read().bits();
-    let reject_cause = pmu.slp_wakeup_status1().read().bits();
     // The host re-enumerates the device after the stopped period.
     delay.delay_millis(3_000);
     println!(
-        "[floor] light sleep: {:?}, RTC {} us, rejected {}, wake 0x{:08X}, reject cause 0x{:08X}",
+        "[floor] light sleep: {:?}, RTC {} us",
         result,
         slept.as_micros(),
-        reject,
-        wake_status,
-        reject_cause,
     );
     dump("after-sleep");
     loop {
@@ -128,11 +135,35 @@ fn usb_session(rtc: &mut Rtc<'_>, delay: &Delay) -> ! {
     }
 }
 
-fn light_sleep(rtc: &mut Rtc<'_>, seconds: u64) -> Result<(), RetainedSleepError> {
-    let timer = TimerWakeupSource::new(Duration::from_secs(seconds));
+fn light_sleep(chip: &ChipInfo, seconds: u64) -> Result<Wake, SleepError> {
+    let request = Request {
+        duration_us: seconds * 1_000_000,
+        power_down: POWER_DOWN,
+        gpio_wake: false,
+        ext1: None,
+        mode: LIGHT_MODE,
+    };
     // SAFETY: no radio, flash writer, DMA or other RTC/PMU user exists in
-    // this image; watchdogs are disabled by `esp_hal::init`.
-    unsafe { rtc.sleep_light_retained_power_down(POWER_DOWN, &[&timer]) }
+    // this image; watchdogs are disabled by `esp_hal::init`; interrupts are
+    // masked for the whole sequence.
+    critical_section::with(|_| unsafe { esp32h2_sleep::light_sleep(chip, &request) })
+}
+
+/// eFuse facts for the sleep backend (read before sleeping: eFuse access is
+/// flash-resident code).
+fn chip_info() -> ChipInfo {
+    use esp_hal::efuse::{Efuse, ACTIVE_HP_DBIAS, ACTIVE_LP_DBIAS, DSLP_DBIAS};
+    let (blk_major, blk_minor) = Efuse::block_version();
+    ChipInfo {
+        fuses: esp32h2_sleep::DbiasFuses {
+            blk_major,
+            blk_minor,
+            active_hp: Efuse::read_field_le::<u8>(ACTIVE_HP_DBIAS),
+            active_lp: Efuse::read_field_le::<u8>(ACTIVE_LP_DBIAS),
+            deep_sleep: Efuse::read_field_le::<u8>(DSLP_DBIAS),
+        },
+        revision: Efuse::chip_revision(),
+    }
 }
 
 /// CPU-busy period that separates phases on the current trace.

@@ -51,6 +51,9 @@ router-app = { path = "../../apps/router", default-features = false, optional = 
 zigbee-nwk = { path = "../../zigbee-nwk", optional = true }
 zigbee-aps = { path = "../../zigbee-aps", optional = true }
 esp32-zigbee-devkit-product = { path = "../../products/esp32-zigbee-devkit", features = ["esp32h2"] }
+# Own PMU sleep backend; the floor lab calls it directly (no product).
+esp32h2-sleep = { path = "../../esp32h2-sleep" }
+critical-section = "1.2"
 
 # ESP32-H2 HAL and runtime
 esp-bootloader-esp-idf = { version = "0.4.0", default-features = false, features = ["esp32h2"] }
@@ -89,6 +92,10 @@ router = [
 ]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
+# Experimental TOP/CPU/modem power-down light sleep (`esp32h2-sleep`
+# `top-pd`); `thermometer.toml` `sleep_mode = "top_pd"` (or floor_lab.toml
+# `light_mode`) selects it. With "retained" the code is linked but unused.
+top-pd = ["light-sleep", "esp32-zigbee-devkit-product/h2-top-pd"]
 # Temperature-only sleepy thermometer (`esp32h2-thermometer` bin); its
 # identity, reporting defaults and cadence come from `thermometer.toml`.
 thermometer = ["sed", "dep:zigbee-aps", "reporting-persist", "anomaly-record"]

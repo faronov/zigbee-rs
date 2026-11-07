@@ -150,6 +150,18 @@ and H2 `soc/regi2c_bias.h`. These are references, not linked IDF dependencies.
 - Correct SYSTIMER high-word reload (`>> 32`, not `<< 32`) for all existing
   setter branches.
 
+## H2 sleep entry superseded (pending removal)
+
+The product no longer calls the H2 light/deep sleep entry points of this
+backport (`rtc_cntl/sleep/esp32h2.rs`, the H2 branches of `retained.rs`):
+ESP32-H2 sleeps through the repository's own `esp32h2-sleep` crate, a port
+of the same IDF v5.5.1 sequence plus TOP power-down (see
+`esp32h2-sleep/README.md`). The H2 clock and calibration fixes above
+(FLASH_PLL source, `fosc_tick_num`, `calibrate_internal` restore, HP_SLEEP
+defaults at init) remain in use through `esp_hal::init`. The H2 sleep
+entry is deleted only after the crate's retained mode is re-proven on
+hardware. ESP32-C6 still uses this backport unchanged.
+
 ## Integration and limits
 
 Patch **all** firmware dependency graphs to this single HAL copy; keep the pinned

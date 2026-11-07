@@ -62,6 +62,14 @@ poll_response_wait_ms = 32
 # SYSTIMER (compensated from the calibrated RTC). false = keep running.
 sleep_xtal_off = true
 sleep_rc_fast_off = true
+# Light-sleep depth (`esp32h2-sleep`, esp32h2-sleep/README.md):
+#   "retained"  every digital domain stays powered at 0.6 V (proven, ~85 uA
+#               chip excess on the ESP32-H2-Zero, phase B - phase D);
+#   "top_pd"    EXPERIMENTAL: TOP, CPU and modem domains powered off, their
+#               registers copied to RAM and back (~5.3 KiB, wake ~1 ms more).
+#               Needs `--features top-pd` and sleep_xtal_off = true; the BOOT
+#               button then wakes through EXT1 (GPIO9 = LP IO 2).
+sleep_mode = "retained"
 # Fast-poll windows after a fresh join (ZHA interview) and after a resume.
 fresh_join_fast_ms = 120000
 restored_fast_ms = 60000

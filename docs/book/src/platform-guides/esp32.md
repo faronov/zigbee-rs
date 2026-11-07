@@ -249,9 +249,18 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   row shorter than `rapid_reset_window_ms`, the next boot keeps light sleep
   off and records reason 8 once (cause = carried reset cause).
 - Light sleep stops XTAL and RC_FAST (`sleep_xtal_off`,
-  `sleep_rc_fast_off`) and applies ESP-IDF's light-sleep analog settings
-  (see `vendor/esp-hal/LOCAL-PATCHES.md`). CPU, top, modem and flash
-  domains stay powered.
+  `sleep_rc_fast_off`) and applies ESP-IDF's light-sleep analog settings.
+  The H2 PMU sequence is the repository's own RAM-resident
+  `esp32h2-sleep` crate (`esp32h2-sleep/README.md`), a port of
+  ESP-IDF v5.5.1 that replaces the H2 entry of the vendor esp-hal backport
+  (`vendor/esp-hal/LOCAL-PATCHES.md`; C6 still uses the backport). With
+  `sleep_mode = "retained"` (default) CPU, top, modem and flash domains
+  stay powered. `sleep_mode = "top_pd"` (`--features top-pd`,
+  **experimental, not yet run on hardware**) powers TOP, CPU and modem off
+  and retains ~5.3 KiB of registers in RAM, aiming at the datasheet ~25 µA
+  light-sleep floor; the BOOT button then wakes through EXT1.
+  `tools/esp32h2-sleep-ram-check.py` checks in CI that the sleep/restore
+  path never reaches flash.
 - CPU clock: the ESP-IDF bootloader leaves the H2 CPU on FLASH_PLL
   (64 MHz from BBPLL, source 3). Earlier HAL code rejected that source, so
   every sleep failed with `UnsupportedClock` (cause `0x14000001`, reason 8)
@@ -300,9 +309,11 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   sleep; without a host it disables the USB pad and cycles light sleep
   (LED DIN untouched, isolated, driven low) and an LP-timer deep sleep, so a
   power trace separates board quiescent current from chip sleep
-  configuration. H2 deep sleep is a local esp-hal backport (timer wake
-  only, see `vendor/esp-hal/LOCAL-PATCHES.md`); production images do not
-  link it. On the H2-Zero (WSTK AEM, 3.3 V) the lab measured light sleep
+  configuration. Light and deep sleep go through `esp32h2-sleep`
+  (`light_mode = "retained"` or, with `--features floor-lab,top-pd`,
+  `"top_pd"`); deep sleep is timer wake only. Production images do not
+  link deep sleep. The measurements below used the earlier esp-hal
+  backport path. On the H2-Zero (WSTK AEM, 3.3 V) the lab measured light sleep
   1.10 mA (= the production floor), 0.97 mA with GPIO8 isolated, 1.18 mA
   with GPIO8 driven low and 0.73 mA in deep sleep.
 - **Known board limit (Waveshare ESP32-H2-Zero):** ~0.73 mA flows even in
@@ -336,9 +347,10 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
 
 Status: join, interview, temperature reporting, the anomaly record and
 retained light sleep with XTAL/RC_FAST off are lab-tested on one H2 board
-(WSTK AEM: polls every 29.8 s, but a flat 1.10 mA sleep floor, so ~1.13 mA
-average; 0.73 mA of it is the H2-Zero board limit above). Pad isolation and
-the HP_SLEEP parity values are built but not yet measured. A tens-of-uA
+through the esp-hal backport path (WSTK AEM, `61b0f8a`: polls every
+29.75 s at ~557 µC, a 0.802 mA sleep floor and ~823 µA average; 0.73 mA of
+it is the H2-Zero board limit above). The same retained mode through
+`esp32h2-sleep`, and the `top_pd` mode, are built and host-tested only. A tens-of-uA
 floor needs a different board; on the H2-Zero the target is B − D near
 80 µA. Reporting persistence across a power cycle and Poll Control check-in
 remain **hardware gates**.

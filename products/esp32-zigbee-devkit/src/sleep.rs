@@ -1,9 +1,12 @@
 //! Calibrated accounting and a retained ESP32-C6/H2 SoC light-sleep boundary.
 //!
-//! Requires the repository's esp-hal 1.0.0 retained-sleep backport. It does not
-//! substitute WFI or deep sleep. Both backends use the HAL
-//! PMU sleep sequence with its default retained CPU/RAM/flash/peripheral domains;
-//! it does not enable CPU power-down or promise minimum-current operation.
+//! ESP32-C6 uses the repository's esp-hal 1.0.0 retained-sleep backport;
+//! ESP32-H2 uses the product's own RAM-resident `esp32h2-sleep` crate (a port
+//! of the same ESP-IDF v5.5.1 sequence, see `esp32h2-sleep/README.md`). Neither
+//! substitutes WFI or deep sleep. The default mode keeps the CPU/RAM/flash/
+//! peripheral domains retained; the H2-only, experimental
+//! `SleepMode::TopPowerDown` (feature `h2-top-pd`) powers TOP/CPU/modem off
+//! and restores their registers from RAM.
 //! C6 MSPI follows SOC_ROOT_CLK (ESP-IDF's C6 `hal/clk_tree_ll.h`); the HAL
 //! switches that root to XTAL before disabling BBPLL. Keeping XTAL and flash
 //! power enabled is essential to this configuration's flash-resident code.
@@ -70,6 +73,9 @@ pub struct SleepReport {
     /// Time already counted by SYSTIMER has been subtracted.
     pub missing_systimer_ticks: u64,
     pub status: SleepStatus,
+    /// ESP32-H2 TOP/CPU/modem power-down happened (registers restored by
+    /// `esp32h2-sleep`); always `false` in the retained mode and on C6.
+    pub top_powered_down: bool,
 }
 
 #[cfg(any(test, target_os = "none"))]
@@ -81,6 +87,8 @@ mod accounting {
     const CAL_SCALE: u128 = 1 << 19;
     pub(super) const TIMER_WAKE: u32 = 1 << 4;
     pub(super) const GPIO_WAKE: u32 = 1 << 2;
+    /// LP IO (EXT1) pad wake, the H2 TOP power-down's GPIO wake.
+    pub(super) const EXT1_WAKE: u32 = 1 << 1;
 
     #[derive(Clone, Copy)]
     pub(super) struct Calibration(u32);
@@ -150,6 +158,7 @@ mod accounting {
                 elapsed_us: elapsed_us as u64,
                 missing_systimer_ticks: missing,
                 status,
+                top_powered_down: false,
             })
         }
     }
@@ -165,19 +174,25 @@ mod accounting {
                 cause: reject_cause,
             };
         }
-        match wake_cause {
-            TIMER_WAKE => SleepStatus::Woke(WakeCause::Timer),
-            GPIO_WAKE if gpio => SleepStatus::Woke(WakeCause::Gpio),
-            cause if gpio && cause == TIMER_WAKE | GPIO_WAKE => {
-                SleepStatus::Woke(WakeCause::TimerAndGpio)
-            }
-            cause => SleepStatus::Unexpected { cause },
+        let pad = if gpio { GPIO_WAKE | EXT1_WAKE } else { 0 };
+        if wake_cause & !(TIMER_WAKE | pad) != 0 {
+            return SleepStatus::Unexpected { cause: wake_cause };
+        }
+        match (wake_cause & TIMER_WAKE != 0, wake_cause & pad != 0) {
+            (true, false) => SleepStatus::Woke(WakeCause::Timer),
+            (false, true) => SleepStatus::Woke(WakeCause::Gpio),
+            (true, true) => SleepStatus::Woke(WakeCause::TimerAndGpio),
+            (false, false) => SleepStatus::Unexpected { cause: wake_cause },
         }
     }
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "esp32c6"))]
 pub use esp_hal::rtc_cntl::sleep::RetainedPowerDown;
+/// ESP32-H2: the product's own RAM-resident sleep crate replaces the vendor
+/// esp-hal retained-sleep backport (`esp32h2-sleep/README.md`).
+#[cfg(all(target_os = "none", feature = "esp32h2"))]
+pub use esp32h2_sleep::{Ext1Wake, PowerDown as RetainedPowerDown, SleepMode, TOP_PD_SUPPORTED};
 #[cfg(target_os = "none")]
 pub use hardware::LightSleep;
 
@@ -195,7 +210,13 @@ mod hardware {
         _timer: LP_TIMER<'d>,
         _pmu: PMU<'d>,
         _aon: LP_AON<'d>,
-        power_down: esp_hal::rtc_cntl::sleep::RetainedPowerDown,
+        power_down: RetainedPowerDown,
+        #[cfg(feature = "esp32h2")]
+        chip: esp32h2_sleep::ChipInfo,
+        #[cfg(feature = "esp32h2")]
+        mode: SleepMode,
+        #[cfg(feature = "esp32h2")]
+        ext1: Option<Ext1Wake>,
     }
 
     impl<'d> LightSleep<'d> {
@@ -205,7 +226,13 @@ mod hardware {
                 _timer: timer,
                 _pmu: pmu,
                 _aon: aon,
-                power_down: esp_hal::rtc_cntl::sleep::RetainedPowerDown::NONE,
+                power_down: RetainedPowerDown::NONE,
+                #[cfg(feature = "esp32h2")]
+                chip: chip_info(),
+                #[cfg(feature = "esp32h2")]
+                mode: SleepMode::Retained,
+                #[cfg(feature = "esp32h2")]
+                ext1: None,
             }
         }
 
@@ -214,20 +241,36 @@ mod hardware {
         ///
         /// Stopping XTAL stops SYSTIMER: [`SleepReport::missing_systimer_ticks`]
         /// then carries the whole interval, which the caller already applies.
-        pub fn with_power_down(
-            mut self,
-            power_down: esp_hal::rtc_cntl::sleep::RetainedPowerDown,
-        ) -> Self {
+        pub fn with_power_down(mut self, power_down: RetainedPowerDown) -> Self {
             self.power_down = power_down;
+            self
+        }
+
+        /// ESP32-H2: select how much of the digital system each sleep powers
+        /// down. [`SleepMode::TopPowerDown`] needs the `h2-top-pd` feature
+        /// (otherwise every sleep fails with `UnsupportedConfiguration`), the
+        /// XTAL power-down, and [`Self::with_ext1_wake`] for pad wake: the
+        /// digital GPIO wake lives in the powered-down TOP domain.
+        #[cfg(feature = "esp32h2")]
+        pub fn with_mode(mut self, mode: SleepMode) -> Self {
+            self.mode = mode;
+            self
+        }
+
+        /// ESP32-H2 TOP power-down: the LP IO pads (GPIO7..=14) that replace
+        /// the digital GPIO wake when `sleep(.., gpio_wakeup = true)`.
+        #[cfg(feature = "esp32h2")]
+        pub fn with_ext1_wake(mut self, ext1: Ext1Wake) -> Self {
+            self.ext1 = Some(ext1);
             self
         }
 
         /// Enter actual PMU light sleep, retaining digital state.
         ///
-        /// `gpio_wakeup` enables the digital GPIO wake source, not RTC EXT1.
-        /// GPIO9 is supported by this source when its digital input, pull-up and
-        /// low-level wake are configured by its owner. The report identifies
-        /// GPIO wake, not an individual pin.
+        /// `gpio_wakeup` enables the digital GPIO wake source (RTC EXT1 with
+        /// the H2 TOP power-down). GPIO9 is supported by this source when its
+        /// digital input, pull-up and low-level wake are configured by its
+        /// owner. The report identifies pad wake, not an individual pin.
         /// Durations below [`MIN_SLEEP_US`] are rejected without entering sleep.
         ///
         /// # Safety
@@ -243,63 +286,106 @@ mod hardware {
         /// and alarm servicing. Apply `missing_systimer_ticks` exactly once,
         /// without moving time backwards. The caller must explicitly handle
         /// `Rejected`/`Unexpected`; a returned report is not proof of sleep.
+        /// After [`SleepReport::top_powered_down`], peripherals outside the
+        /// retained set (UART, TSENS analog trim, AES data) were reset.
         pub unsafe fn sleep(
             &mut self,
             _cs: critical_section::CriticalSection<'_>,
             duration_us: u64,
             gpio_wakeup: bool,
         ) -> Result<SleepReport, SleepError> {
-            {
-                use esp_hal::{
-                    rtc_cntl::sleep::{GpioWakeupSource, TimerWakeupSource},
-                    timer::systimer::{SystemTimer, Unit},
-                };
+            use esp_hal::timer::systimer::{SystemTimer, Unit};
 
-                let timer = LP_TIMER::regs();
-                let calibration = Calibration::new(LP_AON::regs().store1().read().bits())?;
-                calibration.duration_ticks(duration_us)?;
-                let systimer_before = SystemTimer::unit_value(Unit::Unit0);
-                let rtc_before = rtc_ticks();
-                let wake_timer =
-                    TimerWakeupSource::new(core::time::Duration::from_micros(duration_us));
-                let power_down = self.power_down;
-                let result = if gpio_wakeup {
-                    unsafe {
-                        self._rtc.sleep_light_retained_power_down(
-                            power_down,
-                            &[&wake_timer, &GpioWakeupSource::new()],
-                        )
-                    }
-                } else {
-                    unsafe {
-                        self._rtc
-                            .sleep_light_retained_power_down(power_down, &[&wake_timer])
-                    }
-                };
-                let rtc_after = rtc_ticks();
-                let systimer_after = SystemTimer::unit_value(Unit::Unit0);
-                let pmu = PMU::regs();
-                let status = sleep_status(
-                    pmu.int_raw().read().soc_sleep_reject().bit_is_set(),
-                    pmu.slp_wakeup_status1().read().bits(),
-                    pmu.slp_wakeup_status0().read().bits(),
-                    gpio_wakeup,
-                );
-                timer
-                    .tar0_high()
-                    .modify(|_, w| w.main_timer_tar_en0().clear_bit());
-                clear_timer_wakeup();
-                result.map_err(map_hal_error)?;
-                calibration.report(
-                    rtc_before,
-                    rtc_after,
-                    systimer_before,
-                    systimer_after,
-                    SystemTimer::ticks_per_second(),
-                    status,
-                )
-            }
+            let calibration = Calibration::new(LP_AON::regs().store1().read().bits())?;
+            calibration.duration_ticks(duration_us)?;
+            let systimer_before = SystemTimer::unit_value(Unit::Unit0);
+            let rtc_before = rtc_ticks();
+            let outcome = unsafe { self.enter(duration_us, gpio_wakeup) };
+            let rtc_after = rtc_ticks();
+            let systimer_after = SystemTimer::unit_value(Unit::Unit0);
+            let wake = outcome?;
+            let mut report = calibration.report(
+                rtc_before,
+                rtc_after,
+                systimer_before,
+                systimer_after,
+                SystemTimer::ticks_per_second(),
+                sleep_status(wake.rejected, wake.reject_cause, wake.wake_cause, gpio_wakeup),
+            )?;
+            report.top_powered_down = wake.top_powered_down;
+            Ok(report)
         }
+
+        #[cfg(feature = "esp32h2")]
+        unsafe fn enter(&mut self, duration_us: u64, gpio_wakeup: bool) -> Result<Wake, SleepError> {
+            let top_pd = self.mode == SleepMode::TopPowerDown;
+            let ext1 = match (gpio_wakeup && top_pd, self.ext1) {
+                (false, _) => None,
+                (true, Some(ext1)) => Some(ext1),
+                (true, None) => return Err(SleepError::UnsupportedConfiguration),
+            };
+            let request = esp32h2_sleep::Request {
+                duration_us,
+                power_down: self.power_down,
+                gpio_wake: gpio_wakeup && !top_pd,
+                ext1,
+                mode: self.mode,
+            };
+            // SAFETY: forwarded from `sleep`; this struct owns the PMU, LP
+            // timer and LP_AON, and TIMG0 calibration runs only inside it.
+            let wake = unsafe { esp32h2_sleep::light_sleep(&self.chip, &request) }
+                .map_err(map_crate_error)?;
+            Ok(Wake {
+                rejected: wake.rejected,
+                wake_cause: wake.wake_cause,
+                reject_cause: wake.reject_cause,
+                top_powered_down: wake.top_powered_down,
+            })
+        }
+
+        #[cfg(feature = "esp32c6")]
+        unsafe fn enter(&mut self, duration_us: u64, gpio_wakeup: bool) -> Result<Wake, SleepError> {
+            use esp_hal::rtc_cntl::sleep::{GpioWakeupSource, TimerWakeupSource};
+
+            let wake_timer = TimerWakeupSource::new(core::time::Duration::from_micros(duration_us));
+            let power_down = self.power_down;
+            let result = if gpio_wakeup {
+                unsafe {
+                    self._rtc.sleep_light_retained_power_down(
+                        power_down,
+                        &[&wake_timer, &GpioWakeupSource::new()],
+                    )
+                }
+            } else {
+                unsafe {
+                    self._rtc
+                        .sleep_light_retained_power_down(power_down, &[&wake_timer])
+                }
+            };
+            let pmu = PMU::regs();
+            let wake = Wake {
+                rejected: pmu.int_raw().read().soc_sleep_reject().bit_is_set(),
+                reject_cause: pmu.slp_wakeup_status1().read().bits(),
+                wake_cause: pmu.slp_wakeup_status0().read().bits(),
+                top_powered_down: false,
+            };
+            LP_TIMER::regs()
+                .tar0_high()
+                .modify(|_, w| w.main_timer_tar_en0().clear_bit());
+            LP_TIMER::regs()
+                .int_clr()
+                .write(|w| w.soc_wakeup().clear_bit_by_one());
+            result.map_err(map_hal_error)?;
+            Ok(wake)
+        }
+    }
+
+    /// PMU status of one sleep, chip-independent.
+    struct Wake {
+        rejected: bool,
+        wake_cause: u32,
+        reject_cause: u32,
+        top_powered_down: bool,
     }
 
     fn rtc_ticks() -> u64 {
@@ -310,17 +396,42 @@ mod hardware {
         (u64::from(high) << 32) | u64::from(low)
     }
 
-    fn clear_timer_wakeup() {
-        #[cfg(feature = "esp32c6")]
-        LP_TIMER::regs()
-            .int_clr()
-            .write(|w| w.soc_wakeup().clear_bit_by_one());
-        #[cfg(feature = "esp32h2")]
-        LP_TIMER::regs()
-            .int_clr()
-            .write(|w| w.soc_wakeup_int_clr().set_bit());
+    /// PMU voltage eFuses and chip revision, read once outside any sleep
+    /// sequence (eFuse access is flash-resident).
+    #[cfg(feature = "esp32h2")]
+    fn chip_info() -> esp32h2_sleep::ChipInfo {
+        use esp_hal::efuse::{ACTIVE_HP_DBIAS, ACTIVE_LP_DBIAS, DSLP_DBIAS, Efuse};
+        let (blk_major, blk_minor) = Efuse::block_version();
+        esp32h2_sleep::ChipInfo {
+            fuses: esp32h2_sleep::DbiasFuses {
+                blk_major,
+                blk_minor,
+                active_hp: Efuse::read_field_le::<u8>(ACTIVE_HP_DBIAS),
+                active_lp: Efuse::read_field_le::<u8>(ACTIVE_LP_DBIAS),
+                deep_sleep: Efuse::read_field_le::<u8>(DSLP_DBIAS),
+            },
+            revision: Efuse::chip_revision(),
+        }
     }
 
+    #[cfg(feature = "esp32h2")]
+    fn map_crate_error(error: esp32h2_sleep::SleepError) -> SleepError {
+        use esp32h2_sleep::{CalibrationFailure, SleepError as E};
+        match error {
+            E::UnsupportedClock => SleepError::UnsupportedClock,
+            E::InvalidCalibration(failure) => SleepError::InvalidCalibration(match failure {
+                CalibrationFailure::SlowClockPeriodZero => CalibrationFault::SlowPeriodZero,
+                CalibrationFailure::FastClockTimeout => CalibrationFault::FastTimeout,
+                CalibrationFailure::FastClockOutOfRange => CalibrationFault::FastOutOfRange,
+            }),
+            E::InvalidDuration => SleepError::InvalidDuration,
+            E::UnsupportedWakeSource | E::UnsupportedPowerConfiguration => {
+                SleepError::UnsupportedConfiguration
+            }
+        }
+    }
+
+    #[cfg(feature = "esp32c6")]
     fn map_hal_error(error: esp_hal::rtc_cntl::sleep::RetainedSleepError) -> SleepError {
         use esp_hal::rtc_cntl::sleep::RetainedSleepError;
         match error {
@@ -459,11 +570,34 @@ mod tests {
             sleep_status(false, 0, TIMER_WAKE | GPIO_WAKE, true),
             SleepStatus::Woke(WakeCause::TimerAndGpio)
         );
-        for cause in [0, GPIO_WAKE, TIMER_WAKE | 1, 1 << 31] {
+        for cause in [0, GPIO_WAKE, EXT1_WAKE, TIMER_WAKE | 1, 1 << 31] {
             assert_eq!(
                 sleep_status(false, 0, cause, false),
                 SleepStatus::Unexpected { cause }
             );
         }
+        for cause in [0, TIMER_WAKE | 1, GPIO_WAKE | (1 << 6)] {
+            assert_eq!(
+                sleep_status(false, 0, cause, true),
+                SleepStatus::Unexpected { cause }
+            );
+        }
+    }
+
+    #[test]
+    fn top_power_down_ext1_wake_is_a_pad_wake() {
+        assert_eq!(
+            sleep_status(false, 0, EXT1_WAKE, true),
+            SleepStatus::Woke(WakeCause::Gpio)
+        );
+        assert_eq!(
+            sleep_status(false, 0, EXT1_WAKE | TIMER_WAKE, true),
+            SleepStatus::Woke(WakeCause::TimerAndGpio)
+        );
+        let report = Calibration::new(10 << 19)
+            .unwrap()
+            .report(0, 2, 0, 1, 16_000_000, TIMER)
+            .unwrap();
+        assert!(!report.top_powered_down);
     }
 }

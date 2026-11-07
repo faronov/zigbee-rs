@@ -263,6 +263,17 @@ fn main() -> ! {
         .with_power_down(product::sleep::RetainedPowerDown {
             xtal: config::SLEEP_XTAL_OFF,
             rc_fast: config::SLEEP_RC_FAST_OFF,
+        })
+        .with_mode(if config::SLEEP_TOP_PD {
+            product::sleep::SleepMode::TopPowerDown
+        } else {
+            product::sleep::SleepMode::Retained
+        })
+        // TOP power-down only: the BOOT button (GPIO9 = LP IO 2, external
+        // pull-up) wakes through EXT1 at low level.
+        .with_ext1_wake(product::sleep::Ext1Wake {
+            gpio_mask: 1 << 9,
+            high: false,
         }),
     );
     #[cfg(not(feature = "light-sleep"))]
