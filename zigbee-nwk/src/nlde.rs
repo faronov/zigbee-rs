@@ -1062,10 +1062,11 @@ impl<M: MacDriver> NwkLayer<M> {
     ///
     /// Two admission checks run ahead of all of that, on the header alone:
     /// a frame whose type is neither Data nor Command (Inter-PAN, reserved)
-    /// is dropped, and on a secured network so is any unsecured NWK command
-    /// or unsecured NWK broadcast. Neither can reach the BTR, the relay path
-    /// or a command handler. Unsecured unicasts remain accepted so that
-    /// pre-key APS commissioning traffic still arrives.
+    /// is dropped, and on a secured network so is every unsecured NWK frame.
+    /// None of them can reach the BTR, the relay path, a command handler or
+    /// APS. The exceptions are a router-local unsecured Rejoin Request and,
+    /// before any network key is active, a unicast APS command frame (the
+    /// pre-key Transport-Key).
     pub async fn process_incoming_nwk_frame<'a>(
         &mut self,
         mac_payload: &'a [u8],
@@ -1471,9 +1472,22 @@ impl<M: MacDriver> NwkLayer<M> {
         // an attacker's frame into the network and burning a durable outgoing
         // frame counter — and before it is acted upon.
         //
-        // Unsecured *unicasts* are deliberately left alone: pre-key
-        // commissioning traffic (APS Transport-Key) arrives that way, and the
-        // APS layer applies its own security policy to it.
+        // Unsecured NWK *data* is dropped too, unicast included: once a device
+        // holds the network key, APS security does not stand in for NWK
+        // security (R22 §4.3.1.2), so an unsecured unicast must not
+        // reach ZDO/ZCL, advance an APS replay floor or be relayed. The only
+        // unsecured data a device with NWK security enabled may still accept
+        // is, before any network key is active, a unicast APS command (the
+        // pre-key Transport-Key), whose per-command policy APS enforces. The
+        // Trust Center rejoin clears the NWK key material and NWK security
+        // before it waits for its Transport-Key, so that path never reaches
+        // this gate with security enabled.
+        let unsecured_pre_key_aps_command = is_data
+            && !is_broadcast
+            && self.security.active_key().is_none()
+            && mac_payload
+                .get(consumed)
+                .is_some_and(|aps_fc| aps_fc & 0x03 == 0x01);
         #[cfg(feature = "router")]
         let unsecured_local_rejoin = !secured
             && is_command
@@ -1490,12 +1504,12 @@ impl<M: MacDriver> NwkLayer<M> {
         let unsecured_local_rejoin = false;
         if !secured
             && self.nib.security_enabled
-            && (is_command || is_broadcast)
             && !unsecured_local_rejoin
+            && !unsecured_pre_key_aps_command
         {
             log::warn!(
                 "[NWK] Dropping unsecured NWK {} from 0x{:04X}",
-                if is_command { "command" } else { "broadcast" },
+                if is_command { "command" } else { "data" },
                 src.0
             );
             return None;
@@ -3366,9 +3380,10 @@ impl<M: MacDriver> NwkLayer<M> {
         if !self.joined || !self.address_conflict_detection_enabled() {
             return None;
         }
-        // An unsecured unicast is still accepted on a secured network so that
-        // pre-key APS commissioning traffic arrives, and its NWK header is
-        // plaintext a device with no keys at all can write. Resolving a
+        // Before a network key is active an unsecured APS-command unicast is
+        // still accepted on a secured network so that pre-key commissioning
+        // traffic arrives, and its NWK header is plaintext a device with no
+        // keys at all can write. Resolving a
         // conflict changes this device's own address or costs it a rejoin, so
         // only an authenticated header may claim one.
         if self.nib.security_enabled && security_source.is_none() {
@@ -9233,25 +9248,98 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "router")]
-    fn an_unsecured_unicast_is_still_accepted_on_a_secured_network() {
-        // Pre-key APS commissioning traffic (Transport-Key) arrives as an
-        // unsecured NWK unicast; the broadcast/command drop above must not
-        // take it with it. APS applies its own policy to the payload.
-        let mut relay = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+    fn a_node_holding_the_network_key_drops_every_unsecured_data_frame() {
+        // Once a network key is active on a network with NWK security, an
+        // unsecured NWK data frame is discarded — unicast and broadcast
+        // alike, whatever APS frame type or APS security it carries — and is
+        // neither delivered nor relayed. Covered for end devices and, with
+        // the `router` feature, routers.
+        let roles: &[DeviceType] = if cfg!(feature = "router") {
+            &[DeviceType::EndDevice, DeviceType::Router]
+        } else {
+            &[DeviceType::EndDevice]
+        };
+        for &device_type in roles {
+            let mut nwk = secured_node(device_type, OUR_ADDR, RELAY_IEEE);
+            for (dst, aps) in [
+                (OUR_ADDR, &[0x00, 0x02][..]),             // APS data
+                (OUR_ADDR, &[0x01, 0x05][..]),             // APS command
+                (OUR_ADDR, &[0x21, 0x05][..]),             // APS-secured APS command
+                (ShortAddress(0x3333), &[0x00, 0x02][..]), // unicast for another node
+                (ShortAddress(0xFFFF), &[0x01, 0x05][..]), // broadcast APS command
+            ] {
+                let mut buf = [0u8; 128];
+                let len = encode(&frame(NwkFrameType::Data, PEER, dst), aps, &mut buf);
+                assert!(
+                    block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)).is_none(),
+                    "{device_type:?} accepted unsecured data {aps:02X?} to 0x{:04X}",
+                    dst.0
+                );
+            }
+            assert!(
+                nwk.mac.tx_history().is_empty(),
+                "{device_type:?} relayed or answered an unsecured data frame"
+            );
+        }
+    }
+
+    #[test]
+    fn before_a_network_key_only_an_unsecured_aps_command_unicast_is_admitted() {
+        // Without an active network key the only unsecured NWK data a device
+        // with NWK security enabled accepts is a unicast APS command (the
+        // pre-key Transport-Key); APS enforces the per-command policy.
+        let mut nwk = node(DeviceType::EndDevice, OUR_ADDR);
+        nwk.nib.security_enabled = true;
+        assert!(nwk.security.active_key().is_none());
+
         let mut buf = [0u8; 128];
         let len = encode(
             &frame(NwkFrameType::Data, PEER, OUR_ADDR),
-            &[0x01, 0x02],
+            &[0x21, 0x05],
             &mut buf,
         );
-
-        match block_on(relay.process_incoming_nwk_frame(&buf[..len], 42)) {
+        match block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)) {
             Some(NwkIndication::Borrowed(data)) => {
-                assert_eq!(data.payload, &[0x01, 0x02]);
+                assert_eq!(data.payload, &[0x21, 0x05]);
                 assert!(!data.security_use);
             }
-            other => panic!("expected local delivery of the unsecured unicast, got {other:?}"),
+            other => panic!("expected the pre-key APS command, got {other:?}"),
+        }
+
+        for (dst, aps) in [
+            (OUR_ADDR, &[0x00, 0x02][..]),             // APS data
+            (OUR_ADDR, &[0x02][..]),                   // APS ACK
+            (OUR_ADDR, &[][..]),                       // empty APDU
+            (ShortAddress(0xFFFF), &[0x01, 0x05][..]), // broadcast command
+        ] {
+            let len = encode(&frame(NwkFrameType::Data, PEER, dst), aps, &mut buf);
+            assert!(
+                block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)).is_none(),
+                "pre-key node accepted unsecured {aps:02X?} to 0x{:04X}",
+                dst.0
+            );
+        }
+    }
+
+    #[test]
+    fn unsecured_data_is_still_delivered_when_nwk_security_is_disabled() {
+        // nwkSecurityLevel = 0 networks (and the window in which a joining or
+        // Trust-Center-rejoining device has NWK security disabled) still
+        // receive unsecured data unchanged.
+        let mut nwk = node(DeviceType::EndDevice, OUR_ADDR);
+        assert!(!nwk.nib.security_enabled);
+        let mut buf = [0u8; 128];
+        let len = encode(
+            &frame(NwkFrameType::Data, PEER, OUR_ADDR),
+            &[0x00, 0x02],
+            &mut buf,
+        );
+        match block_on(nwk.process_incoming_nwk_frame(&buf[..len], 42)) {
+            Some(NwkIndication::Borrowed(data)) => {
+                assert_eq!(data.payload, &[0x00, 0x02]);
+                assert!(!data.security_use);
+            }
+            other => panic!("expected local delivery on an unsecured network, got {other:?}"),
         }
     }
 
