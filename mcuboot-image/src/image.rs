@@ -3,9 +3,14 @@
 //! The format is the one `imgtool sign` produces (MCUboot
 //! `bootutil/image.h`): a little-endian header at the start of the slot,
 //! the firmware, an optional protected TLV area and an unprotected TLV area.
-//! The SHA-256 TLV covers header, firmware and protected TLVs; the ECDSA
-//! P-256 signature TLV signs that digest; the KEYHASH TLV is SHA-256 of the
-//! signer's DER `SubjectPublicKeyInfo`.
+//! The SHA-256 TLV covers header, firmware and protected TLVs; the signature
+//! TLV (ECDSA P-256, or Ed25519 with the `ed25519` feature) signs that
+//! digest; the KEYHASH TLV before it is SHA-256 of the signer's DER
+//! `SubjectPublicKeyInfo` and selects which trusted key must verify it.
+//!
+//! A loader trusts up to [`MAX_TRUSTED_KEYS`] keys at once so that a
+//! signing key can be rotated: an image is accepted when any trusted key
+//! verifies one of its signatures.
 
 use core::cmp::Ordering;
 
@@ -21,6 +26,12 @@ pub const TLV_PROTECTED_INFO_MAGIC: u16 = 0x6908;
 pub const TLV_KEYHASH: u16 = 0x01;
 pub const TLV_SHA256: u16 = 0x10;
 pub const TLV_ECDSA_SIG: u16 = 0x22;
+/// imgtool's Ed25519 signature over the SHA-256 digest (not `--pure`).
+pub const TLV_ED25519: u16 = 0x24;
+
+/// Most keys a loader or an OTA policy trusts at once (current key plus
+/// rotation successors).
+pub const MAX_TRUSTED_KEYS: usize = 3;
 
 /// DER `SubjectPublicKeyInfo` prefix of every uncompressed P-256 key, up to
 /// and including the SEC1 `0x04` point tag. imgtool hashes the complete
@@ -28,6 +39,12 @@ pub const TLV_ECDSA_SIG: u16 = 0x22;
 pub const P256_SPKI_PREFIX: [u8; 27] = [
     0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, 0x06, 0x08, 0x2A,
     0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+];
+
+/// DER `SubjectPublicKeyInfo` prefix of an Ed25519 key (RFC 8410), up to
+/// the 32-byte key itself.
+pub const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
 
 /// Chunk used to stream flash into SHA-256; bounded stack use.
@@ -126,23 +143,138 @@ impl ImageHeader {
     }
 }
 
-/// A public key trusted to sign images: big-endian affine `x || y`.
+/// A public key trusted to sign images.
+///
+/// Keys are build-time configuration of a product (its loader and its OTA
+/// policy); this crate contains none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TrustedKey {
-    pub xy: [u8; 64],
+pub enum TrustedKey {
+    /// ECDSA P-256: big-endian affine `x || y`.
+    P256 { xy: [u8; 64] },
+    /// Ed25519 public key (feature `ed25519`).
+    #[cfg(feature = "ed25519")]
+    Ed25519 { public: [u8; 32] },
 }
 
 impl TrustedKey {
+    /// An ECDSA P-256 key, big-endian affine `x || y`.
     pub const fn new(xy: [u8; 64]) -> Self {
-        Self { xy }
+        Self::P256 { xy }
+    }
+
+    /// An Ed25519 key.
+    #[cfg(feature = "ed25519")]
+    pub const fn ed25519(public: [u8; 32]) -> Self {
+        Self::Ed25519 { public }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::P256 { xy } => xy,
+            #[cfg(feature = "ed25519")]
+            Self::Ed25519 { public } => public,
+        }
+    }
+
+    /// Short identifier published in the loader record: the first eight
+    /// bytes of the key (the P-256 X coordinate, or the Ed25519 key).
+    pub const fn id(&self) -> [u8; 8] {
+        let bytes: &[u8] = match self {
+            Self::P256 { xy } => xy,
+            #[cfg(feature = "ed25519")]
+            Self::Ed25519 { public } => public,
+        };
+        [
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]
     }
 
     /// SHA-256 of the DER `SubjectPublicKeyInfo` (imgtool's KEYHASH).
     pub fn key_hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(P256_SPKI_PREFIX);
-        hasher.update(self.xy);
+        match self {
+            Self::P256 { .. } => hasher.update(P256_SPKI_PREFIX),
+            #[cfg(feature = "ed25519")]
+            Self::Ed25519 { .. } => hasher.update(ED25519_SPKI_PREFIX),
+        }
+        hasher.update(self.bytes());
         hasher.finalize().into()
+    }
+
+    /// Whether `signature`, the value of a TLV of type `kind`, is this
+    /// key's signature over `digest`. A TLV of another algorithm never
+    /// verifies.
+    #[inline(always)]
+    fn verifies(&self, kind: u16, signature: &[u8], digest: &[u8; 32]) -> bool {
+        match self {
+            Self::P256 { xy } => {
+                kind == TLV_ECDSA_SIG
+                    && match (VerifyingKey::from_xy(xy), parse_der_signature(signature)) {
+                        (Some(key), Some((r, s))) => key.verify_prehash(digest, &r, &s),
+                        _ => false,
+                    }
+            }
+            #[cfg(feature = "ed25519")]
+            Self::Ed25519 { public } => {
+                kind == TLV_ED25519
+                    && <[u8; 64]>::try_from(signature).is_ok_and(|signature| {
+                        ed25519_compact::PublicKey::new(*public)
+                            .verify(digest, &ed25519_compact::Signature::new(signature))
+                            .is_ok()
+                    })
+            }
+        }
+    }
+}
+
+/// A selection of up to [`MAX_TRUSTED_KEYS`] keys from a `static` list,
+/// for policies that are copied around (an OTA writer). Only a reference
+/// and a mask: narrowing the set never copies key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeySet {
+    keys: &'static [TrustedKey],
+    mask: u8,
+}
+
+impl KeySet {
+    /// The first [`MAX_TRUSTED_KEYS`] of `keys`.
+    pub const fn new(keys: &'static [TrustedKey]) -> Self {
+        let len = if keys.len() < MAX_TRUSTED_KEYS {
+            keys.len()
+        } else {
+            MAX_TRUSTED_KEYS
+        };
+        Self {
+            keys,
+            mask: ((1u16 << len) - 1) as u8,
+        }
+    }
+
+    /// The selected keys, in list order.
+    pub fn iter(&self) -> impl Iterator<Item = &'static TrustedKey> + Clone + use<> {
+        let mask = self.mask;
+        self.keys
+            .iter()
+            .enumerate()
+            .filter(move |(index, _)| mask & (1 << index) != 0)
+            .map(|(_, key)| key)
+    }
+
+    pub const fn len(&self) -> usize {
+        self.mask.count_ones() as usize
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.mask == 0
+    }
+
+    /// Keep only the keys for which `keep` returns true.
+    pub fn retain(&mut self, mut keep: impl FnMut(&TrustedKey) -> bool) {
+        for (index, key) in self.keys.iter().enumerate().take(MAX_TRUSTED_KEYS) {
+            if !keep(key) {
+                self.mask &= !(1 << index);
+            }
+        }
     }
 }
 
@@ -156,12 +288,32 @@ pub struct ValidImage {
 }
 
 /// Validate the image at `slot`: geometry within `max_len` bytes, SHA-256,
-/// and an ECDSA P-256 signature by `key` whose KEYHASH TLV names that key.
+/// and a signature by one of `keys`, selected by the KEYHASH TLV that
+/// precedes it. An empty `keys` trusts nothing.
 pub fn validate<F: ReadNorFlash>(
     flash: &mut F,
     slot: u32,
     max_len: u32,
-    key: &TrustedKey,
+    keys: &[TrustedKey],
+) -> Result<ValidImage, ImageError> {
+    validate_by(flash, slot, max_len, keys.iter())
+}
+
+/// [`validate`] against the keys selected by `keys`.
+pub fn validate_with_set<F: ReadNorFlash>(
+    flash: &mut F,
+    slot: u32,
+    max_len: u32,
+    keys: &KeySet,
+) -> Result<ValidImage, ImageError> {
+    validate_by(flash, slot, max_len, keys.iter())
+}
+
+fn validate_by<'k, F: ReadNorFlash>(
+    flash: &mut F,
+    slot: u32,
+    max_len: u32,
+    keys: impl Iterator<Item = &'k TrustedKey> + Clone,
 ) -> Result<ValidImage, ImageError> {
     let header = ImageHeader::read(flash, slot)?.ok_or(ImageError::NoImage)?;
     if header.flags != 0 {
@@ -194,10 +346,10 @@ pub fn validate<F: ReadNorFlash>(
     }
 
     let digest = hash_range(flash, slot, hashed_len)?;
-    let key_hash = key.key_hash();
-    let verifying_key = VerifyingKey::from_xy(&key.xy);
     let mut hash_ok = false;
-    let mut key_selected = false;
+    // The trusted key named by the last KEYHASH TLV; consumed by the next
+    // signature TLV.
+    let mut selected: Option<&TrustedKey> = None;
     let mut signature_ok = false;
 
     let mut offset = hashed_len + 4;
@@ -219,23 +371,25 @@ pub fn validate<F: ReadNorFlash>(
                 hash_ok = value == digest;
             }
             TLV_KEYHASH => {
-                key_selected =
-                    length == 32 && read_array::<_, 32>(flash, slot, value_at, end)? == key_hash;
+                selected = None;
+                if length == 32 {
+                    let value = read_array::<_, 32>(flash, slot, value_at, end)?;
+                    selected = keys.clone().find(|key| key.key_hash() == value);
+                }
             }
-            TLV_ECDSA_SIG if key_selected && !signature_ok => {
-                let mut der = [0u8; 72];
-                let length = length as usize;
-                if length <= der.len() {
-                    flash
-                        .read(slot + value_at, &mut der[..length])
-                        .map_err(|_| ImageError::Flash)?;
-                    if let (Some(key), Some((r, s))) =
-                        (verifying_key, parse_der_signature(&der[..length]))
-                    {
-                        signature_ok = key.verify_prehash(&digest, &r, &s);
+            TLV_ECDSA_SIG | TLV_ED25519 => {
+                if let Some(key) = selected.take()
+                    && !signature_ok
+                {
+                    let mut signature = [0u8; 72];
+                    let length = length as usize;
+                    if length <= signature.len() {
+                        flash
+                            .read(slot + value_at, &mut signature[..length])
+                            .map_err(|_| ImageError::Flash)?;
+                        signature_ok = key.verifies(kind, &signature[..length], &digest);
                     }
                 }
-                key_selected = false;
             }
             _ => {}
         }

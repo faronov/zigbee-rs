@@ -7,9 +7,13 @@
 //! 0x00000..0x01000  BL702 ROM boot header (BFNP) for the loader, img_start 0x2000
 //! 0x01000..0x02000  unused (boot-header reserved area, left as built)
 //! 0x02000..0x10000  bootloader, runs at XIP 0x23000000
+//!                   0x0FFC0..0x0FFE0  LoaderKeys record (extra trusted
+//!                                     key ids, erased with one key)
 //!                   0x0FFE0..0x10000  LoaderInfo record (XIP 0x2300DFE0)
 //! 0x10000..0x87000  primary slot: 0x100 MCUboot header, application at
-//!                   0x10100 (XIP 0x2300E100), TLVs, trailer in last sector
+//!                   0x10100 (XIP 0x2300E100), TLVs; the last sector holds
+//!                   the trial log (0x86000..0x86F80, application confirm
+//!                   writes) and the trailer
 //! 0x87000..0xFE000  secondary slot: OTA download area
 //! 0xFE000..0x100000 Zigbee security-state journal (two 4 KiB sectors)
 //! ```
@@ -36,12 +40,18 @@ pub const XIP_BASE: u32 = 0x2300_0000;
 /// [`XIP_BASE`].
 pub const LOADER_START: u32 = 0x2000;
 pub const LOADER_END: u32 = PRIMARY_SLOT;
-/// Largest loader image the region holds before the LoaderInfo record.
-pub const LOADER_MAX_LEN: u32 = LOADER_INFO_ADDR - LOADER_START;
-/// [`mcuboot_image::LoaderInfo`] (32 bytes) at the end of the loader region.
+/// Largest loader image the region holds before the loader records.
+pub const LOADER_MAX_LEN: u32 = LOADER_BLOCK_ADDR - LOADER_START;
+/// [`mcuboot_image::LoaderInfo`] (32 bytes) at the end of the loader region,
+/// where every loader version keeps it.
 pub const LOADER_INFO_ADDR: u32 = LOADER_END - 32;
-/// Version stamped into the loader's `LoaderInfo`.
-pub const LOADER_VERSION: u32 = 1;
+/// The 64-byte [`mcuboot_image::loader_block`]: the `LoaderKeys` record
+/// (erased with a single key) right before the `LoaderInfo` record.
+pub const LOADER_BLOCK_ADDR: u32 = LOADER_INFO_ADDR - 32;
+/// Version stamped into the loader's `LoaderInfo`: 1 was the single-key
+/// loader without trial accounting, 2 adds trial boots and up to three
+/// trusted keys.
+pub const LOADER_VERSION: u32 = 2;
 
 pub const PRIMARY_SLOT: u32 = 0x1_0000;
 pub const SECONDARY_SLOT: u32 = 0x8_7000;
@@ -78,6 +88,15 @@ pub const fn xip_address(physical: u32) -> u32 {
 pub const APP_XIP_START: u32 = xip_address(APP_START);
 /// XIP address of the LoaderInfo record.
 pub const LOADER_INFO_XIP: u32 = xip_address(LOADER_INFO_ADDR);
+/// XIP address of the loader record block.
+pub const LOADER_BLOCK_XIP: u32 = xip_address(LOADER_BLOCK_ADDR);
+
+/// The loader's boot configuration: overwrite install, the build's trusted
+/// keys and trial-boot budget.
+pub const BOOT_CONFIG: mcuboot_image::BootConfig<'static> = mcuboot_image::BootConfig {
+    trial_boots: BOOT_TRIAL_BOOTS,
+    ..mcuboot_image::BootConfig::overwrite(MCUBOOT, &TRUSTED_KEYS)
+};
 
 const _: () = {
     assert!(LOADER_START.is_multiple_of(SECTOR_SIZE));
@@ -93,6 +112,8 @@ const _: () = {
     assert!(LOADER_END - LOADER_START <= 56 * 1024);
     assert!(APP_XIP_START == 0x2300_E100);
     assert!(LOADER_INFO_XIP == 0x2300_DFE0);
+    assert!(LOADER_BLOCK_XIP == 0x2300_DFC0);
+    assert!(TRUSTED_KEYS.len() <= mcuboot_image::MAX_TRUSTED_KEYS);
     assert!(APP_MAX_LEN == 0x7_5C00);
 };
 
@@ -120,6 +141,18 @@ mod tests {
     fn default_key_is_a_valid_point() {
         assert_ne!(OWN_KEY_XY, [0; 64]);
         assert!(mcuboot_image::p256::VerifyingKey::from_xy(&OWN_KEY_XY).is_some());
+        assert_eq!(TRUSTED_KEYS[0], mcuboot_image::TrustedKey::new(OWN_KEY_XY));
+    }
+
+    // The build script refuses anything else; this catches a script edit.
+    const _: () = assert!(BOOT_WATCHDOG_MS <= 63_999);
+
+    #[test]
+    fn trial_log_stays_clear_of_the_image_and_the_magic() {
+        let (start, end) = mcuboot_image::trial_log_area(&MCUBOOT);
+        assert_eq!((start, end), (0x86000, 0x86F80));
+        assert!(start >= PRIMARY_SLOT + MCUBOOT.max_image_len());
+        assert!(end <= PRIMARY_SLOT + SLOT_SIZE);
     }
 
     fn squash(script: &str) -> String {
@@ -148,7 +181,7 @@ mod tests {
         );
         expect(
             &loader,
-            format!("LOADER_INFO:ORIGIN=0x{LOADER_INFO_XIP:08X},LENGTH=32"),
+            format!("LOADER_INFO:ORIGIN=0x{LOADER_BLOCK_XIP:08X},LENGTH=64"),
         );
     }
 
@@ -159,6 +192,7 @@ mod tests {
         for (name, value) in [
             ("LOADER_START", LOADER_START),
             ("LOADER_INFO_ADDR", LOADER_INFO_ADDR),
+            ("LOADER_BLOCK_ADDR", LOADER_BLOCK_ADDR),
             ("PRIMARY_SLOT", PRIMARY_SLOT),
             ("SECONDARY_SLOT", SECONDARY_SLOT),
             ("SLOT_SIZE", SLOT_SIZE),

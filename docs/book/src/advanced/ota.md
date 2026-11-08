@@ -105,8 +105,8 @@ only.
 | ESP32-H2 | same product writer/layout | prior H2 run demonstrated v1→v2 activation/reboot/network retention; current exact image has build/layout evidence only |
 | EFR32MG1 | Gecko Bootloader storage slot 0 through `BootloaderFlashAccess` | writer implemented; real Zigbee download/install/reboot open |
 | nRF52840/52833 | no writer in current products | `NoOta` |
-| BL702 | overwrite-only `bl702-xt-zb1-boot` loader (`bootloaders/bl702-boot` + `mcuboot-image`, SHA-256 + ECDSA P-256, downgrades refused); download into the secondary slot `0x87000..0xFE000` | one XT-ZB1 upgraded 0.1.0→0.1.1 over ZHA (299 KB, ~33 min), resumed after a server abort, booted the new image and kept its network (commit `8aeee49`); power loss during the copy untested |
-| CC2340R5 | `bootloaders/cc2340r5-boot` loader core on `mcuboot-image`; no product writer | `NoOta`; loader build/host-tested only |
+| BL702 | overwrite-only `bl702-xt-zb1-boot` loader (`bootloaders/bl702-boot` shell of the [bootloader core](./bootloader.md), SHA-256 + ECDSA P-256, downgrades refused); download into the secondary slot `0x87000..0xFE000` | one XT-ZB1 upgraded 0.1.0→0.1.1 over ZHA (299 KB, ~33 min), resumed after a server abort, booted the new image and kept its network (commit `8aeee49`). The v2 loader (trial boot and confirm) upgraded 0.2.0→0.2.1 over ZHA and survived 46 manual power cuts in a lab soak ([results](./bootloader.md#results-2026-11-08)) |
+| CC2340R5 | `bootloaders/cc2340r5-boot` shell of the [bootloader core](./bootloader.md); no product loader binary or writer | `NoOta`; loader build/host-tested only |
 | PHY6222/PB-03F/EFR32MG21/TLSR8258 | no product writer | `NoOta` |
 
 ## ESP32 layout

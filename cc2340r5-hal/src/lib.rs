@@ -35,6 +35,7 @@ pub mod lgpt;
 pub mod power;
 pub mod standby;
 pub mod timebase;
+pub mod watchdog;
 
 #[cfg(target_os = "none")]
 pub mod reset;
@@ -111,6 +112,8 @@ pub struct BootCore {
     pub pins: gpio::Pins,
     pub flash: flash::InternalFlash,
     pub reset: reset::SystemReset,
+    /// The watchdog (not started; see [`watchdog`]).
+    pub wdt: watchdog::Wdt,
 }
 
 /// Claim the chip for a bootloader exactly once.
@@ -131,6 +134,7 @@ pub fn take_boot() -> Option<BootCore> {
         pins: gpio::Pins::new(),
         flash: flash::InternalFlash::new(),
         reset: reset::SystemReset::new(),
+        wdt: watchdog::Wdt::new(),
     })
 }
 

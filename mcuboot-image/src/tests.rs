@@ -6,7 +6,7 @@ use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
 };
 
-use crate::boot::{BootError, BootEvent, Layout, Update, boot};
+use crate::boot::{BootConfig, BootError, BootEvent, Layout, Update, boot};
 use crate::image::{ImageError, ImageHeader, ImageVersion, TrustedKey, validate};
 use crate::trailer::{BOOT_MAGIC, MagicState, magic_address, read_magic};
 
@@ -26,11 +26,11 @@ const LAYOUT: Layout = Layout {
     slot_size: SLOT,
     sector_size: SECTOR,
 };
-const FLASH_LEN: usize = 0x0800 + 2 * SLOT as usize;
+/// Room after the slots for the swap-move status sectors.
+const FLASH_LEN: usize = 0x0800 + 2 * SLOT as usize + 2 * SECTOR as usize;
 
-fn key() -> TrustedKey {
-    TrustedKey::new(TEST_KEY)
-}
+static KEYS: [TrustedKey; 1] = [TrustedKey::new(TEST_KEY)];
+const CONFIG: BootConfig<'static> = BootConfig::overwrite(LAYOUT, &KEYS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MockError {
@@ -176,7 +176,7 @@ fn imgtool_vectors_validate_with_their_signing_key() {
             &mut flash,
             LAYOUT.primary,
             LAYOUT.max_image_len(),
-            &TrustedKey::new(key_xy),
+            &[TrustedKey::new(key_xy)],
         )
         .unwrap();
         assert_eq!(valid.header.version, version);
@@ -203,7 +203,7 @@ fn wrong_key_and_tampering_are_rejected() {
             &mut flash,
             LAYOUT.primary,
             LAYOUT.max_image_len(),
-            &TrustedKey::new(TI_KEY)
+            &[TrustedKey::new(TI_KEY)]
         ),
         Err(ImageError::BadSignature)
     );
@@ -213,7 +213,7 @@ fn wrong_key_and_tampering_are_rejected() {
         let mut flash = MockFlash::new();
         flash.load(LAYOUT.primary, V2);
         flash.data[LAYOUT.primary as usize + offset] ^= 0x01;
-        let result = validate(&mut flash, LAYOUT.primary, LAYOUT.max_image_len(), &key());
+        let result = validate(&mut flash, LAYOUT.primary, LAYOUT.max_image_len(), &KEYS);
         assert!(
             matches!(
                 result,
@@ -229,23 +229,23 @@ fn wrong_key_and_tampering_are_rejected() {
     let last = LAYOUT.primary as usize + V2.len() - 1;
     flash.data[last] ^= 0x01;
     assert_eq!(
-        validate(&mut flash, LAYOUT.primary, LAYOUT.max_image_len(), &key()),
+        validate(&mut flash, LAYOUT.primary, LAYOUT.max_image_len(), &KEYS),
         Err(ImageError::BadSignature)
     );
 
     // Truncation and an oversized declared length.
     let mut flash = MockFlash::new();
     flash.load(LAYOUT.primary, &V2[..V2.len() - 40]);
-    assert!(validate(&mut flash, LAYOUT.primary, LAYOUT.max_image_len(), &key()).is_err());
+    assert!(validate(&mut flash, LAYOUT.primary, LAYOUT.max_image_len(), &KEYS).is_err());
     let mut flash = MockFlash::new();
     flash.load(LAYOUT.primary, V2);
     assert_eq!(
-        validate(&mut flash, LAYOUT.primary, 0x400, &key()),
+        validate(&mut flash, LAYOUT.primary, 0x400, &KEYS),
         Err(ImageError::Malformed)
     );
     let mut empty = MockFlash::new();
     assert_eq!(
-        validate(&mut empty, LAYOUT.primary, LAYOUT.max_image_len(), &key()),
+        validate(&mut empty, LAYOUT.primary, LAYOUT.max_image_len(), &KEYS),
         Err(ImageError::NoImage)
     );
 }
@@ -256,7 +256,7 @@ fn image_flags_are_not_supported() {
     flash.load(LAYOUT.primary, V2);
     flash.data[LAYOUT.primary as usize + 16] = 0x04; // IMAGE_F_ENCRYPTED_AES128
     assert_eq!(
-        validate(&mut flash, LAYOUT.primary, LAYOUT.max_image_len(), &key()),
+        validate(&mut flash, LAYOUT.primary, LAYOUT.max_image_len(), &KEYS),
         Err(ImageError::Unsupported)
     );
 }
@@ -266,7 +266,7 @@ fn no_request_boots_the_primary_untouched() {
     let mut flash = MockFlash::new();
     flash.load(LAYOUT.primary, V1);
     flash.load(LAYOUT.secondary, V2); // staged but not requested
-    let bootable = boot(&mut flash, &LAYOUT, &key(), |_| {}).unwrap();
+    let bootable = boot(&mut flash, &CONFIG, |_| {}).unwrap();
     assert_eq!(bootable.update, Update::None);
     assert_eq!(bootable.vector_table, LAYOUT.primary + 0x100);
     assert_eq!(bootable.image.header.version, version_of(V1));
@@ -281,7 +281,7 @@ fn upgrade_installs_and_drops_the_request() {
         flash.load(LAYOUT.secondary, staged);
         request(&mut flash);
         let mut copying = false;
-        let bootable = boot(&mut flash, &LAYOUT, &key(), |event| {
+        let bootable = boot(&mut flash, &CONFIG, |event| {
             copying |= matches!(event, BootEvent::Copying { .. });
         })
         .unwrap();
@@ -304,7 +304,7 @@ fn upgrade_installs_and_drops_the_request() {
 
         // The next boot has nothing to do.
         let operations = flash.operations;
-        let again = boot(&mut flash, &LAYOUT, &key(), |_| {}).unwrap();
+        let again = boot(&mut flash, &CONFIG, |_| {}).unwrap();
         assert_eq!(again.update, Update::None);
         assert_eq!(flash.operations, operations);
     }
@@ -315,7 +315,7 @@ fn upgrade_into_an_empty_primary_skips_the_downgrade_check() {
     let mut flash = MockFlash::new();
     flash.load(LAYOUT.secondary, V1);
     request(&mut flash);
-    let bootable = boot(&mut flash, &LAYOUT, &key(), |_| {}).unwrap();
+    let bootable = boot(&mut flash, &CONFIG, |_| {}).unwrap();
     assert_eq!(bootable.update, Update::Installed);
 }
 
@@ -325,7 +325,7 @@ fn downgrade_is_refused_and_equal_versions_are_reinstalled() {
     flash.load(LAYOUT.primary, V2);
     flash.load(LAYOUT.secondary, V1);
     request(&mut flash);
-    let bootable = boot(&mut flash, &LAYOUT, &key(), |_| {}).unwrap();
+    let bootable = boot(&mut flash, &CONFIG, |_| {}).unwrap();
     assert_eq!(bootable.update, Update::Downgrade);
     assert_eq!(slot_bytes(&flash, LAYOUT.primary, V2.len()), V2);
     assert_eq!(
@@ -337,7 +337,7 @@ fn downgrade_is_refused_and_equal_versions_are_reinstalled() {
     let mut flash = MockFlash::new();
     flash.load(LAYOUT.primary, V2);
     flash.load(LAYOUT.secondary, V2_PAD);
-    let bootable = boot(&mut flash, &LAYOUT, &key(), |_| {}).unwrap();
+    let bootable = boot(&mut flash, &CONFIG, |_| {}).unwrap();
     assert_eq!(bootable.update, Update::Installed);
     assert_eq!(bootable.image.header.version.build, 7);
 }
@@ -352,7 +352,7 @@ fn invalid_requests_are_dropped_without_touching_the_primary() {
         flash.load(LAYOUT.primary, V1);
         flash.load(LAYOUT.secondary, staged);
         request(&mut flash);
-        let bootable = boot(&mut flash, &LAYOUT, &key(), |_| {}).unwrap();
+        let bootable = boot(&mut flash, &CONFIG, |_| {}).unwrap();
         assert_eq!(bootable.update, Update::Rejected(expected));
         assert_eq!(slot_bytes(&flash, LAYOUT.primary, V1.len()), V1);
         assert_eq!(
@@ -364,7 +364,7 @@ fn invalid_requests_are_dropped_without_touching_the_primary() {
     let mut flash = MockFlash::new();
     flash.load(LAYOUT.primary, V1);
     request(&mut flash);
-    let bootable = boot(&mut flash, &LAYOUT, &key(), |_| {}).unwrap();
+    let bootable = boot(&mut flash, &CONFIG, |_| {}).unwrap();
     assert_eq!(bootable.update, Update::Rejected(ImageError::NoImage));
 }
 
@@ -375,7 +375,7 @@ fn damaged_magic_is_not_a_request() {
     flash.load(LAYOUT.secondary, V2);
     request(&mut flash);
     flash.data[magic_address(LAYOUT.secondary, SLOT) as usize + 15] = 0x00;
-    let bootable = boot(&mut flash, &LAYOUT, &key(), |_| {}).unwrap();
+    let bootable = boot(&mut flash, &CONFIG, |_| {}).unwrap();
     assert_eq!(bootable.update, Update::None);
     assert_eq!(bootable.image.header.version, version_of(V1));
 }
@@ -384,7 +384,7 @@ fn damaged_magic_is_not_a_request() {
 fn nothing_bootable_is_reported() {
     let mut flash = MockFlash::new();
     assert_eq!(
-        boot(&mut flash, &LAYOUT, &key(), |_| {}),
+        boot(&mut flash, &CONFIG, |_| {}),
         Err(BootError::NoBootableImage {
             primary: ImageError::NoImage,
             update: Update::None
@@ -393,7 +393,7 @@ fn nothing_bootable_is_reported() {
     let mut flash = MockFlash::new();
     flash.load(LAYOUT.primary, TI_V2);
     assert_eq!(
-        boot(&mut flash, &LAYOUT, &key(), |_| {}),
+        boot(&mut flash, &CONFIG, |_| {}),
         Err(BootError::NoBootableImage {
             primary: ImageError::BadSignature,
             update: Update::None
@@ -416,20 +416,20 @@ fn upgrade_survives_power_loss_at_every_flash_operation() {
             flash
         };
         let mut reference = fresh();
-        boot(&mut reference, &LAYOUT, &key(), |_| {}).unwrap();
+        boot(&mut reference, &CONFIG, |_| {}).unwrap();
         let total = reference.operations;
         assert!(total > 3);
 
         for cut in 1..=total {
             let mut flash = fresh();
             flash.budget = Some(cut);
-            let first = boot(&mut flash, &LAYOUT, &key(), |_| {});
+            let first = boot(&mut flash, &CONFIG, |_| {});
             assert_eq!(first, Err(BootError::Flash), "cut {cut} of {total}");
             // Power loss may strike repeatedly during recovery as well.
             flash.budget = Some(cut.div_ceil(2));
-            let _ = boot(&mut flash, &LAYOUT, &key(), |_| {});
+            let _ = boot(&mut flash, &CONFIG, |_| {});
             flash.budget = None;
-            let bootable = boot(&mut flash, &LAYOUT, &key(), |_| {})
+            let bootable = boot(&mut flash, &CONFIG, |_| {})
                 .unwrap_or_else(|error| panic!("cut {cut} of {total}: {error:?}"));
             assert_eq!(
                 bootable.image.header.version,
@@ -459,16 +459,13 @@ fn rejected_request_survives_power_loss_while_dropping() {
         flash
     };
     let mut reference = fresh();
-    boot(&mut reference, &LAYOUT, &key(), |_| {}).unwrap();
+    boot(&mut reference, &CONFIG, |_| {}).unwrap();
     for cut in 1..=reference.operations {
         let mut flash = fresh();
         flash.budget = Some(cut);
-        assert_eq!(
-            boot(&mut flash, &LAYOUT, &key(), |_| {}),
-            Err(BootError::Flash)
-        );
+        assert_eq!(boot(&mut flash, &CONFIG, |_| {}), Err(BootError::Flash));
         flash.budget = None;
-        let bootable = boot(&mut flash, &LAYOUT, &key(), |_| {}).unwrap();
+        let bootable = boot(&mut flash, &CONFIG, |_| {}).unwrap();
         assert_eq!(bootable.image.header.version, version_of(V2));
         assert_eq!(slot_bytes(&flash, LAYOUT.primary, V2.len()), V2);
     }
@@ -477,12 +474,15 @@ fn rejected_request_survives_power_loss_while_dropping() {
 #[cfg(feature = "firmware-writer")]
 mod writer {
     use super::*;
+    use crate::boot::Mode;
+    use crate::image::KeySet;
     use crate::writer::{SlotPolicy, SlotWriter};
     use zigbee_runtime::firmware_writer::{FirmwareError, FirmwareWriter};
 
     fn policy(key_xy: [u8; 64]) -> SlotPolicy {
         SlotPolicy {
-            key: TrustedKey::new(key_xy),
+            keys: KeySet::new(Box::leak(Box::new([TrustedKey::new(key_xy)]))),
+            mode: Mode::Overwrite,
             header_size: 0x100,
         }
     }
@@ -520,14 +520,14 @@ mod writer {
             );
             let mut flash = core::mem::replace(writer.flash_mut(), MockFlash::new());
             assert_eq!(
-                boot(&mut flash, &LAYOUT, &key(), |_| {}).unwrap().update,
+                boot(&mut flash, &CONFIG, |_| {}).unwrap().update,
                 Update::None
             );
             *writer.flash_mut() = flash;
             writer.activate().unwrap();
             writer.activate().unwrap(); // idempotent
             let flash = writer.flash_mut();
-            let bootable = boot(flash, &LAYOUT, &key(), |_| {}).unwrap();
+            let bootable = boot(flash, &CONFIG, |_| {}).unwrap();
             assert_eq!(bootable.update, Update::Installed);
             assert_eq!(
                 slot_bytes(flash, LAYOUT.primary, V2.len()),
@@ -568,8 +568,9 @@ mod writer {
             dirty_flash(V1),
             LAYOUT,
             SlotPolicy {
-                key: TrustedKey::new(TEST_KEY),
+                keys: KeySet::new(&KEYS),
                 header_size: 0x200,
+                mode: Mode::Overwrite,
             },
         );
         download(&mut writer, V2, 64);
@@ -624,7 +625,7 @@ mod writer {
         download(&mut writer, V2, 100);
         writer.verify(V2.len() as u32, None).unwrap();
         writer.activate().unwrap();
-        let bootable = boot(writer.flash_mut(), &LAYOUT, &key(), |_| {}).unwrap();
+        let bootable = boot(writer.flash_mut(), &CONFIG, |_| {}).unwrap();
         assert_eq!(bootable.update, Update::Installed);
     }
 
@@ -664,11 +665,101 @@ mod writer {
             assert!(failed.is_err(), "cut {cut}");
             let flash = writer.flash_mut();
             flash.budget = None;
-            let bootable = boot(flash, &LAYOUT, &key(), |_| {}).unwrap();
+            let bootable = boot(flash, &CONFIG, |_| {}).unwrap();
             // The stale request was erased first, or the stale garbage is
             // rejected; the running image is never replaced.
             assert_ne!(bootable.update, Update::Installed, "cut {cut}");
             assert_eq!(bootable.image.header.version, version_of(V1));
         }
+    }
+}
+
+mod trial;
+
+/// Records erase calls; reads return erased flash.
+struct EraseLog(Vec<(u32, u32)>);
+
+impl ErrorType for EraseLog {
+    type Error = MockError;
+}
+
+impl ReadNorFlash for EraseLog {
+    const READ_SIZE: usize = 1;
+    fn read(&mut self, _offset: u32, bytes: &mut [u8]) -> Result<(), MockError> {
+        bytes.fill(0xFF);
+        Ok(())
+    }
+    fn capacity(&self) -> usize {
+        usize::MAX
+    }
+}
+
+impl NorFlash for EraseLog {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = 0x800;
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), MockError> {
+        self.0.push((from, to));
+        Ok(())
+    }
+    fn write(&mut self, _offset: u32, _bytes: &[u8]) -> Result<(), MockError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn install_erase_is_split_into_aligned_steps_with_a_kick_each() {
+    use crate::boot::{ERASE_STEP, erase_range};
+    // (sector size, from, to, expected erase calls)
+    type Case = (u32, u32, u32, &'static [(u32, u32)]);
+    let cases: [Case; 3] = [
+        // 64 KiB steps aligned to absolute addresses (block erases stay usable).
+        (
+            0x1000,
+            0x1000,
+            0x31000,
+            &[
+                (0x1000, 0x10000),
+                (0x10000, 0x20000),
+                (0x20000, 0x30000),
+                (0x30000, 0x31000),
+            ],
+        ),
+        // A sector that does not divide the step: one sector per step.
+        (
+            0x3000,
+            0x3000,
+            0xC000,
+            &[(0x3000, 0x6000), (0x6000, 0x9000), (0x9000, 0xC000)],
+        ),
+        // A sector larger than the step.
+        (
+            0x20000,
+            0x20000,
+            0x60000,
+            &[(0x20000, 0x40000), (0x40000, 0x60000)],
+        ),
+    ];
+    for (sector, from, to, expected) in cases {
+        let layout = Layout {
+            primary: from,
+            secondary: to,
+            slot_size: to - from,
+            sector_size: sector,
+        };
+        let mut flash = EraseLog(Vec::new());
+        let mut busy = 0;
+        erase_range(&mut flash, &layout, from, to, &mut |event| {
+            assert_eq!(event, BootEvent::Busy);
+            busy += 1;
+        })
+        .unwrap();
+        assert_eq!(flash.0, expected);
+        assert_eq!(busy, expected.len());
+        assert!(
+            flash
+                .0
+                .iter()
+                .all(|&(a, b)| b - a <= ERASE_STEP.max(sector))
+        );
     }
 }

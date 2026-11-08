@@ -3598,6 +3598,143 @@ fn acknowledged_traffic_is_proof_and_never_a_missed_report() {
     assert!(run.joined);
 }
 
+/// OTA lifecycle that only records image confirmations; the first
+/// `failures` attempts fail like a flash error.
+struct ConfirmOta<'a> {
+    calls: &'a Cell<u32>,
+    failures: u32,
+}
+
+impl<M, S, P> OtaLifecycle<M, S, P> for ConfirmOta<'_>
+where
+    M: MacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+{
+    const ENABLED: bool = true;
+
+    fn is_active(&self, _profile: &P) -> bool {
+        false
+    }
+
+    fn next_deadline_ms(&self, _profile: &P) -> Option<u32> {
+        None
+    }
+
+    async fn handle_event(
+        &mut self,
+        _node: &mut ZigbeeNode<'_, M, S, P>,
+        _event: &StackEvent,
+    ) -> OtaEventOutcome {
+        OtaEventOutcome::NotHandled
+    }
+
+    async fn service(
+        &mut self,
+        _node: &mut ZigbeeNode<'_, M, S, P>,
+        _elapsed_secs: u16,
+    ) -> OtaServiceOutcome {
+        OtaServiceOutcome::IDLE
+    }
+
+    fn activate(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) -> OtaActivationOutcome {
+        unreachable!("nothing is staged");
+    }
+
+    fn abort(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) {}
+
+    fn confirm_image(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) -> bool {
+        self.calls.set(self.calls.get() + 1);
+        self.calls.get() > self.failures
+    }
+}
+
+/// Every pending APS ACK comes back on the next step.
+fn ack_everything(counter: &mut u8, step: usize, device: &mut ZigbeeDevice<MockMac, EndDevice>) {
+    let aps = device.bdb_mut().zdo_mut().aps_mut();
+    if step.is_multiple_of(2) {
+        *counter = counter.wrapping_add(1);
+        aps.register_ack_pending(*counter, 0x0000, &[0, 1, 2]);
+    } else {
+        for c in 0..=u8::MAX {
+            aps.confirm_ack(0x0000, c);
+        }
+    }
+}
+
+#[test]
+fn the_first_aps_ack_confirms_the_image_once() {
+    let calls = Cell::new(0);
+    let mut counter = 0x10u8;
+    let run = run_bounded(
+        &MISSED_REPORT_POLICY,
+        fast_reporting_profile(),
+        ConfirmOta {
+            calls: &calls,
+            failures: 0,
+        },
+        |_| {},
+        60,
+        |step, device| ack_everything(&mut counter, step, device),
+    );
+    assert!(run.joined);
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn a_failed_confirmation_retries_at_the_next_ack() {
+    let calls = Cell::new(0);
+    let mut counter = 0x10u8;
+    run_bounded(
+        &MISSED_REPORT_POLICY,
+        fast_reporting_profile(),
+        ConfirmOta {
+            calls: &calls,
+            failures: 2,
+        },
+        |_| {},
+        60,
+        |step, device| ack_everything(&mut counter, step, device),
+    );
+    assert_eq!(calls.get(), 3);
+}
+
+#[test]
+fn unacknowledged_reports_never_confirm_the_image() {
+    let calls = Cell::new(0);
+    run_bounded(
+        &MISSED_REPORT_POLICY,
+        fast_reporting_profile(),
+        ConfirmOta {
+            calls: &calls,
+            failures: 0,
+        },
+        |_| {},
+        2_000,
+        |_, _| {},
+    );
+    assert_eq!(calls.get(), 0);
+}
+
+/// Without report ACKs, being joined is the proof.
+#[test]
+fn without_report_acks_joining_confirms_the_image() {
+    let calls = Cell::new(0);
+    let run = run_bounded(
+        &BASE_POLICY,
+        test_profile(),
+        ConfirmOta {
+            calls: &calls,
+            failures: 0,
+        },
+        |_| {},
+        20,
+        |_, _| {},
+    );
+    assert!(run.joined);
+    assert_eq!(calls.get(), 1);
+}
+
 #[test]
 fn pending_work_bound_and_restore_feed_the_anomaly_record() {
     static POLICY: SensorPolicy = SensorPolicy {

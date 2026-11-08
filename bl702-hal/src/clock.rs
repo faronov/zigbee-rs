@@ -66,6 +66,14 @@ pub(crate) fn enable_and_reset(peripheral: Peripheral) {
     });
 }
 
+/// Gate `peripheral`'s clock on without resetting it.
+pub(crate) fn enable_clock(peripheral: Peripheral) {
+    with_shared_registers(|| {
+        let bit = 1 << peripheral as u8;
+        rmw(CGEN_CFG1, bit, bit);
+    });
+}
+
 pub(crate) fn configure_uart_fclk(divider: u8) {
     debug_assert!(divider <= 7);
     with_shared_registers(|| {

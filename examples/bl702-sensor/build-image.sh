@@ -23,6 +23,11 @@ REPO="$(cd ../.. && pwd)"
 #
 # TEST ONLY: BL702_OTA_VERSION_OVERRIDE=MM.mm.pp builds an otherwise
 # identical image with another version (e.g. a "v2" for a bench OTA test).
+#
+# LAB ONLY: BL702_LAB_SOAK=1 builds the loader power-cut soak
+# (src/bin/ota_soak.rs) into $TARGET_DIR/ota-soak instead. It needs a
+# version override above every image it will be tested against, and its
+# OTA file must never be published.
 
 PYTHON="${PYTHON:-python3}"
 OTA_TOOL="$REPO/tools/bl702_ota.py"
@@ -39,7 +44,17 @@ if [[ -n "${BL702_OTA_VERSION_OVERRIDE:-}" ]]; then
     echo "WARNING: TEST-ONLY version override ${BL702_OTA_VERSION_OVERRIDE}; never publish this build" >&2
 fi
 
-if [[ "${BL702_DIAGNOSTIC_LOG:-0}" == "1" ]]; then
+if [[ "${BL702_LAB_SOAK:-0}" == "1" ]]; then
+    if [[ -z "${BL702_OTA_VERSION_OVERRIDE:-}" ]]; then
+        echo "BL702_LAB_SOAK=1 needs BL702_OTA_VERSION_OVERRIDE" >&2
+        exit 1
+    fi
+    echo "WARNING: LAB-ONLY loader soak image; never publish this build" >&2
+    LABEL=lab-soak
+    ELF="$TARGET_DIR/bl702-ota-soak"
+    OUT_DIR="$TARGET_DIR/ota-soak"
+    cargo build --release --locked --features ota-soak --bin bl702-ota-soak
+elif [[ "${BL702_DIAGNOSTIC_LOG:-0}" == "1" ]]; then
     LABEL=diagnostic
     cargo build --release --locked --no-default-features --features diagnostic-logging
 else
@@ -60,7 +75,7 @@ RAW_IMAGE="$ELF.bin"
 
 # The loader's boot ROM image. .loader_info stays out of the ROM-hashed
 # range (see products/bl702-xt-zb1/bootloader/memory.x); the release step
-# places it at physical 0xFFE0.
+# places its 64 bytes (LoaderKeys, then LoaderInfo) at physical 0xFFC0.
 LOADER_RAW="$LOADER_ELF.rom.bin"
 LOADER_IMAGE="$LOADER_ELF.boot.bin"
 "$OBJCOPY" --gap-fill 0xff --remove-section .loader_info -O binary "$LOADER_ELF" "$LOADER_RAW"
@@ -82,8 +97,8 @@ fi
 mv -f firmware.bin "$LOADER_IMAGE"
 
 # Signs the application, checks the boot header (magic, 32 MHz XTAL clocks,
-# CRC, image hash, img_start 0x2000, end below 0xFFE0), the LoaderInfo key
-# and the application entry, then writes the OTA file and the full image.
+# CRC, image hash, img_start 0x2000, end at or below 0xFFC0), the loader's
+# trusted key ids and the application entry, then writes the OTA file and the full image.
 # One build per directory: flash.sh programs the only full image there.
 rm -rf "$OUT_DIR"
 "$PYTHON" "$OTA_TOOL" release \

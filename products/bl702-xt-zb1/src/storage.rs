@@ -25,7 +25,7 @@ use core::fmt::Debug;
 
 use bl702_hal::flash::{FlashError, XipFlash};
 use bl702_hal::peripherals::Flash;
-use bl702_xt_zb1_layout::{FLASH_SIZE, NV_SIZE, NV_START, SECONDARY_SLOT};
+use bl702_xt_zb1_layout::{FLASH_SIZE, MCUBOOT, NV_SIZE, NV_START, SECONDARY_SLOT};
 use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash, check_erase, check_read,
     check_write,
@@ -267,8 +267,9 @@ impl<F: NorFlash> NorFlash for SharedFlash<'_, F> {
 
 /// The OTA writer's view, with absolute physical addresses: reads anywhere
 /// below the journal (downgrade prevention reads the running image's
-/// header, the channel check the LoaderInfo record), erases and writes only
-/// inside the secondary slot.
+/// header, the channel check the loader records), erases and writes inside
+/// the secondary slot, and only writes — never erases — the primary slot's
+/// trial log, where the running image confirms itself to the loader.
 pub struct OtaFlash<F> {
     flash: F,
 }
@@ -284,6 +285,11 @@ impl<F> OtaFlash<F> {
 
     const fn writable(from: u32, to: u32) -> bool {
         OTA_WRITE_START <= from && from <= to && to <= OTA_WRITE_END
+    }
+
+    const fn confirm_log(from: u32, to: u32) -> bool {
+        let (start, end) = mcuboot_image::trial_log_area(&MCUBOOT);
+        start <= from && from <= to && to <= end
     }
 }
 
@@ -332,7 +338,7 @@ where
         let end = offset
             .checked_add(bytes.len() as u32)
             .ok_or(PartitionError::OutOfBounds)?;
-        if !Self::writable(offset, end) {
+        if !Self::writable(offset, end) && !Self::confirm_log(offset, end) {
             return Err(PartitionError::OutOfBounds);
         }
         self.flash
@@ -467,6 +473,15 @@ mod tests {
                 .is_ok()
         );
         assert!(ota.write(NV_START - 1, &[0]).is_ok());
+        // The trial log takes writes, never erases; the magic area after it
+        // and the image before it take neither.
+        let (log, log_end) = mcuboot_image::trial_log_area(&MCUBOOT);
+        assert!(ota.write(log, &[0; 4]).is_ok());
+        assert!(ota.write(log_end - 4, &[0; 4]).is_ok());
+        assert!(ota.write(log_end - 2, &[0; 4]).is_err());
+        assert!(ota.write(log - 1, &[0; 4]).is_err());
+        assert!(ota.write(PRIMARY_SLOT + SLOT_SIZE - 16, &[0; 16]).is_err());
+        assert!(ota.erase(log, log + 0x1000).is_err());
         let mut byte = [0];
         assert!(ota.read(LOADER_INFO_ADDR, &mut byte).is_ok());
         assert!(ota.read(NV_START, &mut byte).is_err());

@@ -1,20 +1,27 @@
 //! Zigbee OTA for the XT-ZB1: identity, file version, the staging writer
 //! for the secondary slot and the client lifecycle.
 //!
-//! The product bootloader (`bootloader/`, overwrite-only MCUboot image
+//! The product bootloader (`bootloader/`, overwrite install, MCUboot image
 //! format) installs a staged image on the next reset. The application only
 //! downloads into the secondary slot through [`OtaFlash`], validates the
-//! complete image with the key the loader trusts, and writes the upgrade
-//! request on activation, after `SensorApp` has checkpointed the security
-//! state.
+//! complete image with the keys both it and the loader trust, and writes
+//! the upgrade request on activation, after `SensorApp` has checkpointed
+//! the security state.
+//!
+//! An installed image is on trial until it confirms itself
+//! ([`FirmwareWriter::confirm_image`], one write into the primary slot's
+//! trial log) after its first acknowledged report on the network. The
+//! overwrite loader cannot revert: an unconfirmed image keeps running and
+//! the loader only reports it.
 //!
 //! # Channel
 //!
-//! The loader advertises itself and its trusted key in a [`LoaderInfo`]
-//! record at [`LOADER_INFO_ADDR`]. Images are accepted only when that
-//! record trusts this build's [`OWN_KEY_XY`]; otherwise anything staged
-//! would be rejected at boot, so OTA stays disabled ([`Channel::Foreign`],
-//! [`Channel::NoLoader`]).
+//! The loader advertises itself and its trusted keys in the
+//! [`mcuboot_image::LoaderInfo`] record at [`LOADER_INFO_ADDR`] (and the
+//! `LoaderKeys` record before it). Images are accepted only when the loader
+//! trusts one of this build's [`TRUSTED_KEYS`], and only signatures by such
+//! a key; otherwise anything staged would be rejected at boot, so OTA stays
+//! disabled ([`Channel::Foreign`], [`Channel::NoLoader`]).
 //!
 //! # File version
 //!
@@ -23,9 +30,9 @@
 //! the same scheme as the CC2340 flower product. The MCUboot header carries
 //! `MM.mm.pp+0`, which the loader's downgrade prevention compares.
 
-use bl702_xt_zb1_layout::{IMAGE_HEADER_SIZE, LOADER_INFO_ADDR, MCUBOOT, OWN_KEY_XY};
+use bl702_xt_zb1_layout::{IMAGE_HEADER_SIZE, LOADER_INFO_ADDR, MCUBOOT, TRUSTED_KEYS};
 use embedded_storage::nor_flash::{NorFlash, NorFlashError};
-use mcuboot_image::{LoaderInfo, SlotPolicy, SlotWriter, TrustedKey};
+use mcuboot_image::{KeySet, Mode, SlotPolicy, SlotWriter, TrustedIds};
 use sensor_sed_app::{
     OtaActivationOutcome as AppOtaActivationOutcome, OtaEventOutcome as AppOtaEventOutcome,
     OtaLifecycle, OtaServiceOutcome, is_ota_event,
@@ -74,9 +81,9 @@ pub const FILE_VERSION: u32 = file_version(VERSION.0, VERSION.1, VERSION.2);
 /// accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
-    /// The product bootloader trusting this build's own key.
+    /// The product bootloader trusting one of this build's keys.
     Own,
-    /// A zigbee-rs loader trusting another key: staged images would be
+    /// A zigbee-rs loader trusting none of them: staged images would be
     /// rejected at boot.
     Foreign,
     /// No loader record (or an unreadable one): nothing is known to install
@@ -85,22 +92,19 @@ pub enum Channel {
 }
 
 impl Channel {
-    /// Classify the loader record read from [`LOADER_INFO_ADDR`].
-    pub fn detect(info: Option<&LoaderInfo>) -> Self {
-        match info {
+    /// Classify the loader records read from [`LOADER_INFO_ADDR`].
+    pub fn detect(ids: Option<&TrustedIds>) -> Self {
+        match ids {
             None => Self::NoLoader,
-            Some(info) if info.trusts(&OWN_KEY_XY) => Self::Own,
-            Some(_) => Self::Foreign,
+            Some(_) if shared_keys(ids).is_empty() => Self::Foreign,
+            Some(_) => Self::Own,
         }
     }
 
-    /// Read the loader record from physical flash. A read error disables
+    /// Read the loader records from physical flash. A read error disables
     /// OTA rather than guessing.
     pub fn read<F: NorFlash>(flash: &mut F) -> Self {
-        match LoaderInfo::read(flash, LOADER_INFO_ADDR) {
-            Ok(info) => Self::detect(info.as_ref()),
-            Err(_) => Self::NoLoader,
-        }
+        Self::detect(loader_ids(flash).as_ref())
     }
 
     pub const fn accepts_images(self) -> bool {
@@ -122,13 +126,26 @@ pub const fn ota_config() -> OtaConfig {
     }
 }
 
+/// The loader's key records; `None` without a valid record or on a read
+/// error.
+fn loader_ids<F: NorFlash>(flash: &mut F) -> Option<TrustedIds> {
+    TrustedIds::read(flash, LOADER_INFO_ADDR).ok().flatten()
+}
+
+/// This build's keys that the loader described by `ids` also trusts.
+pub fn shared_keys(ids: Option<&TrustedIds>) -> KeySet {
+    let mut keys = KeySet::new(&TRUSTED_KEYS);
+    keys.retain(|key| ids.is_some_and(|ids| ids.trusts(key)));
+    keys
+}
+
 /// The product's firmware writer over main flash `F`.
 pub type Bl702Writer<F> = SlotWriter<OtaFlash<F>>;
 
 /// The staging writer for the secondary slot. It refuses images not signed
-/// with `key_xy`, with another header size, or older than the running image,
-/// and writes the upgrade request only on activation.
-pub fn writer_with_key<F: NorFlash>(flash: F, key_xy: [u8; 64]) -> Bl702Writer<F>
+/// by one of `keys`, with another header size, or older than the running
+/// image, and writes the upgrade request only on activation.
+pub fn writer_with_keys<F: NorFlash>(flash: F, keys: KeySet) -> Bl702Writer<F>
 where
     F::Error: NorFlashError,
 {
@@ -136,18 +153,21 @@ where
         OtaFlash::new(flash),
         MCUBOOT,
         SlotPolicy {
-            key: TrustedKey::new(key_xy),
+            keys,
             header_size: IMAGE_HEADER_SIZE as u16,
+            mode: Mode::Overwrite,
         },
     )
 }
 
-/// [`writer_with_key`] for this build's own key.
-pub fn writer<F: NorFlash>(flash: F) -> Bl702Writer<F>
+/// [`writer_with_keys`] for this build's keys that the installed loader
+/// trusts (none — every image refused — without a loader record).
+pub fn writer<F: NorFlash>(mut flash: F) -> Bl702Writer<F>
 where
     F::Error: NorFlashError,
 {
-    writer_with_key(flash, OWN_KEY_XY)
+    let keys = shared_keys(loader_ids(&mut OtaFlash::new(&mut flash)).as_ref());
+    writer_with_keys(flash, keys)
 }
 
 /// The sensor endpoint with its OTA client.
@@ -355,6 +375,21 @@ where
         node.profile_mut().ota_mut().end_session();
         self.session = OtaSession::new();
     }
+
+    fn confirm_image(&mut self, node: &mut ZigbeeNode<'_, M, S, OtaSensorProfile<W>>) -> bool {
+        // One write into the primary slot's trial log while the installed
+        // image is on trial; nothing for a confirmed or factory image.
+        match node.profile_mut().ota_mut().writer_mut().confirm_image() {
+            Ok(()) => {
+                log::info!("[ota] image confirmed");
+                true
+            }
+            Err(error) => {
+                log::warn!("[ota] confirm failed: {error:?}");
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -367,8 +402,14 @@ mod tests {
     use super::*;
     use crate::storage::SharedFlash;
     use crate::storage::mock::MockMainFlash;
-    use bl702_xt_zb1_layout::{NV_START, PRIMARY_SLOT, SECONDARY_SLOT, SLOT_SIZE};
-    use mcuboot_image::{BOOT_MAGIC, MagicState, trailer::read_magic};
+    use bl702_xt_zb1_layout::{
+        BOOT_CONFIG, LOADER_BLOCK_ADDR, LOADER_VERSION, NV_START, OWN_KEY_XY, PRIMARY_SLOT,
+        SECONDARY_SLOT, SLOT_SIZE,
+    };
+    use mcuboot_image::{
+        BOOT_MAGIC, BootConfig, LoaderInfo, MagicState, Trial, TrialState, TrustedKey,
+        loader_block, trailer::read_magic,
+    };
     use zigbee_runtime::firmware_writer::FirmwareError;
 
     // Shared imgtool vectors (header 0x100, TEST-ONLY key).
@@ -378,11 +419,13 @@ mod tests {
     const TEST_V2: &[u8] = include_bytes!("../../../mcuboot-image/tests/vectors/test-v2.bin");
     const TI_V2: &[u8] = include_bytes!("../../../mcuboot-image/tests/vectors/ti-v2.bin");
 
+    static TEST_KEYS: [TrustedKey; 1] = [TrustedKey::new(*TEST_KEY_XY)];
+
     fn test_writer<F: NorFlash>(flash: F) -> Bl702Writer<F>
     where
         F::Error: NorFlashError,
     {
-        writer_with_key(flash, *TEST_KEY_XY)
+        writer_with_keys(flash, KeySet::new(&TEST_KEYS))
     }
 
     /// `imgtool sign --pad`: fill the slot and append the request magic.
@@ -400,8 +443,9 @@ mod tests {
         let mut flash = MockMainFlash::new();
         let primary = PRIMARY_SLOT as usize;
         flash.bytes[primary..primary + running.len()].copy_from_slice(running);
-        let info = LOADER_INFO_ADDR as usize;
-        flash.bytes[info..info + 32].copy_from_slice(&LoaderInfo::new(0, 1, &OWN_KEY_XY).encode());
+        let block = LOADER_BLOCK_ADDR as usize;
+        flash.bytes[block..block + 64]
+            .copy_from_slice(&loader_block(LOADER_VERSION, &TRUSTED_KEYS));
         let nv = NV_START as usize;
         flash.bytes[nv..nv + 64].fill(0x5A);
         flash
@@ -453,13 +497,11 @@ mod tests {
     fn channel_follows_the_loader_record() {
         let ours = LoaderInfo::new(0, 1, &OWN_KEY_XY);
         let other = LoaderInfo::new(0, 1, &[0x42; 64]);
-        assert_eq!(Channel::detect(Some(&ours)), Channel::Own);
-        assert_eq!(Channel::detect(Some(&other)), Channel::Foreign);
-        assert_eq!(Channel::detect(None), Channel::NoLoader);
         assert!(Channel::Own.accepts_images());
         assert!(!Channel::Foreign.accepts_images());
         assert!(!Channel::NoLoader.accepts_images());
 
+        // A version 1 loader: the LoaderInfo record alone.
         let mut flash = MockMainFlash::new();
         assert_eq!(Channel::read(&mut flash), Channel::NoLoader);
         let at = LOADER_INFO_ADDR as usize;
@@ -469,6 +511,41 @@ mod tests {
         assert_eq!(Channel::read(&mut flash), Channel::NoLoader);
         flash.bytes[at..at + 32].copy_from_slice(&other.encode());
         assert_eq!(Channel::read(&mut flash), Channel::Foreign);
+    }
+
+    /// Rotation: a loader trusting another primary key and this build's
+    /// key as an extra one still accepts this build's images, and the
+    /// writer accepts only the keys both sides trust.
+    #[test]
+    fn extra_loader_keys_count_for_the_channel_and_the_writer() {
+        let old = TrustedKey::new([0x42; 64]);
+        let keys = [old, TRUSTED_KEYS[0]];
+        let mut flash = MockMainFlash::new();
+        let at = LOADER_BLOCK_ADDR as usize;
+        flash.bytes[at..at + 64].copy_from_slice(&loader_block(2, &keys));
+        assert_eq!(Channel::read(&mut flash), Channel::Own);
+        let ids = TrustedIds::read(&mut flash, LOADER_INFO_ADDR)
+            .unwrap()
+            .unwrap();
+        assert!(shared_keys(Some(&ids)).iter().eq(&TRUSTED_KEYS[..1]));
+        // The LoaderKeys record damaged: only the foreign primary remains.
+        flash.bytes[at + 14] ^= 1;
+        assert_eq!(Channel::read(&mut flash), Channel::Foreign);
+        assert!(shared_keys(None).is_empty());
+    }
+
+    /// The writer of a device without a loader record refuses everything.
+    #[test]
+    fn writer_without_a_loader_trusts_no_key() {
+        let mut flash = MockMainFlash::new();
+        let primary = PRIMARY_SLOT as usize;
+        flash.bytes[primary..primary + TEST_V1.len()].copy_from_slice(TEST_V1);
+        let mut writer = writer(&mut flash);
+        download(&mut writer, TEST_V2);
+        assert_eq!(
+            writer.verify(TEST_V2.len() as u32, None),
+            Err(FirmwareError::VerifyFailed)
+        );
     }
 
     #[test]
@@ -544,13 +621,52 @@ mod tests {
             writer.verify(TEST_V2.len() as u32, None).unwrap();
             writer.activate().unwrap();
         }
-        let key = TrustedKey::new(*TEST_KEY_XY);
-        let booted = mcuboot_image::boot(&mut flash, &MCUBOOT, &key, |_| {}).unwrap();
+        let config = BootConfig {
+            keys: &TEST_KEYS,
+            ..BOOT_CONFIG
+        };
+        let booted = mcuboot_image::boot(&mut flash, &config, |_| {}).unwrap();
         assert_eq!(booted.update, mcuboot_image::Update::Installed);
         assert_eq!(booted.vector_table, bl702_xt_zb1_layout::APP_START);
         let primary = PRIMARY_SLOT as usize;
         assert_eq!(&flash.bytes[primary..primary + TEST_V2.len()], TEST_V2);
         assert_eq!(request(&mut flash), MagicState::Erased);
+        assert_eq!(&flash.bytes[NV_START as usize..], &nv_before[..]);
+    }
+
+    /// The installed image is on trial until the application confirms it
+    /// through its OTA flash view; the loader then sees it confirmed.
+    #[test]
+    fn installed_image_confirms_itself_through_the_ota_view() {
+        // Trial boots on, whatever BL702_BOOT_TRIAL_BOOTS this build used.
+        let config = BootConfig {
+            keys: &TEST_KEYS,
+            trial_boots: 3,
+            ..BOOT_CONFIG
+        };
+        let mut flash = device(TEST_V1);
+        let nv_before = flash.bytes[NV_START as usize..].to_vec();
+        {
+            let mut writer = test_writer(&mut flash);
+            download(&mut writer, TEST_V2);
+            writer.verify(TEST_V2.len() as u32, None).unwrap();
+            writer.activate().unwrap();
+        }
+        let booted = mcuboot_image::boot(&mut flash, &config, |_| {}).unwrap();
+        assert_eq!(booted.trial, Trial::Testing { boot: 1 });
+        {
+            let mut writer = test_writer(&mut flash);
+            assert_eq!(
+                writer.trial_state(),
+                Some(TrialState::Testing { attempts: 1 })
+            );
+            writer.confirm_image().unwrap();
+            assert_eq!(writer.trial_state(), Some(TrialState::Confirmed));
+            // Confirming again writes nothing.
+            writer.confirm_image().unwrap();
+        }
+        let booted = mcuboot_image::boot(&mut flash, &config, |_| {}).unwrap();
+        assert_eq!(booted.trial, Trial::Confirmed);
         assert_eq!(&flash.bytes[NV_START as usize..], &nv_before[..]);
     }
 

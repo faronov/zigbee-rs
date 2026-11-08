@@ -392,6 +392,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed25519-compact"
+version = "2.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1454db4f2edb7f0e8fe0c5b375b0c978fc63244cc9f010d160e417eb10139aa8"
+
+[[package]]
 name = "efr32mg1-hal"
 version = "0.1.0"
 dependencies = [
@@ -1234,6 +1240,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 name = "mcuboot-image"
 version = "0.1.0"
 dependencies = [
+ "ed25519-compact",
  "embedded-storage",
  "p256",
  "sha2",
@@ -2139,4 +2146,12 @@ dependencies = [
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-types",
+]
+
+[[package]]
+name = "zrs-boot-core"
+version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+ "mcuboot-image",
 ]

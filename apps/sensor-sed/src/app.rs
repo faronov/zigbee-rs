@@ -168,6 +168,9 @@ where
     /// acknowledgement between two checks.
     prev_ack_pending: bool,
     prev_ack_failures: u8,
+    /// The running image has been confirmed to the bootloader this boot
+    /// (or there is nothing to confirm).
+    image_confirmed: bool,
     /// Anomalies recorded since boot (plus any the product restored), and
     /// whether the product has not yet seen the latest change.
     anomalies: AnomalyRecord,
@@ -257,6 +260,7 @@ where
             report_proof_ms: 0,
             prev_ack_pending: false,
             prev_ack_failures: 0,
+            image_confirmed: !O::ENABLED,
             anomalies: AnomalyRecord::EMPTY,
             anomaly_dirty: false,
             sleep_failures: 0,
@@ -823,6 +827,13 @@ where
             || (failures == 0 && self.prev_ack_failures != 0);
         self.prev_ack_pending = ack_pending;
         self.prev_ack_failures = failures;
+
+        // Proof that the running image works on the network confirms it to
+        // the bootloader: an APS ACK of a report, or — without report ACKs —
+        // being joined (this runs only on joined waits).
+        if !self.image_confirmed && (acked || !self.policy.recovery.report_aps_ack) {
+            self.image_confirmed = self.resources.ota.confirm_image(&mut self.node);
+        }
 
         let grace_ms = self.policy.recovery.missed_report_grace_ms;
         let max_interval_s = if grace_ms == 0 {

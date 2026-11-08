@@ -59,6 +59,15 @@ pub trait FirmwareWriter {
 
     /// Abort an in-progress update and revert to the current image.
     fn abort(&mut self) -> Result<(), FirmwareError>;
+
+    /// Confirm that the running image works, so a bootloader with trial
+    /// boots keeps it instead of treating it as failed. Called by the
+    /// application once it has end-to-end proof (for example an
+    /// acknowledged report after joining). Idempotent; the default, for
+    /// bootloaders without a trial, does nothing.
+    fn confirm_image(&mut self) -> Result<(), FirmwareError> {
+        Ok(())
+    }
 }
 
 /// Mock firmware writer for host testing — stores data in a RAM buffer.

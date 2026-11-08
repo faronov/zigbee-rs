@@ -20,6 +20,7 @@ members = [
     "tests",
     "tools/phy62x2-image",
     "mcuboot-image",
+    "bootloaders/core",
 ]
 exclude = [
     "vendor/esp-hal",

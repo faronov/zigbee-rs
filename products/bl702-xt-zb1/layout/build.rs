@@ -1,4 +1,5 @@
-//! Embed the bootloader trust anchor as a raw P-256 `X || Y` constant.
+//! Embed the bootloader trust anchors as raw P-256 `X || Y` constants and
+//! the trial-boot budget.
 //!
 //! `../keys/own-ec-p256.xy.hex` is the public half of the default signing
 //! key (the flower project's own key, whose private half lives outside every
@@ -7,6 +8,20 @@
 //! file holding one, to build for a different key; CI does this with an
 //! ephemeral key and `tools/bl702_ota.py` does it for the key it signs with.
 //! The private key is never read here and never committed.
+//!
+//! Key rotation: `BL702_OTA_KEY2_XY` and `BL702_OTA_KEY3_XY` (same forms)
+//! add further trusted keys. The first key stays the one the loader's
+//! `LoaderInfo` names; the others go into the `LoaderKeys` record before it.
+//!
+//! `BL702_BOOT_TRIAL_BOOTS` (0..=255, default 3) is how many boots an
+//! installed image may take before the loader reports it unconfirmed;
+//! `0` disables trial accounting.
+//!
+//! `BL702_BOOT_WATCHDOG_MS` (0..=63999, default 16000) is the loader
+//! watchdog period; `0` leaves the watchdog off. The default covers the
+//! longest step between two kicks (one full-slot validation, or one 64 KiB
+//! erase, at the ROM's 32 MHz clock) several times over, also with the
+//! tolerance of the uncalibrated 32 kHz RC clock.
 
 use std::env;
 use std::fs;
@@ -27,37 +42,74 @@ fn parse_xy(origin: &str, text: &str) -> [u8; 64] {
     xy
 }
 
+/// The key named by `var` (a hex string or a file path), if set.
+fn env_key(var: &str) -> Option<[u8; 64]> {
+    println!("cargo:rerun-if-env-changed={var}");
+    let value = env::var(var).ok()?;
+    if value.trim().len() == 128 && !value.contains(['/', '\\', '.']) {
+        return Some(parse_xy(var, &value));
+    }
+    println!("cargo:rerun-if-changed={value}");
+    let text =
+        fs::read_to_string(&value).unwrap_or_else(|error| panic!("read {var}={value}: {error}"));
+    Some(parse_xy(&value, &text))
+}
+
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let default = manifest.join("../keys/own-ec-p256.xy.hex");
-    println!("cargo:rerun-if-env-changed=BL702_OTA_KEY_XY");
     println!("cargo:rerun-if-changed={}", default.display());
 
-    let (origin, text) = match env::var("BL702_OTA_KEY_XY") {
-        Ok(value) if value.trim().len() == 128 && !value.contains(['/', '\\', '.']) => {
-            ("BL702_OTA_KEY_XY".to_owned(), value)
+    let xy = env_key("BL702_OTA_KEY_XY").unwrap_or_else(|| {
+        let text = fs::read_to_string(&default)
+            .unwrap_or_else(|error| panic!("read {}: {error}", default.display()));
+        parse_xy(&default.display().to_string(), &text)
+    });
+    let mut keys = vec![xy];
+    for var in ["BL702_OTA_KEY2_XY", "BL702_OTA_KEY3_XY"] {
+        if let Some(key) = env_key(var) {
+            assert!(!keys.contains(&key), "{var} repeats a trusted key");
+            keys.push(key);
         }
-        Ok(path) => {
-            println!("cargo:rerun-if-changed={path}");
-            let text = fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("read BL702_OTA_KEY_XY={path}: {error}"));
-            (path, text)
-        }
-        Err(_) => {
-            let text = fs::read_to_string(&default)
-                .unwrap_or_else(|error| panic!("read {}: {error}", default.display()));
-            (default.display().to_string(), text)
-        }
-    };
-    let xy = parse_xy(&origin, &text);
+    }
 
+    println!("cargo:rerun-if-env-changed=BL702_BOOT_TRIAL_BOOTS");
+    let trial_boots: u8 = match env::var("BL702_BOOT_TRIAL_BOOTS") {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("BL702_BOOT_TRIAL_BOOTS={value} is not 0..=255")),
+        Err(_) => 3,
+    };
+
+    println!("cargo:rerun-if-env-changed=BL702_BOOT_WATCHDOG_MS");
+    let watchdog_ms: u32 = match env::var("BL702_BOOT_WATCHDOG_MS") {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .ok()
+            .filter(|ms| *ms <= 63_999)
+            .unwrap_or_else(|| panic!("BL702_BOOT_WATCHDOG_MS={value} is not 0..=63999")),
+        Err(_) => 16_000,
+    };
+
+    let mut text = format!(
+        "/// Public half (`X || Y`) of the primary key the bootloader trusts.\n\
+         pub const OWN_KEY_XY: [u8; 64] = {xy:?};\n\
+         /// Every key the bootloader trusts, [`OWN_KEY_XY`] first.\n\
+         pub const TRUSTED_KEYS: [mcuboot_image::TrustedKey; {}] = [\n",
+        keys.len()
+    );
+    for key in &keys {
+        text.push_str(&format!("    mcuboot_image::TrustedKey::new({key:?}),\n"));
+    }
+    text.push_str(&format!(
+        "];\n\
+         /// Boots an installed image may take before it counts as unconfirmed.\n\
+         pub const BOOT_TRIAL_BOOTS: u8 = {trial_boots};\n\
+         /// Loader watchdog period in milliseconds (0 = off).\n\
+         pub const BOOT_WATCHDOG_MS: u32 = {watchdog_ms};\n"
+    ));
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("keys.rs");
-    fs::write(
-        &out,
-        format!(
-            "/// Public half (`X || Y`) of the key the bootloader trusts.\n\
-             pub const OWN_KEY_XY: [u8; 64] = {xy:?};\n"
-        ),
-    )
-    .expect("write keys.rs");
+    fs::write(&out, text).expect("write keys.rs");
 }

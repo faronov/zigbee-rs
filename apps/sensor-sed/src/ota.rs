@@ -119,6 +119,16 @@ where
     /// partially staged image may be kept for a later resume, but nothing
     /// may be activated.
     fn abort(&mut self, node: &mut ZigbeeNode<'_, M, S, P>);
+
+    /// Confirm the running image to the bootloader once it has proven
+    /// itself on the network (see `SensorApp`): an installed image is on
+    /// trial until then, and a loader that can revert reverts it after its
+    /// trial boots. Called at most until it returns `true`; `false` (a
+    /// flash error) retries at the next proof. Products without trial
+    /// accounting keep the default.
+    fn confirm_image(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

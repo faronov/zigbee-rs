@@ -4,12 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "no_std MCUboot image validation, overwrite-only boot engine and OTA slot writer"
+description = "no_std MCUboot image validation, boot engine (overwrite, optional swap-move) and OTA slot writer"
 publish = false
 
 [dependencies]
 embedded-storage = { workspace = true }
 sha2 = { version = "0.10", default-features = false }
+ed25519-compact = { version = "2.6", default-features = false, features = ["opt_size"], optional = true }
 zigbee-runtime = { version = "0.1.0", path = "../zigbee-runtime", default-features = false, optional = true }
 
 [features]
@@ -18,6 +19,10 @@ default = []
 firmware-writer = ["dep:zigbee-runtime"]
 # Smaller, slower SHA-256 for size-constrained bootloaders.
 compact-sha256 = ["sha2/force-soft-compact"]
+# Ed25519 image signatures (TLV 0x24) in addition to ECDSA P-256.
+ed25519 = ["dep:ed25519-compact"]
+# Opt-in swap-move install keeping the previous image for revert.
+swap-move = []
 
 [dev-dependencies]
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }

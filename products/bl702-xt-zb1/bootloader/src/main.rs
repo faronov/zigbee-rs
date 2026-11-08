@@ -1,39 +1,47 @@
 //! Bootloader for the BL702 XT-ZB1 sensor: MCUboot image format,
-//! overwrite-only, with this project's own signing key.
+//! overwrite install with trial boots, with this project's own signing
+//! key(s).
 //!
 //! The mask ROM authenticates nothing but this loader (boot-header CRC and
 //! SHA-256). Each reset the loader installs a pending OTA image from the
 //! secondary slot (power-fail safe and resumable), validates the primary
-//! image (SHA-256 and ECDSA P-256 over the `imgtool` TLVs, downgrade
-//! prevention) and starts it at XIP `0x2300E100`. Status lines go to the
+//! image (SHA-256 and ECDSA P-256 over the `imgtool` TLVs by one of the
+//! build's trusted keys, downgrade prevention against a valid primary),
+//! counts trial boots until the application confirms an installed image,
+//! and starts it at XIP `0x2300E100`. Status lines go to the
 //! monitor UART (GPIO14, 2 Mbaud); with nothing bootable it halts until the
-//! next reset.
+//! next reset. The TIMER watchdog (`BL702_BOOT_WATCHDOG_MS`, default 16 s)
+//! resets a hung decision and is off again before the application starts.
 //!
-//! The 32-byte [`LOADER_INFO`] record at physical `0xFFE0` tells the
-//! application that it runs under this loader and which key it trusts,
-//! which selects the application's OTA channel.
+//! The 64-byte [`LOADER_INFO`] block at physical `0xFFC0` (`LoaderKeys`,
+//! then the `LoaderInfo` record at `0xFFE0`) tells the application that it
+//! runs under this loader and which keys it trusts, which selects the
+//! application's OTA channel and signing keys.
 
 #![no_std]
 #![no_main]
 
-use bl702_boot::{Config, Console, TrustedKey};
+use bl702_boot::{Config, Console};
 use bl702_hal::flash::XipFlash;
 use bl702_hal::uart::Uart0Tx;
 use bl702_xt_zb1::{ONBOARD_FLASH_CAPACITY, Resources};
-use bl702_xt_zb1_layout::{LOADER_START, LOADER_VERSION, MCUBOOT, OWN_KEY_XY, XIP_BASE};
+use bl702_xt_zb1_layout::{
+    BOOT_CONFIG, BOOT_WATCHDOG_MS, LOADER_START, LOADER_VERSION, TRUSTED_KEYS, XIP_BASE,
+};
 use panic_halt as _;
 
-/// LoaderInfo record ("ZRSBOOT1", loader version, first 8 bytes of the
-/// trusted key's X coordinate).
+/// LoaderKeys record ("ZRSKEYS1", ids of the extra trusted keys; erased
+/// with one key) followed by the LoaderInfo record ("ZRSBOOT1", loader
+/// version, first 8 bytes of the primary key's X coordinate).
 #[unsafe(link_section = ".loader_info")]
 #[used]
-pub static LOADER_INFO: [u8; 32] = bl702_boot::loader_info(LOADER_VERSION, &OWN_KEY_XY);
+pub static LOADER_INFO: [u8; 64] = bl702_boot::loader_block(LOADER_VERSION, &TRUSTED_KEYS);
 
 static CONFIG: Config = Config {
-    layout: MCUBOOT,
-    key: TrustedKey::new(OWN_KEY_XY),
+    boot: BOOT_CONFIG,
     img_start: LOADER_START,
     xip_base: XIP_BASE,
+    watchdog: bl702_boot::watchdog_ms(BOOT_WATCHDOG_MS),
 };
 
 struct Uart(Option<Uart0Tx<14, 15>>);
@@ -61,7 +69,7 @@ fn main() -> ! {
     // SAFETY: plain read of an initialized static.
     let _ = unsafe { core::ptr::read_volatile(&LOADER_INFO[0]) };
     match XipFlash::new(application.flash, ONBOARD_FLASH_CAPACITY) {
-        Ok(flash) => bl702_boot::run(flash, &CONFIG, &mut console),
+        Ok(flash) => bl702_boot::run(flash, &CONFIG, application.wdt, &mut console),
         Err(_) => {
             console.write(b"bl702-boot: flash config error\r\nbl702-boot: halted\r\n");
             halt()
