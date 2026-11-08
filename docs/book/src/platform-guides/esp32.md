@@ -268,9 +268,13 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   boot (`SensorWake::with_usb_host_wait`); a host seen in that window keeps
   the device awake and reflashable for the power cycle, in either mode, and
   `top_pd` refuses `usb_host_wait_ms = 0` at build time. Images before this
-  gate (e.g. `1b0a72c`, `c53ca91`) can lose that race and then drop off USB
-  even with a host attached; ROM download mode (BOOT) does not help hwlab,
-  since the flash is not attached there (JEDEC `ffffff`).
+  gate (e.g. `1b0a72c`, `c53ca91`, `a8f849b5`) can lose that race and then
+  drop off USB even with a host attached; they are recovered through ROM
+  download mode (BOOT + plug), where hwlab `9c75594` or later attaches the
+  SPI flash through the ROM first (before it, JEDEC read `ffffff`). The gate
+  is hardware-proven on the H2-Zero (`90ef338`, image `d93a205e`): a plain
+  replug without BOOT keeps a stable USB Serial/JTAG port, hwlab reads the
+  chip, and the device rejoins.
   `tools/esp32h2-sleep-ram-check.py` checks in CI that the sleep/restore
   path never reaches flash.
 - CPU clock: the ESP-IDF bootloader leaves the H2 CPU on FLASH_PLL
@@ -351,7 +355,8 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   isolating, the same pads are latched with the per-pad hold
   (`LP_AON_GPIO_HOLD0`, ESP-IDF `gpio_ll_hold_en`), the only pad state that
   survives TOP power-down; without it the `top_pd` floor on the H2-Zero was
-  1.00-1.02 mA instead of the retained 0.80 mA (`1b0a72c`, WSTK AEM). The
+  1.00-1.02 mA instead of the retained 0.80 mA (`1b0a72c`, WSTK AEM), with
+  it 0.895 mA (`90ef338`), still above retained (status below). The
   hold survives every reset except power-on, so an image that drives one of
   these pads must release its hold bit first (`esp-hal` does not).
 - HP_SLEEP PMU parity with ESP-IDF v5.5.1: the H2 init writes the
@@ -372,10 +377,21 @@ it is the H2-Zero board limit above). The retained mode through
 on the WSTK AEM for 1 h: no boot loop, every 29.8 s poll answered after
 TOP/modem power-down, reports delivered, polls ~514 µC and reports ~2.0 mC
 (as retained), but a 1.023 mA floor and ~1,057 µA average because the pad
-isolation was not held; the pad-hold fix is built and not yet measured. A tens-of-uA
-floor needs a different board; on the H2-Zero the target is B − D near
-80 µA. Reporting persistence across a power cycle and Poll Control check-in
-remain **hardware gates**.
+isolation was not held. With the pad hold and the USB gate (`90ef338`,
+image `d93a205e`, WSTK AEM, 1 h) `top_pd` again ran without a boot loop,
+kept a regular 29.76 s poll with retained-size pulses, delivered reports (ZHA's 900 s maximum) and
+answered Diagnostics reads (`0x0000` = 5 and `0x0001` = `0xE008` before
+and after, so no keep-awake limit fired), with polls at a median ~524 µC
+above the floor and reports ~1.7-2.0 mC, but a 0.895 mA floor (stable
+over the hour, against 0.802 mA retained) and ~929 µA average. On this
+board `top_pd` therefore costs ~93 µA more floor than retained: its chip
+excess above the 0.73 mA board limit is ~165 µA against ~72 µA retained,
+and its quiet windows peak at ~1.4 mA against ≤0.95 mA retained (not
+yet characterised). Retained stays the default;
+`top_pd` remains experimental until that excess is explained. A
+tens-of-uA floor needs a different board; on the H2-Zero the target is
+B − D near 80 µA. Reporting persistence across a power cycle and Poll
+Control check-in remain **hardware gates**.
 
 ## Product-owned flash layout
 
