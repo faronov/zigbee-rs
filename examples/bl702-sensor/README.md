@@ -273,11 +273,13 @@ build-, symbol- and host-tested only; see the
 
 ## Remaining gates
 
-- loader and OTA on hardware (pending): first boot through the loader,
-  a full OTA v0.1.0 → v0.1.1 with reboot into the new image, retained
-  network state, power loss during the copy, P-256 verify time at 32 MHz,
-  ROM erase/program with interrupts masked during the download, and the
-  software reset;
+- loader and OTA on hardware: the first boot through the loader, ZHA OTA
+  with reboot into the new image, retained network state, trial
+  boot/confirm, and power loss during the loader copy (46 cuts) were
+  lab-proven on one XT-ZB1 (see the
+  [bootloader results](../../docs/book/src/advanced/bootloader.md#results-2026-11-08)).
+  Still open: downgrade rejection, wrong-key refusal and trial expiry on
+  hardware, and the P-256 verify time on its own;
 - `flash.sh` raw programming with `bflb-iot-tool`;
 - security-journal erase/program, power interruption, and reset recovery;
 - GPADC battery accuracy;

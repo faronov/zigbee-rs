@@ -8,18 +8,22 @@ its loader binary.
 
 This page is both the design and its current status:
 
-- **Phase 1** (`0efac9b`) extracted the shared core from the two existing
-  loaders without changing their behaviour.
-- **Phase 2 step 1** (this revision) adds:
+- **Phase 1** extracted the shared core from the two existing loaders
+  without changing their behaviour.
+- **Phase 2 step 1** adds:
   - the brick fix;
   - trial boots with an application confirm;
   - up to three trusted keys;
   - optional Ed25519;
   - opt-in swap-move with revert.
+- **Phase 2 step 2** adds the loader watchdog, the CC2340 slot guard and
+  the BL702 lab soak.
 
-  All of it is **host-tested only**. The refactored BL702 loader has not
-  yet been run on hardware; the plan is in
-  [BL702 hardware re-validation](#bl702-hardware-re-validation-plan).
+The BL702 v2 loader passed a hardware run on one XT-ZB1 on 2026-11-08:
+OTA through ZHA, confirm-after-rejoin and 46 manual power cuts with no
+failure; see [BL702 hardware results](#results-2026-11-08). Every other
+chip shell, swap-move, Ed25519 and multi-key rotation remain
+**host-tested only**.
 
 Anything marked *later phase* is a proposal. It is not an implemented or
 hardware-proven capability.
@@ -30,7 +34,7 @@ hardware-proven capability.
 |---|---|---|
 | `mcuboot-image` | Image format, SHA-256, ECDSA P-256 and optional Ed25519 verification, the install engine (`boot`), the status/trial log, opt-in swap-move, `LoaderInfo` and `LoaderKeys`, and the application-side `SlotWriter` (`firmware-writer`) | Host-tested, including power loss at every flash operation |
 | `bootloaders/core` (`zrs-boot-core`) | The `Platform` trait and the `launch`/`run` sequence, the `BootFlash` slot guard, the RISC-V fixed-entry and Cortex-M vector-table checks, the console `Reporter`, the LED `Indicator`, and the `sim::SimFlash` power-cut simulator | Host-tested (`--features sim`) |
-| `bootloaders/bl702-boot` | BL702 shell: XIP mapping, L1C invalidation, riscv-rt jump, UART lines | Host-tested and release-built. The v1 loader's production path was proven on one XT-ZB1 (0.1.0→0.1.1 OTA, `8aeee49`). The v2 loader (this revision) **has not been run on hardware** |
+| `bootloaders/bl702-boot` | BL702 shell: XIP mapping, L1C invalidation, riscv-rt jump, UART lines | Host-tested and release-built. The v2 loader (overwrite, one P-256 key, 3 trial boots, 16 s watchdog) is **lab-tested on one XT-ZB1**: ZHA OTA 0.2.0→0.2.1, confirm-after-rejoin, 168 soak installs and 46 power cuts with no failure ([results](#results-2026-11-08)). Downgrade rejection, wrong-key refusal and trial expiry are not yet exercised on hardware |
 | `bootloaders/cc2340r5-boot` | CC2340R5 shell: vector-table check, VTOR/MSP jump, fault blinks, SHUTDOWN | Host-tested; thumbv6m build only. No product loader binary exists |
 | `zigbee-runtime` `FirmwareWriter`/`OtaLifecycle` | `confirm_image` hook; `FirmwareWriter::confirm_image` | Host-tested |
 | `apps/sensor-sed` | Confirms the running image on its first APS-acknowledged report, or once joined when reports are not acknowledged | Host-tested |
@@ -116,8 +120,17 @@ pub const fn trial_log_area(layout) -> (u32, u32);   // overwrite-mode log, for 
   - **Default 16 s rationale (BL702).** At the ROM's 32 MHz, one full-slot
     validation (software SHA-256 over at most `0x76000` bytes plus P-256)
     is estimated at 2–3 s and a 64 KiB erase at 1–2 s. 16 s gives at
-    least 5× margin and covers RC32K tolerance. This is **not measured**:
-    the BL702 hardware run times the loader lines.
+    least 5× margin and covers RC32K tolerance.
+    - **Measured on XT-ZB1** (2026-11-08, 238 KB soak image):
+      - secondary validation before an install: 1.78–1.81 s (184
+        boots);
+      - install: 6.40–6.53 s from `installing update` to
+        `update installed` (171 installs), so 8.21–8.33 s from
+        `bl702-boot: v2` to the jump;
+      - the longest gap between printed progress lines: 3.39 s (the
+        post-copy check).
+    - Even without the per-event kicks, the whole install fits the 16 s
+      period about 1.9×, and the longest measured gap fits about 4.7×.
   - **CC2340R5** uses the CKMD watchdog (`WDTCNT`, stall on debug halt).
     The current `cc2340-sensor` does not feed a watchdog, so a product
     that arms it in the loader would reset its application every period.
@@ -515,8 +528,9 @@ loader's worst-case stack (P-256 and Ed25519) is still open.
 
 ## BL702 hardware re-validation plan
 
-**Nothing below has been run.** Each flashing step needs the user's
-approval first.
+**Run on 2026-11-08; see [Results](#results-2026-11-08).** Each
+flashing step needed the user's approval first, and every future run
+does too. The plan below is kept as it was executed.
 
 ### Device and lab facts (checked read-only)
 
@@ -672,10 +686,9 @@ downgrade and dropped, instead of re-installing the soak.
 8. **Recovery** (only if something fails): restore the step 1 readback
    over ISP.
 
-The UART timestamps from step 5 give the real validation and copy times.
-They show whether the 16 s watchdog default has the margin assumed in
-[the watchdog notes](#core-api); before this run the margin is
-not measured.
+The UART timestamps from step 5 gave the real validation and copy times
+and the watchdog margin; see [the watchdog notes](#core-api) and the
+results below.
 
 ### What the user must do by hand
 
@@ -702,6 +715,89 @@ not measured.
   agent reports the count as it goes, and says **stop at once** if it
   sees a stall or failure.
 
+### Results (2026-11-08)
+
+One XT-ZB1 (BL702, MAC `0000b998614cb97c`, ZHA NWK `0xE8E2`), the v2
+loader built from this branch: overwrite, one P-256 production key, 3
+trial boots, 16 s watchdog. **Lab-tested on one board**; this is not a
+production rollout.
+
+| step | result |
+|---|---|
+| ISP #1 | Full-flash readback kept as the recovery image. The N `-full.bin` was programmed and verified, slot 2 was blanked, and the journal was left untouched. First boot: `bl702-boot: v2`, then `app v0.2.0+0`, with no trial lines |
+| Commission | The sensor replaced the router entry at `0xE8E2` with one re-pair, as planned |
+| OTA 0.2.0→0.2.1 through ZHA | `installing update` to `update installed` took 6.10 s, and 7.86 s from `v2` to the jump. Then `trial boot 1`, `app v0.2.1+0`, rejoin and confirm. An RTS reset afterwards booted with **no** `trial boot` line, so the confirm persisted |
+| Soak 0.2.2 through ZHA | Installed by the loader, and then cycled every 16.3 s by itself |
+| Power cuts | Two manual sessions: **46 verified cuts, 0 failures** (accepted by the user; see below) |
+| ISP #2 | Readback compared offline with the soak image. 0.2.3 `-full.bin` programmed and verified. Slot 2 and the journal were read back unchanged |
+| Final boot | `bl702-boot: v2`, then `app v0.2.3+0`; the unarmed soak image in slot 2 was ignored (see below). Same ZHA device and NWK, with **no re-pair**. Reports resumed, and the first `QueryNextImage` carried `current_file_version 0x25000203`, which ZHA's update entity shows as installed |
+
+**Cut tally.** The monitor classifies each cut by the phase the board
+was in when the port vanished:
+
+| phase | cuts |
+|---|---|
+| loader validation (`cut-loader`) | 4 |
+| loader erase/copy (`cut-copy`/`cut-install`) | 13 |
+| application start (`cut-app`) | 2 |
+| app re-staging slot 2 (`cut-staging`) | 27 |
+| **total** | **46** |
+
+- Replaying the timestamps puts 15 cuts inside the loader's install
+  window: 13 during erase/copy and 2 in the post-copy check.
+- Over the whole soak (199 boots), 168 installs completed. Every boot
+  printed the same CRCs: loader region `08eab8f8`, security journal
+  `bf22f1b1`.
+- There were no `update rejected`, `no bootable image`,
+  `installed copy corrupt` or `flash error` lines, no `trial boot 2`, and
+  no watchdog reset.
+- The user counted about 60 cuts. Quick re-cuts, where the board was
+  powered for less than the host needs to re-enumerate the port, merge
+  into one host-visible loss, so only 46 are counted.
+- The ISP #2 readback agrees: the loader is byte-identical to the
+  programmed images, and the journal CRC matches. The primary equals the
+  signed soak image except 9 trial/confirm bytes in its trailer sector
+  (`0x86000`).
+
+**Timing.** These are the figures in
+[the watchdog notes](#core-api). A boot with no request validates the
+primary in 1.55–1.56 s.
+
+**What this run did not exercise on hardware:**
+
+- **Downgrade rejection.** The power was last removed while the soak was
+  re-staging slot 2: the image was complete but the request magic was
+  not yet written. The loader therefore saw no request and ignored slot
+  2, so `update rejected: downgrade` never ran. This run proves only "an
+  unarmed slot 2 is ignored". The downgrade path remains host-tested.
+- Wrong-key refusal, trial expiry (`image unconfirmed`), multi-key
+  rotation, Ed25519, swap-move, and watchdog expiry on hardware (step 7
+  was skipped).
+- Frame-counter continuity on a sniffer. The journal CRC is unchanged
+  and the sensor rejoined without commissioning, but no capture was taken.
+
+**Lessons for the next run:**
+
+- **Opening the CH340 port resets the BL702.** The monitor has to open
+  the port with DTR and RTS deasserted, and every open is a reset that
+  shows up in the log.
+- **zigpy caches the provider index.** After adding a file, reload the
+  ZHA config entry. After an HA restart the index is re-read.
+- **One unexplained stall.** The first soak `update.install` stopped at
+  about 51 % when zigpy got no block request for 30 s. The cause is
+  unknown (HA was busy, and debug logging was off), and a retry
+  completed.
+- **ZHA cannot reach an idle sensor.** `update.install` sends a unicast
+  `image_notify`. The sensor's 10 s slow poll is longer than the parent's
+  indirect hold time (about 7.7 s), so the notify gets no APS ack and the
+  install fails with `FAILURE`.
+  - The workaround was to reset the board and press install within the
+    120 s fast-poll window after a restore.
+  - This is a product poll-policy defect, tracked separately. It is not a
+    loader issue.
+- **Throughput.** OTA ran at about 77–120 B/s (48 B blocks through
+  parent `0x43FD`), so a 238 KB image took about 33 minutes.
+
 ## Open decisions
 
 Resolved in Phase 2 step 2:
@@ -719,11 +815,13 @@ Still open:
    it with a period that covers a full-slot validation.
 2. **Swap-move per product.** Which of CC2340, nRF52 and MG21/MG22 turn
    it on, and with how many trial boots.
-3. **BL702 run approvals:**
-   - the soak image;
-   - replacing the ZHA router with the sensor;
-   - moving the stale 0.1.1 OTA file;
-   - the two ISP sessions.
+3. **XT-ZB1 slow poll versus OTA reachability.** The product poll
+   policy should let ZHA's `image_notify` reach an idle sensor. This is
+   tracked separately from the loader.
+
+The BL702 run approvals (the soak image, the router-to-sensor swap,
+moving the stale OTA file and both ISP sessions) were given and used on
+2026-11-08.
 
 ## Proposed Phase 2 order
 
@@ -732,7 +830,9 @@ Still open:
      swap-move;
    - the loader watchdog, the CC2340 `BootFlash` guard and the lab soak.
 
-   **Next:** the BL702 hardware run (above).
+   **Done (lab, one board):** the BL702 hardware run
+   ([results](#results-2026-11-08)). Still open on BL702 hardware: a
+   downgrade rejection, wrong-key refusal and trial expiry.
 2. **CC2340R5:** a product loader binary (`BootFlash`, overwrite and
    swap-move builds) and a `SlotWriter`-based product OTA path.
    Hardware: SWD install, boot, OTA, power cuts, and a swap-move revert.
