@@ -261,6 +261,16 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   BOOT button then wakes through EXT1. With TOP off the PMU leaves
   `dig_pad_slp_sel` clear and IO_MUX/GPIO lose power, so the isolated pads
   are also latched with the always-on `LP_AON_GPIO_HOLD0` pad hold (below).
+  A TOP power-down also resets the USB Serial/JTAG (the host sees a
+  detach and the start-of-frame latch behind the USB veto is cleared), and
+  ~17 ms wakes are too short for the host to enumerate again. The
+  thermometer therefore takes no PMU sleep during `usb_host_wait_ms` after
+  boot (`SensorWake::with_usb_host_wait`); a host seen in that window keeps
+  the device awake and reflashable for the power cycle, in either mode, and
+  `top_pd` refuses `usb_host_wait_ms = 0` at build time. Images before this
+  gate (e.g. `1b0a72c`, `c53ca91`) can lose that race and then drop off USB
+  even with a host attached; ROM download mode (BOOT) does not help hwlab,
+  since the flash is not attached there (JEDEC `ffffff`).
   `tools/esp32h2-sleep-ram-check.py` checks in CI that the sleep/restore
   path never reaches flash.
 - CPU clock: the ESP-IDF bootloader leaves the H2 CPU on FLASH_PLL

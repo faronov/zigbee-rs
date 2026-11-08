@@ -307,9 +307,11 @@ fn main() -> ! {
     let (device, security, profile) = compose(peripherals.IEEE802154, peripherals.AES);
     let parts = SensorSedParts {
         #[cfg(feature = "quiet")]
-        wake: SensorWake::new(button, sleep),
+        wake: SensorWake::new(button, sleep).with_usb_host_wait(config::USB_HOST_WAIT_MS),
         #[cfg(not(feature = "quiet"))]
-        wake: thermometer_diag::DiagWake::new(SensorWake::new(button, sleep)),
+        wake: thermometer_diag::DiagWake::new(
+            SensorWake::new(button, sleep).with_usb_host_wait(config::USB_HOST_WAIT_MS),
+        ),
         status: NoStatus,
         environment: DieThermometer::new(sensor),
         battery: NoBattery,

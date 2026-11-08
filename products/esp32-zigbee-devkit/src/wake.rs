@@ -111,6 +111,8 @@ mod hardware {
         sleep: Option<LightSleep<'d>>,
         rejections: u8,
         usb_warning: bool,
+        /// No PMU sleep before this instant (see [`Self::with_usb_host_wait`]).
+        usb_decided_at: Instant,
     }
 
     impl<'d> SensorWake<'d> {
@@ -120,7 +122,21 @@ mod hardware {
                 sleep,
                 rejections: 0,
                 usb_warning: false,
+                usb_decided_at: Instant::from_ticks(0),
             }
+        }
+
+        /// Keep PMU sleep off for the first `ms` after boot, until a USB host
+        /// had time to start sending start-of-frame tokens. Without it the
+        /// SOF veto below can lose the race against the first sleep: a TOP
+        /// power-down resets the USB-Serial-JTAG (the host sees a detach and
+        /// the SOF latch is cleared), and ~17 ms wakes never let the host
+        /// enumerate again, so a host-attached boot drops off USB for good.
+        /// Use the image's `usb_host_wait_ms`, so the veto is settled before
+        /// the pad shutdown decision is.
+        pub fn with_usb_host_wait(mut self, ms: u32) -> Self {
+            self.usb_decided_at = Instant::from_millis(u64::from(ms));
+            self
         }
 
         async fn active_wait(&mut self, timeout_ms: u32) -> WakeReason {
@@ -267,8 +283,9 @@ mod hardware {
                 SleepDepth::Idle if cfg!(feature = "light-sleep") => {}
                 depth => return Err(WakeError::UnsupportedDepth(depth)),
             }
-            if usb_seen() {
-                if !self.usb_warning {
+            let undecided = Instant::now() < self.usb_decided_at;
+            if undecided || usb_seen() {
+                if !undecided && !self.usb_warning {
                     log::warn!(
                         "[ESP sleep] native USB session vetoes PMU sleep; cold boot from power-only supply to qualify sleep"
                     );

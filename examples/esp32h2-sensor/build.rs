@@ -317,6 +317,12 @@ mod thermometer {
                         && self.sleep_xtal_off),
                 "sleep_mode = \"top_pd\" needs the `top-pd` and `light-sleep` features and sleep_xtal_off = true"
             );
+            // TOP power-down resets the USB-Serial-JTAG; only the boot-time
+            // host window keeps a host-attached device awake and reflashable.
+            assert!(
+                !self.sleep_top_pd || self.usb_host_wait_ms > 0,
+                "sleep_mode = \"top_pd\" needs usb_host_wait_ms > 0 (USB host detection before the first sleep)"
+            );
             // The results exist only as log lines, and only the PMU backend
             // can be exercised.
             assert!(

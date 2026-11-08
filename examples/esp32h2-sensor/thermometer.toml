@@ -164,6 +164,9 @@ anomaly_max_writes_per_boot = 8
 # With no USB host seen within this window after boot, the USB Serial/JTAG
 # pad (and its D+ pull-up) is switched off until the next reset. 0 keeps USB
 # powered. Recovery: reset with USB attached (or hold BOOT while resetting).
+# No PMU sleep happens inside the window; a host seen in it keeps the device
+# awake (and reflashable) for the whole power cycle, in either sleep mode.
+# top_pd requires a non-zero window.
 usb_host_wait_ms = 1000
 # GPIO pads isolated once at boot, before the first sleep: output, input
 # buffer and pulls off, muxed to GPIO, and switched to an isolated sleep
