@@ -41,7 +41,7 @@
 //! header         = 0x200                # imgtool --header-size
 //! vector-align   = 0x200                # VTOR alignment of the application (default 0x100)
 //! tlv-reserve    = 0x300                # room for the TLVs after the application
-//! app-max        = 187104               # optional cap on the linked application
+//! app-max        = 200448               # optional cap on the linked application
 //! loader-version = 1
 //! trial-boots    = 3                    # default; <PREFIX>_BOOT_TRIAL_BOOTS overrides
 //! watchdog-ms    = 0                    # default; <PREFIX>_BOOT_WATCHDOG_MS overrides

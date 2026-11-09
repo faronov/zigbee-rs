@@ -383,7 +383,7 @@ fn committed_layouts_are_valid() {
             EFR32S2,
             473_856,
         ),
-        ("products/pb03f-kit/boot/pb03f.layout", CM0, 187_104),
+        ("products/pb03f-kit/boot/pb03f.layout", CM0, 200_448),
     ];
     for (path, limits, app_max_len) in layouts {
         let path = root.join(path);
@@ -402,6 +402,34 @@ fn committed_layouts_are_valid() {
         assert!(!keys.is_empty());
         assert_eq!(layout.app_max_len(), app_max_len, "{}", path.display());
     }
+}
+
+/// The PB-03F loader runs applications at the direct ROM-boot address and
+/// caps them at the direct map's XIP slot: the layout and
+/// `products/pb03f-kit/link/memory.x` (`FLASH`) must agree.
+#[test]
+fn pb03f_layout_matches_direct_map() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../products/pb03f-kit");
+    let path = root.join("boot/pb03f.layout");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let layout = BootLayout::parse(&text, path.parent().unwrap()).unwrap();
+    let script = std::fs::read_to_string(root.join("link/memory.x")).unwrap();
+    let flash = script
+        .lines()
+        .find(|line| line.trim_start().starts_with("FLASH"))
+        .expect("memory.x has a FLASH region");
+    let field = |name: &str| {
+        let value = flash.split(name).nth(1).unwrap();
+        let value = value.trim_start_matches([' ', '=']);
+        let end = value.find([',', ' ']).unwrap_or(value.len());
+        parse_number(&value[..end]).unwrap()
+    };
+    assert_eq!(
+        layout.xip_base + layout.primary.start + layout.header,
+        field("ORIGIN")
+    );
+    assert_eq!(layout.app_max, Some(field("LENGTH")));
+    assert_eq!(layout.app_max_len(), field("LENGTH"));
 }
 
 #[test]

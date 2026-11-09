@@ -31,8 +31,11 @@ The BL702 v2 loader passed a hardware run on one XT-ZB1 on 2026-11-08:
 OTA through ZHA, confirm-after-rejoin and 46 manual power cuts with no
 failure; see [BL702 hardware results](#results-2026-11-08). Every other
 chip shell, swap-move, Ed25519 and multi-key rotation remain
-**host-tested only**. Every Phase 3 loader is **built only**: none has run
-on hardware.
+**host-tested only**. Of the Phase 3 loaders, only the EFR32MG22 loader has
+run on hardware. It is **lab-tested on one BRD4183A** (2026-11-09): boot,
+two upgrades, trial expiry, downgrade and wrong-key refusal, and journal
+retention in ZHA; see [MG22 hardware results](#mg22-results-2026-11-09).
+The other Phase 3 loaders are **built only**.
 
 Anything marked *later phase* is a proposal. It is not an implemented or
 hardware-proven capability.
@@ -50,8 +53,8 @@ hardware-proven capability.
 | `bootloaders/layout` (`zrs-boot-layout`) | Build-time parser and checker of product `boot/*.layout` and `boot/app-verify.conf` files; emits `BootConfig`, keys, loader and application `MEMORY` regions | Host-tested |
 | `bootloaders/cortex-m-boot` (`zrs-boot-cortex-m`) | Cortex-M shell: entry check through the flash driver, VTOR/MSP hand-over, `Hooks` for status, watchdog and failure | Host-tested; built in the three loaders below |
 | `products/nrf52840-sensor/bootloader` | nRF52840 loader, one build per board layout | Release-built and linted; **not run on hardware** |
-| `bootloaders/efr32s2-boot` | EFR32MG22/MG21 loader; on MG21 chained above the Gecko Bootloader | Release-built and linted; **not run on hardware** |
-| `efr32s2-hal::watchdog` | EFR32 Series 2 WDOG0 driver (period rounding, arm/kick/disarm) | Host-tested (period maths); **not run on hardware** |
+| `bootloaders/efr32s2-boot` | EFR32MG22/MG21 loader; on MG21 chained above the Gecko Bootloader | Release-built and linted. The MG22 devkit build is **lab-tested on one BRD4183A** ([results](#mg22-results-2026-11-09)). MG21, ZBT-1 and `gecko-recovery` are **not run on hardware** |
+| `efr32s2-hal::watchdog` | EFR32 Series 2 WDOG0 driver (period rounding, arm/kick/disarm) | Host-tested (period maths). On one MG22 it was seen armed while the loader ran and disarmed in the application. Its period and an actual expiry reset are **not measured** |
 | `bootloaders/phy62x2-boot` | PHY62x2 loader started by the boot ROM | Release-built, linted, ROM-boot image generated; **not run on hardware** |
 | `mcuboot-image::envelope` | Application-side verification of a signed MCUboot envelope (`EnvelopeWriter`) for chips whose ROM/SDK boot stays | Host-tested with imgtool vectors; ESP32 product tests |
 
@@ -183,7 +186,10 @@ pub const fn trial_log_area(layout) -> (u32, u32);   // overwrite-mode log, for 
     (8 s → `PERSEL` 11: ≥14.9 s, nominally 16.4 s). The 1.1 kHz bound is
     an assumption that is not yet measured. WDOG0 is disabled before the
     jump, so the application does not have to feed it, and before the
-    halt or the `gecko-recovery` reset.
+    halt or the `gecko-recovery` reset. On one MG22, `WDOG0_EN` read 1
+    while the loader ran and 0 in the application. A whole install plus
+    application start took at most about 5 s, a third of the minimum
+    period ([results](#mg22-results-2026-11-09)).
 - **Crypto accelerator** (later phase, optional). This would be an
   `ImageCrypto` trait for streaming SHA-256 and signature verification,
   with the software path as the default and as the host-test reference.
@@ -569,10 +575,11 @@ from the EFR32 `gecko-recovery` option below.
   image.
 - **Address.** Applications run at `0x11010100`, the same address as a
   direct ROM-boot image.
-- **Application cap.** The application is capped at 187,104 B
-  (`app-max = 0x2DAE0`), the XIP application slot of the direct
-  ROM-boot map (`products/phy62x2-evk/link/memory.x`). Each slot is
-  0x30000: the cap plus the 0x100 header, the 0x300 TLV reserve and the
+- **Application cap.** The application is capped at 200,448 B
+  (`app-max = 0x30F00`), the XIP application slot of the PB-03F direct
+  ROM-boot map (`products/pb03f-kit/link/memory.x`); a layout test checks
+  that the cap and the run address agree with that map. Each slot is
+  0x33000: the cap plus the 0x100 header, the 0x300 TLV reserve and the
   trailer sector, in whole sectors.
 - **Cold boot only.** PHY system sleep wakes through the ROM, which would
   rerun the loader and clobber retained RAM. Sleeping products need a
@@ -591,7 +598,7 @@ from the EFR32 `gecko-recovery` option below.
 | EFR32MG22 devkit (`efr32mg22-sensor/boot/devkit.layout`) | none (router tables reclaimed) | `0x0..0x4000` | `0x4000..0x40000` | `0x40000..0x7C000` | `0x7C000..0x80000` | 236,288 B |
 | EFR32MG21 devkit (`efr32mg21-sensor/boot/devkit.layout`), F1024 only | Gecko `0x0..0x4000`, router tables `0x74000..0x7C000` | `0x4000..0x8000` | `0x80000..0xC0000` | `0xC0000..0x100000` | `0x7C000..0x80000` | 252,672 B |
 | ZBT-1 (`ha-connect-zbt1/boot/zbt1.layout`) | Gecko `0x0..0x4000`, router tables `0xF4000..0xFC000` | `0x4000..0x8000` | `0x8000..0x7E000` | `0x7E000..0xF4000` | `0xFC000..0x100000` | 473,856 B |
-| PB-03F (`pb03f-kit/boot/pb03f.layout`) | ROM/factory `0x0..0x2000`, ROM-boot table `0x2000..0x3000`, factory data `0x3000..0x5000`, load data `0x5000..0x6000`, router tables `0x7A000..0x7E000` | `0x6000..0xA000` | `0x10000..0x40000` | `0x40000..0x70000` | `0x7E000..0x80000` | 187,104 B (`app-max`) |
+| PB-03F (`pb03f-kit/boot/pb03f.layout`) | ROM/factory `0x0..0x2000`, ROM-boot table `0x2000..0x3000`, factory data `0x3000..0x5000`, load data `0x5000..0x6000`, router tables `0x7A000..0x7E000` | `0x6000..0xA000` | `0x10000..0x43000` | `0x43000..0x76000` | `0x7E000..0x80000` | 200,448 B (`app-max`) |
 
 The application cap is the slot minus its last sector (the trailer), the
 0x200-byte header (0x100 on PHY62x2) and the 0x300-byte TLV reserve, or
@@ -649,9 +656,9 @@ the product has no OTA writer yet, so nothing uses it.
 - **No confirm in the `zrs-boot` nRF and EFR32 applications.** They use
   `NoOta`, so nothing confirms a trial install; it reports `unconfirmed`
   and keeps booting (the approved overwrite behaviour).
-- **PHY62x2.** `phy6222-sensor` (138,208 B) fits the 187,104 B cap;
-  `pb03f-zigbee` (195,168 B) does not (its direct map allows 200,448 B).
-  There is no PHY `zrs-boot` application build yet. System sleep
+- **PHY62x2.** `pb03f-zigbee` (195,168 B) fits the 200,448 B PB-03F cap.
+  The PHY62x2 EVK (`phy6222-sensor`, 187,104 B direct slot) has no loader
+  layout. There is no PHY `zrs-boot` application build yet. System sleep
   warm-boots through the ROM (see above).
 - **Watchdog bounds.** The EFR32 ULFRCO worst case (1.1 kHz) and the nRF
   UF2-bootloader interaction are unverified.
@@ -1118,6 +1125,45 @@ primary in 1.55–1.56 s.
 - **Throughput.** OTA ran at about 77–120 B/s (48 B blocks through
   parent `0x43FD`), so a 238 KB image took about 33 minutes.
 
+### MG22 results (2026-11-09)
+
+One EFR32MG22C224F512IM40 on a BRD4183A radio board in a WSTK (J-Link
+440206286, SWD through hwlab). The loader is the `efr32mg22-devkit` build
+from this branch (9,536 B): overwrite, one P-256 key, 3 trial boots, 8 s
+watchdog request (`PERSEL` 11). The application is
+`examples/efr32mg22-sensor` with `sed,zrs-boot` (234,164 B). Every test
+image was signed with imgtool 2.4.0 and the options `--header-size 0x200
+--pad-header --align 4 --slot-size 0x3C000`. Upgrade images also had
+`--pad`, which writes the request magic. **Lab-tested on one board**;
+over-the-air (ZHA OTA) delivery into the secondary slot is not yet tested.
+
+| step | result |
+|---|---|
+| Preparation | DEVINFO read: EFR32MG22C224, 512 KiB flash and 32 KiB RAM. Full 512 KiB backup (two identical reads, SHA-256 `6d7b5b3b…`) and the user-data page saved. The main flash was erased and the loader written at `0x0` |
+| First boot | Unpadded 0.1.0 written at `0x4000`. Loader → application: banner, then a scan of PAN `0xDFE9`. Fresh persistence |
+| ZHA join | Joined the home network as `0x8C8F` under the existing device entry (`Zigbee-RS EFR32MG22-Sensor`). Interview and reporting set up (3 of 3 reports configured) |
+| Upgrade 0.1.0→0.1.1 | Padded image written to the secondary over SWD. After the reset the primary header read 0.1.1 and the trial log `Done, Attempt`. The secondary header and magic were erased. The application printed `valid security journal preserved`, then resumed on the network with no re-pair |
+| Trial expiry | Three more resets: the log stopped at `Done` + 3 `Attempt` (`trial_boots`), and each later boot kept starting the image with its journal (overwrite mode: the image stays and is reported unconfirmed) |
+| Downgrade 0.0.9 | Refused. The primary stayed 0.1.1, the log was unchanged, and the request (secondary header and magic) was dropped |
+| Wrong key (0.1.2 signed with a throw-away P-256 key) | Refused in the same way |
+| Upgrade 0.1.1→0.1.3 | Installed; the log restarted at `Done, Attempt`; the device rejoined |
+| Watchdog | `WDOG0_EN` = 1 while the loader ran (sampled twice), and 0 in the application after both installs and after plain resets. The application banner came 4.3–5.0 s after the programming call returned, including J-Link Commander exit, verification, install and 0.4 s of application start. The minimum period is 14.9 s |
+| Retention in HA | The sensor kept reporting in HA after every reflash, without a re-pair |
+
+Notes:
+
+- **The SWD attach resets the board in EM2.** The application leaves
+  `EMU_CTRL.EM2DBGEN` clear. A J-Link attach while the SED sleeps in EM2
+  therefore resets the chip, which counts as one more boot (one more trial
+  attempt) during tests. Two of the `WDOG0_EN = 1` samples come from such
+  attaches.
+- **Not exercised on this board:** delivery over ZHA OTA, power cuts
+  during an install, a watchdog expiry reset (needs a hung loader), the
+  ULFRCO period, and a confirmed image. `zrs-boot` builds use `NoOta` and
+  never confirm. MG21, ZBT-1 and `gecko-recovery` were also not exercised.
+- **Restoring the board:** the original image is the backup `6d7b5b3b…`
+  in the hwlab artifacts, taken before the erase.
+
 ## Open decisions
 
 Resolved in Phase 2 step 2:
@@ -1133,7 +1179,7 @@ Resolved in Phase 3:
   roles only under the loader).
 - nRF52840 and EFR32 Series 2 loaders arm a watchdog (8 s in the
   committed layouts); on nRF the `zrs-boot` application feeds it.
-- The PHY62x2 application cap is the 187,104 B XIP slot.
+- The PB-03F application cap is its direct map's 200,448 B XIP slot.
 - ESP32 version mapping: file version `0xMMmmrrrr` is `MM.mm.rrrr`.
 
 Still open:
@@ -1141,8 +1187,6 @@ Still open:
 0. **Phase 3:**
    - **PHY62x2 sleep.** The warm-boot path for sleeping PHY62x2
      products.
-   - **`pb03f-zigbee`.** Raise PB-03F `app-max` to its direct map's
-     200,448 B, or shrink the image.
 1. **CC2340 watchdog default.** The CC2340 WDT cannot be stopped once
    armed, and `cc2340-sensor` does not feed it. Product configs therefore
    keep `watchdog: None` until the app feeds the watchdog; then they arm
@@ -1181,8 +1225,10 @@ moving the stale OTA file and both ISP sessions) were given and used on
 
 Phase 3 status:
 
-- **Built and host-tested only:** steps 3 to 6, all awaiting
-  hardware runs.
+- **Lab-tested on one board:** the EFR32MG22 part of step 4
+  ([results](#mg22-results-2026-11-09)).
+- **Built and host-tested only:** steps 3, 5 and 6, and the MG21 part of
+  step 4, all awaiting hardware runs.
 - **Skipped:** step 2 (SDK blocker) and step 7.
 
 Each hardware run needs the user's approval of the board, the probe, the
