@@ -4,6 +4,8 @@
 # zigbee-rs loader. Router tables and the security journal keep the addresses
 # of link/memory.x. Recovery without SWD: the Gecko UART bootloader (see the
 # loader's `gecko-recovery` feature), which rewrites 0x4000+.
+# Watchdog: WDOG0 (ULFRCO) for the boot decision only, stopped before the
+# hand-over; 8 s requested -> PERSEL 11 (>= 14.9 s, nominally 16.4 s).
 name           = ha-connect-zbt1
 flash          = 0x0..0x100000
 sector         = 0x2000
@@ -18,7 +20,7 @@ header         = 0x200
 vector-align   = 0x200
 loader-version = 1
 trial-boots    = 3
-watchdog-ms    = 0
+watchdog-ms    = 8000
 mode           = overwrite
 env-prefix     = ZBT1
 key-file       = ../../../bootloaders/keys/own-ec-p256.xy.hex

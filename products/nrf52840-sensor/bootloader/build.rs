@@ -22,8 +22,9 @@ fn main() {
     let build = Build::load(
         format!("../boot/{deployment}.layout"),
         ChipLimits {
-            // No loader watchdog: the nRF52 WDT cannot be stopped again.
-            watchdog_max_ms: 0,
+            // Largest period whose CRV (32,768 Hz) fits 32 bits. The WDT
+            // cannot be stopped again: the application inherits it.
+            watchdog_max_ms: 131_071_999,
             vtor: true,
         },
     );

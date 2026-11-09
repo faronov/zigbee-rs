@@ -10,8 +10,11 @@
 # image's `[SP, Reset]` pair is followed by its 0x400-byte ROM jump table,
 # which the loader copies to 0x1fff0000 before the hand-over.
 #
-# The XIP application is capped at 130,816 B (0x20000 minus the header).
-# 0xA000..0x10000 and 0x54000..0x7A000 are unused.
+# The XIP application is capped at 187,104 B (0x2DAE0), the PHY62x2 XIP
+# application slot of products/phy62x2-evk/link/memory.x. Each slot holds
+# that cap plus the 0x100 header, the 0x300 TLV reserve and the 4 KiB
+# trailer sector, rounded up to whole sectors: 0x30000.
+# 0xA000..0x10000 and 0x70000..0x7A000 are unused.
 name           = pb03f-kit
 flash          = 0x0..0x80000
 sector         = 0x1000
@@ -20,14 +23,14 @@ reserved       = 0x2000..0x3000 rom-boot-table
 reserved       = 0x3000..0x5000 factory-data
 reserved       = 0x5000..0x6000 loader-rom-load-data
 loader         = 0x6000..0xA000
-primary        = 0x10000..0x32000
-secondary      = 0x32000..0x54000
+primary        = 0x10000..0x40000
+secondary      = 0x40000..0x70000
 reserved       = 0x7A000..0x7E000 router-tables
 journal        = 0x7E000..0x80000
 ram            = 0x1FFF1838..0x20000000
 xip-base       = 0x11000000
 header         = 0x100
-app-max        = 130816
+app-max        = 187104
 loader-version = 1
 trial-boots    = 3
 watchdog-ms    = 0

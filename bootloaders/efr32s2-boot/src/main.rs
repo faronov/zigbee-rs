@@ -10,13 +10,22 @@
 //! oscillator or DCDC changes. No status output. With nothing bootable the
 //! loader halts in WFI (recover over SWD) or, with `gecko-recovery` on a
 //! chained layout, re-enters the resident Gecko Bootloader.
+//!
+//! Watchdog: with the layout's `watchdog-ms` > 0, WDOG0 (ULFRCO, reset
+//! mode, paused in debug halt) is armed before the boot decision, kicked at
+//! every engine step and stopped again before the hand-over, the halt and
+//! the Gecko re-entry, so the application starts with WDOG0 disabled and
+//! unlocked (its own policy). Left on are the xG22 WDOG0 bus clock and
+//! `CMU_WDOG0CLKCTRL = ULFRCO`. A watchdog the loader cannot arm (locked by
+//! earlier code) does not stop the boot: the decision runs without it.
 
 #![no_std]
 #![no_main]
 
 use efr32s2_hal::peripherals::Peripherals;
+use efr32s2_hal::watchdog::{Period, Watchdog};
 use panic_halt as _;
-use zrs_boot_cortex_m::{Config, Hooks};
+use zrs_boot_cortex_m::{Config, Entry, Hooks};
 
 #[allow(dead_code)]
 mod layout {
@@ -36,15 +45,40 @@ static CONFIG: Config = Config {
     vtor: true,
 };
 
-const _: () = assert!(layout::BOOT_WATCHDOG_MS == 0);
+/// The layout's watchdog period, `None` when `watchdog-ms` is 0.
+const WATCHDOG: Option<Period> = Period::from_ms(layout::BOOT_WATCHDOG_MS);
+const _: () = assert!(layout::BOOT_WATCHDOG_MS == 0 || WATCHDOG.is_some());
 const _: () =
     assert!((layout::SECTOR_SIZE as usize).is_multiple_of(efr32s2_hal::flash::FLASH_PAGE_SIZE));
 const _: () = assert!(layout::XIP_BASE == 0);
 
-struct Fail;
+struct Shell {
+    watchdog: Option<Watchdog>,
+}
 
-impl Hooks for Fail {
+impl Shell {
+    fn stop_watchdog(&mut self) {
+        if let Some(watchdog) = self.watchdog.take() {
+            // A synchronizer timeout leaves it running: the application
+            // then resets within one period unless it owns WDOG0 itself.
+            let _ = watchdog.disarm();
+        }
+    }
+}
+
+impl Hooks for Shell {
+    fn kick_watchdog(&mut self) {
+        if let Some(watchdog) = self.watchdog.as_mut() {
+            watchdog.kick();
+        }
+    }
+
+    fn before_start(&mut self, _entry: &Entry) {
+        self.stop_watchdog();
+    }
+
     fn fail(&mut self) -> ! {
+        self.stop_watchdog();
         #[cfg(feature = "gecko-recovery")]
         gecko_bootloader();
         #[cfg(not(feature = "gecko-recovery"))]
@@ -57,7 +91,8 @@ fn main() -> ! {
     let Some(peripherals) = Peripherals::take() else {
         halt()
     };
-    zrs_boot_cortex_m::run(peripherals.flash, &CONFIG, &mut Fail)
+    let watchdog = WATCHDOG.and_then(|period| Watchdog::arm(peripherals.wdog, period).ok());
+    zrs_boot_cortex_m::run(peripherals.flash, &CONFIG, &mut Shell { watchdog })
 }
 
 #[cfg_attr(feature = "gecko-recovery", allow(dead_code))]

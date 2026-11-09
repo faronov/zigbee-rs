@@ -1913,7 +1913,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/efr32mg21-sensor
-          key: thumbv8m-efr32mg21-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg21-sensor/Cargo.lock', 'products/efr32mg21-sensor/link/**', 'efr32s2-hal/link/**') }}
+          key: thumbv8m-efr32mg21-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg21-sensor/Cargo.lock', 'products/efr32mg21-sensor/link/**', 'products/efr32mg21-sensor/boot/**', 'efr32s2-hal/link/**') }}
       # One bin per role; role features are mutually exclusive, so each role
       # is its own build and dependency feature unification never mixes them.
       - name: Build EFR32MG21 sensor, End Device and Router (release)
@@ -1922,6 +1922,17 @@ jobs:
           cargo build --release --locked
           cargo build --release --locked --no-default-features --features ed
           cargo build --release --locked --no-default-features --features router
+      # The leaf roles linked into the primary slot of the zigbee-rs loader
+      # (products/efr32mg21-sensor/boot/devkit.layout, feature zrs-boot);
+      # build.rs checks the layout against link/memory.x. The router image
+      # does not fit the 252,672 B slot.
+      - name: Build EFR32MG21 loader-linked sensor and End Device
+        working-directory: examples/efr32mg21-sensor
+        run: |
+          for role in sed ed; do
+            cargo build --release --locked --no-default-features \
+              --features "$role,zrs-boot" --target-dir target/zrs-boot
+          done
       - name: Clippy EFR32MG21 role compositions
         working-directory: examples/efr32mg21-sensor
         run: |
@@ -2034,12 +2045,34 @@ jobs:
           workspaces: |
             examples/efr32mg22-sensor
             tools/efr32s2-lab
-          key: thumbv8m-efr32mg22-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg22-sensor/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/efr32mg22-sensor/link/**', 'efr32s2-hal/link/**') }}
+          key: thumbv8m-efr32mg22-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg22-sensor/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/efr32mg22-sensor/link/**', 'products/efr32mg22-sensor/boot/**', 'efr32s2-hal/link/**') }}
       - name: Build EFR32MG22 sensor and End Device (release)
         working-directory: examples/efr32mg22-sensor
         run: |
           cargo build --release --locked
           cargo build --release --locked --no-default-features --features ed
+      # The leaf roles linked into the primary slot of the zigbee-rs loader
+      # (products/efr32mg22-sensor/boot/devkit.layout, feature zrs-boot).
+      # That layout reclaims the router tables, so router + zrs-boot must be
+      # refused by build.rs.
+      - name: Build EFR32MG22 loader-linked sensor and End Device
+        working-directory: examples/efr32mg22-sensor
+        run: |
+          for role in sed ed; do
+            cargo build --release --locked --no-default-features \
+              --features "$role,zrs-boot" --target-dir target/zrs-boot
+          done
+          if cargo build --release --locked --no-default-features \
+            --features router,zrs-boot --target-dir target/zrs-boot \
+            2> "$RUNNER_TEMP/mg22-router-zrs-boot.log"; then
+            echo "EFR32MG22 router built against the loader layout" >&2
+            exit 1
+          fi
+          grep -qF 'feature `router` cannot be combined with `zrs-boot`' \
+            "$RUNNER_TEMP/mg22-router-zrs-boot.log" || {
+            cat "$RUNNER_TEMP/mg22-router-zrs-boot.log" >&2
+            exit 1
+          }
       # The Router composition compiles, but its static RAM leaves less than
       # the 14 KiB stack floor in 32 KiB SRAM. The product linker script must
       # reject it with that assertion rather than link an image that would

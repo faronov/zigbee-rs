@@ -20,7 +20,9 @@ This page is both the design and its current status:
   the BL702 lab soak.
 - **Phase 3** ports the loader to more chips, with layouts read from
   product files: nRF52840 (bare DK and three UF2 boards), EFR32 Series 2
-  (MG22, MG21, ZBT-1 chained above Gecko) and PHY62x2 (PB-03F). ESP32
+  (MG22, MG21, ZBT-1 chained above Gecko) and PHY62x2 (PB-03F). The
+  nRF52840 and EFR32 loaders arm a watchdog, and the nRF52840 and
+  EFR32MG21/MG22 applications have a `zrs-boot` link variant. ESP32
   gets an application-side signature and version check; its ROM and IDF
   boot stay. Telink has the configuration only. See
   [Phase 3](#phase-3-more-chips).
@@ -49,6 +51,7 @@ hardware-proven capability.
 | `bootloaders/cortex-m-boot` (`zrs-boot-cortex-m`) | Cortex-M shell: entry check through the flash driver, VTOR/MSP hand-over, `Hooks` for status, watchdog and failure | Host-tested; built in the three loaders below |
 | `products/nrf52840-sensor/bootloader` | nRF52840 loader, one build per board layout | Release-built and linted; **not run on hardware** |
 | `bootloaders/efr32s2-boot` | EFR32MG22/MG21 loader; on MG21 chained above the Gecko Bootloader | Release-built and linted; **not run on hardware** |
+| `efr32s2-hal::watchdog` | EFR32 Series 2 WDOG0 driver (period rounding, arm/kick/disarm) | Host-tested (period maths); **not run on hardware** |
 | `bootloaders/phy62x2-boot` | PHY62x2 loader started by the boot ROM | Release-built, linted, ROM-boot image generated; **not run on hardware** |
 | `mcuboot-image::envelope` | Application-side verification of a signed MCUboot envelope (`EnvelopeWriter`) for chips whose ROM/SDK boot stays | Host-tested with imgtool vectors; ESP32 product tests |
 
@@ -124,6 +127,9 @@ pub const fn trial_log_area(layout) -> (u32, u32);   // overwrite-mode log, for 
   |---|---|---|---|---|
   | BL702 | `BL702_BOOT_WATCHDOG_MS` (layout build script) | 16,000 ms | 0 (off) or 1..=63,999 | disarmed before the jump and before the `halted` loop |
   | CC2340R5 | `Config::watchdog` (`watchdog_ms()`) | product choice; keep `None` until the app feeds it | 1..=131,071,000 ms | **cannot be stopped**; kicked once before the jump, so the app gets a full period |
+  | nRF52840 | `watchdog-ms` in `boot/*.layout` (`<PREFIX>_BOOT_WATCHDOG_MS`) | 8,000 ms | 0 (off) or 1..=131,071,999 | **cannot be stopped**; reloaded before the jump; the `zrs-boot` app adopts it (`NrfWatchdogSupervisor`) |
+  | EFR32 Series 2 | `watchdog-ms` in `boot/*.layout` (`<PREFIX>_BOOT_WATCHDOG_MS`) | 8,000 ms | 0 (off) or 1..=238,313 | stopped before the jump and before the halt; the app needs nothing |
+  | PHY62x2 | none | 0 | 0 only | no loader watchdog |
 
   - **BL702** uses the TIMER block's watchdog on the 32 kHz clock with
     divider 32 (1,024 ticks/s, 16-bit match). An out-of-range value fails
@@ -150,6 +156,34 @@ pub const fn trial_log_area(layout) -> (u32, u32);   // overwrite-mode log, for 
     Products keep `watchdog: None` until the application feeds it.
   - If the BL702 32 kHz clock does not run, the watchdog never fires
     (fails open). Whether WSR.WTS survives a watchdog reset is unverified.
+  - **nRF52840** uses the WDT on the 32.768 kHz LFCLK
+    (CRV = ⌈ms·32768/1000⌉, reload register `RR[0]` only), with
+    SLEEP and HALT set to **pause**. Consequences:
+    - Once started it runs until a pin, power-on, brown-out or watchdog
+      reset; a soft reset (OTA, `sys_reset`) keeps it running. A loader
+      that finds it already running keeps its configuration and only
+      reloads it.
+    - The `zrs-boot` application must feed it. `NrfWatchdogSupervisor`
+      adopts it right after `embassy_nrf::init`: it writes every reload
+      register on every heartbeat (so it also feeds a WDT started with
+      another register set), and limits the sleep length to half
+      the period only if the WDT counts in sleep. With the loader's
+      pause-in-sleep setting a sleepy device is never woken by it, but a
+      hang inside `WFE` is not caught either.
+    - With nothing bootable the loader halts in `WFI`; the paused WDT
+      never fires, so it does not reset-loop.
+    - The direct-map (non-`zrs-boot`) images never see a running WDT.
+    - **Unverified:** a soft reset into the Adafruit UF2 bootloader with
+      the WDT running (UF2 boards). If UF2 does not feed it, DFU mode
+      resets after one period; recovery then is a double-tap reset, which
+      is a pin reset and stops the WDT.
+  - **EFR32 Series 2** uses WDOG0 (`efr32s2-hal::watchdog`) on the
+    ULFRCO. The period rounds up to the next `PERSEL` step that is at
+    least the requested time at an assumed worst-case ULFRCO of 1.1 kHz
+    (8 s → `PERSEL` 11: ≥14.9 s, nominally 16.4 s). The 1.1 kHz bound is
+    an assumption that is not yet measured. WDOG0 is disabled before the
+    jump, so the application does not have to feed it, and before the
+    halt or the `gecko-recovery` reset.
 - **Crypto accelerator** (later phase, optional). This would be an
   `ImageCrypto` trait for streaming SHA-256 and signature verification,
   with the software path as the default and as the host-test reference.
@@ -468,13 +502,9 @@ environment.
    jumps.
 
 Each chip loader only composes its flash driver, its generated `Config` and
-its `Hooks`. None of them configures clocks, GPIO or the radio. None arms a
-watchdog yet:
-
-- the nRF52 WDT cannot be stopped once started, and the applications do
-  not feed it;
-- `efr32s2-hal` has no WDOG driver;
-- PHY62x2 has no watchdog driver in the loader.
+its `Hooks`. None of them configures clocks, GPIO or the radio. The nRF52840
+and EFR32 Series 2 loaders arm their watchdog for the boot decision (see
+[the watchdog notes](#core-api)); PHY62x2 has no loader watchdog.
 
 With nothing bootable, the loaders halt in `WFI` (recovery over SWD), apart
 from the EFR32 `gecko-recovery` option below.
@@ -492,7 +522,9 @@ from the EFR32 `gecko-recovery` option below.
   feature `zrs-boot`. It links into the selected layout's primary slot
   after the 0x200-byte header, and its build checks that the security
   journal stays where the direct map has it. The direct map remains the
-  default and is unchanged.
+  default and is unchanged. Under `zrs-boot` the application adopts the
+  loader's WDT (`NrfWatchdogSupervisor`); the default build keeps
+  `NrfSupervisor`.
 
 **EFR32 Series 2** (`bootloaders/efr32s2-boot`, features
 `efr32mg22-devkit`, `efr32mg21-devkit`, `ha-connect-zbt1`):
@@ -510,6 +542,20 @@ from the EFR32 `gecko-recovery` option below.
 - **Gecko secure boot.** If a device's Gecko Bootloader enforces it, Gecko
   would refuse to start the unsigned loader. This must be read from the
   device before any install.
+- **Application link variant.** `examples/efr32mg21-sensor` and
+  `examples/efr32mg22-sensor` have a feature `zrs-boot`. `build.rs` loads
+  `products/<product>/boot/devkit.layout`, links the image into the
+  primary slot after the 0x200-byte header, checks that the layout's
+  journal is the direct map's `PERSISTENCE`, and keeps the direct map's
+  stack and RAM `ASSERT`s. The default build still uses the product
+  `link/memory.x` unchanged. Roles:
+  - `sed` and `ed` build for both chips (CI);
+  - MG22 `router` is refused by `build.rs`, because the layout hands the
+    router tables to the slots (the router does not fit MG22's 32 KiB SRAM
+    in any case);
+  - MG21 `router` (355,680 B) does not fit the 252,672 B cap; the link
+    fails.
+  ZBT-1 (`examples/ha-connect-zbt1`) has no `zrs-boot` variant yet.
 
 **PHY62x2** (`bootloaders/phy62x2-boot`, feature `pb03f-kit`):
 
@@ -523,7 +569,11 @@ from the EFR32 `gecko-recovery` option below.
   image.
 - **Address.** Applications run at `0x11010100`, the same address as a
   direct ROM-boot image.
-- **Application cap.** The application is capped at 130,816 B (`app-max`).
+- **Application cap.** The application is capped at 187,104 B
+  (`app-max = 0x2DAE0`), the XIP application slot of the direct
+  ROM-boot map (`products/phy62x2-evk/link/memory.x`). Each slot is
+  0x30000: the cap plus the 0x100 header, the 0x300 TLV reserve and the
+  trailer sector, in whole sectors.
 - **Cold boot only.** PHY system sleep wakes through the ROM, which would
   rerun the loader and clobber retained RAM. Sleeping products need a
   ROM warm-boot path that bypasses it. That is an open hardware question.
@@ -533,19 +583,23 @@ from the EFR32 `gecko-recovery` option below.
 
 ### Phase 3 layouts
 
-| deployment (file) | reserved, never written | loader | primary | secondary | journal | slot capacity |
+| deployment (file) | reserved, never written | loader | primary | secondary | journal | application cap |
 |---|---|---|---|---|---|---|
-| nRF52840 DK (`nrf52840-sensor/boot/dk.layout`) | none | `0x0..0x4000` | `0x4000..0x81000` | `0x81000..0xFE000` | `0xFE000..0x100000` | 510,720 B |
-| nRF52840 MDK / PCA10059 UF2 (`mdk-uf2`, `pca10059-uf2`) | MBR `0x0..0x1000`, UF2 `0xF4000..0xFE000`, MBR params `0xFE000..0x100000` | `0x1000..0x5000` | `0x5000..0x7B000` | `0x7B000..0xF1000` | `0xF2000..0xF4000` | 482,048 B |
-| nRF52840 ProMicro UF2 (`promicro-uf2`) | MBR+S140 `0x0..0x26000`, boot guard `0xF0000..0xF4000`, UF2, MBR params | `0x26000..0x2A000` | `0x2A000..0x8C000` | `0x8C000..0xEE000` | `0xEE000..0xF0000` | 400,128 B |
-| EFR32MG22 devkit (`efr32mg22-sensor/boot/devkit.layout`) | router tables `0x74000..0x7C000` | `0x0..0x4000` | `0x4000..0x3C000` | `0x3C000..0x74000` | `0x7C000..0x80000` | 228,096 B |
-| EFR32MG21 devkit (`efr32mg21-sensor/boot/devkit.layout`), F1024 only | Gecko `0x0..0x4000`, router tables `0x74000..0x7C000` | `0x4000..0x8000` | `0x80000..0xC0000` | `0xC0000..0x100000` | `0x7C000..0x80000` | 260,864 B |
-| ZBT-1 (`ha-connect-zbt1/boot/zbt1.layout`) | Gecko `0x0..0x4000`, router tables `0xF4000..0xFC000` | `0x4000..0x8000` | `0x8000..0x7E000` | `0x7E000..0xF4000` | `0xFC000..0x100000` | 482,048 B |
-| PB-03F (`pb03f-kit/boot/pb03f.layout`) | ROM/factory `0x0..0x2000`, ROM-boot table `0x2000..0x3000`, factory data `0x3000..0x5000`, load data `0x5000..0x6000`, router tables `0x7A000..0x7E000` | `0x6000..0xA000` | `0x10000..0x32000` | `0x32000..0x54000` | `0x7E000..0x80000` | 130,816 B (`app-max`) |
+| nRF52840 DK (`nrf52840-sensor/boot/dk.layout`) | none | `0x0..0x4000` | `0x4000..0x81000` | `0x81000..0xFE000` | `0xFE000..0x100000` | 506,624 B |
+| nRF52840 MDK / PCA10059 UF2 (`mdk-uf2`, `pca10059-uf2`) | MBR `0x0..0x1000`, UF2 `0xF4000..0xFE000`, MBR params `0xFE000..0x100000` | `0x1000..0x5000` | `0x5000..0x7B000` | `0x7B000..0xF1000` | `0xF2000..0xF4000` | 477,952 B |
+| nRF52840 ProMicro UF2 (`promicro-uf2`) | MBR+S140 `0x0..0x26000`, boot guard `0xF0000..0xF4000`, UF2, MBR params | `0x26000..0x2A000` | `0x2A000..0x8C000` | `0x8C000..0xEE000` | `0xEE000..0xF0000` | 396,032 B |
+| EFR32MG22 devkit (`efr32mg22-sensor/boot/devkit.layout`) | none (router tables reclaimed) | `0x0..0x4000` | `0x4000..0x40000` | `0x40000..0x7C000` | `0x7C000..0x80000` | 236,288 B |
+| EFR32MG21 devkit (`efr32mg21-sensor/boot/devkit.layout`), F1024 only | Gecko `0x0..0x4000`, router tables `0x74000..0x7C000` | `0x4000..0x8000` | `0x80000..0xC0000` | `0xC0000..0x100000` | `0x7C000..0x80000` | 252,672 B |
+| ZBT-1 (`ha-connect-zbt1/boot/zbt1.layout`) | Gecko `0x0..0x4000`, router tables `0xF4000..0xFC000` | `0x4000..0x8000` | `0x8000..0x7E000` | `0x7E000..0xF4000` | `0xFC000..0x100000` | 473,856 B |
+| PB-03F (`pb03f-kit/boot/pb03f.layout`) | ROM/factory `0x0..0x2000`, ROM-boot table `0x2000..0x3000`, factory data `0x3000..0x5000`, load data `0x5000..0x6000`, router tables `0x7A000..0x7E000` | `0x6000..0xA000` | `0x10000..0x40000` | `0x40000..0x70000` | `0x7E000..0x80000` | 187,104 B (`app-max`) |
 
-Slot capacity is the slot minus the 0x200-byte header (0x100 on PHY62x2)
-and the 0x300-byte TLV reserve. All deployments use overwrite mode with 3 trial boots
-and a loader watchdog of 0 (none).
+The application cap is the slot minus its last sector (the trailer), the
+0x200-byte header (0x100 on PHY62x2) and the 0x300-byte TLV reserve, or
+`app-max` when that is smaller. The layout tests assert every cap. (The
+earlier "slot capacity" column, and the 244,480 B figure for a reclaimed
+MG22 slot, omitted the trailer sector.) All deployments use overwrite mode
+with 3 trial boots. The nRF52840 and EFR32 layouts set `watchdog-ms = 8000`;
+PB-03F sets 0.
 
 ### Application-side verification (ESP32, Telink)
 
@@ -587,17 +641,20 @@ the product has no OTA writer yet, so nothing uses it.
 
 ### Phase 3 blockers
 
-- **EFR32MG22.** The current sensor image (234,164 B) does not fit the
-  228,096 B slots. Either the router-tables reservation is reclaimed
-  (244,480 B slots) or the image shrinks.
+- **EFR32MG22 headroom.** With the router tables reclaimed, the
+  `zrs-boot` sensor (234,164 B) fits the 236,288 B cap with about 2.1 KB
+  to spare; the End Device is 229,788 B.
 - **EFR32MG21 devkit.** The layout needs an F1024 part; there is no room
   for two image-sized slots below the router tables on F512.
-- **No EFR32 application link variant yet.** Only nRF has a loader-linked
-  application build. MG21 and ZBT-1 need one before an end-to-end test.
-- **PHY62x2.** Current applications exceed the 130,816 B cap:
-  `phy6222-sensor` is 138,208 B and `pb03f-zigbee` 195,168 B. System
-  sleep warm-boots through the ROM (see above).
-- **No watchdog** in the nRF, EFR32 and PHY loaders (see above).
+- **No confirm in the `zrs-boot` nRF and EFR32 applications.** They use
+  `NoOta`, so nothing confirms a trial install; it reports `unconfirmed`
+  and keeps booting (the approved overwrite behaviour).
+- **PHY62x2.** `phy6222-sensor` (138,208 B) fits the 187,104 B cap;
+  `pb03f-zigbee` (195,168 B) does not (its direct map allows 200,448 B).
+  There is no PHY `zrs-boot` application build yet. System sleep
+  warm-boots through the ROM (see above).
+- **Watchdog bounds.** The EFR32 ULFRCO worst case (1.1 kHz) and the nRF
+  UF2-bootloader interaction are unverified.
 - **CC2340R5 product loader:** blocked on SDK `lpf3-9.20.01.21`.
 - **EFR32MG1:** deferred until a sacrificial-board rehearsal.
 
@@ -671,14 +728,37 @@ not been measured.
 **Phase 3 loaders** (ECDSA P-256, one key, overwrite, 3 trial boots; flash
 is file-backed `.vector_table + .text + .rodata + .data + .loader_info`):
 
-| loader | region | flash | RAM (`.data` + `.bss`) |
-|---|---|---|---|
-| nRF52840 `dk`, `mdk-uf2`, `pca10059-uf2` | 16,384 B | 9,084 B | 0 B |
-| nRF52840 `promicro-uf2` | 16,384 B | 9,076 B | 0 B |
-| EFR32MG22 devkit | 16,384 B | 9,232 B | 280 B |
-| EFR32MG21 devkit, ZBT-1 | 16,384 B | 9,124 B | 280 B |
-| ZBT-1 `gecko-recovery` | 16,384 B | 9,192 B | 280 B |
-| PB-03F | 16,384 B XIP + 4 KiB load data | 9,048 B XIP + 1,032 B load data | 708 B |
+| loader | region | flash (`d35436f`) | flash (watchdog) | RAM (`.data` + `.bss`) |
+|---|---|---|---|---|
+| nRF52840 `dk` | 16,384 B | 9,084 B | 9,264 B (+180) | 0 B |
+| nRF52840 `mdk-uf2` | 16,384 B | 9,088 B | 9,260 B (+172) | 0 B |
+| nRF52840 `pca10059-uf2` | 16,384 B | 9,084 B | 9,260 B (+176) | 0 B |
+| nRF52840 `promicro-uf2` | 16,384 B | 9,080 B | 9,256 B (+176) | 0 B |
+| EFR32MG22 devkit | 16,384 B | 9,232 B | 9,536 B (+304) | 280 B |
+| EFR32MG21 devkit, ZBT-1 | 16,384 B | 9,124 B | 9,412 B (+288) | 280 B |
+| ZBT-1 `gecko-recovery` | 16,384 B | 9,192 B | 9,480 B (+288) | 280 B |
+| PB-03F (no watchdog) | 16,384 B XIP + 4 KiB load data | 9,048 B XIP + 1,032 B load data | unchanged | 708 B |
+
+The loader rows were measured in one worktree; the watchdog column is the
+loader with `watchdog-ms = 8000`.
+
+**`zrs-boot` application builds** (not shipped; flash is file-backed):
+
+| image | flash | cap |
+|---|---|---|
+| nRF52840 UF2 `board-nrf-dk,zrs-boot` | 230,276 B (+232 for `NrfWatchdogSupervisor`) | 506,624 B |
+| nRF52840 UF2 `board-promicro,zrs-boot` | 229,156 B (+336) | 396,032 B |
+| EFR32MG22 `sed,zrs-boot` | 234,164 B | 236,288 B |
+| EFR32MG22 `ed,zrs-boot` | 229,788 B | 236,288 B |
+| EFR32MG21 `sed,zrs-boot` | 234,272 B | 252,672 B |
+| EFR32MG21 `ed,zrs-boot` | 229,988 B | 252,672 B |
+
+Shipped default images: with these changes reverted in the same worktree,
+the nRF52840 UF2 (ProMicro, 228,840 B) and EFR32MG22 sensor (234,160 B)
+images are the same size. The other defaults (MG22 ed/router, MG21
+roles, other UF2 boards) were compared only across worktrees, where
+builds differ by 4–20 B in both directions from crate-hash layout noise;
+no growth was attributable to the changes.
 
 Phase 3 application images (equal-length worktree paths, against `d4c4023`):
 
@@ -1047,18 +1127,22 @@ Resolved in Phase 2 step 2:
 - Loaders arm a watchdog (BL702 default 16 s).
 - An expired trial in overwrite mode keeps booting and is reported.
 
+Resolved in Phase 3:
+
+- MG22 reclaims the router-tables reservation for the slots (end-device
+  roles only under the loader).
+- nRF52840 and EFR32 Series 2 loaders arm a watchdog (8 s in the
+  committed layouts); on nRF the `zrs-boot` application feeds it.
+- The PHY62x2 application cap is the 187,104 B XIP slot.
+- ESP32 version mapping: file version `0xMMmmrrrr` is `MM.mm.rrrr`.
+
 Still open:
 
 0. **Phase 3:**
-   - **MG22.** Reclaim the router-tables reservation, or shrink the
-     image.
-   - **Loader watchdogs.** Whether to add an EFR32 WDOG driver and arm
-     watchdogs in the nRF, EFR32 and PHY loaders.
-   - **PHY62x2 application cap.** Whether to keep the 130,816 B cap.
    - **PHY62x2 sleep.** The warm-boot path for sleeping PHY62x2
      products.
-   - **ESP32 version mapping.** Confirm the ESP32 file-version to MCUboot
-     version mapping.
+   - **`pb03f-zigbee`.** Raise PB-03F `app-max` to its direct map's
+     200,448 B, or shrink the image.
 1. **CC2340 watchdog default.** The CC2340 WDT cannot be stopped once
    armed, and `cc2340-sensor` does not feed it. Product configs therefore
    keep `watchdog: None` until the app feeds the watchdog; then they arm

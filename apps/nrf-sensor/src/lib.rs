@@ -27,6 +27,6 @@ pub use diagnostics::{NrfDiagnostics, persistence_failure};
 pub use environment::{HUMIDITY_UNKNOWN, OnChipTemperature};
 pub use platform::{
     NrfPolarityStatus, NrfStatus, NrfSupervisor, NrfTimerWakeController, NrfWakeController,
-    SensorMac,
+    NrfWatchdogSupervisor, SensorMac,
 };
 pub use sensor_sed_app::{EnvironmentReading, EnvironmentSink, EnvironmentSource, policy};

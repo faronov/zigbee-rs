@@ -10,6 +10,8 @@
 # therefore needs an F1024 part (unlike link/memory.x, which also fits F512);
 # on an F512 part every slot read fails and the loader halts.
 # 0x8000..0x74000 is unused.
+# Watchdog: WDOG0 (ULFRCO) for the boot decision only, stopped before the
+# hand-over; 8 s requested -> PERSEL 11 (>= 14.9 s, nominally 16.4 s).
 name           = efr32mg21-devkit
 flash          = 0x0..0x100000
 sector         = 0x2000
@@ -24,7 +26,7 @@ header         = 0x200
 vector-align   = 0x200
 loader-version = 1
 trial-boots    = 3
-watchdog-ms    = 0
+watchdog-ms    = 8000
 mode           = overwrite
 env-prefix     = EFR32MG21
 key-file       = ../../../bootloaders/keys/own-ec-p256.xy.hex

@@ -45,12 +45,16 @@ use defmt::*;
 use {defmt_rtt as _, panic_probe as _};
 
 use core::mem::MaybeUninit;
+#[cfg(not(feature = "zrs-boot"))]
+use nrf_sensor_app::NrfSupervisor;
 #[cfg(any(feature = "board-promicro", feature = "board-mdk"))]
 use nrf_sensor_app::NrfTimerWakeController;
 #[cfg(any(feature = "board-nrf-dongle", feature = "board-nrf-dk"))]
 use nrf_sensor_app::NrfWakeController;
+#[cfg(feature = "zrs-boot")]
+use nrf_sensor_app::NrfWatchdogSupervisor;
 use nrf_sensor_app::{
-    BatteryPolicy, NrfBattery, NrfDiagnostics, NrfPolarityStatus, NrfSupervisor, OnChipTemperature,
+    BatteryPolicy, NrfBattery, NrfDiagnostics, NrfPolarityStatus, OnChipTemperature,
 };
 #[cfg(any(feature = "board-promicro", feature = "board-mdk"))]
 use sensor_sed_app::NoUserAction;
@@ -149,6 +153,12 @@ async fn main(_spawner: Spawner) {
         reg1: true,
     };
     let p = embassy_nrf::init(config);
+    // The zrs-boot loader leaves the WDT running (it cannot be stopped):
+    // adopt and reload it before anything slow.
+    #[cfg(feature = "zrs-boot")]
+    let supervisor = NrfWatchdogSupervisor::adopt(p.WDT);
+    #[cfg(not(feature = "zrs-boot"))]
+    let supervisor = NrfSupervisor;
 
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);
@@ -253,7 +263,7 @@ async fn main(_spawner: Spawner) {
             battery: NrfBattery::<Battery>::new(battery),
             ota: NoOta,
             actions,
-            supervisor: NrfSupervisor,
+            supervisor,
             diagnostics: NrfDiagnostics,
         },
     )

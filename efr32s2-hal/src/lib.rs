@@ -30,3 +30,4 @@ pub mod rtcc;
 pub mod time_driver;
 pub mod usart;
 pub mod vectors;
+pub mod watchdog;

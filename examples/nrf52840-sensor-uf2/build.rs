@@ -47,7 +47,9 @@ fn main() {
         let build = zrs_boot_layout::Build::load(
             format!("../../products/nrf52840-sensor/boot/{}", selected[0].1),
             zrs_boot_layout::ChipLimits {
-                watchdog_max_ms: 0,
+                // As the loader (`products/nrf52840-sensor/bootloader`):
+                // the application adopts the WDT the loader starts.
+                watchdog_max_ms: 131_071_999,
                 vtor: true,
             },
         );

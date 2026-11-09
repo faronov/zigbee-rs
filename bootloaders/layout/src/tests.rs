@@ -339,21 +339,53 @@ fn swap_mode_emits_status() {
     );
 }
 
-/// Every committed product layout parses and passes its chip's checks.
+/// Every committed product layout parses and passes its chip's checks (the
+/// limits its loader's build script passes), and links the application cap
+/// the documentation states.
 #[test]
 fn committed_layouts_are_valid() {
+    // products/nrf52840-sensor/bootloader/build.rs
+    const NRF: ChipLimits = ChipLimits {
+        watchdog_max_ms: 131_071_999,
+        vtor: true,
+    };
+    // bootloaders/efr32s2-boot/build.rs
+    const EFR32S2: ChipLimits = ChipLimits {
+        watchdog_max_ms: 238_313,
+        vtor: true,
+    };
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let layouts = [
-        ("products/nrf52840-sensor/boot/dk.layout", CM4),
-        ("products/nrf52840-sensor/boot/mdk-uf2.layout", CM4),
-        ("products/nrf52840-sensor/boot/pca10059-uf2.layout", CM4),
-        ("products/nrf52840-sensor/boot/promicro-uf2.layout", CM4),
-        ("products/efr32mg22-sensor/boot/devkit.layout", CM4),
-        ("products/efr32mg21-sensor/boot/devkit.layout", CM4),
-        ("products/ha-connect-zbt1/boot/zbt1.layout", CM4),
-        ("products/pb03f-kit/boot/pb03f.layout", CM0),
+        ("products/nrf52840-sensor/boot/dk.layout", NRF, 506_624),
+        ("products/nrf52840-sensor/boot/mdk-uf2.layout", NRF, 477_952),
+        (
+            "products/nrf52840-sensor/boot/pca10059-uf2.layout",
+            NRF,
+            477_952,
+        ),
+        (
+            "products/nrf52840-sensor/boot/promicro-uf2.layout",
+            NRF,
+            396_032,
+        ),
+        (
+            "products/efr32mg22-sensor/boot/devkit.layout",
+            EFR32S2,
+            236_288,
+        ),
+        (
+            "products/efr32mg21-sensor/boot/devkit.layout",
+            EFR32S2,
+            252_672,
+        ),
+        (
+            "products/ha-connect-zbt1/boot/zbt1.layout",
+            EFR32S2,
+            473_856,
+        ),
+        ("products/pb03f-kit/boot/pb03f.layout", CM0, 187_104),
     ];
-    for (path, limits) in layouts {
+    for (path, limits, app_max_len) in layouts {
         let path = root.join(path);
         let text = std::fs::read_to_string(&path).unwrap();
         let layout = BootLayout::parse(&text, path.parent().unwrap())
@@ -368,6 +400,7 @@ fn committed_layouts_are_valid() {
             )
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         assert!(!keys.is_empty());
+        assert_eq!(layout.app_max_len(), app_max_len, "{}", path.display());
     }
 }
 

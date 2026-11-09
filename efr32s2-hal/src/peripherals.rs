@@ -10,6 +10,7 @@ use crate::{
     radio::RadioToken,
     rtcc::RtccToken,
     usart::{Instance, Usart},
+    watchdog::WdogToken,
 };
 
 static TAKEN: AtomicBool = AtomicBool::new(false);
@@ -28,6 +29,7 @@ pub struct Peripherals {
     pub i2c0: I2c0Token,
     pub radio: RadioToken,
     pub rtcc: RtccToken,
+    pub wdog: WdogToken,
 }
 
 impl Peripherals {
@@ -53,6 +55,7 @@ impl Peripherals {
                 i2c0: I2c0Token::new(),
                 radio: RadioToken::new(),
                 rtcc: RtccToken::new(),
+                wdog: WdogToken::new(),
             })
     }
 }
@@ -72,5 +75,6 @@ mod tests {
         assert_eq!(size_of::<RadioToken>(), 0);
         assert_eq!(size_of::<I2c0Token>(), 0);
         assert_eq!(size_of::<RtccToken>(), 0);
+        assert_eq!(size_of::<WdogToken>(), 0);
     }
 }

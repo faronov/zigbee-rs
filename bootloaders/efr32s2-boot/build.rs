@@ -44,8 +44,10 @@ fn main() {
     let build = Build::load(
         layout,
         ChipLimits {
-            // efr32s2-hal has no WDOG driver yet.
-            watchdog_max_ms: 0,
+            // `efr32s2_hal::watchdog::MAX_PERIOD_MS` (2^18 + 1 ULFRCO
+            // cycles at the assumed 1.1 kHz bound); `src/main.rs` asserts
+            // that the layout's period converts.
+            watchdog_max_ms: 238_313,
             vtor: true,
         },
     );

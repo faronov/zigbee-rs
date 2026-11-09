@@ -19,7 +19,10 @@ header         = 0x200
 vector-align   = 0x200
 loader-version = 1
 trial-boots    = 3
-watchdog-ms    = 0
+# The WDT cannot be stopped once started: the loader starts it for the
+# boot decision (paused in sleep and debug halt) and the `zrs-boot`
+# application must keep reloading it (NrfWatchdogSupervisor).
+watchdog-ms    = 8000
 mode           = overwrite
 env-prefix     = NRF52840
 key-file       = ../../../bootloaders/keys/own-ec-p256.xy.hex

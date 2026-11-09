@@ -194,6 +194,7 @@ dependencies = [
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
+ "zrs-boot-layout",
 ]
 
 [[package]]
@@ -703,3 +704,7 @@ dependencies = [
  "zigbee-nwk",
  "zigbee-types",
 ]
+
+[[package]]
+name = "zrs-boot-layout"
+version = "0.1.0"
