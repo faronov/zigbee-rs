@@ -396,10 +396,69 @@ same router resumed as 0x565F without a new association, and Identify worked.
 overflows (0.12 %, all outright), no evictions, and high-water 16. The image
 it replaced had run for days and lost 744 of 30,524 valid frames (2.44 %, 13
 evictions) in the 15 minutes just before the flash. Its lifetime rate was
-0.92 %, so the channel traffic varies a lot between runs. A short burst
-overflow remains, and no per-phase attribution has been run on the new image.
-Frames that arrive while flash erase/write runs with interrupts disabled are
-lost without being counted.
+0.92 %, so the channel traffic varies a lot between runs. Frames that arrive
+while flash erase/write runs with interrupts disabled are lost without being
+counted.
+
+The residual burst overflow was attributed with the lab-only `lab-rx-trace`
+ring (`TLSR_LAB_RX_TRACE`, read over SWire; off in production images). In a
+30.6-minute soak of the scheduled-relay image, 1 of 30,292 valid frames
+overflowed, with no evictions. The bursts come from the coordinator's
+many-to-one route-request floods, which about 13 routers relay. Each copy
+costs CCM* decryption and RREQ handling, so the router loop is busy rather
+than stalled. The dropped frames were redundant RREQ copies, so this residue
+does not justify a larger queue.
+
+A separate path did lose data: the IRQ path acknowledged a frame for this
+node before it pushed it into a full queue, so the drop was silent and the
+sender never retransmitted. This is the likely cause of a first-join failure
+in which the Transport-Key unicast after network-up was lost (25 of 1,508
+frames overflowed in that window). The HAL now withholds the software ACK
+when the push would drop the frame outright, so the sender's MAC retries
+deliver it after the queue drains. On the production router this costs
+40 B of RAM code and no image, bss or stack growth. In a 31.1-minute soak
+after the change, the production image lost 754 of 61,279 valid frames, with
+no evictions. 743 of them fell in one burst while Home Assistant restarted:
+ZHA's startup re-initialises the coordinator, floods route requests and polls
+every device. In the 16.5 minutes after the burst, 11 of 29,701 frames
+overflowed (0.04 %), at about twice the channel rate of the earlier soak. A
+lab image with the same change ran 16 minutes without overflow (13,370
+frames). An overflow counted here can be the sender's MAC retry of a frame
+whose ACK was withheld, rather than a lost frame. The traffic differed too
+much between the soaks for a like-for-like loss comparison.
+
+A shared SoftMac duplicate filter (IEEE 802.15.4 §7.5.6.2, one
+source/DSN entry) was measured at +304 B flash, +16 B bss and +16 B stack.
+It fired once in 16 minutes of soak and was not adopted.
+
+### Trust Center rejoin
+
+The `lab-rejoin-trigger` feature (off in production) exposes
+`TELINK_LAB_REJOIN`. Writing `0x01004A52` there over SWire requests a secured
+rejoin, and `0x02004A52` a Trust Center rejoin through
+`ZigbeeNode::trust_center_rejoin`. The cell records the result, the NWK frame
+counter and reservation limit, counter regressions, the NWK rejoin stage and
+the BDB key-wait counters. It was tested on the TB-04 router (0x045B, parent
+0x43FD, ZHA with the bellows/EZSP coordinator):
+
+| request | result |
+|---|---|
+| secured rejoin | resumed 0x045B; ZCL probe 45/45 |
+| TC rejoin, default ZHA policy | parent accepts the unsecured Rejoin Request, but the TC sends no Transport Key; the 10 s key wait fails, the persisted security is restored and the secured retry recovers 0x045B |
+| TC rejoin inside a node-scoped 30 s `zha.permit` | Transport Key (NWK-unsecured, APS-secured) accepted by the unsecured RX gate and installed; resumed 0x045B; ZCL probe 28/28 |
+
+In every case the NWK frame counter only increased. Two later reboots (a lab
+image, then the production image) resumed 0x045B from the security state
+persisted after the TC rejoin, with no new association or key exchange. The
+coordinator did not rotate the key, so this does not cover a rejoin that
+delivers a new key sequence number.
+
+bellows (EZSP v8+) sets the Trust Center policy to allow joins only.
+`ALLOW_UNSECURED_REJOINS` is set only for the duration of a permit, so a
+device that lost the network key cannot recover through a TC rejoin unless
+a permit is open. That is coordinator policy, not a device fault. The
+parent-side branch of the gate (a child rejoining through this router) has
+not been tested on hardware.
 
 Remaining gates:
 
@@ -410,9 +469,10 @@ Remaining gates:
   observed to reach the SED through its third-party parent);
 - pad/comparator wake modes;
 - corrected-image first-attempt child admission and complete interview;
-- the parent router: a child joining through it, its own neighbour table in
-  ZHA, a paint-based stack high-water on the persistence paths, and
-  attribution of the residual burst RX-queue overflow (0.12 %) that remains
-  with the scheduled NWK relays;
+- the parent router: a child joining (and Trust Center rejoining) through
+  it, its own neighbour table in ZHA, and a paint-based stack high-water on
+  the persistence paths;
+- independent packet-capture proof of the ACK-withholding behaviour (no
+  sniffer was available);
 - the one-off SED `security persistence` panic seen once and not reproduced;
 - long-duration router and sleep stability.
