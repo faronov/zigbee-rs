@@ -373,7 +373,14 @@ retained light sleep with XTAL/RC_FAST off are lab-tested on one H2 board
 through the esp-hal backport path (WSTK AEM, `61b0f8a`: polls every
 29.75 s at ~557 µC, a 0.802 mA sleep floor and ~823 µA average; 0.73 mA of
 it is the H2-Zero board limit above). The retained mode through
-`esp32h2-sleep` passed the USB selftest. `top_pd` (`1b0a72c`) is lab-tested
+`esp32h2-sleep` (`3aa3ffa`, quiet image `694fb656`, WSTK AEM, 1 h from a
+VMCU power cycle) matches it: the restored-state fast window ends ~103 s
+after power-on, then polls every ~29.8 s at a median ~511 µC above the
+floor, reports ~1.6-1.9 mC, a 0.80 mA floor (0.801-0.805 mA in four quiet
+windows across the hour, peaks ≤0.99 mA) and ~824 µA average after the
+fast window (~848 µA over the whole hour including it). Diagnostics read
+`0x0000` = 5 and `0x0001` = `0xE008` before and after, so no keep-awake
+limit fired. `top_pd` (`1b0a72c`) is lab-tested
 on the WSTK AEM for 1 h: no boot loop, every 29.8 s poll answered after
 TOP/modem power-down, reports delivered, polls ~514 µC and reports ~2.0 mC
 (as retained), but a 1.023 mA floor and ~1,057 µA average because the pad
