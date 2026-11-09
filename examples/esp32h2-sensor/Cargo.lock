@@ -856,6 +856,7 @@ dependencies = [
  "esp-hal",
  "esp-storage",
  "esp32-zigbee-devkit",
+ "esp32h2-sleep",
  "log",
  "router-app",
  "sensor-sed-app",
@@ -919,6 +920,7 @@ dependencies = [
 name = "esp32h2-sensor"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
  "embassy-time",
  "esp-alloc",
  "esp-backtrace",
@@ -927,6 +929,7 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp32-zigbee-devkit-product",
+ "esp32h2-sleep",
  "heapless 0.9.2",
  "log",
  "portable-atomic",
@@ -939,6 +942,13 @@ dependencies = [
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
+]
+
+[[package]]
+name = "esp32h2-sleep"
+version = "0.1.0"
+dependencies = [
+ "esp32h2 0.18.0",
 ]
 
 [[package]]

@@ -263,6 +263,17 @@ fn main() -> ! {
         .with_power_down(product::sleep::RetainedPowerDown {
             xtal: config::SLEEP_XTAL_OFF,
             rc_fast: config::SLEEP_RC_FAST_OFF,
+        })
+        .with_mode(if config::SLEEP_TOP_PD {
+            product::sleep::SleepMode::TopPowerDown
+        } else {
+            product::sleep::SleepMode::Retained
+        })
+        // TOP power-down only: the BOOT button (GPIO9 = LP IO 2, external
+        // pull-up) wakes through EXT1 at low level.
+        .with_ext1_wake(product::sleep::Ext1Wake {
+            gpio_mask: 1 << 9,
+            high: false,
         }),
     );
     #[cfg(not(feature = "light-sleep"))]
@@ -296,9 +307,11 @@ fn main() -> ! {
     let (device, security, profile) = compose(peripherals.IEEE802154, peripherals.AES);
     let parts = SensorSedParts {
         #[cfg(feature = "quiet")]
-        wake: SensorWake::new(button, sleep),
+        wake: SensorWake::new(button, sleep).with_usb_host_wait(config::USB_HOST_WAIT_MS),
         #[cfg(not(feature = "quiet"))]
-        wake: thermometer_diag::DiagWake::new(SensorWake::new(button, sleep)),
+        wake: thermometer_diag::DiagWake::new(
+            SensorWake::new(button, sleep).with_usb_host_wait(config::USB_HOST_WAIT_MS),
+        ),
         status: NoStatus,
         environment: DieThermometer::new(sensor),
         battery: NoBattery,

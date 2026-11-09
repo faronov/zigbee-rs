@@ -33,6 +33,8 @@ esp-storage = { version = "0.7", default-features = false, features = [
     "bytewise-read",
     "critical-section",
 ] }
+# ESP32-H2 PMU light/deep sleep (own RAM-resident port of ESP-IDF v5.5.1).
+esp32h2-sleep = { path = "../../esp32h2-sleep", optional = true }
 
 [features]
 default = []
@@ -50,7 +52,15 @@ reporting-persist = []
 # `zbnv`; written only when a limit fires.
 anomaly-record = ["sed"]
 esp32c6 = ["esp32-zigbee-devkit/esp32c6", "esp-hal/esp32c6", "zigbee-runtime/ota"]
-esp32h2 = ["esp32-zigbee-devkit/esp32h2", "esp-hal/esp32h2", "zigbee-runtime/ota"]
+esp32h2 = [
+    "esp32-zigbee-devkit/esp32h2",
+    "esp-hal/esp32h2",
+    "zigbee-runtime/ota",
+    "dep:esp32h2-sleep",
+]
+# ESP32-H2 only, experimental: compile in the TOP/CPU/modem power-down
+# light sleep (`SleepMode::TopPowerDown`); the image selects it at runtime.
+h2-top-pd = ["esp32h2", "light-sleep", "esp32h2-sleep/top-pd"]
 
 [patch.crates-io]
 esp-hal = { path = "../../vendor/esp-hal" }

@@ -952,6 +952,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp32h2-sleep"
+version = "0.1.0"
+dependencies = [
+ "esp32h2",
+]
+
+[[package]]
 name = "esp32s2"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

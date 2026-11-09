@@ -626,6 +626,7 @@ dependencies = [
  "esp-hal",
  "esp-storage",
  "esp32-zigbee-devkit",
+ "esp32h2-sleep",
  "log",
  "router-app",
  "sensor-sed-app",
@@ -692,6 +693,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5bab026020ed4606ce113b6fde598dbc48f7eefcc46e9469ece77cc2b1aa4be"
 dependencies = [
  "vcell",
+]
+
+[[package]]
+name = "esp32h2-sleep"
+version = "0.1.0"
+dependencies = [
+ "esp32h2 0.18.0",
 ]
 
 [[package]]

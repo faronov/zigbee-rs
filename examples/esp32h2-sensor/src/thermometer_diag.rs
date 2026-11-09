@@ -138,7 +138,7 @@ impl<M: MacDriver, W: WakeController<M>> WakeController<M> for DiagWake<W> {
 /// production backend before the radio starts, results logged afterwards.
 #[cfg(feature = "light-sleep")]
 pub fn sleep_selftest(sleep: Option<&mut esp32_zigbee_devkit_product::sleep::LightSleep<'_>>) {
-    use esp32_zigbee_devkit_product::sleep::{SleepError, SleepStatus};
+    use esp32_zigbee_devkit_product::sleep::SleepError;
     use esp32_zigbee_devkit_product::wake::{boot_sleep_selftest, wake_code};
 
     if !config::SLEEP_SELFTEST {
@@ -165,25 +165,50 @@ pub fn sleep_selftest(sleep: Option<&mut esp32_zigbee_devkit_product::sleep::Lig
     let delay = esp_hal::delay::Delay::new();
     // Let the console drain before the clocks stop.
     delay.delay_millis(100);
-    let mut results: [Option<Result<(u64, SleepStatus), SleepError>>;
-        config::SLEEP_SELFTEST_COUNT] = [None; config::SLEEP_SELFTEST_COUNT];
+    let mut results: [Option<Result<SelftestSleep, SleepError>>; config::SLEEP_SELFTEST_COUNT] =
+        [None; config::SLEEP_SELFTEST_COUNT];
+    let mut integrity = [RegionDiff::NONE; INTEGRITY_REGIONS];
+    // TSENS lives in the TOP domain (APB_SARADC) and its range DAC in the
+    // analog block: a read after the sleeps proves both survive or are
+    // re-applied by the per-read configuration.
+    let sensor = crate::chip_temperature::H2TemperatureSensor::new();
+    let temperature_before = sensor
+        .as_ref()
+        .map_err(|e| *e)
+        .and_then(|s| s.read_gated_centi_celsius());
     for result in &mut results {
+        snapshot();
         // SAFETY: called from `main` before the radio, flash writers and the
         // executor exist; the console was drained above.
         let outcome =
             unsafe { boot_sleep_selftest(sleep, u64::from(config::SLEEP_SELFTEST_MS) * 1_000) };
-        *result = Some(outcome.map(|report| (report.elapsed_us, report.status)));
+        compare(&mut integrity);
+        *result = Some(outcome.map(|report| SelftestSleep {
+            elapsed_us: report.elapsed_us,
+            status: report.status,
+            top_powered_down: report.top_powered_down,
+        }));
         delay.delay_millis(100);
     }
+    let temperature_after = sensor
+        .as_ref()
+        .map_err(|e| *e)
+        .and_then(|s| s.read_gated_centi_celsius());
     // The USB host re-enumerates the device after the stopped periods.
     delay.delay_millis(3_000);
+    log::info!(
+        "[selftest] temperature before {:?}, after {:?} (0.01 C)",
+        temperature_before,
+        temperature_after
+    );
     for (index, result) in results.iter().enumerate() {
         match result {
-            Some(Ok((elapsed_us, status))) => log::info!(
-                "[selftest] sleep {}: OK, RTC {} us, {:?}",
+            Some(Ok(sleep)) => log::info!(
+                "[selftest] sleep {}: OK, RTC {} us, {:?}, top powered down {}",
                 index + 1,
-                elapsed_us,
-                status
+                sleep.elapsed_us,
+                sleep.status,
+                sleep.top_powered_down
             ),
             Some(Err(error)) => log::warn!(
                 "[selftest] sleep {}: error 0x{:08X} {:?}",
@@ -193,6 +218,113 @@ pub fn sleep_selftest(sleep: Option<&mut esp32_zigbee_devkit_product::sleep::Lig
                 error
             ),
             None => {}
+        }
+    }
+    // Retention check: TOP-domain configuration read before and after every
+    // sleep. Live status words (GPIO input, interrupt status) differ in both
+    // modes; compare a `top_pd` run against a `retained` run.
+    for (region, diff) in integrity_regions().zip(integrity.iter()) {
+        if diff.words == 0 {
+            log::info!("[selftest] retain {}: identical", region.name);
+        } else {
+            log::warn!(
+                "[selftest] retain {}: {} word(s) differ, first +0x{:03X}: 0x{:08X} -> 0x{:08X}",
+                region.name,
+                diff.words,
+                diff.first_offset,
+                diff.before,
+                diff.after
+            );
+        }
+    }
+}
+
+#[cfg(feature = "light-sleep")]
+#[derive(Clone, Copy)]
+struct SelftestSleep {
+    elapsed_us: u64,
+    status: esp32_zigbee_devkit_product::sleep::SleepStatus,
+    top_powered_down: bool,
+}
+
+/// Regions whose configuration must survive any light sleep: clocks/resets,
+/// IO_MUX/GPIO matrix, interrupt matrix, HP system, APM, TEE and the modem
+/// clocks (`esp32h2_sleep::retention`).
+#[cfg(feature = "light-sleep")]
+fn integrity_regions() -> impl Iterator<Item = &'static esp32h2_sleep::retention::Region> {
+    use esp32h2_sleep::retention::{MODEM_CLOCK, PCR, SYSTEM};
+    PCR.iter().chain(SYSTEM).chain(MODEM_CLOCK)
+}
+
+#[cfg(feature = "light-sleep")]
+const INTEGRITY_REGIONS: usize = esp32h2_sleep::retention::PCR.len()
+    + esp32h2_sleep::retention::SYSTEM.len()
+    + esp32h2_sleep::retention::MODEM_CLOCK.len();
+#[cfg(feature = "light-sleep")]
+const INTEGRITY_WORDS: usize = esp32h2_sleep::retention::PCR_WORDS
+    + esp32h2_sleep::retention::SYSTEM_WORDS
+    + esp32h2_sleep::retention::MODEM_CLOCK_WORDS;
+
+#[cfg(feature = "light-sleep")]
+static mut BEFORE: [u32; INTEGRITY_WORDS] = [0; INTEGRITY_WORDS];
+
+/// Accumulated difference of one region over every self-test sleep.
+#[cfg(feature = "light-sleep")]
+#[derive(Clone, Copy)]
+struct RegionDiff {
+    words: u16,
+    first_offset: u16,
+    before: u32,
+    after: u32,
+}
+
+#[cfg(feature = "light-sleep")]
+impl RegionDiff {
+    const NONE: Self = Self {
+        words: 0,
+        first_offset: 0,
+        before: 0,
+        after: 0,
+    };
+}
+
+#[cfg(feature = "light-sleep")]
+fn read_word(region: &esp32h2_sleep::retention::Region, index: usize) -> u32 {
+    // SAFETY: a documented, always-clocked-at-boot register of the retained
+    // set; reads have no side effect on these configuration registers.
+    unsafe { core::ptr::read_volatile((region.base as usize + 4 * index) as *const u32) }
+}
+
+#[cfg(feature = "light-sleep")]
+fn snapshot() {
+    // SAFETY: single-threaded boot self-test; nothing else touches BEFORE.
+    let before = unsafe { &mut *core::ptr::addr_of_mut!(BEFORE) };
+    let mut word = 0;
+    for region in integrity_regions() {
+        for index in 0..region.words {
+            before[word] = read_word(region, index);
+            word += 1;
+        }
+    }
+}
+
+#[cfg(feature = "light-sleep")]
+fn compare(diffs: &mut [RegionDiff; INTEGRITY_REGIONS]) {
+    // SAFETY: as in `snapshot`.
+    let before = unsafe { &*core::ptr::addr_of!(BEFORE) };
+    let mut word = 0;
+    for (region, diff) in integrity_regions().zip(diffs.iter_mut()) {
+        for index in 0..region.words {
+            let after = read_word(region, index);
+            if after != before[word] {
+                if diff.words == 0 {
+                    diff.first_offset = (4 * index) as u16;
+                    diff.before = before[word];
+                    diff.after = after;
+                }
+                diff.words = diff.words.saturating_add(1);
+            }
+            word += 1;
         }
     }
 }

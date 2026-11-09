@@ -144,6 +144,7 @@ mod thermometer {
             rapid_reset_window_ms: int(&mut values, "rapid_reset_window_ms", 1_000, 3_600_000),
             sleep_xtal_off: boolean(&mut values, "sleep_xtal_off"),
             sleep_rc_fast_off: boolean(&mut values, "sleep_rc_fast_off"),
+            sleep_top_pd: sleep_mode(&mut values, "sleep_mode"),
             fresh_join_fast_ms: int(&mut values, "fresh_join_fast_ms", 1, 3_600_000),
             restored_fast_ms: int(&mut values, "restored_fast_ms", 1, 3_600_000),
             button_fast_poll_ms: int(&mut values, "button_fast_poll_ms", 1, 600_000),
@@ -201,6 +202,7 @@ mod thermometer {
         rapid_reset_window_ms: i64,
         sleep_xtal_off: bool,
         sleep_rc_fast_off: bool,
+        sleep_top_pd: bool,
         fresh_join_fast_ms: i64,
         restored_fast_ms: i64,
         button_fast_poll_ms: i64,
@@ -306,6 +308,21 @@ mod thermometer {
                     || self.sleep_isolate_gpio_mask & ((1 << 23) | (1 << 24)) == 0,
                 "sleep_isolate_gpio_mask must not include UART0 (GPIO23/24) in builds with a console"
             );
+            // The TOP power-down is compiled in only by the `top-pd` feature,
+            // keeps no SYSTIMER/XTAL alive and wakes the button through EXT1.
+            assert!(
+                !self.sleep_top_pd
+                    || (env::var_os("CARGO_FEATURE_TOP_PD").is_some()
+                        && env::var_os("CARGO_FEATURE_LIGHT_SLEEP").is_some()
+                        && self.sleep_xtal_off),
+                "sleep_mode = \"top_pd\" needs the `top-pd` and `light-sleep` features and sleep_xtal_off = true"
+            );
+            // TOP power-down resets the USB-Serial-JTAG; only the boot-time
+            // host window keeps a host-attached device awake and reflashable.
+            assert!(
+                !self.sleep_top_pd || self.usb_host_wait_ms > 0,
+                "sleep_mode = \"top_pd\" needs usb_host_wait_ms > 0 (USB host detection before the first sleep)"
+            );
             // The results exist only as log lines, and only the PMU backend
             // can be exercised.
             assert!(
@@ -366,6 +383,8 @@ mod thermometer {
                  pub const SLEEP_XTAL_OFF: bool = {xtal_off};\n\
                  pub const SLEEP_RC_FAST_OFF: bool = {fosc_off};\n\
                  #[allow(dead_code)]\n\
+                 pub const SLEEP_TOP_PD: bool = {top_pd};\n\
+                 #[allow(dead_code)]\n\
                  pub const LOG_LEVEL: log::LevelFilter = log::LevelFilter::{log_level};\n\
                  #[allow(dead_code)]\n\
                  pub const DIAG_SUMMARY_MS: u32 = {diag_summary_ms};\n\
@@ -420,6 +439,7 @@ mod thermometer {
                 rapid_window = self.rapid_reset_window_ms,
                 xtal_off = self.sleep_xtal_off,
                 fosc_off = self.sleep_rc_fast_off,
+                top_pd = self.sleep_top_pd,
                 log_level = self.log_level,
                 diag_summary_ms = self.diag_summary_ms,
                 selftest = self.sleep_selftest,
@@ -491,6 +511,16 @@ mod thermometer {
         }
     }
 
+    /// `sleep_mode`: `"retained"` (default, proven) or `"top_pd"`; returns
+    /// whether the TOP/CPU/modem power-down is selected.
+    fn sleep_mode(values: &mut BTreeMap<String, String>, key: &str) -> bool {
+        match string(values, key).as_str() {
+            "retained" => false,
+            "top_pd" => true,
+            other => panic!("`{key}` = `{other}` must be retained or top_pd"),
+        }
+    }
+
     /// `log::LevelFilter` variant name for a console log level.
     fn log_level(values: &mut BTreeMap<String, String>, key: &str) -> &'static str {
         match string(values, key).as_str() {
@@ -538,6 +568,23 @@ mod floor_lab {
         let text = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read floor-lab config {}: {e}", path.display()));
         let mut v = super::thermometer::parse(&text, &path);
+        let light_top_pd = match take(&mut v, "light_mode").trim().trim_matches('"') {
+            "retained" => false,
+            "top_pd" => true,
+            other => panic!("`light_mode` = `{other}` must be \"retained\" or \"top_pd\""),
+        };
+        if light_top_pd {
+            assert!(
+                env::var_os("CARGO_FEATURE_TOP_PD").is_some(),
+                "`light_mode` = \"top_pd\" needs `--features top-pd`"
+            );
+        }
+        let xtal_off = boolean(&mut v, "sleep_xtal_off");
+        // TOP power-down admission requires the XTAL stopped in sleep.
+        assert!(
+            !light_top_pd || xtal_off,
+            "`light_mode` = \"top_pd\" needs sleep_xtal_off = true"
+        );
         let out = format!(
             "pub const USB_HOST_WAIT_MS: u32 = {};\n\
              pub const USB_DUMP_INTERVAL_MS: u32 = {};\n\
@@ -547,16 +594,18 @@ mod floor_lab {
              pub const LIGHT_ISOLATED_S: u64 = {};\n\
              pub const LIGHT_DRIVE_LOW_S: u64 = {};\n\
              pub const DEEP_S: u64 = {};\n\
-             pub const MARKER_MS: u32 = {};\n",
+             pub const MARKER_MS: u32 = {};\n\
+             pub const LIGHT_TOP_PD: bool = {};\n",
             int(&mut v, "usb_host_wait_ms", 100, 10_000),
             int(&mut v, "usb_dump_interval_ms", 1_000, 60_000),
-            boolean(&mut v, "sleep_xtal_off"),
+            xtal_off,
             boolean(&mut v, "sleep_rc_fast_off"),
             int(&mut v, "light_default_s", 5, 600),
             int(&mut v, "light_isolated_s", 5, 600),
             int(&mut v, "light_drive_low_s", 5, 600),
             int(&mut v, "deep_s", 5, 3_600),
             int(&mut v, "marker_ms", 100, 5_000),
+            light_top_pd,
         );
         if let Some(key) = v.keys().next() {
             panic!("{}: unknown key `{key}`", path.display());

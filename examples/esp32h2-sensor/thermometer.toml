@@ -62,6 +62,14 @@ poll_response_wait_ms = 32
 # SYSTIMER (compensated from the calibrated RTC). false = keep running.
 sleep_xtal_off = true
 sleep_rc_fast_off = true
+# Light-sleep depth (`esp32h2-sleep`, esp32h2-sleep/README.md):
+#   "retained"  every digital domain stays powered at 0.6 V (proven, ~85 uA
+#               chip excess on the ESP32-H2-Zero, phase B - phase D);
+#   "top_pd"    EXPERIMENTAL: TOP, CPU and modem domains powered off, their
+#               registers copied to RAM and back (~5.3 KiB, wake ~1 ms more).
+#               Needs `--features top-pd` and sleep_xtal_off = true; the BOOT
+#               button then wakes through EXT1 (GPIO9 = LP IO 2).
+sleep_mode = "retained"
 # Fast-poll windows after a fresh join (ZHA interview) and after a resume.
 fresh_join_fast_ms = 120000
 restored_fast_ms = 60000
@@ -156,10 +164,15 @@ anomaly_max_writes_per_boot = 8
 # With no USB host seen within this window after boot, the USB Serial/JTAG
 # pad (and its D+ pull-up) is switched off until the next reset. 0 keeps USB
 # powered. Recovery: reset with USB attached (or hold BOOT while resetting).
+# No PMU sleep happens inside the window; a host seen in it keeps the device
+# awake (and reflashable) for the whole power cycle, in either sleep mode.
+# top_pd requires a non-zero window.
 usb_host_wait_ms = 1000
 # GPIO pads isolated once at boot, before the first sleep: output, input
 # buffer and pulls off, muxed to GPIO, and switched to an isolated sleep
-# configuration in light sleep (ESP-IDF's sleep GPIO isolation). Bit n =
+# configuration in light sleep (ESP-IDF's sleep GPIO isolation), then
+# latched with the LP_AON pad hold so the state also survives
+# sleep_mode = "top_pd" (the hold persists until power-on). Bit n =
 # GPIOn; name only pads nothing on the board drives and no firmware uses.
 # Refused by the build: flash pads (GPIO15..=20), USB (GPIO26/27), the
 # BOOT/wake button (GPIO9) and, in builds with a console, UART0 (GPIO23/24).

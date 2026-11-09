@@ -21,6 +21,7 @@ members = [
     "tools/phy62x2-image",
     "mcuboot-image",
     "bootloaders/core",
+    "esp32h2-sleep",
 ]
 exclude = [
     "vendor/esp-hal",

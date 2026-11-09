@@ -1101,6 +1101,25 @@ jobs:
           # the router is the positive control for the symbol pattern.
           ../../tools/check-role-symbols.sh leaf "$DIR/esp32h2-sensor" "$DIR/esp32h2-ed"
           ../../tools/check-role-symbols.sh parent "$DIR/esp32h2-router"
+      - name: Build ESP32-H2 thermometer and floor lab, check the RAM sleep path
+        working-directory: examples/esp32h2-sensor
+        run: |
+          # Quiet thermometer in both light-sleep depths, plus the sleep-floor
+          # lab with TOP power-down; separate target dirs keep the ELFs apart.
+          T=target/thermometer
+          cargo build --release --locked -Z build-std=core,alloc --target-dir "$T/retained" \
+            --bin esp32h2-thermometer --features thermometer,light-sleep,quiet
+          H2_THERMO_SLEEP_MODE=top_pd cargo build --release --locked -Z build-std=core,alloc \
+            --target-dir "$T/top-pd" --bin esp32h2-thermometer --features thermometer,top-pd,quiet
+          cargo clippy --release --locked -Z build-std=core,alloc --target-dir "$T/top-pd" \
+            --bin esp32h2-thermometer --features thermometer,top-pd -- -D warnings
+          H2_FLOOR_LIGHT_MODE=top_pd cargo build --release --locked -Z build-std=core,alloc \
+            --target-dir "$T/floor" --no-default-features --features floor-lab,top-pd \
+            --bin esp32h2-floor-lab
+          R=riscv32imac-unknown-none-elf/release
+          python3 ../../tools/esp32h2-sleep-ram-check.py \
+            "$T/retained/$R/esp32h2-thermometer" "$T/top-pd/$R/esp32h2-thermometer" \
+            "$T/floor/$R/esp32h2-floor-lab"
       - name: Check ESP32-H2 hardware AES and role split
         run: |
           ELF=examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor
@@ -1205,6 +1224,11 @@ jobs:
           cargo test --locked --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
             --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/$CHIP-light-sleep-host" \
             --no-default-features --features "$CHIP,light-sleep" -- --include-ignored
+          if [[ "$CHIP" == esp32h2 ]]; then
+            cargo test --locked --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
+              --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/$CHIP-light-sleep-host" \
+              --no-default-features --features "esp32h2,h2-top-pd" -- --include-ignored
+          fi
           ./tools/firmware-size-report.sh "$CHIP-light-sleep" "${ELF}.app.bin" "${ELF}.size.json"
 
   build-bl702:
