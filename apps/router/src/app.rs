@@ -32,6 +32,8 @@ use crate::children::NoChildren;
 use crate::children::PersistentChildren;
 use crate::diagnostics::{DiagnosticEvent, Diagnostics, summarize_stack_event};
 use crate::error::RouterAppError;
+#[cfg(feature = "rejoin-request")]
+use crate::observer::RejoinRequest;
 use crate::observer::{NoObserver, RouterObserver};
 use crate::parts::RouterParts;
 use crate::policy::RouterPolicy;
@@ -1703,6 +1705,41 @@ where
         Ok(())
     }
 
+    /// Perform a maintenance rejoin reported by
+    /// [`RouterObserver::take_rejoin_request`].
+    ///
+    /// The secured request reuses the Leave-with-rejoin recovery path. The
+    /// Trust Center request skips the secured attempt; success and failure
+    /// are handled exactly like a secured rejoin's, so a failed attempt
+    /// enters the same bounded secured-rejoin backoff.
+    #[cfg(feature = "rejoin-request")]
+    async fn perform_requested_rejoin(
+        &mut self,
+        request: RejoinRequest,
+    ) -> Result<(), RouterAppError> {
+        if request == RejoinRequest::Secured {
+            return await_out_of_line!(self.perform_secure_rejoin());
+        }
+        self.set_status(RouterStatus::Rejoining {
+            archetype: K::ID,
+            failures: self.secure_rejoin_failures,
+        });
+        let started_us = self.now_us();
+        O::on_secure_rejoin_attempt(self.node.device(), started_us);
+        let result = await_out_of_line!(self.node.trust_center_rejoin());
+        O::on_secure_rejoin_result(self.node.device(), result);
+        match result {
+            Ok(short_address) => {
+                self.parts
+                    .diagnostics
+                    .record(DiagnosticEvent::SecureRejoinSucceeded { short_address });
+                self.activate_network(short_address)?;
+            }
+            Err(error) => self.note_secure_rejoin_failure(Some(error)).await?,
+        }
+        Ok(())
+    }
+
     fn set_run_again(&mut self, delay_ms: u32) -> Result<(), RouterAppError> {
         if delay_ms > RouterPolicy::max_relative_delay_us() / 1_000 {
             return Err(RouterAppError::InvalidRunAgainDelay { delay_ms });
@@ -1849,6 +1886,12 @@ where
         self.parts.supervisor.heartbeat();
         await_out_of_line!(self.complete_pending_receive_durability::<DEFER_SECURITY>())?;
         await_out_of_line!(self.persist_aps_tables_if_dirty())?;
+        #[cfg(feature = "rejoin-request")]
+        if let Some(request) = O::take_rejoin_request(self.node.device()) {
+            await_out_of_line!(self.perform_requested_rejoin(request))?;
+            self.parts.supervisor.heartbeat();
+            return Ok(events);
+        }
         match await_out_of_line!(self.service_pending_child_leave_cascade())? {
             LeaveCascadeControl::Completed { rejoin: true } => {
                 await_out_of_line!(self.perform_secure_rejoin())?;

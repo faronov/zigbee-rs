@@ -96,6 +96,8 @@ pub use diagnostics::{
     DiagnosticEvent, Diagnostics, NoDiagnostics, StackEventSummary, summarize_stack_event,
 };
 pub use error::RouterAppError;
+#[cfg(feature = "rejoin-request")]
+pub use observer::RejoinRequest;
 pub use observer::{NoObserver, RouterObserver};
 pub use parts::RouterParts;
 pub use policy::RouterPolicy;

@@ -3,6 +3,13 @@ name = "telink-tlsr8258-router"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Lab-only images; production builds enable neither.
+# Debugger-driven secured / Trust Center rejoin request cell.
+lab-rejoin-trigger = ["router-app/rejoin-request"]
+# Receive-queue overflow attribution ring in the TLSR8258 HAL.
+lab-rx-trace = ["tlsr8258-hal/lab-rx-trace"]
+
 [dependencies]
 router-app = { path = "../../apps/router", features = ["router"] }
 zigbee-types = { path = "../../zigbee-types" }
