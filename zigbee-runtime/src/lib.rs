@@ -3264,6 +3264,75 @@ mod resume_tests {
         assert_eq!(device.mac().tx_history().len(), 1);
     }
 
+    #[test]
+    fn requested_trust_center_rejoin_skips_the_secured_attempt() {
+        use crate::node::ZigbeeNode;
+        use crate::profile::{DeviceProfile, RangeExtender};
+        const CURRENT_KEY: [u8; 16] = [0x9A; 16];
+        const CURRENT_SEQUENCE: u8 = 5;
+        const NEW_SHORT: ShortAddress = ShortAddress(0x6789);
+
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        let limit_before = store.load().unwrap().unwrap().global_counter_limit;
+        device.mac_mut().clear_tx_history();
+        device.mac_mut().add_beacon(rejoin_beacon());
+        // MockMac pops with swap_remove: the response, then the key.
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            unsecured_rejoin_response(ShortAddress(OUR_SHORT), NEW_SHORT),
+            ShortAddress(OUR_SHORT),
+        ));
+        device.mac_mut().enqueue_rx(rejoin_indication(
+            trust_center_rejoin_transport_key(NEW_SHORT, CURRENT_KEY, CURRENT_SEQUENCE),
+            NEW_SHORT,
+        ));
+
+        let mut profile = DeviceProfile::new(
+            1,
+            zigbee_aps::PROFILE_HOME_AUTOMATION,
+            zigbee_zcl::DeviceId::RANGE_EXTENDER,
+            RangeExtender,
+        );
+        let mut node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        assert_eq!(block_on(node.trust_center_rejoin()), Ok(NEW_SHORT.0));
+
+        let history = device.mac().tx_history();
+        let (request, _) =
+            zigbee_nwk::frames::NwkHeader::parse(history[0].payload.as_slice()).unwrap();
+        assert!(
+            !request.frame_control.security,
+            "the first frame must be the unsecured Trust Center rejoin request"
+        );
+        let persisted = store.load().unwrap().unwrap();
+        assert_eq!(persisted.short_address, NEW_SHORT.0);
+        assert_eq!(persisted.network_key, CURRENT_KEY);
+        assert!(
+            persisted.global_counter_limit > limit_before,
+            "the rejoin must reserve a fresh outgoing counter window"
+        );
+    }
+
+    #[test]
+    fn requested_trust_center_rejoin_is_refused_on_distributed_networks() {
+        let mut state = distributed_rejoin_state();
+        state.rejoin_pending = false;
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS)).build();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        device.mac_mut().clear_tx_history();
+
+        assert_eq!(
+            block_on(device.trust_center_rejoin_only_with_security_store(&mut store)),
+            Err(crate::event_loop::StartError::CommissioningFailed(
+                zigbee_bdb::BdbStatus::NotPermitted
+            ))
+        );
+        assert!(device.mac().tx_history().is_empty());
+    }
+
     fn distributed_rejoin_state() -> PersistentSecurityState {
         let mut state = commissioned_state();
         state.rejoin_pending = true;
@@ -10080,6 +10149,32 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.bdb.set_rejoin_scan_widened(true);
         self.trust_center_rejoin_fallback_with_security_store(store)
             .await
+    }
+
+    /// Perform the unsecured Trust Center rejoin directly, without the
+    /// secured attempt that normally precedes it.
+    ///
+    /// This is a maintenance/validation entry point for the centralized
+    /// fallback path that
+    /// [`Self::secure_rejoin_with_fallback_with_security_store`] only reaches
+    /// after a secured rejoin has failed. It applies the same persisted
+    /// policy, counter reservation and rollback as that fallback, and scans
+    /// only the last operating channel. A record that does not permit an
+    /// unsecured Trust Center rejoin (distributed security, self-formed or
+    /// not commissioned) is rejected with
+    /// [`BdbStatus::NotPermitted`](zigbee_bdb::BdbStatus::NotPermitted)
+    /// before anything is transmitted.
+    pub async fn trust_center_rejoin_only_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<u16, event_loop::StartError> {
+        if Self::rejoin_fallback_policy(store)? != RejoinFallback::TrustCenterRejoin {
+            return Err(event_loop::StartError::CommissioningFailed(
+                zigbee_bdb::BdbStatus::NotPermitted,
+            ));
+        }
+        self.bdb.set_rejoin_scan_widened(false);
+        await_in_place!(self.trust_center_rejoin_fallback_with_security_store(store))
     }
 
     async fn trust_center_rejoin_fallback_with_security_store<S: SecurityStateStore>(

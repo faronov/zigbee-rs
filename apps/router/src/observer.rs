@@ -60,6 +60,37 @@ where
     fn on_tick(_device: &ZigbeeDevice<M, R>, _elapsed_secs: u16, _result: &TickResult) {}
 
     fn on_fault(_device: &ZigbeeDevice<M, R>, _error: RouterAppError) {}
+
+    /// Consume one pending maintenance rejoin request.
+    ///
+    /// Polled once per joined service step, before any receive. The default
+    /// never requests anything. A product or lab image may return a
+    /// request from a debugger-, button- or command-driven cell to exercise
+    /// the recovery paths the network otherwise only triggers on parent
+    /// loss or a missed key update. The hook itself only reports the
+    /// request; the application performs the rejoin and reports it through
+    /// [`Self::on_secure_rejoin_attempt`] / [`Self::on_secure_rejoin_result`].
+    ///
+    /// Available with the `rejoin-request` feature only, so an override can
+    /// never be silently ignored by an application built without the
+    /// request path.
+    #[cfg(feature = "rejoin-request")]
+    fn take_rejoin_request(_device: &ZigbeeDevice<M, R>) -> Option<RejoinRequest> {
+        None
+    }
+}
+
+/// Maintenance rejoin selected by [`RouterObserver::take_rejoin_request`].
+#[cfg(feature = "rejoin-request")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejoinRequest {
+    /// R22 secured NWK rejoin; a centralized network falls back to the
+    /// unsecured Trust Center rejoin if the secured exchange fails.
+    Secured,
+    /// Unsecured Trust Center rejoin on the current channel, without the
+    /// secured attempt. Centralized networks only; any other record is
+    /// rejected before anything is transmitted.
+    TrustCenter,
 }
 
 #[derive(Debug, Default, Clone, Copy)]

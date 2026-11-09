@@ -461,6 +461,168 @@ impl JoinMetrics {
 #[unsafe(no_mangle)]
 static TELINK_JOIN_METRICS: JoinMetrics = JoinMetrics::new();
 
+/// Lab-only maintenance rejoin trigger (`lab-rejoin-trigger`).
+///
+/// A debugger writes [`LAB_REJOIN_SECURED`] or [`LAB_REJOIN_TRUST_CENTER`]
+/// to `TELINK_LAB_REJOIN.request`; the next joined service step consumes it
+/// and the shared router app performs that rejoin. `status` records the
+/// outcome and `nwk_counter`/`nwk_counter_limit` mirror the NIB outgoing
+/// NWK frame counter and its durable reservation once per second, so a
+/// SWire read can confirm the counter never moves backwards across rejoins.
+#[cfg(feature = "lab-rejoin-trigger")]
+mod lab_rejoin {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use router_app::RejoinRequest;
+    use zigbee_mac::telink::TelinkRouterMac;
+    use zigbee_runtime::ZigbeeDevice;
+    use zigbee_runtime::event_loop::StartError;
+    use zigbee_runtime::role::Router;
+
+    pub const LAB_REJOIN_SECURED: u32 = 0x524A_0001;
+    pub const LAB_REJOIN_TRUST_CENTER: u32 = 0x524A_0002;
+
+    #[repr(C)]
+    pub struct LabRejoin {
+        request: AtomicU32,
+        taken: AtomicU32,
+        last_request: AtomicU32,
+        attempts: AtomicU32,
+        /// 0x0001_xxxx Ok(short address), 0x0002_00ss CommissioningFailed(ss),
+        /// 0x0003_0000 PersistenceFailed, 0x0004_0000 InitFailed.
+        status: AtomicU32,
+        nwk_counter: AtomicU32,
+        nwk_counter_limit: AtomicU32,
+        nwk_counter_regressions: AtomicU32,
+        /// Ring of the last [`HISTORY`] rejoin outcomes, indexed by
+        /// `attempts % HISTORY`: `[status, diag0, diag1, diag2]` where the
+        /// diag words pack the NWK `RejoinDiagnostics` (see [`pack`]).
+        history: [[AtomicU32; 4]; HISTORY],
+        /// BDB key-wait counters at the last attempt's start `[0]` and
+        /// result `[1]`: `passive_rx | poll_data << 16`,
+        /// `poll_attempts | key_frame_result << 16 | nwk_security << 24`.
+        steering: [[AtomicU32; 2]; 2],
+    }
+
+    const HISTORY: usize = 4;
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO_ENTRY: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+    #[used]
+    #[unsafe(no_mangle)]
+    pub static TELINK_LAB_REJOIN: LabRejoin = LabRejoin {
+        request: AtomicU32::new(0),
+        taken: AtomicU32::new(0),
+        last_request: AtomicU32::new(0),
+        attempts: AtomicU32::new(0),
+        status: AtomicU32::new(0),
+        nwk_counter: AtomicU32::new(0),
+        nwk_counter_limit: AtomicU32::new(0),
+        nwk_counter_regressions: AtomicU32::new(0),
+        history: [ZERO_ENTRY; HISTORY],
+        steering: [const { [const { AtomicU32::new(0) }; 2] }; 2],
+    };
+
+    fn snapshot_steering(device: &ZigbeeDevice<TelinkRouterMac, Router>, slot: usize) {
+        let d = device.steering_diagnostics();
+        let words = [
+            u32::from(d.passive_rx_frames) | u32::from(d.poll_data_frames) << 16,
+            u32::from(d.poll_attempts)
+                | (d.key_frame_result as u32) << 16
+                | u32::from(d.nwk_security) << 24,
+        ];
+        for (word, value) in TELINK_LAB_REJOIN.steering[slot].iter().zip(words) {
+            word.store(value, Ordering::Relaxed);
+        }
+    }
+
+    /// `diag0 = stage | candidates << 8 | tx << 16 | polls << 24`,
+    /// `diag1 = rx_frames | last_status << 8 | last_parent << 16`,
+    /// `diag2 = no_ack | channel_access << 8 | other_tx << 16`.
+    fn pack(d: zigbee_nwk::RejoinDiagnostics) -> [u32; 3] {
+        [
+            u32::from_le_bytes([
+                d.stage,
+                d.candidate_attempts,
+                d.tx_attempts,
+                d.poll_attempts,
+            ]),
+            u32::from(d.rx_frames) | u32::from(d.last_status) << 8 | u32::from(d.last_parent) << 16,
+            u32::from_le_bytes([
+                d.no_ack_failures,
+                d.channel_access_failures,
+                d.other_tx_failures,
+                0,
+            ]),
+        ]
+    }
+
+    pub fn take() -> Option<RejoinRequest> {
+        let lab = &TELINK_LAB_REJOIN;
+        let request = lab.request.load(Ordering::Relaxed);
+        if request == 0 {
+            return None;
+        }
+        lab.request.store(0, Ordering::Relaxed);
+        lab.last_request.store(request, Ordering::Relaxed);
+        let selected = match request {
+            LAB_REJOIN_SECURED => RejoinRequest::Secured,
+            LAB_REJOIN_TRUST_CENTER => RejoinRequest::TrustCenter,
+            _ => return None,
+        };
+        lab.taken.store(
+            lab.taken.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
+        Some(selected)
+    }
+
+    pub fn attempt(device: &ZigbeeDevice<TelinkRouterMac, Router>) {
+        snapshot_steering(device, 0);
+        let lab = &TELINK_LAB_REJOIN;
+        lab.attempts.store(
+            lab.attempts.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn result(device: &ZigbeeDevice<TelinkRouterMac, Router>, result: Result<u16, StartError>) {
+        let status = match result {
+            Ok(address) => 0x0001_0000 | u32::from(address),
+            Err(StartError::CommissioningFailed(status)) => 0x0002_0000 | status as u32,
+            Err(StartError::PersistenceFailed(_)) => 0x0003_0000,
+            Err(StartError::InitFailed) => 0x0004_0000,
+        };
+        snapshot_steering(device, 1);
+        let lab = &TELINK_LAB_REJOIN;
+        lab.status.store(status, Ordering::Relaxed);
+        let slot = &lab.history[lab.attempts.load(Ordering::Relaxed) as usize % HISTORY];
+        let diag = pack(device.bdb().zdo().nwk().rejoin_diagnostics());
+        slot[0].store(status, Ordering::Relaxed);
+        for (word, value) in slot[1..].iter().zip(diag) {
+            word.store(value, Ordering::Relaxed);
+        }
+    }
+
+    pub fn capture_counter(device: &ZigbeeDevice<TelinkRouterMac, Router>) {
+        let lab = &TELINK_LAB_REJOIN;
+        let nib = device.bdb().zdo().nwk().nib();
+        let previous = lab.nwk_counter.load(Ordering::Relaxed);
+        if nib.outgoing_frame_counter < previous {
+            lab.nwk_counter_regressions.store(
+                lab.nwk_counter_regressions
+                    .load(Ordering::Relaxed)
+                    .wrapping_add(1),
+                Ordering::Relaxed,
+            );
+        }
+        lab.nwk_counter
+            .store(nib.outgoing_frame_counter, Ordering::Relaxed);
+        lab.nwk_counter_limit
+            .store(nib.outgoing_frame_counter_limit, Ordering::Relaxed);
+    }
+}
+
 /// Zero-storage static observer that preserves the debugger ABI of
 /// `TELINK_JOIN_METRICS` while the shared app owns the lifecycle.
 struct TelinkJoinObserver;
@@ -487,7 +649,21 @@ impl RouterObserver<TelinkRouterMac, Router> for TelinkJoinObserver {
         device: &ZigbeeDevice<TelinkRouterMac, Router>,
         _result: Result<u16, StartError>,
     ) {
+        #[cfg(feature = "lab-rejoin-trigger")]
+        lab_rejoin::result(device, _result);
         TELINK_JOIN_METRICS.capture_steering(device);
+    }
+
+    #[cfg(feature = "lab-rejoin-trigger")]
+    fn on_secure_rejoin_attempt(device: &ZigbeeDevice<TelinkRouterMac, Router>, _started_us: u32) {
+        lab_rejoin::attempt(device);
+    }
+
+    #[cfg(feature = "lab-rejoin-trigger")]
+    fn take_rejoin_request(
+        _device: &ZigbeeDevice<TelinkRouterMac, Router>,
+    ) -> Option<router_app::RejoinRequest> {
+        lab_rejoin::take()
     }
 
     fn on_network_ready(device: &ZigbeeDevice<TelinkRouterMac, Router>) {
@@ -530,6 +706,8 @@ impl RouterObserver<TelinkRouterMac, Router> for TelinkJoinObserver {
             // Bounded snapshot only on the existing one-second stack tick,
             // never in the turnaround-critical IRQ or per-frame path.
             TELINK_JOIN_METRICS.capture_radio(device.mac());
+            #[cfg(feature = "lab-rejoin-trigger")]
+            lab_rejoin::capture_counter(device);
         }
     }
 }

@@ -276,6 +276,18 @@ where
             .await
     }
 
+    /// Perform an unsecured Trust Center rejoin without a preceding secured
+    /// attempt (centralized networks only); see
+    /// [`ZigbeeDevice::trust_center_rejoin_only_with_security_store`].
+    ///
+    /// [`ZigbeeDevice::trust_center_rejoin_only_with_security_store`]:
+    ///     crate::ZigbeeDevice::trust_center_rejoin_only_with_security_store
+    pub async fn trust_center_rejoin(&mut self) -> Result<u16, StartError> {
+        self.device
+            .trust_center_rejoin_only_with_security_store(&mut *self.security_store)
+            .await
+    }
+
     pub async fn factory_reset(&mut self) -> Result<(), StartError> {
         self.device
             .factory_reset_with_security_store(&mut *self.security_store)

@@ -15,6 +15,9 @@ distributed-security = ["zigbee-runtime/distributed-security"]
 groups = ["zigbee-runtime/groups"]
 router = ["zigbee-runtime/router", "application-link-key-installation"]
 trust-center = ["router", "zigbee-runtime/trust-center"]
+# Maintenance rejoin requests through `RouterObserver::take_rejoin_request`.
+# Off by default so products that never request one carry no request path.
+rejoin-request = []
 
 [dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }
