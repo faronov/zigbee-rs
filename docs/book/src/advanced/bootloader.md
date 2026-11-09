@@ -63,7 +63,7 @@ hardware-proven capability.
 | `mcuboot-image::staging` | Application side of a zigbee-rs loader: `LoaderChannel` (own / foreign / no loader), `shared_keys` (keys both the application and the installed loader trust) and `StagingFlash` (erase/write only in the secondary slot, write-only in the running image's trial log) | Host-tested |
 | `apps/sensor-sed` `ota_client` (feature `ota`) | `ImageOtaClient`: query schedule, Image Notify, offer gating on the loader channel, activation after the security checkpoint, reset, confirm through the writer | Host-tested (through the MG22 product tests) |
 | `tools/zrs_boot_ota.py` | Signs a loader-linked application from its product `.layout` and the ELF's `ZRS_OTA_IDENTITY`; writes the signed image and the Zigbee OTA file; `check`, `key-xy`, zigpy `index` | Python unit tests; real imgtool 2.4.0 signing of the MG22 build (local and CI with an ephemeral key) |
-| `products/efr32mg22-sensor` `ota` (`sed,zrs-boot`) | MG22 identity, flash split, `SlotWriter` over `StagingFlash`, OTA profile and client | Host-tested and release-built; **not run on hardware** |
+| `products/efr32mg22-sensor` `ota` (`sed,zrs-boot`) | MG22 identity, flash split, `SlotWriter` over `StagingFlash`, OTA profile and client | Host-tested and release-built. Confirm-after-rejoin of an SWD-staged 0.2.0 is **lab-tested on one BRD4183A** ([results](#mg22-ota-confirm-results-2026-11-09)); delivery over ZHA OTA is **not yet run on hardware** |
 
 ```text
 product loader binary   layout, BootConfig (keys, trial boots, mode), loader block, console/LEDs
@@ -747,8 +747,12 @@ python3 tools/zrs_boot_ota.py release \
 - **Declined offers:** a declined offer leaves flash untouched.
 - **Other:** channel detection.
 
-**Not run on hardware** (ZHA OTA delivery, confirm on the device and the
-stack headroom of the verify path).
+**Hardware.** On one BRD4183A, the confirm-after-rejoin of an SWD-staged
+TEST-ONLY 0.2.0 is lab-tested; see
+[MG22 OTA confirm results](#mg22-ota-confirm-results-2026-11-09). These
+are **not run on hardware**: ZHA OTA delivery into the secondary (the
+`StagingFlash` write path and the OTA-time signature check) and the
+stack headroom of the verify path.
 
 ### Phase 3 blockers
 
@@ -1326,11 +1330,38 @@ Notes:
 - **Not exercised on this board:** delivery over ZHA OTA, power cuts
   during an install, a watchdog expiry reset (needs a hung loader), the
   ULFRCO period, and a confirmed image. The `zrs-boot` build tested here
-  used `NoOta` and never confirmed; OTA receive and confirm came later
-  ([MG22 OTA receive](#efr32mg22-ota-receive)) and are not yet run on
-  hardware. MG21, ZBT-1 and `gecko-recovery` were also not exercised.
+  used `NoOta` and never confirmed. OTA receive and confirm came later
+  ([MG22 OTA receive](#efr32mg22-ota-receive)); the confirm is now
+  lab-tested ([below](#mg22-ota-confirm-results-2026-11-09)), but ZHA OTA
+  delivery is not. MG21, ZBT-1 and `gecko-recovery` were also not
+  exercised.
 - **Restoring the board:** the original image is the backup `6d7b5b3b…`
   in the hwlab artifacts, taken before the erase.
+
+### MG22 OTA confirm results (2026-11-09)
+
+The same board was used, still joined as `0x8C8F`. It started with the
+loader and 0.1.3 (`NoOta`). The application under test was
+`examples/efr32mg22-sensor` with `sed,zrs-boot` and the OTA receive
+path, built with `EFR32MG22_OTA_VERSION_OVERRIDE=0.2.0` (a TEST-ONLY
+build; Zigbee file version `0x25000200`; 233,904 B payload, 234,567 B
+signed). It was signed with the options above plus `--pad --version
+0.2.0+0`. `tools/zrs_boot_ota.py release` accepted the same ELF with
+3,001 B of slot margin. **Lab-tested on one board.**
+
+| step | result |
+|---|---|
+| Backup | Full 512 KiB, two identical reads, SHA-256 `70f166ba…`. Decoded: loader present, primary 0.1.3, secondary header erased, trial log `Done, Attempt` (0.1.3 never confirmed), journal in use |
+| Stage | Padded 0.2.0 programmed at `0x40000..0x7C000` only (30 sectors written and read back). The loader and journal sectors were not in the programmed range |
+| Install and banner | After the reset, VCOM printed `MG22 app 0.2.0 (TEST-ONLY version): loader Own, OTA 0x1234/0x0022 file 0x25000200` |
+| Rejoin | ZHA kept the same device entry: nwk `0x8C8F`, available, LQI 112. A report arrived about 70 s after the reset, with no availability gap and no re-pair |
+| Confirm | The primary trailer log read `Done (0x6000), Attempt (0xC000), Confirmed (0xA000)`. The app appended the confirm record after the rejoin |
+| Post-state | Backup SHA-256 `9cd8c870…`. Loader bytes unchanged. Primary equals the signed image (header, payload and the 151-byte TLV). Secondary header and trailer sectors erased. Journal grew from 1,547 to 1,785 non-`0xFF` bytes (persistence continued). Reports continued after the SWD session |
+
+**Not exercised:** delivery over ZHA OTA (block transfer into the
+secondary through `StagingFlash`, the OTA-time signature check, and
+activation by the upgrade-end response), a power cut during staging, and
+the stack headroom of the verify path. These wait for the ZHA OTA step.
 
 ## Open decisions
 
