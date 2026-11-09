@@ -52,6 +52,9 @@ embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
 log = "0.4"
 static_cell = "2"
 
+[build-dependencies]
+zrs-boot-layout = { path = "../../bootloaders/layout" }
+
 [features]
 default = ["sed"]
 # Sleepy environmental sensor (the original image).
@@ -68,6 +71,10 @@ em2-debug = []
 # Lab: fill the stack with 0xCCCCCCCC at reset so the high-water mark can
 # be read over SWD (first non-pattern word above `__ebss`).
 stack-paint = ["cortex-m-rt/paint-stack"]
+# Link into the primary slot of the zigbee-rs loader layout
+# (products/efr32mg22-sensor/boot/devkit.layout) instead of the direct map;
+# sign the result with mcuboot-image for bootloaders/efr32s2-boot.
+zrs-boot = []
 
 [profile.dev]
 opt-level = "s"

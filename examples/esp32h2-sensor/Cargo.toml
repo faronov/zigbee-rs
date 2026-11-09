@@ -92,6 +92,9 @@ router = [
 ]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
+# Accept only signed MCUboot envelopes over OTA (see the product's
+# `signed_ota` module and `boot/app-verify.conf`).
+signed-ota = ["esp32-zigbee-devkit-product/signed-ota"]
 # Experimental TOP/CPU/modem power-down light sleep (`esp32h2-sleep`
 # `top-pd`); `thermometer.toml` `sleep_mode = "top_pd"` (or floor_lab.toml
 # `light_mode`) selects it. With "retained" the code is linked but unused.

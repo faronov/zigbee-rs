@@ -1,0 +1,44 @@
+[package]
+name = "nrf52840-sensor-boot"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "zigbee-rs MCUboot-image bootloader for the nRF52840 sensor deployments (layout from ../boot/*.layout)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone embedded binary like examples/nrf52840-sensor.
+[workspace]
+
+[features]
+# Exactly one deployment: the matching ../boot/<name>.layout is built in.
+dk = []
+mdk-uf2 = []
+pca10059-uf2 = []
+promicro-uf2 = []
+# Refused (fails the build): Ed25519 does not fit the 16 KiB loader.
+ed25519 = ["zrs-boot-cortex-m/ed25519"]
+
+[dependencies]
+zrs-boot-cortex-m = { path = "../../../bootloaders/cortex-m-boot" }
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+# NVMC driver only: `embassy_nrf::init` is never called, so clocks, UICR and
+# errata state stay as reset left them for the application.
+embassy-nrf = { version = "0.3", default-features = false, features = ["nrf52840", "rt"] }
+panic-halt = "1.0"
+
+[build-dependencies]
+zrs-boot-layout = { path = "../../../bootloaders/layout" }
+
+[[bin]]
+name = "nrf52840-sensor-boot"
+test = false
+bench = false
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true

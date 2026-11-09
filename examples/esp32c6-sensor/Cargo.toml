@@ -73,6 +73,9 @@ router = [
 ]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
+# Accept only signed MCUboot envelopes over OTA (see the product's
+# `signed_ota` module and `boot/app-verify.conf`).
+signed-ota = ["esp32-zigbee-devkit-product/signed-ota"]
 
 [patch.crates-io]
 esp-hal = { path = "../../vendor/esp-hal" }

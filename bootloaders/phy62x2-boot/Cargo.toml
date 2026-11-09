@@ -1,0 +1,41 @@
+[package]
+name = "phy62x2-boot"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "zigbee-rs MCUboot-image loader for PHY62x2 products, started by the boot ROM; the layout comes from the product's boot/*.layout"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone embedded binary like examples/pb03f-kit (nightly, build-std,
+# panic=immediate-abort; see .cargo/config.toml).
+[workspace]
+
+[features]
+# Exactly one deployment; each builds in the product-owned layout file.
+pb03f-kit = [] # ../../products/pb03f-kit/boot/pb03f.layout
+# Refused (fails the build): Ed25519 does not fit the 16 KiB loader.
+ed25519 = ["zrs-boot-cortex-m/ed25519"]
+
+[dependencies]
+zrs-boot-cortex-m = { path = "../cortex-m-boot" }
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+# `rt`: the boot ROM ignores the run descriptor's SP; Reset loads it.
+phy6222-hal = { path = "../../phy6222-hal", features = ["rt"] }
+panic-halt = "1.0"
+
+[build-dependencies]
+zrs-boot-layout = { path = "../layout" }
+
+[[bin]]
+name = "phy62x2-boot"
+test = false
+bench = false
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true

@@ -309,7 +309,7 @@ pub fn validate_with_set<F: ReadNorFlash>(
     validate_by(flash, slot, max_len, keys.iter())
 }
 
-fn validate_by<'k, F: ReadNorFlash>(
+pub(crate) fn validate_by<'k, F: ReadNorFlash>(
     flash: &mut F,
     slot: u32,
     max_len: u32,

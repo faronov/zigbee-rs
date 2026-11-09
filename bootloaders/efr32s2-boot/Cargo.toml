@@ -1,0 +1,46 @@
+[package]
+name = "efr32s2-boot"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "zigbee-rs MCUboot-image loader for EFR32 Series 2 (MG21/MG22) products; the layout comes from the product's boot/*.layout"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone embedded binary like examples/efr32mg22-sensor.
+[workspace]
+
+[features]
+# Exactly one deployment; each builds in the product-owned layout file.
+efr32mg22-devkit = ["efr32s2-hal/efr32mg22"] # ../../products/efr32mg22-sensor/boot/devkit.layout
+efr32mg21-devkit = ["efr32s2-hal/efr32mg21"] # ../../products/efr32mg21-sensor/boot/devkit.layout
+ha-connect-zbt1 = ["efr32s2-hal/efr32mg21"]  # ../../products/ha-connect-zbt1/boot/zbt1.layout
+# With nothing bootable, re-enter the resident Gecko Bootloader (reset cause
+# BOOTLOAD at the start of RAM, then a system reset) instead of halting.
+# Only for chained layouts (loader above a reserved Gecko Bootloader).
+# Not yet verified on hardware.
+gecko-recovery = []
+# Refused (fails the build): Ed25519 does not fit the 16 KiB loader.
+ed25519 = ["zrs-boot-cortex-m/ed25519"]
+
+[dependencies]
+zrs-boot-cortex-m = { path = "../cortex-m-boot" }
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["rt"] }
+panic-halt = "1.0"
+
+[build-dependencies]
+zrs-boot-layout = { path = "../layout" }
+
+[[bin]]
+name = "efr32s2-boot"
+test = false
+bench = false
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true

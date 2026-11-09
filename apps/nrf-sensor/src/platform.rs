@@ -188,3 +188,66 @@ impl Supervisor for NrfSupervisor {
         cortex_m::peripheral::SCB::sys_reset()
     }
 }
+
+/// [`Supervisor`] serving a WDT that was started before the application,
+/// e.g. by the `zrs-boot` loader (`products/nrf52840-sensor/bootloader`).
+///
+/// The nRF52840 WDT cannot be stopped or reconfigured while it runs, so this
+/// adopts whatever configuration it finds instead of imposing one: every
+/// heartbeat reloads all eight reload registers (writes to registers that
+/// `RREN` leaves disabled are ignored). When the WDT keeps counting in sleep
+/// (`CONFIG.SLEEP = RUN`) waits are capped at half its period; with `PAUSE`
+/// (what the loader configures) sleep is unbounded. Without a running WDT
+/// this behaves like [`NrfSupervisor`].
+#[derive(Debug, Clone, Copy)]
+pub struct NrfWatchdogSupervisor {
+    running: bool,
+    max_wait_ms: Option<u32>,
+}
+
+impl NrfWatchdogSupervisor {
+    /// WDT clock (LFCLK).
+    const TICKS_PER_SECOND: u64 = 32_768;
+
+    /// Take ownership of the WDT and serve it if it runs.
+    pub fn adopt(wdt: embassy_nrf::peripherals::WDT) -> Self {
+        let config = embassy_nrf::wdt::Config::try_new(&wdt);
+        let max_wait_ms = config.as_ref().and_then(|config| {
+            (config.action_during_sleep == embassy_nrf::wdt::SleepConfig::RUN).then(|| {
+                let period_ms = u64::from(config.timeout_ticks) * 1000 / Self::TICKS_PER_SECOND;
+                u32::try_from(period_ms / 2).unwrap_or(u32::MAX).max(1)
+            })
+        });
+        let mut supervisor = Self {
+            running: config.is_some(),
+            max_wait_ms,
+        };
+        supervisor.heartbeat();
+        supervisor
+    }
+
+    /// Whether a WDT was running when the supervisor adopted it.
+    pub fn running(&self) -> bool {
+        self.running
+    }
+}
+
+impl Supervisor for NrfWatchdogSupervisor {
+    fn heartbeat(&mut self) {
+        if self.running {
+            for index in 0..8 {
+                // SAFETY: the supervisor owns the WDT; a reload request only
+                // restarts the count.
+                unsafe { embassy_nrf::wdt::WatchdogHandle::steal(index) }.pet();
+            }
+        }
+    }
+
+    fn max_wait_ms(&self) -> Option<u32> {
+        self.max_wait_ms
+    }
+
+    fn reset(&mut self) -> ! {
+        cortex_m::peripheral::SCB::sys_reset()
+    }
+}

@@ -19,6 +19,16 @@ zigbee-mac = { path = "../../zigbee-mac" }
 zigbee-runtime = { path = "../../zigbee-runtime" }
 zigbee-zcl = { path = "../../zigbee-zcl" }
 esp32-zigbee-devkit = { path = "../../boards/esp32-zigbee-devkit" }
+# App-side envelope verification (feature `signed-ota`).
+mcuboot-image = { path = "../../mcuboot-image", features = ["firmware-writer"], optional = true }
+
+[build-dependencies]
+# Trusted keys for `signed-ota` from `boot/app-verify.conf`.
+zrs-boot-layout = { path = "../../bootloaders/layout", optional = true }
+
+[dev-dependencies]
+# Signs test envelopes (host tests of `signed-ota` only).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 
 # Only for naming the concrete flash error type that `esp32-zigbee-devkit`'s
 # `RawFlash` returns (`embedded_storage::nor_flash::ErrorType::Error`); all
@@ -58,6 +68,11 @@ esp32h2 = [
     "zigbee-runtime/ota",
     "dep:esp32h2-sleep",
 ]
+# Accept only OTA images in a signed MCUboot envelope (P-256, keys from
+# `boot/app-verify.conf`) that are not older than the running image. The
+# ESP-IDF bootloader still boots the native image unchecked; see
+# `signed_ota`.
+signed-ota = ["dep:mcuboot-image", "dep:zrs-boot-layout"]
 # ESP32-H2 only, experimental: compile in the TOP/CPU/modem power-down
 # light sleep (`SleepMode::TopPowerDown`); the image selects it at runtime.
 h2-top-pd = ["esp32h2", "light-sleep", "esp32h2-sleep/top-pd"]

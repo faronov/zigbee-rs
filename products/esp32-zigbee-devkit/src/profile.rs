@@ -55,9 +55,36 @@ mod with_ota {
     use zigbee_runtime::ota::{OtaConfig, OtaManager};
     use zigbee_runtime::profile::{ProfileError, WithOta};
 
+    /// The OTA writer: the ESP image writer, behind the signed-envelope
+    /// check with feature `signed-ota`.
+    #[cfg(not(feature = "signed-ota"))]
+    pub type OtaWriter = EspFirmwareWriter<EspOtaFlash>;
+    #[cfg(feature = "signed-ota")]
+    pub type OtaWriter = crate::signed_ota::SignedEspWriter<EspOtaFlash>;
+
     /// The ESP32 profile: the shared base profile plus the mandatory OTA
     /// Upgrade client cluster.
-    pub type SensorProfile = WithOta<BaseSensorProfile, EspFirmwareWriter<EspOtaFlash>>;
+    pub type SensorProfile = WithOta<BaseSensorProfile, OtaWriter>;
+
+    /// The product's OTA writer for a build advertising `firmware_version`
+    /// (with `signed-ota`, also the oldest envelope version accepted).
+    #[cfg_attr(not(feature = "signed-ota"), allow(unused_variables))]
+    pub fn ota_writer(firmware_version: u32, reset: fn() -> !) -> Result<OtaWriter, OtaInitError> {
+        let writer = EspFirmwareWriter::new(EspOtaFlash::new(), reset)?;
+        #[cfg(feature = "signed-ota")]
+        let writer = crate::signed_ota::signed_writer(
+            writer,
+            crate::signed_ota::image_version(firmware_version),
+        );
+        Ok(writer)
+    }
+
+    /// The ESP image writer inside [`OtaWriter`].
+    fn esp_writer(writer: &OtaWriter) -> &EspFirmwareWriter<EspOtaFlash> {
+        #[cfg(feature = "signed-ota")]
+        let writer = writer.inner();
+        writer
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SensorProfileError {
@@ -102,11 +129,11 @@ mod with_ota {
             auto_accept: true,
             hardware_version: Some(OTA_HARDWARE_VERSION),
         };
-        let writer = EspFirmwareWriter::new(EspOtaFlash::new(), reset)?;
+        let writer = ota_writer(firmware_version, reset)?;
         log::info!(
             "[ESP32] OTA ready: running slot {}, staging slot {}, version {}",
-            writer.running_slot(),
-            writer.target_slot(),
+            esp_writer(&writer).running_slot(),
+            esp_writer(&writer).target_slot(),
             firmware_version
         );
         Ok(WithOta::new(
@@ -117,4 +144,4 @@ mod with_ota {
 }
 
 #[cfg(target_os = "none")]
-pub use with_ota::{SensorProfile, SensorProfileError, sensor_profile};
+pub use with_ota::{OtaWriter, SensorProfile, SensorProfileError, ota_writer, sensor_profile};

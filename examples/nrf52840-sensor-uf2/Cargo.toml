@@ -22,6 +22,11 @@ board-nrf-dk = [
     "dep:nrf52840-dk",
     "nrf52840-sensor-product/deployment-dk",
 ] # Nordic nRF52840 DK, direct/J-Link map
+# Link the application into the primary slot of the zigbee-rs loader
+# (products/nrf52840-sensor/bootloader) for the selected board, instead of
+# directly after the MBR/SoftDevice. Sign the result with imgtool
+# (header 0x200). Changes only the link address; off by default.
+zrs-boot = []
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
@@ -46,6 +51,9 @@ defmt = "1.0"
 defmt-rtt = "1.0"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 log = "0.4"
+
+[build-dependencies]
+zrs-boot-layout = { path = "../../bootloaders/layout" }
 
 [profile.release]
 opt-level = "s"

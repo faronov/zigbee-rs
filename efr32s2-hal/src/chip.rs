@@ -93,6 +93,7 @@ impl BusClock {
     pub const TIMER0: Self = Self::clken0(4);
     pub const USART0: Self = Self::clken0(8);
     pub const USART1: Self = Self::clken0(9);
+    pub const WDOG0: Self = Self::clken0(13);
     pub const I2C0: Self = Self::clken0(14);
     pub const SYSCFG: Self = Self::clken0(16);
     pub const HFXO0: Self = Self::clken0(19);

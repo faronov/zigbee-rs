@@ -1,0 +1,32 @@
+# EFR32MG21 sensor on BRD4181A/BRD4001A (EFR32MG21A010F1024IM32: 1 MiB
+# flash, 8 KiB pages; RAM as link/memory.x). Chained: the resident Gecko
+# Bootloader (0x0..0x4000) is never written and starts whatever is at 0x4000
+# — here the zigbee-rs loader. The router tables and the security journal
+# keep the addresses of link/memory.x (0x74000..0x80000).
+#
+# The slots must be contiguous with nothing protected between them, and two
+# equal slots below 0x74000 (216 KiB each) cannot hold the current sensor
+# image (~234 KB), so they occupy the upper 512 KiB. This deployment
+# therefore needs an F1024 part (unlike link/memory.x, which also fits F512);
+# on an F512 part every slot read fails and the loader halts.
+# 0x8000..0x74000 is unused.
+# Watchdog: WDOG0 (ULFRCO) for the boot decision only, stopped before the
+# hand-over; 8 s requested -> PERSEL 11 (>= 14.9 s, nominally 16.4 s).
+name           = efr32mg21-devkit
+flash          = 0x0..0x100000
+sector         = 0x2000
+reserved       = 0x0..0x4000 gecko-bootloader
+loader         = 0x4000..0x8000
+reserved       = 0x74000..0x7C000 router-tables
+journal        = 0x7C000..0x80000
+primary        = 0x80000..0xC0000
+secondary      = 0xC0000..0x100000
+ram            = 0x20000000..0x20010000
+header         = 0x200
+vector-align   = 0x200
+loader-version = 1
+trial-boots    = 3
+watchdog-ms    = 8000
+mode           = overwrite
+env-prefix     = EFR32MG21
+key-file       = ../../../bootloaders/keys/own-ec-p256.xy.hex

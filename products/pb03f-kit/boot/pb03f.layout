@@ -1,0 +1,40 @@
+# Ai-Thinker PB-03F-Kit (PHY6252, 512 KiB flash, 4 KiB sectors) under the
+# zigbee-rs loader. The boot ROM starts the loader from its ROM-boot table
+# (0x2000, one sector) and SRAM load data (0x5000: jump table and run
+# descriptor); both are written only when the loader is installed. The ROM
+# and factory sectors (0x0..0x2000, 0x3000..0x5000: boot/OTA record and the
+# BLE address used for the EUI-64) are never written.
+#
+# Applications run XIP at 0x11000000 + primary + 0x100, i.e. 0x11010100 like
+# the direct ROM-boot image. Boot ABI (no VTOR on this Cortex-M0): the
+# image's `[SP, Reset]` pair is followed by its 0x400-byte ROM jump table,
+# which the loader copies to 0x1fff0000 before the hand-over.
+#
+# The XIP application is capped at 200,448 B (0x30F00), the XIP
+# application slot of the direct ROM-boot map (products/pb03f-kit/link/
+# memory.x, FLASH LENGTH; the layout tests check that both agree). Each slot
+# holds that cap plus the 0x100 header, the 0x300 TLV reserve and the 4 KiB
+# trailer sector, rounded up to whole sectors: 0x33000.
+# 0xA000..0x10000 and 0x76000..0x7A000 are unused.
+name           = pb03f-kit
+flash          = 0x0..0x80000
+sector         = 0x1000
+reserved       = 0x0..0x2000 rom-factory
+reserved       = 0x2000..0x3000 rom-boot-table
+reserved       = 0x3000..0x5000 factory-data
+reserved       = 0x5000..0x6000 loader-rom-load-data
+loader         = 0x6000..0xA000
+primary        = 0x10000..0x43000
+secondary      = 0x43000..0x76000
+reserved       = 0x7A000..0x7E000 router-tables
+journal        = 0x7E000..0x80000
+ram            = 0x1FFF1838..0x20000000
+xip-base       = 0x11000000
+header         = 0x100
+app-max        = 200448
+loader-version = 1
+trial-boots    = 3
+watchdog-ms    = 0
+mode           = overwrite
+env-prefix     = PB03F
+key-file       = ../../../bootloaders/keys/own-ec-p256.xy.hex

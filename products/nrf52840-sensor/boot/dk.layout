@@ -1,0 +1,25 @@
+# nRF52840 DK (J-Link) under the zigbee-rs loader. No resident bootloader:
+# the loader is the reset image at 0x0 and the security journal keeps the
+# top two pages, exactly as the bare DK map (link/uf2-dk.x).
+name           = nrf52840-dk
+flash          = 0x0..0x100000
+sector         = 0x1000
+loader         = 0x0..0x4000
+primary        = 0x4000..0x81000
+secondary      = 0x81000..0xFE000
+journal        = 0xFE000..0x100000
+ram            = 0x20000000..0x20040000
+# VTOR needs 512-byte alignment (48 + 16 vectors rounded up).
+header         = 0x200
+vector-align   = 0x200
+loader-version = 1
+trial-boots    = 3
+# The nRF WDT cannot be stopped once started; off until the applications
+# service it (the shell has no WDT support, so a non-zero value fails).
+# The WDT cannot be stopped once started: the loader starts it for the
+# boot decision (paused in sleep and debug halt) and the `zrs-boot`
+# application must keep reloading it (NrfWatchdogSupervisor).
+watchdog-ms    = 8000
+mode           = overwrite
+env-prefix     = NRF52840
+key-file       = ../../../bootloaders/keys/own-ec-p256.xy.hex

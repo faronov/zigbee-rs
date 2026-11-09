@@ -171,6 +171,11 @@ jobs:
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
             features: esp32h2,light-sleep,sed
+          # Signed MCUboot envelopes over OTA (boot/app-verify.conf keys).
+          - name: ESP32-C6 sensor product (signed OTA)
+            manifest: products/esp32-zigbee-devkit/Cargo.toml
+            workspace: products/esp32-zigbee-devkit
+            features: esp32c6,sed,roles,signed-ota
           - name: nRF52840 always-on End Device product
             manifest: products/nrf52840-router/Cargo.toml
             workspace: products/nrf52840-router
@@ -356,6 +361,9 @@ jobs:
           cargo fmt --manifest-path products/cc2340-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path cc2340r5-hal/Cargo.toml -- --check
           cargo fmt --manifest-path bootloaders/cc2340r5-boot/Cargo.toml -- --check
+          cargo fmt --manifest-path products/nrf52840-sensor/bootloader/Cargo.toml -- --check
+          cargo fmt --manifest-path bootloaders/efr32s2-boot/Cargo.toml -- --check
+          cargo fmt --manifest-path bootloaders/phy62x2-boot/Cargo.toml -- --check
           cargo fmt --manifest-path products/nrf52840-router/Cargo.toml -- --check
           cargo fmt --manifest-path boards/nrf52840-mdk-usb-dongle/Cargo.toml -- --check
           cargo fmt --manifest-path boards/nrf52840-pca10059/Cargo.toml -- --check
@@ -817,6 +825,7 @@ jobs:
       matrix:
         include:
           - board: promicro
+            loader: promicro-uf2
             feature: board-promicro
             artifact: nrf52840-sensor-uf2-firmware
             app_start: "00026000"
@@ -826,6 +835,7 @@ jobs:
             bootloader_start: "000f4000"
             boot_state_start: "000fe000"
           - board: mdk
+            loader: mdk-uf2
             feature: board-mdk
             artifact: nrf52840-sensor-uf2-mdk-firmware
             app_start: "00001000"
@@ -835,6 +845,7 @@ jobs:
             bootloader_start: "000f4000"
             boot_state_start: "000fe000"
           - board: pca10059
+            loader: pca10059-uf2
             feature: board-nrf-dongle
             artifact: nrf52840-sensor-uf2-pca10059-firmware
             app_start: "00001000"
@@ -844,6 +855,7 @@ jobs:
             bootloader_start: "000f4000"
             boot_state_start: "000fe000"
           - board: dk
+            loader: dk
             feature: board-nrf-dk
             artifact: nrf52840-sensor-uf2-dk-firmware
             app_start: "00000000"
@@ -858,11 +870,13 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: thumbv7em-none-eabihf
-          components: llvm-tools
+          components: llvm-tools, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: examples/nrf52840-sensor-uf2
-          key: thumbv7em-nrf52840-uf2-${{ env.RUST_TOOLCHAIN }}-${{ matrix.board }}-${{ hashFiles('examples/nrf52840-sensor-uf2/Cargo.lock', 'products/nrf52840-sensor/link/uf2-*.x') }}
+          workspaces: |
+            examples/nrf52840-sensor-uf2
+            products/nrf52840-sensor/bootloader
+          key: thumbv7em-nrf52840-uf2-${{ env.RUST_TOOLCHAIN }}-${{ matrix.board }}-${{ hashFiles('examples/nrf52840-sensor-uf2/Cargo.lock', 'products/nrf52840-sensor/link/uf2-*.x', 'products/nrf52840-sensor/bootloader/Cargo.lock', 'products/nrf52840-sensor/boot/*.layout') }}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12.11"
@@ -871,6 +885,35 @@ jobs:
       - name: Build nRF52840 UF2 sensor (release)
         working-directory: examples/nrf52840-sensor-uf2
         run: cargo build --release --locked --no-default-features --features "${{ matrix.feature }}"
+      # zigbee-rs loader for this board (products/nrf52840-sensor/boot/
+      # <loader>.layout). Its build fails if the loader outgrows its region.
+      - name: Build zigbee-rs loader
+        working-directory: products/nrf52840-sensor/bootloader
+        run: |
+          cargo build --release --locked --features "${{ matrix.loader }}"
+          cargo clippy --release --locked --features "${{ matrix.loader }}" -- -D warnings
+          if [[ "${{ matrix.board }}" == dk ]]; then
+            # No deployment, and Ed25519, must be refused with an explanation.
+            if cargo build --release --locked 2> "$RUNNER_TEMP/nrf-boot-none.log"; then
+              echo "nrf52840-sensor-boot built without a deployment feature" >&2
+              exit 1
+            fi
+            grep -q 'select exactly one deployment feature' "$RUNNER_TEMP/nrf-boot-none.log"
+            if cargo build --release --locked --features dk,ed25519 \
+              2> "$RUNNER_TEMP/nrf-boot-ed25519.log"; then
+              echo "nrf52840-sensor-boot built with feature ed25519; it must fail" >&2
+              exit 1
+            fi
+            grep -q 'Ed25519 is not supported by the Cortex-M loaders' \
+              "$RUNNER_TEMP/nrf-boot-ed25519.log"
+          fi
+      # The same application linked into the loader's primary slot (feature
+      # zrs-boot); build.rs checks it against the layout file.
+      - name: Build loader-linked application
+        working-directory: examples/nrf52840-sensor-uf2
+        run: |
+          cargo build --release --locked --no-default-features \
+            --features "${{ matrix.feature }},zrs-boot" --target-dir target/zrs-boot
       - name: Create firmware artifacts (.bin, .hex, .uf2)
         run: |
           ELF=examples/nrf52840-sensor-uf2/target/thumbv7em-none-eabihf/release/nrf52840-sensor-uf2
@@ -1689,12 +1732,14 @@ jobs:
         with:
           toolchain: ${{ env.ESP_PHY_RUST_TOOLCHAIN }}
           targets: thumbv6m-none-eabi
-          components: rust-src, llvm-tools
+          components: rust-src, llvm-tools, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: examples/pb03f-kit
+          workspaces: |
+            examples/pb03f-kit
+            bootloaders/phy62x2-boot
           cache-targets: false
-          key: thumbv6m-pb03f-${{ env.ESP_PHY_RUST_TOOLCHAIN }}-${{ hashFiles('examples/pb03f-kit/Cargo.lock', 'products/pb03f-kit/link/**') }}
+          key: thumbv6m-pb03f-${{ env.ESP_PHY_RUST_TOOLCHAIN }}-${{ hashFiles('examples/pb03f-kit/Cargo.lock', 'products/pb03f-kit/link/**', 'bootloaders/phy62x2-boot/Cargo.lock', 'products/pb03f-kit/boot/*.layout') }}
       - name: Build PB-03F-Kit binaries (release)
         working-directory: examples/pb03f-kit
         run: cargo build --release --locked
@@ -1727,11 +1772,33 @@ jobs:
             cat router.log >&2
             exit 1
           }
+      # zigbee-rs loader (products/pb03f-kit/boot/pb03f.layout), started by
+      # the boot ROM. Its build fails if it outgrows its region.
+      - name: Build zigbee-rs loader
+        working-directory: bootloaders/phy62x2-boot
+        run: |
+          cargo build --release --locked --features pb03f-kit
+          cargo clippy --release --locked --features pb03f-kit -- -D warnings
+          # No deployment, and Ed25519, must be refused with an explanation.
+          if cargo build --release --locked 2> "$RUNNER_TEMP/phy-boot-none.log"; then
+            echo "phy62x2-boot built without a deployment feature" >&2
+            exit 1
+          fi
+          grep -q 'select exactly one deployment feature' "$RUNNER_TEMP/phy-boot-none.log"
+          if cargo build --release --locked --features pb03f-kit,ed25519 \
+            2> "$RUNNER_TEMP/phy-boot-ed25519.log"; then
+            echo "phy62x2-boot built with feature ed25519; it must fail" >&2
+            exit 1
+          fi
+          grep -q 'Ed25519 is not supported by the Cortex-M loaders' \
+            "$RUNNER_TEMP/phy-boot-ed25519.log"
       - name: Create ROM-boot images
         run: |
           OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
-          for BIN in pb03f-zigbee pb03f-lab pb03f-radio-lab; do
-            ELF=examples/pb03f-kit/target/thumbv6m-none-eabi/release/$BIN
+          for ELF in examples/pb03f-kit/target/thumbv6m-none-eabi/release/pb03f-zigbee \
+              examples/pb03f-kit/target/thumbv6m-none-eabi/release/pb03f-lab \
+              examples/pb03f-kit/target/thumbv6m-none-eabi/release/pb03f-radio-lab \
+              bootloaders/phy62x2-boot/target/thumbv6m-none-eabi/release/phy62x2-boot; do
             "$OBJCOPY" -O ihex "$ELF" "${ELF}.hex"
             cargo run --quiet --locked -p phy62x2-image -- --rom-boot \
               "${ELF}.hex" "${ELF}.table.bin" "${ELF}.app.bin"
@@ -1744,6 +1811,9 @@ jobs:
             examples/pb03f-kit/target/thumbv6m-none-eabi/release/pb03f-*.hex
             examples/pb03f-kit/target/thumbv6m-none-eabi/release/pb03f-*.table.bin
             examples/pb03f-kit/target/thumbv6m-none-eabi/release/pb03f-*.app.bin
+            bootloaders/phy62x2-boot/target/thumbv6m-none-eabi/release/phy62x2-boot.hex
+            bootloaders/phy62x2-boot/target/thumbv6m-none-eabi/release/phy62x2-boot.table.bin
+            bootloaders/phy62x2-boot/target/thumbv6m-none-eabi/release/phy62x2-boot.app.bin
           if-no-files-found: error
 
   # ── EFR32MG1P (Silicon Labs, ARM Cortex-M4F) ─────────────────
@@ -1843,7 +1913,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: examples/efr32mg21-sensor
-          key: thumbv8m-efr32mg21-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg21-sensor/Cargo.lock', 'products/efr32mg21-sensor/link/**', 'efr32s2-hal/link/**') }}
+          key: thumbv8m-efr32mg21-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg21-sensor/Cargo.lock', 'products/efr32mg21-sensor/link/**', 'products/efr32mg21-sensor/boot/**', 'efr32s2-hal/link/**') }}
       # One bin per role; role features are mutually exclusive, so each role
       # is its own build and dependency feature unification never mixes them.
       - name: Build EFR32MG21 sensor, End Device and Router (release)
@@ -1852,6 +1922,17 @@ jobs:
           cargo build --release --locked
           cargo build --release --locked --no-default-features --features ed
           cargo build --release --locked --no-default-features --features router
+      # The leaf roles linked into the primary slot of the zigbee-rs loader
+      # (products/efr32mg21-sensor/boot/devkit.layout, feature zrs-boot);
+      # build.rs checks the layout against link/memory.x. The router image
+      # does not fit the 252,672 B slot.
+      - name: Build EFR32MG21 loader-linked sensor and End Device
+        working-directory: examples/efr32mg21-sensor
+        run: |
+          for role in sed ed; do
+            cargo build --release --locked --no-default-features \
+              --features "$role,zrs-boot" --target-dir target/zrs-boot
+          done
       - name: Clippy EFR32MG21 role compositions
         working-directory: examples/efr32mg21-sensor
         run: |
@@ -1964,12 +2045,34 @@ jobs:
           workspaces: |
             examples/efr32mg22-sensor
             tools/efr32s2-lab
-          key: thumbv8m-efr32mg22-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg22-sensor/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/efr32mg22-sensor/link/**', 'efr32s2-hal/link/**') }}
+          key: thumbv8m-efr32mg22-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg22-sensor/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/efr32mg22-sensor/link/**', 'products/efr32mg22-sensor/boot/**', 'efr32s2-hal/link/**') }}
       - name: Build EFR32MG22 sensor and End Device (release)
         working-directory: examples/efr32mg22-sensor
         run: |
           cargo build --release --locked
           cargo build --release --locked --no-default-features --features ed
+      # The leaf roles linked into the primary slot of the zigbee-rs loader
+      # (products/efr32mg22-sensor/boot/devkit.layout, feature zrs-boot).
+      # That layout reclaims the router tables, so router + zrs-boot must be
+      # refused by build.rs.
+      - name: Build EFR32MG22 loader-linked sensor and End Device
+        working-directory: examples/efr32mg22-sensor
+        run: |
+          for role in sed ed; do
+            cargo build --release --locked --no-default-features \
+              --features "$role,zrs-boot" --target-dir target/zrs-boot
+          done
+          if cargo build --release --locked --no-default-features \
+            --features router,zrs-boot --target-dir target/zrs-boot \
+            2> "$RUNNER_TEMP/mg22-router-zrs-boot.log"; then
+            echo "EFR32MG22 router built against the loader layout" >&2
+            exit 1
+          fi
+          grep -qF 'feature `router` cannot be combined with `zrs-boot`' \
+            "$RUNNER_TEMP/mg22-router-zrs-boot.log" || {
+            cat "$RUNNER_TEMP/mg22-router-zrs-boot.log" >&2
+            exit 1
+          }
       # The Router composition compiles, but its static RAM leaves less than
       # the 14 KiB stack floor in 32 KiB SRAM. The product linker script must
       # reject it with that assertion rather than link an image that would
@@ -2020,6 +2123,64 @@ jobs:
             examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-*.bin
             examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-*.hex
             examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release/efr32mg22-*.size.json
+          if-no-files-found: error
+
+  # zigbee-rs loader for EFR32 Series 2, one build per product layout
+  # (products/*/boot/*.layout). On ZBT-1 it is chained above the resident
+  # Gecko Bootloader, which the layout reserves.
+  build-efr32s2-boot:
+    name: Build EFR32 Series 2 zigbee-rs loader
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv8m.main-none-eabihf
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: bootloaders/efr32s2-boot
+          cache-targets: false
+          key: thumbv8m-efr32s2-boot-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('bootloaders/efr32s2-boot/Cargo.lock', 'products/*/boot/*.layout', 'efr32s2-hal/link/**') }}
+      - name: Build and lint each deployment
+        working-directory: bootloaders/efr32s2-boot
+        run: |
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          for deployment in efr32mg22-devkit efr32mg21-devkit ha-connect-zbt1 \
+              ha-connect-zbt1,gecko-recovery; do
+            DIR="target/${deployment//,/-}"
+            cargo build --release --locked --features "$deployment" --target-dir "$DIR"
+            cargo clippy --release --locked --features "$deployment" --target-dir "$DIR" \
+              -- -D warnings
+            ELF="$DIR/thumbv8m.main-none-eabihf/release/efr32s2-boot"
+            "$OBJCOPY" -O ihex "$ELF" "$DIR/efr32s2-boot-${deployment//,/-}.hex"
+          done
+      - name: Refused configurations fail with an explanation
+        working-directory: bootloaders/efr32s2-boot
+        run: |
+          refused() {
+            local message=$1
+            shift
+            if cargo build --release --locked "$@" 2> "$RUNNER_TEMP/efr32s2-boot.log"; then
+              echo "efr32s2-boot built with $*; it must fail" >&2
+              exit 1
+            fi
+            grep -qE "$message" "$RUNNER_TEMP/efr32s2-boot.log" || {
+              cat "$RUNNER_TEMP/efr32s2-boot.log" >&2
+              exit 1
+            }
+          }
+          # Without a deployment the HAL has no chip feature either; either
+          # explanation may come first.
+          refused 'select exactly one deployment feature|enable one chip feature'
+          refused 'needs a chained layout' --features efr32mg22-devkit,gecko-recovery
+          refused 'Ed25519 is not supported by the Cortex-M loaders' --features ha-connect-zbt1,ed25519
+      - name: Upload EFR32 Series 2 loaders
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: efr32s2-boot
+          path: bootloaders/efr32s2-boot/target/*/efr32s2-boot-*.hex
           if-no-files-found: error
 
   # ── Deploy Book + Web Flasher to GitHub Pages ────────────────

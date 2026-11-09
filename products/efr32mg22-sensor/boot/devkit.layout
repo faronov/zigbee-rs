@@ -1,0 +1,32 @@
+# EFR32MG22 sensor on BRD4183A/BRD4001A (512 KiB flash, 8 KiB pages, 32 KiB
+# RAM). No resident bootloader: the Secure Engine starts the vector table at
+# 0x0, so the zigbee-rs loader lives there. The security journal keeps the
+# address of link/memory.x and is never written by the loader. Recovery: SWD.
+#
+# Product decision (boot-phase3): the router role's table journals
+# (0x74000..0x7C000 in link/memory.x) are reclaimed for the slots: each slot
+# is 0x3C000 (245,760 B); minus the 8 KiB trailer sector, the 0x200 header
+# and the 0x300 TLV reserve the application may link 0x39B00 = 236,288 B.
+# Only the end-device roles (sed, ed) build against this layout; the router
+# role (which does not fit the 32 KiB SRAM anyway) is refused by the
+# `zrs-boot` application build (examples/efr32mg22-sensor/build.rs).
+#
+# Watchdog: WDOG0 on the ULFRCO, armed for the boot decision only and stopped
+# before the hand-over. 8 s requested -> PERSEL 11: at least 14.9 s at the
+# assumed 1.1 kHz ULFRCO bound, nominally 16.4 s.
+name           = efr32mg22-devkit
+flash          = 0x0..0x80000
+sector         = 0x2000
+loader         = 0x0..0x4000
+primary        = 0x4000..0x40000
+secondary      = 0x40000..0x7C000
+journal        = 0x7C000..0x80000
+ram            = 0x20000000..0x20008000
+header         = 0x200
+vector-align   = 0x200
+loader-version = 1
+trial-boots    = 3
+watchdog-ms    = 8000
+mode           = overwrite
+env-prefix     = EFR32MG22
+key-file       = ../../../bootloaders/keys/own-ec-p256.xy.hex

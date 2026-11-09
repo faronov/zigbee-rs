@@ -213,8 +213,7 @@ impl EnvironmentSink for Thermometer {
     }
 }
 
-pub type ThermoProfile =
-    WithOta<DeviceProfile<Thermometer>, product::ota::EspFirmwareWriter<product::ota::EspOtaFlash>>;
+pub type ThermoProfile = WithOta<DeviceProfile<Thermometer>, product::profile::OtaWriter>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThermoProfileError {
@@ -228,7 +227,7 @@ pub fn thermo_profile(
     firmware_version: u32,
     reset: fn() -> !,
 ) -> Result<ThermoProfile, ThermoProfileError> {
-    let writer = product::ota::EspFirmwareWriter::new(product::ota::EspOtaFlash::new(), reset)
+    let writer = product::profile::ota_writer(firmware_version, reset)
         .map_err(ThermoProfileError::OtaInitialization)?;
     let config = zigbee_runtime::ota::OtaConfig {
         manufacturer_code: product::OTA_MANUFACTURER_CODE,
