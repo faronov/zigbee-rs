@@ -61,8 +61,17 @@
 //! byte is rewritten. Any other image discards the staged data and starts at
 //! offset 0 with a fresh erase. Corruption (header/layout mismatch, a writer
 //! error, verification failure) and an explicit [`OtaManager::abort`] always
-//! discard. The suspended state lives in RAM only; a reset restarts the
-//! download from offset 0.
+//! discard.
+//!
+//! The suspended state itself lives in RAM. To survive a reset or power
+//! loss, the product builds a writer that keeps progress
+//! ([`FirmwareWriter::checkpoint_interval`] non-zero); the default writer
+//! methods keep none (and compile away), and a reset then restarts the
+//! download at offset 0. The manager records progress each time the staged
+//! payload crosses a multiple of the writer's interval (never per block, to bound flash wear) and
+//! [`OtaManager::new`] restores the recorded download as a suspended one:
+//! the next session offering the same image continues at the offset the
+//! writer reports, which may be earlier than the last checkpoint.
 //!
 //! Enabled with the `ota` feature flag.
 
@@ -259,7 +268,7 @@ impl OtaDownloadCtx {
 
 impl<F: FirmwareWriter> OtaManager<F> {
     /// Create a new OTA manager.
-    pub fn new(writer: F, config: OtaConfig) -> Self {
+    pub fn new(mut writer: F, config: OtaConfig) -> Self {
         let mut cluster = OtaCluster::new(
             config.manufacturer_code,
             config.image_type,
@@ -270,21 +279,68 @@ impl<F: FirmwareWriter> OtaManager<F> {
             cluster.set_hardware_version(hw);
         }
 
+        // A download recorded before a reset resumes as a suspended one.
+        let restored = Self::restore_checkpoint(&mut writer, &config);
+        let suspended = restored.is_some();
         Self {
             cluster,
             writer,
             config,
             pending_frame: None,
             zcl_seq: 0,
-            download_ctx: OtaDownloadCtx::new(),
+            download_ctx: restored.unwrap_or_else(OtaDownloadCtx::new),
             offered_image: None,
             accepted_image: None,
             end_request_retries: 0,
             response_wait_secs: 0,
             block_retry: None,
             activation_pending: false,
-            suspended: false,
+            suspended,
         }
+    }
+
+    /// Give the firmware writer back (for example to rebuild the manager).
+    pub fn into_writer(self) -> F {
+        self.writer
+    }
+
+    /// The download context of a download that the writer recorded before a
+    /// reset, if it matches this client and slot.
+    fn restore_checkpoint(writer: &mut F, config: &OtaConfig) -> Option<OtaDownloadCtx> {
+        if writer.checkpoint_interval() == 0 {
+            return None;
+        }
+        let record = writer.resume()?;
+        let payload_end = record.payload_start.checked_add(record.firmware_size);
+        if record.manufacturer_code != config.manufacturer_code
+            || record.image_type != config.image_type
+            || record.staged == 0
+            || record.staged >= record.firmware_size
+            || record.firmware_size > writer.slot_size()
+            || payload_end.is_none_or(|end| end > record.image_size)
+        {
+            // The next accepted download erases the slot.
+            return None;
+        }
+        let mut ctx = OtaDownloadCtx::new();
+        ctx.phase = OtaParsePhase::Payload;
+        ctx.payload_start = record.payload_start;
+        ctx.firmware_size = record.firmware_size;
+        ctx.firmware_written = record.staged;
+        ctx.file_offset = record.payload_start + record.staged;
+        ctx.slot_erased = true;
+        ctx.offer = Some(OtaImageOffer {
+            manufacturer_code: record.manufacturer_code,
+            image_type: record.image_type,
+            file_version: record.file_version,
+            image_size: record.image_size,
+        });
+        log::info!(
+            "[OTA] Resumable download 0x{:08X} at offset {}",
+            record.file_version,
+            ctx.file_offset
+        );
+        Some(ctx)
     }
 
     fn next_seq(&mut self) -> u8 {
@@ -812,9 +868,12 @@ impl<F: FirmwareWriter> OtaManager<F> {
                         let n = rest.len().min((payload_end - pos) as usize);
                         let flash_offset = pos - ctx.payload_start;
                         self.writer.write_block(flash_offset, &rest[..n])?;
-                        self.download_ctx.firmware_written = flash_offset + n as u32;
+                        let written = flash_offset + n as u32;
+                        self.download_ctx.firmware_written = written;
                         if pos + n as u32 == payload_end {
                             self.download_ctx.phase = OtaParsePhase::Trailer;
+                        } else {
+                            self.checkpoint_progress(&offer, flash_offset, written);
                         }
                         n
                     }
@@ -829,6 +888,27 @@ impl<F: FirmwareWriter> OtaManager<F> {
             self.download_ctx.file_offset = pos + consumed as u32;
         }
         Ok(())
+    }
+
+    /// Record download progress when `written` crosses a multiple of
+    /// [`FirmwareWriter::checkpoint_interval`]. Best effort: a lost
+    /// checkpoint only costs a longer download after a reset.
+    fn checkpoint_progress(&mut self, offer: &OtaImageOffer, before: u32, written: u32) {
+        let every = self.writer.checkpoint_interval();
+        if every == 0 || written / every == before / every {
+            return;
+        }
+        let ctx = &self.download_ctx;
+        let record = crate::firmware_writer::ResumeRecord {
+            manufacturer_code: offer.manufacturer_code,
+            image_type: offer.image_type,
+            file_version: offer.file_version,
+            image_size: offer.image_size,
+            payload_start: ctx.payload_start,
+            firmware_size: ctx.firmware_size,
+            staged: written,
+        };
+        let _ = self.writer.checkpoint(&record);
     }
 
     /// Buffer and validate the OTA file header. Returns bytes consumed.

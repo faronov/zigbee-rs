@@ -1266,11 +1266,20 @@ const RESUME_TYPE: u16 = 0x0001;
 fn resume_manager(
     auto_accept: bool,
 ) -> zigbee_runtime::ota::OtaManager<zigbee_runtime::firmware_writer::MockFirmwareWriter> {
-    use zigbee_runtime::firmware_writer::MockFirmwareWriter;
+    resume_manager_with(
+        zigbee_runtime::firmware_writer::MockFirmwareWriter::new(4096),
+        auto_accept,
+    )
+}
+
+fn resume_manager_with(
+    writer: zigbee_runtime::firmware_writer::MockFirmwareWriter,
+    auto_accept: bool,
+) -> zigbee_runtime::ota::OtaManager<zigbee_runtime::firmware_writer::MockFirmwareWriter> {
     use zigbee_runtime::ota::{OtaConfig, OtaManager};
 
     OtaManager::new(
-        MockFirmwareWriter::new(4096),
+        writer,
         OtaConfig {
             manufacturer_code: RESUME_MFG,
             image_type: RESUME_TYPE,
@@ -1592,4 +1601,109 @@ fn ota_manager_explicit_abort_discards_a_suspended_download() {
     resume_start_session(&mut mgr, 2, total);
     let request = mgr.take_pending_frame().expect("fresh block request");
     assert_eq!(pending_block_offset(&request), 0);
+}
+
+// ── Resume after a reset (persistent checkpoints) ───────────────
+
+/// A "reset" keeps two managers, each holding a 256 KiB mock slot; run the
+/// test on a thread with room for them.
+fn with_slot_stack(test: fn()) {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(test)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Progress is recorded only when the staged payload crosses a multiple of
+/// the interval, never per block, and a manager rebuilt over the same
+/// writer (a reset) resumes at the recorded offset.
+#[test]
+fn ota_manager_checkpoints_at_the_interval_and_resumes_after_a_reset() {
+    with_slot_stack(ota_manager_checkpoints_at_the_interval_and_resumes_after_a_reset_body);
+}
+
+fn ota_manager_checkpoints_at_the_interval_and_resumes_after_a_reset_body() {
+    use zigbee_runtime::firmware_writer::MockFirmwareWriter;
+
+    let firmware = resume_firmware(3);
+    let file = build_ota_file(RESUME_MFG, RESUME_TYPE, 2, &firmware);
+    let total = file.len() as u32;
+    let mut mgr = resume_manager_with(MockFirmwareWriter::with_resume(4096, 64), true);
+
+    resume_start_session(&mut mgr, 2, total);
+    // File blocks of 48 B; the payload starts at file offset 62, so after
+    // the block ending at 240 the writer holds 178 payload bytes.
+    resume_serve_blocks(&mut mgr, &file, 2, 240);
+    assert_eq!(mgr.writer().bytes_written(), 178);
+    // Crossed 64 (at 82) and 128 (at 130): two records for four blocks.
+    assert_eq!(mgr.writer().checkpoint_count(), 2);
+    assert_eq!(mgr.writer().last_checkpoint().map(|r| r.staged), Some(130));
+
+    // Power loss: RAM state is gone, the writer (flash) keeps the record.
+    let writer = mgr.into_writer();
+    let mut mgr = resume_manager_with(writer, true);
+    assert!(mgr.is_suspended());
+    assert_eq!(
+        mgr.suspended_download()
+            .map(|(offer, offset)| (offer.file_version, offset)),
+        Some((2, 62 + 130))
+    );
+
+    resume_start_session(&mut mgr, 2, total);
+    let request = mgr.take_pending_frame().expect("resumed block request");
+    assert_eq!(pending_block_offset(&request), 62 + 130);
+    assert!(mgr.requeue_pending_frame(request));
+    resume_serve_blocks(&mut mgr, &file, 2, u32::MAX);
+    assert_eq!(mgr.state(), OtaState::WaitingActivate);
+    assert_eq!(mgr.writer().data(), &firmware[..]);
+    // The block that completed the payload did not record progress.
+    assert_eq!(mgr.writer().checkpoint_count(), 2 + 1);
+}
+
+/// After a reset, a different image discards the recorded download and
+/// starts at offset 0.
+#[test]
+fn ota_manager_reset_checkpoint_is_discarded_for_another_image() {
+    with_slot_stack(ota_manager_reset_checkpoint_is_discarded_for_another_image_body);
+}
+
+fn ota_manager_reset_checkpoint_is_discarded_for_another_image_body() {
+    use zigbee_runtime::firmware_writer::MockFirmwareWriter;
+
+    let firmware = resume_firmware(5);
+    let file = build_ota_file(RESUME_MFG, RESUME_TYPE, 2, &firmware);
+    let total = file.len() as u32;
+    let mut mgr = resume_manager_with(MockFirmwareWriter::with_resume(4096, 64), true);
+    resume_start_session(&mut mgr, 2, total);
+    resume_serve_blocks(&mut mgr, &file, 2, 240);
+    let mut mgr = resume_manager_with(mgr.into_writer(), true);
+    assert!(mgr.is_suspended());
+
+    let newer = build_ota_file(RESUME_MFG, RESUME_TYPE, 3, &firmware);
+    resume_start_session(&mut mgr, 3, newer.len() as u32);
+    assert!(!mgr.is_suspended());
+    assert_eq!(mgr.writer().last_checkpoint(), None, "the erase dropped it");
+    let request = mgr.take_pending_frame().expect("fresh block request");
+    assert_eq!(pending_block_offset(&request), 0);
+}
+
+#[test]
+fn ota_manager_without_an_interval_restarts_after_a_reset() {
+    with_slot_stack(ota_manager_without_an_interval_restarts_after_a_reset_body);
+}
+
+fn ota_manager_without_an_interval_restarts_after_a_reset_body() {
+    use zigbee_runtime::firmware_writer::MockFirmwareWriter;
+
+    let firmware = resume_firmware(5);
+    let file = build_ota_file(RESUME_MFG, RESUME_TYPE, 2, &firmware);
+    let total = file.len() as u32;
+    let mut mgr = resume_manager_with(MockFirmwareWriter::with_resume(4096, 0), true);
+    resume_start_session(&mut mgr, 2, total);
+    resume_serve_blocks(&mut mgr, &file, 2, 240);
+    assert_eq!(mgr.writer().checkpoint_count(), 0);
+    let mgr = resume_manager_with(mgr.into_writer(), true);
+    assert!(!mgr.is_suspended());
 }

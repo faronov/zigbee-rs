@@ -30,6 +30,7 @@ use crate::frames::{
     FrameBuildError, build_association_response, build_coordinator_realignment_orphan_response,
     build_nonbeacon_beacon, parse_parent_command,
 };
+use crate::pib::BASE_SUPERFRAME_DURATION_US;
 use crate::{
     MacCapabilities, MacCommandEvent, MacDriver, MacError, MacFrame, McpsDataConfirm,
     McpsDataIndication, McpsDataRequest, MlmeAssociateConfirm, MlmeAssociateRequest,
@@ -38,10 +39,6 @@ use crate::{
     MlmeStartRequest, PhyError, PibAttribute, PibValue, PlatformServices, RadioPhy,
 };
 use zigbee_types::TxPower;
-
-/// aBaseSuperframeDuration (960 symbols × 16 µs): unit of
-/// `macTransactionPersistenceTime` in a non-beacon PAN.
-const BASE_SUPERFRAME_DURATION_US: u32 = 960 * 16;
 
 struct PendingAssociation {
     response: MlmeAssociateResponse,

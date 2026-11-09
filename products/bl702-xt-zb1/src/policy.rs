@@ -11,6 +11,13 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     // limits. Idle waits and the 10 s long poll were exercised on XT-ZB1
     // hardware (join, interview, reconfigure, leave, resume); sleep current
     // is not yet measured.
+    //
+    // OTA reachability: 10 s is longer than the parent's indirect hold
+    // (6..7.68 s) and the board has no button, so an idle sensor misses the
+    // OTA server's Image Notify (`SensorPolicy::ota_reachable` is false).
+    // ZHA can start an OTA only inside the fast-poll window after a boot
+    // with a restored network (`restored_fast_ms`) or after a join/rejoin
+    // (`fresh_join_fast_ms`).
     fast_poll_ms: 250,
     slow_poll_ms: 10_000,
     fresh_join_fast_ms: 120_000,
@@ -54,6 +61,20 @@ mod tests {
         assert_eq!(SENSOR_POLICY.sample_interval_ms, 30_000);
         assert_eq!(SENSOR_POLICY.fast_poll_ms, 250);
         assert_eq!(SENSOR_POLICY.slow_poll_ms, 10_000);
+    }
+
+    /// Documented limitation: an idle sensor cannot take an OTA server's
+    /// Image Notify; the post-boot and post-join fast-poll windows can.
+    #[test]
+    fn ota_starts_only_in_the_post_boot_or_join_fast_poll_window() {
+        assert!(
+            !SENSOR_POLICY
+                .ota_reachable(<NoUserAction as sensor_sed_app::UserActionPolicy>::SHORT_PRESS)
+        );
+        assert!(!SENSOR_POLICY.slow_poll_within_parent_hold());
+        assert_eq!(SENSOR_POLICY.restored_fast_ms, 120_000);
+        assert_eq!(SENSOR_POLICY.fresh_join_fast_ms, 120_000);
+        assert!(SENSOR_POLICY.fast_poll_ms < sensor_sed_app::RESPONSIVE_SLOW_POLL_MS);
     }
 
     #[test]

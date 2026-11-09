@@ -793,8 +793,10 @@ primary in 1.55–1.56 s.
   install fails with `FAILURE`.
   - The workaround was to reset the board and press install within the
     120 s fast-poll window after a restore.
-  - This is a product poll-policy defect, tracked separately. It is not a
-    loader issue.
+  - This is a product poll-policy limitation, not a loader issue. The
+    10 s poll is kept; the documented procedure is to start the install
+    within the 120 s fast-poll window after a reset or rejoin (see
+    [Reaching a sleepy device](./ota.md#reaching-a-sleepy-device)).
 - **Throughput.** OTA ran at about 77–120 B/s (48 B blocks through
   parent `0x43FD`), so a 238 KB image took about 33 minutes.
 
@@ -815,9 +817,10 @@ Still open:
    it with a period that covers a full-slot validation.
 2. **Swap-move per product.** Which of CC2340, nRF52 and MG21/MG22 turn
    it on, and with how many trial boots.
-3. **XT-ZB1 slow poll versus OTA reachability.** The product poll
-   policy should let ZHA's `image_notify` reach an idle sensor. This is
-   tracked separately from the loader.
+3. **XT-ZB1 slow poll versus OTA reachability.** The 10 s poll is kept
+   (product decision); an idle sensor is reachable for OTA only in the
+   120 s fast-poll window after a reset or rejoin (see
+   [Reaching a sleepy device](./ota.md#reaching-a-sleepy-device)).
 
 The BL702 run approvals (the soak image, the router-to-sensor swap,
 moving the stale OTA file and both ISP sessions) were given and used on

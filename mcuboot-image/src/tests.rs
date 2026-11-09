@@ -477,7 +477,7 @@ mod writer {
     use crate::boot::Mode;
     use crate::image::KeySet;
     use crate::writer::{SlotPolicy, SlotWriter};
-    use zigbee_runtime::firmware_writer::{FirmwareError, FirmwareWriter};
+    use zigbee_runtime::firmware_writer::{FirmwareError, FirmwareWriter, ResumeRecord};
 
     fn policy(key_xy: [u8; 64]) -> SlotPolicy {
         SlotPolicy {
@@ -642,6 +642,155 @@ mod writer {
         writer.abort().unwrap();
         writer.abort().unwrap();
         assert_eq!(writer.flash_mut().operations, staged + 1);
+    }
+
+    fn resume_record(staged: u32, image: &[u8]) -> ResumeRecord {
+        ResumeRecord {
+            manufacturer_code: 0x1234,
+            image_type: 0x0702,
+            file_version: 0x2500_0204,
+            image_size: image.len() as u32 + 62,
+            payload_start: 62,
+            firmware_size: image.len() as u32,
+            staged,
+        }
+    }
+
+    /// A writer that keeps resume checkpoints (the interval only gates
+    /// them; the tests call `checkpoint` themselves).
+    fn resumable(flash: MockFlash) -> SlotWriter<MockFlash> {
+        SlotWriter::new(flash, LAYOUT, policy(TEST_KEY)).with_resume_checkpoints(512)
+    }
+
+    /// Stage `image[..stop]` in `block`-sized writes with a checkpoint each
+    /// time the staged length crosses a multiple of `every`.
+    fn stage_with_checkpoints(
+        writer: &mut SlotWriter<MockFlash>,
+        image: &[u8],
+        stop: usize,
+        block: usize,
+        every: u32,
+    ) -> u32 {
+        writer.erase_slot().unwrap();
+        let mut offset = 0u32;
+        let mut last = 0;
+        for chunk in image[..stop].chunks(block) {
+            writer.write_block(offset, chunk).unwrap();
+            let before = offset;
+            offset += chunk.len() as u32;
+            if offset / every != before / every {
+                assert!(writer.checkpoint(&resume_record(offset, image)));
+                last = offset;
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn checkpointed_download_resumes_after_a_reset_and_installs() {
+        for (image, block) in [(V2, 48), (V2_PAD, 64)] {
+            let stop = image.len() - image.len() / 16;
+            let mut writer = resumable(dirty_flash(V1));
+            let last = stage_with_checkpoints(&mut writer, image, stop, block, 512);
+            assert!(last >= SECTOR);
+
+            // The records never form a request: the loader keeps V1.
+            let mut flash = core::mem::replace(writer.flash_mut(), MockFlash::new());
+            assert_eq!(
+                boot(&mut flash, &CONFIG, |_| {}).unwrap().update,
+                Update::None
+            );
+
+            // Reset: a new writer over the same flash resumes at the start
+            // of the sector holding the last record.
+            let mut writer = resumable(flash);
+            let resumed = writer.resume().expect("recorded download");
+            assert_eq!(resumed.staged, (last / SECTOR * SECTOR).min(SLOT - SECTOR));
+            assert_eq!(
+                resumed,
+                ResumeRecord {
+                    staged: resumed.staged,
+                    ..resume_record(0, image)
+                }
+            );
+            let mut offset = resumed.staged;
+            for chunk in image[offset as usize..].chunks(block) {
+                writer.write_block(offset, chunk).unwrap();
+                offset += chunk.len() as u32;
+            }
+            writer.verify(image.len() as u32, None).unwrap();
+            writer.activate().unwrap();
+            let flash = writer.flash_mut();
+            assert_eq!(
+                boot(flash, &CONFIG, |_| {}).unwrap().update,
+                Update::Installed
+            );
+            assert_eq!(
+                slot_bytes(flash, LAYOUT.primary, V2.len()),
+                &image[..V2.len()]
+            );
+
+            // The install erased the secondary trailer and its records.
+            let flash = core::mem::replace(writer.flash_mut(), MockFlash::new());
+            let mut writer = resumable(flash);
+            assert_eq!(writer.resume(), None);
+        }
+    }
+
+    #[test]
+    fn writer_without_an_interval_keeps_no_progress() {
+        let mut writer = SlotWriter::new(dirty_flash(V1), LAYOUT, policy(TEST_KEY));
+        assert_eq!(writer.checkpoint_interval(), 0);
+        writer.erase_slot().unwrap();
+        writer.write_block(0, &V2[..2400]).unwrap();
+        assert!(!writer.checkpoint(&resume_record(2400, V2)));
+        let flash = core::mem::replace(writer.flash_mut(), MockFlash::new());
+        assert_eq!(resumable(flash).resume(), None);
+    }
+
+    #[test]
+    fn torn_checkpoints_are_ignored_and_erase_or_abort_drop_records() {
+        // A power loss halfway through a progress entry leaves `staged`
+        // without its complement: the previous entry still counts.
+        let mut writer = resumable(dirty_flash(V1));
+        let last = stage_with_checkpoints(&mut writer, V2, 3000, 48, 1024);
+        assert_eq!(last / 1024, 2);
+        writer.flash_mut().budget = Some(1);
+        assert!(!writer.checkpoint(&resume_record(3000, V2)));
+        let flash = core::mem::replace(writer.flash_mut(), MockFlash::new());
+        let mut writer = resumable(flash);
+        writer.flash_mut().budget = None;
+        assert_eq!(writer.resume().map(|r| r.staged), Some(SECTOR));
+
+        // A torn session header disables checkpoints for the session and
+        // fails its CRC after a reset.
+        let mut writer = resumable(dirty_flash(V1));
+        writer.erase_slot().unwrap();
+        writer.write_block(0, &V2[..2400]).unwrap();
+        writer.flash_mut().budget = Some(1);
+        assert!(!writer.checkpoint(&resume_record(2400, V2)));
+        writer.flash_mut().budget = None;
+        assert!(!writer.checkpoint(&resume_record(2400, V2)));
+        let flash = core::mem::replace(writer.flash_mut(), MockFlash::new());
+        assert_eq!(resumable(flash).resume(), None);
+
+        // Nothing below one sector is worth resuming.
+        let mut writer = resumable(dirty_flash(V1));
+        stage_with_checkpoints(&mut writer, V2, 1000, 48, 512);
+        let flash = core::mem::replace(writer.flash_mut(), MockFlash::new());
+        assert_eq!(resumable(flash).resume(), None);
+
+        // A new download and an abort both drop the records.
+        for drop_records in [
+            |writer: &mut SlotWriter<MockFlash>| writer.erase_slot().unwrap(),
+            |writer: &mut SlotWriter<MockFlash>| writer.abort().unwrap(),
+        ] {
+            let mut writer = resumable(dirty_flash(V1));
+            stage_with_checkpoints(&mut writer, V2, 3000, 48, 1024);
+            drop_records(&mut writer);
+            let flash = core::mem::replace(writer.flash_mut(), MockFlash::new());
+            assert_eq!(resumable(flash).resume(), None);
+        }
     }
 
     #[test]

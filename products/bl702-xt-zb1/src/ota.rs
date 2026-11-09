@@ -68,6 +68,10 @@ pub const QUERY_INTERVAL_SECS: u32 = 24 * 60 * 60;
 pub const OTA_SERVER: (u16, u8) = (0x0000, 1);
 /// Image Block Request size.
 pub const OTA_BLOCK_SIZE: u8 = 48;
+/// Staged bytes between download progress records in the secondary
+/// trailer sector (two flash sectors): a reset or power cut repeats at most
+/// this much plus one sector, for about 30 eight-byte writes per image.
+pub const OTA_RESUME_CHECKPOINT_BYTES: u32 = 2 * bl702_xt_zb1_layout::SECTOR_SIZE;
 
 /// `0x25MMmmpp`.
 pub const fn file_version(major: u8, minor: u8, patch: u8) -> u32 {
@@ -144,7 +148,9 @@ pub type Bl702Writer<F> = SlotWriter<OtaFlash<F>>;
 
 /// The staging writer for the secondary slot. It refuses images not signed
 /// by one of `keys`, with another header size, or older than the running
-/// image, and writes the upgrade request only on activation.
+/// image, and writes the upgrade request only on activation. It records
+/// download progress every [`OTA_RESUME_CHECKPOINT_BYTES`] so a download
+/// continues after a reset.
 pub fn writer_with_keys<F: NorFlash>(flash: F, keys: KeySet) -> Bl702Writer<F>
 where
     F::Error: NorFlashError,
@@ -158,6 +164,7 @@ where
             mode: Mode::Overwrite,
         },
     )
+    .with_resume_checkpoints(OTA_RESUME_CHECKPOINT_BYTES)
 }
 
 /// [`writer_with_keys`] for this build's keys that the installed loader
@@ -410,7 +417,7 @@ mod tests {
         BOOT_MAGIC, BootConfig, LoaderInfo, MagicState, Trial, TrialState, TrustedKey,
         loader_block, trailer::read_magic,
     };
-    use zigbee_runtime::firmware_writer::FirmwareError;
+    use zigbee_runtime::firmware_writer::{FirmwareError, ResumeRecord};
 
     // Shared imgtool vectors (header 0x100, TEST-ONLY key).
     const TEST_KEY_XY: &[u8; 64] =
@@ -577,6 +584,59 @@ mod tests {
         assert_eq!(request(writer.flash_mut()), MagicState::Erased);
         writer.activate().unwrap();
         assert_eq!(request(writer.flash_mut()), MagicState::Good);
+    }
+
+    /// Progress records sit in the secondary trailer sector only: a reset
+    /// resumes the download on the product layout, the install still
+    /// succeeds, and neither the journal nor the low flash changes.
+    #[test]
+    fn download_resumes_after_a_reset_without_touching_nv() {
+        let every = OTA_RESUME_CHECKPOINT_BYTES;
+        let image = padded(TEST_V2);
+        let stop = 5 * every as usize + 100;
+        let flash = RefCell::new(device(TEST_V1));
+        let nv_before = flash.borrow().bytes[NV_START as usize..].to_vec();
+        let low_before = flash.borrow().bytes[..SECONDARY_SLOT as usize].to_vec();
+        let record = |staged| ResumeRecord {
+            manufacturer_code: MANUFACTURER_CODE,
+            image_type: IMAGE_TYPE,
+            file_version: FILE_VERSION + 1,
+            image_size: image.len() as u32 + 62,
+            payload_start: 62,
+            firmware_size: image.len() as u32,
+            staged,
+        };
+
+        let mut writer = test_writer(SharedFlash::new(&flash));
+        assert_eq!(writer.checkpoint_interval(), every);
+        writer.erase_slot().unwrap();
+        let mut offset = 0u32;
+        for block in image[..stop].chunks(OTA_BLOCK_SIZE as usize) {
+            writer.write_block(offset, block).unwrap();
+            let before = offset;
+            offset += block.len() as u32;
+            if offset / every != before / every {
+                assert!(writer.checkpoint(&record(offset)));
+            }
+        }
+
+        // Reset: a new writer over the same flash.
+        let mut writer = test_writer(SharedFlash::new(&flash));
+        let resumed = writer.resume().expect("recorded download");
+        assert_eq!(resumed, record(5 * every));
+        let mut offset = resumed.staged;
+        for block in image[offset as usize..].chunks(OTA_BLOCK_SIZE as usize) {
+            writer.write_block(offset, block).unwrap();
+            offset += block.len() as u32;
+        }
+        writer.verify(image.len() as u32, None).unwrap();
+        writer.activate().unwrap();
+        assert_eq!(request(writer.flash_mut()), MagicState::Good);
+        let flash = flash.borrow();
+        let secondary = SECONDARY_SLOT as usize;
+        assert_eq!(&flash.bytes[secondary..secondary + TEST_V2.len()], TEST_V2);
+        assert_eq!(&flash.bytes[NV_START as usize..], &nv_before[..]);
+        assert_eq!(&flash.bytes[..SECONDARY_SLOT as usize], &low_before[..]);
     }
 
     #[test]
