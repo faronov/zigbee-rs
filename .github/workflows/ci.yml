@@ -810,7 +810,8 @@ jobs:
 
   build-nrf52840-uf2:
     name: Build nRF52840 sensor UF2 (${{ matrix.board }})
-    runs-on: ubuntu-latest
+    # Pinned: setup-python has no pinned CPython builds for ubuntu-26.04 yet.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -1233,7 +1234,8 @@ jobs:
 
   build-bl702:
     name: Build BL702 sensor
-    runs-on: ubuntu-latest
+    # Pinned: setup-python has no pinned CPython builds for ubuntu-26.04 yet.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
