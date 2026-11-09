@@ -662,6 +662,15 @@ impl RxQueue {
         RxQueuePush::Queued
     }
 
+    /// Whether [`Self::push`] would drop an arrival of `priority` outright:
+    /// the queue is full and holds no strictly lower-priority victim. When
+    /// full every slot is occupied, so the whole priority array is live.
+    #[inline(always)]
+    fn would_drop(&self, priority: RxPriority) -> bool {
+        self.len as usize == IRQ_RX_QUEUE_CAPACITY
+            && self.priorities.iter().all(|&queued| queued >= priority)
+    }
+
     /// Oldest queued entry among those of the *lowest* priority present,
     /// but only if that priority is strictly below the arriving frame's.
     ///
@@ -1620,6 +1629,31 @@ mod tests {
     }
 
     #[test]
+    fn would_drop_predicts_an_outright_drop_exactly() {
+        let mut queue = RxQueue::new();
+        // Not full: nothing is dropped.
+        for tag in 0..(IRQ_RX_QUEUE_CAPACITY - 1) as u8 {
+            let (frame, priority) = frame_with_priority(RxPriority::Local, tag);
+            queue.push(frame, priority);
+        }
+        assert!(!queue.would_drop(RxPriority::Local));
+        // Full with one broadcast: a local arrival evicts it.
+        let (frame, priority) = frame_with_priority(RxPriority::Broadcast, 0xB0);
+        queue.push(frame, priority);
+        assert!(!queue.would_drop(RxPriority::Local));
+        assert!(queue.would_drop(RxPriority::Broadcast));
+        let (frame, priority) = frame_with_priority(RxPriority::Local, 0xA0);
+        assert_eq!(queue.push(frame, priority), RxQueuePush::Evicted);
+        // Full of local frames: the next local arrival is dropped.
+        assert!(queue.would_drop(RxPriority::Local));
+        let (frame, priority) = frame_with_priority(RxPriority::Local, 0xA1);
+        assert_eq!(queue.push(frame, priority), RxQueuePush::Dropped);
+        // One pop makes room again.
+        queue.pop();
+        assert!(!queue.would_drop(RxPriority::Local));
+    }
+
+    #[test]
     fn rx_queue_counters_are_cumulative_and_high_water_is_measured() {
         let mut queue = RxQueue::new();
         assert_eq!(queue.counters(), (0, 0, 0));
@@ -1647,7 +1681,8 @@ mod hw {
     use super::frame::{self, BeaconInfo};
     use super::{
         AckPendingAddress, AckPendingError, AckPendingTable, DMA_BUF_LEN, DmaBuf,
-        MAX_MAC_FRAME_LEN, RawRxOutcome, ReceivedFrame, RxAddressFilter, RxQueue, RxQueuePush, phy,
+        MAX_MAC_FRAME_LEN, RawRxOutcome, ReceivedFrame, RxAddressFilter, RxPriority, RxQueue,
+        RxQueuePush, phy,
     };
     use crate::timer;
 
@@ -2701,6 +2736,17 @@ mod hw {
             _ => false,
         };
         if !addressed_to_us {
+            return false;
+        }
+        // An ACK-requested frame addressed to us classifies as
+        // `RxPriority::Local`. If the receive queue is already full of
+        // frames at least that important, `push_irq_rx` will drop it, and
+        // an ACK would make that loss silent: the originator would never
+        // retransmit. Withholding the ACK (IEEE 802.15.4 only acknowledges
+        // frames the MAC accepted) lets the sender's macMaxFrameRetries
+        // deliver it after the consumer drains the queue. Only reachable
+        // while the queue is full, so the normal turnaround is unchanged.
+        if unsafe { (*core::ptr::addr_of!(IRQ_RX_QUEUE)).would_drop(RxPriority::Local) } {
             return false;
         }
 
