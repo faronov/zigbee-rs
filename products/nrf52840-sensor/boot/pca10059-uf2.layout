@@ -1,0 +1,25 @@
+# Nordic nRF52840 Dongle (PCA10059) with the Adafruit UF2 bootloader:
+# chained after the resident UF2 bootloader. The MBR (0x0..0x1000) and the UF2 bootloader start whatever is
+# at 0x1000 — here the zigbee-rs loader. The UF2 bootloader, its settings
+# and the MBR parameters are never written (same map as link/uf2-pca10059.x).
+# Recovery: double-tap reset enters the UF2 drive, which rewrites 0x1000+.
+name           = nrf52840-pca10059-uf2
+flash          = 0x0..0x100000
+sector         = 0x1000
+reserved       = 0x0..0x1000 mbr
+loader         = 0x1000..0x5000
+primary        = 0x5000..0x7B000
+secondary      = 0x7B000..0xF1000
+# 0xF1000..0xF2000 is one spare page (the slots must be equal).
+journal        = 0xF2000..0xF4000
+reserved       = 0xF4000..0xFE000 uf2-bootloader
+reserved       = 0xFE000..0x100000 mbr-params-and-settings
+ram            = 0x20000000..0x20040000
+header         = 0x200
+vector-align   = 0x200
+loader-version = 1
+trial-boots    = 3
+watchdog-ms    = 0
+mode           = overwrite
+env-prefix     = NRF52840
+key-file       = ../../../bootloaders/keys/own-ec-p256.xy.hex

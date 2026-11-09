@@ -1,0 +1,24 @@
+# Home Assistant Connect ZBT-1 (EFR32MG21A020F1024IM32: 1 MiB flash, 8 KiB
+# pages, 96 KiB RAM). Chained: the resident Gecko Bootloader 2.4.2
+# (0x0..0x4000) is never written and starts whatever is at 0x4000 — here the
+# zigbee-rs loader. Router tables and the security journal keep the addresses
+# of link/memory.x. Recovery without SWD: the Gecko UART bootloader (see the
+# loader's `gecko-recovery` feature), which rewrites 0x4000+.
+name           = ha-connect-zbt1
+flash          = 0x0..0x100000
+sector         = 0x2000
+reserved       = 0x0..0x4000 gecko-bootloader
+loader         = 0x4000..0x8000
+primary        = 0x8000..0x7E000
+secondary      = 0x7E000..0xF4000
+reserved       = 0xF4000..0xFC000 router-tables
+journal        = 0xFC000..0x100000
+ram            = 0x20000000..0x20018000
+header         = 0x200
+vector-align   = 0x200
+loader-version = 1
+trial-boots    = 3
+watchdog-ms    = 0
+mode           = overwrite
+env-prefix     = ZBT1
+key-file       = ../../../bootloaders/keys/own-ec-p256.xy.hex

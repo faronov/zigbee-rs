@@ -18,12 +18,19 @@ This page is both the design and its current status:
   - opt-in swap-move with revert.
 - **Phase 2 step 2** adds the loader watchdog, the CC2340 slot guard and
   the BL702 lab soak.
+- **Phase 3** ports the loader to more chips, with layouts read from
+  product files: nRF52840 (bare DK and three UF2 boards), EFR32 Series 2
+  (MG22, MG21, ZBT-1 chained above Gecko) and PHY62x2 (PB-03F). ESP32
+  gets an application-side signature and version check; its ROM and IDF
+  boot stay. Telink has the configuration only. See
+  [Phase 3](#phase-3-more-chips).
 
 The BL702 v2 loader passed a hardware run on one XT-ZB1 on 2026-11-08:
 OTA through ZHA, confirm-after-rejoin and 46 manual power cuts with no
 failure; see [BL702 hardware results](#results-2026-11-08). Every other
 chip shell, swap-move, Ed25519 and multi-key rotation remain
-**host-tested only**.
+**host-tested only**. Every Phase 3 loader is **built only**: none has run
+on hardware.
 
 Anything marked *later phase* is a proposal. It is not an implemented or
 hardware-proven capability.
@@ -38,6 +45,12 @@ hardware-proven capability.
 | `bootloaders/cc2340r5-boot` | CC2340R5 shell: vector-table check, VTOR/MSP jump, fault blinks, SHUTDOWN | Host-tested; thumbv6m build only. No product loader binary exists |
 | `zigbee-runtime` `FirmwareWriter`/`OtaLifecycle` | `confirm_image` hook; `FirmwareWriter::confirm_image` | Host-tested |
 | `apps/sensor-sed` | Confirms the running image on its first APS-acknowledged report, or once joined when reports are not acknowledged | Host-tested |
+| `bootloaders/layout` (`zrs-boot-layout`) | Build-time parser and checker of product `boot/*.layout` and `boot/app-verify.conf` files; emits `BootConfig`, keys, loader and application `MEMORY` regions | Host-tested |
+| `bootloaders/cortex-m-boot` (`zrs-boot-cortex-m`) | Cortex-M shell: entry check through the flash driver, VTOR/MSP hand-over, `Hooks` for status, watchdog and failure | Host-tested; built in the three loaders below |
+| `products/nrf52840-sensor/bootloader` | nRF52840 loader, one build per board layout | Release-built and linted; **not run on hardware** |
+| `bootloaders/efr32s2-boot` | EFR32MG22/MG21 loader; on MG21 chained above the Gecko Bootloader | Release-built and linted; **not run on hardware** |
+| `bootloaders/phy62x2-boot` | PHY62x2 loader started by the boot ROM | Release-built, linted, ROM-boot image generated; **not run on hardware** |
+| `mcuboot-image::envelope` | Application-side verification of a signed MCUboot envelope (`EnvelopeWriter`) for chips whose ROM/SDK boot stays | Host-tested with imgtool vectors; ESP32 product tests |
 
 ```text
 product loader binary   layout, BootConfig (keys, trial boots, mode), loader block, console/LEDs
@@ -358,8 +371,10 @@ finish the install.
 
 ## Per-chip layouts and field migration
 
-Existing layouts do not change. New layouts are proposals for later phases.
-They need the product's post-link checks before any firmware uses them.
+Existing direct-link layouts do not change. Phase 3 adds loader layouts as
+product files (see [Layout files](#layout-files)); the table below is the
+pre-Phase 3 plan. The implemented maps are in
+[Phase 3 layouts](#phase-3-layouts).
 
 | chip / product | today | proposed loader | slots (proposal) | migration |
 |---|---|---|---|---|
@@ -392,6 +407,199 @@ on a sacrificial board. The constraints that rehearsal must settle:
   direct SPI access must never run at the same time.
 - **Protected regions.** NVM3, the journal and the application NV must
   stay behind `BootFlash`.
+
+## Phase 3: more chips
+
+### Layout files
+
+Each loader deployment is one text file in its product, by convention
+`products/<product>/boot/<deployment>.layout`. The loader's build script and
+the application's build script both read it through `zrs-boot-layout`, so the
+loader region, the slots, the journal and every protected region are written
+once. The format (keys, units and defaults) is documented in the crate. In
+short:
+
+```text
+name      = nrf52840-mdk-uf2
+flash     = 0x0..0x100000
+sector    = 0x1000
+reserved  = 0x0..0x1000 mbr            # repeatable, labelled, never written
+loader    = 0x1000..0x5000             # last 64 B: LoaderKeys + LoaderInfo
+primary   = 0x5000..0x7B000
+secondary = 0x7B000..0xF1000
+journal   = 0xF2000..0xF4000           # product persistence, never written
+ram       = 0x20000000..0x20040000
+header    = 0x200                      # imgtool --header-size
+trial-boots = 3                        # <PREFIX>_BOOT_TRIAL_BOOTS overrides
+watchdog-ms = 0                        # <PREFIX>_BOOT_WATCHDOG_MS overrides
+mode      = overwrite
+env-prefix = NRF52840_MDK
+key-file  = ../../../bootloaders/keys/own-ec-p256.xy.hex
+```
+
+The build refuses, with a message naming the file:
+
+- overlapping regions, a protected region between the slots, unequal or
+  misaligned slots, a slot or journal not on erase boundaries;
+- a vector table that `VTOR` cannot address (`vector-align`), or a header
+  size other than the image's;
+- a loader region too small for its 64-byte block, and a linked loader
+  that overflows its region (post-link `ASSERT`). The 16 KiB regions
+  therefore reject Ed25519 with an explanation;
+- a watchdog period the chip cannot provide;
+- trusted keys that are missing or malformed. Keys come from
+  `<PREFIX>_BOOT_KEYn` environment variables or the `key-file`; private
+  keys are never read.
+
+The repository key `bootloaders/keys/own-ec-p256.xy.hex` is a
+**development key**. Production images need product keys passed through the
+environment.
+
+### Cortex-M loaders
+
+`zrs-boot-cortex-m` is the shared shell. One boot:
+
+1. installs a pending, valid, non-downgrade image and validates the
+   primary, inside `BootFlash`;
+2. checks the entry: the header has exactly the configured size, and the
+   initial SP and reset vector, read through the flash driver, point into
+   SRAM and into the image;
+3. masks interrupts, sets `VTOR` where the core has one, loads `MSP` and
+   jumps.
+
+Each chip loader only composes its flash driver, its generated `Config` and
+its `Hooks`. None of them configures clocks, GPIO or the radio. None arms a
+watchdog yet:
+
+- the nRF52 WDT cannot be stopped once started, and the applications do
+  not feed it;
+- `efr32s2-hal` has no WDOG driver;
+- PHY62x2 has no watchdog driver in the loader.
+
+With nothing bootable, the loaders halt in `WFI` (recovery over SWD), apart
+from the EFR32 `gecko-recovery` option below.
+
+**nRF52840** (`products/nrf52840-sensor/bootloader`, features `dk`,
+`mdk-uf2`, `pca10059-uf2`, `promicro-uf2`):
+
+- The bare DK loader sits at `0x0`.
+- On the UF2 boards the loader is the "application" that the MBR and the
+  Adafruit UF2 bootloader start. The MBR, the UF2 bootloader and its
+  settings are reserved and never written, so UF2 remains the recovery
+  path.
+- On ProMicro the S140 SoftDevice region is reserved as well.
+- The application gets a link variant, `examples/nrf52840-sensor-uf2`
+  feature `zrs-boot`. It links into the selected layout's primary slot
+  after the 0x200-byte header, and its build checks that the security
+  journal stays where the direct map has it. The direct map remains the
+  default and is unchanged.
+
+**EFR32 Series 2** (`bootloaders/efr32s2-boot`, features
+`efr32mg22-devkit`, `efr32mg21-devkit`, `ha-connect-zbt1`):
+
+- **MG22** has no resident bootloader. The Secure Engine starts the
+  vector table at `0x0`, so the loader lives there.
+- **MG21 and ZBT-1 are chained.** The resident Gecko Bootloader at
+  `0x0..0x4000` is reserved and never written. Gecko starts whatever is at
+  `0x4000`, which is the zigbee-rs loader.
+- **`gecko-recovery`.** With this feature, when nothing is bootable the
+  loader writes the BOOTLOAD reset cause and resets into Gecko's UART
+  recovery. Gecko then rewrites everything from `0x4000` up. The build
+  refuses this feature unless Gecko is reserved below the loader. It is
+  **not verified on hardware**.
+- **Gecko secure boot.** If a device's Gecko Bootloader enforces it, Gecko
+  would refuse to start the unsigned loader. This must be read from the
+  device before any install.
+
+**PHY62x2** (`bootloaders/phy62x2-boot`, feature `pb03f-kit`):
+
+- **Start.** The boot ROM loads the loader through its own ROM-boot table
+  at `0x2000`. The jump table and the run descriptor are SRAM load data at
+  `0x5000`. The loader's code runs XIP from `0x6000..0xA000`.
+- **No VTOR.** The Cortex-M0 has no `VTOR`, so the image ABI is:
+  `[SP, Reset]` at the start of the image, followed directly by the
+  application's 0x400-byte ROM jump table. The loader copies that table to
+  `0x1fff0000` before the hand-over, after checking that it lies inside the
+  image.
+- **Address.** Applications run at `0x11010100`, the same address as a
+  direct ROM-boot image.
+- **Application cap.** The application is capped at 130,816 B (`app-max`).
+- **Cold boot only.** PHY system sleep wakes through the ROM, which would
+  rerun the loader and clobber retained RAM. Sleeping products need a
+  ROM warm-boot path that bypasses it. That is an open hardware question.
+- **Building.** The build uses `ESP_PHY_RUST_TOOLCHAIN` with
+  `panic = immediate-abort`. CI turns the ELF into a ROM-boot table and
+  `app.bin` with `phy62x2-image --rom-boot`.
+
+### Phase 3 layouts
+
+| deployment (file) | reserved, never written | loader | primary | secondary | journal | slot capacity |
+|---|---|---|---|---|---|---|
+| nRF52840 DK (`nrf52840-sensor/boot/dk.layout`) | none | `0x0..0x4000` | `0x4000..0x81000` | `0x81000..0xFE000` | `0xFE000..0x100000` | 510,720 B |
+| nRF52840 MDK / PCA10059 UF2 (`mdk-uf2`, `pca10059-uf2`) | MBR `0x0..0x1000`, UF2 `0xF4000..0xFE000`, MBR params `0xFE000..0x100000` | `0x1000..0x5000` | `0x5000..0x7B000` | `0x7B000..0xF1000` | `0xF2000..0xF4000` | 482,048 B |
+| nRF52840 ProMicro UF2 (`promicro-uf2`) | MBR+S140 `0x0..0x26000`, boot guard `0xF0000..0xF4000`, UF2, MBR params | `0x26000..0x2A000` | `0x2A000..0x8C000` | `0x8C000..0xEE000` | `0xEE000..0xF0000` | 400,128 B |
+| EFR32MG22 devkit (`efr32mg22-sensor/boot/devkit.layout`) | router tables `0x74000..0x7C000` | `0x0..0x4000` | `0x4000..0x3C000` | `0x3C000..0x74000` | `0x7C000..0x80000` | 228,096 B |
+| EFR32MG21 devkit (`efr32mg21-sensor/boot/devkit.layout`), F1024 only | Gecko `0x0..0x4000`, router tables `0x74000..0x7C000` | `0x4000..0x8000` | `0x80000..0xC0000` | `0xC0000..0x100000` | `0x7C000..0x80000` | 260,864 B |
+| ZBT-1 (`ha-connect-zbt1/boot/zbt1.layout`) | Gecko `0x0..0x4000`, router tables `0xF4000..0xFC000` | `0x4000..0x8000` | `0x8000..0x7E000` | `0x7E000..0xF4000` | `0xFC000..0x100000` | 482,048 B |
+| PB-03F (`pb03f-kit/boot/pb03f.layout`) | ROM/factory `0x0..0x2000`, ROM-boot table `0x2000..0x3000`, factory data `0x3000..0x5000`, load data `0x5000..0x6000`, router tables `0x7A000..0x7E000` | `0x6000..0xA000` | `0x10000..0x32000` | `0x32000..0x54000` | `0x7E000..0x80000` | 130,816 B (`app-max`) |
+
+Slot capacity is the slot minus the 0x200-byte header (0x100 on PHY62x2)
+and the 0x300-byte TLV reserve. All deployments use overwrite mode with 3 trial boots
+and a loader watchdog of 0 (none).
+
+### Application-side verification (ESP32, Telink)
+
+On these chips the ROM or SDK boot stays. The application authenticates what
+it accepts over Zigbee OTA:
+
+- **Input.** The OTA payload is a plain
+  `imgtool sign --header-size 0x20 --pad-header` image:
+  `[32-byte header][native image][protected TLVs][TLVs]`.
+- **Staging.** `mcuboot_image::envelope::EnvelopeWriter` wraps the product
+  `FirmwareWriter`. It keeps the header and the TLV trailer in RAM and
+  stages only the native image, so the ESP image the IDF bootloader
+  checks is unchanged.
+- **Before any payload byte is written,** the header is parsed and
+  refused if malformed or larger than the slot.
+- **At `verify`:**
+  1. the inner writer checks its own format;
+  2. the SHA-256 (over header + image + protected TLVs, as MCUboot
+     defines it) and the ECDSA P-256 signature are checked against the
+     trusted keys, reading the staged image back;
+  3. the digest must match the Zigbee `expected_hash` when one is given;
+  4. a version older than the running one is refused (`cmp_release`).
+- **`activate`** is refused unless `verify` succeeded.
+- **Keys** come from the product file `boot/app-verify.conf` (`name`,
+  `env-prefix`, `key-file`) through `zrs-boot-layout::AppVerify`, with the
+  same `<PREFIX>_BOOT_KEYn` override as the loaders.
+
+**ESP32-C6/H2.** The product feature `signed-ota` and the example feature
+`signed-ota` select `product::profile::OtaWriter = SignedEspWriter`. The
+default build is unchanged. Version mapping: Zigbee OTA file version
+`0xMMmmrrrr` is MCUboot version `MM.mm.rrrr`, so sign with
+`imgtool sign --version MM.mm.rrrr`.
+
+**Limit.** This does not make the ESP32 secure-boot. Anything written over
+UART or JTAG still boots; use ESP secure boot for that.
+
+**TLSR8258.** `products/tlsr8258-tb04/boot/app-verify.conf` exists, but
+the product has no OTA writer yet, so nothing uses it.
+
+### Phase 3 blockers
+
+- **EFR32MG22.** The current sensor image (234,164 B) does not fit the
+  228,096 B slots. Either the router-tables reservation is reclaimed
+  (244,480 B slots) or the image shrinks.
+- **EFR32MG21 devkit.** The layout needs an F1024 part; there is no room
+  for two image-sized slots below the router tables on F512.
+- **No EFR32 application link variant yet.** Only nRF has a loader-linked
+  application build. MG21 and ZBT-1 need one before an end-to-end test.
+- **PHY62x2.** Current applications exceed the 130,816 B cap:
+  `phy6222-sensor` is 138,208 B and `pb03f-zigbee` 195,168 B. System
+  sleep warm-boots through the ROM (see above).
+- **No watchdog** in the nRF, EFR32 and PHY loaders (see above).
+- **CC2340R5 product loader:** blocked on SDK `lpf3-9.20.01.21`.
+- **EFR32MG1:** deferred until a sacrificial-board rehearsal.
 
 ## Size budget
 
@@ -459,6 +667,38 @@ not been measured.
 | EFR32MG1 sensor | `.text` +136 B | unchanged | not gated |
 | nRF52840 sensor | `.text` +228 B | unchanged | not gated |
 | CC2340 sensor (no-SDK fallback) | `.text` +48 B | `.bss` −8 B | not gated |
+
+**Phase 3 loaders** (ECDSA P-256, one key, overwrite, 3 trial boots; flash
+is file-backed `.vector_table + .text + .rodata + .data + .loader_info`):
+
+| loader | region | flash | RAM (`.data` + `.bss`) |
+|---|---|---|---|
+| nRF52840 `dk`, `mdk-uf2`, `pca10059-uf2` | 16,384 B | 9,084 B | 0 B |
+| nRF52840 `promicro-uf2` | 16,384 B | 9,076 B | 0 B |
+| EFR32MG22 devkit | 16,384 B | 9,232 B | 280 B |
+| EFR32MG21 devkit, ZBT-1 | 16,384 B | 9,124 B | 280 B |
+| ZBT-1 `gecko-recovery` | 16,384 B | 9,192 B | 280 B |
+| PB-03F | 16,384 B XIP + 4 KiB load data | 9,048 B XIP + 1,032 B load data | 708 B |
+
+Phase 3 application images (equal-length worktree paths, against `d4c4023`):
+
+- **ESP32-C6 sensor** (default): `.text` −8 B, `.data` and `.bss`
+  unchanged.
+- **ESP32-H2 sensor** (default): `.text` −8 B, `.data` and `.bss`
+  unchanged.
+- **ESP32-H2 thermometer** (default): `.text` +16 B, `.data` and `.bss`
+  unchanged. Per function, the delta is `esp_sync` lock inlining
+  (+20/+16/−34 B) plus +8 B in `main` and +6 B in one critical section.
+  No OTA or writer symbol changed; the crate disambiguators changed.
+- **nRF52840 UF2** (default direct map): padding only.
+
+**`signed-ota` cost** (opt-in):
+
+| image | `.text` | `.data` | `.bss` |
+|---|---|---|---|
+| ESP32-C6 sensor | +12,252 B | +160 B | +352 B |
+| ESP32-H2 sensor | +12,168 B | +168 B | +352 B |
+| ESP32-H2 thermometer | +12,888 B | +168 B | −168 B |
 
 The BL702 loader reserves a 15 KiB stack. A static measurement of the
 loader's worst-case stack (P-256 and Ed25519) is still open.
@@ -809,6 +1049,16 @@ Resolved in Phase 2 step 2:
 
 Still open:
 
+0. **Phase 3:**
+   - **MG22.** Reclaim the router-tables reservation, or shrink the
+     image.
+   - **Loader watchdogs.** Whether to add an EFR32 WDOG driver and arm
+     watchdogs in the nRF, EFR32 and PHY loaders.
+   - **PHY62x2 application cap.** Whether to keep the 130,816 B cap.
+   - **PHY62x2 sleep.** The warm-boot path for sleeping PHY62x2
+     products.
+   - **ESP32 version mapping.** Confirm the ESP32 file-version to MCUboot
+     version mapping.
 1. **CC2340 watchdog default.** The CC2340 WDT cannot be stopped once
    armed, and `cc2340-sensor` does not feed it. Product configs therefore
    keep `watchdog: None` until the app feeds the watchdog; then they arm
@@ -844,3 +1094,12 @@ moving the stale OTA file and both ISP sessions) were given and used on
 6. **ESP32 and Telink:** app-side verification of the shared signature
    before activation, with no loader change.
 7. **EFR32MG1 leaving Gecko:** last, after a sacrificial-board rehearsal.
+
+Phase 3 status:
+
+- **Built and host-tested only:** steps 3 to 6, all awaiting
+  hardware runs.
+- **Skipped:** step 2 (SDK blocker) and step 7.
+
+Each hardware run needs the user's approval of the board, the probe, the
+erase scope and the backup first.

@@ -109,6 +109,8 @@ pub mod ota_transport;
 pub mod otadata;
 #[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
 pub mod sha256;
+#[cfg(all(feature = "signed-ota", any(feature = "esp32c6", feature = "esp32h2")))]
+pub mod signed_ota;
 
 pub const MANUFACTURER: &str = "Zigbee-RS";
 pub const DATE_CODE: &str = "20260403";

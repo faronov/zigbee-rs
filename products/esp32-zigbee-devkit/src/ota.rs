@@ -308,6 +308,24 @@ impl<F: OtaFlash> EspFirmwareWriter<F> {
     }
 }
 
+/// Read-back of the verified staged image for the signed-envelope check
+/// (`crate::signed_ota`).
+#[cfg(feature = "signed-ota")]
+impl<F: OtaFlash> mcuboot_image::StagedImage for EspFirmwareWriter<F> {
+    fn read_staged(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), FirmwareError> {
+        let length = u32::try_from(bytes.len()).map_err(|_| FirmwareError::OutOfRange)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or(FirmwareError::OutOfRange)?;
+        // Only an image this writer staged and checked, and only its bytes.
+        if self.state != State::Verified || end > self.written {
+            return Err(FirmwareError::OutOfRange);
+        }
+        let base = self.slot_base();
+        self.flash.read(base + offset, bytes)
+    }
+}
+
 impl<F: OtaFlash> FirmwareWriter for EspFirmwareWriter<F> {
     /// Prepare for a download. No flash is erased here; see the module docs.
     fn erase_slot(&mut self) -> Result<(), FirmwareError> {
@@ -1462,5 +1480,203 @@ mod tests {
             "verified and activated {} bytes in both slots: {path}",
             image.len()
         );
+    }
+
+    /// Feature `signed-ota`: the ESP image in a signed MCUboot envelope.
+    #[cfg(feature = "signed-ota")]
+    mod signed {
+        use super::*;
+        use crate::signed_ota::{SignedEspWriter, TRAILER_CAPACITY, signed_writer_with_keys};
+        use mcuboot_image::{ImageVersion, KeySet, TrustedKey};
+        use p256::ecdsa::signature::hazmat::PrehashSigner;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        fn signing_key(seed: u8) -> SigningKey {
+            SigningKey::from_bytes(&sha256(&[seed]).into()).unwrap()
+        }
+
+        fn trusted(key: &SigningKey) -> KeySet {
+            let point = key.verifying_key().to_encoded_point(false);
+            let xy: [u8; 64] = point.as_bytes()[1..].try_into().unwrap();
+            KeySet::new(Box::leak(Box::new([TrustedKey::new(xy)])))
+        }
+
+        /// `imgtool sign --header-size 0x20 --pad-header` around `image`.
+        fn envelope(image: &[u8], version: (u8, u8, u16), key: &SigningKey) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&0x96F3_B83Du32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // load_addr
+            out.extend_from_slice(&0x20u16.to_le_bytes()); // hdr_size
+            out.extend_from_slice(&0u16.to_le_bytes()); // protect_tlv_size
+            out.extend_from_slice(&(image.len() as u32).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // flags
+            out.extend_from_slice(&[version.0, version.1]);
+            out.extend_from_slice(&version.2.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // build
+            out.extend_from_slice(&0u32.to_le_bytes()); // pad
+            out.extend_from_slice(image);
+            let digest = sha256(&out);
+            let signature: Signature = key.sign_prehash(&digest).unwrap();
+            let der = signature.to_der();
+            let key_hash = trusted(key).iter().next().unwrap().key_hash();
+            let mut tlvs = Vec::new();
+            for (kind, value) in [
+                (0x10u16, &digest[..]),
+                (0x01, &key_hash[..]),
+                (0x22, der.as_bytes()),
+            ] {
+                tlvs.extend_from_slice(&kind.to_le_bytes());
+                tlvs.extend_from_slice(&(value.len() as u16).to_le_bytes());
+                tlvs.extend_from_slice(value);
+            }
+            out.extend_from_slice(&0x6907u16.to_le_bytes());
+            out.extend_from_slice(&((tlvs.len() + 4) as u16).to_le_bytes());
+            out.extend_from_slice(&tlvs);
+            out
+        }
+
+        fn signed(keys: KeySet, running: (u8, u8, u16)) -> SignedEspWriter<MockFlash> {
+            let running = ImageVersion::new(running.0, running.1, running.2, 0);
+            signed_writer_with_keys(new_writer(MockFlash::with_otadata(1, 0)), keys, running)
+        }
+
+        fn download(writer: &mut SignedEspWriter<MockFlash>, data: &[u8], block: usize) {
+            writer.erase_slot().unwrap();
+            let mut offset = 0;
+            for chunk in data.chunks(block) {
+                writer.write_block(offset, chunk).unwrap();
+                offset += chunk.len() as u32;
+            }
+        }
+
+        #[test]
+        fn signed_envelope_stages_the_esp_image_and_activates() {
+            let key = signing_key(1);
+            let image = esp_image(EXPECTED_CHIP_ID, 3001);
+            let file = envelope(&image, (1, 2, 0), &key);
+            for block in [48, 7, 64] {
+                let mut writer = signed(trusted(&key), (1, 1, 9));
+                download(&mut writer, &file, block);
+                assert_eq!(writer.activate(), Err(FirmwareError::ActivateFailed));
+                writer.verify(file.len() as u32, None).unwrap();
+                let base = ota_slot_offset(writer.inner().target_slot()) as usize;
+                let flash = &writer.inner().flash;
+                assert_eq!(&flash.data[base..base + image.len()], &image[..]);
+                // Activation reaches the platform writer: it selects the slot
+                // and resets.
+                let reset = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = writer.activate();
+                }));
+                assert!(reset.is_err(), "activation must reset");
+                let selected = read_otadata(&mut writer.inner_mut().flash).unwrap();
+                assert_eq!(selected.active_slot(), Some(writer.inner().target_slot()));
+            }
+        }
+
+        #[test]
+        fn unsigned_foreign_tampered_and_older_images_are_refused() {
+            let key = signing_key(1);
+            let image = esp_image(EXPECTED_CHIP_ID, 2000);
+
+            // A bare ESP image (no envelope) fails at its first 32 bytes,
+            // before anything is staged.
+            let mut bare = signed(trusted(&key), (1, 0, 0));
+            bare.erase_slot().unwrap();
+            assert_eq!(
+                bare.write_block(0, &image[..64]),
+                Err(FirmwareError::VerifyFailed)
+            );
+            assert_eq!(bare.inner().bytes_written(), 0);
+
+            // Signed by another key.
+            let foreign = envelope(&image, (2, 0, 0), &signing_key(2));
+            let mut writer = signed(trusted(&key), (1, 0, 0));
+            download(&mut writer, &foreign, 64);
+            assert_eq!(
+                writer.verify(foreign.len() as u32, None),
+                Err(FirmwareError::VerifyFailed)
+            );
+            assert_eq!(writer.activate(), Err(FirmwareError::ActivateFailed));
+
+            // Older than the running image.
+            let older = envelope(&image, (1, 0, 0), &key);
+            let mut writer = signed(trusted(&key), (1, 0, 1));
+            download(&mut writer, &older, 64);
+            assert_eq!(
+                writer.verify(older.len() as u32, None),
+                Err(FirmwareError::VerifyFailed)
+            );
+
+            // A correctly re-hashed ESP image whose envelope signature no
+            // longer matches: the ESP check passes, the envelope fails.
+            let mut file = envelope(&image, (2, 0, 0), &key);
+            file[0x20 + 100] ^= 1;
+            rehash(&mut file[0x20..0x20 + image.len()]);
+            let mut writer = signed(trusted(&key), (1, 0, 0));
+            download(&mut writer, &file, 64);
+            assert_eq!(
+                writer.verify(file.len() as u32, None),
+                Err(FirmwareError::VerifyFailed)
+            );
+
+            // A signed envelope around a broken ESP image: the ESP check
+            // fails first.
+            let mut broken = image.clone();
+            broken[100] ^= 1;
+            let file = envelope(&broken, (2, 0, 0), &key);
+            let mut writer = signed(trusted(&key), (1, 0, 0));
+            download(&mut writer, &file, 64);
+            assert_eq!(
+                writer.verify(file.len() as u32, None),
+                Err(FirmwareError::VerifyFailed)
+            );
+        }
+
+        #[test]
+        fn read_back_is_limited_to_the_verified_image() {
+            use mcuboot_image::StagedImage;
+            let image = esp_image(EXPECTED_CHIP_ID, 500);
+            let mut inner = new_writer(MockFlash::with_otadata(1, 0));
+            let mut byte = [0u8; 1];
+            assert_eq!(
+                inner.read_staged(0, &mut byte),
+                Err(FirmwareError::OutOfRange)
+            );
+            stage(&mut inner, &image, 64).unwrap();
+            inner
+                .read_staged(image.len() as u32 - 1, &mut byte)
+                .unwrap();
+            assert_eq!(byte[0], *image.last().unwrap());
+            assert_eq!(
+                inner.read_staged(image.len() as u32, &mut byte),
+                Err(FirmwareError::OutOfRange)
+            );
+            // An ECDSA P-256 envelope's TLVs fit the RAM trailer.
+            let file = envelope(&image, (1, 0, 0), &signing_key(1));
+            assert!(file.len() - 0x20 - image.len() <= TRAILER_CAPACITY);
+        }
+
+        #[test]
+        fn build_trusts_the_configured_key() {
+            let own: [u8; 64] = {
+                let text = include_str!("../../../bootloaders/keys/own-ec-p256.xy.hex");
+                let digits: String = text
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with('#'))
+                    .flat_map(|line| line.chars())
+                    .filter(|c| c.is_ascii_hexdigit())
+                    .collect();
+                let mut xy = [0u8; 64];
+                for (index, byte) in xy.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&digits[index * 2..index * 2 + 2], 16).unwrap();
+                }
+                xy
+            };
+            assert_eq!(crate::signed_ota::TRUSTED_KEYS.len(), 1);
+            assert_eq!(
+                crate::signed_ota::TRUSTED_KEYS[0].key_hash(),
+                TrustedKey::new(own).key_hash()
+            );
+        }
     }
 }

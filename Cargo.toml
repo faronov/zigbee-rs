@@ -21,6 +21,8 @@ members = [
     "tools/phy62x2-image",
     "mcuboot-image",
     "bootloaders/core",
+    "bootloaders/cortex-m-boot",
+    "bootloaders/layout",
     "esp32h2-sleep",
 ]
 exclude = [

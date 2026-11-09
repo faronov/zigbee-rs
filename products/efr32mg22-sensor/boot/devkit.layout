@@ -1,0 +1,27 @@
+# EFR32MG22 sensor on BRD4183A/BRD4001A (512 KiB flash, 8 KiB pages, 32 KiB
+# RAM). No resident bootloader: the Secure Engine starts the vector table at
+# 0x0, so the zigbee-rs loader lives there. The router-table journals and the
+# security journal keep the addresses of link/memory.x and are never written
+# by the loader. Recovery: SWD.
+#
+# Capacity: each slot holds at most 0x38000 - 0x200 - 0x300 = 228,096 B of
+# image; the default sensor image (~234 KB) does not fit yet. The 512 KiB
+# part leaves no room for larger equal slots without reclaiming the
+# router-tables reservation (a product decision, not taken here).
+name           = efr32mg22-devkit
+flash          = 0x0..0x80000
+sector         = 0x2000
+loader         = 0x0..0x4000
+primary        = 0x4000..0x3C000
+secondary      = 0x3C000..0x74000
+reserved       = 0x74000..0x7C000 router-tables
+journal        = 0x7C000..0x80000
+ram            = 0x20000000..0x20008000
+header         = 0x200
+vector-align   = 0x200
+loader-version = 1
+trial-boots    = 3
+watchdog-ms    = 0
+mode           = overwrite
+env-prefix     = EFR32MG22
+key-file       = ../../../bootloaders/keys/own-ec-p256.xy.hex

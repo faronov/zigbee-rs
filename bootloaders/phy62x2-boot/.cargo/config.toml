@@ -1,0 +1,17 @@
+# Toolchain: ESP_PHY_RUST_TOOLCHAIN of .github/workflows/ci.yml (nightly with
+# `panic-immediate-abort`), e.g. `cargo +nightly-2026-08-01 build --release`.
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+rustflags = ["-C", "link-arg=-Tphy62x2-loader.x", "-Zlocation-detail=none"]
+
+[unstable]
+build-std = ["core"]
+# Required by the `immediate-abort` panic strategy below.
+panic-immediate-abort = true
+
+# Every panic site is a single `udf` trap into the HardFault handler (halt),
+# as on the PHY62x2 applications.
+[profile.release]
+panic = "immediate-abort"

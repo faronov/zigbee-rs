@@ -1,0 +1,26 @@
+# nice!nano-style ProMicro nRF52840: MBR + S140 SoftDevice (0x0..0x26000),
+# Adafruit UF2 bootloader at 0xF4000. The UF2 bootloader starts the
+# application at 0x26000 — here the zigbee-rs loader — and the loader points
+# VTOR at the application, so the SoftDevice's interrupt forwarding is not
+# used. Same protected map as link/uf2-promicro.x, including the
+# 0xF0000..0xF4000 guard and the 0x20000000..0x20002000 SoftDevice RAM.
+name           = nrf52840-promicro-uf2
+flash          = 0x0..0x100000
+sector         = 0x1000
+reserved       = 0x0..0x26000 mbr-and-s140
+loader         = 0x26000..0x2A000
+primary        = 0x2A000..0x8C000
+secondary      = 0x8C000..0xEE000
+journal        = 0xEE000..0xF0000
+reserved       = 0xF0000..0xF4000 boot-guard
+reserved       = 0xF4000..0xFE000 uf2-bootloader
+reserved       = 0xFE000..0x100000 mbr-params-and-settings
+ram            = 0x20002000..0x20040000
+header         = 0x200
+vector-align   = 0x200
+loader-version = 1
+trial-boots    = 3
+watchdog-ms    = 0
+mode           = overwrite
+env-prefix     = NRF52840
+key-file       = ../../../bootloaders/keys/own-ec-p256.xy.hex

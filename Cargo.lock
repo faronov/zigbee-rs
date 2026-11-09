@@ -2162,3 +2162,15 @@ dependencies = [
  "embedded-storage",
  "mcuboot-image",
 ]
+
+[[package]]
+name = "zrs-boot-cortex-m"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "zrs-boot-core",
+]
+
+[[package]]
+name = "zrs-boot-layout"
+version = "0.1.0"

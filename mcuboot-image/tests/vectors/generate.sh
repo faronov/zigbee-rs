@@ -56,3 +56,22 @@ raw = load(sys.argv[3]).public_bytes(serialization.Encoding.Raw, serialization.P
 open(sys.argv[4], "wb").write(raw)
 PYEOF
 rm payload.bin
+# Cortex-M vector for the Cortex-M loader shell (zrs-boot-cortex-m): a
+# 0x200-byte header and a vector table for a primary slot at 0x800 —
+# initial SP 0x20010000, reset handler 0xA41 (Thumb) — then a pattern.
+if [ ! -f test-cm-v1.bin ]; then
+    "$PY" -c 'import struct, sys; sys.stdout.buffer.write(struct.pack("<II", 0x20010000, 0xA41) + bytes((i * 5 + 1) & 0xFF for i in range(504)))' > cm-payload.bin
+    "$IMGTOOL" sign --header-size 0x200 --pad-header --align 4 --slot-size 0x4000 \
+        --version 1.0.0 --key TEST-ONLY-ec-p256.pem cm-payload.bin test-cm-v1.bin
+    rm cm-payload.bin
+fi
+# Envelope vectors (app-side verification on ROM/SDK-booted platforms): the
+# 32-byte MCUboot header directly precedes the native image, which is staged
+# without it (see `src/envelope.rs`).
+if [ ! -f test-env-v2.bin ] || [ ! -f test-env-v1-protected.bin ]; then
+    "$PY" -c 'import sys; sys.stdout.buffer.write(bytes((i * 11 + 5) & 0xFF for i in range(2999)))' > env-payload.bin
+    ENV="--header-size 0x20 --pad-header --align 4 --slot-size 0x4000"
+    "$IMGTOOL" sign $ENV --version 2.0.0 --key TEST-ONLY-ec-p256.pem env-payload.bin test-env-v2.bin
+    "$IMGTOOL" sign $ENV --version 1.2.3+4 --security-counter auto --key TEST-ONLY-ec-p256.pem env-payload.bin test-env-v1-protected.bin
+    rm env-payload.bin
+fi
