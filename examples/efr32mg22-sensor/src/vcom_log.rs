@@ -68,6 +68,13 @@ pub fn flush() {
     });
 }
 
+/// A bench marker line, written whatever log level is compiled in (the
+/// loader-linked sensor compiles `log` to warnings).
+#[cfg(all(feature = "sed", feature = "zrs-boot"))]
+pub fn marker(args: core::fmt::Arguments<'_>) {
+    emergency(args)
+}
+
 /// Best-effort message from a fault path (panic/HardFault). Skipped if the
 /// fault interrupted a VCOM write.
 pub fn emergency(args: core::fmt::Arguments<'_>) {

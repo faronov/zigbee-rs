@@ -73,8 +73,13 @@ em2-debug = []
 stack-paint = ["cortex-m-rt/paint-stack"]
 # Link into the primary slot of the zigbee-rs loader layout
 # (products/efr32mg22-sensor/boot/devkit.layout) instead of the direct map;
-# sign the result with mcuboot-image for bootloaders/efr32s2-boot.
-zrs-boot = []
+# sign the result with tools/zrs_boot_ota.py for bootloaders/efr32s2-boot.
+# With `sed` the sensor also receives Zigbee OTA images into the secondary
+# slot (products/efr32mg22-sensor/src/ota.rs). Loader-linked images compile
+# `log` to warnings: the slot's 236,288 B cannot hold the OTA client with
+# info-level logs (measured 265,908 B, 233,596 B at warn); the sensor
+# prints its version and loader channel as a raw VCOM marker line.
+zrs-boot = ["efr32mg22-sensor-product/zrs-boot", "log/release_max_level_warn"]
 
 [profile.dev]
 opt-level = "s"

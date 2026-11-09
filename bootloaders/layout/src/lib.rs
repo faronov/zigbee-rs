@@ -870,6 +870,18 @@ impl Build {
         link_search_out_dir();
     }
 
+    /// Write `version.rs` ([`ReleaseVersion::rust`]) into `OUT_DIR` from
+    /// the package version and the layout's version-override variable.
+    pub fn write_version(&self) -> ReleaseVersion {
+        let var = ReleaseVersion::override_var(&self.layout.env_prefix);
+        println!("cargo:rerun-if-env-changed={var}");
+        let package = std::env::var("CARGO_PKG_VERSION").expect("build script");
+        let version = ReleaseVersion::resolve(&package, std::env::var(&var).ok().as_deref())
+            .unwrap_or_else(|error| panic!("{var} / CARGO_PKG_VERSION: {error}"));
+        write_out("version.rs", &version.rust());
+        version
+    }
+
     /// Write the application's `memory.x` into `OUT_DIR` and add it to the
     /// link search path.
     pub fn write_app_memory_x(&self) {
@@ -889,6 +901,70 @@ fn write_out(name: &str, text: &str) {
 
 fn link_search_out_dir() {
     println!("cargo:rustc-link-search={}", out_dir().display());
+}
+
+/// Release version `MAJOR.MINOR.PATCH` of a loader-linked application:
+/// the package version, or for a TEST-ONLY bench build the value of
+/// `<PREFIX>_OTA_VERSION_OVERRIDE` (an otherwise identical image with
+/// another version, to exercise an upgrade without editing `Cargo.toml`;
+/// never publish such a build). The image is signed with the same version
+/// (`imgtool sign --version MAJOR.MINOR.PATCH+0`), which the loader's
+/// downgrade prevention compares; the product maps it to its Zigbee OTA
+/// file version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseVersion {
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
+    pub overridden: bool,
+}
+
+impl ReleaseVersion {
+    /// `package` unless `override_value` is set and non-empty.
+    pub fn resolve(package: &str, override_value: Option<&str>) -> Result<Self, String> {
+        let (text, overridden) = match override_value.map(str::trim) {
+            Some(value) if !value.is_empty() => (value, true),
+            _ => (package, false),
+        };
+        let parts: Vec<&str> = text.split('.').collect();
+        let [major, minor, patch] = parts[..] else {
+            return Err(format!("version must be MAJOR.MINOR.PATCH, got {text:?}"));
+        };
+        let component = |part: &str| {
+            part.parse::<u8>()
+                .map_err(|_| format!("version components must be 0..=255, got {text:?}"))
+        };
+        Ok(Self {
+            major: component(major)?,
+            minor: component(minor)?,
+            patch: component(patch)?,
+            overridden,
+        })
+    }
+
+    /// The override variable for layouts with `env-prefix = prefix`.
+    pub fn override_var(prefix: &str) -> String {
+        format!("{prefix}_OTA_VERSION_OVERRIDE")
+    }
+
+    /// Rust constants for `include!`: `SW_BUILD`, `VERSION`,
+    /// `VERSION_OVERRIDDEN`.
+    pub fn rust(&self) -> String {
+        let Self {
+            major,
+            minor,
+            patch,
+            overridden,
+        } = *self;
+        format!(
+            "/// Release version `MAJOR.MINOR.PATCH` (Basic SW build ID).\n\
+             pub const SW_BUILD: &str = \"{major}.{minor}.{patch}\";\n\
+             /// Release version; the image is signed as `MAJOR.MINOR.PATCH+0`.\n\
+             pub const VERSION: (u8, u8, u8) = ({major}, {minor}, {patch});\n\
+             /// `true` for a TEST-ONLY version-override build.\n\
+             pub const VERSION_OVERRIDDEN: bool = {overridden};\n"
+        )
+    }
 }
 
 #[cfg(test)]

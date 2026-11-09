@@ -15,12 +15,23 @@ publish = false
 efr32mg22-devkit = { path = "../../boards/efr32mg22-devkit" }
 efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg22"] }
 embedded-storage = "0.3"
+mcuboot-image = { path = "../../mcuboot-image", features = ["firmware-writer"], optional = true }
 router-app = { path = "../../apps/router", default-features = false }
 sensor-sed-app = { path = "../../apps/sensor-sed", optional = true }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 
+[build-dependencies]
+zrs-boot-layout = { path = "../../bootloaders/layout" }
+
+[dev-dependencies]
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
+
 [features]
 # Sleepy sensor role policy (pulls in the SED lifecycle crate).
 sed = ["dep:sensor-sed-app"]
+# The image runs from the primary slot of the zigbee-rs loader
+# (boot/devkit.layout): layout constants, and with `sed` the Zigbee OTA
+# client staging into the secondary slot (`ota`).
+zrs-boot = ["dep:mcuboot-image", "sensor-sed-app?/ota"]

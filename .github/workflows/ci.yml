@@ -55,6 +55,8 @@ jobs:
         run: python3 -m unittest discover -s tools -p 'test_firmware_size_report.py' -v
       - name: Test BL702 OTA release tooling
         run: python3 -m unittest discover -s tools -p 'test_bl702_ota.py' -v
+      - name: Test zigbee-rs loader OTA release tooling
+        run: python3 -m unittest discover -s tools -p 'test_zrs_boot_ota.py' -v
       - name: Test MAC footprint stack-frame analysis
         run: python3 -m unittest discover -s tools -p 'test_mac_footprint.py' -v
       - name: Test BL702 static stack gate
@@ -208,6 +210,10 @@ jobs:
             manifest: products/efr32mg22-sensor/Cargo.toml
             workspace: products/efr32mg22-sensor
             features: sed
+          - name: EFR32MG22 sensor product (loader-linked sleepy OTA)
+            manifest: products/efr32mg22-sensor/Cargo.toml
+            workspace: products/efr32mg22-sensor
+            features: sed,zrs-boot
           - name: Home Assistant Connect ZBT-1 product
             manifest: products/ha-connect-zbt1/Cargo.toml
             workspace: products/ha-connect-zbt1
@@ -2058,7 +2064,21 @@ jobs:
       # The leaf roles linked into the primary slot of the zigbee-rs loader
       # (products/efr32mg22-sensor/boot/devkit.layout, feature zrs-boot).
       # That layout reclaims the router tables, so router + zrs-boot must be
-      # refused by build.rs.
+      # refused by build.rs. The sleepy sensor receives OTA images; its
+      # release and OTA file are signed with a key generated for this run
+      # only (test-signed, never for a board whose loader trusts the
+      # release key).
+      - name: Install imgtool
+        run: |
+          python3 -m venv "$RUNNER_TEMP/imgtool"
+          "$RUNNER_TEMP/imgtool/bin/pip" install --quiet "imgtool==${IMGTOOL_VERSION}"
+          echo "$RUNNER_TEMP/imgtool/bin" >> "$GITHUB_PATH"
+      - name: Generate ephemeral OTA signing key
+        run: |
+          imgtool keygen -t ecdsa-p256 -k "$RUNNER_TEMP/ci-mg22-ota.pem"
+          echo "MG22_OTA_KEY=$RUNNER_TEMP/ci-mg22-ota.pem" >> "$GITHUB_ENV"
+          echo "EFR32MG22_OTA_KEY_XY=$(python3 tools/zrs_boot_ota.py key-xy \
+            --key "$RUNNER_TEMP/ci-mg22-ota.pem")" >> "$GITHUB_ENV"
       - name: Build EFR32MG22 loader-linked sensor and End Device
         working-directory: examples/efr32mg22-sensor
         run: |
@@ -2066,6 +2086,12 @@ jobs:
             cargo build --release --locked --no-default-features \
               --features "$role,zrs-boot" --target-dir target/zrs-boot
           done
+          # Signature, identity, version and slot fit of the OTA file.
+          python3 ../../tools/zrs_boot_ota.py release \
+            --layout ../../products/efr32mg22-sensor/boot/devkit.layout \
+            --elf target/zrs-boot/thumbv8m.main-none-eabihf/release/efr32mg22-sensor \
+            --out target/zrs-boot/ota --key "$MG22_OTA_KEY" \
+            --name efr32mg22-sensor --label ci-test
           if cargo build --release --locked --no-default-features \
             --features router,zrs-boot --target-dir target/zrs-boot \
             2> "$RUNNER_TEMP/mg22-router-zrs-boot.log"; then
@@ -2098,6 +2124,11 @@ jobs:
           for role in sed ed router; do
             cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
               --no-default-features --features "$role" -- -D warnings
+          done
+          for role in sed ed; do
+            cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+              --no-default-features --features "$role,zrs-boot" \
+              --target-dir target/zrs-boot -- -D warnings
           done
       - name: Build EFR32 Series 2 lab gate binaries (MG22)
         working-directory: tools/efr32s2-lab

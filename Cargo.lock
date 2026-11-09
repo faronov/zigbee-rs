@@ -1629,6 +1629,7 @@ name = "sensor-sed-app"
 version = "0.1.0"
 dependencies = [
  "embedded-storage",
+ "log",
  "zigbee-aps",
  "zigbee-mac",
  "zigbee-nwk",

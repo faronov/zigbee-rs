@@ -8,6 +8,10 @@
 //! Measurements: temperature is the EFR32 die sensor (EMU_TEMP), humidity is
 //! synthetic and the battery is a fixed 3000 mV — the BRD4183A has no
 //! reachable Si7021 (the `s2-i2c-scan` lab gate found no device).
+//!
+//! With feature `zrs-boot` the image runs from the zigbee-rs loader's
+//! primary slot and receives Zigbee OTA images into the secondary slot
+//! (`product::ota`, `sensor_sed_app::ota_client::ImageOtaClient`).
 
 #![no_std]
 #![no_main]
@@ -20,7 +24,7 @@ use efr32mg22_devkit::resources::BoardResources;
 use efr32mg22_sensor_product as product;
 use efr32s2_hal::power;
 use embassy_executor::Spawner;
-use sensor_sed_app::{FixedBattery, NoOta, SensorApp, SensorSedParts};
+use sensor_sed_app::{FixedBattery, SensorApp, SensorSedParts};
 use static_cell::StaticCell;
 use zigbee_mac::efr32s2::{Efr32s2RadioPhy, Efr32s2SoftMac};
 use zigbee_runtime::{
@@ -34,23 +38,27 @@ use zigbee_zcl::clusters::basic::PowerSource;
 #[allow(unused_imports)]
 use efr32s2_hal::vectors::__INTERRUPTS;
 
+#[cfg(not(feature = "zrs-boot"))]
+type Profile = product::profile::SensorProfile;
+#[cfg(not(feature = "zrs-boot"))]
+type Ota = sensor_sed_app::NoOta;
+#[cfg(feature = "zrs-boot")]
+type Profile = product::ota::OtaSensorProfile<product::ota::Mg22Writer<product::ota::LowFlash>>;
+#[cfg(feature = "zrs-boot")]
+type Ota = sensor_sed_app::ota_client::ImageOtaClient;
+
 type AppParts = SensorSedParts<
     platform::Mg22Wake,
     platform::Led0Status,
     platform::DieTemperature,
     FixedBattery,
-    NoOta,
+    Ota,
     sensor_sed_app::ToggleJoinAction,
     platform::Efr32Supervisor,
     platform::VcomDiagnostics,
 >;
-type SharedSensorApp = SensorApp<
-    'static,
-    Efr32s2SoftMac,
-    product::storage::SecurityStore,
-    product::profile::SensorProfile,
-    AppParts,
->;
+type SharedSensorApp =
+    SensorApp<'static, Efr32s2SoftMac, product::storage::SecurityStore, Profile, AppParts>;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -121,11 +129,20 @@ fn compose(
     log::info!("[MG22] EUI-64 {:02X?}", ieee);
 
     static SECURITY: StaticCell<product::storage::SecurityStore> = StaticCell::new();
-    static PROFILE: StaticCell<product::profile::SensorProfile> = StaticCell::new();
+    static PROFILE: StaticCell<Profile> = StaticCell::new();
     static DEVICE: StaticCell<ZigbeeDevice<Efr32s2SoftMac>> = StaticCell::new();
     static APP: StaticCell<SharedSensorApp> = StaticCell::new();
 
-    let profile = PROFILE.init(product::profile::sensor_profile());
+    #[cfg(not(feature = "zrs-boot"))]
+    let (profile, ota) = (
+        PROFILE.init(product::profile::sensor_profile()),
+        sensor_sed_app::NoOta,
+    );
+    #[cfg(feature = "zrs-boot")]
+    let (flash, profile, ota) = {
+        let (flash, profile, ota) = loader_ota(flash);
+        (flash, PROFILE.init(profile), ota)
+    };
     let device = ZigbeeDevice::builder(mac)
         .power_mode(product::policy::SENSOR_POLICY.power_mode())
         .automatic_polling(false)
@@ -185,7 +202,7 @@ fn compose(
                     percentage_remaining: 200,
                 },
             ),
-            ota: NoOta,
+            ota,
             actions: product::policy::USER_ACTIONS,
             supervisor: platform::Efr32Supervisor,
             diagnostics: platform::VcomDiagnostics,
@@ -198,6 +215,45 @@ fn compose(
 
     APP.init(app)
 }
+
+/// Split the flash for the OTA writer, classify the installed loader and
+/// build the OTA-capable profile and client.
+#[cfg(feature = "zrs-boot")]
+fn loader_ota(
+    flash: efr32s2_hal::flash::Efr32s2Flash,
+) -> (efr32s2_hal::flash::Efr32s2Flash, Profile, Ota) {
+    let (flash, mut low) = product::ota::ota_flash(flash);
+    let channel = product::ota::channel(&mut low);
+    // Raw line: `log` is compiled to warnings in this build.
+    vcom_log::marker(format_args!(
+        "MG22 app {}{}: loader {channel:?}, OTA 0x{:04X}/0x{:04X} file 0x{:08X}",
+        product::SW_BUILD,
+        if product::VERSION_OVERRIDDEN {
+            " (TEST-ONLY version)"
+        } else {
+            ""
+        },
+        product::ota::MANUFACTURER_CODE,
+        product::ota::IMAGE_TYPE,
+        product::ota::FILE_VERSION
+    ));
+    let profile = product::ota::sensor_ota_profile(low).unwrap_or_else(|error| {
+        log::error!("[MG22] OTA profile: {error:?}");
+        platform::halt()
+    });
+    (flash, profile, product::ota::client(channel, reset))
+}
+
+#[cfg(feature = "zrs-boot")]
+fn reset() -> ! {
+    cortex_m::peripheral::SCB::sys_reset()
+}
+
+/// Identity read by `tools/zrs_boot_ota.py` from the ELF.
+#[cfg(feature = "zrs-boot")]
+#[unsafe(no_mangle)]
+#[used]
+static ZRS_OTA_IDENTITY: [u32; 2] = product::ota::OTA_IDENTITY;
 
 #[unsafe(no_mangle)]
 extern "C" fn GPIO_EVEN() {
