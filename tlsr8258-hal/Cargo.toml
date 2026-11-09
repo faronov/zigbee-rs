@@ -12,6 +12,9 @@ default = []
 # implementation remains available to host tests; target-only restoration
 # callers are selected by this feature in the MAC/product composition.
 retention-proof = []
+# Lab-only receive-queue overflow ring (`TLSR_LAB_RX_TRACE`) read over
+# SWire. Never enabled by production images.
+lab-rx-trace = []
 
 [dependencies]
 embedded-hal = "1.0"

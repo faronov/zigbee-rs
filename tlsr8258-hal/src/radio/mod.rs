@@ -2205,6 +2205,10 @@ mod hw {
             }
             if phy::rx_done() {
                 let outcome = take_completed_rx();
+                #[cfg(feature = "lab-rx-trace")]
+                if let RawRxOutcome::Frame(frame) = &outcome {
+                    lab_rx_trace::record_polled(frame);
+                }
                 increment_counter(core::ptr::addr_of_mut!(RX_SERVICED_POLLED_COUNT));
                 frames_seen += 1;
                 if on_frame(outcome) {
@@ -2230,6 +2234,8 @@ mod hw {
     #[inline(never)]
     #[unsafe(link_section = ".ram_code")]
     pub fn handle_irq() {
+        #[cfg(feature = "lab-rx-trace")]
+        lab_rx_trace::set_in_irq(true);
         if rx_on_when_idle() {
             // A second frame can finish while the first ACK and queue copy
             // are in progress. Drain a small fixed burst; if more remains,
@@ -2245,6 +2251,8 @@ mod hw {
         if !phy::rx_done() {
             clear_cpu_rx_irq_sources();
         }
+        #[cfg(feature = "lab-rx-trace")]
+        lab_rx_trace::set_in_irq(false);
         // TLSR8258 clears the global enable on IRQ entry. The proven lab
         // vector requires the handler to re-enable it before IRQ return.
         unsafe {
@@ -2540,16 +2548,209 @@ mod hw {
         // The return value is intentionally unused here: `RxQueue` already
         // accounts for every outcome in its own cumulative counters, which
         // `rx_diagnostics()` exports. There is no silent failure path.
-        let _: RxQueuePush =
+        let _outcome: RxQueuePush =
             unsafe { (*core::ptr::addr_of_mut!(IRQ_RX_QUEUE)).push(frame, priority) };
+        #[cfg(feature = "lab-rx-trace")]
+        if _outcome != RxQueuePush::Queued
+            || (priority == RxPriority::Local && lab_rx_trace::record_local())
+        {
+            lab_rx_trace::record(&frame, priority, _outcome);
+        }
         compiler_fence(Ordering::Release);
     }
 
     fn pop_irq_rx() -> Option<ReceivedFrame> {
         compiler_fence(Ordering::Acquire);
         let frame = unsafe { (*core::ptr::addr_of_mut!(IRQ_RX_QUEUE)).pop() };
+        #[cfg(feature = "lab-rx-trace")]
+        if frame.is_some() {
+            lab_rx_trace::note_pop();
+        }
         compiler_fence(Ordering::Acquire);
         frame
+    }
+
+    /// Lab-only attribution of receive-queue overflows.
+    ///
+    /// Every overflow (eviction or outright drop) appends one record to a
+    /// fixed ring that a debugger reads over SWire (`TLSR_LAB_RX_TRACE`).
+    /// Records hold the arrival's MAC/NWK header prefix, the queue state,
+    /// the time since the consumer last popped a frame, and — when the
+    /// overflow was taken in the RF interrupt — the interrupted main-loop
+    /// return address saved by the vector's first `push {lr}`, which
+    /// identifies the code that was not draining the queue. Never built
+    /// into production images.
+    #[cfg(feature = "lab-rx-trace")]
+    pub mod lab_rx_trace {
+        use super::super::{IRQ_RX_QUEUE_CAPACITY, RxPriority, RxQueuePush};
+        use super::{IRQ_RX_QUEUE, ReceivedFrame};
+        use crate::timer;
+
+        const ENTRIES: usize = 24;
+        const HEAD_BYTES: usize = 24;
+        const MAGIC: u32 = 0x5452_584C; // "LXRT"
+
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct Entry {
+            ticks: u32,
+            irq_lr: u32,
+            since_pop: u32,
+            len: u8,
+            local: u8,
+            priority: u8,
+            /// bit0 evicted, bit2 queued (neither: dropped), bit3 taken by
+            /// a polled window (bypassed the queue), bit1 IRQ context,
+            /// bit7 valid.
+            flags: u8,
+            psdu_len: u8,
+            reserved: [u8; 3],
+            head: [u8; HEAD_BYTES],
+        }
+
+        #[repr(C)]
+        pub struct Trace {
+            magic: u32,
+            count: u32,
+            last_pop: u32,
+            in_irq: u32,
+            entries: [Entry; ENTRIES],
+            /// Debugger-armed: non-zero also records every *queued* frame
+            /// unicast to this node, to see what reached the HAL during a
+            /// short protocol window (e.g. a Transport-Key wait). Appended
+            /// so the offsets above stay stable.
+            record_local: u32,
+        }
+
+        const EMPTY: Entry = Entry {
+            ticks: 0,
+            irq_lr: 0,
+            since_pop: 0,
+            len: 0,
+            local: 0,
+            priority: 0,
+            flags: 0,
+            psdu_len: 0,
+            reserved: [0; 3],
+            head: [0; HEAD_BYTES],
+        };
+
+        #[unsafe(no_mangle)]
+        #[used]
+        pub static mut TLSR_LAB_RX_TRACE: Trace = Trace {
+            magic: 0,
+            count: 0,
+            last_pop: 0,
+            in_irq: 0,
+            entries: [EMPTY; ENTRIES],
+            record_local: 0,
+        };
+
+        #[inline(always)]
+        pub fn record_local() -> bool {
+            unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(TLSR_LAB_RX_TRACE.record_local)) != 0
+            }
+        }
+
+        unsafe extern "C" {
+            static _irq_stack_top: u8;
+        }
+
+        #[inline(always)]
+        pub fn set_in_irq(active: bool) {
+            unsafe {
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!(TLSR_LAB_RX_TRACE.in_irq),
+                    active as u32,
+                );
+            }
+        }
+
+        pub fn note_pop() {
+            unsafe {
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!(TLSR_LAB_RX_TRACE.last_pop),
+                    timer::now_ticks(),
+                );
+            }
+        }
+
+        /// Record a frame a polled receive window took straight from the
+        /// radio, bypassing the queue, when it is unicast to this node and
+        /// [`record_local`] is armed.
+        pub fn record_polled(frame: &ReceivedFrame) {
+            if !record_local() {
+                return;
+            }
+            let filter =
+                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(super::ACK_FILTER)) };
+            let priority = super::super::classify_rx_priority(
+                frame.as_slice(),
+                &super::super::RxAddressFilter {
+                    pan_id: filter.pan_id,
+                    short_address: filter.short_address,
+                    extended_address: filter.extended_address,
+                    enabled: filter.enabled != 0 && filter.promiscuous == 0,
+                },
+            );
+            if priority == RxPriority::Local {
+                record_with(frame, priority, RxQueuePush::Queued, 0x08);
+            }
+        }
+
+        pub fn record(frame: &ReceivedFrame, priority: RxPriority, outcome: RxQueuePush) {
+            record_with(frame, priority, outcome, 0);
+        }
+
+        fn record_with(
+            frame: &ReceivedFrame,
+            priority: RxPriority,
+            outcome: RxQueuePush,
+            extra_flags: u8,
+        ) {
+            let now = timer::now_ticks();
+            unsafe {
+                let trace = &mut *core::ptr::addr_of_mut!(TLSR_LAB_RX_TRACE);
+                let queue = &*core::ptr::addr_of!(IRQ_RX_QUEUE);
+                trace.magic = MAGIC;
+                let in_irq = core::ptr::read_volatile(&trace.in_irq) != 0;
+                let irq_lr = if in_irq {
+                    let top = core::ptr::addr_of!(_irq_stack_top) as *const u32;
+                    core::ptr::read_volatile(top.sub(1))
+                } else {
+                    0
+                };
+                let mut local = 0u8;
+                for position in 0..queue.len as usize {
+                    if queue.priorities[queue.slot_at(position)] == RxPriority::Local {
+                        local += 1;
+                    }
+                }
+                let psdu = frame.as_slice();
+                let mut head = [0u8; HEAD_BYTES];
+                let copied = psdu.len().min(HEAD_BYTES);
+                head[..copied].copy_from_slice(&psdu[..copied]);
+                let index = trace.count as usize % ENTRIES;
+                trace.entries[index] = Entry {
+                    ticks: now,
+                    irq_lr,
+                    since_pop: now.wrapping_sub(trace.last_pop),
+                    len: queue.len.min(IRQ_RX_QUEUE_CAPACITY as u8),
+                    local,
+                    priority: priority as u8,
+                    flags: 0x80
+                        | (outcome == RxQueuePush::Evicted) as u8
+                        | ((in_irq as u8) << 1)
+                        | (((outcome == RxQueuePush::Queued) as u8) << 2)
+                        | extra_flags,
+                    psdu_len: psdu.len() as u8,
+                    reserved: [0; 3],
+                    head,
+                };
+                core::ptr::write_volatile(&mut trace.count, trace.count.wrapping_add(1));
+            }
+        }
     }
 
     fn irq_rx_queue_counters() -> (u32, u32, u8) {
