@@ -22,6 +22,25 @@ pub enum FirmwareError {
     HardwareError,
 }
 
+/// Download progress a writer can keep across a reset, so an interrupted OTA
+/// download continues where the staged data ends (see
+/// [`FirmwareWriter::checkpoint`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeRecord {
+    /// Offered image identity (Query Next Image Response).
+    pub manufacturer_code: u16,
+    pub image_type: u16,
+    pub file_version: u32,
+    /// Total OTA file size.
+    pub image_size: u32,
+    /// OTA file offset of the Upgrade Image payload.
+    pub payload_start: u32,
+    /// Upgrade Image payload length.
+    pub firmware_size: u32,
+    /// Payload bytes durably staged from slot offset 0.
+    pub staged: u32,
+}
+
 /// Platform-independent firmware writer for OTA upgrades.
 ///
 /// # Platform implementations
@@ -68,6 +87,38 @@ pub trait FirmwareWriter {
     fn confirm_image(&mut self) -> Result<(), FirmwareError> {
         Ok(())
     }
+
+    /// Staged payload bytes between progress checkpoints kept across a
+    /// reset; `0` (the default) keeps no progress, and a reset then restarts
+    /// the download at offset 0. The product selects the interval when it
+    /// builds the writer; each checkpoint costs the writer one small flash
+    /// write, so it bounds wear (never one write per block).
+    fn checkpoint_interval(&self) -> u32 {
+        0
+    }
+
+    /// Record download progress so that [`resume`](Self::resume) can
+    /// continue it after a reset. Called each time `record.staged` crosses a
+    /// multiple of [`checkpoint_interval`](Self::checkpoint_interval), with a
+    /// growing value for one staged image (since the last
+    /// [`erase_slot`](Self::erase_slot)). Returns whether the progress was
+    /// recorded.
+    ///
+    /// The record must live with the staged data: erasing or aborting the
+    /// slot, and installing the image, must also drop it.
+    fn checkpoint(&mut self, record: &ResumeRecord) -> bool {
+        let _ = record;
+        false
+    }
+
+    /// The download recorded by [`checkpoint`](Self::checkpoint), if the
+    /// slot still holds it. On `Some`, the writer is positioned to continue
+    /// with `write_block(record.staged, ..)`; `staged` may be lower than the
+    /// last checkpoint (for example rounded down to an erase sector) and is
+    /// never 0. Called once at start-up, before any other write.
+    fn resume(&mut self) -> Option<ResumeRecord> {
+        None
+    }
 }
 
 /// Mock firmware writer for host testing — stores data in a RAM buffer.
@@ -83,6 +134,13 @@ pub struct MockFirmwareWriter {
     activated: bool,
     /// Maximum slot size.
     max_size: u32,
+    /// Checkpoint interval; `0` keeps no progress. Checkpoints survive a
+    /// manager rebuild, as on flash.
+    checkpoint_every: u32,
+    /// Last recorded progress.
+    checkpoint: Option<ResumeRecord>,
+    /// Checkpoints recorded since creation.
+    checkpoints: u32,
 }
 
 #[cfg(any(test, feature = "ota"))]
@@ -95,7 +153,29 @@ impl MockFirmwareWriter {
             erased: false,
             activated: false,
             max_size: slot_size.min(262144),
+            checkpoint_every: 0,
+            checkpoint: None,
+            checkpoints: 0,
         }
+    }
+
+    /// A mock writer that keeps download progress every `checkpoint_every`
+    /// staged bytes for [`FirmwareWriter::resume`].
+    pub fn with_resume(slot_size: u32, checkpoint_every: u32) -> Self {
+        Self {
+            checkpoint_every,
+            ..Self::new(slot_size)
+        }
+    }
+
+    /// Last recorded progress.
+    pub fn last_checkpoint(&self) -> Option<ResumeRecord> {
+        self.checkpoint
+    }
+
+    /// Checkpoints recorded since creation.
+    pub fn checkpoint_count(&self) -> u32 {
+        self.checkpoints
     }
 
     /// Get the written data (for verification in tests).
@@ -121,6 +201,7 @@ impl FirmwareWriter for MockFirmwareWriter {
         self.written = 0;
         self.erased = true;
         self.activated = false;
+        self.checkpoint = None;
         log::debug!("[MockFW] Slot erased");
         Ok(())
     }
@@ -183,7 +264,32 @@ impl FirmwareWriter for MockFirmwareWriter {
         self.written = 0;
         self.erased = false;
         self.activated = false;
+        self.checkpoint = None;
         log::info!("[MockFW] OTA aborted");
         Ok(())
+    }
+
+    fn checkpoint_interval(&self) -> u32 {
+        self.checkpoint_every
+    }
+
+    fn checkpoint(&mut self, record: &ResumeRecord) -> bool {
+        if self.checkpoint_every == 0 || !self.erased || record.staged > self.written {
+            return false;
+        }
+        self.checkpoint = Some(*record);
+        self.checkpoints += 1;
+        true
+    }
+
+    /// Continue exactly at the last checkpoint; staged bytes after it are
+    /// dropped.
+    fn resume(&mut self) -> Option<ResumeRecord> {
+        let record = self.checkpoint.filter(|record| record.staged > 0)?;
+        self.buffer.truncate(record.staged as usize);
+        self.written = record.staged;
+        self.erased = true;
+        self.activated = false;
+        Some(record)
     }
 }

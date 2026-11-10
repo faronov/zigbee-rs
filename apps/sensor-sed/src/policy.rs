@@ -268,6 +268,25 @@ impl SensorPolicy {
         self.slow_poll_ms <= RESPONSIVE_SLOW_POLL_MS
     }
 
+    /// Whether an OTA server can start an upgrade on this joined sensor
+    /// without first relying on luck.
+    ///
+    /// An OTA server starts a session with an unsolicited Image Notify
+    /// (ZCL OTA §11.13.3). zigpy/ZHA fails the update when that frame is not
+    /// acknowledged, and outside an update it answers a client-initiated
+    /// Query Next Image with NO_IMAGE_AVAILABLE, so periodic queries do not
+    /// help. The notify reaches the sensor when its slow poll is within the
+    /// parent's indirect hold ([`Self::slow_poll_within_parent_hold`]), or
+    /// when the user can open a fast-poll window first: only
+    /// [`ShortPressAction::ForceReport`] does that on a joined sensor
+    /// (`ToggleJoin` leaves the network and `JoinOnly` does nothing).
+    ///
+    /// Products check this at build time, for example
+    /// `const _: () = assert!(POLICY.ota_reachable(ACTIONS::SHORT_PRESS));`.
+    pub const fn ota_reachable(&self, short_press: ShortPressAction) -> bool {
+        matches!(short_press, ShortPressAction::ForceReport) || self.slow_poll_within_parent_hold()
+    }
+
     pub const fn power_mode(&self) -> PowerMode {
         PowerMode::Sleepy {
             poll_interval_ms: self.slow_poll_ms,
@@ -298,8 +317,13 @@ pub const RESPONSIVE_SLOW_POLL_MS: u32 =
     PARENT_INDIRECT_HOLD_MIN_MS - PARENT_INDIRECT_HOLD_MARGIN_MS;
 
 // The shortest hold must not exceed the 802.15.4 default
-// macTransactionPersistenceTime (0x01F4 unit backoff periods of 15.36 ms).
-const _: () = assert!(PARENT_INDIRECT_HOLD_MIN_MS <= 0x01F4 * 15_360 / 1_000);
+// macTransactionPersistenceTime (7.68 s).
+const _: () = assert!(
+    PARENT_INDIRECT_HOLD_MIN_MS
+        <= zigbee_mac::pib::transaction_persistence_ms(
+            zigbee_mac::pib::DEFAULT_TRANSACTION_PERSISTENCE_TIME
+        )
+);
 const _: () = assert!(PARENT_INDIRECT_HOLD_MARGIN_MS < PARENT_INDIRECT_HOLD_MIN_MS);
 
 /// Largest configurable backoff cap (30 minutes); see
@@ -494,6 +518,20 @@ mod tests {
         assert!(policy.slow_poll_within_parent_hold());
         policy.slow_poll_ms = RESPONSIVE_SLOW_POLL_MS + 1;
         assert!(!policy.slow_poll_within_parent_hold());
+    }
+
+    #[test]
+    fn ota_start_needs_a_responsive_slow_poll_or_a_report_button() {
+        let mut policy = VALID;
+        policy.slow_poll_ms = RESPONSIVE_SLOW_POLL_MS;
+        assert!(policy.ota_reachable(ShortPressAction::None));
+        // A 10 s poll misses an Image Notify that a parent expired after
+        // 6..7.68 s; only a report press opens a fast-poll window first.
+        policy.slow_poll_ms = 10_000;
+        assert!(!policy.ota_reachable(ShortPressAction::None));
+        assert!(!policy.ota_reachable(ShortPressAction::JoinOnly));
+        assert!(!policy.ota_reachable(ShortPressAction::ToggleJoin));
+        assert!(policy.ota_reachable(ShortPressAction::ForceReport));
     }
 
     const VALID: SensorPolicy = SensorPolicy {

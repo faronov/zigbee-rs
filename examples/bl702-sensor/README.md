@@ -29,7 +29,12 @@ The root constructs explicit `SensorSedParts`:
   diagnostics.
 
 The product selects `Idle` for both fast (250 ms) and slow (10 s) parent-poll
-waits. An `Idle` wait:
+waits. The 10 s slow poll is longer than the parent's indirect hold
+(6–7.68 s) and the board has no button, so an idle sensor misses ZHA's OTA
+Image Notify (`SensorPolicy::ota_reachable` is false). Start an OTA install
+within the 120 s fast-poll window after a boot with a restored network
+(`restored_fast_ms`) or after a join/rejoin (`fresh_join_fast_ms`); see
+[Reaching a sleepy device](../../docs/book/src/advanced/ota.md#reaching-a-sleepy-device). An `Idle` wait:
 
 1. disables M154 receive and waits (bounded) for the M154 state machine to
    report idle; if it does not, the wait returns `WakeReason::Activity`
@@ -161,6 +166,16 @@ Diagnostic logging:
 BL702_DIAGNOSTIC_LOG=1 ./build-image.sh
 ```
 
+Lab only, never publish: an image that never confirms itself, used to check
+the loader's trial expiry (`trial boot 1..N`, then `image unconfirmed`):
+
+```bash
+BL702_OTA_VERSION_OVERRIDE=0.2.8 BL702_LAB_NO_CONFIRM=1 ./build-image.sh
+```
+
+The `lab-no-confirm` feature is off in every shipped build; with it off the
+production and diagnostic binaries are byte-identical to builds without it.
+
 `build-image.sh` builds the application and the loader, packages the
 loader with `bflb-mcu-tool --build`, and runs `tools/bl702_ota.py release`,
 which checks the boot header (magic, 32 MHz XTAL clocks, CRC, image hash,
@@ -232,7 +247,9 @@ The product's OTA identity is manufacturer `0x1234`, image type `0x0702`
 (unused by the other products here and by the CC2340 flower), file version
 `0x25MMmmpp`. The client queries the OTA server (coordinator, endpoint 1)
 300 s after boot and then every 24 h, downloads 48-byte blocks into the
-secondary slot, keeps polling fast for 120 s around OTA activity, verifies
+secondary slot (recording progress every 8 KiB, so a download resumes
+after a reset or power cut), keeps polling fast for 120 s around OTA
+activity, verifies
 the image (SHA-256 and signature against the key in the loader), marks the
 upgrade, checkpoints the security state and resets into the loader. It
 declines offers when no loader or an unknown loader key is detected (the

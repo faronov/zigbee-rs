@@ -46,7 +46,7 @@ hardware-proven capability.
 |---|---|---|
 | `mcuboot-image` | Image format, SHA-256, ECDSA P-256 and optional Ed25519 verification, the install engine (`boot`), the status/trial log, opt-in swap-move, `LoaderInfo` and `LoaderKeys`, and the application-side `SlotWriter` (`firmware-writer`) | Host-tested, including power loss at every flash operation |
 | `bootloaders/core` (`zrs-boot-core`) | The `Platform` trait and the `launch`/`run` sequence, the `BootFlash` slot guard, the RISC-V fixed-entry and Cortex-M vector-table checks, the console `Reporter`, the LED `Indicator`, and the `sim::SimFlash` power-cut simulator | Host-tested (`--features sim`) |
-| `bootloaders/bl702-boot` | BL702 shell: XIP mapping, L1C invalidation, riscv-rt jump, UART lines | Host-tested and release-built. The v2 loader (overwrite, one P-256 key, 3 trial boots, 16 s watchdog) is **lab-tested on one XT-ZB1**: ZHA OTA 0.2.0→0.2.1, confirm-after-rejoin, 168 soak installs and 46 power cuts with no failure ([results](#results-2026-11-08)). Downgrade rejection, wrong-key refusal and trial expiry are not yet exercised on hardware |
+| `bootloaders/bl702-boot` | BL702 shell: XIP mapping, L1C invalidation, riscv-rt jump, UART lines | Host-tested and release-built. The v2 loader (overwrite, one P-256 key, 3 trial boots, 16 s watchdog) is **lab-tested on one XT-ZB1**: ZHA OTA 0.2.0→0.2.1, confirm-after-rejoin, 168 soak installs and 46 power cuts with no failure ([results](#results-2026-11-08)). Trial expiry (`image unconfirmed`, keeps booting) is lab-tested; wrong-key and downgrade images are refused on hardware by the application before arming ([results](#results-2026-11-0910-refusals-trial-expiry-resume)). The loader's own downgrade and wrong-key rejection are host-tested only |
 | `bootloaders/cc2340r5-boot` | CC2340R5 shell: vector-table check, VTOR/MSP jump, fault blinks, SHUTDOWN | Host-tested; thumbv6m build only. No product loader binary exists |
 | `zigbee-runtime` `FirmwareWriter`/`OtaLifecycle` | `confirm_image` hook; `FirmwareWriter::confirm_image` | Host-tested |
 | `apps/sensor-sed` | Confirms the running image on its first APS-acknowledged report, or once joined when reports are not acknowledged | Host-tested |
@@ -1120,10 +1120,62 @@ primary in 1.55–1.56 s.
   install fails with `FAILURE`.
   - The workaround was to reset the board and press install within the
     120 s fast-poll window after a restore.
-  - This is a product poll-policy defect, tracked separately. It is not a
-    loader issue.
+  - This is a product poll-policy limitation, not a loader issue. The
+    10 s poll is kept; the documented procedure is to start the install
+    within the 120 s fast-poll window after a reset or rejoin (see
+    [Reaching a sleepy device](./ota.md#reaching-a-sleepy-device)).
 - **Throughput.** OTA ran at about 77–120 B/s (48 B blocks through
   parent `0x43FD`), so a 238 KB image took about 33 minutes.
+
+### Results (2026-11-09/10): refusals, trial expiry, resume
+
+These runs used the same XT-ZB1 (`0xE8E2`, parent `0x43FD`), the v2 loader
+and test-only diagnostic images. Every image went out through ZHA
+`update.install`, started inside the 120 s fast-poll window after a reset.
+No ISP session was used.
+
+- **Install, trial and confirm.** 0.2.4 and 0.2.5 installed with
+  `installing update`, `update installed`, `trial boot 1`, the new
+  `app v…`, and then `[ota] image confirmed`. The device kept its NWK
+  address with no re-pairing.
+- **Confirm survives a power cut.** After a USB-UART unplug of about 5 s,
+  0.2.5 booted with no trial line.
+- **Unknown key refused (app level).** A 0x25000206 OTA file was signed
+  with a throwaway P-256 key. It downloaded completely, then
+  `[OTA] Verify failed: VerifyFailed` and `[ota] failed`. No request was
+  armed, and the device stayed on 0.2.5.
+- **Disguised downgrade refused (app level).** The signed 0.2.4 MCUboot
+  image was wrapped in an OTA file version 0x25000207, which is newer than
+  the running 0x25000205 at the Zigbee level, so ZHA offered it. The
+  download was interrupted by a power cut and resumed. After completion it
+  gave `Verify failed` and `[ota] failed`, and the device stayed on 0.2.5.
+  The product `SlotWriter` compares MCUboot versions before arming.
+- **Resume after reset or power cut.** See
+  [Resume after a reset](./ota.md#resume-after-a-reset).
+- **Trial expiry.** A lab-only 0.2.8 built with `lab-no-confirm`
+  (`BL702_LAB_NO_CONFIRM=1`) never confirms itself. Installed through
+  ZHA, it booted with `trial boot 1` and then `[ota] LAB: image confirm
+  skipped`. Three RTS resets gave `trial boot 2`, `trial boot 3` and then
+  `image unconfirmed`, as did every later reset. In overwrite mode the
+  loader kept booting 0.2.8, which rejoined as `0xE8E2` each time. A
+  normal 0.2.9 then installed over it and confirmed.
+
+The loader's own `update rejected: downgrade` and unknown-key paths are
+still host-tested only: the app refuses those images before it arms a
+request, so OTA cannot reach them. A loader-level check needs an ISP
+session to arm slot 2 by hand, and that was declined. The NV-journal
+power-cut soak was also declined. Each frame-counter reservation covers
+1024 counter values (`FRAME_COUNTER_RESERVATION_SIZE`), so an OTA writes
+only a handful of journal records.
+
+**Radio.** From about 22:24 on 2026-11-09, bursts of MAC NoAck and route
+errors via parent `0x43FD` (RSSI about −83 dBm) aborted downloads at the
+server three times, which is the environment, not the firmware. The retries
+completed.
+
+**ZHA note.** After a config-entry reload the update entity shows no
+`latest_version` until the device queries again. Calling
+`homeassistant.update_entity` on it re-reads the provider index at once.
 
 ### MG22 results (2026-11-09)
 
@@ -1193,9 +1245,10 @@ Still open:
    it with a period that covers a full-slot validation.
 2. **Swap-move per product.** Which of CC2340, nRF52 and MG21/MG22 turn
    it on, and with how many trial boots.
-3. **XT-ZB1 slow poll versus OTA reachability.** The product poll
-   policy should let ZHA's `image_notify` reach an idle sensor. This is
-   tracked separately from the loader.
+3. **XT-ZB1 slow poll versus OTA reachability.** The 10 s poll is kept
+   (product decision); an idle sensor is reachable for OTA only in the
+   120 s fast-poll window after a reset or rejoin (see
+   [Reaching a sleepy device](./ota.md#reaching-a-sleepy-device)).
 
 The BL702 run approvals (the soak image, the router-to-sensor swap,
 moving the stale OTA file and both ISP sessions) were given and used on

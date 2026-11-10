@@ -28,6 +28,11 @@ REPO="$(cd ../.. && pwd)"
 # (src/bin/ota_soak.rs) into $TARGET_DIR/ota-soak instead. It needs a
 # version override above every image it will be tested against, and its
 # OTA file must never be published.
+#
+# LAB ONLY: BL702_LAB_NO_CONFIRM=1 builds the diagnostic sensor with the
+# `lab-no-confirm` feature: it never confirms an installed image, so the
+# loader's trial expiry (`trial boot 1..N`, then `image unconfirmed`) can
+# be checked. Needs a version override; never publish it.
 
 PYTHON="${PYTHON:-python3}"
 OTA_TOOL="$REPO/tools/bl702_ota.py"
@@ -54,6 +59,14 @@ if [[ "${BL702_LAB_SOAK:-0}" == "1" ]]; then
     ELF="$TARGET_DIR/bl702-ota-soak"
     OUT_DIR="$TARGET_DIR/ota-soak"
     cargo build --release --locked --features ota-soak --bin bl702-ota-soak
+elif [[ "${BL702_LAB_NO_CONFIRM:-0}" == "1" ]]; then
+    if [[ -z "${BL702_OTA_VERSION_OVERRIDE:-}" ]]; then
+        echo "BL702_LAB_NO_CONFIRM=1 needs BL702_OTA_VERSION_OVERRIDE" >&2
+        exit 1
+    fi
+    echo "WARNING: LAB-ONLY image that never confirms; never publish this build" >&2
+    LABEL=lab-no-confirm
+    cargo build --release --locked --no-default-features --features diagnostic-logging,lab-no-confirm
 elif [[ "${BL702_DIAGNOSTIC_LOG:-0}" == "1" ]]; then
     LABEL=diagnostic
     cargo build --release --locked --no-default-features --features diagnostic-logging

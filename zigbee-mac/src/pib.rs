@@ -197,7 +197,7 @@ impl MacPib {
             response_wait_time: 32,
             dsn,
             bsn,
-            transaction_persistence_time: 0x01F4,
+            transaction_persistence_time: DEFAULT_TRANSACTION_PERSISTENCE_TIME,
             promiscuous: false,
             current_channel: 11,
             transmit_power: 0,
@@ -445,6 +445,19 @@ impl PibValue {
 
 /// Base superframe duration in symbols (960)
 pub const A_BASE_SUPERFRAME_DURATION: u32 = 960;
+
+/// aBaseSuperframeDuration at 2.4 GHz (960 symbols × 16 µs): the unit of
+/// `macTransactionPersistenceTime` in a non-beacon PAN.
+pub const BASE_SUPERFRAME_DURATION_US: u32 = A_BASE_SUPERFRAME_DURATION * 16;
+
+/// IEEE 802.15.4 default `macTransactionPersistenceTime` (0x01F4 unit
+/// periods): how long a parent holds an indirect frame for a sleepy child.
+pub const DEFAULT_TRANSACTION_PERSISTENCE_TIME: u16 = 0x01F4;
+
+/// `macTransactionPersistenceTime` in milliseconds (rounded down).
+pub const fn transaction_persistence_ms(units: u16) -> u32 {
+    (units as u32 * BASE_SUPERFRAME_DURATION_US) / 1_000
+}
 
 /// Symbol rate at 2.4 GHz in symbols/second
 pub const SYMBOL_RATE_2_4GHZ: u32 = 62_500;

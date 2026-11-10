@@ -92,10 +92,78 @@ and the server is not sent an Upgrade End. When the next Query Next Image
 response offers the same manufacturer code, image type, file version and size,
 the download continues at the saved offset without erasing the slot. Any other
 offer, an explicit abort, or a verification failure discards the staged data
-and starts again at offset 0. Resume state lives in RAM only, so a reset still
-restarts the download. One BL702 hardware run resumed after a ZHA server abort
-at offset 12,720 (commit `8aeee49`); the other products have host tests
-only.
+and starts again at offset 0. One BL702 hardware run resumed after a ZHA
+server abort at offset 12,720 (commit `8aeee49`); the other products have
+host tests only.
+
+### Resume after a reset
+
+The suspended state lives in RAM. A writer that reports a non-zero
+`FirmwareWriter::checkpoint_interval` also keeps progress across a reset or
+power cut:
+
+- `OtaManager` calls `FirmwareWriter::checkpoint` with the offer identity
+  and the staged length each time the staged payload crosses a multiple of
+  the interval. It never records per block, and not for the block that
+  completes the payload.
+- `OtaManager::new` asks the writer for its record
+  (`FirmwareWriter::resume`). A record for this client's manufacturer code and
+  image type restores a suspended download. The next offer of the same file
+  version and size continues at the offset the writer reports, which may be
+  earlier than the last checkpoint. Any other offer erases the slot as usual.
+- The default trait methods keep no progress and compile away, so products
+  without a resumable writer are unchanged; a reset restarts at offset 0.
+
+`mcuboot-image::SlotWriter::with_resume_checkpoints` (overwrite mode only)
+keeps the records at the start of the secondary slot's trailer sector: one
+32-byte header (identity and CRC-32) and append-only 8-byte entries
+(`staged`, `!staged`). A torn entry fails its complement and is skipped.
+The writer resumes at the last entry rounded down to an erase sector and
+erases that sector again before writing it. The loader reads only the
+request magic at the end of that sector and erases the whole sector after an
+install or a dropped request; `erase_slot` and `abort` erase it too. The
+records therefore cost no erase of their own, never touch the NV journal,
+and disappear with the download they describe. The final signature check
+still covers the whole image.
+
+| product | interval | status |
+|---|---|---|
+| BL702 XT-ZB1 | 8 KiB (`OTA_RESUME_CHECKPOINT_BYTES`, about 30 entries per image) | hardware-proven through ZHA (2026-11-09/10): reset at 30 % resumed at 90174, a second reset at 98366, and a 10 s USB power cut resumed at 57406 |
+| ESP32-C6/H2, EFR32MG1 | none (writer defaults) | a reset restarts the download |
+
+On hardware the resumed download needs the install started again: the reset
+interrupts zigpy's `update.install`, so press install again within the 120 s
+fast-poll window after the boot. The boot log shows
+`[OTA] Resumable download <version> at offset <n>`, and the first offer of
+the same file continues with `[OTA] Resuming download at offset <n>`.
+
+## Reaching a sleepy device
+
+ZHA (zigpy) serves an image only while `update.install` is running. That
+call starts with a unicast Image Notify and fails immediately if the notify
+gets no APS acknowledgement. Outside an install, zigpy answers a device's own
+Query Next Image with NO_IMAGE_AVAILABLE, so periodic queries cannot start
+an update. A sleepy device is therefore reachable for OTA only when:
+
+- its slow poll fetches the queued notify before the parent drops it
+  (`SensorPolicy::slow_poll_within_parent_hold`: the slow poll is at most
+  `PARENT_INDIRECT_HOLD_MIN_MS`, the shortest common parent indirect hold,
+  6 s; the IEEE 802.15.4 default `macTransactionPersistenceTime` is 7.68 s);
+  or
+- a user action opens a fast-poll window (`ForceReportAction`) before the
+  install is started.
+
+`SensorPolicy::ota_reachable` combines both; a product can assert it at
+compile time. A product that fails it can still be updated: the sensor polls
+fast for a bounded window after a boot with a restored network
+(`restored_fast_ms`) and after a join or rejoin (`fresh_join_fast_ms`), so
+start the install inside that window.
+
+| product | slow poll | short press | reachable while idle |
+|---|---|---|---|
+| BL702 XT-ZB1 | 10 s | none | no: only in the 120 s window after a reset or rejoin |
+| EFR32MG1 TRADFRI | 30 s | force report (fast-poll window) | after a button press |
+| ESP32-C6/H2 devkit | 30 s | join toggle | no (open) |
 
 ## Platform implementations
 

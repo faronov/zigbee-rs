@@ -11,6 +11,10 @@ publish = false
 # Mains roles of the role template (always-on End Device and Router policy,
 # router journals); the sensor SED builds without it.
 roles = ["dep:router-app"]
+# LAB ONLY: never confirm an installed image, so the loader's trial expiry
+# (`trial boot 1..N`, then `image unconfirmed`) can be checked on hardware.
+# Never publish an image built with it.
+lab-no-confirm = []
 
 [dependencies]
 bl702-hal = { path = "../../bl702-hal" }
