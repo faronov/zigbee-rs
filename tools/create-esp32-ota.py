@@ -2,6 +2,7 @@
 """Build, wrap and verify a Zigbee OTA image for an ESP32-C6/H2 sensor.
 
     tools/create-esp32-ota.py <firmware-version> [output-directory] --chip <chip>
+        [--variant thermometer] [--sign-key KEY.pem]
 
 The pipeline is deliberately end-to-end so a version can never be stamped onto
 an image that does not contain it:
@@ -20,7 +21,19 @@ an image that does not contain it:
 5. A `zigpy_local` index is regenerated from every `.ota` file in the output
    directory, with the sha3-256 checksum ZHA verifies after downloading.
 
-Only the Python standard library is used.
+`--sign-key` builds with the `signed-ota` feature and wraps the application
+image in an `imgtool sign --header-size 0x20 --pad-header` envelope, which is
+what that firmware accepts (`products/esp32-zigbee-devkit/src/signed_ota.rs`).
+The envelope version is the file version `0xMMmmrrrr` read as `MM.mm.rrrr`.
+The signature is checked with `imgtool verify`, and the key must be one the
+firmware trusts (`products/esp32-zigbee-devkit/boot/app-verify.conf`, or its
+`ESP32_DEVKIT_OTA_KEY*_XY` overrides).
+
+`--variant thermometer` packages the ESP32-H2 `esp32h2-thermometer` binary;
+its model and OTA image type come from `examples/esp32h2-sensor/thermometer.toml`.
+
+The container steps use only the Python standard library; signing needs
+imgtool (`pip install imgtool==2.4.0`).
 Preflight does not authenticate firmware or prove bootability. Actual silicon
 and eFuse revision compatibility is checked by the receiving device.
 """
@@ -58,7 +71,15 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_TARGET = "riscv32imac-unknown-none-elf"
 
 sys.path.insert(0, str(REPO_ROOT / "products/esp32-zigbee-devkit/partitions"))
+sys.path.insert(0, str(REPO_ROOT / "tools"))
 from esp_app_image import CHIP_IDS, validate_application
+from bl702_ota import IMAGE_MAGIC, ToolError, find_imgtool, imgtool_public_xy, parse_mcuboot
+from zrs_boot_ota import parse_xy, trusted_keys
+
+# The product's app-side trust anchor for `signed-ota` builds.
+APP_VERIFY_CONF = REPO_ROOT / "products/esp32-zigbee-devkit/boot/app-verify.conf"
+# `imgtool sign --header-size` the firmware's envelope parser expects.
+ENVELOPE_HEADER_SIZE = 0x20
 
 
 @dataclass(frozen=True)
@@ -68,10 +89,47 @@ class ChipConfig:
     model_name: str
     header_string: str
     example_name: str
+    bin_name: str = ""
+    features: str = ""
 
     @property
     def example_dir(self) -> pathlib.Path:
         return REPO_ROOT / "examples" / self.example_name
+
+    @property
+    def binary(self) -> str:
+        return self.bin_name or self.example_name
+
+
+def read_flat_toml(path: pathlib.Path) -> dict[str, str]:
+    """`key = value` lines of a flat TOML file (Python 3.9 has no tomllib)."""
+    values = {}
+    for line in path.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        key, sep, value = line.partition("=")
+        if sep:
+            values[key.strip()] = value.strip().strip('"')
+    return values
+
+
+def thermometer_config() -> ChipConfig:
+    """The ESP32-H2 thermometer; identity from its `thermometer.toml`."""
+    example = "esp32h2-sensor"
+    values = read_flat_toml(REPO_ROOT / "examples" / example / "thermometer.toml")
+    try:
+        model = values["model"]
+        image_type = int(values["ota_image_type"], 0)
+    except (KeyError, ValueError) as error:
+        raise SystemExit(f"thermometer.toml: bad or missing model/ota_image_type: {error}")
+    return ChipConfig(
+        chip_id=CHIP_IDS["esp32h2"],
+        image_type=image_type,
+        model_name=model,
+        header_string="zigbee-rs ESP32-H2 thermometer",
+        example_name=example,
+        bin_name="esp32h2-thermometer",
+        features="thermometer,light-sleep",
+    )
 
 
 CHIPS = {
@@ -90,7 +148,23 @@ CHIPS = {
         example_name="esp32h2-sensor",
     ),
 }
-CHIPS_BY_IMAGE_TYPE = {config.image_type: config for config in CHIPS.values()}
+VARIANTS = {"sensor": None, "thermometer": ("esp32h2", thermometer_config)}
+
+
+def known_configs() -> dict[int, ChipConfig]:
+    configs = {config.image_type: config for config in CHIPS.values()}
+    thermometer = thermometer_config()
+    configs[thermometer.image_type] = thermometer
+    return configs
+
+
+def select_config(chip: str, variant: str) -> ChipConfig:
+    if VARIANTS[variant] is None:
+        return CHIPS[chip]
+    variant_chip, load = VARIANTS[variant]
+    if chip != variant_chip:
+        raise SystemExit(f"--variant {variant} is {variant_chip} only")
+    return load()
 
 
 def parse_version(raw: str) -> int:
@@ -106,17 +180,20 @@ def run(command: list[str], *, cwd: pathlib.Path, env: dict | None = None) -> No
 
 
 def build_elf(
-    version: int, example_dir: pathlib.Path, toolchain: str, features: str = ""
+    version: int, example_dir: pathlib.Path, toolchain: str, features: str = "",
+    bin_name: str = "",
 ) -> pathlib.Path:
     env = dict(os.environ, ESP32_OTA_VERSION=str(version))
     command = ["cargo"]
     if toolchain:
         command.append(f"+{toolchain}")
     command += ["build", "--release", "--locked", "-Z", "build-std=core,alloc"]
+    if bin_name:
+        command += ["--bin", bin_name]
     if features:
         command += ["--features", features]
     run(command, cwd=example_dir, env=env)
-    elf = example_dir / "target" / DEFAULT_TARGET / "release" / example_dir.name
+    elf = example_dir / "target" / DEFAULT_TARGET / "release" / (bin_name or example_dir.name)
     if not elf.is_file():
         raise SystemExit(f"expected ELF at {elf}")
     return elf
@@ -139,6 +216,71 @@ def check_esp_image(image: bytes, config: ChipConfig) -> None:
             validate_application(image, config.chip_id, offset, OTA_SLOT_SIZE)
     except ValueError as error:
         raise SystemExit(f"{config.example_name}: {error}") from error
+
+
+def envelope_version(file_version: int) -> str:
+    """imgtool `--version` for file version `0xMMmmrrrr` (`MM.mm.rrrr`), as
+    `signed_ota::image_version` maps it."""
+    return (f"{file_version >> 24}.{(file_version >> 16) & 0xFF}."
+            f"{file_version & 0xFFFF}+0")
+
+
+def firmware_trusted_keys() -> list[bytes]:
+    """The P-256 keys a `signed-ota` build trusts, resolved as its build
+    script resolves them."""
+    values = {}
+    for line in APP_VERIFY_CONF.read_text().splitlines():
+        key, sep, value = line.split("#", 1)[0].partition("=")
+        if sep:
+            values[key.strip()] = value.strip()
+
+    class AppVerify:
+        env_prefix = values["env-prefix"]
+        key_file = APP_VERIFY_CONF.parent / values["key-file"] if "key-file" in values else None
+
+    return trusted_keys(AppVerify)
+
+
+def envelope_image(payload: bytes) -> bytes | None:
+    """The ESP image inside a signed envelope, or None for a plain image."""
+    if len(payload) < 4 or struct.unpack_from("<I", payload)[0] != IMAGE_MAGIC:
+        return None
+    try:
+        parsed = parse_mcuboot(payload)
+    except ToolError as error:
+        raise SystemExit(f"bad signed envelope: {error}") from error
+    if parsed.hdr_size != ENVELOPE_HEADER_SIZE:
+        raise SystemExit(f"envelope header is 0x{parsed.hdr_size:X} bytes, "
+                         f"expected 0x{ENVELOPE_HEADER_SIZE:X}")
+    if not parsed.sha256_ok or not parsed.has_signature:
+        raise SystemExit("envelope has a bad digest or no signature")
+    if parsed.end != len(payload):
+        raise SystemExit("trailing bytes after the envelope's TLVs")
+    return payload[parsed.hdr_size:parsed.hdr_size + parsed.img_size]
+
+
+def sign_image(image_path: pathlib.Path, version: int, key: pathlib.Path,
+               imgtool: str, output: pathlib.Path, *, untrusted_key: bool) -> bytes:
+    xy = imgtool_public_xy(imgtool, key)
+    if not untrusted_key and xy not in firmware_trusted_keys():
+        raise SystemExit(f"{key} is not a key the firmware trusts "
+                         f"({APP_VERIFY_CONF.relative_to(REPO_ROOT)})")
+    run([imgtool, "sign", "--header-size", hex(ENVELOPE_HEADER_SIZE), "--pad-header",
+         "--align", "4", "--slot-size", hex(OTA_SLOT_SIZE),
+         "--version", envelope_version(version), "--key", str(key),
+         str(image_path), str(output)], cwd=REPO_ROOT)
+    result = subprocess.run([imgtool, "verify", "--key", str(key), str(output)],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"imgtool verify failed: {result.stdout}{result.stderr}".strip())
+    envelope = output.read_bytes()
+    parsed = parse_mcuboot(envelope)
+    major, minor, revision, _build = parsed.version
+    if (major << 24 | minor << 16 | revision) != version:
+        raise SystemExit("envelope version does not match the file version")
+    if envelope_image(envelope) != image_path.read_bytes():
+        raise SystemExit("envelope does not carry the application image unchanged")
+    return envelope
 
 
 def build_container(image: bytes, version: int, config: ChipConfig) -> bytes:
@@ -246,7 +388,13 @@ def verify_container(
     if len(blob) != expected_size:
         raise SystemExit(f"container is {len(blob)} bytes, expected {expected_size}")
     # Recheck application structure and integrity after the round trip.
-    check_esp_image(parsed["payload"], config)
+    check_payload(parsed["payload"], config)
+
+
+def check_payload(payload: bytes, config: ChipConfig) -> None:
+    """Check a plain ESP image, or the one inside a signed envelope."""
+    inner = envelope_image(payload)
+    check_esp_image(payload if inner is None else inner, config)
 
 
 def write_index(output_dir: pathlib.Path) -> pathlib.Path:
@@ -259,12 +407,12 @@ def write_index(output_dir: pathlib.Path) -> pathlib.Path:
                 f"{path} uses unknown manufacturer 0x"
                 f"{parsed['manufacturer_code']:04X}"
             )
-        config = CHIPS_BY_IMAGE_TYPE.get(parsed["image_type"])
+        config = known_configs().get(parsed["image_type"])
         if config is None:
             raise SystemExit(
                 f"{path} uses unknown image type 0x{parsed['image_type']:04X}"
             )
-        check_esp_image(parsed["payload"], config)
+        check_payload(parsed["payload"], config)
         firmwares.append(
             {
                 "path": path.name,
@@ -297,6 +445,15 @@ def main() -> int:
         help="output directory (default: target/ota)",
     )
     parser.add_argument("--chip", default="esp32c6", choices=sorted(CHIPS))
+    parser.add_argument("--variant", default="sensor", choices=sorted(VARIANTS),
+                        help="image to package (thermometer: ESP32-H2 only)")
+    parser.add_argument("--sign-key", help="P-256 PEM: build `signed-ota` and sign")
+    parser.add_argument("--imgtool", help="imgtool executable (default: on PATH)")
+    parser.add_argument(
+        "--test-only-untrusted-key", action="store_true",
+        help="TEST-ONLY: allow a signing key the firmware does not trust "
+             "(builds an image the device must refuse)",
+    )
     parser.add_argument(
         "--toolchain", default="nightly", help="cargo toolchain (default: nightly)"
     )
@@ -311,8 +468,12 @@ def main() -> int:
     args = parser.parse_args()
 
     version = parse_version(args.version)
-    config = CHIPS[args.chip]
+    config = select_config(args.chip, args.variant)
     example_dir = config.example_dir
+    if args.test_only_untrusted_key and not args.sign_key:
+        parser.error("--test-only-untrusted-key needs --sign-key")
+    features = ",".join(f for f in (config.features, args.features,
+                                    "signed-ota" if args.sign_key else "") if f)
     output_dir = pathlib.Path(args.output_dir)
     if not output_dir.is_absolute():
         output_dir = example_dir / output_dir
@@ -321,24 +482,38 @@ def main() -> int:
     elf = (
         pathlib.Path(args.elf).resolve()
         if args.elf
-        else build_elf(version, example_dir, args.toolchain, args.features)
+        else build_elf(version, example_dir, args.toolchain, features, config.bin_name)
     )
 
-    base = output_dir / f"{example_dir.name}-v{version}"
+    signed = "-signed" if args.sign_key else ""
+    base = output_dir / f"{config.binary}-v{version}{signed}"
     app_bin = base.with_suffix(".app.bin")
     ota_file = base.with_suffix(".ota")
 
     image = save_image(elf, args.chip, example_dir, app_bin)
     check_esp_image(image, config)
+    payload = image
+    if args.sign_key:
+        try:
+            payload = sign_image(
+                app_bin, version, pathlib.Path(args.sign_key).resolve(),
+                find_imgtool(args.imgtool), base.with_suffix(".signed.bin"),
+                untrusted_key=args.test_only_untrusted_key,
+            )
+        except ToolError as error:
+            raise SystemExit(str(error)) from error
 
-    container = build_container(image, version, config)
+    container = build_container(payload, version, config)
     ota_file.write_bytes(container)
-    verify_container(ota_file.read_bytes(), image, version, config)
+    verify_container(ota_file.read_bytes(), payload, version, config)
 
     index = write_index(output_dir)
 
     print()
     print(f"application image : {app_bin} ({len(image)} bytes)")
+    if args.sign_key:
+        print(f"signed envelope   : {base.with_suffix('.signed.bin')} "
+              f"({len(payload)} bytes, version {envelope_version(version)})")
     print(f"OTA container     : {ota_file} ({len(container)} bytes)")
     print(f"  manufacturer    : 0x{MANUFACTURER_CODE:04X}")
     print(f"  image type      : 0x{config.image_type:04X}")
