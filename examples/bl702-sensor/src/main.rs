@@ -234,7 +234,7 @@ fn build_mac(ieee: [u8; 8], aes: bl702_hal::peripherals::Aes) -> Bl702SoftMac {
 
 type Bl702Profile<'f> = OtaSensorProfile<Bl702Writer<SharedFlash<'f, MainFlash>>>;
 
-/// Compose the sensor endpoint and OTA client and move it into `slot`.
+/// Compose the sensor endpoint and OTA client in place in `slot`.
 ///
 /// Not inlined, so the cluster tables are built in this short frame rather
 /// than in the sensor task's poll frame.
@@ -243,8 +243,8 @@ fn build_profile<'f, 's>(
     flash: &'f RefCell<MainFlash>,
     slot: &'s mut MaybeUninit<Bl702Profile<'f>>,
 ) -> &'s mut Bl702Profile<'f> {
-    match product::ota::sensor_ota_profile(SharedFlash::new(flash)) {
-        Ok(profile) => slot.write(profile),
+    match product::ota::init_sensor_ota_profile(SharedFlash::new(flash), slot) {
+        Ok(profile) => profile,
         Err(error) => {
             log::error!("OTA profile composition failed: {error:?}");
             hal::halt()

@@ -31,6 +31,7 @@
 //! `MM.mm.pp+0`, which the loader's downgrade prevention compares.
 
 use bl702_xt_zb1_layout::{IMAGE_HEADER_SIZE, LOADER_INFO_ADDR, MCUBOOT, TRUSTED_KEYS};
+use core::mem::MaybeUninit;
 use embedded_storage::nor_flash::{NorFlash, NorFlashError};
 use mcuboot_image::{KeySet, Mode, SlotPolicy, SlotWriter, TrustedIds};
 use sensor_sed_app::{
@@ -189,6 +190,22 @@ where
     F::Error: NorFlashError,
 {
     WithOta::new(
+        sensor_profile(),
+        OtaManager::new(writer(flash), ota_config()),
+    )
+}
+
+/// [`sensor_ota_profile`] composed in place in `slot`, without a
+/// profile-sized temporary in the caller's (boot) stack frame.
+pub fn init_sensor_ota_profile<F: NorFlash>(
+    flash: F,
+    slot: &mut MaybeUninit<OtaSensorProfile<Bl702Writer<F>>>,
+) -> Result<&mut OtaSensorProfile<Bl702Writer<F>>, ProfileError>
+where
+    F::Error: NorFlashError,
+{
+    WithOta::init(
+        slot,
         sensor_profile(),
         OtaManager::new(writer(flash), ota_config()),
     )

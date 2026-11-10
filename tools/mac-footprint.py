@@ -383,8 +383,9 @@ def _rv_const(regs: dict[str, int], mnemonic: str, operands: str) -> None:
     """Track registers loaded with a constant in a RISC-V prologue.
 
     Frames larger than an ``addi`` immediate (2 KiB) are allocated with
-    ``lui aN, hi; addi aN, aN, lo; sub sp, sp, aN``.  Any other write to a
-    tracked register forgets it, so a stale value is never used.
+    ``lui aN, hi; addi aN, aN, lo; sub sp, sp, aN``, or for a multiple of
+    256 B with ``li aN, k; slli aN, aN, 8; sub sp, sp, aN``.  Any other
+    write to a tracked register forgets it, so a stale value is never used.
     """
     ops = [o.strip() for o in operands.split(",")]
     if not ops or not re.fullmatch(r"[a-z]+\d*", ops[0]) or RV_NO_DEST.match(mnemonic):
@@ -400,6 +401,11 @@ def _rv_const(regs: dict[str, int], mnemonic: str, operands: str) -> None:
             return
         if mnemonic in ("addi", "c.addi") and ops[1:2] == [dest] and dest in regs:
             regs[dest] += int(ops[-1], 0)
+            return
+        if mnemonic in ("slli", "c.slli") and ops[1:2] == [dest] and dest in regs:
+            regs[dest] = (regs[dest] << int(ops[-1], 0)) & 0xFFFF_FFFF
+            if regs[dest] & 0x8000_0000:
+                regs[dest] -= 1 << 32
             return
     except ValueError:
         pass
