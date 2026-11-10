@@ -27,6 +27,7 @@ pub mod envelope;
 pub mod image;
 pub mod loader_info;
 pub mod p256;
+pub mod staging;
 mod status;
 #[cfg(feature = "swap-move")]
 mod swap;
@@ -51,6 +52,7 @@ pub use image::{
     validate, validate_with_set,
 };
 pub use loader_info::{LoaderInfo, LoaderKeys, TrustedIds, loader_block};
+pub use staging::{LoaderChannel, StagingError, StagingFlash, loader_ids, shared_keys};
 pub use trailer::{BOOT_MAGIC, MagicState};
 #[cfg(feature = "firmware-writer")]
 pub use writer::{SlotPolicy, SlotWriter};

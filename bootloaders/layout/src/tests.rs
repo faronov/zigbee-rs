@@ -496,3 +496,31 @@ fn committed_app_verify_configs_load() {
         assert_eq!(keys.keys.len(), 1, "{}", path.display());
     }
 }
+
+#[test]
+fn release_version_from_the_package_or_the_override() {
+    let package = ReleaseVersion::resolve("0.1.0", None).unwrap();
+    assert_eq!((package.major, package.minor, package.patch), (0, 1, 0));
+    assert!(!package.overridden);
+    assert_eq!(
+        ReleaseVersion::resolve("0.1.0", Some(" ")).unwrap(),
+        package
+    );
+    let bench = ReleaseVersion::resolve("0.1.0", Some("2.10.255")).unwrap();
+    assert_eq!((bench.major, bench.minor, bench.patch), (2, 10, 255));
+    assert!(bench.overridden);
+    for bad in ["1.2", "1.2.3.4", "1.2.256", "1.x.3", "0.1.0-rc1"] {
+        assert!(
+            ReleaseVersion::resolve("0.1.0", Some(bad)).is_err(),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        ReleaseVersion::override_var("EFR32MG22"),
+        "EFR32MG22_OTA_VERSION_OVERRIDE"
+    );
+    let rust = bench.rust();
+    assert!(rust.contains("pub const SW_BUILD: &str = \"2.10.255\";"));
+    assert!(rust.contains("pub const VERSION: (u8, u8, u8) = (2, 10, 255);"));
+    assert!(rust.contains("pub const VERSION_OVERRIDDEN: bool = true;"));
+}

@@ -31,6 +31,8 @@ pub mod diagnostics;
 pub mod environment;
 pub mod measurement;
 pub mod ota;
+#[cfg(feature = "ota")]
+pub mod ota_client;
 pub mod parts;
 pub mod policy;
 pub mod reset_cause;

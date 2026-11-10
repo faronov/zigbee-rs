@@ -11,10 +11,11 @@ publish = false
 default = ["distributed-security", "groups"]
 distributed-security = ["zigbee-runtime/distributed-security"]
 groups = ["zigbee-runtime/groups"]
-ota = ["zigbee-runtime/ota"]
+ota = ["zigbee-runtime/ota", "dep:log"]
 
 [dependencies]
 embedded-storage = { workspace = true }
+log = { workspace = true, optional = true }
 zigbee-mac = { path = "../../zigbee-mac" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["sleepy-end-device", "finding-binding-target"] }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

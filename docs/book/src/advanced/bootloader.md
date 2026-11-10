@@ -22,7 +22,10 @@ This page is both the design and its current status:
   product files: nRF52840 (bare DK and three UF2 boards), EFR32 Series 2
   (MG22, MG21, ZBT-1 chained above Gecko) and PHY62x2 (PB-03F). The
   nRF52840 and EFR32 loaders arm a watchdog, and the nRF52840 and
-  EFR32MG21/MG22 applications have a `zrs-boot` link variant. ESP32
+  EFR32MG21/MG22 applications have a `zrs-boot` link variant. The MG22
+  `sed,zrs-boot` sensor also receives Zigbee OTA images into the
+  secondary slot and confirms them after rejoining
+  ([MG22 OTA receive](#efr32mg22-ota-receive)). ESP32
   gets an application-side signature and version check; its ROM and IDF
   boot stay. Telink has the configuration only. See
   [Phase 3](#phase-3-more-chips).
@@ -57,6 +60,10 @@ hardware-proven capability.
 | `efr32s2-hal::watchdog` | EFR32 Series 2 WDOG0 driver (period rounding, arm/kick/disarm) | Host-tested (period maths). On one MG22 it was seen armed while the loader ran and disarmed in the application. Its period and an actual expiry reset are **not measured** |
 | `bootloaders/phy62x2-boot` | PHY62x2 loader started by the boot ROM | Release-built, linted, ROM-boot image generated; **not run on hardware** |
 | `mcuboot-image::envelope` | Application-side verification of a signed MCUboot envelope (`EnvelopeWriter`) for chips whose ROM/SDK boot stays | Host-tested with imgtool vectors; ESP32 product tests |
+| `mcuboot-image::staging` | Application side of a zigbee-rs loader: `LoaderChannel` (own / foreign / no loader), `shared_keys` (keys both the application and the installed loader trust) and `StagingFlash` (erase/write only in the secondary slot, write-only in the running image's trial log) | Host-tested |
+| `apps/sensor-sed` `ota_client` (feature `ota`) | `ImageOtaClient`: query schedule, Image Notify, offer gating on the loader channel, activation after the security checkpoint, reset, confirm through the writer | Host-tested (through the MG22 product tests) |
+| `tools/zrs_boot_ota.py` | Signs a loader-linked application from its product `.layout` and the ELF's `ZRS_OTA_IDENTITY`; writes the signed image and the Zigbee OTA file; `check`, `key-xy`, zigpy `index` | Python unit tests; real imgtool 2.4.0 signing of the MG22 build (local and CI with an ephemeral key) |
+| `products/efr32mg22-sensor` `ota` (`sed,zrs-boot`) | MG22 identity, flash split, `SlotWriter` over `StagingFlash`, OTA profile and client | Host-tested and release-built. Confirm-after-rejoin of an SWD-staged 0.2.0 is **lab-tested on one BRD4183A** ([results](#mg22-ota-confirm-results-2026-11-09)); delivery over ZHA OTA is **not yet run on hardware** |
 
 ```text
 product loader binary   layout, BootConfig (keys, trial boots, mode), loader block, console/LEDs
@@ -646,16 +653,120 @@ UART or JTAG still boots; use ESP secure boot for that.
 **TLSR8258.** `products/tlsr8258-tb04/boot/app-verify.conf` exists, but
 the product has no OTA writer yet, so nothing uses it.
 
+### EFR32MG22 OTA receive
+
+`examples/efr32mg22-sensor` with `sed,zrs-boot` downloads Zigbee OTA
+images into the loader's secondary slot. The pieces, from shared to
+product-specific:
+
+- **`mcuboot_image::staging`** (shared).
+  - `LoaderChannel::read` reads the installed loader's `LoaderInfo` and
+    `LoaderKeys` records at the layout's `LOADER_INFO_ADDR`. It returns
+    `Own` when the loader trusts at least one of the application's keys,
+    `Foreign` when it trusts none, and `NoLoader` when there are no
+    readable records.
+  - Offers are accepted only on `Own`. A direct-mapped or foreign-keyed
+    device declines without touching flash.
+  - `shared_keys` gives the writer only the keys both sides trust, so an
+    image the loader would refuse is refused before activation.
+  - `StagingFlash` limits the writer's flash view:
+    - reads stop at the end of the higher slot;
+    - erase and write are allowed only in the secondary slot;
+    - in the running image's trial log, writes only (the confirm).
+- **`sensor_sed_app::ota_client::ImageOtaClient`** (shared, feature `ota`).
+  - Queries the coordinator 300 s after joining, then daily, and answers
+    Image Notify.
+  - Downloads through the runtime `OtaManager`.
+  - Activates only after `SensorApp` has checkpointed the security
+    journal, then resets into the loader.
+  - Confirms through the writer: `SensorApp` calls `confirm_image` on
+    the first APS-acknowledged report after the rejoin.
+- **`products/efr32mg22-sensor::ota`** (product).
+  - Identity: manufacturer `0x1234`, image type `0x0022`.
+  - File version `0x25MMmmpp`, generated from the package version by
+    `zrs-boot-layout::ReleaseVersion`. The TEST-ONLY
+    `EFR32MG22_OTA_VERSION_OVERRIDE` marks the image `TEST-ONLY` in its
+    banner.
+  - 48-byte blocks; `auto_accept` is off.
+  - The flash split: the OTA writer gets `0x0..JOURNAL_START` and the
+    security journal keeps its own driver. The product's const asserts
+    tie the split to `boot/devkit.layout`.
+  - The writer is a `SlotWriter` over `StagingFlash`.
+- **Composition** (`main.rs`):
+  - picks `OtaSensorProfile` and `ImageOtaClient` under `zrs-boot`;
+  - prints one raw VCOM line with the version, the loader channel and
+    the OTA identity;
+  - exports `ZRS_OTA_IDENTITY` for the release tool.
+  - The default builds keep `NoOta` and `SensorProfile`.
+
+**Logs.** OTA receive costs about 32 KB of flash:
+
+| part | flash |
+|---|---|
+| `OtaManager` | 8.6 KB |
+| `mcuboot-image` (P-256, image hash) | 6.2 KB |
+| `sensor-sed-app` | 2.5 KB |
+| `sha2` | 2.4 KB |
+| ZCL OTA cluster | 2.2 KB |
+
+With info-level logs the image would be 265,908 B, over the 236,288 B
+cap. The `zrs-boot` feature therefore compiles `log` to warnings
+(`log/release_max_level_warn`, 233,872 B); the version line is printed
+raw. `opt-level = "z"` (222,144 B with warnings) was not used, because it
+is profile-wide and its MAC timing is unproven.
+
+**Release.**
+
+```text
+python3 tools/zrs_boot_ota.py release \
+  --layout products/efr32mg22-sensor/boot/devkit.layout \
+  --elf examples/efr32mg22-sensor/target/zrs-boot/thumbv8m.main-none-eabihf/release/efr32mg22-sensor \
+  --out <dir> --key <P-256 PEM> --name efr32mg22-sensor
+```
+
+- The tool checks:
+  - the ELF is linked at the primary slot plus header;
+  - the key is one the layout trusts (`key-file` or
+    `<PREFIX>_OTA_KEY_XY`).
+- It signs unpadded (`--header-size 0x200 --pad-header --align 4
+  --slot-size 0x3C000 --version MM.mm.pp+0`), runs `imgtool verify`, and
+  writes `<name>-<version>.signed.bin` (SWD into the primary) and
+  `<name>-<version>.zigbee`.
+- The 0.1.0 image is 234,534 B, which leaves 3,034 B of slot margin.
+- CI signs with a per-run key, as for BL702.
+
+**Validation.** Host tests (MG22 product, 23 with `sed,zrs-boot`):
+
+- **Staged and activated:** an image is staged and requested on
+  activation; padded images are handled.
+- **Refused:** wrong key, downgrade and truncation.
+- **Install and confirm:** the shared boot engine installs the staged
+  image, which then confirms through the trial log, with the loader and
+  the journal untouched.
+- **Staging view:** it protects the loader, the image and the journal.
+- **Declined offers:** a declined offer leaves flash untouched.
+- **Other:** channel detection.
+
+**Hardware.** On one BRD4183A, the confirm-after-rejoin of an SWD-staged
+TEST-ONLY 0.2.0 is lab-tested; see
+[MG22 OTA confirm results](#mg22-ota-confirm-results-2026-11-09). These
+are **not run on hardware**: ZHA OTA delivery into the secondary (the
+`StagingFlash` write path and the OTA-time signature check) and the
+stack headroom of the verify path.
+
 ### Phase 3 blockers
 
-- **EFR32MG22 headroom.** With the router tables reclaimed, the
-  `zrs-boot` sensor (234,164 B) fits the 236,288 B cap with about 2.1 KB
-  to spare; the End Device is 229,788 B.
+- **EFR32MG22 headroom.** With the router tables reclaimed and OTA
+  receive added, the `sed,zrs-boot` sensor (233,872 B, warn-level logs)
+  fits the 236,288 B cap with 2,416 B to spare; the End Device is
+  204,484 B. Any further OTA feature (resume checkpoints) needs
+  headroom first; see [MG22 OTA receive](#efr32mg22-ota-receive).
 - **EFR32MG21 devkit.** The layout needs an F1024 part; there is no room
   for two image-sized slots below the router tables on F512.
-- **No confirm in the `zrs-boot` nRF and EFR32 applications.** They use
-  `NoOta`, so nothing confirms a trial install; it reports `unconfirmed`
-  and keeps booting (the approved overwrite behaviour).
+- **No confirm in the other `zrs-boot` applications.** The nRF52840,
+  EFR32MG21 and MG22 `ed` builds use `NoOta`, so nothing confirms a trial
+  install; it reports `unconfirmed` and keeps booting (the approved
+  overwrite behaviour). Only MG22 `sed,zrs-boot` has OTA and confirm.
 - **PHY62x2.** `pb03f-zigbee` (195,168 B) fits the 200,448 B PB-03F cap.
   The PHY62x2 EVK (`phy6222-sensor`, 187,104 B direct slot) has no loader
   layout. There is no PHY `zrs-boot` application build yet. System sleep
@@ -755,8 +866,8 @@ loader with `watchdog-ms = 8000`.
 |---|---|---|
 | nRF52840 UF2 `board-nrf-dk,zrs-boot` | 230,276 B (+232 for `NrfWatchdogSupervisor`) | 506,624 B |
 | nRF52840 UF2 `board-promicro,zrs-boot` | 229,156 B (+336) | 396,032 B |
-| EFR32MG22 `sed,zrs-boot` | 234,164 B | 236,288 B |
-| EFR32MG22 `ed,zrs-boot` | 229,788 B | 236,288 B |
+| EFR32MG22 `sed,zrs-boot` (OTA receive, warn-level logs) | 233,872 B (was 234,164 B without OTA, info logs); `.bss` 16,136 B (+1,536) | 236,288 B |
+| EFR32MG22 `ed,zrs-boot` (warn-level logs) | 204,484 B (was 229,788 B) | 236,288 B |
 | EFR32MG21 `sed,zrs-boot` | 234,272 B | 252,672 B |
 | EFR32MG21 `ed,zrs-boot` | 229,988 B | 252,672 B |
 
@@ -778,6 +889,13 @@ Phase 3 application images (equal-length worktree paths, against `d4c4023`):
   (+20/+16/−34 B) plus +8 B in `main` and +6 B in one critical section.
   No OTA or writer symbol changed; the crate disambiguators changed.
 - **nRF52840 UF2** (default direct map): padding only.
+
+MG22 OTA receive (`boot-mg22-ota`, equal-length worktrees against
+`493955d`; the shared `sensor-sed-app` gained an optional `log`
+dependency, which changes crate hashes everywhere): no function changed
+size in the default images. Totals: EFR32MG22 sensor −8 B, End Device
++8 B, nRF52840 DK sensor +16 B (alignment padding), BL702 sensor ±0;
+`.bss` unchanged.
 
 **`signed-ota` cost** (opt-in):
 
@@ -1211,10 +1329,171 @@ Notes:
   attaches.
 - **Not exercised on this board:** delivery over ZHA OTA, power cuts
   during an install, a watchdog expiry reset (needs a hung loader), the
-  ULFRCO period, and a confirmed image. `zrs-boot` builds use `NoOta` and
-  never confirm. MG21, ZBT-1 and `gecko-recovery` were also not exercised.
+  ULFRCO period, and a confirmed image. The `zrs-boot` build tested here
+  used `NoOta` and never confirmed. OTA receive and confirm came later
+  ([MG22 OTA receive](#efr32mg22-ota-receive)); the confirm is now
+  lab-tested ([below](#mg22-ota-confirm-results-2026-11-09)), but ZHA OTA
+  delivery is not. MG21, ZBT-1 and `gecko-recovery` were also not
+  exercised.
 - **Restoring the board:** the original image is the backup `6d7b5b3b…`
   in the hwlab artifacts, taken before the erase.
+
+### MG22 OTA confirm results (2026-11-09)
+
+The same board was used, still joined as `0x8C8F`. It started with the
+loader and 0.1.3 (`NoOta`). The application under test was
+`examples/efr32mg22-sensor` with `sed,zrs-boot` and the OTA receive
+path, built with `EFR32MG22_OTA_VERSION_OVERRIDE=0.2.0` (a TEST-ONLY
+build; Zigbee file version `0x25000200`; 233,904 B payload, 234,567 B
+signed). It was signed with the options above plus `--pad --version
+0.2.0+0`. `tools/zrs_boot_ota.py release` accepted the same ELF with
+3,001 B of slot margin. **Lab-tested on one board.**
+
+| step | result |
+|---|---|
+| Backup | Full 512 KiB, two identical reads, SHA-256 `70f166ba…`. Decoded: loader present, primary 0.1.3, secondary header erased, trial log `Done, Attempt` (0.1.3 never confirmed), journal in use |
+| Stage | Padded 0.2.0 programmed at `0x40000..0x7C000` only (30 sectors written and read back). The loader and journal sectors were not in the programmed range |
+| Install and banner | After the reset, VCOM printed `MG22 app 0.2.0 (TEST-ONLY version): loader Own, OTA 0x1234/0x0022 file 0x25000200` |
+| Rejoin | ZHA kept the same device entry: nwk `0x8C8F`, available, LQI 112. A report arrived about 70 s after the reset, with no availability gap and no re-pair |
+| Confirm | The primary trailer log read `Done (0x6000), Attempt (0xC000), Confirmed (0xA000)`. The app appended the confirm record after the rejoin |
+| Post-state | Backup SHA-256 `9cd8c870…`. Loader bytes unchanged. Primary equals the signed image (header, payload and the 151-byte TLV). Secondary header and trailer sectors erased. Journal grew from 1,547 to 1,785 non-`0xFF` bytes (persistence continued). Reports continued after the SWD session |
+
+**Not exercised:** delivery over ZHA OTA (block transfer into the
+secondary through `StagingFlash`, the OTA-time signature check, and
+activation by the upgrade-end response), a power cut during staging, and
+the stack headroom of the verify path. These wait for the ZHA OTA step.
+
+### MG22 ZHA OTA (2026-11-10)
+
+**Re-pair.** ZHA had interviewed the board while it ran 0.1.3, which has no
+OTA client. Its stored descriptor therefore listed no output clusters, and
+ZHA created no update entity after the SWD upgrade to 0.2.0 (see
+[OTA: reaching a sleepy device](ota.md#reaching-a-sleepy-device)).
+
+1. An SWD reset opened the 120 s fast-poll window, then `zha.remove`.
+2. A 60 s `zha.permit`, then another SWD reset. The device rejoined after
+   a cold start with no button press.
+
+The interview recorded output cluster `0x0019`, and ZHA created
+`update.zigbee_rs_efr32mg22_sensor_firmware` with installed version
+`0x25000200`. The board is now NWK `0x9F38` (40760), still IEEE
+`08:6b:d7:ff:fe:c3:90:12`; the sensor entity IDs were kept.
+
+**Images.** All were built from the rebased branch, with the
+`sed,zrs-boot` feature set and a version override, then signed:
+
+| run | file version | inner image | `.zigbee` size | SHA-256 |
+|---|---|---|---|---|
+| A upgrade | `0x25000201` | 0.2.1, own key | 234,797 B | `8c387f7d…` |
+| B wrong key | `0x25000202` | 0.2.2, throwaway P-256 key | 234,797 B | `3cedd8a0…` |
+| C disguised downgrade | `0x25000203` | 0.1.9, own key | 234,798 B | `8fe8600b…` |
+
+Each signed image is 234,735 B, leaving 2,833 B of slot margin.
+`zrs_boot_ota.py check` refuses C because its inner version is not its
+outer file version. The device must refuse B and C when it verifies the
+download.
+
+**Run A, attempt 1.**
+- **Offer:** HA showed `latest_version 0x25000201`.
+- **Install:** started 20 s after an SWD reset.
+- **Stall:** at offset 7,584 (about 3%) the device stopped receiving
+  blocks. zigpy aborted after its 30 s no-progress limit
+  (`MAX_TIME_WITHOUT_PROGRESS`; the timer restarts only after a block
+  response is delivered).
+- **Device log:** `Server aborted the download at offset 7584; keeping
+  staged data`.
+- **Outcome:** 0.2.0 kept running; no upgrade request was written.
+- **Context:** the install started 2.5 min after a ZHA reload and 9 min
+  after an HA restart, during the post-start traffic burst.
+
+**Attempt 2** was cut off by another HA restart before the install began.
+
+Each later run followed the same procedure:
+- swap the single test file in `/config/zigpy_ota` and check its SHA-256;
+- reload the ZHA entry, settle at least 10 min, then
+  `homeassistant.update_entity` until `latest_version` showed the file;
+- start a VCOM capture, reset over SWD, and start `update.install` inside
+  the 120 s fast-poll window;
+- after the run, read flash over SWD.
+
+**Run A (0.2.0 → 0.2.1): pass.**
+- **Install:** started 15 s after the SWD reset, about 10 min after the
+  reload. The download took about 25 min.
+- **Result:** HA reported `installed_version 0x25000201`.
+- **SWD after the install:**
+  - the trial log at `0x3E000` read `Done, Attempt, Confirmed`;
+  - the primary header at `0x4000` showed 0.2.1;
+  - the secondary header and trailer were erased.
+- **Device log during the download:**
+  - 363 `[NWK] Frame counter replay from 0x0000`;
+  - 57 `NoAck` and 23 `ChannelAccessFailure`;
+  - 44 NWK route errors, each surfacing as `ZCL frame send failed:
+    NoShortAddress`;
+  - one block for another offset, ignored.
+
+  The stop-and-wait retries absorbed all of them.
+
+**Run B (wrong key, `0x25000202`): pass, refused.**
+- **Download:** completed in about 24 min.
+- **Result:** HA raised `Update was not successful: Status.INVALID_IMAGE`;
+  `installed_version` stayed `0x25000201`.
+- **SWD:**
+  - the secondary slot held the fully staged 0.2.2 image (MCUboot magic);
+  - the upgrade request trailer (ending at `0x7BFE0`) was erased;
+  - the primary was still 0.2.1 and the trial log was unchanged.
+
+**Run C (disguised downgrade, `0x25000203`): pass, refused.**
+- **Attempt 1:** started 15 s after an SWD reset. It failed within 1 s
+  with `Status.FAILURE` because zigpy could not deliver Image Notify.
+  - The device had sent no frame for 62 s after the reset.
+  - Shortly before, it had rejoined on its marginal link (RSSI −81 dBm)
+    and repeated announces with identical TSNs.
+- **Attempt 2:** started only after HA logged the first frame from
+  `0x9F38` after the reset.
+  - **Download:** about 25 min.
+  - **Result:** HA reported `Status.FAILURE`. zigpy reports that when the
+    Upgrade End exchange fails, not only on a device status.
+    `installed_version` stayed `0x25000201`.
+  - **SWD:**
+    - the secondary slot held the staged 0.1.9 image;
+    - the trailer was erased, so no install was requested;
+    - the primary was still 0.2.1 and the trial log was unchanged.
+
+**Final state.**
+- **Board:** NWK `0x9F38`, running TEST-ONLY 0.2.1 (confirmed). The
+  secondary slot holds an unrequested 0.1.9 image, which the loader
+  ignores and the next accepted download overwrites.
+- **HA:** `/config/zigpy_ota` restored to its original four files
+  (SHA-256 checked), and the ZHA entry reloaded.
+
+**Findings, not fixed:**
+- **Frame-counter replays.** Frames from the coordinator were rejected as
+  NWK frame-counter replays, most likely the parent's retransmissions after
+  a missed MAC ACK.
+- **Misleading error mapping.** A NWK route error reaches the ZCL layer as
+  `NoShortAddress`.
+- **Image Notify needs a gated start.** On a marginal link, start an install
+  only after HA has heard from the device following the reset.
+- **No resume checkpoints on MG22.** An interrupted download restarts from
+  offset 0.
+- **Not tested:** a power cut during staging, and stack headroom in the
+  verify path.
+
+**Probe artefact (not a firmware fault).** The loader-linked image sleeps
+in EM2 with the EM2 debug domain off. A J-Link connect then resets the
+target to reach the debug port. Two signs of this:
+- Right after the connect, an SWD read sees reset-state GPIO (port A
+  `MODEL` = 0, VCOM pins off).
+- A fresh boot banner follows on the VCOM.
+
+This was reproduced on purpose, with a back-to-back pair of reads:
+- the first read saw `MODEL` 0;
+- the second saw PA4/PA5 configured;
+- one new banner was captured.
+
+Reads taken while the device polls fast during a download do not reset
+it. Expect one extra reboot from any SWD read of an idle MG22. Build with
+`em2-debug` if that matters.
 
 ## Open decisions
 
