@@ -1298,12 +1298,16 @@ jobs:
           done
       # LAB ONLY loader power-cut soak: compiled and linted so it cannot rot;
       # never packaged or published by CI.
-      - name: Build and check BL702 loader soak (lab only)
+      - name: Build and check BL702 lab images (loader soak, never-confirm)
         working-directory: examples/bl702-sensor
         run: |
           cargo build --release --locked --features ota-soak --bin bl702-ota-soak
           cargo clippy --release --locked --target riscv32imc-unknown-none-elf \
             --features ota-soak --bin bl702-ota-soak -- -D warnings
+          # LAB ONLY never-confirm sensor (loader trial-expiry check).
+          cargo clippy --release --locked --target riscv32imc-unknown-none-elf \
+            --no-default-features --features diagnostic-logging,lab-no-confirm \
+            --bin bl702-sensor -- -D warnings
           DIR=target/riscv32imc-unknown-none-elf/release
           ../../tools/check-role-symbols.sh leaf "$DIR/bl702-sensor" "$DIR/bl702-ed"
           ../../tools/check-role-symbols.sh parent "$DIR/bl702-router"

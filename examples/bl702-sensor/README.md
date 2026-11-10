@@ -166,6 +166,16 @@ Diagnostic logging:
 BL702_DIAGNOSTIC_LOG=1 ./build-image.sh
 ```
 
+Lab only, never publish: an image that never confirms itself, used to check
+the loader's trial expiry (`trial boot 1..N`, then `image unconfirmed`):
+
+```bash
+BL702_OTA_VERSION_OVERRIDE=0.2.8 BL702_LAB_NO_CONFIRM=1 ./build-image.sh
+```
+
+The `lab-no-confirm` feature is off in every shipped build; with it off the
+production and diagnostic binaries are byte-identical to builds without it.
+
 `build-image.sh` builds the application and the loader, packages the
 loader with `bflb-mcu-tool --build`, and runs `tools/bl702_ota.py release`,
 which checks the boot header (magic, 32 MHz XTAL clocks, CRC, image hash,

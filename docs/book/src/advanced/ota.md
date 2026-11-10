@@ -128,8 +128,14 @@ still covers the whole image.
 
 | product | interval | status |
 |---|---|---|
-| BL702 XT-ZB1 | 8 KiB (`OTA_RESUME_CHECKPOINT_BYTES`, about 30 entries per image) | host-tested on the product layout |
+| BL702 XT-ZB1 | 8 KiB (`OTA_RESUME_CHECKPOINT_BYTES`, about 30 entries per image) | hardware-proven through ZHA (2026-11-09/10): reset at 30 % resumed at 90174, a second reset at 98366, and a 10 s USB power cut resumed at 57406 |
 | ESP32-C6/H2, EFR32MG1 | none (writer defaults) | a reset restarts the download |
+
+On hardware the resumed download needs the install started again: the reset
+interrupts zigpy's `update.install`, so press install again within the 120 s
+fast-poll window after the boot. The boot log shows
+`[OTA] Resumable download <version> at offset <n>`, and the first offer of
+the same file continues with `[OTA] Resuming download at offset <n>`.
 
 ## Reaching a sleepy device
 

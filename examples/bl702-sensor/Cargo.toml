@@ -37,6 +37,9 @@ diagnostic-logging = []
 # rejects both together). The sensor SED (`bl702-sensor`) needs neither.
 ed = ["dep:router-app", "dep:static_cell", "dep:portable-atomic", "dep:zigbee-nwk", "bl702-xt-zb1-product/roles"]
 ota-soak = ["dep:bl702-xt-zb1-layout", "dep:embedded-storage", "dep:mcuboot-image"]
+# LAB ONLY: the sensor never confirms an installed image (loader trial
+# expiry check); `BL702_LAB_NO_CONFIRM=1 ./build-image.sh`. Never publish.
+lab-no-confirm = ["bl702-xt-zb1-product/lab-no-confirm"]
 router = ["dep:router-app", "dep:static_cell", "dep:portable-atomic", "dep:zigbee-nwk", "bl702-xt-zb1-product/roles", "router-app/router", "zigbee-runtime/router"]
 
 [dependencies]

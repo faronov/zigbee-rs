@@ -383,6 +383,15 @@ where
         self.session = OtaSession::new();
     }
 
+    #[cfg(feature = "lab-no-confirm")]
+    fn confirm_image(&mut self, _node: &mut ZigbeeNode<'_, M, S, OtaSensorProfile<W>>) -> bool {
+        // LAB ONLY: report "done" without the trial-log write, so the image
+        // stays on trial and the loader's expiry path runs.
+        log::warn!("[ota] LAB: image confirm skipped");
+        true
+    }
+
+    #[cfg(not(feature = "lab-no-confirm"))]
     fn confirm_image(&mut self, node: &mut ZigbeeNode<'_, M, S, OtaSensorProfile<W>>) -> bool {
         // One write into the primary slot's trial log while the installed
         // image is on trial; nothing for a confirmed or factory image.
