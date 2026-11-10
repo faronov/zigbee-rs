@@ -1363,6 +1363,52 @@ secondary through `StagingFlash`, the OTA-time signature check, and
 activation by the upgrade-end response), a power cut during staging, and
 the stack headroom of the verify path. These wait for the ZHA OTA step.
 
+### MG22 ZHA OTA (2026-11-10, in progress)
+
+**Re-pair.** ZHA had interviewed the board while it ran 0.1.3, which has no
+OTA client. Its stored descriptor therefore listed no output clusters, and
+ZHA created no update entity after the SWD upgrade to 0.2.0 (see
+[OTA: reaching a sleepy device](ota.md#reaching-a-sleepy-device)).
+
+1. An SWD reset opened the 120 s fast-poll window, then `zha.remove`.
+2. A 60 s `zha.permit`, then another SWD reset. The device rejoined after
+   a cold start with no button press.
+
+The interview recorded output cluster `0x0019`, and ZHA created
+`update.zigbee_rs_efr32mg22_sensor_firmware` with installed version
+`0x25000200`. The board is now NWK `0x9F38` (40760), still IEEE
+`08:6b:d7:ff:fe:c3:90:12`; the sensor entity IDs were kept.
+
+**Images.** All were built from the rebased branch, with the
+`sed,zrs-boot` feature set and a version override, then signed:
+
+| run | file version | inner image | `.zigbee` size | SHA-256 |
+|---|---|---|---|---|
+| A upgrade | `0x25000201` | 0.2.1, own key | 234,797 B | `8c387f7d…` |
+| B wrong key | `0x25000202` | 0.2.2, throwaway P-256 key | 234,797 B | `3cedd8a0…` |
+| C disguised downgrade | `0x25000203` | 0.1.9, own key | 234,798 B | `8fe8600b…` |
+
+Each signed image is 234,735 B, leaving 2,833 B of slot margin.
+`zrs_boot_ota.py check` refuses C because its inner version is not its
+outer file version. The device must refuse B and C when it verifies the
+download.
+
+**Run A, attempt 1.**
+- **Offer:** HA showed `latest_version 0x25000201`.
+- **Install:** started 20 s after an SWD reset.
+- **Stall:** at offset 7,584 (about 3%) the device stopped receiving
+  blocks. zigpy aborted after its 30 s no-progress limit
+  (`MAX_TIME_WITHOUT_PROGRESS`; the timer restarts only after a block
+  response is delivered).
+- **Device log:** `Server aborted the download at offset 7584; keeping
+  staged data`.
+- **Outcome:** 0.2.0 kept running; no upgrade request was written.
+- **Context:** the install started 2.5 min after a ZHA reload and 9 min
+  after an HA restart, during the post-start traffic burst.
+
+**Attempt 2** was cut off by another HA restart before the install began.
+Runs B and C have not started.
+
 ## Open decisions
 
 Resolved in Phase 2 step 2:

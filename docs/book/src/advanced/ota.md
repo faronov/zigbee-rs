@@ -164,6 +164,15 @@ start the install inside that window.
 | BL702 XT-ZB1 | 10 s | none | no: only in the 120 s window after a reset or rejoin |
 | EFR32MG1 TRADFRI | 30 s | force report (fast-poll window) | after a button press |
 | ESP32-C6/H2 devkit | 30 s | join toggle | no (open) |
+| EFR32MG22 devkit (`zrs-boot`) | 30 s | join toggle | no: only in the 120 s window after a reset or rejoin |
+
+ZHA builds a device's update entity from the cluster list it read when the
+device was interviewed, and it does not re-read that list on a rejoin, a
+reconfigure or a firmware change. A device that joined with firmware
+without the OTA client cluster (`0x0019`, client side) keeps no update
+entity after an upgrade that adds it. Remove it in ZHA and re-pair it so
+the interview records `0x0019`. The re-pair gives it a new NWK address and
+may rename its entities.
 
 ## Platform implementations
 
