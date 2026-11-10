@@ -111,6 +111,16 @@ class Bl702StackGateTests(unittest.TestCase):
         report = run(GOOD_SYMBOLS, disasm, "--frame-allow", "app::compose=4000")
         self.assertTrue(any("reviewed cap" in f for f in report.failures))
 
+    def test_unbounded_frame_fails(self):
+        # A register-sized frame the analysis cannot resolve must not pass as
+        # its small addi part only.
+        lines = listing().splitlines()
+        at = lines.index("23000300 <app::compose>:")
+        lines[at + 2:at + 2] = ["23000302:      \tsub\tsp, sp, a2"]
+        report = run(GOOD_SYMBOLS, "\n".join(lines))
+        self.assertTrue(any("cannot bound" in f and "app::compose" in f
+                            for f in report.failures))
+
     def test_chain_budget_regression_fails(self):
         self.assertEqual(run(GOOD_SYMBOLS, None, "--chain-budget", "scan=app::scan$=320").failures,
                          [])

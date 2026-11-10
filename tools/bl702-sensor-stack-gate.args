@@ -41,16 +41,16 @@
 ::time_driver::dispatch$
 
 # Reviewed exception (exact symbol). One-shot boot frame: build_profile
-# assembles the OTA sensor profile in place before the SensorApp runs.
-# Measured 4,832 B; cap rounded up to the next 256 B.
+# assembles the OTA sensor profile in place (WithOta::init) before the
+# SensorApp runs. Measured 3,840 B; cap rounded up to the next 256 B.
 --frame-allow
-bl702_sensor::build_profile=4864
+bl702_sensor::build_profile=4096
 
 # Chain budgets: worst depth below (and including) any matching function,
 # measured on the 24 KiB fix build, rounded up to the next 256 B boundary
 # above the measurement. A regression fails the build.
 --chain-budget
-boot=^bl702_sensor::build_(mac|profile|device)$=5120
+boot=^bl702_sensor::build_(mac|profile|device)$=4096
 --chain-budget
 commissioning=join_or_resume|start_or_resume_steering|start_fresh_steering|nlme_network_discovery=14080
 --chain-budget

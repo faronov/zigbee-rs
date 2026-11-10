@@ -569,13 +569,39 @@ pub struct WithOta<P, F: crate::firmware_writer::FirmwareWriter> {
 #[cfg(feature = "ota")]
 impl<P: ApplicationProfile, F: crate::firmware_writer::FirmwareWriter> WithOta<P, F> {
     pub fn new(inner: P, ota: crate::ota::OtaManager<F>) -> Result<Self, ProfileError> {
+        Self::check(&inner, &ota)?;
+        Ok(Self { inner, ota })
+    }
+
+    /// Like [`WithOta::new`], but moves the parts straight into `slot`, so
+    /// neither a profile-sized `Result` nor a composed temporary sits in the
+    /// caller's stack frame (a large one-shot boot frame on small targets).
+    #[inline(never)]
+    pub fn init(
+        slot: &mut core::mem::MaybeUninit<Self>,
+        inner: P,
+        ota: crate::ota::OtaManager<F>,
+    ) -> Result<&mut Self, ProfileError> {
+        Self::check(&inner, &ota)?;
+        let dst = slot.as_mut_ptr();
+        // SAFETY: `dst` points to writable, properly aligned storage for
+        // `Self`. Both fields are written exactly once before the slot is
+        // treated as initialised, and `Self` has no other fields.
+        unsafe {
+            core::ptr::addr_of_mut!((*dst).inner).write(inner);
+            core::ptr::addr_of_mut!((*dst).ota).write(ota);
+            Ok(slot.assume_init_mut())
+        }
+    }
+
+    fn check(inner: &P, ota: &crate::ota::OtaManager<F>) -> Result<(), ProfileError> {
         if inner.endpoint() != ota.endpoint() {
             return Err(ProfileError::EndpointMismatch {
                 profile_endpoint: inner.endpoint(),
                 component_endpoint: ota.endpoint(),
             });
         }
-        Ok(Self { inner, ota })
+        Ok(())
     }
 
     pub const fn inner(&self) -> &P {
@@ -939,5 +965,41 @@ mod tests {
                 component_endpoint: 2,
             })
         ));
+    }
+
+    #[cfg(feature = "ota")]
+    #[test]
+    fn ota_decorator_init_composes_in_place_and_validates() {
+        use crate::firmware_writer::MockFirmwareWriter;
+        use crate::ota::{OtaConfig, OtaManager};
+        use core::mem::MaybeUninit;
+
+        let ota = |endpoint| {
+            OtaManager::new(
+                MockFirmwareWriter::new(1024),
+                OtaConfig {
+                    endpoint,
+                    ..OtaConfig::default()
+                },
+            )
+        };
+
+        let mut slot = MaybeUninit::uninit();
+        assert!(matches!(
+            WithOta::init(&mut slot, profile(), ota(2)),
+            Err(ProfileError::EndpointMismatch {
+                profile_endpoint: 1,
+                component_endpoint: 2,
+            })
+        ));
+
+        let profile = WithOta::init(&mut slot, profile(), ota(1)).unwrap();
+        let mut clusters = ApplicationClusters::new();
+        profile.collect_clusters(&mut clusters).unwrap();
+        assert_eq!(clusters.len(), 4);
+        assert_eq!(
+            clusters.last().map(|cluster| cluster.cluster.cluster_id()),
+            Some(ClusterId::OTA_UPGRADE)
+        );
     }
 }

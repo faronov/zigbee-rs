@@ -41,6 +41,14 @@ class RiscvLargeFrameTests(unittest.TestCase):
     def test_li_sub_frame_is_counted(self):
         self.assertEqual(frame(riscv("li\ta1, 0x7f0", "sub\tsp, sp, a1")), (0x7f0, False))
 
+    def test_li_slli_sub_frame_is_counted(self):
+        # bl702-sensor build_profile: 0x100 + (0x17 << 8). Untracked, the
+        # 5888 B part was reported as a dynamic frame and missed by the gate.
+        self.assertEqual(frame(riscv("addi\tsp, sp, -0x100", "sw\tra, 0xfc(sp)",
+                                     "li\ta2, 0x17", "slli\ta2, a2, 0x8",
+                                     "sub\tsp, sp, a2")),
+                         (0x100 + (0x17 << 8), False))
+
     def test_negative_constant_added_to_sp_is_counted(self):
         self.assertEqual(frame(riscv("lui\tt0, 0xffffe", "add\tsp, sp, t0")), (0x2000, False))
 

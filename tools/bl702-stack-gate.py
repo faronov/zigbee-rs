@@ -18,7 +18,9 @@ Checks:
   through the CLIC dispatch pointer; interrupts do not nest) leaves at least
   ``--min-gap`` bytes of the declared stack;
 * frames: no function frame exceeds ``--max-frame`` unless listed in
-  ``--frame-allow SYMBOL=CAP`` (exact demangled name without hash);
+  ``--frame-allow SYMBOL=CAP`` (exact demangled name without hash), and no
+  function has a stack adjustment the prologue analysis cannot bound (it
+  would otherwise count as 0 B and hide a large frame);
 * chains: every ``--chain-budget NAME=REGEX=BYTES`` holds (worst depth of
   any function matching REGEX), so a regression of a reviewed path fails.
 
@@ -178,6 +180,9 @@ def check_graph(args, disasm: str, stack_bytes: int, report: Report) -> None:
     seen_allowed = set()
     for func in funcs.values():
         name = plain(func.name)
+        if func.dynamic:
+            report.failures.append(f"frame: {footprint.short(name)} has a stack adjustment "
+                                   f"the analysis cannot bound (counted {func.frame} B)")
         if name in allowed:
             seen_allowed.add(name)
             if func.frame > allowed[name]:
