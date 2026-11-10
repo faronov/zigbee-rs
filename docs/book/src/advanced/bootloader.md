@@ -1363,7 +1363,7 @@ secondary through `StagingFlash`, the OTA-time signature check, and
 activation by the upgrade-end response), a power cut during staging, and
 the stack headroom of the verify path. These wait for the ZHA OTA step.
 
-### MG22 ZHA OTA (2026-11-10, in progress)
+### MG22 ZHA OTA (2026-11-10)
 
 **Re-pair.** ZHA had interviewed the board while it ran 0.1.3, which has no
 OTA client. Its stored descriptor therefore listed no output clusters, and
@@ -1407,7 +1407,93 @@ download.
   after an HA restart, during the post-start traffic burst.
 
 **Attempt 2** was cut off by another HA restart before the install began.
-Runs B and C have not started.
+
+Each later run followed the same procedure:
+- swap the single test file in `/config/zigpy_ota` and check its SHA-256;
+- reload the ZHA entry, settle at least 10 min, then
+  `homeassistant.update_entity` until `latest_version` showed the file;
+- start a VCOM capture, reset over SWD, and start `update.install` inside
+  the 120 s fast-poll window;
+- after the run, read flash over SWD.
+
+**Run A (0.2.0 → 0.2.1): pass.**
+- **Install:** started 15 s after the SWD reset, about 10 min after the
+  reload. The download took about 25 min.
+- **Result:** HA reported `installed_version 0x25000201`.
+- **SWD after the install:**
+  - the trial log at `0x3E000` read `Done, Attempt, Confirmed`;
+  - the primary header at `0x4000` showed 0.2.1;
+  - the secondary header and trailer were erased.
+- **Device log during the download:**
+  - 363 `[NWK] Frame counter replay from 0x0000`;
+  - 57 `NoAck` and 23 `ChannelAccessFailure`;
+  - 44 NWK route errors, each surfacing as `ZCL frame send failed:
+    NoShortAddress`;
+  - one block for another offset, ignored.
+
+  The stop-and-wait retries absorbed all of them.
+
+**Run B (wrong key, `0x25000202`): pass, refused.**
+- **Download:** completed in about 24 min.
+- **Result:** HA raised `Update was not successful: Status.INVALID_IMAGE`;
+  `installed_version` stayed `0x25000201`.
+- **SWD:**
+  - the secondary slot held the fully staged 0.2.2 image (MCUboot magic);
+  - the upgrade request trailer (ending at `0x7BFE0`) was erased;
+  - the primary was still 0.2.1 and the trial log was unchanged.
+
+**Run C (disguised downgrade, `0x25000203`): pass, refused.**
+- **Attempt 1:** started 15 s after an SWD reset. It failed within 1 s
+  with `Status.FAILURE` because zigpy could not deliver Image Notify.
+  - The device had sent no frame for 62 s after the reset.
+  - Shortly before, it had rejoined on its marginal link (RSSI −81 dBm)
+    and repeated announces with identical TSNs.
+- **Attempt 2:** started only after HA logged the first frame from
+  `0x9F38` after the reset.
+  - **Download:** about 25 min.
+  - **Result:** HA reported `Status.FAILURE`. zigpy reports that when the
+    Upgrade End exchange fails, not only on a device status.
+    `installed_version` stayed `0x25000201`.
+  - **SWD:**
+    - the secondary slot held the staged 0.1.9 image;
+    - the trailer was erased, so no install was requested;
+    - the primary was still 0.2.1 and the trial log was unchanged.
+
+**Final state.**
+- **Board:** NWK `0x9F38`, running TEST-ONLY 0.2.1 (confirmed). The
+  secondary slot holds an unrequested 0.1.9 image, which the loader
+  ignores and the next accepted download overwrites.
+- **HA:** `/config/zigpy_ota` restored to its original four files
+  (SHA-256 checked), and the ZHA entry reloaded.
+
+**Findings, not fixed:**
+- **Frame-counter replays.** Frames from the coordinator were rejected as
+  NWK frame-counter replays, most likely the parent's retransmissions after
+  a missed MAC ACK.
+- **Misleading error mapping.** A NWK route error reaches the ZCL layer as
+  `NoShortAddress`.
+- **Image Notify needs a gated start.** On a marginal link, start an install
+  only after HA has heard from the device following the reset.
+- **No resume checkpoints on MG22.** An interrupted download restarts from
+  offset 0.
+- **Not tested:** a power cut during staging, and stack headroom in the
+  verify path.
+
+**Probe artefact (not a firmware fault).** The loader-linked image sleeps
+in EM2 with the EM2 debug domain off. A J-Link connect then resets the
+target to reach the debug port. Two signs of this:
+- Right after the connect, an SWD read sees reset-state GPIO (port A
+  `MODEL` = 0, VCOM pins off).
+- A fresh boot banner follows on the VCOM.
+
+This was reproduced on purpose, with a back-to-back pair of reads:
+- the first read saw `MODEL` 0;
+- the second saw PA4/PA5 configured;
+- one new banner was captured.
+
+Reads taken while the device polls fast during a download do not reset
+it. Expect one extra reboot from any SWD read of an idle MG22. Build with
+`em2-debug` if that matters.
 
 ## Open decisions
 
