@@ -24,6 +24,12 @@ pub mod door_lock;
 pub mod electrical;
 pub mod fan_control;
 pub mod flow_measurement;
+#[cfg(feature = "green-power")]
+pub mod green_power;
+/// Pre-GP skeleton (wrong sink attribute IDs, accepts every command), kept
+/// only so images built without `green-power` stay byte-identical.
+#[cfg(not(feature = "green-power"))]
+#[path = "green_power_legacy.rs"]
 pub mod green_power;
 pub mod groups;
 pub mod humidity;

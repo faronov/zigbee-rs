@@ -66,6 +66,7 @@ green-power = [
     "zigbee-mac/green-power",
     "zigbee-aps/green-power",
     "zigbee-nwk/green-power",
+    "zigbee-zcl/green-power",
 ]
 # Deprecated item-by-item `save_state`/`restore_state` persistence. It does not
 # persist the Trust Center link key, APS keys, bindings or groups; production
