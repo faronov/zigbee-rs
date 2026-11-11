@@ -75,10 +75,26 @@ drives the LED from RMT channel 0:
   dim white booting, amber 1 Hz searching, green for 30 s after joining,
   blue 0.5 Hz permit join, magenta 2 Hz identify, cyan OTA flash, red
   error; no channel above 24/255.
-- The board (`esp32_zigbee_devkit::status_led`) owns GPIO8 and the encoder:
-  16 MHz RMT ticks, 0.31/0.88 µs bit halves, a 300 µs latch, one 25-symbol
-  frame that fits a single channel memory block. A frame is written only
-  when the colour changes (about 330 µs busy wait, interrupts enabled).
+- The board (`esp32_zigbee_devkit::status_led`) owns GPIO8 and the RMT
+  backend: 16 MHz RMT ticks, 0.31/0.88 µs bit halves, a 300 µs latch, one
+  25-symbol frame that fits a single channel memory block. A frame is
+  written only when the colour changes (about 330 µs busy wait, interrupts
+  enabled).
+- The colour byte order, the bit encoding and the ns-to-tick timing come
+  from the platform-neutral `zigbee-ws2812` crate in
+  [zigbee-rs-drivers](https://github.com/faronov/zigbee-rs-drivers)
+  (`drivers/ws2812`, git dependency pinned to an exact rev, pulled in only
+  by `status-led`). It also has an SPI byte-pattern encoder for future
+  nRF52/EFR32/BL702 backends.
+- The byte order is a board fact (`esp32_zigbee_devkit::BOARD`, fixed at
+  build time): the Espressif devkits take GRB, the Waveshare ESP32-H2-Zero
+  takes RGB. Build H2-Zero images with the `waveshare-h2-zero` feature,
+  e.g. `--no-default-features --features router,waveshare-h2-zero`; a GRB
+  image on the H2-Zero shows green as red. The lab-only
+  `status-led-selftest` feature shows red, green and blue for 3 s each at
+  start (logged), to check the order on a new board; it is never part of
+  a shipped image. Both were confirmed on an H2-Zero (red, green, blue,
+  joined green, identify magenta).
 
 It is default-on only for the router (about 3.8 KB of app image, 32 B of
 `.bss`). The ED keeps it opt-in, and sleepy images reject it at build time

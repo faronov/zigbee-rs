@@ -37,6 +37,10 @@ pub static STATUS_PALETTE: StatusPalette = StatusPalette {
 
 const _: () = assert!(STATUS_PALETTE.is_valid());
 
+/// The board selected by the features and its LED colour byte order.
+pub use esp32_zigbee_devkit::status_led::{COLOR_ORDER, ColorOrder};
+pub use esp32_zigbee_devkit::{BOARD, Board};
+
 #[cfg(target_os = "none")]
 pub use adapter::RgbStatusLed;
 /// The board's RMT WS2812 driver, re-exported for the composition roots.
@@ -52,6 +56,34 @@ mod adapter {
         embassy_time::Instant::now().as_millis() as u32
     }
 
+    /// Lab check of the colour byte order (feature `status-led-selftest`,
+    /// never in shipped images): red, green and blue for 3 s each at the
+    /// palette's maximum drive, 1 s dark between them and 2 s dark after,
+    /// each step logged. Blocks for 13 s.
+    #[cfg(feature = "status-led-selftest")]
+    fn self_test(led: &mut StatusLed) -> Result<(), StatusLedError> {
+        use super::MAX_CHANNEL as M;
+        log::info!(
+            "status LED self-test on {:?} ({:?}): red, green, blue 3 s each",
+            super::BOARD,
+            super::COLOR_ORDER
+        );
+        let delay = esp_hal::delay::Delay::new();
+        for (name, (r, g, b)) in [
+            ("red", (M, 0, 0)),
+            ("green", (0, M, 0)),
+            ("blue", (0, 0, M)),
+        ] {
+            log::info!("status LED self-test: {}", name);
+            led.write(r, g, b)?;
+            delay.delay_millis(3_000);
+            log::info!("status LED self-test: dark");
+            led.write(0, 0, 0)?;
+            delay.delay_millis(if name == "blue" { 2_000 } else { 1_000 });
+        }
+        Ok(())
+    }
+
     /// [`StatusSink`] that forwards every status to `inner` (the console
     /// log) and shows it on the WS2812. Only colour changes are written,
     /// so the RMT is idle between blink edges.
@@ -65,8 +97,15 @@ mod adapter {
 
     impl<S: StatusSink> RgbStatusLed<S> {
         /// `led` is `None` when the RMT could not be configured; the
-        /// sink then only forwards to `inner`. Shows the booting colour.
+        /// sink then only forwards to `inner`. Shows the booting colour,
+        /// after the lab self-test with feature `status-led-selftest`.
         pub fn new(inner: S, led: Option<StatusLed>, palette: &'static StatusPalette) -> Self {
+            #[cfg(feature = "status-led-selftest")]
+            let mut led = led;
+            #[cfg(feature = "status-led-selftest")]
+            if let Some(Err(error)) = led.as_mut().map(self_test) {
+                log::warn!("status LED self-test failed: {:?}", error);
+            }
             let mut this = Self {
                 inner,
                 led,

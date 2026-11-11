@@ -488,6 +488,7 @@ dependencies = [
  "embedded-storage",
  "esp-hal",
  "esp-storage",
+ "zigbee-ws2812",
 ]
 
 [[package]]
@@ -1133,3 +1134,8 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "zigbee-ws2812"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=24662c9fe4ca3019e9556e3373b075c3e8ac3a5e#24662c9fe4ca3019e9556e3373b075c3e8ac3a5e"

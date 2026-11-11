@@ -361,6 +361,12 @@ are byte-identical to `5fdc5e5`, and the ED builds without the LED by
 default. Those rows had already drifted from the baseline at `5fdc5e5`, so
 `compare` still reports them until they are refreshed separately.
 
+Moving the WS2812 encoder to the `zigbee-ws2812` crate (zigbee-rs-drivers)
+and making the colour byte order a compile-time board constant took 6 B
+of `flash` and `text` off both router rows; `data`, `bss`, `stack` and
+`mac_chain` did not change. The sensor, thermometer, light-sleep and ED
+images stayed byte-identical. The rows were refreshed again.
+
 The CC2340 image uses
 the fallback (no SDK) mode, because SDK mode cannot be built locally. The
 PHY62x2 images were measured from the tree at `44d457c`.

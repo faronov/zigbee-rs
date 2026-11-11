@@ -182,12 +182,12 @@ jobs:
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
             features: esp32h2,sed,roles,signed-ota
-          # WS2812 status LED: shared indicator, product palette, RMT encoder.
+          # WS2812 status LED: shared indicator, product palette, RMT timing.
           - name: ESP32-H2 router product (status LED)
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
             features: esp32h2,roles,status-led
-          - name: ESP32 devkit board (status LED encoder)
+          - name: ESP32 devkit board (status LED RMT timing)
             manifest: boards/esp32-zigbee-devkit/Cargo.toml
             workspace: boards/esp32-zigbee-devkit
             features: esp32h2,status-led
@@ -1213,6 +1213,12 @@ jobs:
             --no-default-features --features ed,status-led
           cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/status-led \
             --no-default-features --features ed,status-led -- -D warnings
+          # Waveshare ESP32-H2-Zero router (RGB LED byte order) and the lab
+          # colour self-test, which is never part of a shipped image.
+          cargo build --release --locked -Z build-std=core,alloc --target-dir target/h2-zero \
+            --no-default-features --features router,waveshare-h2-zero
+          cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/h2-zero \
+            --no-default-features --features router,waveshare-h2-zero,status-led-selftest -- -D warnings
           DIR=target/riscv32imac-unknown-none-elf/release
           LED_DIR=target/status-led/riscv32imac-unknown-none-elf/release
           CSV=../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv
