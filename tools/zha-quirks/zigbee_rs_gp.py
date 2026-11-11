@@ -18,16 +18,24 @@ support, Home Assistant 2026.11 or later).
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from zha.application.platforms.event import BaseEvent
 from zha.application.platforms.sensor import BaseSensor
 from zha.application.platforms.sensor.const import SensorDeviceClass, SensorStateClass
 from zha.units import PERCENTAGE, UnitOfTemperature
 from zigpy.device import GreenPowerCommandReceived
 from zigpy.zgp.types import DeviceID, GPDCommandID
 
-from zhaquirks.builder import EventDeviceClass, GreenPowerQuirkBuilder
+from zhaquirks.builder import GreenPowerQuirkBuilder
+
+try:  # Event entities need a ZHA with the event platform.
+    from zha.application.platforms.event import BaseEvent
+    from zha.application.platforms.event.const import EventDeviceClass
+except ImportError:  # pragma: no cover - older ZHA: sensor quirk only
+    BaseEvent = None
+
+_LOGGER = logging.getLogger(__name__)
 
 ZIGBEE_RS_MANUFACTURER_ID = 0x6D6B
 ZIGBEE_RS_GP_SENSOR_MODEL_ID = 0xF300
@@ -108,27 +116,6 @@ class ZigbeeRsBattery(ZigbeeRsGreenPowerSensor):
     _attr_suggested_display_precision = 0
 
 
-class ZigbeeRsSwitchEvent(BaseEvent):
-    """Event entity firing on/off/toggle for the switch commands."""
-
-    _attr_device_class = EventDeviceClass.BUTTON
-    _attr_event_types = list(SWITCH_COMMANDS.values())
-
-    def on_add(self) -> None:
-        """Subscribe to the commands sent by the switch."""
-        super().on_add()
-        self._on_remove_callbacks.append(
-            self.device.device.on_event(
-                GreenPowerCommandReceived.event_type, self._handle_command
-            )
-        )
-
-    def _handle_command(self, event: GreenPowerCommandReceived) -> None:
-        event_type = SWITCH_COMMANDS.get(int(event.command_id))
-        if event_type is not None:
-            self._trigger_event(event_type)
-
-
 (
     GreenPowerQuirkBuilder()
     .applies_to(
@@ -145,14 +132,38 @@ class ZigbeeRsSwitchEvent(BaseEvent):
     .add_to_registry()
 )
 
-(
-    GreenPowerQuirkBuilder()
-    .applies_to(
-        device_id=DeviceID.OnOffSwitch,
-        manufacturer_id=ZIGBEE_RS_MANUFACTURER_ID,
-        model_id=ZIGBEE_RS_GP_SWITCH_MODEL_ID,
+if BaseEvent is None:
+    _LOGGER.warning("ZHA has no event platform: zigbee-rs GP switch quirk disabled")
+else:
+
+    class ZigbeeRsSwitchEvent(BaseEvent):
+        """Event entity firing on/off/toggle for the switch commands."""
+
+        _attr_device_class = EventDeviceClass.BUTTON
+        _attr_event_types = list(SWITCH_COMMANDS.values())
+
+        def on_add(self) -> None:
+            """Subscribe to the commands sent by the switch."""
+            super().on_add()
+            self._on_remove_callbacks.append(
+                self.device.device.on_event(
+                    GreenPowerCommandReceived.event_type, self._handle_command
+                )
+            )
+
+        def _handle_command(self, event: GreenPowerCommandReceived) -> None:
+            event_type = SWITCH_COMMANDS.get(int(event.command_id))
+            if event_type is not None:
+                self._trigger_event(event_type)
+
+    (
+        GreenPowerQuirkBuilder()
+        .applies_to(
+            device_id=DeviceID.OnOffSwitch,
+            manufacturer_id=ZIGBEE_RS_MANUFACTURER_ID,
+            model_id=ZIGBEE_RS_GP_SWITCH_MODEL_ID,
+        )
+        .adds_entity(ZigbeeRsSwitchEvent, unique_id_suffix="button", fallback_name="Button")
+        .friendly_name(manufacturer="zigbee-rs", model="GP switch")
+        .add_to_registry()
     )
-    .adds_entity(ZigbeeRsSwitchEvent, unique_id_suffix="button", fallback_name="Button")
-    .friendly_name(manufacturer="zigbee-rs", model="GP switch")
-    .add_to_registry()
-)

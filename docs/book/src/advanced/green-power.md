@@ -20,8 +20,8 @@
 | ESP32-H2 router example `green-power` + 8 KiB `zbnv` journal at 0x3F8000 | builds | not flashed |
 | `efr32s2-hal::trng` (MG22 CRYPTOACC BA431 TRNG: GSDK init, conditioning KAT, health-failure reinit) | implemented | host model tests; lab bin `s2-trng` built, not run |
 | `apps/gpd` (`gpd-app`): provisioning, `GpdJournal`, beacon scan for a permit-join network, unidirectional commissioning, L3 Multi-Cluster Reports and switch commands, CCA backoff | implemented | host tests: sink-side decode of commissioning (key unwrap), reports and Toggle; counter never reused across reboot; failed reservation transmits nothing; journal rollover / interrupted write / CRC fallback |
-| `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | builds | layout verified; not flashed |
-| ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | written | byte-compiled only; not loaded in ZHA |
+| `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch image not flashed |
+| ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | sensor part lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity/battery entities; the switch event entity is not tested |
 | Bidirectional GPD, full proxy, Combo/Sink | not started | — |
 
 Implementation notes that differ from the design below:
