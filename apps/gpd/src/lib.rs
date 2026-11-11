@@ -55,10 +55,13 @@ impl GpdKind {
         }
     }
 
+    /// Differs in both halves: the low 16 bits are the GPD's derived NWK
+    /// alias (GP A.3.6.3.3.1), so two kinds on one chip must not share them.
+    /// Only new identities use it; a persisted SrcID is never re-derived.
     const fn src_id_salt(self) -> u32 {
         match self {
             Self::Sensor => 0,
-            Self::Switch => 0x5357_0000,
+            Self::Switch => 0x5357_5357,
         }
     }
 }

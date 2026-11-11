@@ -194,6 +194,27 @@ fn src_id_derivation_avoids_reserved_and_separates_kinds() {
 }
 
 #[test]
+fn kinds_on_one_chip_get_distinct_nwk_aliases() {
+    // Includes the BRD4183A whose first switch shared the sensor's alias.
+    let euis = [
+        EUI,
+        [0x12, 0x90, 0xC3, 0xFE, 0xFF, 0xD7, 0x6B, 0x08],
+        [0; 8],
+        [0xFF; 8],
+        [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0],
+    ];
+    for eui in euis {
+        let sensor = GpdId::SrcId(derive_src_id(eui, GpdKind::Sensor));
+        let switch = GpdId::SrcId(derive_src_id(eui, GpdKind::Switch));
+        assert_ne!(
+            zigbee_gp::types::derive_alias(&sensor),
+            zigbee_gp::types::derive_alias(&switch),
+            "{eui:02X?}"
+        );
+    }
+}
+
+#[test]
 fn provisioning_is_persisted_and_resumed() {
     let (d, p) = open(MockPhy::default(), MockFlash::new(), sensor_profile());
     assert_eq!(p, Provisioning::Provisioned);

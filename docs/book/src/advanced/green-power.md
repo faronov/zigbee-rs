@@ -1,8 +1,9 @@
 # Zigbee Green Power (design draft)
 
 > **Status: Proxy Basic and the unidirectional GPD app (MG22 sensor and
-> switch) are implemented and host-tested on the `green-power` branch;
-> nothing is hardware-tested yet.** Bidirectional operation, the full
+> switch) are implemented on the `green-power` branch. The MG22 GPD
+> sensor and switch are lab-tested on hardware directly against ZHA; the
+> proxy is host-tested only.** Bidirectional operation, the full
 > proxy and Combo/Sink are still design only. Spec
 > references are to GP 1.0a (docs-09-5499-26) and GP 1.1 where noted.
 
@@ -20,8 +21,8 @@
 | ESP32-H2 router example `green-power` + 8 KiB `zbnv` journal at 0x3F8000 | builds | not flashed |
 | `efr32s2-hal::trng` (MG22 CRYPTOACC BA431 TRNG: GSDK init, conditioning KAT, health-failure reinit) | implemented | host model tests; lab bin `s2-trng` built, not run |
 | `apps/gpd` (`gpd-app`): provisioning, `GpdJournal`, beacon scan for a permit-join network, unidirectional commissioning, L3 Multi-Cluster Reports and switch commands, CCA backoff | implemented | host tests: sink-side decode of commissioning (key unwrap), reports and Toggle; counter never reused across reboot; failed reservation transmits nothing; journal rollover / interrupted write / CRC fallback |
-| `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch image not flashed |
-| ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | sensor part lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity/battery entities; the switch event entity is not tested |
+| `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch lab-tested the same day with a separate SrcID (0x7A6B9879) and journal: commissioned, Off/On/Toggle events in HA every 30 s (`lab-switch-cycle` build), counter resumed at 16 after reset and accepted. Re-flashing the sensor resumed its own SrcID (counter 80) and ZHA accepted it |
+| ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity entities (battery not reported by the MG22 build); switch event entity with `off`/`on`/`toggle` |
 | Bidirectional GPD, full proxy, Combo/Sink | not started | — |
 
 Implementation notes that differ from the design below:
@@ -381,9 +382,20 @@ No board crate gets GP storage. Products own the partitions.
   swapping the sensor and switch images on one board keeps both
   identities; 0x78000–0x80000 never written (0x7C000 keeps the Zigbee
   sensor product's security journal).
-- Measured (release): 40,048 B file-backed flash (`.text` 32,728,
-  `.rodata` 6,668, `.data` 332), `.bss` 2,312 B; 29.9 KiB linked stack.
-  Sensor and switch are the same size.
+- Measured (release): 41,228 B file-backed flash, `.bss` 2,312 B;
+  29.9 KiB linked stack. Sensor and switch are the same size.
+- `lab-switch-cycle` (lab only, never shipped): the switch sends
+  Off/On/Toggle every 30 s without a button press, because hwlab cannot
+  press BTN0.
+- NWK alias: zigpy gives a GPD the NWK `derive_alias(SrcID)` (the low 16
+  bits). The first switch identity used a salt that only changed the high
+  16 bits, so sensor and switch on one chip shared alias 0x9879. zigpy
+  tolerates alias collisions (GP spec A.3.6.3.3) and both worked; the salt
+  now differs in both halves for new identities (a host test checks the
+  aliases differ). Persisted SrcIDs are never re-derived.
+- Open: one sensor report (fc 5, first hardware run) never reached ZHA
+  while all others did; the ZHA reload window does not explain it. To be
+  checked with an over-the-air capture.
 - ZHA: identity 0x6D6B / 0xF300 (DeviceID 0x33) and 0x6D6B / 0xF400
   (DeviceID 0x02). Without a quirk ZHA creates no entities for a GPD;
   `tools/zha-quirks/zigbee_rs_gp.py` adds temperature, humidity and battery
