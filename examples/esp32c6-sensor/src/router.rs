@@ -6,8 +6,8 @@
 //! so the core's software pending set is empty) under
 //! [`router_app::ParentRouterApp`]: beacons, association, indirect TX to
 //! sleepy children, routing, durable child and APS tables. Status goes to
-//! the USB Serial/JTAG console, BOOT (GPIO9) re-arms commissioning after a
-//! Leave.
+//! the USB Serial/JTAG console (and, with `status-led`, the WS2812 on
+//! GPIO8), BOOT (GPIO9) re-arms commissioning after a Leave.
 //!
 //! No OTA client: this image is installed over the serial/JTAG link into
 //! `ota_0`. The router never enters light sleep (`macRxOnWhenIdle`).
@@ -28,7 +28,7 @@ use esp32_zigbee_devkit_product as product;
 use esp_backtrace as _;
 use product::executor::block_on;
 use product::router::{ApsTableStore, ChildStore, RouterProfile};
-use roles::{halt, CommissioningTrigger, LogDiagnostics, LogStatus, ResetSupervisor};
+use roles::{halt, CommissioningTrigger, LogDiagnostics, ResetSupervisor, Status};
 use router_app::{
     NoObserver, NodeArchetype, ParentRouterApp, PersistentApsTables, PersistentChildren,
 };
@@ -47,7 +47,7 @@ type App = ParentRouterApp<
     product::storage::SecurityStore,
     RouterProfile,
     ChildStore,
-    LogStatus,
+    Status,
     ResetSupervisor,
     LogDiagnostics,
     NoObserver,
@@ -62,7 +62,7 @@ const SUMMARY_PERIOD: Duration = Duration::from_secs(60);
 fn main() -> ! {
     let started = roles::start(product::ROUTER_MODEL);
     let trigger = CommissioningTrigger::new(started.button);
-    let app = compose(started.radio, started.aes);
+    let app = compose(started.radio, started.aes, started.status_pins);
     block_on(run(app, trigger))
 }
 
@@ -80,6 +80,13 @@ async fn run(app: &'static mut App, mut trigger: CommissioningTrigger) -> ! {
         if let Err(error) = app.step().await {
             roles::fatal(app.parts_mut(), ARCHETYPE, error);
         }
+        #[cfg(feature = "status-led")]
+        {
+            // Advance the LED blink/hold; the NIB tracks the timed
+            // permit-join close, which raises no stack event.
+            let permit_join = app.node().device().bdb().zdo().nwk().nib().permit_joining;
+            app.parts_mut().status.refresh(permit_join);
+        }
         if Instant::now() >= next_summary {
             next_summary += SUMMARY_PERIOD;
             log_summary(app);
@@ -93,6 +100,7 @@ async fn run(app: &'static mut App, mut trigger: CommissioningTrigger) -> ! {
 fn compose(
     radio: esp_hal::peripherals::IEEE802154<'static>,
     aes: esp_hal::peripherals::AES<'static>,
+    status_pins: roles::StatusPins,
 ) -> &'static mut App {
     let Ok(mac) = roles::radio_phy(radio, aes).into_parent_mac() else {
         log::error!("[ESP32-C6] MAC init failed");
@@ -143,7 +151,7 @@ fn compose(
         PersistentChildren::new(child_store),
         PersistentApsTables::new(aps_store),
         &product::router::ROUTER_POLICY,
-        roles::parts(),
+        roles::parts(status_pins),
     )
     .unwrap_or_else(|error| {
         log::error!("[ESP32-C6] invalid composition: {:?}", error);

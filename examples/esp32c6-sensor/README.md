@@ -4,6 +4,10 @@
 The current product intentionally uses `Active` for both fast and slow waits;
 it makes no low-power sleep claim.
 
+The DevKitC-1 LED is a WS2812 on GPIO8. The sensor does not drive it; the
+mains role bins show status on it with `--no-default-features --features
+router,status-led` (or `ed,status-led`); see the ESP32 platform guide.
+
 ## Architecture
 
 ```text

@@ -60,6 +60,29 @@ image). They have no OTA client. The product enables their modules through
 its `roles` feature; the SED-only modules (policy, wake, OTA) sit behind
 `sed`, so the existing SED images do not change.
 
+**Status LED (`status-led`, mains roles only).** All three boards (C6
+DevKitC-1, H2 DevKitM-1, Waveshare H2-Zero) fit a WS2812-class RGB LED with
+DIN on GPIO8; a plain GPIO level cannot light it. With
+`--no-default-features --features router,status-led` (or `ed,status-led`)
+the image drives it from RMT channel 0:
+
+- `router_app::StatusIndicator` (shared, host tested) maps the
+  `RouterStatus` lifecycle, the NIB permit-join flag and OTA events to an
+  indication: error > identify > OTA > permit join > joined > searching >
+  booting. Joined is shown for `joined_hold_ms`, then the LED goes dark.
+- The product (`esp32_zigbee_devkit_product::status_led`) owns the palette:
+  dim white booting, amber 1 Hz searching, green for 30 s after joining,
+  blue 0.5 Hz permit join, magenta 2 Hz identify, cyan OTA flash, red
+  error; no channel above 24/255.
+- The board (`esp32_zigbee_devkit::status_led`) owns GPIO8 and the encoder:
+  16 MHz RMT ticks, 0.31/0.88 µs bit halves, a 300 µs latch, one 25-symbol
+  frame that fits a single channel memory block. A frame is written only
+  when the colour changes (about 330 µs busy wait, interrupts enabled).
+
+The feature is opt-in. Sleepy images reject it at build time and keep GPIO8
+isolated; without it, the role images log status on the console only. The
+router has no OTA client, so the OTA indication does not occur there yet.
+
 **Frame Pending.** The radio auto-ACKs in hardware, and the core is too late
 to influence that ACK, so the router keeps the core's `PENDING` capacity at
 0. The `esp-parent` feature of `zigbee-mac` enables the local esp-radio patch
@@ -114,7 +137,10 @@ Both images provide a concrete
 | default | `Active` | `Active` | 30 s |
 | `--features light-sleep` (experimental) | `Active` | retained `Idle` | 5 s |
 
-C6 has no status LED adapter; H2 keeps its active-low fitted LED.
+Neither SED image shows a status: the C6 has no LED adapter, and the H2
+sensor's active-low GPIO8 output cannot light the board's WS2812. It is
+kept unchanged so the validated image stays byte-identical; the
+`status-led` driver above is for the mains roles only.
 
 `Active`/`Active` describes the radio/SoC policy, not a continuously spinning
 CPU. The executor uses `WFI` while its root future is pending. SYSTIMER alarm 0

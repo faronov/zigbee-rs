@@ -71,6 +71,9 @@ router = [
     "zigbee-mac/esp-parent",
     "esp32-zigbee-devkit-product/roles",
 ]
+# WS2812 status LED on GPIO8 (RMT) for the mains roles: `--features
+# router,status-led` or `ed,status-led`. Sleepy images reject it.
+status-led = ["esp32-zigbee-devkit-product/status-led"]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
 # Accept only signed MCUboot envelopes over OTA (see the product's

@@ -3,8 +3,8 @@
 //! RX-on-when-idle, non-routing: the shared `SoftMacCore` end-device MAC
 //! (`EspSoftMac`, hardware auto-ACK) under
 //! [`router_app::AlwaysOnEndDeviceApp`]. Basic + Identify on endpoint 1;
-//! the GPIO8 LED shows the online state, BOOT (GPIO9) re-arms
-//! commissioning after a Leave.
+//! status goes to the console (and, with `status-led`, the WS2812 on
+//! GPIO8), BOOT (GPIO9) re-arms commissioning after a Leave.
 //!
 //! Identity, policy and the security journal are owned by
 //! `products/esp32-zigbee-devkit`. No OTA client: this image is installed
@@ -25,7 +25,7 @@ use esp32_zigbee_devkit_product as product;
 use esp_backtrace as _;
 use product::end_device::EndDeviceProfile;
 use product::executor::block_on;
-use roles::{halt, CommissioningTrigger, LedStatus, LogDiagnostics, ResetSupervisor};
+use roles::{halt, CommissioningTrigger, LogDiagnostics, ResetSupervisor, Status};
 use router_app::{AlwaysOnEndDeviceApp, NodeArchetype};
 use static_cell::StaticCell;
 use zigbee_mac::esp::EspSoftMac;
@@ -42,7 +42,7 @@ type App = AlwaysOnEndDeviceApp<
     Mac,
     product::storage::SecurityStore,
     EndDeviceProfile,
-    LedStatus,
+    Status,
     ResetSupervisor,
     LogDiagnostics,
 >;
@@ -53,7 +53,7 @@ const ARCHETYPE: NodeArchetype = NodeArchetype::AlwaysOnEndDevice;
 fn main() -> ! {
     let started = roles::start(product::END_DEVICE_MODEL);
     let trigger = CommissioningTrigger::new(started.button);
-    let app = compose(started.radio, started.aes, started.led);
+    let app = compose(started.radio, started.aes, started.status_pins);
     block_on(run(app, trigger))
 }
 
@@ -69,6 +69,12 @@ async fn run(app: &'static mut App, mut trigger: CommissioningTrigger) -> ! {
         if let Err(error) = app.step().await {
             roles::fatal(app.parts_mut(), ARCHETYPE, error);
         }
+        #[cfg(feature = "status-led")]
+        {
+            // Advance the LED blink/hold (an end device never permits joining).
+            let permit_join = false;
+            app.parts_mut().status.refresh(permit_join);
+        }
     }
 }
 
@@ -78,7 +84,7 @@ async fn run(app: &'static mut App, mut trigger: CommissioningTrigger) -> ! {
 fn compose(
     radio: esp_hal::peripherals::IEEE802154<'static>,
     aes: esp_hal::peripherals::AES<'static>,
-    led: esp_hal::gpio::Output<'static>,
+    status_pins: roles::StatusPins,
 ) -> &'static mut App {
     let Ok(mac) = roles::radio_phy(radio, aes).into_soft_mac() else {
         log::error!("[ESP32-H2] MAC init failed");
@@ -127,7 +133,7 @@ fn compose(
     let app = AlwaysOnEndDeviceApp::new(
         node,
         &product::end_device::END_DEVICE_POLICY,
-        roles::parts(led),
+        roles::parts(status_pins),
     )
     .unwrap_or_else(|error| {
         log::error!("[ESP32-H2] invalid composition: {:?}", error);

@@ -687,6 +687,7 @@ name = "esp32-zigbee-devkit"
 version = "0.1.0"
 dependencies = [
  "embedded-storage",
+ "esp-hal",
  "esp-storage",
 ]
 

@@ -55,6 +55,10 @@ sed = ["dep:sensor-sed-app"]
 # Mains role policies/profiles (always-on End Device, Router) and the
 # router's child/APS journals.
 roles = ["dep:router-app"]
+# WS2812 status indication for the mains roles (`status_led`): the product
+# palette over `router_app::StatusIndicator`, shown through the board's RMT
+# driver. Never enabled by sleepy images.
+status-led = ["roles", "esp32-zigbee-devkit/status-led"]
 light-sleep = []
 # Persist ZCL Configure Reporting state in `zbnv` (sleepy sensor images).
 reporting-persist = []
