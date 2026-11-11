@@ -354,10 +354,104 @@ class OtaBuildTests(unittest.TestCase):
                     ):
                         self.assertEqual(OTA.main(), 0)
                     build.assert_called_once_with(
-                        7, OTA.CHIPS[chip].example_dir, "nightly-2026-08-01", features,
+                        7, OTA.CHIPS[chip].example_dir, "nightly-2026-08-01", features, "",
                     )
                     container = Path(directory) / f"{chip}-sensor-v7.ota"
                     self.assertEqual(OTA.parse_container(container.read_bytes())["file_version"], 7)
+
+    def test_build_selects_a_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            example = Path(directory) / "esp32h2-sensor"
+            elf = example / "target" / OTA.DEFAULT_TARGET / "release" / "esp32h2-thermometer"
+            elf.parent.mkdir(parents=True)
+            elf.touch()
+            with mock.patch.object(OTA, "run") as run:
+                self.assertEqual(
+                    OTA.build_elf(7, example, "", "thermometer", "esp32h2-thermometer"), elf
+                )
+            self.assertEqual(run.call_args.args[0][-4:],
+                             ["--bin", "esp32h2-thermometer", "--features", "thermometer"])
+
+    def test_signed_thermometer_packaging(self):
+        image = application("esp32h2")
+        envelope = signed_envelope(image, (0, 2, 1))
+        thermometer = OTA.thermometer_config()
+        with tempfile.TemporaryDirectory() as directory:
+            args = ["create-ota.py", "0x00020001", directory, "--chip", "esp32h2",
+                    "--variant", "thermometer", "--sign-key", "key.pem",
+                    "--imgtool", "imgtool", "--toolchain", ""]
+            with (
+                mock.patch.object(sys, "argv", args),
+                mock.patch.object(OTA, "build_elf", return_value=Path("firmware.elf")) as build,
+                mock.patch.object(OTA, "save_image", return_value=image),
+                mock.patch.object(OTA, "sign_image", return_value=envelope) as sign,
+                mock.patch.object(OTA, "find_imgtool", return_value="imgtool"),
+                mock.patch("builtins.print"),
+            ):
+                self.assertEqual(OTA.main(), 0)
+            build.assert_called_once_with(
+                0x00020001, thermometer.example_dir, "",
+                "thermometer,light-sleep,signed-ota", "esp32h2-thermometer",
+            )
+            self.assertFalse(sign.call_args.kwargs["untrusted_key"])
+            container = Path(directory) / "esp32h2-thermometer-v131073-signed.ota"
+            parsed = OTA.parse_container(container.read_bytes())
+            self.assertEqual(parsed["payload"], envelope)
+            self.assertEqual(parsed["image_type"], thermometer.image_type)
+            index = json.loads((Path(directory) / "index.json").read_text())
+            self.assertEqual(index["firmwares"][0]["model_names"], [thermometer.model_name])
+
+    def test_thermometer_identity_comes_from_its_toml(self):
+        values = OTA.read_flat_toml(ROOT / "examples/esp32h2-sensor/thermometer.toml")
+        config = OTA.thermometer_config()
+        self.assertEqual(config.image_type, int(values["ota_image_type"], 0))
+        self.assertEqual(config.model_name, values["model"])
+        self.assertNotIn(config.image_type, {c.image_type for c in OTA.CHIPS.values()})
+        with self.assertRaises(SystemExit):
+            OTA.select_config("esp32c6", "thermometer")
+
+    def test_envelope_version_mapping(self):
+        self.assertEqual(OTA.envelope_version(0x00020001), "0.2.1+0")
+        self.assertEqual(OTA.envelope_version(0x01020304), "1.2.772+0")
+
+    def test_signed_envelope_payload_checks(self):
+        image = application("esp32h2")
+        envelope = signed_envelope(image, (0, 2, 1))
+        self.assertEqual(OTA.envelope_image(envelope), image)
+        self.assertIsNone(OTA.envelope_image(image))
+        OTA.check_payload(envelope, OTA.CHIPS["esp32h2"])
+        with self.assertRaises(SystemExit):  # wrong chip inside the envelope
+            OTA.check_payload(signed_envelope(application("esp32c6"), (0, 2, 1)),
+                              OTA.CHIPS["esp32h2"])
+        tampered = bytearray(envelope)
+        tampered[0x40] ^= 1
+        with self.assertRaises(SystemExit):  # digest no longer matches
+            OTA.envelope_image(bytes(tampered))
+        with self.assertRaises(SystemExit):  # trailing bytes
+            OTA.envelope_image(envelope + b"\xff")
+        with self.assertRaises(SystemExit):  # unsigned
+            OTA.envelope_image(signed_envelope(image, (0, 2, 1), signature=False))
+        with self.assertRaises(SystemExit):  # another header size
+            OTA.envelope_image(signed_envelope(image, (0, 2, 1), header=0x200))
+
+    def test_firmware_trusted_keys_follow_app_verify_conf(self):
+        own = bytes.fromhex((ROOT / "bootloaders/keys/own-ec-p256.xy.hex").read_text().strip())
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("ESP32_DEVKIT_")}
+        with mock.patch.dict(os.environ, clean, clear=True):
+            self.assertEqual(OTA.firmware_trusted_keys(), [own])
+        with mock.patch.dict(os.environ, dict(clean, ESP32_DEVKIT_OTA_KEY2_XY="ab" * 64),
+                             clear=True):
+            self.assertEqual(OTA.firmware_trusted_keys(), [own, b"\xab" * 64])
+
+    def test_signing_refuses_an_untrusted_key(self):
+        with (
+            mock.patch.object(OTA, "imgtool_public_xy", return_value=b"\x01" * 64),
+            mock.patch.object(OTA, "run") as run,
+            self.assertRaises(SystemExit),
+        ):
+            OTA.sign_image(Path("app.bin"), 0x00020001, Path("key.pem"), "imgtool",
+                           Path("out.bin"), untrusted_key=False)
+        run.assert_not_called()
 
     def test_wrappers_reject_features_with_prebuilt_elf(self):
         for chip in CHIP_IDS:
@@ -370,6 +464,20 @@ class OtaBuildTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("not allowed with argument", result.stderr)
+
+
+def signed_envelope(image: bytes, version: tuple[int, int, int], *, header: int = 0x20,
+                    signature: bool = True) -> bytes:
+    """An `imgtool sign --pad-header` layout with a SHA-256 TLV and a dummy
+    signature TLV (the packager checks structure; devices verify the key)."""
+    major, minor, revision = version
+    head = struct.pack("<IIHHIIBBHI", 0x96F3B83D, 0, header, 0, len(image), 0,
+                       major, minor, revision, 0).ljust(header, b"\0")
+    body = head + image
+    tlvs = struct.pack("<BxH", 0x10, 32) + hashlib.sha256(body).digest()
+    if signature:
+        tlvs += struct.pack("<BxH", 0x22, 72) + bytes(72)
+    return body + struct.pack("<HH", 0x6907, 4 + len(tlvs)) + tlvs
 
 
 def write_corpus(destination: Path, chip: str | None = None) -> None:

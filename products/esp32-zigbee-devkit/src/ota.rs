@@ -20,7 +20,11 @@
 //!    altered and the padding lives past the end of the image.
 //! 4. [`FirmwareWriter::verify`] re-reads and validates the complete ESP image
 //!    structure, chip compatibility, XOR checksum and appended SHA-256.
-//!    This is integrity checking, NOT secure-boot authentication.
+//!    This is integrity checking, NOT secure-boot authentication. A refused
+//!    image, and any transfer dropped through [`FirmwareWriter::abort`], has
+//!    the slot's first sector erased so its ESP image magic is gone and the
+//!    bootloader cannot fall back into it. A transfer the OTA runtime merely
+//!    suspends (server abort, silence) keeps its staged data.
 //! 5. [`FirmwareWriter::activate`] writes one 32-byte `ESP_OTA_IMG_NEW`
 //!    `otadata` entry into the sector that does not hold the active entry and
 //!    resets the chip. A power failure leaves the previous entry intact and
@@ -107,6 +111,9 @@ enum State {
     Staging,
     /// Image checked against its own SHA-256, ready to activate.
     Verified,
+    /// `otadata` programming has started; the slot may already be selected,
+    /// so it is never discarded from here on.
+    Activating,
 }
 
 /// Stages OTA payloads into the inactive `ota_0`/`ota_1` slot.
@@ -196,6 +203,7 @@ impl<F: OtaFlash> EspFirmwareWriter<F> {
         let activation = data
             .activation_for(self.target_slot)
             .map_err(|_| FirmwareError::ActivateFailed)?;
+        self.state = State::Activating;
         program_entry(&mut self.flash, &activation)?;
 
         let confirmed = self.read_otadata()?;
@@ -241,6 +249,33 @@ impl<F: OtaFlash> EspFirmwareWriter<F> {
         self.finalized = false;
     }
 
+    /// Drop the staged transfer and, if this transfer wrote into the slot,
+    /// erase the slot's first sector so the ESP image magic is gone and no
+    /// bootloader fallback can start a refused or partial image.
+    ///
+    /// Nothing is erased when this transfer never touched the slot (the slot
+    /// may still hold the previous good image) or once activation has started
+    /// (`otadata` may already select the slot). The bookkeeping is reset even
+    /// if the erase fails; a second call is then a no-op.
+    fn discard_staged(&mut self) -> Result<(), FirmwareError> {
+        let invalidate = self.sectors_erased > 0 && self.state != State::Activating;
+        let base = self.slot_base();
+        self.reset_staging();
+        if !invalidate {
+            return Ok(());
+        }
+        let erased = self.flash.erase_sector(base);
+        match erased {
+            Ok(()) => log::info!("[ESP OTA] slot {} header erased", self.target_slot),
+            Err(error) => log::error!(
+                "[ESP OTA] slot {} header erase failed: {:?}",
+                self.target_slot,
+                error
+            ),
+        }
+        erased
+    }
+
     fn ensure_sector_erased(&mut self, sector: u32) -> Result<(), FirmwareError> {
         while self.sectors_erased <= sector {
             let address = self.slot_base() + self.sectors_erased * SECTOR_SIZE;
@@ -281,6 +316,24 @@ impl<F: OtaFlash> EspFirmwareWriter<F> {
         }
         self.finalized = true;
         Ok(())
+    }
+
+    /// Finish the transfer and check it; the caller discards on failure.
+    fn check_staged(
+        &mut self,
+        expected_size: u32,
+        expected_hash: Option<&[u8]>,
+    ) -> Result<(), FirmwareError> {
+        self.flush_tail()?;
+        if self.written != expected_size {
+            log::warn!(
+                "[ESP OTA] size mismatch: staged {} bytes, expected {}",
+                self.written,
+                expected_size
+            );
+            return Err(FirmwareError::VerifyFailed);
+        }
+        self.verify_staged_image(expected_hash)
     }
 
     fn verify_staged_image(&mut self, expected_hash: Option<&[u8]>) -> Result<(), FirmwareError> {
@@ -404,16 +457,11 @@ impl<F: OtaFlash> FirmwareWriter for EspFirmwareWriter<F> {
         if self.state != State::Staging {
             return Err(FirmwareError::VerifyFailed);
         }
-        self.flush_tail()?;
-        if self.written != expected_size {
-            log::warn!(
-                "[ESP OTA] size mismatch: staged {} bytes, expected {}",
-                self.written,
-                expected_size
-            );
-            return Err(FirmwareError::VerifyFailed);
+        if let Err(error) = self.check_staged(expected_size, expected_hash) {
+            // A refused download is discarded here, not left for abort().
+            let _ = self.discard_staged();
+            return Err(error);
         }
-        self.verify_staged_image(expected_hash)?;
         self.state = State::Verified;
         log::info!(
             "[ESP OTA] slot {} verified ({} bytes)",
@@ -433,14 +481,15 @@ impl<F: OtaFlash> FirmwareWriter for EspFirmwareWriter<F> {
         OTA_SLOT_SIZE
     }
 
-    /// Drop the partially staged image. `otadata` is untouched, so the running
-    /// slot stays selected.
+    /// Discard the staged image: the slot's first sector is erased if this
+    /// transfer wrote into it (see `discard_staged`). `otadata` is untouched,
+    /// so the running slot stays selected. The OTA runtime does not call this
+    /// when it suspends a transfer to resume later.
     fn abort(&mut self) -> Result<(), FirmwareError> {
         if self.state != State::Idle {
             log::info!("[ESP OTA] aborted after {} bytes", self.written);
         }
-        self.reset_staging();
-        Ok(())
+        self.discard_staged()
     }
 }
 
@@ -720,6 +769,7 @@ mod tests {
         erased: Vec<u32>,
         writes: Vec<(u32, usize)>,
         fail_write_at: Option<u32>,
+        fail_erase_at: Option<u32>,
         running: Result<u8, RunningImageError>,
     }
 
@@ -730,6 +780,7 @@ mod tests {
                 erased: Vec::new(),
                 writes: Vec::new(),
                 fail_write_at: None,
+                fail_erase_at: None,
                 running: Ok(0),
             }
         }
@@ -802,6 +853,9 @@ mod tests {
                 is_ota_writable(address, SECTOR_SIZE),
                 "erase outside the OTA partitions at {address:#X}"
             );
+            if self.fail_erase_at == Some(address) {
+                return Err(FirmwareError::EraseFailed);
+            }
             let start = address as usize;
             self.data[start..start + SECTOR_SIZE as usize].fill(0xFF);
             self.erased.push(address);
@@ -1082,6 +1136,156 @@ mod tests {
         assert_eq!(writer.flash.slice(OTA_1_OFFSET, image.len()), image);
     }
 
+    /// The first sector of the target slot is erased, so no ESP image magic
+    /// is left for a bootloader fallback.
+    fn assert_header_erased(flash: &MockFlash) {
+        assert_eq!(flash.erased.last(), Some(&OTA_1_OFFSET));
+        assert!(
+            flash
+                .slice(OTA_1_OFFSET, SECTOR_SIZE as usize)
+                .iter()
+                .all(|byte| *byte == 0xFF),
+            "refused image header left in the slot"
+        );
+    }
+
+    #[test]
+    fn refused_images_are_discarded_from_the_slot() {
+        let image = esp_image(EXPECTED_CHIP_ID, 5000); // spans two sectors
+        let mut corrupted = image.clone();
+        corrupted[4500] ^= 1;
+        /// Image, size reported to verify, expected hash.
+        type Case<'a> = (&'a [u8], u32, Option<&'a [u8]>);
+        let cases: [Case; 4] = [
+            (&corrupted, corrupted.len() as u32, None),
+            (&image, image.len() as u32 + 1, None),
+            (&image, image.len() as u32, Some(&[0; 32])),
+            (&image[..3], 3, None),
+        ];
+        for (data, size, hash) in cases {
+            let flash = MockFlash::with_otadata(1, 0);
+            let otadata_before = flash
+                .slice(OTADATA_OFFSET, 2 * SECTOR_SIZE as usize)
+                .to_vec();
+            let mut writer = new_writer(flash);
+            writer.erase_slot().unwrap();
+            let mut offset = 0u32;
+            for chunk in data.chunks(48) {
+                writer.write_block(offset, chunk).unwrap();
+                offset += chunk.len() as u32;
+            }
+            assert_eq!(writer.verify(size, hash), Err(FirmwareError::VerifyFailed));
+            assert_header_erased(&writer.flash);
+            assert_eq!(
+                writer.flash.slice(OTADATA_OFFSET, 2 * SECTOR_SIZE as usize),
+                otadata_before.as_slice(),
+                "otadata untouched"
+            );
+            assert_eq!(writer.sectors_erased(), 0);
+            assert_eq!(writer.bytes_written(), 0);
+            assert_eq!(
+                writer.stage_activation(),
+                Err(FirmwareError::ActivateFailed)
+            );
+            // The runtime aborts after a failed verify; nothing is erased twice.
+            let erases = writer.flash.erased.len();
+            writer.abort().unwrap();
+            assert_eq!(writer.flash.erased.len(), erases);
+        }
+    }
+
+    #[test]
+    fn abort_invalidates_a_partial_or_verified_download() {
+        let image = esp_image(EXPECTED_CHIP_ID, 5000);
+        // Partial download.
+        let mut writer = new_writer(MockFlash::with_otadata(1, 0));
+        writer.erase_slot().unwrap();
+        writer.write_block(0, &image[..4200]).unwrap();
+        assert_eq!(writer.sectors_erased(), 2);
+        writer.abort().unwrap();
+        assert_header_erased(&writer.flash);
+        assert_eq!(writer.flash.erased.len(), 3);
+        writer.abort().unwrap();
+        assert_eq!(writer.flash.erased.len(), 3, "second abort is a no-op");
+
+        // Verified but never activated (dropped by the OTA engine).
+        let mut writer = new_writer(MockFlash::with_otadata(1, 0));
+        stage(&mut writer, &image, 48).unwrap();
+        writer.abort().unwrap();
+        assert_header_erased(&writer.flash);
+        assert_eq!(writer.read_otadata().unwrap().active_slot(), Some(0));
+    }
+
+    #[test]
+    fn abort_before_any_write_keeps_the_previous_slot_contents() {
+        let mut flash = MockFlash::with_otadata(1, 0);
+        let base = OTA_1_OFFSET as usize;
+        flash.data[base..base + 64].fill(0xA5);
+        let mut writer = new_writer(flash);
+        writer.abort().unwrap(); // idle
+        writer.erase_slot().unwrap();
+        writer.abort().unwrap(); // staging, nothing written
+        writer.erase_slot().unwrap();
+        writer.write_block(0, &[1, 2, 3]).unwrap(); // buffered sub-word tail
+        writer.abort().unwrap();
+        assert!(writer.flash.erased.is_empty());
+        assert!(
+            writer
+                .flash
+                .slice(OTA_1_OFFSET, 64)
+                .iter()
+                .all(|b| *b == 0xA5)
+        );
+    }
+
+    #[test]
+    fn abort_never_erases_once_activation_has_started() {
+        let image = esp_image(EXPECTED_CHIP_ID, 512);
+        // Successful activation (the reset did not happen on the host).
+        let mut writer = new_writer(MockFlash::with_otadata(1, 0));
+        stage(&mut writer, &image, 48).unwrap();
+        writer.stage_activation().unwrap();
+        let erases = writer.flash.erased.len();
+        writer.abort().unwrap();
+        assert_eq!(writer.flash.erased.len(), erases);
+        assert_eq!(writer.flash.slice(OTA_1_OFFSET, image.len()), image);
+
+        // otadata programming failed part-way: the slot may be selected.
+        let mut flash = MockFlash::with_otadata(1, 0);
+        flash.fail_write_at = Some(otadata_sector_offset(1));
+        let mut writer = new_writer(flash);
+        stage(&mut writer, &image, 48).unwrap();
+        assert_eq!(writer.stage_activation(), Err(FirmwareError::WriteFailed));
+        let erases = writer.flash.erased.len();
+        writer.abort().unwrap();
+        assert_eq!(writer.flash.erased.len(), erases);
+        assert_eq!(writer.flash.slice(OTA_1_OFFSET, image.len()), image);
+    }
+
+    #[test]
+    fn a_failed_discard_erase_is_reported_and_not_retried() {
+        let image = esp_image(EXPECTED_CHIP_ID, 300);
+        let mut writer = new_writer(MockFlash::new());
+        writer.erase_slot().unwrap();
+        writer.write_block(0, &image).unwrap();
+        writer.flash.fail_erase_at = Some(OTA_1_OFFSET);
+        assert_eq!(writer.abort(), Err(FirmwareError::EraseFailed));
+        assert_eq!(writer.bytes_written(), 0);
+        assert_eq!(writer.abort(), Ok(()));
+        // A verify failure keeps its own error even if the discard fails.
+        let mut corrupted = image.clone();
+        corrupted[200] ^= 1;
+        writer.flash.fail_erase_at = None;
+        writer.erase_slot().unwrap();
+        writer.write_block(0, &corrupted).unwrap();
+        writer.flash.fail_erase_at = Some(OTA_1_OFFSET);
+        assert_eq!(
+            writer.verify(corrupted.len() as u32, None),
+            Err(FirmwareError::VerifyFailed)
+        );
+        assert_eq!(writer.sectors_erased(), 0);
+    }
+
     #[test]
     fn the_running_slot_is_never_written() {
         let image = esp_image(EXPECTED_CHIP_ID, 8192);
@@ -1286,7 +1490,9 @@ mod tests {
         writer.write_block(0, &[1, 2, 3]).unwrap();
         assert!(writer.flash.writes.is_empty());
         assert_eq!(writer.verify(3, None), Err(FirmwareError::VerifyFailed));
-        assert_eq!(writer.flash.slice(OTA_1_OFFSET, 4), &[1, 2, 3, 0xFF]);
+        // The padded word was programmed, then discarded with the refusal.
+        assert_eq!(writer.flash.writes, vec![(OTA_1_OFFSET, 4)]);
+        assert_header_erased(&writer.flash);
         assert_eq!(
             writer.stage_activation(),
             Err(FirmwareError::ActivateFailed)
@@ -1597,6 +1803,14 @@ mod tests {
                 Err(FirmwareError::VerifyFailed)
             );
             assert_eq!(writer.activate(), Err(FirmwareError::ActivateFailed));
+            // The ESP-valid but unsigned-by-us image is not left bootable.
+            assert_header_erased(&writer.inner().flash);
+            assert_eq!(
+                read_otadata(&mut writer.inner_mut().flash)
+                    .unwrap()
+                    .active_slot(),
+                Some(0)
+            );
 
             // Older than the running image.
             let older = envelope(&image, (1, 0, 0), &key);
@@ -1606,6 +1820,7 @@ mod tests {
                 writer.verify(older.len() as u32, None),
                 Err(FirmwareError::VerifyFailed)
             );
+            assert_header_erased(&writer.inner().flash);
 
             // A correctly re-hashed ESP image whose envelope signature no
             // longer matches: the ESP check passes, the envelope fails.

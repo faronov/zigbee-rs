@@ -178,6 +178,10 @@ jobs:
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
             features: esp32c6,sed,roles,signed-ota
+          - name: ESP32-H2 sensor product (signed OTA)
+            manifest: products/esp32-zigbee-devkit/Cargo.toml
+            workspace: products/esp32-zigbee-devkit
+            features: esp32h2,sed,roles,signed-ota
           - name: nRF52840 always-on End Device product
             manifest: products/nrf52840-router/Cargo.toml
             workspace: products/nrf52840-router
@@ -1166,6 +1170,12 @@ jobs:
           H2_FLOOR_LIGHT_MODE=top_pd cargo build --release --locked -Z build-std=core,alloc \
             --target-dir "$T/floor" --no-default-features --features floor-lab,top-pd \
             --bin esp32h2-floor-lab
+          # Signed-OTA thermometer (what tools/create-esp32-ota.py --variant
+          # thermometer --sign-key builds); its envelope stays in RAM.
+          cargo build --release --locked -Z build-std=core,alloc --target-dir "$T/signed" \
+            --bin esp32h2-thermometer --features thermometer,light-sleep,signed-ota
+          cargo clippy --release --locked -Z build-std=core,alloc --target-dir "$T/signed" \
+            --bin esp32h2-thermometer --features thermometer,light-sleep,signed-ota -- -D warnings
           R=riscv32imac-unknown-none-elf/release
           python3 ../../tools/esp32h2-sleep-ram-check.py \
             "$T/retained/$R/esp32h2-thermometer" "$T/top-pd/$R/esp32h2-thermometer" \

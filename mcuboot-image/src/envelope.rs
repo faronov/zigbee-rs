@@ -288,7 +288,50 @@ mod writer {
 
         /// `expected_size` is the whole envelope; `expected_hash`, when
         /// given, must be the MCUboot image hash (the SHA-256 TLV).
+        ///
+        /// A refused envelope is discarded: the native writer is aborted, so
+        /// it drops (and, where the platform does so, invalidates) the staged
+        /// image instead of keeping a bootable copy of an image that failed
+        /// the signature or version check.
         fn verify(
+            &mut self,
+            expected_size: u32,
+            expected_hash: Option<&[u8]>,
+        ) -> Result<(), FirmwareError> {
+            let checked = self.check(expected_size, expected_hash);
+            if checked.is_err() {
+                self.reset();
+                let _ = self.inner.abort();
+            }
+            checked
+        }
+
+        fn activate(&mut self) -> Result<(), FirmwareError> {
+            if !self.verified {
+                return Err(FirmwareError::ActivateFailed);
+            }
+            self.inner.activate()
+        }
+
+        /// The largest envelope: a full native slot plus header and trailer.
+        fn slot_size(&self) -> u32 {
+            self.inner
+                .slot_size()
+                .saturating_add((ENVELOPE_HEADER_LEN + TRAILER) as u32)
+        }
+
+        fn abort(&mut self) -> Result<(), FirmwareError> {
+            self.reset();
+            self.inner.abort()
+        }
+
+        fn confirm_image(&mut self) -> Result<(), FirmwareError> {
+            self.inner.confirm_image()
+        }
+    }
+
+    impl<W: StagedImage, const TRAILER: usize> EnvelopeWriter<W, TRAILER> {
+        fn check(
             &mut self,
             expected_size: u32,
             expected_hash: Option<&[u8]>,
@@ -323,29 +366,6 @@ mod writer {
             }
             self.verified = true;
             Ok(())
-        }
-
-        fn activate(&mut self) -> Result<(), FirmwareError> {
-            if !self.verified {
-                return Err(FirmwareError::ActivateFailed);
-            }
-            self.inner.activate()
-        }
-
-        /// The largest envelope: a full native slot plus header and trailer.
-        fn slot_size(&self) -> u32 {
-            self.inner
-                .slot_size()
-                .saturating_add((ENVELOPE_HEADER_LEN + TRAILER) as u32)
-        }
-
-        fn abort(&mut self) -> Result<(), FirmwareError> {
-            self.reset();
-            self.inner.abort()
-        }
-
-        fn confirm_image(&mut self) -> Result<(), FirmwareError> {
-            self.inner.confirm_image()
         }
     }
 
