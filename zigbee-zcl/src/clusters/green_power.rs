@@ -130,7 +130,8 @@ pub enum GpRole {
 /// - `Sink` registers only sink-side attributes.
 /// - `Combined` registers both.
 pub struct GreenPowerCluster {
-    store: AttributeStore<8>,
+    /// Room for every attribute of the `Combined` role.
+    store: AttributeStore<16>,
     role: GpRole,
 }
 
@@ -329,6 +330,25 @@ mod tests {
         assert_eq!(a.get(AttributeId(0x0004)), Some(&ZclValue::U16(180)));
         assert_eq!(a.get(AttributeId(0x0005)), Some(&ZclValue::Bitmap8(0x01)));
         assert!(a.get(ATTR_GPP_MAX_PROXY_TABLE_ENTRIES).is_none());
+    }
+
+    #[test]
+    fn combined_role_registers_every_attribute() {
+        let c = GreenPowerCluster::new(GpRole::Combined, 8, 4);
+        let a = c.attributes();
+        for id in [
+            ATTR_GPP_MAX_PROXY_TABLE_ENTRIES,
+            ATTR_GPP_NOTIFICATION_RETRY_NUMBER,
+            ATTR_GPP_NOTIFICATION_RETRY_TIMER,
+            ATTR_GPP_MAX_SEARCH_COUNTER,
+            ATTR_GPS_MAX_SINK_TABLE_ENTRIES,
+            ATTR_GPS_COMMUNICATION_MODE,
+            ATTR_GPS_COMMISSIONING_EXIT_MODE,
+            ATTR_GPS_COMMISSIONING_WINDOW,
+            ATTR_GPS_SECURITY_LEVEL,
+        ] {
+            assert!(a.get(id).is_some(), "attribute {:#06x} missing", id.0);
+        }
     }
 
     #[test]
