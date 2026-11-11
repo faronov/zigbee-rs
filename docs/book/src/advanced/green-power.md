@@ -1,8 +1,9 @@
 # Zigbee Green Power (design draft)
 
-> **Status: Proxy Basic implemented and host-tested on the `green-power`
-> branch; nothing is hardware-tested yet.** The GPD app, bidirectional
-> operation, the full proxy and Combo/Sink are still design only. Spec
+> **Status: Proxy Basic and the unidirectional GPD app (MG22 sensor and
+> switch) are implemented and host-tested on the `green-power` branch;
+> nothing is hardware-tested yet.** Bidirectional operation, the full
+> proxy and Combo/Sink are still design only. Spec
 > references are to GP 1.0a (docs-09-5499-26) and GP 1.1 where noted.
 
 ## 0. Implementation status
@@ -17,7 +18,11 @@
 | `GpProxyJournal` (two sectors, 1024-byte slots, EPID-bound, CRC + commit marker) | implemented | host tests: rollover, interrupted write, CRC fallback, erased, generation exhaustion, bad geometry |
 | `router-app/green-power`: product store (missing store is an error), restore after APS tables, persist when dirty, clear on reset / stale fresh join, receive slice bounded by tunnelling deadlines | implemented | lifecycle test |
 | ESP32-H2 router example `green-power` + 8 KiB `zbnv` journal at 0x3F8000 | builds | not flashed |
-| GPD app (MG22), bidirectional, full proxy, Combo/Sink | not started | — |
+| `efr32s2-hal::trng` (MG22 CRYPTOACC BA431 TRNG: GSDK init, conditioning KAT, health-failure reinit) | implemented | host model tests; lab bin `s2-trng` built, not run |
+| `apps/gpd` (`gpd-app`): provisioning, `GpdJournal`, beacon scan for a permit-join network, unidirectional commissioning, L3 Multi-Cluster Reports and switch commands, CCA backoff | implemented | host tests: sink-side decode of commissioning (key unwrap), reports and Toggle; counter never reused across reboot; failed reservation transmits nothing; journal rollover / interrupted write / CRC fallback |
+| `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | builds | layout verified; not flashed |
+| ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | written | byte-compiled only; not loaded in ZHA |
+| Bidirectional GPD, full proxy, Combo/Sink | not started | — |
 
 Implementation notes that differ from the design below:
 
@@ -340,6 +345,50 @@ No board crate gets GP storage. Products own the partitions.
 
 ### 3.6 GPD app (`apps/gpd` plus `products/<board>-gpd`)
 
+**As implemented (unidirectional, MG22):**
+
+- `gpd-app` is platform-independent: `GpdDevice<P: RadioPhy +
+  PlatformServices, S: GpdStore>`. The product supplies the profile, the
+  journal and an entropy closure; the MG22 product feeds it from the
+  CRYPTOACC TRNG, which is opened only to provision a key and then
+  released. `Efr32s2RadioPhy::fill_random` stays `Unsupported`, so the
+  shipped MG22 sensor image is unchanged.
+- Identity: SrcID derived from the EUI-64 and the device kind; a random
+  individual key (security level 3, key type 0b100), persisted before the
+  first use. The key survives recommissioning; only the channel is
+  forgotten, and the frame counter never moves backwards.
+- `GpdJournal`: two erase sectors of 64-byte records (magic, generation,
+  SrcID, key, counter reservation, channel, CRC-32, commit marker written
+  last). The counter is reserved in blocks of 16 (`counter_block`), so
+  flash is written once per 16 frames; after a reset the device continues
+  from the reserved limit.
+- Commissioning: an active scan (Beacon Request per channel) picks the
+  strongest Zigbee PRO network that permits joining; the device then sends
+  three Commissioning GPDFs (0xE0, no `rxAfterTx`) with the key wrapped by
+  `ZigBeeAlliance09`. Each commissioning frame consumes a frame counter,
+  because zigpy stores the commissioning counter as the replay floor.
+- Operation: Multi-Cluster Reporting (0xA2) with temperature (0x0402),
+  humidity (0x0405) and optional battery (0x0001/0x0021); switch commands
+  Off/On/Toggle (0x20–0x22). Each GPDF is sent twice with the same counter
+  (sinks and proxies drop the duplicate), after CCA with random backoff.
+- MG22 composition (`examples/efr32mg22-gpd`): commission once at boot if
+  needed; BTN0 short press = report now / Toggle; BTN0 held 3 s = forget
+  the channel and recommission; the sensor reports every 60 s; EM2 with
+  the radio idled between events. Temperature is the die sensor and the
+  humidity is **synthetic** (BRD4183A has no humidity sensor).
+- Flash map: application 0x0–0x74000 (no bootloader), GPD journal
+  0x74000–0x78000, 0x78000–0x80000 never written (0x7C000 keeps the Zigbee
+  sensor product's security journal).
+- Measured (release): 40,048 B file-backed flash (`.text` 32,728,
+  `.rodata` 6,668, `.data` 332), `.bss` 2,312 B; 29.9 KiB linked stack.
+  Sensor and switch are the same size.
+- ZHA: identity 0x6D6B / 0xF300 (DeviceID 0x33) and 0x6D6B / 0xF400
+  (DeviceID 0x02). Without a quirk ZHA creates no entities for a GPD;
+  `tools/zha-quirks/zigbee_rs_gp.py` adds temperature, humidity and battery
+  sensors, and an event entity (`on`/`off`/`toggle`) for the switch.
+
+**Original design:**
+
 - Built directly on `RadioPhy`: one CCA and TX per channel repetition, then a
   bounded RX window for bidirectional operation. It does **not** use
   `SoftMacCore`, NWK or the runtime.
@@ -385,7 +434,7 @@ journals reuse the existing stack-scoped flash path.
 | (a+) bidirectional commissioning (gpTxQueue 5) | +2–3 KB, plus PHY timed TX 0.3–1 KB | +0.4 KB | +0.1 KB |
 | (b) Full proxy | +4–6 KB | +0.3 KB | +0.2 KB |
 | (c) Combo/Sink (8 sinks, 16 translations) | +8–12 KB | +1.0–1.6 KB | +0.5 KB |
-| (d) GPD app, complete image (radio, CCM*, counter journal, one sensor) | 15–30 KB total | 1.5–3 KB | 1–2 KB |
+| (d) GPD app, complete image (radio, CCM*, counter journal, one sensor) | 15–30 KB total (**measured 40.0 KB** on MG22 with Embassy, VCOM `log` formatting and the TRNG) | 1.5–3 KB (**measured 2.6 KB**) | 1–2 KB |
 
 Which layers each platform can take, based on the current numbers in
 [Firmware Size](./firmware-size.md):

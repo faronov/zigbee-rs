@@ -91,6 +91,7 @@ jobs:
       - run: cargo test -p zigbee-runtime --no-default-features --locked
       - run: cargo test -p zigbee-gp --all-features --locked
       - run: cargo test -p zigbee-gp --no-default-features --locked
+      - run: cargo test -p gpd-app --locked
       # Do not combine these with --workspace/--all-features: unification hid
       # missing mandatory TCLK features in both production frontends.
       - run: cargo test -p router-app --no-default-features --test production_graph --locked
@@ -235,6 +236,10 @@ jobs:
             manifest: products/efr32mg22-sensor/Cargo.toml
             workspace: products/efr32mg22-sensor
             features: sed,zrs-boot
+          - name: EFR32MG22 Green Power Device product
+            manifest: products/efr32mg22-gpd/Cargo.toml
+            workspace: products/efr32mg22-gpd
+            features: ""
           - name: Home Assistant Connect ZBT-1 product
             manifest: products/ha-connect-zbt1/Cargo.toml
             workspace: products/ha-connect-zbt1
@@ -384,6 +389,7 @@ jobs:
       - run: cargo clippy -p sensor-sed-app --all-targets --features ota --locked -- -D warnings
       - run: cargo clippy -p zigbee-gp --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-gp --all-targets --no-default-features --locked -- -D warnings
+      - run: cargo clippy -p gpd-app --all-targets --locked -- -D warnings
       - run: cargo clippy -p zigbee-runtime --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zdo --features router --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --features stm32wb --all-targets --locked -- -D warnings
@@ -432,6 +438,7 @@ jobs:
           cargo fmt --manifest-path boards/efr32mg22-devkit/Cargo.toml -- --check
           cargo fmt --manifest-path boards/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path products/efr32mg22-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path products/efr32mg22-gpd/Cargo.toml -- --check
           cargo fmt --manifest-path products/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path products/phy62x2-evk/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52840-router/Cargo.toml -- --check
@@ -444,6 +451,7 @@ jobs:
           cargo fmt --manifest-path examples/efr32mg1-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg21-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg22-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/efr32mg22-gpd/Cargo.toml -- --check
           cargo fmt --manifest-path examples/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path efr32mg1-hal/Cargo.toml -- --check
           cargo fmt --manifest-path efr32s2-hal/Cargo.toml -- --check
@@ -2228,8 +2236,9 @@ jobs:
         with:
           workspaces: |
             examples/efr32mg22-sensor
+            examples/efr32mg22-gpd
             tools/efr32s2-lab
-          key: thumbv8m-efr32mg22-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg22-sensor/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/efr32mg22-sensor/link/**', 'products/efr32mg22-sensor/boot/**', 'efr32s2-hal/link/**') }}
+          key: thumbv8m-efr32mg22-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/efr32mg22-sensor/Cargo.lock', 'examples/efr32mg22-gpd/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/efr32mg22-sensor/link/**', 'products/efr32mg22-sensor/boot/**', 'products/efr32mg22-gpd/link/**', 'efr32s2-hal/link/**') }}
       - name: Build EFR32MG22 sensor and End Device (release)
         working-directory: examples/efr32mg22-sensor
         run: |
@@ -2307,6 +2316,17 @@ jobs:
       - name: Build EFR32 Series 2 lab gate binaries (MG22)
         working-directory: tools/efr32s2-lab
         run: cargo build --release --locked --bins
+      # Green Power Devices (sensor, switch): no network join, own journal
+      # at 0x74000; the image must stay inside 0..0x74000 like the sensor.
+      - name: Build and lint EFR32MG22 Green Power Devices
+        working-directory: examples/efr32mg22-gpd
+        run: |
+          cargo build --release --locked --bins
+          cargo clippy --release --locked --target thumbv8m.main-none-eabihf -- -D warnings
+          for image in efr32mg22-gpd-sensor efr32mg22-gpd-switch; do
+            python3 ../efr32mg22-sensor/tools/verify-layout.py \
+              "target/thumbv8m.main-none-eabihf/release/$image"
+          done
       - name: Create firmware artifacts
         run: |
           DIR=examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release

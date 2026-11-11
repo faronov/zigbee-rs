@@ -1,0 +1,17 @@
+[package]
+name = "efr32mg22-gpd-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product configuration for the BRD4183A EFR32MG22 Green Power Devices (sensor, switch)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Keep this product independently testable without changing the repository
+# workspace or its lockfile.
+[workspace]
+
+[dependencies]
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg22"] }
+gpd-app = { path = "../../apps/gpd" }
+zigbee-gp = { path = "../../zigbee-gp", features = ["gpd"] }

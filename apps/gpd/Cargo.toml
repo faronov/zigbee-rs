@@ -1,0 +1,20 @@
+[package]
+name = "gpd-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Platform-independent Zigbee Green Power Device (GPD) lifecycle: provisioning, commissioning, reporting"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# A GPD does not join a network: no NWK/APS/runtime, only the shared
+# GP frame builders (zigbee-gp/gpd) on top of a `RadioPhy`.
+[dependencies]
+embedded-storage = { workspace = true }
+heapless = { workspace = true }
+zigbee-crypto = { path = "../../zigbee-crypto" }
+zigbee-gp = { path = "../../zigbee-gp", features = ["gpd"] }
+zigbee-mac = { path = "../../zigbee-mac" }
+
+[dev-dependencies]
+embassy-futures = "0.1"

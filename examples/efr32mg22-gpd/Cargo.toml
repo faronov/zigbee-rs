@@ -1,0 +1,50 @@
+[package]
+name = "efr32mg22-gpd"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+
+# Zigbee Green Power Devices on BRD4183A: a temperature/humidity sensor and
+# an On/Off switch. Neither joins a network; both send security level 3
+# GPDFs (products/efr32mg22-gpd).
+#   cargo build --release --bins
+[[bin]]
+name = "efr32mg22-gpd-sensor"
+path = "src/sensor.rs"
+
+[[bin]]
+name = "efr32mg22-gpd-switch"
+path = "src/switch.rs"
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+efr32mg22-devkit = { path = "../../boards/efr32mg22-devkit" }
+efr32mg22-gpd-product = { path = "../../products/efr32mg22-gpd" }
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg22", "rt", "time-driver"] }
+gpd-app = { path = "../../apps/gpd" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["efr32mg22"] }
+
+# Embassy on the RTCC time driver (keeps counting in EM2), as in
+# examples/efr32mg22-sensor.
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
+embassy-time = "0.5"
+embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
+log = "0.4"
+
+[features]
+# Keep the debug interface powered in EM2 (SWD attach while asleep).
+# Off by default so EM2 current is representative.
+em2-debug = []
+
+[profile.dev]
+opt-level = "s"
+debug = true
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+lto = true
+debug = true
+panic = "abort"
