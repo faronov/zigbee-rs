@@ -637,6 +637,9 @@ it accepts over Zigbee OTA:
   3. the digest must match the Zigbee `expected_hash` when one is given;
   4. a version older than the running one is refused (`cmp_release`).
 - **`activate`** is refused unless `verify` succeeded.
+- **Discard.** Any `verify` failure (format, signature, hash or version)
+  aborts the inner writer, so the platform drops the staged image instead
+  of keeping a bootable copy (see the ESP behaviour below).
 - **Keys** come from the product file `boot/app-verify.conf` (`name`,
   `env-prefix`, `key-file`) through `zrs-boot-layout::AppVerify`, with the
   same `<PREFIX>_OTA_KEY{,2,3}_XY` override as the loaders.
@@ -646,6 +649,32 @@ it accepts over Zigbee OTA:
 default build is unchanged. Version mapping: Zigbee OTA file version
 `0xMMmmrrrr` is MCUboot version `MM.mm.rrrr`, so sign with
 `imgtool sign --version MM.mm.rrrr`.
+
+**Refused images are discarded (ESP, signed and unsigned).** The shared
+`EspFirmwareWriter` erases the first 4 KiB sector of the target slot, so
+the ESP image magic `0xE9` is gone and no IDF bootloader fallback can start
+the image, when:
+
+- `verify` fails (size, ESP structure, checksum, SHA-256 or expected hash),
+  or the envelope check fails above it; or
+- `abort()` drops a transfer: an explicit abort, another offer replacing a
+  suspended download, or the OTA engine ending the session.
+
+It does not erase:
+
+- when the transfer never programmed the slot (a staged image from an
+  earlier transfer may still be there);
+- once `otadata` programming has started, because the slot may already be
+  selected;
+- when the runtime only suspends a transfer (server ABORT or silence with
+  staged data), which never calls `abort()` and keeps the data for resume.
+
+A second abort is a no-op. If the erase itself fails, `abort()` reports
+`EraseFailed`, and a verify failure keeps its own error. Host-tested
+(`products/esp32-zigbee-devkit/src/ota.rs` and
+`mcuboot-image/src/envelope_tests.rs`); not yet rerun on hardware. Size:
++390 B flash on the default C6 sensor, +388 B on the default H2 sensor and
++84 B on the quiet H2 thermometers, with no bss change.
 
 `tools/create-esp32-ota.py` builds, signs and packages in one step:
 
@@ -1630,15 +1659,15 @@ active OTA session holds fast poll.
 - **HA:** `/config/zigpy_ota` restored to its original four files
   (SHA-256 checked), and the ZHA entry reloaded.
 
-**Findings, not fixed:**
-- **A refused image stays bootable.** `abort()` resets only RAM state.
-  After run B the inactive slot held the 0.2.2 inner ESP image (magic
-  `0xE9`), and the older `otadata` sector still pointed at that slot.
-  Today it is not selected, because the newer sector wins. It would boot
-  if the newer `otadata` sector became invalid.
-  - **Proposed hardening:** erase the first sector of the target slot on
-    `abort()` and on a failed verify. This affects the shared writer,
-    including shipped unsigned builds, so it needs approval.
+**Findings:**
+- **A refused image stays bootable (fixed after this run).** In the
+  firmware tested here, `abort()` reset only RAM state. After run B the
+  inactive slot held the 0.2.2 inner ESP image (magic `0xE9`), and the
+  older `otadata` sector still pointed at that slot. It was not selected,
+  because the newer sector wins, but it would boot if the newer `otadata`
+  sector became invalid. The writer now erases the slot's first sector on
+  a failed verify and on abort ([discard rules](#application-side-verification-esp32-telink)).
+  The board still runs the pre-fix 0.2.1 test image.
 - **Parent link.** A lossy parent link with about 16% MAC NoAck makes a
   45 min download vulnerable to a parent-loss rejoin. zigpy then aborts
   on the re-announce.

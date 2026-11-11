@@ -204,7 +204,10 @@ device following the reset.
 
 The writer stages only into the inactive slot, erases sectors lazily, pads a
 ragged final word with `0xFF`, and re-reads the image to verify magic, chip ID,
-and SHA-256. OTA writes cannot enter `zbnv`.
+and SHA-256. OTA writes cannot enter `zbnv`. A failed verify or an abort
+erases the slot's first sector, so a refused or partial image cannot be booted
+by a bootloader fallback; a suspended download keeps its data
+([discard rules](./bootloader.md#application-side-verification-esp32-telink)).
 
 Package a new image from the selected example:
 

@@ -197,6 +197,7 @@ mod writer {
         verified_len: Option<u32>,
         activated: bool,
         confirmed: bool,
+        aborts: u32,
     }
 
     impl FirmwareWriter for Native {
@@ -241,6 +242,8 @@ mod writer {
         fn abort(&mut self) -> Result<(), FirmwareError> {
             self.staging = false;
             self.slot.clear();
+            self.verified_len = None;
+            self.aborts += 1;
             Ok(())
         }
 
@@ -316,6 +319,66 @@ mod writer {
             writer.activate().unwrap();
             assert!(writer.inner().activated);
         }
+    }
+
+    /// Every refusal in `verify` aborts the native writer, so the platform
+    /// can invalidate the staged image instead of leaving it bootable.
+    #[test]
+    fn refused_envelopes_are_discarded_from_the_native_slot() {
+        let mut tampered = ENV_V2.to_vec();
+        tampered[ENVELOPE_HEADER_LEN + 100] ^= 1;
+        /// Envelope, running version, trusted key, expected hash.
+        type Case<'a> = (&'a [u8], ImageVersion, [u8; 64], Option<&'a [u8; 32]>);
+        let cases: [Case; 4] = [
+            // Downgrade (version below the running image).
+            (ENV_V2, ImageVersion::new(2, 0, 1, 0), TEST_KEY, None),
+            // Untrusted signer.
+            (ENV_V2, ImageVersion::default(), KEY_B, None),
+            // Tampered native payload.
+            (&tampered, ImageVersion::default(), TEST_KEY, None),
+            // Hash that is not the envelope's.
+            (ENV_V2, ImageVersion::default(), TEST_KEY, Some(&[0; 32])),
+        ];
+        for (envelope, running, key, hash) in cases {
+            let mut writer = EnvelopeWriter::<_, 512>::new(
+                Native {
+                    capacity: 0x4000,
+                    ..Default::default()
+                },
+                EnvelopePolicy {
+                    keys: keys(key),
+                    running,
+                },
+            );
+            download(&mut writer, envelope, 64).unwrap();
+            assert_eq!(
+                writer.verify(envelope.len() as u32, hash.map(|h| &h[..])),
+                Err(FirmwareError::VerifyFailed)
+            );
+            assert_eq!(writer.inner().aborts, 1, "native writer discarded");
+            assert!(writer.inner().slot.is_empty());
+            assert!(writer.verified_header().is_none());
+            assert_eq!(writer.activate(), Err(FirmwareError::ActivateFailed));
+            // A retried verify cannot resurrect the discarded image.
+            assert_eq!(
+                writer.verify(envelope.len() as u32, None),
+                Err(FirmwareError::VerifyFailed)
+            );
+        }
+        // Size mismatch is refused before the native writer verifies, and is
+        // discarded the same way.
+        let mut short = writer(ImageVersion::default());
+        download(&mut short, ENV_V2, 64).unwrap();
+        assert_eq!(
+            short.verify(ENV_V2.len() as u32 + 1, None),
+            Err(FirmwareError::VerifyFailed)
+        );
+        assert_eq!(short.inner().aborts, 1);
+        // An accepted envelope is not aborted.
+        let mut good = writer(ImageVersion::default());
+        download(&mut good, ENV_V2, 64).unwrap();
+        good.verify(ENV_V2.len() as u32, None).unwrap();
+        assert_eq!(good.inner().aborts, 0);
     }
 
     #[test]

@@ -77,6 +77,10 @@ pub trait FirmwareWriter {
     fn slot_size(&self) -> u32;
 
     /// Abort an in-progress update and revert to the current image.
+    ///
+    /// The staged data is discarded; a writer may also invalidate it in flash
+    /// so a bootloader fallback cannot start it. The OTA engine does not call
+    /// this when it only suspends a transfer to resume it later.
     fn abort(&mut self) -> Result<(), FirmwareError>;
 
     /// Confirm that the running image works, so a bootloader with trial
