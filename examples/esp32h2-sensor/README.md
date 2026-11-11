@@ -4,6 +4,15 @@
 uses the shared `SensorApp`, an active-low status LED, product-owned security
 storage/OTA, and `Active` for both fast and slow waits.
 
+The board LED on GPIO8 is a WS2812: the sensor's active-low GPIO8 output
+cannot light it (kept for byte-identity of the validated image). The router
+bin always shows status on it (`status-led` is part of the
+`router` feature); the ED takes `--features ed,status-led`. On a Waveshare
+ESP32-H2-Zero add `waveshare-h2-zero` (its LED takes RGB byte order, the
+DevKitM-1 default is GRB), e.g.
+`--no-default-features --features router,waveshare-h2-zero`; see the ESP32
+platform guide.
+
 ## Composition
 
 `main.rs` owns ESP startup, radio/AES resources, BOOT input, LED, on-chip

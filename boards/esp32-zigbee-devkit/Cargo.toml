@@ -3,12 +3,16 @@ name = "esp32-zigbee-devkit"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Physical chip flash access for the ESP32-C6 and ESP32-H2 Zigbee devkits"
+description = "Physical chip flash and WS2812 status LED for the ESP32-C6 and ESP32-H2 Zigbee devkits"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
 [dependencies]
 embedded-storage = "0.3"
+# Platform-neutral WS2812 colour/bit encoder (feature `status-led` only).
+# Pinned separately from the other drivers (69e073c) so images without
+# this feature keep their lockfile dependency set.
+zigbee-ws2812 = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "24662c9fe4ca3019e9556e3373b075c3e8ac3a5e", optional = true }
 
 # `esp-storage` only builds for the Espressif targets (it links the ROM SPI
 # flash routines), so it is target gated: on the host, this crate exposes no
@@ -24,8 +28,22 @@ esp-storage = { version = "0.7", default-features = false, features = [
     "bytewise-read",
     "critical-section",
 ] }
+# RMT driver for the WS2812 status LED (feature `status-led` only).
+esp-hal = { version = "=1.0.0", features = ["unstable"], optional = true }
 
 [features]
 default = []
-esp32c6 = ["esp-storage/esp32c6"]
-esp32h2 = ["esp-storage/esp32h2"]
+esp32c6 = ["esp-storage/esp32c6", "esp-hal?/esp32c6"]
+esp32h2 = ["esp-storage/esp32h2", "esp-hal?/esp32h2"]
+# The board is a Waveshare ESP32-H2-Zero instead of the ESP32-H2-DevKitM-1
+# (`BOARD`): its status LED takes RGB byte order. Requires esp32h2.
+waveshare-h2-zero = []
+# WS2812 status LED on GPIO8 driven by RMT channel 0 (`status_led`), with
+# the frame encoder from `zigbee-ws2812`. Without this feature neither
+# crate is in the dependency graph.
+status-led = ["dep:esp-hal", "dep:zigbee-ws2812"]
+
+# Same esp-hal as the product and examples when this crate is the root
+# (standalone host tests of the encoder); ignored as a dependency.
+[patch.crates-io]
+esp-hal = { path = "../../vendor/esp-hal" }

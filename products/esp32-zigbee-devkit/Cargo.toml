@@ -55,6 +55,16 @@ sed = ["dep:sensor-sed-app"]
 # Mains role policies/profiles (always-on End Device, Router) and the
 # router's child/APS journals.
 roles = ["dep:router-app"]
+# WS2812 status indication for the mains roles (`status_led`): the product
+# palette over `router_app::StatusIndicator`, shown through the board's RMT
+# driver. Never enabled by sleepy images.
+status-led = ["roles", "esp32-zigbee-devkit/status-led"]
+# Build for the Waveshare ESP32-H2-Zero instead of the ESP32-H2-DevKitM-1
+# (status LED byte order; see `esp32_zigbee_devkit::BOARD`).
+waveshare-h2-zero = ["esp32-zigbee-devkit/waveshare-h2-zero"]
+# Lab only, never in shipped images: show red, green, blue for 3 s each
+# when the status LED starts, to check the board's colour byte order.
+status-led-selftest = ["status-led"]
 light-sleep = []
 # Persist ZCL Configure Reporting state in `zbnv` (sleepy sensor images).
 reporting-persist = []

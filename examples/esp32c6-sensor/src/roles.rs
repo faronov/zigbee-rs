@@ -13,6 +13,9 @@ compile_error!(
     "enable exactly one role feature (sed, ed or router); use --no-default-features for ed/router"
 );
 
+#[cfg(all(feature = "status-led", not(any(feature = "ed", feature = "router"))))]
+compile_error!("`status-led` is for the mains roles (ed, router)");
+
 #[cfg(all(feature = "light-sleep", any(feature = "ed", feature = "router")))]
 compile_error!("`light-sleep` is a sleepy-sensor feature; the mains roles keep RX on");
 
@@ -44,6 +47,8 @@ pub struct Started {
     pub radio: esp_hal::peripherals::IEEE802154<'static>,
     pub aes: esp_hal::peripherals::AES<'static>,
     pub button: Input<'static>,
+    /// Peripherals of the status sink (see [`parts`]).
+    pub status_pins: StatusPins,
 }
 
 /// Heap, console log and SYSTIMER time driver. The mains roles never enter
@@ -68,6 +73,10 @@ pub fn start(model: &str) -> Started {
             peripherals.GPIO9,
             InputConfig::default().with_pull(Pull::Up),
         ),
+        #[cfg(feature = "status-led")]
+        status_pins: (peripherals.RMT, peripherals.GPIO8),
+        #[cfg(not(feature = "status-led"))]
+        status_pins: StatusPins,
     }
 }
 
@@ -153,8 +162,9 @@ impl CommissioningTrigger {
     }
 }
 
-/// The DevKitC-1 LED is a WS2812 on GPIO8 (no plain GPIO LED), so the
-/// lifecycle status goes to the console only.
+/// Lifecycle changes on the console. The DevKitC-1 LED is a WS2812 on
+/// GPIO8 (no plain GPIO LED): it is shown with `status-led` (always in the router; see
+/// [`Status`]).
 pub struct LogStatus {
     last: Option<RouterStatus>,
 }
@@ -167,6 +177,39 @@ impl StatusSink for LogStatus {
         self.last = Some(status);
         log::info!("[ESP32-C6] status {:?}", status);
     }
+}
+
+/// The status sink of this image: the console, plus the WS2812 on GPIO8
+/// with `status-led` (mains roles only; sleepy images never drive it).
+#[cfg(feature = "status-led")]
+pub type Status = product::status_led::RgbStatusLed<LogStatus>;
+#[cfg(not(feature = "status-led"))]
+pub type Status = LogStatus;
+
+/// What [`Status`] owns: the LED's RMT and data pin, or nothing.
+#[cfg(feature = "status-led")]
+pub type StatusPins = (
+    esp_hal::peripherals::RMT<'static>,
+    esp_hal::peripherals::GPIO8<'static>,
+);
+#[cfg(not(feature = "status-led"))]
+pub struct StatusPins;
+
+#[cfg(feature = "status-led")]
+fn status((rmt, pin): StatusPins) -> Status {
+    let led = product::status_led::StatusLed::new(rmt, pin)
+        .map_err(|error| log::warn!("[ESP32-C6] status LED unavailable: {:?}", error))
+        .ok();
+    product::status_led::RgbStatusLed::new(
+        LogStatus { last: None },
+        led,
+        &product::status_led::STATUS_PALETTE,
+    )
+}
+
+#[cfg(not(feature = "status-led"))]
+fn status(_: StatusPins) -> Status {
+    LogStatus { last: None }
 }
 
 pub struct LogDiagnostics;
@@ -280,10 +323,10 @@ impl Supervisor for ResetSupervisor {
     }
 }
 
-pub type Parts = RouterParts<LogStatus, ResetSupervisor, LogDiagnostics>;
+pub type Parts = RouterParts<Status, ResetSupervisor, LogDiagnostics>;
 
-pub fn parts() -> Parts {
-    RouterParts::new(LogStatus { last: None }, ResetSupervisor, LogDiagnostics)
+pub fn parts(status_pins: StatusPins) -> Parts {
+    RouterParts::new(status(status_pins), ResetSupervisor, LogDiagnostics)
 }
 
 /// Record, show and reset on an unrecoverable lifecycle error.

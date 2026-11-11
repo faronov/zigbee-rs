@@ -345,6 +345,28 @@ were raised to the corrected values. Earlier RISC-V `stack` and `mac_chain`
 figures in this chapter, including the ESP32-C6/H2 and `44d457c` tables, are
 the old, under-counted values.
 
+The `esp32h2-router` and `esp32c6-router` rows were refreshed when the
+WS2812 status LED (`status-led`, esp-hal RMT on GPIO8) became part of the
+router build. The comparison is the router at master `5fdc5e5` against the
+router with the LED, both measured with the current tool:
+
+| image | `flash` | `data` | `bss` | `stack` | `mac_chain` |
+|---|---:|---:|---:|---:|---:|
+| esp32h2-router | +3,370 | +96 | +24 | −16 | −16 |
+| esp32c6-router | +3,836 | +96 | +32 | −16 | −16 |
+
+The two row updates were the only changes. The ESP32 ED, sensor and
+light-sleep rows were left as they were. The sensor and thermometer images
+are byte-identical to `5fdc5e5`, and the ED builds without the LED by
+default. Those rows had already drifted from the baseline at `5fdc5e5`, so
+`compare` still reports them until they are refreshed separately.
+
+Moving the WS2812 encoder to the `zigbee-ws2812` crate (zigbee-rs-drivers)
+and making the colour byte order a compile-time board constant took 6 B
+of `flash` and `text` off both router rows; `data`, `bss`, `stack` and
+`mac_chain` did not change. The sensor, thermometer, light-sleep and ED
+images stayed byte-identical. The rows were refreshed again.
+
 The CC2340 image uses
 the fallback (no SDK) mode, because SDK mode cannot be built locally. The
 PHY62x2 images were measured from the tree at `44d457c`.

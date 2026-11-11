@@ -41,6 +41,8 @@
 //! * [`end_device`] — always-on (RX-on-when-idle) End Device policy/profile.
 //! * [`router`] — parent Router policy/profile plus the child-table and APS
 //!   binding/group journals in the first 16 KiB of `zbnv`.
+//! * [`status_led`] (feature `status-led`) — the status palette and the
+//!   WS2812 [`router_app::StatusSink`] for those roles.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -78,6 +80,8 @@ pub mod reset_cause;
 #[cfg(feature = "roles")]
 pub mod router;
 pub mod sleep;
+#[cfg(feature = "status-led")]
+pub mod status_led;
 #[cfg(target_os = "none")]
 pub mod storage;
 #[cfg(any(target_os = "none", test))]

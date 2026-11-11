@@ -13,6 +13,14 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     println!("cargo:rerun-if-env-changed=ESP32_OTA_VERSION");
 
+    // The WS2812 status LED is for the mains roles: sleepy images keep GPIO8
+    // isolated and link no RMT driver.
+    let feature = |name: &str| env::var_os(format!("CARGO_FEATURE_{name}")).is_some();
+    assert!(
+        !feature("STATUS_LED") || !(feature("SED") || feature("FLOOR_LAB")),
+        "`status-led` is for the mains roles: the router enables it; the ED takes --no-default-features --features ed,status-led"
+    );
+
     let raw = env::var("ESP32_OTA_VERSION").unwrap_or_else(|_| "1".to_owned());
     let version = parse_u32(&raw).expect("ESP32_OTA_VERSION must be a decimal or 0x-prefixed u32");
     assert!(version != u32::MAX, "0xFFFFFFFF is reserved by Zigbee OTA");

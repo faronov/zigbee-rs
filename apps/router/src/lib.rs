@@ -77,6 +77,7 @@ mod capabilities;
 mod children;
 mod diagnostics;
 mod error;
+mod indication;
 mod observer;
 mod parts;
 mod policy;
@@ -96,6 +97,7 @@ pub use diagnostics::{
     DiagnosticEvent, Diagnostics, NoDiagnostics, StackEventSummary, summarize_stack_event,
 };
 pub use error::RouterAppError;
+pub use indication::{Indication, IndicationStyle, Pattern, Rgb, StatusIndicator, StatusPalette};
 #[cfg(feature = "rejoin-request")]
 pub use observer::RejoinRequest;
 pub use observer::{NoObserver, RouterObserver};

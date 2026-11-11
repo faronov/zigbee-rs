@@ -60,6 +60,47 @@ image). They have no OTA client. The product enables their modules through
 its `roles` feature; the SED-only modules (policy, wake, OTA) sit behind
 `sed`, so the existing SED images do not change.
 
+**Status LED (`status-led`, mains roles only).** All three boards (C6
+DevKitC-1, H2 DevKitM-1, Waveshare H2-Zero) fit a WS2812-class RGB LED with
+DIN on GPIO8; a plain GPIO level cannot light it. The router image
+(`--no-default-features --features router`) always enables `status-led`;
+the ED takes it on request (`--features ed,status-led`). Such an image
+drives the LED from RMT channel 0:
+
+- `router_app::StatusIndicator` (shared, host tested) maps the
+  `RouterStatus` lifecycle, the NIB permit-join flag and OTA events to an
+  indication: error > identify > OTA > permit join > joined > searching >
+  booting. Joined is shown for `joined_hold_ms`, then the LED goes dark.
+- The product (`esp32_zigbee_devkit_product::status_led`) owns the palette:
+  dim white booting, amber 1 Hz searching, green for 30 s after joining,
+  blue 0.5 Hz permit join, magenta 2 Hz identify, cyan OTA flash, red
+  error; no channel above 24/255.
+- The board (`esp32_zigbee_devkit::status_led`) owns GPIO8 and the RMT
+  backend: 16 MHz RMT ticks, 0.31/0.88 µs bit halves, a 300 µs latch, one
+  25-symbol frame that fits a single channel memory block. A frame is
+  written only when the colour changes (about 330 µs busy wait, interrupts
+  enabled).
+- The colour byte order, the bit encoding and the ns-to-tick timing come
+  from the platform-neutral `zigbee-ws2812` crate in
+  [zigbee-rs-drivers](https://github.com/faronov/zigbee-rs-drivers)
+  (`drivers/ws2812`, git dependency pinned to an exact rev, pulled in only
+  by `status-led`). It also has an SPI byte-pattern encoder for future
+  nRF52/EFR32/BL702 backends.
+- The byte order is a board fact (`esp32_zigbee_devkit::BOARD`, fixed at
+  build time): the Espressif devkits take GRB, the Waveshare ESP32-H2-Zero
+  takes RGB. Build H2-Zero images with the `waveshare-h2-zero` feature,
+  e.g. `--no-default-features --features router,waveshare-h2-zero`; a GRB
+  image on the H2-Zero shows green as red. The lab-only
+  `status-led-selftest` feature shows red, green and blue for 3 s each at
+  start (logged), to check the order on a new board; it is never part of
+  a shipped image. Both were confirmed on an H2-Zero (red, green, blue,
+  joined green, identify magenta).
+
+It is default-on only for the router (about 3.8 KB of app image, 32 B of
+`.bss`). The ED keeps it opt-in, and sleepy images reject it at build time
+and keep GPIO8 isolated; without it the ED logs status on the console only. The
+router has no OTA client, so the OTA indication does not occur there yet.
+
 **Frame Pending.** The radio auto-ACKs in hardware, and the core is too late
 to influence that ACK, so the router keeps the core's `PENDING` capacity at
 0. The `esp-parent` feature of `zigbee-mac` enables the local esp-radio patch
@@ -114,7 +155,10 @@ Both images provide a concrete
 | default | `Active` | `Active` | 30 s |
 | `--features light-sleep` (experimental) | `Active` | retained `Idle` | 5 s |
 
-C6 has no status LED adapter; H2 keeps its active-low fitted LED.
+Neither SED image shows a status: the C6 has no LED adapter, and the H2
+sensor's active-low GPIO8 output cannot light the board's WS2812. It is
+kept unchanged so the validated image stays byte-identical; the
+`status-led` driver above is for the mains roles only.
 
 `Active`/`Active` describes the radio/SoC policy, not a continuously spinning
 CPU. The executor uses `WFI` while its root future is pending. SYSTIMER alarm 0

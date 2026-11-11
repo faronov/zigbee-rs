@@ -89,7 +89,18 @@ router = [
     "zigbee-runtime/router",
     "zigbee-mac/esp-parent",
     "esp32-zigbee-devkit-product/roles",
+    "status-led",
 ]
+# WS2812 status LED on GPIO8 (RMT) for the mains roles: always on in the
+# router, opt-in for the ED (`--features ed,status-led`). Sleepy images
+# reject it.
+status-led = ["esp32-zigbee-devkit-product/status-led"]
+# Board is a Waveshare ESP32-H2-Zero (default: ESP32-H2-DevKitM-1); sets
+# the status LED's RGB byte order.
+waveshare-h2-zero = ["esp32-zigbee-devkit-product/waveshare-h2-zero"]
+# Lab only, never in shipped images: red, green, blue for 3 s each when the
+# LED starts, to check the colour byte order of the board.
+status-led-selftest = ["status-led", "esp32-zigbee-devkit-product/status-led-selftest"]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
 # Accept only signed MCUboot envelopes over OTA (see the product's
