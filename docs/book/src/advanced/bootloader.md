@@ -59,7 +59,7 @@ hardware-proven capability.
 | `bootloaders/efr32s2-boot` | EFR32MG22/MG21 loader; on MG21 chained above the Gecko Bootloader | Release-built and linted. The MG22 devkit build is **lab-tested on one BRD4183A** ([results](#mg22-results-2026-11-09)). MG21, ZBT-1 and `gecko-recovery` are **not run on hardware** |
 | `efr32s2-hal::watchdog` | EFR32 Series 2 WDOG0 driver (period rounding, arm/kick/disarm) | Host-tested (period maths). On one MG22 it was seen armed while the loader ran and disarmed in the application. Its period and an actual expiry reset are **not measured** |
 | `bootloaders/phy62x2-boot` | PHY62x2 loader started by the boot ROM | Release-built, linted, ROM-boot image generated; **not run on hardware** |
-| `mcuboot-image::envelope` | Application-side verification of a signed MCUboot envelope (`EnvelopeWriter`) for chips whose ROM/SDK boot stays | Host-tested with imgtool vectors; ESP32 product tests |
+| `mcuboot-image::envelope` | Application-side verification of a signed MCUboot envelope (`EnvelopeWriter`) for chips whose ROM/SDK boot stays | Host-tested with imgtool vectors; ESP32 product tests; ESP32-H2 ZHA upgrade plus wrong-key and downgrade refusal on hardware ([results](#esp32-h2-signed-zha-ota-2026-11-10)); C6 and Telink not run on hardware |
 | `mcuboot-image::staging` | Application side of a zigbee-rs loader: `LoaderChannel` (own / foreign / no loader), `shared_keys` (keys both the application and the installed loader trust) and `StagingFlash` (erase/write only in the secondary slot, write-only in the running image's trial log) | Host-tested |
 | `apps/sensor-sed` `ota_client` (feature `ota`) | `ImageOtaClient`: query schedule, Image Notify, offer gating on the loader channel, activation after the security checkpoint, reset, confirm through the writer | Host-tested (through the MG22 product tests) |
 | `tools/zrs_boot_ota.py` | Signs a loader-linked application from its product `.layout` and the ELF's `ZRS_OTA_IDENTITY`; writes the signed image and the Zigbee OTA file; `check`, `key-xy`, zigpy `index` | Python unit tests; real imgtool 2.4.0 signing of the MG22 build (local and CI with an ephemeral key) |
@@ -495,7 +495,7 @@ The build refuses, with a message naming the file:
   therefore reject Ed25519 with an explanation;
 - a watchdog period the chip cannot provide;
 - trusted keys that are missing or malformed. Keys come from
-  `<PREFIX>_BOOT_KEYn` environment variables or the `key-file`; private
+  `<PREFIX>_OTA_KEY{,2,3}_XY` environment variables or the `key-file`; private
   keys are never read.
 
 The repository key `bootloaders/keys/own-ec-p256.xy.hex` is a
@@ -639,13 +639,40 @@ it accepts over Zigbee OTA:
 - **`activate`** is refused unless `verify` succeeded.
 - **Keys** come from the product file `boot/app-verify.conf` (`name`,
   `env-prefix`, `key-file`) through `zrs-boot-layout::AppVerify`, with the
-  same `<PREFIX>_BOOT_KEYn` override as the loaders.
+  same `<PREFIX>_OTA_KEY{,2,3}_XY` override as the loaders.
 
 **ESP32-C6/H2.** The product feature `signed-ota` and the example feature
 `signed-ota` select `product::profile::OtaWriter = SignedEspWriter`. The
 default build is unchanged. Version mapping: Zigbee OTA file version
 `0xMMmmrrrr` is MCUboot version `MM.mm.rrrr`, so sign with
 `imgtool sign --version MM.mm.rrrr`.
+
+`tools/create-esp32-ota.py` builds, signs and packages in one step:
+
+```bash
+tools/create-esp32-ota.py 0x00020001 out --chip esp32h2 \
+    --variant thermometer --sign-key own-ec-p256.pem
+```
+
+- `--sign-key` adds the `signed-ota` feature and wraps the ESP image with
+  `imgtool sign --header-size 0x20 --pad-header --align 4 --slot-size 0x1F0000
+  --version MM.mm.rrrr+0`.
+- The result is checked with `imgtool verify`, and the inner image must be
+  byte-identical to the espflash image.
+- The key's public point must be one of the firmware's trusted keys
+  (`boot/app-verify.conf`, including `ESP32_DEVKIT_OTA_KEY{,2,3}_XY`). Otherwise the
+  tool refuses; `--test-only-untrusted-key` exists only to build refusal-test
+  images.
+- `--variant thermometer` takes the model and image type (0x0012) from
+  `examples/esp32h2-sensor/thermometer.toml` and builds the
+  `esp32h2-thermometer` binary with `thermometer,light-sleep`.
+- The container and `index.json` checks accept the envelope: SHA-256 TLV,
+  signature TLV, no trailing bytes, inner ESP image valid for the chip.
+
+Signed-OTA size (thermometer, `light-sleep`, non-quiet): +11,892 B text,
++376 B rodata, +160 B data, +352 B bss over the same build without
+`signed-ota`. The stack is about 192 KiB, so P-256 verification has ample
+headroom. Default builds do not enable it.
 
 **Limit.** This does not make the ESP32 secure-boot. Anything written over
 UART or JTAG still boots; use ESP secure boot for that.
@@ -1494,6 +1521,127 @@ This was reproduced on purpose, with a back-to-back pair of reads:
 Reads taken while the device polls fast during a download do not reset
 it. Expect one extra reboot from any SWD read of an idle MG22. Build with
 `em2-debug` if that matters.
+
+### ESP32-H2 signed ZHA OTA (2026-11-10)
+
+**Board.**
+- Waveshare ESP32-H2-Zero on USB, reached through the hwlab `espusbjtag`
+  probe `10:51:DB:63:BB:2E`. This is the first real-hardware use of that
+  probe's H2 flash path; the H2 profile was listed as simulation-only.
+- Console: `/dev/cu.usbmodem141101`.
+- Secure boot and flash encryption are off.
+- Joined to the home ZHA network as NWK `0x3FBB` (unchanged by the
+  campaign).
+
+**Backup.** A full 4 MiB backup was taken before any write, SHA-256
+`5c325d9f…4bdf9`. It held 0.1.0 in `ota_0` and an erased `ota_1`. It must
+never be restored as a whole, because its `zbnv` holds old frame counters.
+
+**Base.** TEST-ONLY 0.2.0 (`thermometer,light-sleep,signed-ota`,
+non-quiet) was programmed into `ota_0` (`0x10000`) only. It resumed on
+the network without a rejoin.
+
+**Images** (`tools/create-esp32-ota.py --variant thermometer`):
+
+| run | file version | inner image | `.ota` size | SHA-256 |
+|---|---|---|---|---|
+| A upgrade | `0x00020001` | 0.2.1, own key | 413,114 B | `00612be5…` |
+| B wrong key | `0x00020002` | 0.2.2, throwaway P-256 key (`--test-only-untrusted-key`) | 413,113 B | `d1d3db38…` |
+| C disguised downgrade | `0x00020003` | 0.1.9, own key; container version rewritten | 413,114 B | `cf1b9704…` |
+
+**Procedure for each run:**
+- swap one test file into `/config/zigpy_ota` and check its SHA-256;
+- reload the ZHA entry and settle at least 10 min;
+- start a UART capture, then a JTAG system reset (`ndmreset`; USB stays
+  up);
+- run `homeassistant.update_entity` and `update.install` inside the 60 s
+  fast-poll window. `latest_version` appears only after the device answers
+  in that window; while it long-polls it stays empty.
+
+The H2 stays awake on USB ("native USB session vetoes PMU sleep"). An
+active OTA session holds fast poll.
+
+**Run A, attempt 1: aborted by the server, not by the device.**
+- **Rejoin after reset:** the old parent `0x1F0F` did not answer, so the
+  device rejoined via `0x43FD` with the same address.
+- **Parent loss:** at 41% (offset 170,064, 22 min in), polls to `0x43FD`
+  failed and the staged rejoin ran:
+  - the secure rejoin failed;
+  - the Trust Center rejoin via `0x4A76` was accepted but delivered no
+    key;
+  - a 14.7 s backoff followed;
+  - the secure rejoin via `0x43FD` then succeeded.
+- **Abort:** the device re-announced, and zigpy aborted with
+  `Status.TIMEOUT`.
+- **Device side:** `Server aborted the download at offset 170064; keeping
+  staged data`. `otadata` was unchanged and 0.2.0 kept running.
+- **Cause:** a lossy link to the parent, not the OTA path. The retry used
+  the same procedure, about 4 min later.
+
+**Run A, attempt 2 (0.2.0 → 0.2.1): pass.**
+- **Download:** about 44 min.
+- **Device log:**
+  - `slot 1 verified (412864 bytes)`;
+  - `Server says upgrade NOW`;
+  - `otadata sector 1 -> seq 2 (slot 1)`;
+  - reboot, then `Loaded app from partition at offset 0x200000`;
+  - resumed as `0x3FBB` with no rejoin;
+  - `running image confirmed`.
+- **HA:** `installed_version 0x00020001`.
+- **JTAG:** `otadata` sector 0 had seq 1 (VALID); sector 1 had seq 2,
+  state 2 (VALID).
+- **Link counters during the download:**
+  - 1,237 MAC `NoAck` to the parent, about 16% of transmissions, each
+    surfacing as a NWK route error and `NoShortAddress`;
+  - 11 frame-counter replays.
+
+  Stop-and-wait retries absorbed them all.
+
+**Run B (wrong key, `0x00020002`): pass, refused.**
+- **Download:** the full image, about 45 min, staged into slot 0.
+- **Device log:** `slot 0 verified (412864 bytes)` (ESP image check),
+  then `Verify failed: VerifyFailed` (signature). The device then sent
+  Upgrade End with status `0x96` (INVALID_IMAGE): `aborted`, `transfer
+  failed`.
+- **HA:** `Update was not successful: Status.FAILURE`; `installed_version`
+  stayed `0x00020001`. As on MG22, zigpy does not pass the device's
+  status through.
+- **JTAG:** both `otadata` sectors were unchanged; slot 1 stays selected.
+
+**Run C (disguised downgrade, `0x00020003`): pass, refused.**
+- **Download:** the full image, about 50 min, staged into slot 0. One
+  block for another offset was ignored.
+- **Device log:** `slot 0 verified (412864 bytes)`, then `Verify failed:
+  VerifyFailed`. The signature is valid, but the envelope's MCUboot
+  version 0.1.9 is older than the running 0.2.1. The device then sent
+  Upgrade End with status `0x96`.
+- **HA:** `Status.FAILURE`; `installed_version` stayed `0x00020001`.
+- **JTAG:** both `otadata` sectors were unchanged.
+- **Link:** NoAck, route-error and replay counts were similar to run A
+  (1,269 NoAck, 12 replays).
+
+**Final state.**
+- **Board:** H2 `0x3FBB` running TEST-ONLY 0.2.1 from `ota_1`
+  (confirmed).
+  - `ota_1` is byte-identical to run A's inner image.
+  - `ota_0` holds run C's refused 0.1.9 inner image, which is not
+    selected.
+  - Final backup SHA-256: `4ad0bbf0…29be53`.
+- **HA:** `/config/zigpy_ota` restored to its original four files
+  (SHA-256 checked), and the ZHA entry reloaded.
+
+**Findings, not fixed:**
+- **A refused image stays bootable.** `abort()` resets only RAM state.
+  After run B the inactive slot held the 0.2.2 inner ESP image (magic
+  `0xE9`), and the older `otadata` sector still pointed at that slot.
+  Today it is not selected, because the newer sector wins. It would boot
+  if the newer `otadata` sector became invalid.
+  - **Proposed hardening:** erase the first sector of the target slot on
+    `abort()` and on a failed verify. This affects the shared writer,
+    including shipped unsigned builds, so it needs approval.
+- **Parent link.** A lossy parent link with about 16% MAC NoAck makes a
+  45 min download vulnerable to a parent-loss rejoin. zigpy then aborts
+  on the re-announce.
 
 ## Open decisions
 
