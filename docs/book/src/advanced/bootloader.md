@@ -1653,9 +1653,14 @@ active OTA session holds fast poll.
 - **Board:** H2 `0x3FBB` running TEST-ONLY 0.2.1 from `ota_1`
   (confirmed).
   - `ota_1` is byte-identical to run A's inner image.
-  - `ota_0` holds run C's refused 0.1.9 inner image, which is not
-    selected.
-  - Final backup SHA-256: `4ad0bbf0…29be53`.
+  - After the run, `ota_0` held run C's refused 0.1.9 inner image, which
+    was not selected. Its first sector (`0x10000`, 4 KiB) was later
+    erased over JTAG, so `ota_0` no longer carries a valid image header.
+    The erase was a region erase with no protected overlap, taken after a
+    verified backup (`2c6e8108…`). `otadata` was byte-identical before and
+    after. The hart was resumed without a reset, and the app kept
+    reporting.
+  - Final backup SHA-256 after the campaign: `4ad0bbf0…29be53`.
 - **HA:** `/config/zigpy_ota` restored to its original four files
   (SHA-256 checked), and the ZHA entry reloaded.
 
