@@ -568,7 +568,24 @@ from the EFR32 `gecko-recovery` option below.
     in any case);
   - MG21 `router` (355,680 B) does not fit the 252,672 B cap; the link
     fails.
-  ZBT-1 (`examples/ha-connect-zbt1`) has no `zrs-boot` variant yet.
+- **ZBT-1 loader-linked router.** `examples/ha-connect-zbt1` feature
+  `zrs-boot` (router role only; `ed`/`sed` refuse it at compile time) links
+  the router into the primary slot of `products/ha-connect-zbt1/boot/
+  zbt1.layout` (application `0x8200`, cap 473,856 B). `build.rs` checks
+  that the layout keeps the direct map's security journal and reserves its
+  router tables (`0xF4000..0xFC000`), so a direct-linked and a
+  loader-linked router resume the same child/APS tables and frame
+  counters. The product module `boot` (`products/ha-connect-zbt1/src/
+  boot.rs`) owns the flash split (a `StagingFlash` view below the router
+  tables: writes only to the secondary slot and the trial log), the loader
+  channel, the identity (`0x1234`/`0x2101`, file version `0x25MMmmpp`,
+  ELF symbol `ZRS_OTA_IDENTITY`) and `TrialConfirm`. The router confirms
+  once per boot when its status is `Online` **and** it has decrypted at
+  least one NWK-secured frame. There is no Zigbee OTA client in this
+  build: upgrades are staged into the secondary slot over SWD. Feature
+  `trial-no-confirm` (TEST-ONLY) never confirms, for the trial-expiry
+  test. `tools/verify-layout.py --layout boot/zbt1.layout` checks the
+  loader-linked ELF; CI builds, lints, layout-checks and test-signs it.
 
 **PHY62x2** (`bootloaders/phy62x2-boot`, feature `pb03f-kit`):
 
@@ -926,6 +943,7 @@ loader with `watchdog-ms = 8000`.
 | EFR32MG22 `ed,zrs-boot` (warn-level logs) | 204,484 B (was 229,788 B) | 236,288 B |
 | EFR32MG21 `sed,zrs-boot` | 234,272 B | 252,672 B |
 | EFR32MG21 `ed,zrs-boot` | 229,988 B | 252,672 B |
+| ZBT-1 `router,zrs-boot` (info logs, trial confirm, no OTA client) | 357,544 B (+2,048 vs the direct router's 355,496 B); `.bss` 39,184 B (unchanged), stack 58,096 B | 473,856 B |
 
 Shipped default images: with these changes reverted in the same worktree,
 the nRF52840 UF2 (ProMicro, 228,840 B) and EFR32MG22 sensor (234,160 B)
@@ -933,6 +951,14 @@ images are the same size. The other defaults (MG22 ed/router, MG21
 roles, other UF2 boards) were compared only across worktrees, where
 builds differ by 4–20 B in both directions from crate-hash layout noise;
 no growth was attributable to the changes.
+
+ZBT-1 shipped roles (`ed` 229,268 B, `router` 355,504 B, `sed` 225,520 B
+`.bin`), measured in one worktree before and after the `zrs-boot`
+change: every section has the same size and address, and the per-function
+disassembly (addresses and crate-hash suffixes normalised) is identical.
+The `.bin` bytes are not identical: the new build script and features
+change the crates' disambiguator hashes, which reorders functions at link
+time.
 
 Phase 3 application images (equal-length worktree paths, against `d4c4023`):
 

@@ -14,6 +14,9 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
+#[cfg(feature = "zrs-boot")]
+compile_error!("feature `zrs-boot` is the loader-linked router: combine it with `router`");
+
 mod rtt_log;
 
 use embassy_executor::Spawner;

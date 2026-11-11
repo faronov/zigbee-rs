@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Verify the Home Assistant Connect ZBT-1 application, persistence, RAM, and stack layout."""
+"""Verify the Home Assistant Connect ZBT-1 application, persistence, RAM, and stack layout.
+
+Default: the direct map (link/memory.x), application at 0x4000 after the
+Gecko Bootloader. With `--layout boot/zbt1.layout`: a loader-linked
+(`zrs-boot`) image, whose application must lie in the primary slot's
+application area of that layout (after the image header, before the TLVs
+and the trailer sector)."""
 
 import argparse
 import struct
@@ -33,11 +39,46 @@ def checked_slice(data: bytes, offset: int, size: int, description: str) -> byte
     return data[offset:end]
 
 
+def loader_layout_bounds(path: Path) -> tuple[int, int]:
+    """`[start, end)` of the application area of a zrs-boot layout, as
+    `zrs-boot-layout`'s `app_memory_x` links it."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools"))
+    import zrs_boot_ota  # noqa: E402
+
+    try:
+        layout = zrs_boot_ota.Layout.load(path)
+    except zrs_boot_ota.ToolError as error:
+        fail(f"{path}: {error}")
+    if layout.xip_base:
+        fail(f"{path}: ZBT-1 executes in place from flash address 0")
+    app_len = layout.max_image_len - layout.header - layout.tlv_reserve
+    for line in path.read_text().splitlines():
+        key, sep, value = line.split("#", 1)[0].partition("=")
+        if sep and key.strip() == "app-max":
+            app_len = min(app_len, zrs_boot_ota.parse_number(value))
+    start = layout.app_start
+    end = start + app_len
+    if not (FLASH_START < start and end <= FLASH_END):
+        fail(
+            f"{path}: application 0x{start:08X}..0x{end:08X} is outside "
+            f"0x{FLASH_START:08X}..0x{FLASH_END:08X}"
+        )
+    return start, end
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("elf", type=Path)
+    parser.add_argument(
+        "--layout",
+        type=Path,
+        help="zrs-boot layout the image is linked for (loader-linked image)",
+    )
     args = parser.parse_args()
     data = args.elf.read_bytes()
+    app_start, app_end = (
+        loader_layout_bounds(args.layout) if args.layout else (FLASH_START, FLASH_END)
+    )
 
     if data[:6] != b"\x7fELF\x01\x01":
         fail("expected a 32-bit little-endian ELF")
@@ -123,10 +164,10 @@ def main() -> None:
     )
     if (
         vector is None
-        or vector["address"] != FLASH_START
+        or vector["address"] != app_start
         or vector["size"] < EXPECTED_VECTOR_BYTES
     ):
-        fail("61-IRQ vector table is not present at 0x00004000")
+        fail(f"61-IRQ vector table is not present at 0x{app_start:08X}")
     vector_data = checked_slice(data, vector["offset"], vector["size"], "vector table")
     initial_sp, reset_vector = struct.unpack_from("<II", vector_data)
 
@@ -165,7 +206,7 @@ def main() -> None:
             f"entry/vector Reset mismatch: entry=0x{entry:08X} "
             f"vector=0x{reset_vector:08X} symbol=0x{reset:08X}"
         )
-    if reset & 1 == 0 or not (FLASH_START <= (reset & ~1) < FLASH_END):
+    if reset & 1 == 0 or not (app_start <= (reset & ~1) < app_end):
         fail(f"invalid Thumb reset vector 0x{reset:08X}")
     require_handler(3, "HardFault")
     # xG21 IRQ numbers: RTCC 10 (time driver), RAC_RSM 37 (radio).
@@ -181,9 +222,9 @@ def main() -> None:
             continue
         start = section["address"]
         end = start + size
-        if FLASH_START <= start < FLASH_END:
-            if end > FLASH_END:
-                fail(f"{section['name']} enters persistence at 0x{end:08X}")
+        if app_start <= start < app_end:
+            if end > app_end:
+                fail(f"{section['name']} ends at 0x{end:08X}, above 0x{app_end:08X}")
         elif RAM_START <= start < RAM_END:
             if end > RAM_END:
                 fail(f"{section['name']} exceeds RAM at 0x{end:08X}")
@@ -214,7 +255,7 @@ def main() -> None:
         segment = containing[0]
         load_start = segment["paddr"] + start - segment["vaddr"]
         load_end = load_start + size
-        if load_start < FLASH_START or load_end > FLASH_END:
+        if load_start < app_start or load_end > app_end:
             fail(
                 f"{section['name']} load 0x{load_start:08X}..0x{load_end:08X} "
                 "is outside application flash"
@@ -226,7 +267,7 @@ def main() -> None:
             continue
         physical_start = segment["paddr"]
         physical_end = physical_start + segment["file_size"]
-        if FLASH_START <= physical_start and physical_end <= FLASH_END:
+        if app_start <= physical_start and physical_end <= app_end:
             continue
 
         backs_allocated_data = any(
@@ -258,8 +299,8 @@ def main() -> None:
     first_load = min(start for start, _ in load_ranges)
     highest_load = max(end for _, end in load_ranges)
     loaded_bytes = sum(end - start for start, end in load_ranges)
-    if first_load != FLASH_START:
-        fail(f"first firmware load is 0x{first_load:08X}, expected 0x00004000")
+    if first_load != app_start:
+        fail(f"first firmware load is 0x{first_load:08X}, expected 0x{app_start:08X}")
     if ram_static_end > stack_end:
         fail(
             f"RAM allocations end at 0x{ram_static_end:08X}, "
@@ -269,7 +310,8 @@ def main() -> None:
     print(f"PASS: {args.elf}")
     print(
         f"  load=0x{first_load:08X}..0x{highest_load:08X} "
-        f"(span={highest_load - first_load} bytes, file-backed={loaded_bytes} bytes)"
+        f"(span={highest_load - first_load} bytes, file-backed={loaded_bytes} bytes; "
+        f"limit 0x{app_start:08X}..0x{app_end:08X}, {app_end - app_start} bytes)"
     )
     print(
         f"  persistence=0x{FLASH_END:08X}..0x{PERSISTENCE_END:08X} "

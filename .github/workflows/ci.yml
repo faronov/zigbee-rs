@@ -226,6 +226,10 @@ jobs:
             manifest: products/ha-connect-zbt1/Cargo.toml
             workspace: products/ha-connect-zbt1
             features: sed
+          - name: Home Assistant Connect ZBT-1 product (loader-linked router)
+            manifest: products/ha-connect-zbt1/Cargo.toml
+            workspace: products/ha-connect-zbt1
+            features: zrs-boot
           - name: PHY6222 sensor product
             manifest: products/phy62x2-evk/Cargo.toml
             workspace: products/phy62x2-evk
@@ -2005,7 +2009,7 @@ jobs:
           workspaces: |
             examples/ha-connect-zbt1
             tools/efr32s2-lab
-          key: thumbv8m-zbt1-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/ha-connect-zbt1/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/ha-connect-zbt1/link/**', 'efr32s2-hal/link/**') }}
+          key: thumbv8m-zbt1-${{ env.RUST_TOOLCHAIN }}-roles-${{ hashFiles('examples/ha-connect-zbt1/Cargo.lock', 'tools/efr32s2-lab/Cargo.lock', 'products/ha-connect-zbt1/link/**', 'products/ha-connect-zbt1/boot/**', 'efr32s2-hal/link/**') }}
       # One bin per role; role features are mutually exclusive, so each role
       # is its own build and dependency feature unification never mixes them.
       - name: Build ZBT-1 End Device, Router and Sleepy End Device (release)
@@ -2014,12 +2018,45 @@ jobs:
           cargo build --release --locked
           cargo build --release --locked --no-default-features --features router
           cargo build --release --locked --no-default-features --features sed
+      # The router linked into the primary slot of the zigbee-rs loader
+      # chained after the Gecko Bootloader (products/ha-connect-zbt1/boot/
+      # zbt1.layout, feature zrs-boot). Its release is signed with a key
+      # generated for this run only (test-signed, never for a board whose
+      # loader trusts the release key).
+      - name: Install imgtool
+        run: |
+          python3 -m venv "$RUNNER_TEMP/imgtool"
+          "$RUNNER_TEMP/imgtool/bin/pip" install --quiet "imgtool==${IMGTOOL_VERSION}"
+          echo "$RUNNER_TEMP/imgtool/bin" >> "$GITHUB_PATH"
+      - name: Generate ephemeral ZBT-1 signing key
+        run: |
+          imgtool keygen -t ecdsa-p256 -k "$RUNNER_TEMP/ci-zbt1.pem"
+          echo "ZBT1_KEY=$RUNNER_TEMP/ci-zbt1.pem" >> "$GITHUB_ENV"
+          echo "ZBT1_OTA_KEY_XY=$(python3 tools/zrs_boot_ota.py key-xy \
+            --key "$RUNNER_TEMP/ci-zbt1.pem")" >> "$GITHUB_ENV"
+      - name: Build ZBT-1 loader-linked Router
+        working-directory: examples/ha-connect-zbt1
+        run: |
+          cargo build --release --locked --no-default-features \
+            --features router,zrs-boot --target-dir target/zrs-boot
+          ELF=target/zrs-boot/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-router
+          python3 tools/verify-layout.py --layout ../../products/ha-connect-zbt1/boot/zbt1.layout "$ELF"
+          # Signature, identity, version and slot fit of the release.
+          python3 ../../tools/zrs_boot_ota.py release \
+            --layout ../../products/ha-connect-zbt1/boot/zbt1.layout \
+            --elf "$ELF" --out target/zrs-boot/release --key "$ZBT1_KEY" \
+            --name ha-connect-zbt1-router --label ci-test
       - name: Clippy ZBT-1 role compositions
         working-directory: examples/ha-connect-zbt1
         run: |
           for role in ed router sed; do
             cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
               --no-default-features --features "$role" -- -D warnings
+          done
+          for features in router,zrs-boot router,trial-no-confirm; do
+            cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+              --no-default-features --features "$features" \
+              --target-dir target/zrs-boot -- -D warnings
           done
       - name: Build EFR32 Series 2 lab gate binaries (ZBT-1, MG21)
         working-directory: tools/efr32s2-lab
