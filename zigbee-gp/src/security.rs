@@ -7,7 +7,7 @@
 
 use zigbee_crypto::{AesKey, ForwardAesProvider, ccm_star_decrypt_with, ccm_star_encrypt_with};
 
-use crate::frame::{Gpdf, MAX_GPD_PAYLOAD, MIC_LEN};
+use crate::frame::{Gpdf, GpdfParams, MAX_GPD_PAYLOAD, MIC_LEN, write_header, write_mac_header};
 use crate::types::{GpdId, SecurityLevel};
 use crate::{Error, Result};
 
@@ -185,6 +185,63 @@ pub fn seal<P: ForwardAesProvider>(
         _ => return Err(Error::Unsupported),
     }
     Ok(needed)
+}
+
+/// Build a complete GPDF MAC frame without FCS: the minimal GP MAC header
+/// (A.1.4.1.1, destination PAN/address 0xFFFF, no source), the NWK header
+/// described by `params`, and `command_id` + `payload`, protected with `key`
+/// when `params.security_level` is 0b10/0b11.
+///
+/// Shared by the GPD (frames to a GPP) and the proxy's TempMaster
+/// (frames to a GPD, `params.to_gpd`). Returns the frame length.
+pub fn build_gpdf<P: ForwardAesProvider>(
+    provider: &mut P,
+    key: Option<&AesKey>,
+    params: &GpdfParams,
+    mac_seq: u8,
+    command_id: u8,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize> {
+    if payload.len() + 1 > MAX_GPD_PAYLOAD {
+        return Err(Error::BufferFull);
+    }
+    let mac = write_mac_header(out, mac_seq)?;
+    let hl = write_header(out.get_mut(mac..).ok_or(Error::BufferFull)?, params)?;
+    let body = mac + hl;
+    let mut clear = [0u8; MAX_GPD_PAYLOAD];
+    clear[0] = command_id;
+    clear[1..=payload.len()].copy_from_slice(payload);
+    let clear = &clear[..=payload.len()];
+    let n = if params.security_level.is_protected() {
+        let key = key.ok_or(Error::AuthFailed)?;
+        let gpd = GpdId::SrcId(params.src_id.ok_or(Error::Unsupported)?);
+        let (head, tail) = out.split_at_mut(body);
+        seal(
+            provider,
+            key,
+            &SealContext {
+                gpd,
+                frame_counter: params.frame_counter,
+                level: params.security_level,
+                direction: if params.to_gpd {
+                    Direction::ToGpd
+                } else {
+                    Direction::FromGpd
+                },
+            },
+            &head[mac..],
+            clear,
+            tail,
+        )?
+    } else {
+        let dst = out
+            .get_mut(body..body + clear.len())
+            .ok_or(Error::BufferFull)?;
+        dst.copy_from_slice(clear);
+        clear.len()
+    };
+    Ok(body + n)
 }
 
 /// A TC-LK protected GPD key: 16 encrypted key bytes and a 4-byte MIC.

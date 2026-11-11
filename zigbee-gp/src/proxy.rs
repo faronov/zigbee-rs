@@ -23,6 +23,8 @@ use crate::cluster::{
 };
 use crate::codec::{Reader, Writer};
 use crate::dup::DuplicateFilter;
+#[cfg(feature = "proxy-bidirectional")]
+use crate::frame::GpdfParams;
 use crate::frame::{FrameType, Gpdf};
 use crate::security::{self, Direction};
 use crate::types::{
@@ -67,6 +69,19 @@ pub const D_MAX_MS: u32 = 100;
 pub const DEFAULT_COMMISSIONING_WINDOW_S: u16 = 180;
 /// NWK broadcast address for all RxOnWhenIdle devices.
 pub const BROADCAST_RX_ON_WHEN_IDLE: u16 = 0xFFFD;
+/// gpTxQueue length: the GP 1.0a A.1.5.2.1.1 minimum.
+#[cfg(feature = "proxy-bidirectional")]
+pub const GP_TX_QUEUE_LEN: usize = 5;
+/// Largest GPD command payload a GP Response can queue for a GPD. A
+/// Commissioning Reply with PAN ID, TC-LK protected key, key MIC and frame
+/// counter is 27 bytes.
+#[cfg(feature = "proxy-bidirectional")]
+pub const MAX_DOWNLINK_PAYLOAD: usize = 32;
+/// Default gpTxQueueEntryLifetime, ms.
+pub const DEFAULT_TX_QUEUE_LIFETIME_MS: u32 = 10_000;
+/// gpTxOffset (A.1.5.2.1.2): a queued GPDF is sent this long after the
+/// start of the triggering GPDF, in µs.
+pub const GP_TX_OFFSET_US: u32 = 5_000;
 
 /// Proxy configuration selected by the product.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +93,9 @@ pub struct ProxyConfig {
     /// values since the last persisted value (flash wear trade-off; sinks run
     /// their own freshness check). 1 persists every update.
     pub counter_persist_stride: u32,
+    /// gpTxQueueEntryLifetime of a GPDF queued by a GP Response, ms
+    /// (bidirectional proxies only).
+    pub tx_queue_lifetime_ms: u32,
 }
 
 impl Default for ProxyConfig {
@@ -85,6 +103,7 @@ impl Default for ProxyConfig {
         Self {
             default_commissioning_window_s: DEFAULT_COMMISSIONING_WINDOW_S,
             counter_persist_stride: 16,
+            tx_queue_lifetime_ms: DEFAULT_TX_QUEUE_LIFETIME_MS,
         }
     }
 }
@@ -415,6 +434,19 @@ struct Pending {
     dests: heapless::Vec<Dest, MAX_DESTINATIONS>,
 }
 
+/// One gpTxQueue entry: a GPDF waiting for the GPD's next `rxAfterTx`
+/// window.
+#[cfg(feature = "proxy-bidirectional")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TxQueueEntry {
+    /// GPD the frame is for; SrcID 0 for a Maintenance frame (Channel
+    /// Configuration).
+    gpd_id: GpdId,
+    command_id: u8,
+    payload: heapless::Vec<u8, MAX_DOWNLINK_PAYLOAD>,
+    expires_ms: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CommissioningState {
     originator: u16,
@@ -485,6 +517,21 @@ pub struct Proxy<const N: usize, const Q: usize> {
     commissioning: Option<CommissioningState>,
     pending: heapless::Vec<Pending, Q>,
     dirty: bool,
+    #[cfg(feature = "proxy-bidirectional")]
+    bidi: Bidirectional,
+}
+
+/// TempMaster state of a bidirectional proxy.
+#[cfg(feature = "proxy-bidirectional")]
+struct Bidirectional {
+    /// The platform transmits a GPDF at gpTxOffset after a received GPDF.
+    capable: bool,
+    /// IEEE 802.15.4 channel of the network (0 = unknown).
+    operational_channel: u8,
+    tx_queue: heapless::Vec<TxQueueEntry, GP_TX_QUEUE_LEN>,
+    /// GPD this proxy was last appointed TempMaster for; it uses the
+    /// shortest tunnelling delay for that GPD (A.3.9.1 step 12).
+    temp_master_for: Option<GpdId>,
 }
 
 fn due(now: u32, deadline: u32) -> bool {
@@ -521,6 +568,13 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             commissioning: None,
             pending: heapless::Vec::new(),
             dirty: false,
+            #[cfg(feature = "proxy-bidirectional")]
+            bidi: Bidirectional {
+                capable: false,
+                operational_channel: 0,
+                tx_queue: heapless::Vec::new(),
+                temp_master_for: None,
+            },
         }
     }
 
@@ -543,6 +597,77 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         self.commissioning = None;
         self.dup = DuplicateFilter::new(crate::dup::DUPLICATE_TIMEOUT_MS);
         self.dirty = true;
+        #[cfg(feature = "proxy-bidirectional")]
+        {
+            self.bidi.tx_queue.clear();
+            self.bidi.temp_master_for = None;
+        }
+    }
+
+    /// Whether this proxy acts as TempMaster: built with
+    /// `proxy-bidirectional` and the platform declared, through
+    /// [`set_bidirectional_capable`](Self::set_bidirectional_capable), that it
+    /// can transmit a GPDF at gpTxOffset after a received one.
+    pub fn bidirectional(&self) -> bool {
+        #[cfg(feature = "proxy-bidirectional")]
+        {
+            self.bidi.capable
+        }
+        #[cfg(not(feature = "proxy-bidirectional"))]
+        {
+            false
+        }
+    }
+
+    /// Declare whether the platform can transmit a queued GPDF at
+    /// [`GP_TX_OFFSET_US`] after the start of a received GPDF, without
+    /// CSMA/CA. Without it the proxy stays unidirectional: it does not
+    /// advertise bidirectional operation and rejects GP Responses that
+    /// appoint it TempMaster.
+    #[cfg(feature = "proxy-bidirectional")]
+    pub fn set_bidirectional_capable(&mut self, capable: bool) {
+        self.bidi.capable = capable;
+        if !capable {
+            self.bidi.tx_queue.clear();
+        }
+    }
+
+    /// Update the network's IEEE 802.15.4 channel (11..=26).
+    #[cfg(feature = "proxy-bidirectional")]
+    pub fn set_operational_channel(&mut self, channel: u8) {
+        if self.bidi.operational_channel != channel {
+            self.bidi.operational_channel = channel;
+            self.bidi.tx_queue.clear();
+        }
+    }
+
+    /// Whether this proxy has no gpTxQueue room for `gpd` (Notification
+    /// option gppTxQueueFull, A.3.5.2.1). A proxy that cannot act as
+    /// TempMaster has no room for any GPD.
+    fn tx_queue_full_for(&self, _gpd: &GpdId, _now_ms: u32) -> bool {
+        #[cfg(feature = "proxy-bidirectional")]
+        {
+            let q = &self.bidi.tx_queue;
+            !self.bidi.capable
+                || (!q.iter().any(|e| e.gpd_id.matches(_gpd))
+                    && q.iter().filter(|e| !due(_now_ms, e.expires_ms)).count() >= GP_TX_QUEUE_LEN)
+        }
+        #[cfg(not(feature = "proxy-bidirectional"))]
+        {
+            true
+        }
+    }
+
+    /// Whether this proxy is the GPD's current TempMaster.
+    fn is_temp_master_for(&self, _gpd: &GpdId) -> bool {
+        #[cfg(feature = "proxy-bidirectional")]
+        {
+            self.bidi.temp_master_for.is_some_and(|g| g.matches(_gpd))
+        }
+        #[cfg(not(feature = "proxy-bidirectional"))]
+        {
+            false
+        }
     }
 
     /// Update this node's NWK address (after join / rejoin / conflict).
@@ -610,7 +735,12 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 LONG_OCTET_STRING
             }
             attr::GPP_FUNCTIONALITY => {
-                w.u24(functionality::BASIC_PROXY)?;
+                let bidirectional = if self.bidirectional() {
+                    functionality::BIDIRECTIONAL
+                } else {
+                    0
+                };
+                w.u24(functionality::BASIC_PROXY | bidirectional)?;
                 BITMAP24
             }
             attr::GPP_ACTIVE_FUNCTIONALITY => {
@@ -840,8 +970,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 KeyType::NoKey
             },
             rx_after_tx: h.rx_after_tx,
-            tx_queue_full: false,
-            bidirectional_cap: false,
+            tx_queue_full: h.rx_after_tx && self.tx_queue_full_for(&e.gpd_id, now_ms),
+            bidirectional_cap: self.bidirectional(),
             frame_counter: if h.security_level.is_protected() {
                 h.frame_counter
             } else {
@@ -956,7 +1086,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             security_level: h.security_level,
             key_type,
             security_failed,
-            bidirectional_cap: false,
+            bidirectional_cap: self.bidirectional(),
             frame_counter: if protected {
                 h.frame_counter
             } else {
@@ -1006,7 +1136,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             radius: 0,
         });
         let delay = if h.rx_after_tx {
-            tunneling_delay_ms(false, false, link)
+            tunneling_delay_ms(self.is_temp_master_for(gpd), false, link)
         } else {
             D_MIN_MS
         };
@@ -1051,7 +1181,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             }
             client_cmd::RESPONSE => {
                 let r = Response::decode(payload)?;
-                self.on_response(&r);
+                self.on_response(&r, now_ms)?;
             }
             client_cmd::NOTIFICATION_RESPONSE => {
                 let r = NotificationResponse::decode(payload)?;
@@ -1246,14 +1376,173 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         Ok(())
     }
 
-    fn on_response(&mut self, r: &Response<'_>) {
-        // Proxy Basic is unidirectional: it never acts as TempMaster. A
-        // response appointing another proxy clears FirstToForward.
-        if r.temp_master_short != self.own_nwk
-            && let Some(i) = self.find(&r.gpd_id)
+    /// GP Response (A.3.5.2.1 / A.3.9.1 steps 8 and 14).
+    ///
+    /// A Response appointing this proxy TempMaster queues the GPDF for the
+    /// GPD's next `rxAfterTx` window and sets FirstToForward. It fails with
+    /// [`Error::Unsupported`] when this proxy cannot act as TempMaster
+    /// (unidirectional build or platform), or when the TempMaster would have
+    /// to switch to another channel (Channel Configuration delivery on a
+    /// non-operational channel). A full gpTxQueue returns
+    /// [`Error::BufferFull`]. A Response appointing another proxy drops our
+    /// queued GPDF for that GPD and clears FirstToForward.
+    fn on_response(&mut self, r: &Response<'_>, _now_ms: u32) -> Result<()> {
+        if r.temp_master_short == self.own_nwk {
+            #[cfg(feature = "proxy-bidirectional")]
+            return self.queue_response(r, _now_ms);
+            #[cfg(not(feature = "proxy-bidirectional"))]
+            return Err(Error::Unsupported);
+        }
+        #[cfg(feature = "proxy-bidirectional")]
         {
+            self.bidi.tx_queue.retain(|e| !e.gpd_id.matches(&r.gpd_id));
+            if self.is_temp_master_for(&r.gpd_id) {
+                self.bidi.temp_master_for = None;
+            }
+        }
+        if let Some(i) = self.find(&r.gpd_id) {
             self.table[i].first_to_forward = false;
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "proxy-bidirectional")]
+    fn queue_response(&mut self, r: &Response<'_>, now_ms: u32) -> Result<()> {
+        if !self.bidi.capable || r.transmit_on_endpoint_match {
+            return Err(Error::Unsupported);
+        }
+        // Delivery on another channel needs the TempMaster channel switch
+        // of A.3.9.1 step 8 (proxy-full).
+        if self.bidi.operational_channel == 0 || r.tx_channel() != self.bidi.operational_channel {
+            return Err(Error::Unsupported);
+        }
+        let payload = heapless::Vec::from_slice(r.payload).map_err(|_| Error::BufferFull)?;
+        let entry = TxQueueEntry {
+            gpd_id: r.gpd_id,
+            command_id: r.command_id,
+            payload,
+            expires_ms: now_ms.wrapping_add(self.config.tx_queue_lifetime_ms),
+        };
+        let q = &mut self.bidi.tx_queue;
+        q.retain(|e| !due(now_ms, e.expires_ms));
+        if let Some(e) = q.iter_mut().find(|e| e.gpd_id.matches(&r.gpd_id)) {
+            *e = entry; // ENTRY_REPLACED
+        } else {
+            q.push(entry).map_err(|_| Error::BufferFull)?; // QUEUE_FULL
+        }
+        self.bidi.temp_master_for = Some(r.gpd_id);
+        if let Some(i) = self.find(&r.gpd_id) {
+            self.table[i].first_to_forward = true;
+        }
+        Ok(())
+    }
+
+    /// TempMaster transmission (A.1.5.2.2, A.3.9.1 steps 8 and 14).
+    ///
+    /// Call for every received GPDF *before* [`on_gpdf`](Self::on_gpdf).
+    /// When the GPDF opens a receive window (`rxAfterTx`, or a Channel
+    /// Request) and the gpTxQueue holds a GPDF for its GPD, the queued GPDF
+    /// is built into `out` (MAC frame without FCS) and removed from the
+    /// queue; the caller transmits it [`GP_TX_OFFSET_US`] after the start of
+    /// the received GPDF, without CSMA/CA and without a MAC ACK request.
+    ///
+    /// The reply uses the security parameters of the triggering GPDF: a
+    /// protected trigger must pass the Proxy Table entry's MIC and
+    /// freshness checks and the reply is protected with the same key and
+    /// frame counter (direction GPP → GPD). A queued GPDF for SrcID 0 is
+    /// sent as an unprotected Maintenance frame.
+    #[cfg(feature = "proxy-bidirectional")]
+    pub fn take_downlink<P: ForwardAesProvider>(
+        &mut self,
+        aes: &mut P,
+        frame: &Gpdf<'_>,
+        now_ms: u32,
+        mac_seq: u8,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        if !self.bidi.capable || self.bidi.tx_queue.is_empty() {
+            return None;
+        }
+        let h = &frame.header;
+        if h.to_gpd {
+            return None;
+        }
+        let channel_request = frame.clear_command_id() == Some(cmd::CHANNEL_REQUEST);
+        if !h.rx_after_tx && !channel_request {
+            return None;
+        }
+        self.bidi.tx_queue.retain(|e| !due(now_ms, e.expires_ms));
+        let gpd = h.gpd_id.unwrap_or(GpdId::SrcId(0));
+        let q = &self.bidi.tx_queue;
+        let idx = q.iter().position(|e| e.gpd_id.matches(&gpd)).or_else(|| {
+            channel_request
+                .then(|| q.iter().position(|e| e.gpd_id == GpdId::SrcId(0)))
+                .flatten()
+        })?;
+        let maintenance = q[idx].gpd_id == GpdId::SrcId(0);
+        let GpdId::SrcId(src_id) = gpd else {
+            // ApplicationID 0b010 GPDs are not served by the TempMaster.
+            return None;
+        };
+        let key = if h.security_level.is_protected() && !maintenance {
+            let i = self.find(&gpd)?;
+            let e = &self.table[i];
+            if !e.active
+                || !e.valid
+                || e.security_level != h.security_level
+                || e.key_type.is_individual() != h.individual_key
+                || h.frame_counter <= e.frame_counter
+            {
+                return None;
+            }
+            let key = e.key?;
+            security::open(aes, &key, frame, Direction::FromGpd).ok()?;
+            Some(key)
+        } else {
+            None
+        };
+        let params = if maintenance {
+            // A.1.4.1.2: the Extended NWK FC may be omitted towards the GPD;
+            // with it, a SrcID would have to follow.
+            GpdfParams {
+                frame_type: FrameType::Maintenance,
+                auto_commissioning: false,
+                src_id: None,
+                security_level: SecurityLevel::None,
+                individual_key: false,
+                rx_after_tx: false,
+                to_gpd: false,
+                frame_counter: 0,
+            }
+        } else {
+            GpdfParams {
+                frame_type: FrameType::Data,
+                auto_commissioning: false,
+                src_id: Some(src_id),
+                security_level: if key.is_some() {
+                    h.security_level
+                } else {
+                    SecurityLevel::None
+                },
+                individual_key: key.is_some() && h.individual_key,
+                rx_after_tx: false,
+                to_gpd: true,
+                frame_counter: if key.is_some() { h.frame_counter } else { 0 },
+            }
+        };
+        let e = &self.bidi.tx_queue[idx];
+        let n = security::build_gpdf(
+            aes,
+            key.as_ref(),
+            &params,
+            mac_seq,
+            e.command_id,
+            &e.payload,
+            out,
+        )
+        .ok()?;
+        self.bidi.tx_queue.swap_remove(idx);
+        Some(n)
     }
 
     fn proxy_table_response(&self, dst: u16, req: &ProxyTableRequest) -> Result<GpTx> {
@@ -1815,5 +2104,276 @@ mod tests {
             tunneling_delay_ms(false, false, GppGpdLink(0)),
             D_MIN_MS + 85
         );
+    }
+
+    #[cfg(feature = "proxy-bidirectional")]
+    mod bidirectional {
+        use super::*;
+        use crate::frame::{FrameType, GpdfParams, parse_mac};
+        use crate::security::{self, Direction};
+
+        const CHANNEL: u8 = 25;
+
+        fn bidi_proxy(fc: u32) -> P {
+            let mut p = paired_proxy(fc);
+            p.set_bidirectional_capable(true);
+            p.set_operational_channel(CHANNEL);
+            p
+        }
+
+        fn response(
+            p: &mut P,
+            gpd: GpdId,
+            temp_master: u16,
+            channel: u8,
+            command_id: u8,
+            payload: &[u8],
+            now_ms: u32,
+        ) -> Result<()> {
+            let r = Response {
+                gpd_id: gpd,
+                transmit_on_endpoint_match: false,
+                temp_master_short: temp_master,
+                temp_master_tx_channel: channel - 11,
+                command_id,
+                payload,
+            };
+            let mut b = [0u8; 64];
+            let n = r.encode(&mut b).unwrap();
+            let mut reply = None;
+            p.on_client_command(0x0000, client_cmd::RESPONSE, &b[..n], now_ms, &mut reply)
+                .map(|_| ())
+        }
+
+        /// GPD → GPP frame (MAC header included, no FCS).
+        fn uplink(
+            src: Option<u32>,
+            key: Option<&AesKey>,
+            fc: u32,
+            rx_after_tx: bool,
+            command_id: u8,
+            payload: &[u8],
+        ) -> heapless::Vec<u8, 64> {
+            let params = GpdfParams {
+                frame_type: if src.is_some() {
+                    FrameType::Data
+                } else {
+                    FrameType::Maintenance
+                },
+                auto_commissioning: false,
+                src_id: src,
+                security_level: if key.is_some() {
+                    SecurityLevel::Encrypted
+                } else {
+                    SecurityLevel::None
+                },
+                individual_key: false,
+                rx_after_tx,
+                to_gpd: false,
+                frame_counter: fc,
+            };
+            let mut out = [0u8; 64];
+            let n = security::build_gpdf(
+                &mut SoftwareAesProvider,
+                key,
+                &params,
+                fc as u8,
+                command_id,
+                payload,
+                &mut out,
+            )
+            .unwrap();
+            heapless::Vec::from_slice(&out[..n]).unwrap()
+        }
+
+        fn gpdf(raw: &[u8]) -> Gpdf<'_> {
+            let mac = parse_mac(raw).unwrap();
+            parse(&raw[mac.payload_offset..], mac.seq, None).unwrap()
+        }
+
+        fn take(p: &mut P, raw: &[u8], now_ms: u32) -> Option<heapless::Vec<u8, 64>> {
+            let mut out = [0u8; 64];
+            let n =
+                p.take_downlink(&mut SoftwareAesProvider, &gpdf(raw), now_ms, 0x42, &mut out)?;
+            Some(heapless::Vec::from_slice(&out[..n]).unwrap())
+        }
+
+        #[test]
+        fn functionality_and_notification_follow_capability() {
+            let mut p = paired_proxy(1);
+            let mut out = [0u8; 4];
+            p.read_attribute(attr::GPP_FUNCTIONALITY, &mut out).unwrap();
+            assert_eq!(u32::from_le_bytes(out) & functionality::BIDIRECTIONAL, 0);
+            // A unidirectional proxy has no gpTxQueue room for anyone.
+            let raw = uplink(Some(SRC), Some(&KEY_C0), 2, true, cmd::TOGGLE, &[]);
+            p.on_gpdf(&mut SoftwareAesProvider, &gpdf(&raw), GppGpdLink(0), 0);
+            let tx = (0..1000).find_map(|t| p.poll(t)).unwrap();
+            let TxFrame::GpCommand { payload, .. } = &tx.frame else {
+                panic!()
+            };
+            let n = Notification::decode(payload).unwrap();
+            assert!(n.rx_after_tx && n.tx_queue_full && !n.bidirectional_cap);
+
+            p.set_bidirectional_capable(true);
+            p.read_attribute(attr::GPP_FUNCTIONALITY, &mut out).unwrap();
+            assert_ne!(u32::from_le_bytes(out) & functionality::BIDIRECTIONAL, 0);
+            let raw = uplink(Some(SRC), Some(&KEY_C0), 3, true, cmd::TOGGLE, &[]);
+            p.on_gpdf(&mut SoftwareAesProvider, &gpdf(&raw), GppGpdLink(0), 2000);
+            let tx = (2000..3000).find_map(|t| p.poll(t)).unwrap();
+            let TxFrame::GpCommand { payload, .. } = &tx.frame else {
+                panic!()
+            };
+            let n = Notification::decode(payload).unwrap();
+            assert!(n.rx_after_tx && !n.tx_queue_full && n.bidirectional_cap);
+        }
+
+        #[test]
+        fn unsupported_temp_master_appointments_fail_explicitly() {
+            let gpd = GpdId::SrcId(SRC);
+            let mut p = paired_proxy(1);
+            assert_eq!(
+                response(&mut p, gpd, 0x1234, CHANNEL, 0xF0, &[0x98], 0),
+                Err(Error::Unsupported)
+            );
+            p.set_bidirectional_capable(true);
+            // No operational channel known yet.
+            assert_eq!(
+                response(&mut p, gpd, 0x1234, CHANNEL, 0xF0, &[0x98], 0),
+                Err(Error::Unsupported)
+            );
+            p.set_operational_channel(CHANNEL);
+            // Delivery on another channel needs a channel switch (proxy-full).
+            assert_eq!(
+                response(&mut p, gpd, 0x1234, 15, 0xF0, &[0x98], 0),
+                Err(Error::Unsupported)
+            );
+            assert_eq!(
+                response(&mut p, gpd, 0x1234, CHANNEL, 0xF0, &[0x98], 0),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn protected_trigger_gets_sealed_reply_with_trigger_counter() {
+            let mut p = bidi_proxy(1);
+            let gpd = GpdId::SrcId(SRC);
+            response(&mut p, gpd, 0x1234, CHANNEL, 0xF0, &[0x98], 0).unwrap();
+            assert!(p.entries()[0].first_to_forward);
+
+            // Without rxAfterTx the GPD is not listening.
+            let plain = uplink(Some(SRC), Some(&KEY_C0), 2, false, cmd::TOGGLE, &[]);
+            assert!(take(&mut p, &plain, 10).is_none());
+            // A forged MIC does not release the queued GPDF.
+            let mut forged = uplink(Some(SRC), Some(&KEY_C0), 3, true, cmd::TOGGLE, &[]);
+            let last = forged.len() - 1;
+            forged[last] ^= 1;
+            assert!(take(&mut p, &forged, 10).is_none());
+            // A stale frame counter neither.
+            let stale = uplink(Some(SRC), Some(&KEY_C0), 1, true, cmd::TOGGLE, &[]);
+            assert!(take(&mut p, &stale, 10).is_none());
+
+            let trigger = uplink(Some(SRC), Some(&KEY_C0), 7, true, cmd::TOGGLE, &[]);
+            let down = take(&mut p, &trigger, 20).unwrap();
+            assert_eq!(&down[..7], &[0x01, 0x08, 0x42, 0xFF, 0xFF, 0xFF, 0xFF]);
+            let f = gpdf(&down);
+            assert_eq!(f.header.frame_type, FrameType::Data);
+            assert!(f.header.to_gpd && !f.header.rx_after_tx);
+            assert_eq!(f.header.gpd_id, Some(gpd));
+            assert_eq!(f.header.security_level, SecurityLevel::Encrypted);
+            assert_eq!(f.header.frame_counter, 7);
+            let clear =
+                security::open(&mut SoftwareAesProvider, &KEY_C0, &f, Direction::ToGpd).unwrap();
+            assert_eq!(&clear[..], &[0xF0, 0x98]);
+            // Sent once; the trigger is still forwarded to the sinks.
+            assert!(take(&mut p, &trigger, 20).is_none());
+            assert_eq!(
+                p.on_gpdf(&mut SoftwareAesProvider, &gpdf(&trigger), GppGpdLink(0), 20),
+                GpdfOutcome::Notification
+            );
+        }
+
+        #[test]
+        fn unprotected_commissioning_gets_clear_reply() {
+            let mut p = bidi_proxy(1);
+            let gpd = GpdId::SrcId(0x6D6B_F300);
+            response(&mut p, gpd, 0x1234, CHANNEL, 0xF0, &[0x98], 0).unwrap();
+            let trigger = uplink(
+                Some(0x6D6B_F300),
+                None,
+                0,
+                true,
+                cmd::COMMISSIONING,
+                &[0x02],
+            );
+            let down = take(&mut p, &trigger, 5).unwrap();
+            let f = gpdf(&down);
+            assert!(f.header.to_gpd);
+            assert_eq!(f.header.security_level, SecurityLevel::None);
+            assert_eq!(f.header.gpd_id, Some(gpd));
+            assert_eq!(f.payload, &[0xF0, 0x98]);
+        }
+
+        #[test]
+        fn channel_request_gets_maintenance_channel_configuration() {
+            let mut p = bidi_proxy(1);
+            // zigpy: GP Response for GPD SrcID 0, transmitted on the
+            // requested channel (here the operational one).
+            response(&mut p, GpdId::SrcId(0), 0x1234, CHANNEL, 0xF3, &[0x1E], 0).unwrap();
+            let req = uplink(None, None, 0, false, cmd::CHANNEL_REQUEST, &[0xEE]);
+            let down = take(&mut p, &req, 5).unwrap();
+            assert_eq!(&down[7..], &[0x0D, 0xF3, 0x1E]);
+        }
+
+        #[test]
+        fn queue_replaces_fills_and_expires() {
+            let mut p = bidi_proxy(1);
+            for i in 0..GP_TX_QUEUE_LEN as u32 {
+                response(
+                    &mut p,
+                    GpdId::SrcId(0x100 + i),
+                    0x1234,
+                    CHANNEL,
+                    0xF0,
+                    &[0],
+                    0,
+                )
+                .unwrap();
+            }
+            // ENTRY_REPLACED for a GPD already queued.
+            response(&mut p, GpdId::SrcId(0x100), 0x1234, CHANNEL, 0xF0, &[1], 0).unwrap();
+            assert_eq!(
+                response(&mut p, GpdId::SrcId(0x200), 0x1234, CHANNEL, 0xF0, &[0], 0),
+                Err(Error::BufferFull)
+            );
+            let t = uplink(Some(0x100), None, 0, true, cmd::COMMISSIONING, &[0x02]);
+            let down = take(&mut p, &t, 1).unwrap();
+            assert_eq!(gpdf(&down).payload, &[0xF0, 1]);
+            // Lifetime elapsed: queued GPDFs are dropped, room again.
+            let late = DEFAULT_TX_QUEUE_LIFETIME_MS;
+            let t = uplink(Some(0x101), None, 0, true, cmd::COMMISSIONING, &[0x02]);
+            assert!(take(&mut p, &t, late).is_none());
+            response(
+                &mut p,
+                GpdId::SrcId(0x200),
+                0x1234,
+                CHANNEL,
+                0xF0,
+                &[0],
+                late,
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn response_for_other_temp_master_drops_our_entry() {
+            let mut p = bidi_proxy(1);
+            let gpd = GpdId::SrcId(SRC);
+            response(&mut p, gpd, 0x1234, CHANNEL, 0xF0, &[0x98], 0).unwrap();
+            assert!(p.entries()[0].first_to_forward);
+            response(&mut p, gpd, 0x5678, CHANNEL, 0xF0, &[0x98], 1).unwrap();
+            assert!(!p.entries()[0].first_to_forward);
+            let trigger = uplink(Some(SRC), Some(&KEY_C0), 7, true, cmd::TOGGLE, &[]);
+            assert!(take(&mut p, &trigger, 2).is_none());
+        }
     }
 }

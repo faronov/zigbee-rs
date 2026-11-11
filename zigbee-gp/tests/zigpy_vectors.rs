@@ -555,4 +555,38 @@ mod proxy {
             .unwrap();
         assert_eq!(p.entries().len(), 0);
     }
+
+    /// zigpy appoints the proxy TempMaster for a GPD that opened an
+    /// rxAfterTx window; the proxy answers with the trigger's security
+    /// parameters (independent AES-CCM vector, A.1.5.2.2).
+    #[cfg(feature = "proxy-bidirectional")]
+    #[test]
+    fn zigpy_response_is_delivered_as_sealed_downlink() {
+        let mut p: Proxy<4, 4> = Proxy::new(ProxyConfig::default());
+        p.set_own_nwk(0x1234);
+        p.set_bidirectional_capable(true);
+        p.set_operational_channel(25);
+        let mut reply = None;
+        p.on_client_command(0, client_cmd::PAIRING, v::PAIRING_ADD_L3, 0, &mut reply)
+            .unwrap();
+        p.on_client_command(
+            0,
+            client_cmd::RESPONSE,
+            v::RESPONSE_COMMISSIONING_REPLY,
+            0,
+            &mut reply,
+        )
+        .unwrap();
+
+        let raw = v::GPDF_L3_TOGGLE_RX_AFTER_TX;
+        let mac = parse_mac(raw).unwrap();
+        let f = parse(&raw[mac.payload_offset..], mac.seq, None).unwrap();
+        let mut aes = SoftwareAesProvider;
+        let mut out = [0u8; 64];
+        let n = p.take_downlink(&mut aes, &f, 10, 0x77, &mut out).unwrap();
+        assert_eq!(&out[..7], &[0x01, 0x08, 0x77, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(&out[7..n], v::DOWNLINK_L3_COMMISSIONING_REPLY_NWK);
+        // The trigger itself is still tunnelled, flagged rxAfterTx.
+        assert_eq!(p.on_gpdf(&mut aes, &f, LINK, 10), GpdfOutcome::Notification);
+    }
 }

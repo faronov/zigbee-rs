@@ -10,11 +10,8 @@
 use zigbee_crypto::{AesKey, ForwardAesProvider};
 
 use crate::commissioning::{CommissioningPayload, CommissioningReply};
-use crate::frame::{
-    FrameType, GPD_MAC_HEADER_LEN, GpdfParams, MAX_GPD_PAYLOAD, parse, parse_mac, write_header,
-    write_mac_header,
-};
-use crate::security::{self, Direction, SealContext, WrappedKey};
+use crate::frame::{FrameType, GPD_MAC_HEADER_LEN, GpdfParams, MAX_GPD_PAYLOAD, parse, parse_mac};
+use crate::security::{self, Direction, WrappedKey};
 use crate::types::{GpdId, KeyType, SecurityLevel, cmd};
 use crate::{Error, Result};
 
@@ -161,7 +158,6 @@ impl Gpd {
             return Err(Error::BufferFull);
         }
         let seq = self.next_seq(security.map(|(_, fc)| fc));
-        let mac = write_mac_header(out, seq)?;
         let params = GpdfParams {
             frame_type: FrameType::Data,
             auto_commissioning: opts.auto_commissioning,
@@ -172,38 +168,15 @@ impl Gpd {
             to_gpd: false,
             frame_counter: security.map_or(0, |(_, fc)| fc),
         };
-        let hl = write_header(out.get_mut(mac..).ok_or(Error::BufferFull)?, &params)?;
-        let body = mac + hl;
-        let mut clear = [0u8; MAX_GPD_PAYLOAD];
-        clear[0] = command_id;
-        clear[1..=payload.len()].copy_from_slice(payload);
-        let clear = &clear[..=payload.len()];
-        let n = match security {
-            None => {
-                let dst = out
-                    .get_mut(body..body + clear.len())
-                    .ok_or(Error::BufferFull)?;
-                dst.copy_from_slice(clear);
-                clear.len()
-            }
-            Some((s, fc)) => {
-                let (head, tail) = out.split_at_mut(body);
-                security::seal(
-                    aes,
-                    &s.key,
-                    &SealContext {
-                        gpd: GpdId::SrcId(self.config.src_id),
-                        frame_counter: fc,
-                        level: s.level,
-                        direction: Direction::FromGpd,
-                    },
-                    &head[mac..],
-                    clear,
-                    tail,
-                )?
-            }
-        };
-        Ok(body + n)
+        security::build_gpdf(
+            aes,
+            security.as_ref().map(|(s, _)| &s.key),
+            &params,
+            seq,
+            command_id,
+            payload,
+            out,
+        )
     }
 
     /// Build a data GPDF carrying `command_id` + `payload`, protected with
