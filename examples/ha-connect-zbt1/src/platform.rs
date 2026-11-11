@@ -12,6 +12,9 @@ compile_error!(
     "enable exactly one role feature (ed, router or sed); use --no-default-features for router/sed"
 );
 
+#[cfg(all(feature = "zrs-boot", not(feature = "router")))]
+compile_error!("feature `zrs-boot` is the loader-linked router: combine it with `router`");
+
 use ha_connect_zbt1::resources::BoardResources;
 use ha_connect_zbt1_product as product;
 

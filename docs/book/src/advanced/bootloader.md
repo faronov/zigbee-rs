@@ -56,7 +56,7 @@ hardware-proven capability.
 | `bootloaders/layout` (`zrs-boot-layout`) | Build-time parser and checker of product `boot/*.layout` and `boot/app-verify.conf` files; emits `BootConfig`, keys, loader and application `MEMORY` regions | Host-tested |
 | `bootloaders/cortex-m-boot` (`zrs-boot-cortex-m`) | Cortex-M shell: entry check through the flash driver, VTOR/MSP hand-over, `Hooks` for status, watchdog and failure | Host-tested; built in the three loaders below |
 | `products/nrf52840-sensor/bootloader` | nRF52840 loader, one build per board layout | Release-built and linted; **not run on hardware** |
-| `bootloaders/efr32s2-boot` | EFR32MG22/MG21 loader; on MG21 chained above the Gecko Bootloader | Release-built and linted. The MG22 devkit build is **lab-tested on one BRD4183A** ([results](#mg22-results-2026-11-09)). MG21, ZBT-1 and `gecko-recovery` are **not run on hardware** |
+| `bootloaders/efr32s2-boot` | EFR32MG22/MG21 loader; on MG21 chained above the Gecko Bootloader | Release-built and linted. The MG22 devkit build is **lab-tested on one BRD4183A** ([results](#mg22-results-2026-11-09)). The ZBT-1 build, chained above the Gecko Bootloader with the loader-linked router, is **lab-tested on one live ZBT-1 router** ([results](#zbt-1-results-2026-11-11)). The MG21 devkit and `gecko-recovery` builds are **not run on hardware** |
 | `efr32s2-hal::watchdog` | EFR32 Series 2 WDOG0 driver (period rounding, arm/kick/disarm) | Host-tested (period maths). On one MG22 it was seen armed while the loader ran and disarmed in the application. Its period and an actual expiry reset are **not measured** |
 | `bootloaders/phy62x2-boot` | PHY62x2 loader started by the boot ROM | Release-built, linted, ROM-boot image generated; **not run on hardware** |
 | `mcuboot-image::envelope` | Application-side verification of a signed MCUboot envelope (`EnvelopeWriter`) for chips whose ROM/SDK boot stays | Host-tested with imgtool vectors; ESP32 product tests; ESP32-H2 ZHA upgrade plus wrong-key and downgrade refusal on hardware ([results](#esp32-h2-signed-zha-ota-2026-11-10)); C6 and Telink not run on hardware |
@@ -568,7 +568,24 @@ from the EFR32 `gecko-recovery` option below.
     in any case);
   - MG21 `router` (355,680 B) does not fit the 252,672 B cap; the link
     fails.
-  ZBT-1 (`examples/ha-connect-zbt1`) has no `zrs-boot` variant yet.
+- **ZBT-1 loader-linked router.** `examples/ha-connect-zbt1` feature
+  `zrs-boot` (router role only; `ed`/`sed` refuse it at compile time) links
+  the router into the primary slot of `products/ha-connect-zbt1/boot/
+  zbt1.layout` (application `0x8200`, cap 473,856 B). `build.rs` checks
+  that the layout keeps the direct map's security journal and reserves its
+  router tables (`0xF4000..0xFC000`), so a direct-linked and a
+  loader-linked router resume the same child/APS tables and frame
+  counters. The product module `boot` (`products/ha-connect-zbt1/src/
+  boot.rs`) owns the flash split (a `StagingFlash` view below the router
+  tables: writes only to the secondary slot and the trial log), the loader
+  channel, the identity (`0x1234`/`0x2101`, file version `0x25MMmmpp`,
+  ELF symbol `ZRS_OTA_IDENTITY`) and `TrialConfirm`. The router confirms
+  once per boot when its status is `Online` **and** it has decrypted at
+  least one NWK-secured frame. There is no Zigbee OTA client in this
+  build: upgrades are staged into the secondary slot over SWD. Feature
+  `trial-no-confirm` (TEST-ONLY) never confirms, for the trial-expiry
+  test. `tools/verify-layout.py --layout boot/zbt1.layout` checks the
+  loader-linked ELF; CI builds, lints, layout-checks and test-signs it.
 
 **PHY62x2** (`bootloaders/phy62x2-boot`, feature `pb03f-kit`):
 
@@ -926,6 +943,7 @@ loader with `watchdog-ms = 8000`.
 | EFR32MG22 `ed,zrs-boot` (warn-level logs) | 204,484 B (was 229,788 B) | 236,288 B |
 | EFR32MG21 `sed,zrs-boot` | 234,272 B | 252,672 B |
 | EFR32MG21 `ed,zrs-boot` | 229,988 B | 252,672 B |
+| ZBT-1 `router,zrs-boot` (info logs, trial confirm, no OTA client) | 357,544 B (+2,048 vs the direct router's 355,496 B); `.bss` 39,184 B (unchanged), stack 58,096 B | 473,856 B |
 
 Shipped default images: with these changes reverted in the same worktree,
 the nRF52840 UF2 (ProMicro, 228,840 B) and EFR32MG22 sensor (234,160 B)
@@ -933,6 +951,14 @@ images are the same size. The other defaults (MG22 ed/router, MG21
 roles, other UF2 boards) were compared only across worktrees, where
 builds differ by 4–20 B in both directions from crate-hash layout noise;
 no growth was attributable to the changes.
+
+ZBT-1 shipped roles (`ed` 229,268 B, `router` 355,504 B, `sed` 225,520 B
+`.bin`), measured in one worktree before and after the `zrs-boot`
+change: every section has the same size and address, and the per-function
+disassembly (addresses and crate-hash suffixes normalised) is identical.
+The `.bin` bytes are not identical: the new build script and features
+change the crates' disambiguator hashes, which reorders functions at link
+time.
 
 Phase 3 application images (equal-length worktree paths, against `d4c4023`):
 
@@ -1676,6 +1702,55 @@ active OTA session holds fast poll.
 - **Parent link.** A lossy parent link with about 16% MAC NoAck makes a
   45 min download vulnerable to a parent-loss rejoin. zigpy then aborts
   on the re-announce.
+
+### ZBT-1 results (2026-11-11)
+
+The device is one Home Assistant Connect ZBT-1 (EFR32MG21A020F1024IM32,
+J-Link 89732290, SWD through hwlab). It is a live router in the home ZHA
+network as `0x4A76` and stayed joined throughout. Before the test it ran
+a direct-linked zigbee-rs router at `0x4000`, with the Nabu Casa Gecko
+Bootloader at `0x0..0x4000`.
+
+- **Loader:** the `efr32s2-boot` `ha-connect-zbt1` build (16 KiB
+  `loader.bin` at `0x4000`), with overwrite, one P-256 key (own key),
+  3 trial boots and an 8 s watchdog request (`PERSEL` 11).
+- **Application:** `examples/ha-connect-zbt1` built as `router,zrs-boot`,
+  TEST-ONLY versions 0.1.0–0.1.3 (357,564 B; the TEST-ONLY marker adds
+  20 B). The 0.1.2 image is a `router,trial-no-confirm` build.
+- **Test images:** padded secondary images were signed with imgtool 2.4.0,
+  options `--header-size 0x200 --pad-header --align 4 --slot-size 0x76000
+  --pad`. `zrs_boot_ota.py release` refused the CI key for this layout, as
+  intended.
+- **Validation level:** **lab-tested on one board**. There was no ZHA OTA
+  (the router has no OTA client), no Gecko recovery test and no power cut
+  during an install.
+
+| step | result |
+|---|---|
+| Preparation | Read-only identification (VTref 3.31 V, Gecko present, stock NVM3 leftover at `0x74000..0x7E000`, journals in use at `0xF4000+`). Full 1 MiB backup read twice, identical, SHA-256 `35a92f2b…`. The journal gate (`products/ha-connect-zbt1/tests/backup_compat.rs` on the backup, read-only flash view) passed: `0x4A76`, PAN `0xDFE9`, channel 15, NWK and TCLK counter reservations present, APS tables empty |
+| Install | Erased `0x4000..0x7E000` only (61 sectors, including the stock NVM3 leftover). Wrote loader plus signed 0.1.0 at `0x4000`. The Gecko region (`0x0..0x4000`, SHA-256 `c84f5462…`) was re-read unchanged |
+| First boot | Loader → application, `trial permanent` (SWD-written primary), `valid security journal preserved`, `router online: addr=0x4A76 ch=15 pan=0xDFE9`. No re-pair; the children rejoined or re-parented as after any router reboot |
+| Upgrade 0.1.0→0.1.1 | Padded image staged in the secondary over SWD. After the reset: `trial testing 1`, then `trial confirm: testing 1 -> confirmed` 0.9 s after online. The secondary's first sector and trailer were erased |
+| Downgrade 0.1.0 | Refused: 0.1.1 stayed `confirmed`, and the request was dropped (secondary first sector and trailer erased). Reset to banner took ≈8.4 s, against ≈2.9 s for a plain reset |
+| Wrong key (0.1.4, throw-away P-256) | Refused in the same way. The primary and Gecko were unchanged |
+| Trial expiry (0.1.2, no confirm) | Installed as `testing 1`, then `testing 2` and `testing 3` on the next resets. Later resets kept booting 0.1.2 with the log stopped at 3 attempts (overwrite mode: reported unconfirmed, not reverted). The router was online with the journal preserved on every boot |
+| Final 0.1.2→0.1.3 | Installed `testing 1` → `confirmed`. A plain reset then showed `trial confirmed` |
+| Watchdog | With the application running, `WDOG0` read `EN` = 0 and `CFG` = `0x000B0000` (`PERSEL` 11, left by the loader). There was no reset over more than 120 s of uptime. `EN` = 1 was not sampled during a loader run on this board (see MG22). The slowest loader path seen (the refusal, ≈5.4 s over a plain boot) stays under the 14.9 s minimum period |
+| Retention | The final backup (SHA-256 `03971523…`) passed the journal gate again: same identity, and the counter reservations only moved forward (NWK `0x56800`→`0x59C00`, TCLK `0x1900D`→`0x1C40D`). Gecko and loader bytes were unchanged. The primary equals the 0.1.3 image except the trial-log sector. ZHA shows `0x4A76` available with the same IEEE and two sleepy children |
+
+Notes:
+
+- **RTT during an install.** An RTT capture that resets the target fails
+  during an install ("invalid UTF-8" from the RTT stream). Use a plain
+  reset, then a capture without reset. Install duration was therefore not
+  measured.
+- **Restore.** Use the application and loader only: halt, erase
+  `0x4000..0xF4000`, then program a direct router image or the
+  `0x4000..0xF4000` slice of a backup. Never write `0x0..0x4000` (Gecko)
+  or anything from `0xF4000` up, and never restore a full backup (that
+  rolls back the frame counters).
+- **Board state.** Loader plus confirmed TEST-ONLY 0.1.3 loader-linked
+  router.
 
 ## Open decisions
 

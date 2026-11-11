@@ -29,6 +29,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46afbd2983a5d5a7bd740ccb198caf5b82f45c40c09c0eed36052d91cb92e719"
 
 [[package]]
+name = "block-buffer"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -154,6 +163,16 @@ dependencies = [
  "darling_core",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "digest"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+dependencies = [
+ "block-buffer",
+ "crypto-common",
 ]
 
 [[package]]
@@ -355,6 +374,7 @@ dependencies = [
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zcl",
+ "zrs-boot-layout",
 ]
 
 [[package]]
@@ -364,11 +384,13 @@ dependencies = [
  "efr32s2-hal",
  "embedded-storage",
  "ha-connect-zbt1",
+ "mcuboot-image",
  "router-app",
  "sensor-sed-app",
  "zigbee-aps",
  "zigbee-runtime",
  "zigbee-zcl",
+ "zrs-boot-layout",
 ]
 
 [[package]]
@@ -432,6 +454,14 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "mcuboot-image"
+version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+ "sha2",
+]
 
 [[package]]
 name = "nb"
@@ -520,6 +550,17 @@ dependencies = [
  "zigbee-mac",
  "zigbee-runtime",
  "zigbee-zcl",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]
@@ -702,3 +743,7 @@ dependencies = [
  "zigbee-nwk",
  "zigbee-types",
 ]
+
+[[package]]
+name = "zrs-boot-layout"
+version = "0.1.0"

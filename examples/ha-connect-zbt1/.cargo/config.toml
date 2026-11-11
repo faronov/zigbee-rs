@@ -3,7 +3,6 @@ target = "thumbv8m.main-none-eabihf"
 
 [target.thumbv8m.main-none-eabihf]
 rustflags = [
-    "-L", "../../products/ha-connect-zbt1/link",
     "-L", "../../efr32s2-hal/link/efr32mg21",
     "-C", "link-arg=-Tlink.x",
     "-C", "link-arg=--nmagic",

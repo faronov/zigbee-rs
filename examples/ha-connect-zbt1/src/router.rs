@@ -9,6 +9,13 @@
 //!
 //! Product identity, policy, TX power and the journals are owned by
 //! `products/ha-connect-zbt1`; physical resources by `boards/ha-connect-zbt1`.
+//!
+//! With feature `zrs-boot` the image runs from the primary slot of the
+//! zigbee-rs loader (`products/ha-connect-zbt1/boot/zbt1.layout`), chained
+//! after the Gecko Bootloader. It logs which loader started it and, once
+//! back on the network, confirms an image the loader installed on trial
+//! (`product::boot::TrialConfirm`). Router tables and the security journal
+//! stay at the direct map's addresses.
 
 #![no_std]
 #![no_main]
@@ -60,7 +67,11 @@ const SUMMARY_PERIOD: Duration = Duration::from_secs(60);
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let started = platform::start(product::ROUTER_MODEL);
-    let app = compose(started.radio, started.flash);
+    #[cfg(feature = "zrs-boot")]
+    let (flash, mut trial) = loader_trial(started.flash);
+    #[cfg(not(feature = "zrs-boot"))]
+    let flash = started.flash;
+    let app = compose(started.radio, flash);
     if let Err(error) = app.initialize().await {
         fatal(app.parts_mut(), error);
     }
@@ -85,12 +96,106 @@ async fn main(_spawner: Spawner) {
             fatal(app.parts_mut(), error);
         }
 
+        #[cfg(feature = "zrs-boot")]
+        trial.confirm_when_online(app);
+
         if Instant::now() >= next_summary {
             next_summary += SUMMARY_PERIOD;
             log_summary(app);
         }
     }
 }
+
+/// The running image's trial, confirmed once the router is back online.
+#[cfg(feature = "zrs-boot")]
+struct LoaderTrial {
+    confirm: product::boot::TrialConfirm<product::boot::BootFlash>,
+    /// `trial-no-confirm` reported that it leaves the trial running.
+    skipped: bool,
+}
+
+/// Split the flash for the loader view, report which loader started this
+/// image and read its trial state.
+#[cfg(feature = "zrs-boot")]
+fn loader_trial(
+    flash: efr32s2_hal::flash::Efr32s2Flash,
+) -> (efr32s2_hal::flash::Efr32s2Flash, LoaderTrial) {
+    let (flash, mut low) = product::boot::split_flash(flash);
+    let channel = product::boot::channel(&mut low);
+    let confirm = product::boot::TrialConfirm::new(low);
+    let (trial, boots) = trial_label(confirm.state());
+    log::info!(
+        "[ZBT1] ZBT1 app {}{}: loader {channel:?}, image 0x{:04X}/0x{:04X} file 0x{:08X}, trial {trial} {boots}",
+        product::SW_BUILD,
+        if product::VERSION_OVERRIDDEN {
+            " (TEST-ONLY version)"
+        } else {
+            ""
+        },
+        product::boot::MANUFACTURER_CODE,
+        product::boot::IMAGE_TYPE,
+        product::boot::FILE_VERSION,
+    );
+    (
+        flash,
+        LoaderTrial {
+            confirm,
+            skipped: false,
+        },
+    )
+}
+
+#[cfg(feature = "zrs-boot")]
+impl LoaderTrial {
+    /// Confirm the trial once the router is online and NWK security works
+    /// on the air; one attempt per boot.
+    fn confirm_when_online(&mut self, app: &App) {
+        if !self.confirm.pending() || self.skipped {
+            return;
+        }
+        let online = matches!(app.parts().status.last, Some(RouterStatus::Online { .. }));
+        let decrypted = app
+            .node()
+            .device()
+            .bdb()
+            .zdo()
+            .nwk()
+            .rx_security_stats()
+            .decrypt_successes;
+        if !product::boot::confirm_due(online, decrypted) {
+            return;
+        }
+        if cfg!(feature = "trial-no-confirm") {
+            self.skipped = true;
+            log::warn!("[ZBT1] trial-no-confirm: online, leaving the trial unconfirmed");
+            return;
+        }
+        let (before, boots) = trial_label(self.confirm.confirm());
+        let (after, _) = trial_label(self.confirm.state());
+        log::info!("[ZBT1] trial confirm: {before} {boots} -> {after}");
+    }
+}
+
+/// Compact trial-state label for RTT (no `Debug` of the loader types):
+/// `(state, boots on trial)`.
+#[cfg(feature = "zrs-boot")]
+fn trial_label(
+    state: Result<product::boot::TrialState, product::boot::BootError>,
+) -> (&'static str, u16) {
+    use product::boot::TrialState;
+    match state {
+        Ok(TrialState::Permanent) => ("permanent", 0),
+        Ok(TrialState::Testing { attempts }) => ("testing", attempts),
+        Ok(TrialState::Confirmed) => ("confirmed", 0),
+        Err(_) => ("unreadable", 0),
+    }
+}
+
+/// Identity read by `tools/zrs_boot_ota.py` from the ELF.
+#[cfg(feature = "zrs-boot")]
+#[unsafe(no_mangle)]
+#[used]
+static ZRS_OTA_IDENTITY: [u32; 2] = product::boot::OTA_IDENTITY;
 
 /// Build MAC, device, stores and app into static storage. Not inlined, so
 /// the large builder temporaries are released before the run loop.

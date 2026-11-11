@@ -11,6 +11,10 @@ autobins = false
 #   cargo build --release                                       # ed (default)
 #   cargo build --release --no-default-features --features router
 #   cargo build --release --no-default-features --features sed
+# Loader-linked router (primary slot of boot/zbt1.layout, chained after the
+# Gecko Bootloader), in its own target dir:
+#   cargo build --release --no-default-features --features router,zrs-boot \
+#     --target-dir target/zrs-boot
 [[bin]]
 name = "ha-connect-zbt1-ed"
 path = "src/main.rs"
@@ -50,6 +54,9 @@ embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
 log = "0.4"
 static_cell = "2"
 
+[build-dependencies]
+zrs-boot-layout = { path = "../../bootloaders/layout" }
+
 [features]
 default = ["ed"]
 # Always-on End Device (the original image).
@@ -65,6 +72,14 @@ sed = [
 ]
 # SED lab: keep the debug interface powered in EM2 (RTT/SWD while asleep).
 em2-debug = []
+# Router image for the zigbee-rs loader (products/ha-connect-zbt1/boot/
+# zbt1.layout): linked into the primary slot, confirms its trial once back
+# on the network. Upgrades are staged over SWD (no Zigbee OTA client).
+# Router role only (src/platform.rs).
+zrs-boot = ["ha-connect-zbt1-product/zrs-boot"]
+# TEST-ONLY trial-expiry bench image: never confirms, so the loader reports
+# the expired trial and keeps booting it (overwrite mode).
+trial-no-confirm = ["zrs-boot"]
 
 [profile.dev]
 opt-level = "s"

@@ -15,15 +15,23 @@ publish = false
 efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21"] }
 embedded-storage = "0.3"
 ha-connect-zbt1 = { path = "../../boards/ha-connect-zbt1" }
+mcuboot-image = { path = "../../mcuboot-image", optional = true }
 router-app = { path = "../../apps/router", default-features = false }
 sensor-sed-app = { path = "../../apps/sensor-sed", default-features = false, optional = true }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 
+[build-dependencies]
+zrs-boot-layout = { path = "../../bootloaders/layout" }
+
 [features]
 # Sleepy End Device role policy (pulls in the SED lifecycle crate).
 sed = ["dep:sensor-sed-app"]
+# The image runs from the primary slot of the zigbee-rs loader chained
+# above the Gecko Bootloader (boot/zbt1.layout): layout constants, the
+# release version and the trial confirm (`boot`). No OTA client.
+zrs-boot = ["dep:mcuboot-image"]
 
 [dev-dependencies]
 zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
