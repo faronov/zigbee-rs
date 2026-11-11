@@ -120,9 +120,23 @@ pub async fn run(profile: GpdProfile) -> ! {
         profile,
         eui64,
         |key: &mut [u8]| {
-            let mut trng = Trng::new()?;
+            let mut trng = Trng::new().inspect_err(|error| {
+                log::error!("[GPD] TRNG start (conditioning/startup tests): {error:?}");
+            })?;
             let filled = trng.fill(key);
             trng.release();
+            match filled {
+                // Key quality summary only; the key itself is never logged.
+                Ok(()) => log::info!(
+                    "[GPD] TRNG ok: {} key bytes, non-zero {}, {} distinct bytes, {} of {} bits set",
+                    key.len(),
+                    key.iter().any(|b| *b != 0),
+                    distinct_bytes(key),
+                    key.iter().map(|b| b.count_ones()).sum::<u32>(),
+                    key.len() * 8
+                ),
+                Err(error) => log::error!("[GPD] TRNG fill: {error:?}"),
+            }
             filled
         },
     )
@@ -178,8 +192,9 @@ pub async fn run(profile: GpdProfile) -> ! {
                     next_report = Instant::now() + interval;
                 }
                 GpdKind::Switch => {
+                    let counter = device.next_frame_counter();
                     let sent = device.switch(SwitchCommand::Toggle).await;
-                    log::info!("[GPD] Toggle: {sent:?}");
+                    log::info!("[GPD] Toggle fc {counter}: {sent:?}");
                     flash_result(&mut led, sent.is_ok()).await;
                 }
             },
@@ -246,9 +261,10 @@ async fn report(device: &mut Device, led: &mut Led0, sequence: &mut u32) {
         battery_half_percent: None,
     };
     *sequence = sequence.wrapping_add(1);
+    let counter = device.next_frame_counter();
     let sent = device.report_environment(report).await;
     log::info!(
-        "[GPD] report {} c°C {:?} c% : {sent:?}",
+        "[GPD] report fc {counter} {} c°C {:?} c% : {sent:?}",
         report.temperature_centi_celsius,
         report.humidity_centi_percent
     );
@@ -270,6 +286,15 @@ async fn blink(led: &mut Led0, times: u8, ms: u64) {
         led.off();
         Timer::after(Duration::from_millis(ms)).await;
     }
+}
+
+/// Number of different byte values in `bytes` (TRNG sanity summary).
+fn distinct_bytes(bytes: &[u8]) -> usize {
+    let mut seen = [false; 256];
+    bytes
+        .iter()
+        .filter(|b| !core::mem::replace(&mut seen[usize::from(**b)], true))
+        .count()
 }
 
 #[inline(never)]
