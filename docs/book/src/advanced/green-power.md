@@ -1,10 +1,59 @@
 # Zigbee Green Power (design draft)
 
-> **Status: design only, not implemented.** Nothing on this page has been
-> built, host-tested or tried on hardware. All size figures are estimates.
-> The spec references are to GP 1.0a (docs-09-5499-26). The GP Basic 1.1.x
-> document (14-0563) has not been obtained yet; any requirement marked
-> *(verify 1.1)* has to be checked against it before implementation.
+> **Status: Proxy Basic implemented and host-tested on the `green-power`
+> branch; nothing is hardware-tested yet.** The GPD app, bidirectional
+> operation, the full proxy and Combo/Sink are still design only. Spec
+> references are to GP 1.0a (docs-09-5499-26) and GP 1.1 where noted.
+
+## 0. Implementation status
+
+| Piece | State | Validation |
+|---|---|---|
+| `zigbee-gp` crate: GPDF codec, GP CCM* security, duplicate filter, Proxy Table, Pairing / Proxy Commissioning Mode / Response / Proxy Table Request, Notification and Commissioning Notification codecs | implemented | host tests, zigpy byte patterns, corrected GP 1.0a security vectors |
+| ZCL GP cluster IDs (`zigbee-zcl/green-power`) | fixed | host tests |
+| MAC sequence number on `MacFrame` (`zigbee-mac/green-power`) | implemented | host tests |
+| NWK/APS alias TX (`zigbee-nwk`/`zigbee-aps` `green-power`) | implemented | host tests |
+| Runtime proxy (`zigbee-runtime/green-power`): protocol-3 demux, GPEP 242 dispatch, Device_annce hooks, `gp_poll` / `gp_next_wait_us`, clear on leave | implemented | end-to-end host test: sink Pairing → tunnelled L3 Notification decrypted by a sink → replay dropped → reboot restore |
+| `GpProxyJournal` (two sectors, 1024-byte slots, EPID-bound, CRC + commit marker) | implemented | host tests: rollover, interrupted write, CRC fallback, erased, generation exhaustion, bad geometry |
+| `router-app/green-power`: product store (missing store is an error), restore after APS tables, persist when dirty, clear on reset / stale fresh join, receive slice bounded by tunnelling deadlines | implemented | lifecycle test |
+| ESP32-H2 router example `green-power` + 8 KiB `zbnv` journal at 0x3F8000 | builds | not flashed |
+| GPD app (MG22), bidirectional, full proxy, Combo/Sink | not started | — |
+
+Implementation notes that differ from the design below:
+
+- The MAC sequence number travels on `MacFrame` (`mac_sequence()`), not
+  on `McpsDataIndication`.
+- GPEP (242) group memberships are owned by the Proxy Table: the APS
+  group snapshot drops them and the GP restore re-adds them after the APS
+  restore.
+- The proxy persists the per-GPD security frame counter with a stride
+  (`ProxyConfig::counter_persist_stride`, default 16). After a power loss
+  up to stride − 1 already-tunnelled frames could be accepted once more by
+  this proxy; zigpy's sink checks the counter again. A stride of 1 removes
+  the window at the cost of one flash slot per frame.
+- The corrected ZCL GP cluster is behind `zigbee-zcl/green-power`
+  (enabled by `zigbee-runtime/green-power`). Without the feature,
+  `clusters/green_power_legacy.rs` (master's skeleton, verbatim) is
+  compiled. Changing the ungated cluster altered fat-LTO code folding
+  and so changed ESP router codegen, even though no image uses the
+  cluster.
+- Feature-off identity against master 8ce234f, all 13 shipped images
+  (release, `--locked`):
+  - BL702 router and sensor, EFR32MG1, TLSR8258 router and sensor, and
+    the ESP32-H2 thermometer are byte-identical as shipped.
+  - The other 7 (MG22 sensor, ESP32-C6/H2 routers, ESP32-H2 sensor,
+    nRF52833 ED, nRF52840 router, ZBT-1 router) differ only in the
+    line/column fields of `core::panic::Location` records, because shared
+    source files gained lines. A checker confirms that every differing
+    word is such a field.
+  - Built with `-Zlocation-detail=none`, all 11 non-TLSR images are
+    byte-identical.
+
+**Measured cost (ESP32-H2 router, release, `green-power` on vs off):**
+`.text` +25,284 B, `.rodata` +1,572 B, `.data` +320 B, `.bss` +2,280 B
+(about 27.2 KB flash, 2.6 KB RAM), plus about 1.8 KB of stack during a
+Proxy Table save or restore. Re-measured at the commit that gated the ZCL
+cluster: unchanged.
 
 Zigbee Green Power (GP) lets batteryless or very-low-power devices (GPDs)
 send short frames without joining the network. GP Data Frames (GPDFs) use
