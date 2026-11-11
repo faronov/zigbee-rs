@@ -168,6 +168,10 @@ jobs:
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
             features: esp32h2,sed,roles
+          - name: ESP32-H2 router product (Green Power proxy)
+            manifest: products/esp32-zigbee-devkit/Cargo.toml
+            workspace: products/esp32-zigbee-devkit
+            features: esp32h2,roles,green-power
           - name: ESP32-C6 light-sleep product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit

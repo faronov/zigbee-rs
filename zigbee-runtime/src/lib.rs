@@ -127,6 +127,12 @@ pub mod nv_storage;
 pub mod ota;
 #[cfg(feature = "ota")]
 pub mod ota_transport;
+#[cfg(all(feature = "green-power", not(feature = "router")))]
+compile_error!("`green-power` implements the GP proxy of a router: enable `router` too");
+#[cfg(feature = "green-power")]
+pub mod gp_store;
+#[cfg(feature = "green-power")]
+pub mod green_power;
 pub mod power;
 pub mod profile;
 pub mod remote_reporting;
@@ -8247,6 +8253,9 @@ pub struct ZigbeeDevice<M: MacDriver, R: crate::role::DeviceRole = crate::role::
     /// concrete state through [`ParentRole`](crate::role::ParentRole) /
     /// [`EndDeviceRole`](crate::role::EndDeviceRole).
     role_state: R::State,
+    /// Green Power proxy state (GP 1.1 Proxy Basic).
+    #[cfg(feature = "green-power")]
+    green_power: green_power::GreenPowerState,
     /// Zero-sized compile-time logical role marker.
     _role: core::marker::PhantomData<R>,
 }
@@ -10664,6 +10673,8 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         // coordinator re-runs it from scratch.
         self.remote_reporting.clear();
         self.secure_rejoin_retry_at = None;
+        #[cfg(feature = "green-power")]
+        self.green_power.clear();
         R::ed_reset(self);
     }
 
@@ -14693,6 +14704,14 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         }
         let mac_payload = indication.payload.as_slice();
 
+        // Green Power data frames (NWK protocol version 3) bypass the Zigbee
+        // NWK layer, which only speaks protocol version 2.
+        #[cfg(feature = "green-power")]
+        if zigbee_gp::frame::is_gpdf(mac_payload) {
+            self.gp_receive_gpdf(indication);
+            return None;
+        }
+
         // NWK layer: header parsing, broadcast eligibility, BTR/relay for
         // routing devices, replay checks, decryption and NWK command
         // dispatch all live in the shared NWK implementation. The runtime
@@ -14920,6 +14939,12 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 return None;
             }
             let announced = authenticated_device_announcement(&aps_indication, src, nwk_security);
+            // Proxies act on every authenticated Device_annce, including the
+            // all-ones-IEEE announcements other proxies send for aliases.
+            #[cfg(feature = "green-power")]
+            if cluster_id == zigbee_zdo::DEVICE_ANNCE && nwk_security {
+                self.gp_device_annce(aps_indication.payload);
+            }
             if cluster_id == zigbee_zdo::DEVICE_ANNCE && announced.is_none() {
                 return None;
             }
@@ -15100,6 +15125,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         // The only `M`-generic side effects — APS group-table updates and the
         // Finding & Binding Identify collection — are returned as actions and
         // applied here, after the borrow of runtime-local state is released.
+        #[cfg(feature = "green-power")]
+        if self.gp_handle_aps(&aps_indication, src_addr, nwk_security) {
+            return None;
+        }
         self.dispatch_application_zcl(clusters, &aps_indication, dst_ep, cluster_id, src_addr, dst)
     }
 
@@ -16440,6 +16469,192 @@ mod parent_router_tests {
             .unwrap(),
             security_use: false,
         }
+    }
+
+    /// GP Proxy Basic end to end: a sink's GP Pairing arrives over the
+    /// secured NWK, a paired L3 GPDF is tunnelled as a groupcast GP
+    /// Notification under the GPD alias, a replay is rejected, and the
+    /// persisted Proxy Table restores the entry, its group and its counter.
+    #[cfg(feature = "green-power")]
+    #[test]
+    fn gp_proxy_tunnels_paired_gpdf_and_restores_its_table() {
+        use zigbee_aps::ApsTxOptions;
+        use zigbee_aps::apsde::ApsdeDataRequest;
+        use zigbee_aps::{ApsAddress, ApsAddressMode};
+        use zigbee_gp::cluster::{Notification, Pairing, PairingSink, client_cmd, server_cmd};
+        use zigbee_gp::types::{CommunicationMode, GpdId, KeyType, SecurityLevel};
+
+        const SRC: u32 = 0x8765_4321;
+        const GROUP: u16 = 0x0B84;
+        const KEY: [u8; 16] = [
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD,
+            0xCE, 0xCF,
+        ];
+        // GP 1.1 A.1.5.5.4: L3, shared key, frame counter 2, Off (0x20).
+        const L3_GPDF: [u8; 15] = [
+            0x8C, 0x18, 0x21, 0x43, 0x65, 0x87, 0x02, 0x00, 0x00, 0x00, 0x83, 0xCA, 0x43, 0x24,
+            0xDD,
+        ];
+        const GPDF_MAC_SEQ: u8 = 0x20;
+
+        let gpdf = || McpsDataIndication {
+            src_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+            dst_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+            lqi: 180,
+            payload: MacFrame::from_slice(&L3_GPDF)
+                .unwrap()
+                .with_mac_sequence(GPDF_MAC_SEQ),
+            security_use: false,
+        };
+
+        // The sink (as ZHA does) pairs the GPD for commissioned groupcast.
+        let mut sink = centralized_coordinator();
+        sink.bdb
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nib_mut()
+            .ieee_address = TC_IEEE;
+        let pairing = Pairing {
+            gpd_id: GpdId::SrcId(SRC),
+            add_sink: true,
+            remove_gpd: false,
+            communication_mode: CommunicationMode::CommissionedGroupcast,
+            gpd_fixed: false,
+            mac_seq_cap: true,
+            security_level: SecurityLevel::Encrypted,
+            key_type: KeyType::GpdGroupKey,
+            sink: PairingSink::Group(GROUP),
+            device_id: Some(0x02),
+            frame_counter: Some(1),
+            key: Some(KEY),
+            assigned_alias: None,
+            groupcast_radius: None,
+        };
+        let mut zcl = [0u8; 64];
+        zcl[..3].copy_from_slice(&[0x19, 0x42, client_cmd::PAIRING]);
+        let len = 3 + pairing.encode(&mut zcl[3..]).unwrap();
+        block_on(
+            sink.bdb
+                .zdo_mut()
+                .aps_mut()
+                .apsde_data_request(&ApsdeDataRequest {
+                    dst_addr_mode: ApsAddressMode::Short,
+                    dst_address: ApsAddress::Short(ShortAddress(0xFFFD)),
+                    dst_endpoint: 242,
+                    profile_id: 0xA1E0,
+                    cluster_id: 0x0021,
+                    src_endpoint: 242,
+                    payload: &zcl[..len],
+                    tx_options: ApsTxOptions {
+                        use_nwk_key: true,
+                        ..ApsTxOptions::default()
+                    },
+                    radius: 0,
+                    alias_src_addr: None,
+                    alias_seq: None,
+                }),
+        )
+        .unwrap();
+        let pairing_frame = McpsDataIndication {
+            src_address: MacAddress::Short(PAN, ShortAddress::COORDINATOR),
+            dst_address: MacAddress::Short(PAN, ShortAddress(0xFFFF)),
+            lqi: 200,
+            payload: MacFrame::from_slice(
+                sink.mac().tx_history().last().unwrap().payload.as_slice(),
+            )
+            .unwrap(),
+            security_use: false,
+        };
+
+        let mut router = centralized_router();
+        assert!(block_on(router.process_incoming(&pairing_frame, &mut [])).is_none());
+        assert_eq!(router.gp_proxy().entries().len(), 1);
+        assert!(
+            router
+                .bdb
+                .zdo()
+                .aps()
+                .group_member_endpoints(GROUP)
+                .contains(&242)
+        );
+
+        // A paired GPDF is tunnelled after the tunnelling delay.
+        router.mac_mut().clear_tx_history();
+        assert!(block_on(router.process_incoming(&gpdf(), &mut [])).is_none());
+        block_on(router.mac_mut().delay_micros(150_000));
+        block_on(router.gp_poll());
+        let history = router.mac().tx_history();
+        assert_eq!(history.len(), 1);
+        let nwk = history[0].payload.as_slice();
+        // Secured NWK data frame under the GPD alias.
+        assert_eq!(nwk[1] & 0x02, 0x02);
+        assert_eq!(u16::from_le_bytes([nwk[4], nwk[5]]), SRC as u16);
+        assert_eq!(nwk[7], GPDF_MAC_SEQ.wrapping_sub(13));
+
+        // The sink decrypts a GP Notification for the GPD.
+        let nwk_frame: heapless::Vec<u8, 128> = heapless::Vec::from_slice(nwk).unwrap();
+        let indication = block_on(
+            sink.bdb
+                .zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .process_incoming_nwk_frame(&nwk_frame, 200),
+        );
+        let Some(zigbee_nwk::nlde::NwkIndication::Owned(aps)) = indication else {
+            panic!("sink must decrypt the tunnelled frame");
+        };
+        assert_eq!(aps.src_addr, ShortAddress(SRC as u16));
+        // APS group frame: FC, group, cluster, profile, src EP, counter.
+        let zcl = &aps.payload[9..];
+        assert_eq!(zcl[2], server_cmd::NOTIFICATION);
+        let decoded = Notification::decode(&zcl[3..]).unwrap();
+        assert_eq!(decoded.gpd_id, GpdId::SrcId(SRC));
+        assert_eq!(decoded.frame_counter, 2);
+        assert_eq!(decoded.command_id, 0x20);
+
+        // Replays are dropped, also after the duplicate window.
+        router.mac_mut().clear_tx_history();
+        block_on(router.mac_mut().delay_micros(3_000_000));
+        assert!(block_on(router.process_incoming(&gpdf(), &mut [])).is_none());
+        block_on(router.mac_mut().delay_micros(150_000));
+        block_on(router.gp_poll());
+        assert!(router.mac().tx_history().is_empty());
+
+        // The table survives a reboot with its group and frame counter.
+        let mut store = crate::gp_store::RamGpProxyStore::new();
+        assert!(router.save_gp_proxy_table_if_dirty(&mut store).unwrap());
+        assert!(!router.save_gp_proxy_table_if_dirty(&mut store).unwrap());
+        let mut rebooted = centralized_router();
+        assert_eq!(rebooted.restore_gp_proxy_table(&mut store).unwrap(), 1);
+        assert_eq!(rebooted.gp_proxy().entries()[0].frame_counter, 2);
+        assert!(
+            rebooted
+                .bdb
+                .zdo()
+                .aps()
+                .group_member_endpoints(GROUP)
+                .contains(&242)
+        );
+        assert!(block_on(rebooted.process_incoming(&gpdf(), &mut [])).is_none());
+        block_on(rebooted.mac_mut().delay_micros(150_000));
+        block_on(rebooted.gp_poll());
+        assert!(rebooted.mac().tx_history().is_empty());
+
+        // A snapshot from another network is refused.
+        let mut foreign = centralized_router();
+        foreign
+            .bdb
+            .zdo_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nib_mut()
+            .extended_pan_id = [0x5A; 8];
+        assert_eq!(
+            foreign.restore_gp_proxy_table(&mut store),
+            Err(crate::gp_store::GpStoreError::ForeignNetwork)
+        );
+        assert!(foreign.gp_proxy().entries().is_empty());
     }
 
     #[test]

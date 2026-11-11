@@ -54,6 +54,10 @@ log = "0.4"
 default = []
 alloc = []
 mock = []
+# Green Power: carry the received MAC sequence number in `MacFrame`
+# (unsecured GPDF replay/duplicate counter). Off by default; shipped images
+# are byte-identical without it.
+green-power = []
 
 # Platform backends
 esp32c6 = [

@@ -235,6 +235,18 @@ pub enum DiagnosticEvent {
     },
     ApsTablesSaved,
     ApsTablesCleared,
+    #[cfg(feature = "green-power")]
+    GpProxyTableRestored {
+        count: usize,
+    },
+    #[cfg(feature = "green-power")]
+    GpProxyTableDiscarded {
+        error: zigbee_runtime::gp_store::GpStoreError,
+    },
+    #[cfg(feature = "green-power")]
+    GpProxyTableSaved,
+    #[cfg(feature = "green-power")]
+    GpProxyTableCleared,
     FrameReceived,
     StackEvent(StackEventSummary),
     RunAgain {

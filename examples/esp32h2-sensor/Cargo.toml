@@ -101,6 +101,13 @@ waveshare-h2-zero = ["esp32-zigbee-devkit-product/waveshare-h2-zero"]
 # Lab only, never in shipped images: red, green, blue for 3 s each when the
 # LED starts, to check the colour byte order of the board.
 status-led-selftest = ["status-led", "esp32-zigbee-devkit-product/status-led-selftest"]
+# Green Power Proxy Basic on the router: tunnels GPDFs to the sink and
+# journals the Proxy Table in `zbnv`. Off by default (images unchanged).
+green-power = [
+    "router",
+    "router-app/green-power",
+    "esp32-zigbee-devkit-product/green-power",
+]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
 # Accept only signed MCUboot envelopes over OTA (see the product's

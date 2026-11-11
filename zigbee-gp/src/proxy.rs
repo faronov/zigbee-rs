@@ -17,9 +17,9 @@
 use zigbee_crypto::{AesKey, ForwardAesProvider};
 
 use crate::cluster::{
-    self, CommissioningNotification, GppGpdLink, Notification, NotificationResponse, Pairing,
-    PairingSink, ProxyCommissioningMode, ProxyInfo, ProxyTableRequest, Response, client_cmd,
-    exit_mode, server_cmd,
+    self, CommissioningNotification, GP_CLUSTER_REVISION, GppGpdLink, Notification,
+    NotificationResponse, Pairing, PairingSink, ProxyCommissioningMode, ProxyInfo,
+    ProxyTableRequest, Response, attr, client_cmd, exit_mode, functionality, server_cmd,
 };
 use crate::codec::{Reader, Writer};
 use crate::dup::DuplicateFilter;
@@ -39,6 +39,10 @@ pub const MAX_SINK_GROUPS: usize = 2;
 pub const MAX_DESTINATIONS: usize = MAX_UNICAST_SINKS + MAX_SINK_GROUPS + 1;
 /// Maximum Green Power cluster command payload produced by the proxy.
 pub const MAX_GP_COMMAND_LEN: usize = 128;
+/// Largest Green Power cluster command payload that fits one unfragmented,
+/// NWK-secured APS frame: 127-byte PSDU − 9 MAC header − 2 FCS − 8 NWK header
+/// − 14 NWK auxiliary header − 4 MIC − 8 APS header − 3 ZCL header.
+pub const MAX_TX_PAYLOAD: usize = 79;
 /// Maximum encoded length of one Proxy Table entry.
 pub const MAX_ENTRY_ENCODED_LEN: usize = 2
     + 9
@@ -520,6 +524,27 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         }
     }
 
+    /// Active configuration.
+    pub fn config(&self) -> &ProxyConfig {
+        &self.config
+    }
+
+    /// Replace the configuration (product policy).
+    pub fn set_config(&mut self, config: ProxyConfig) {
+        self.config = config;
+    }
+
+    /// Drop the Proxy Table and all volatile state (leave / factory reset).
+    /// The emptied table is reported by [`take_dirty`](Self::take_dirty) so
+    /// the owner persists the reset.
+    pub fn clear(&mut self) {
+        self.table.clear();
+        self.pending.clear();
+        self.commissioning = None;
+        self.dup = DuplicateFilter::new(crate::dup::DUPLICATE_TIMEOUT_MS);
+        self.dirty = true;
+    }
+
     /// Update this node's NWK address (after join / rejoin / conflict).
     pub fn set_own_nwk(&mut self, nwk: u16) {
         self.own_nwk = nwk;
@@ -553,9 +578,64 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         })
     }
 
+    /// Encode a GP *client* cluster attribute served by this proxy (GP 1.1
+    /// A.3.4.2) into `out` as ZCL data. Returns the ZCL data type and the
+    /// encoded length, or `None` for an unsupported attribute.
+    ///
+    /// The Proxy Table attribute is a long octet string of the encoded
+    /// entries; when it does not fit `out` the result is
+    /// [`Error::BufferFull`] and sinks use Proxy Table Request instead.
+    pub fn read_attribute(&self, id: u16, out: &mut [u8]) -> Result<Option<(u8, usize)>> {
+        const UINT8: u8 = 0x20;
+        const UINT16: u8 = 0x21;
+        const BITMAP24: u8 = 0x1A;
+        const LONG_OCTET_STRING: u8 = 0x43;
+        let mut w = Writer::new(out);
+        let data_type = match id {
+            attr::GPP_MAX_PROXY_TABLE_ENTRIES => {
+                w.u8(N.min(u8::MAX as usize) as u8)?;
+                UINT8
+            }
+            attr::PROXY_TABLE => {
+                let mut total = 0usize;
+                let mut tmp = [0u8; MAX_ENTRY_ENCODED_LEN];
+                for e in &self.table {
+                    total += e.encode(&mut tmp)?;
+                }
+                w.u16(u16::try_from(total).map_err(|_| Error::BufferFull)?)?;
+                for e in &self.table {
+                    let n = e.encode(&mut tmp)?;
+                    w.bytes(&tmp[..n])?;
+                }
+                LONG_OCTET_STRING
+            }
+            attr::GPP_FUNCTIONALITY => {
+                w.u24(functionality::BASIC_PROXY)?;
+                BITMAP24
+            }
+            attr::GPP_ACTIVE_FUNCTIONALITY => {
+                // A.3.4.2.8: GP feature set, remaining sub-fields reserved 1.
+                w.u24(0x00FF_FFFF)?;
+                BITMAP24
+            }
+            attr::CLUSTER_REVISION => {
+                w.u16(GP_CLUSTER_REVISION)?;
+                UINT16
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some((data_type, w.len())))
+    }
+
     /// Returns and clears the "table changed, persist it" flag.
     pub fn take_dirty(&mut self) -> bool {
         core::mem::take(&mut self.dirty)
+    }
+
+    /// Set the "table changed, persist it" flag again, e.g. after the owner
+    /// failed to persist a snapshot.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     fn find(&self, gpd: &GpdId) -> Option<usize> {
@@ -1197,7 +1277,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         let mut encoded = [0u8; MAX_GP_COMMAND_LEN];
         let mut used = 0usize;
         let mut count = 0u8;
-        let budget = MAX_GP_COMMAND_LEN - 4;
+        // Status, total, start index and entry count precede the entries.
+        let budget = MAX_TX_PAYLOAD - 4;
         for e in slice {
             let mut tmp = [0u8; MAX_ENTRY_ENCODED_LEN];
             let n = e.encode(&mut tmp)?;
@@ -1395,6 +1476,78 @@ mod tests {
         assert_eq!(&fx.groups[..], &[GroupChange::Join(0x0B84)]);
         assert!(p.take_dirty());
         p
+    }
+
+    #[test]
+    fn serves_mandatory_client_attributes() {
+        let p = paired_proxy(1);
+        let mut out = [0u8; 128];
+        assert_eq!(
+            p.read_attribute(attr::GPP_MAX_PROXY_TABLE_ENTRIES, &mut out),
+            Ok(Some((0x20, 1)))
+        );
+        assert_eq!(out[0], 4);
+        assert_eq!(
+            p.read_attribute(attr::GPP_FUNCTIONALITY, &mut out),
+            Ok(Some((0x1A, 3)))
+        );
+        assert_eq!(
+            u32::from_le_bytes([out[0], out[1], out[2], 0]),
+            functionality::BASIC_PROXY
+        );
+        assert_eq!(
+            p.read_attribute(attr::GPP_ACTIVE_FUNCTIONALITY, &mut out),
+            Ok(Some((0x1A, 3)))
+        );
+        assert_eq!(&out[..3], &[0xFF, 0xFF, 0xFF]);
+        let Ok(Some((0x43, n))) = p.read_attribute(attr::PROXY_TABLE, &mut out) else {
+            panic!()
+        };
+        let body = u16::from_le_bytes([out[0], out[1]]) as usize;
+        assert_eq!(n, body + 2);
+        let (entry, used) = ProxyEntry::decode(&out[2..n]).unwrap();
+        assert_eq!(used, body);
+        assert_eq!(entry.gpd_id, GpdId::SrcId(SRC));
+        assert_eq!(p.read_attribute(attr::GP_LINK_KEY, &mut out), Ok(None));
+        let mut tiny = [0u8; 4];
+        assert_eq!(
+            p.read_attribute(attr::PROXY_TABLE, &mut tiny),
+            Err(Error::BufferFull)
+        );
+    }
+
+    #[test]
+    fn proxy_table_response_fits_one_unfragmented_frame() {
+        let mut p = P::new(ProxyConfig::default());
+        for i in 0..4u32 {
+            let mut e = ProxyEntry::new(GpdId::SrcId(0x1000 + i));
+            e.security_level = SecurityLevel::Encrypted;
+            e.key_type = KeyType::IndividualKey;
+            e.key = Some(KEY_C0);
+            e.groups
+                .push(SinkGroup {
+                    group: 0x0B84,
+                    alias: None,
+                })
+                .unwrap();
+            p.restore(e).unwrap();
+        }
+        let mut reply = None;
+        p.on_client_command(
+            0x0000,
+            client_cmd::PROXY_TABLE_REQUEST,
+            &[0x08, 0x00],
+            0,
+            &mut reply,
+        )
+        .unwrap();
+        let TxFrame::GpCommand { payload, .. } = reply.unwrap().frame else {
+            panic!()
+        };
+        assert!(payload.len() <= MAX_TX_PAYLOAD);
+        // Status, total entries, start index, then at least one entry.
+        assert_eq!(&payload[..3], &[0x00, 4, 0]);
+        assert!(payload[3] >= 1 && payload[3] < 4);
     }
 
     #[test]

@@ -426,6 +426,12 @@ pub struct NwkLayer<M: MacDriver> {
     /// an unauthenticated frame can never be treated as evidence of an address
     /// conflict.
     pub(crate) rx_authenticated: bool,
+    /// One-shot Green Power alias (GP 1.1 A.3.6.3.3) applied to the next
+    /// `nlde_data_request` only: NWK source address and sequence number are
+    /// replaced, while NIB address, sequence and NWK security frame counter
+    /// stay those of this device.
+    #[cfg(feature = "green-power")]
+    tx_alias: Option<(ShortAddress, u8)>,
 }
 
 impl<M: MacDriver> NwkLayer<M> {
@@ -487,6 +493,8 @@ impl<M: MacDriver> NwkLayer<M> {
             next_child_addr_offset: 1,
             pending_command_outcome: None,
             rx_authenticated: false,
+            #[cfg(feature = "green-power")]
+            tx_alias: None,
         }
     }
 
@@ -551,6 +559,8 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).next_child_addr_offset).write(1);
             core::ptr::addr_of_mut!((*slot).pending_command_outcome).write(None);
             core::ptr::addr_of_mut!((*slot).rx_authenticated).write(false);
+            #[cfg(feature = "green-power")]
+            core::ptr::addr_of_mut!((*slot).tx_alias).write(None);
         }
     }
 
@@ -575,6 +585,15 @@ impl<M: MacDriver> NwkLayer<M> {
     }
 
     /// Get reference to the NIB.
+    /// Arm a one-shot Green Power alias for the next NLDE-DATA.request
+    /// (GP 1.1 A.3.6.3.3): that frame carries `alias_addr`/`alias_seq` as its
+    /// NWK source address and sequence number. The alias is consumed by the
+    /// next request whatever its outcome; the NIB is not modified.
+    #[cfg(feature = "green-power")]
+    pub fn set_tx_alias(&mut self, alias_addr: ShortAddress, alias_seq: u8) {
+        self.tx_alias = Some((alias_addr, alias_seq));
+    }
+
     pub fn nib(&self) -> &nib::Nib {
         &self.nib
     }

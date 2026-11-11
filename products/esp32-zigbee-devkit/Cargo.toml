@@ -66,6 +66,9 @@ waveshare-h2-zero = ["esp32-zigbee-devkit/waveshare-h2-zero"]
 # when the status LED starts, to check the board's colour byte order.
 status-led-selftest = ["status-led"]
 light-sleep = []
+# Green Power Proxy Basic on the router image: the router app's GP proxy and
+# its Proxy Table journal in `zbnv`.
+green-power = ["roles", "router-app/green-power", "zigbee-runtime/green-power"]
 # Persist ZCL Configure Reporting state in `zbnv` (sleepy sensor images).
 reporting-persist = []
 # Persist the sleepy sensor's anomaly record (fired keep-awake limits) in

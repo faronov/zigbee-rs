@@ -301,6 +301,20 @@ impl Diagnostics for LogDiagnostics {
             DiagnosticEvent::SecureRejoinLimitReached { failures } => {
                 log::warn!("[ESP32-H2] secure rejoin limit reached at {}", failures)
             }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableRestored { count } => {
+                log::info!("[ESP32-H2] {} GP proxy table entries restored", count)
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableDiscarded { error } => {
+                log::warn!("[ESP32-H2] GP proxy table discarded: {:?}", error)
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableSaved => log::info!("[ESP32-H2] GP proxy table saved"),
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableCleared => {
+                log::info!("[ESP32-H2] GP proxy table cleared")
+            }
             DiagnosticEvent::FactoryReset => log::info!("[ESP32-H2] security journal reset"),
             DiagnosticEvent::Fatal(error) => log::error!("[ESP32-H2] fatal: {:?}", error),
             _ => {}

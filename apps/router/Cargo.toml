@@ -18,6 +18,10 @@ trust-center = ["router", "zigbee-runtime/trust-center"]
 # Maintenance rejoin requests through `RouterObserver::take_rejoin_request`.
 # Off by default so products that never request one carry no request path.
 rejoin-request = []
+# Green Power Proxy Basic: runs the runtime GP proxy on joined routers and
+# persists its Proxy Table through the store given to
+# `set_green_power_store`. Off by default: images without it are unchanged.
+green-power = ["router", "zigbee-runtime/green-power"]
 
 [dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }
@@ -31,6 +35,7 @@ zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, feat
 zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+zigbee-gp = { path = "../../zigbee-gp", features = ["proxy"] }
 
 # The lifecycle suite exercises the routing and coordinator frontends, which
 # exist only with the `router` feature. Keep `cargo test -p router-app` with

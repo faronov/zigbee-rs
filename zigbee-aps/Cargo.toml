@@ -23,6 +23,8 @@ fragmentation = []
 router = ["zigbee-nwk/router", "fragmentation"]
 trust-center = ["router"]
 trace = ["zigbee-nwk/trace"]
+# Green Power alias transmission for GP Notification tunnelling. Off by default.
+green-power = ["zigbee-nwk/green-power"]
 
 [dev-dependencies]
 zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }

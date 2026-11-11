@@ -413,6 +413,10 @@ impl<M: MacDriver> NwkLayer<M> {
         discover_route: bool,
         kind: crate::IndirectFrameKind,
     ) -> Result<NldeDataConfirm, NwkStatus> {
+        // Consume the one-shot alias first so it can never leak into a later
+        // frame, whatever path this request takes.
+        #[cfg(feature = "green-power")]
+        let alias = self.tx_alias.take();
         #[cfg(not(feature = "router"))]
         let _ = kind;
         if !self.joined {
@@ -527,7 +531,13 @@ impl<M: MacDriver> NwkLayer<M> {
                 self.routing.clear_route_record_required(dst_addr);
             }
         }
+        #[cfg(not(feature = "green-power"))]
         let seq = self.nib.next_seq();
+        #[cfg(feature = "green-power")]
+        let seq = match alias {
+            Some((_, alias_seq)) => alias_seq,
+            None => self.nib.next_seq(),
+        };
 
         // Build NWK header
         // Note: multicast flag is ONLY for group-addressed frames (via APS group delivery).
@@ -561,7 +571,10 @@ impl<M: MacDriver> NwkLayer<M> {
                 end_device_initiator: false, // Maximise compatibility with older stacks
             },
             dst_addr,
+            #[cfg(not(feature = "green-power"))]
             src_addr: self.nib.network_address,
+            #[cfg(feature = "green-power")]
+            src_addr: alias.map_or(self.nib.network_address, |(alias_addr, _)| alias_addr),
             radius,
             seq_number: seq,
             dst_ieee: None,

@@ -1370,7 +1370,10 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             src_address: source,
             dst_address: destination,
             lqi: frame.lqi,
+            #[cfg(not(feature = "green-power"))]
             payload: MacFrame::from_slice(&data[payload_offset..])?,
+            #[cfg(feature = "green-power")]
+            payload: MacFrame::from_slice(&data[payload_offset..])?.with_mac_sequence(data[2]),
             security_use,
         })
     }
@@ -2221,6 +2224,35 @@ mod tests {
         assert_eq!(indication.payload.as_slice(), [0xCC]);
         assert_eq!(indication.lqi, 180);
         assert_eq!(core.phy().sent_acks.as_slice(), [(0x2A, false)]);
+    }
+
+    /// A Green Power data frame (GP 1.1 A.1.4.1: MAC FC 0x0801 — data,
+    /// broadcast PAN/short destination, no source address) is delivered to
+    /// the stack with its MAC sequence number, which unsecured GPDFs use as
+    /// their duplicate/replay counter.
+    #[test]
+    #[cfg(feature = "green-power")]
+    fn gpdf_broadcast_is_delivered_with_its_mac_sequence() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        let gpdf = [
+            0x01, 0x08, 0xA7, 0xFF, 0xFF, 0xFF, 0xFF, // MAC header, seq 0xA7
+            0x8C, 0x10, 0x32, 0x54, 0x76, 0x98, 0x20, // NWK FC v3, SrcID, Off
+        ];
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(PhyRxFrame::from_slice(&gpdf, 150).unwrap())))
+            .unwrap();
+
+        let indication = block_on(core.receive_data(5_000)).unwrap();
+
+        assert_eq!(indication.payload.as_slice(), &gpdf[7..]);
+        assert_eq!(indication.payload.mac_sequence(), 0xA7);
+        assert!(matches!(
+            indication.src_address,
+            MacAddress::Short(_, ShortAddress(0xFFFF))
+        ));
     }
 
     #[test]

@@ -70,6 +70,8 @@ macro_rules! zigbee_device_fields {
             aps_tables_persisted: false,
             secure_rejoin_retry_at: None,
             role_state: <$role as DeviceRole>::State::new(),
+            #[cfg(feature = "green-power")]
+            green_power: crate::green_power::GreenPowerState::new(),
             _role: core::marker::PhantomData,
         )
     };

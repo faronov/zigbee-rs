@@ -95,7 +95,12 @@ pub mod attr {
     pub const GP_SHARED_SECURITY_KEY: u16 = 0x0021;
     /// gpLinkKey.
     pub const GP_LINK_KEY: u16 = 0x0022;
+    /// ClusterRevision (global attribute).
+    pub const CLUSTER_REVISION: u16 = 0xFFFD;
 }
+
+/// Green Power cluster revision implemented by this crate (GP 1.1).
+pub const GP_CLUSTER_REVISION: u16 = 1;
 
 /// gppFunctionality / gpsFunctionality bits (GP spec Table 41).
 pub mod functionality {

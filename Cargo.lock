@@ -1557,6 +1557,7 @@ name = "router-app"
 version = "0.1.0"
 dependencies = [
  "zigbee-aps",
+ "zigbee-gp",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-runtime",
@@ -2115,6 +2116,7 @@ dependencies = [
  "log",
  "zigbee-aps",
  "zigbee-bdb",
+ "zigbee-gp",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-types",
