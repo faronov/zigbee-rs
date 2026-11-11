@@ -367,6 +367,7 @@ mod tests {
             (APS_TABLE_OFFSET, APS_TABLE_SIZE),
             (REPORTING_OFFSET, REPORTING_SIZE),
             (ANOMALY_OFFSET, ANOMALY_SIZE),
+            (GP_PROXY_TABLE_OFFSET, GP_PROXY_TABLE_SIZE),
             (NV_OFFSET, NV_SIZE),
         ];
         for (index, (start, size)) in windows.iter().enumerate() {
@@ -382,9 +383,10 @@ mod tests {
                 CHILD_TABLE_OFFSET,
                 APS_TABLE_OFFSET,
                 REPORTING_OFFSET,
-                ANOMALY_OFFSET
+                ANOMALY_OFFSET,
+                GP_PROXY_TABLE_OFFSET
             ),
-            (0x003F_0000, 0x003F_2000, 0x003F_4000, 0x003F_6000)
+            (0x003F_0000, 0x003F_2000, 0x003F_4000, 0x003F_6000, 0x003F_8000)
         );
     }
 
