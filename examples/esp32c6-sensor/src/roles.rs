@@ -163,7 +163,7 @@ impl CommissioningTrigger {
 }
 
 /// Lifecycle changes on the console. The DevKitC-1 LED is a WS2812 on
-/// GPIO8 (no plain GPIO LED): it is shown only with `status-led` (see
+/// GPIO8 (no plain GPIO LED): it is shown with `status-led` (always in the router; see
 /// [`Status`]).
 pub struct LogStatus {
     last: Option<RouterStatus>,

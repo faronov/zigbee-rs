@@ -15,7 +15,7 @@ fn main() {
     let feature = |name: &str| env::var_os(format!("CARGO_FEATURE_{name}")).is_some();
     assert!(
         !feature("STATUS_LED") || !(feature("SED") || feature("FLOOR_LAB")),
-        "`status-led` is for the mains roles: build with --no-default-features --features router,status-led (or ed,status-led)"
+        "`status-led` is for the mains roles: the router enables it; the ED takes --no-default-features --features ed,status-led"
     );
 
     let raw = env::var("ESP32_OTA_VERSION").unwrap_or_else(|_| "1".to_owned());

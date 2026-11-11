@@ -62,9 +62,10 @@ its `roles` feature; the SED-only modules (policy, wake, OTA) sit behind
 
 **Status LED (`status-led`, mains roles only).** All three boards (C6
 DevKitC-1, H2 DevKitM-1, Waveshare H2-Zero) fit a WS2812-class RGB LED with
-DIN on GPIO8; a plain GPIO level cannot light it. With
-`--no-default-features --features router,status-led` (or `ed,status-led`)
-the image drives it from RMT channel 0:
+DIN on GPIO8; a plain GPIO level cannot light it. The router image
+(`--no-default-features --features router`) always enables `status-led`;
+the ED takes it on request (`--features ed,status-led`). Such an image
+drives the LED from RMT channel 0:
 
 - `router_app::StatusIndicator` (shared, host tested) maps the
   `RouterStatus` lifecycle, the NIB permit-join flag and OTA events to an
@@ -79,8 +80,9 @@ the image drives it from RMT channel 0:
   frame that fits a single channel memory block. A frame is written only
   when the colour changes (about 330 µs busy wait, interrupts enabled).
 
-The feature is opt-in. Sleepy images reject it at build time and keep GPIO8
-isolated; without it, the role images log status on the console only. The
+It is default-on only for the router (about 3.8 KB of app image, 32 B of
+`.bss`). The ED keeps it opt-in, and sleepy images reject it at build time
+and keep GPIO8 isolated; without it the ED logs status on the console only. The
 router has no OTA client, so the OTA indication does not occur there yet.
 
 **Frame Pending.** The radio auto-ACKs in hardware, and the core is too late

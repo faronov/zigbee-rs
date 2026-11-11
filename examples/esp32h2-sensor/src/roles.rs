@@ -163,7 +163,7 @@ impl CommissioningTrigger {
 }
 
 /// Lifecycle changes on the console. The board LED on GPIO8 is a WS2812,
-/// not a plain GPIO LED: it is shown only with `status-led` (see
+/// not a plain GPIO LED: it is shown with `status-led` (always in the router; see
 /// [`Status`]).
 pub struct LogStatus {
     last: Option<RouterStatus>,

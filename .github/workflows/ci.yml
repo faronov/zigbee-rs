@@ -1069,21 +1069,19 @@ jobs:
           # the router is the positive control for the symbol pattern.
           ../../tools/check-role-symbols.sh leaf "$DIR/esp32c6-sensor" "$DIR/esp32c6-ed"
           ../../tools/check-role-symbols.sh parent "$DIR/esp32c6-router"
-      - name: Build and check ESP32-C6 status-LED role images
+      - name: Build and check ESP32-C6 status-LED images
         working-directory: examples/esp32c6-sensor
         run: |
-          # Opt-in WS2812 status LED (RMT, `status-led`) for the mains roles.
-          # Only these images may link the RMT driver.
-          for role in ed router; do
-            cargo build --release --locked -Z build-std=core,alloc --target-dir target/status-led \
-              --no-default-features --features "$role,status-led"
-            cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/status-led \
-              --no-default-features --features "$role,status-led" -- -D warnings
-          done
+          # WS2812 status LED (RMT, `status-led`): part of the router feature,
+          # opt-in for the ED. Only these images may link the RMT driver.
+          cargo build --release --locked -Z build-std=core,alloc --target-dir target/status-led \
+            --no-default-features --features ed,status-led
+          cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/status-led \
+            --no-default-features --features ed,status-led -- -D warnings
           DIR=target/riscv32imac-unknown-none-elf/release
           LED_DIR=target/status-led/riscv32imac-unknown-none-elf/release
           CSV=../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv
-          for image in esp32c6-ed esp32c6-router; do
+          for image in esp32c6-ed; do
             espflash save-image --skip-update-check --chip esp32c6 \
               --partition-table "$CSV" --target-app-partition ota_0 \
               "$LED_DIR/$image" "$LED_DIR/$image.app.bin"
@@ -1095,12 +1093,11 @@ jobs:
               --chip esp32c6 --slot ota_0 --merged "$LED_DIR/$image.bin" "$LED_DIR/$image.app.bin"
           done
           ../../tools/check-role-symbols.sh leaf "$LED_DIR/esp32c6-ed"
-          ../../tools/check-role-symbols.sh parent "$LED_DIR/esp32c6-router"
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           for elf in "$DIR/esp32c6-sensor" "$DIR/esp32c6-ed" "$DIR/esp32c6-router" \
-            "$LED_DIR/esp32c6-ed" "$LED_DIR/esp32c6-router"; do
+            "$LED_DIR/esp32c6-ed"; do
             SYMS="$("$NM" --demangle "$elf")"
-            if [[ "$elf" == "$LED_DIR"/* ]]; then
+            if [[ "$elf" == "$LED_DIR"/* || "$elf" == */esp32c6-router ]]; then
               grep -q 'esp_hal::rmt::' <<<"$SYMS" ||
                 { echo "$elf is missing the RMT status LED driver" >&2; exit 1; }
             elif grep -q 'esp_hal::rmt::' <<<"$SYMS"; then
@@ -1207,21 +1204,19 @@ jobs:
           # the router is the positive control for the symbol pattern.
           ../../tools/check-role-symbols.sh leaf "$DIR/esp32h2-sensor" "$DIR/esp32h2-ed"
           ../../tools/check-role-symbols.sh parent "$DIR/esp32h2-router"
-      - name: Build and check ESP32-H2 status-LED role images
+      - name: Build and check ESP32-H2 status-LED images
         working-directory: examples/esp32h2-sensor
         run: |
-          # Opt-in WS2812 status LED (RMT, `status-led`) for the mains roles.
-          # Only these images may link the RMT driver.
-          for role in ed router; do
-            cargo build --release --locked -Z build-std=core,alloc --target-dir target/status-led \
-              --no-default-features --features "$role,status-led"
-            cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/status-led \
-              --no-default-features --features "$role,status-led" -- -D warnings
-          done
+          # WS2812 status LED (RMT, `status-led`): part of the router feature,
+          # opt-in for the ED. Only these images may link the RMT driver.
+          cargo build --release --locked -Z build-std=core,alloc --target-dir target/status-led \
+            --no-default-features --features ed,status-led
+          cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/status-led \
+            --no-default-features --features ed,status-led -- -D warnings
           DIR=target/riscv32imac-unknown-none-elf/release
           LED_DIR=target/status-led/riscv32imac-unknown-none-elf/release
           CSV=../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv
-          for image in esp32h2-ed esp32h2-router; do
+          for image in esp32h2-ed; do
             espflash save-image --skip-update-check --chip esp32h2 \
               --partition-table "$CSV" --target-app-partition ota_0 \
               "$LED_DIR/$image" "$LED_DIR/$image.app.bin"
@@ -1233,12 +1228,11 @@ jobs:
               --chip esp32h2 --slot ota_0 --merged "$LED_DIR/$image.bin" "$LED_DIR/$image.app.bin"
           done
           ../../tools/check-role-symbols.sh leaf "$LED_DIR/esp32h2-ed"
-          ../../tools/check-role-symbols.sh parent "$LED_DIR/esp32h2-router"
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           for elf in "$DIR/esp32h2-sensor" "$DIR/esp32h2-ed" "$DIR/esp32h2-router" \
-            "$LED_DIR/esp32h2-ed" "$LED_DIR/esp32h2-router"; do
+            "$LED_DIR/esp32h2-ed"; do
             SYMS="$("$NM" --demangle "$elf")"
-            if [[ "$elf" == "$LED_DIR"/* ]]; then
+            if [[ "$elf" == "$LED_DIR"/* || "$elf" == */esp32h2-router ]]; then
               grep -q 'esp_hal::rmt::' <<<"$SYMS" ||
                 { echo "$elf is missing the RMT status LED driver" >&2; exit 1; }
             elif grep -q 'esp_hal::rmt::' <<<"$SYMS"; then

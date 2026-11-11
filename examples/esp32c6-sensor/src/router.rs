@@ -6,8 +6,8 @@
 //! so the core's software pending set is empty) under
 //! [`router_app::ParentRouterApp`]: beacons, association, indirect TX to
 //! sleepy children, routing, durable child and APS tables. Status goes to
-//! the USB Serial/JTAG console (and, with `status-led`, the WS2812 on
-//! GPIO8), BOOT (GPIO9) re-arms commissioning after a Leave.
+//! the USB Serial/JTAG console and the WS2812 on GPIO8; BOOT (GPIO9)
+//! re-arms commissioning after a Leave.
 //!
 //! No OTA client: this image is installed over the serial/JTAG link into
 //! `ota_0`. The router never enters light sleep (`macRxOnWhenIdle`).
