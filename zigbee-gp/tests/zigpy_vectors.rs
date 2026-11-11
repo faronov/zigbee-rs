@@ -13,7 +13,8 @@ use zigbee_gp::cluster::{
 };
 use zigbee_gp::commissioning::{
     ApplicationInfo, AttributeReport, CommissioningPayload, CommissioningReply,
-    CommissioningSecurity, channel_configuration, channel_request, encode_channel_configuration,
+    CommissioningSecurity, MultiClusterReport, channel_configuration, channel_request,
+    encode_channel_configuration,
 };
 use zigbee_gp::frame::{parse, parse_mac};
 use zigbee_gp::security::{self, DEFAULT_TC_LINK_KEY, Direction, WrappedKey};
@@ -70,6 +71,40 @@ fn attribute_reports_match_zigpy() {
         .unwrap()
         .finish();
     assert_eq!(&b[..n], v::MFR_ATTR_REPORT_HUMIDITY);
+}
+
+#[test]
+fn multi_cluster_report_matches_zigpy() {
+    let mut b = [0u8; 32];
+    let n = MultiClusterReport::new(&mut b)
+        .int16(0x0402, 0x0000, -125)
+        .unwrap()
+        .uint16(0x0405, 0x0000, 4875)
+        .unwrap()
+        .uint8(0x0001, 0x0020, 30)
+        .unwrap()
+        .finish();
+    assert_eq!(&b[..n], v::MULTI_CLUSTER_REPORT_TEMP_HUM_BATT);
+}
+
+#[test]
+fn switch_commissioning_payload_matches_zigpy() {
+    let mut p = sensor_commissioning();
+    p.device_id = 0x02;
+    let mut cmds = heapless::Vec::new();
+    cmds.extend_from_slice(&[cmd::OFF, cmd::ON, cmd::TOGGLE])
+        .unwrap();
+    p.app_info = Some(ApplicationInfo {
+        manufacturer_id: Some(0x6D6B),
+        model_id: Some(0xF400),
+        gpd_commands: Some(cmds),
+        ..ApplicationInfo::default()
+    });
+    assert_eq!(encode::<64>(|b| p.encode(b)), v::COMMISSIONING_SWITCH_L3);
+    assert_eq!(
+        CommissioningPayload::decode(v::COMMISSIONING_SWITCH_L3).unwrap(),
+        p
+    );
 }
 
 #[test]
@@ -346,6 +381,28 @@ fn gpd_builder_matches_independent_gpdf() {
         )
         .unwrap();
     assert_eq!(&out[..n], v::GPDF_L3_TEMP_REPORT);
+    let n = g
+        .data_frame(
+            &mut aes,
+            &mut c,
+            TxOptions::default(),
+            cmd::MULTI_CLUSTER_REPORTING,
+            v::MULTI_CLUSTER_REPORT_TEMP_HUM_BATT,
+            &mut out,
+        )
+        .unwrap();
+    assert_eq!(&out[..n], v::GPDF_L3_MULTI_REPORT);
+    let n = g
+        .data_frame(
+            &mut aes,
+            &mut c,
+            TxOptions::default(),
+            cmd::TOGGLE,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+    assert_eq!(&out[..n], v::GPDF_L3_TOGGLE);
 }
 
 #[cfg(feature = "gpd")]
@@ -365,13 +422,16 @@ fn gpd_commissioning_frame_payload_matches_zigpy() {
         4,
     )
     .unwrap();
-    let c = CounterReservation::resume(16, 16);
+    let mut c = CounterReservation::resume(16, 16);
+    c.reserved(c.pending_reservation().unwrap().unwrap());
     let mut p = sensor_commissioning();
     p.security = None; // filled in by the builder
     let mut out = [0u8; 127];
     let n = g
-        .commissioning_frame(&mut aes, &c, &DEFAULT_TC_LINK_KEY, p, false, &mut out)
+        .commissioning_frame(&mut aes, &mut c, &DEFAULT_TC_LINK_KEY, p, false, &mut out)
         .unwrap();
+    // zigpy stores 16 as the last counter received; data starts at 17.
+    assert_eq!(c.peek(), 17);
     let mac = parse_mac(&out[..n]).unwrap();
     assert_eq!(mac.seq, 5);
     let f = parse(&out[mac.payload_offset..n], mac.seq, None).unwrap();

@@ -28,6 +28,8 @@ pub mod radio;
 pub mod rtcc;
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
+#[cfg(feature = "efr32mg22")]
+pub mod trng;
 pub mod usart;
 pub mod vectors;
 pub mod watchdog;

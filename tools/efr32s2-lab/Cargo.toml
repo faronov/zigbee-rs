@@ -33,6 +33,11 @@ name = "s2-em2"
 path = "src/bin/em2.rs"
 required-features = ["wstk"]
 
+[[bin]]
+name = "s2-trng"
+path = "src/bin/trng.rs"
+required-features = ["wstk"]
+
 [features]
 default = ["wstk"]
 # BRD4001A + BRD4183A (EFR32MG22): VCOM log, LED0, image at 0x0.

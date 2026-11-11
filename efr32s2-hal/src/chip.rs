@@ -102,6 +102,7 @@ impl BusClock {
     pub const LFXO: Self = Self::clken0(22);
     pub const RTCC: Self = Self::clken0(30);
     pub const DCDC: Self = Self::clken0(31);
+    pub const CRYPTOACC: Self = Self::clken1(13);
     pub const SMU: Self = Self::clken1(15);
     pub const MSC: Self = Self::clken1(17);
 }

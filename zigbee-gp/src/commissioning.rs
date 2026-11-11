@@ -397,9 +397,93 @@ impl<'a> AttributeReport<'a> {
     }
 }
 
+/// Builder for GPD Multi-Cluster Reporting (0xA2) / Manufacturer-specific
+/// Multi-Cluster Reporting (0xA3) payloads (GP spec A.4.2.3.3, zigpy
+/// `GPMultiClusterReportingPayload`): a list of `(cluster ID, attribute ID,
+/// ZCL data type, value)` records, so one GPDF can carry e.g. temperature
+/// and humidity.
+pub struct MultiClusterReport<'a> {
+    w: Writer<'a>,
+}
+
+impl<'a> MultiClusterReport<'a> {
+    /// Start a 0xA2 payload.
+    pub fn new(out: &'a mut [u8]) -> Self {
+        Self {
+            w: Writer::new(out),
+        }
+    }
+
+    /// Start a 0xA3 payload.
+    pub fn new_manufacturer(out: &'a mut [u8], manufacturer: u16) -> Result<Self> {
+        let mut w = Writer::new(out);
+        w.u16(manufacturer)?;
+        Ok(Self { w })
+    }
+
+    /// Append a raw record.
+    pub fn record(
+        mut self,
+        cluster_id: u16,
+        attr_id: u16,
+        data_type: u8,
+        value: &[u8],
+    ) -> Result<Self> {
+        self.w.u16(cluster_id)?;
+        self.w.u16(attr_id)?;
+        self.w.u8(data_type)?;
+        self.w.bytes(value)?;
+        Ok(self)
+    }
+
+    /// Append an `int16` record (ZCL type 0x29).
+    pub fn int16(self, cluster_id: u16, attr_id: u16, value: i16) -> Result<Self> {
+        self.record(cluster_id, attr_id, 0x29, &value.to_le_bytes())
+    }
+
+    /// Append a `uint16` record (ZCL type 0x21).
+    pub fn uint16(self, cluster_id: u16, attr_id: u16, value: u16) -> Result<Self> {
+        self.record(cluster_id, attr_id, 0x21, &value.to_le_bytes())
+    }
+
+    /// Append a `uint8` record (ZCL type 0x20).
+    pub fn uint8(self, cluster_id: u16, attr_id: u16, value: u8) -> Result<Self> {
+        self.record(cluster_id, attr_id, 0x20, &[value])
+    }
+
+    /// Finish, returning the payload length.
+    pub fn finish(self) -> usize {
+        self.w.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_cluster_report_layout() {
+        let mut buf = [0u8; 32];
+        let n = MultiClusterReport::new(&mut buf)
+            .int16(0x0402, 0x0000, -125)
+            .unwrap()
+            .uint16(0x0405, 0x0000, 4875)
+            .unwrap()
+            .finish();
+        assert_eq!(
+            &buf[..n],
+            &[
+                0x02, 0x04, 0x00, 0x00, 0x29, 0x83, 0xFF, 0x05, 0x04, 0x00, 0x00, 0x21, 0x0B, 0x13
+            ]
+        );
+        let mut small = [0u8; 6];
+        assert_eq!(
+            MultiClusterReport::new(&mut small)
+                .int16(0x0402, 0, 1)
+                .err(),
+            Some(Error::BufferFull)
+        );
+    }
 
     #[test]
     fn commissioning_round_trip() {

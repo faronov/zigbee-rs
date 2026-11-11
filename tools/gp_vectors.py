@@ -42,7 +42,9 @@ from zigpy.zgp.commands import (
     GPCommissioningPayload,
     GPCommissioningReplyOptions,
     GPCommissioningReplyPayload,
+    GPClusterReport,
     GPManufacturerSpecificAttributeReportingPayload,
+    GPMultiClusterReportingPayload,
 )
 from zigpy.zgp.types import (
     GP_GROUP_ID,
@@ -123,6 +125,32 @@ def main() -> None:
         ],
     ).serialize()
     emit("MFR_ATTR_REPORT_HUMIDITY", mreport)
+    multi = GPMultiClusterReportingPayload(
+        reports=[
+            GPClusterReport(
+                cluster_id=0x0402,
+                attribute=foundation.Attribute(
+                    attrid=0x0000,
+                    value=foundation.TypeValue(type=0x29, value=t.int16s(-125)),
+                ),
+            ),
+            GPClusterReport(
+                cluster_id=0x0405,
+                attribute=foundation.Attribute(
+                    attrid=0x0000,
+                    value=foundation.TypeValue(type=0x21, value=t.uint16_t(4875)),
+                ),
+            ),
+            GPClusterReport(
+                cluster_id=0x0001,
+                attribute=foundation.Attribute(
+                    attrid=0x0020,
+                    value=foundation.TypeValue(type=0x20, value=t.uint8_t(30)),
+                ),
+            ),
+        ]
+    ).serialize()
+    emit("MULTI_CLUSTER_REPORT_TEMP_HUM_BATT", multi)
 
     wrapped, mic = wrap_key_from_gpd(SRC_ID, GPD_KEY)
     comm = GPCommissioningPayload(
@@ -160,6 +188,44 @@ def main() -> None:
         model_id=t.uint16_t(0xF300),
     ).serialize()
     emit("COMMISSIONING_SENSOR_L3", comm)
+    switch_comm = GPCommissioningPayload(
+        device_id=0x02,
+        options=GPCommissioningOptions(
+            mac_seq_num_capability=1,
+            rx_on_capability=0,
+            app_info_present=1,
+            _reserved=0,
+            pan_id_request=0,
+            security_key_request=0,
+            fixed_location=1,
+            extended_options_present=1,
+        ),
+        extended_options=GPCommissioningExtendedOptions(
+            security_level=SecurityLevel.Encrypted,
+            key_type=SecurityKeyType.IndividualKey,
+            key_present=1,
+            key_encrypted=1,
+            outgoing_counter_present=1,
+        ),
+        security_key=t.KeyData(wrapped),
+        key_mic=t.uint32_t.deserialize(mic)[0],
+        outgoing_counter=t.uint32_t(16),
+        app_info=GPCommissioningAppInfo(
+            manufacturer_id_present=1,
+            model_id_present=1,
+            gpd_commands_present=1,
+            cluster_list_present=0,
+            switch_info_present=0,
+            app_description_follows=0,
+            _reserved=0,
+        ),
+        manufacturer_id=t.uint16_t(0x6D6B),
+        model_id=t.uint16_t(0xF400),
+        gpd_commands=t.LVList[t.uint8_t, t.uint8_t](
+            [GPDCommandID.Off, GPDCommandID.On, GPDCommandID.Toggle]
+        ),
+    ).serialize()
+    emit("COMMISSIONING_SWITCH_L3", switch_comm)
     emit("COMMISSIONING_WRAPPED_KEY", wrapped + mic)
 
     reply = GPCommissioningReplyPayload(
@@ -396,6 +462,8 @@ def main() -> None:
 
     # --- Over-the-air GPDF (independent AES-CCM) ---------------------------
     emit("GPDF_L3_TEMP_REPORT", gpdf_l3(SRC_ID, 0x11, GPD_KEY, 0xA0, report))
+    emit("GPDF_L3_MULTI_REPORT", gpdf_l3(SRC_ID, 0x12, GPD_KEY, 0xA2, multi))
+    emit("GPDF_L3_TOGGLE", gpdf_l3(SRC_ID, 0x13, GPD_KEY, 0x22, b""))
 
 
 if __name__ == "__main__":

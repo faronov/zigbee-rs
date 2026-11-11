@@ -227,12 +227,19 @@ impl Gpd {
     /// Build an unprotected GPD Commissioning (0xE0) GPDF.
     ///
     /// If the GPD is protected, the extended options advertise the level,
-    /// key type, the TC-LK protected key and the next outgoing counter.
+    /// key type, the TC-LK protected key and the outgoing counter.
     /// `payload.security` is overwritten from the configuration.
+    ///
+    /// The advertised counter is *taken* from `counter`: the sink stores it
+    /// as the last counter received and rejects any later GPDF whose counter
+    /// is not greater (zigpy `GreenPowerDevice.is_duplicate`, A.3.6.1.2), so
+    /// the first data frame must use the next value. Like
+    /// [`data_frame`](Self::data_frame) this fails until the reservation is
+    /// persisted.
     pub fn commissioning_frame(
         &mut self,
         aes: &mut impl ForwardAesProvider,
-        counter: &CounterReservation,
+        counter: &mut CounterReservation,
         tc_link_key: &AesKey,
         mut payload: CommissioningPayload,
         rx_after_tx: bool,
@@ -253,7 +260,7 @@ impl Gpd {
                     level: s.level,
                     key_type: s.key_type,
                     key: Some((w.key, Some(u32::from_le_bytes(w.mic)))),
-                    outgoing_counter: Some(counter.peek()),
+                    outgoing_counter: Some(counter.take()?),
                 })
             }
         };
@@ -446,7 +453,7 @@ mod tests {
             9,
         )
         .unwrap();
-        let c = CounterReservation::resume(100, 16);
+        let mut c = CounterReservation::resume(100, 16);
         let mut out = [0u8; MAX_GPD_FRAME];
         let p = CommissioningPayload {
             device_id: 0xFE,
@@ -462,9 +469,24 @@ mod tests {
                 ..ApplicationInfo::default()
             }),
         };
+        // Not reserved yet: the advertised counter must be durable first.
+        assert_eq!(
+            g.commissioning_frame(
+                &mut aes,
+                &mut c,
+                &DEFAULT_TC_LINK_KEY,
+                p.clone(),
+                false,
+                &mut out
+            ),
+            Err(Error::Unsupported)
+        );
+        c.reserved(c.pending_reservation().unwrap().unwrap());
         let n = g
-            .commissioning_frame(&mut aes, &c, &DEFAULT_TC_LINK_KEY, p, false, &mut out)
+            .commissioning_frame(&mut aes, &mut c, &DEFAULT_TC_LINK_KEY, p, false, &mut out)
             .unwrap();
+        // The first data frame must carry a counter above the advertised one.
+        assert_eq!(c.peek(), 101);
         assert_eq!(&out[..3], &[0x01, 0x08, 10]);
         let f = parse(&out[7..n], 10, None).unwrap();
         assert_eq!(f.header.security_level, SecurityLevel::None);
