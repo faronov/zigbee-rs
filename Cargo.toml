@@ -11,6 +11,7 @@ members = [
     "zigbee-zcl",
     "zigbee-runtime",
     "zigbee",
+    "zigbee-gp",
     "apps/router",
     "apps/sensor-sed",
     "examples/mock-sensor",

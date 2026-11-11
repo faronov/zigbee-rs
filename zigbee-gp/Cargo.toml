@@ -1,0 +1,29 @@
+[package]
+name = "zigbee-gp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Zigbee Green Power (GP) stub, proxy and GPD building blocks for zigbee-rs"
+repository = "https://github.com/zigbee-rs/zigbee-rs"
+
+[dependencies]
+heapless = "0.9"
+zigbee-types = { path = "../zigbee-types" }
+zigbee-crypto = { path = "../zigbee-crypto" }
+
+[features]
+default = []
+# GP Proxy Basic (GP 1.1 Basic proxy): GPDF reception and security
+# processing, proxy table, commissioning mode, Commissioning Notification and
+# groupcast / lightweight-unicast GP Notification tunnelling with aliasing,
+# duplicate filtering and Device_annce alias-conflict handling.
+proxy = []
+# Bidirectional proxy operation: gpTxQueue, GP Response handling, TempMaster
+# role (Commissioning Reply / Channel Configuration delivery).
+proxy-bidirectional = ["proxy"]
+# Full proxy: full unicast with GP Notification Response / retries, Tunneling
+# Stop, Pairing Search and proxy-table maintenance.
+proxy-full = ["proxy-bidirectional"]
+# Green Power Device side: GPDF builder, commissioning payload builder, key
+# wrapping and outgoing frame-counter handling.
+gpd = []

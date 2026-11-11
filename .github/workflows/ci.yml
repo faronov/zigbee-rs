@@ -89,6 +89,8 @@ jobs:
       - run: cargo test -p zigbee-zdo --features router --locked
       - run: cargo test -p zigbee-mac --features stm32wb --lib stm32wb --locked
       - run: cargo test -p zigbee-runtime --no-default-features --locked
+      - run: cargo test -p zigbee-gp --all-features --locked
+      - run: cargo test -p zigbee-gp --no-default-features --locked
       # Do not combine these with --workspace/--all-features: unification hid
       # missing mandatory TCLK features in both production frontends.
       - run: cargo test -p router-app --no-default-features --test production_graph --locked
@@ -375,6 +377,8 @@ jobs:
       - run: cargo clippy -p router-app --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p router-app --no-default-features --locked -- -D warnings
       - run: cargo clippy -p sensor-sed-app --all-targets --features ota --locked -- -D warnings
+      - run: cargo clippy -p zigbee-gp --all-targets --all-features --locked -- -D warnings
+      - run: cargo clippy -p zigbee-gp --all-targets --no-default-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-runtime --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zdo --features router --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --features stm32wb --all-targets --locked -- -D warnings
