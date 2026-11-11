@@ -376,8 +376,10 @@ No board crate gets GP storage. Products own the partitions.
   the channel and recommission; the sensor reports every 60 s; EM2 with
   the radio idled between events. Temperature is the die sensor and the
   humidity is **synthetic** (BRD4183A has no humidity sensor).
-- Flash map: application 0x0–0x74000 (no bootloader), GPD journal
-  0x74000–0x78000, 0x78000–0x80000 never written (0x7C000 keeps the Zigbee
+- Flash map: application 0x0–0x70000 (no bootloader), one GPD journal per
+  device kind (switch 0x70000–0x74000, sensor 0x74000–0x78000), so
+  swapping the sensor and switch images on one board keeps both
+  identities; 0x78000–0x80000 never written (0x7C000 keeps the Zigbee
   sensor product's security journal).
 - Measured (release): 40,048 B file-backed flash (`.text` 32,728,
   `.rodata` 6,668, `.data` 332), `.bss` 2,312 B; 29.9 KiB linked stack.

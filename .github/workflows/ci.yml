@@ -2316,15 +2316,16 @@ jobs:
       - name: Build EFR32 Series 2 lab gate binaries (MG22)
         working-directory: tools/efr32s2-lab
         run: cargo build --release --locked --bins
-      # Green Power Devices (sensor, switch): no network join, own journal
-      # at 0x74000; the image must stay inside 0..0x74000 like the sensor.
+      # Green Power Devices (sensor, switch): no network join, one journal
+      # per kind at 0x70000 (switch) / 0x74000 (sensor); the image must stay
+      # inside 0..0x70000.
       - name: Build and lint EFR32MG22 Green Power Devices
         working-directory: examples/efr32mg22-gpd
         run: |
           cargo build --release --locked --bins
           cargo clippy --release --locked --target thumbv8m.main-none-eabihf -- -D warnings
           for image in efr32mg22-gpd-sensor efr32mg22-gpd-switch; do
-            python3 ../efr32mg22-sensor/tools/verify-layout.py \
+            python3 ../efr32mg22-sensor/tools/verify-layout.py --flash-end 0x70000 \
               "target/thumbv8m.main-none-eabihf/release/$image"
           done
       - name: Create firmware artifacts

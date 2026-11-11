@@ -37,6 +37,9 @@ log = "0.4"
 # Keep the debug interface powered in EM2 (SWD attach while asleep).
 # Off by default so EM2 current is representative.
 em2-debug = []
+# LAB ONLY: the switch sends Off, On, Toggle in turn every 30 s without a
+# button press (unattended sink/event tests). Never a product image.
+lab-switch-cycle = []
 
 [profile.dev]
 opt-level = "s"

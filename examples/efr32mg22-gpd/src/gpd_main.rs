@@ -34,6 +34,10 @@ type Device = GpdDevice<Efr32s2RadioPhy, product::GpdStore>;
 
 /// Longest EM2 sleep of an idle device (RTCC ticks fit `u32`).
 const IDLE_SLEEP_MS: u32 = 3_600_000;
+/// Lab only (`lab-switch-cycle`): the switch sends Off, On, Toggle in turn
+/// at this interval without a button press, for unattended sink tests.
+#[cfg(feature = "lab-switch-cycle")]
+const LAB_CYCLE: Duration = Duration::from_secs(30);
 const HELD_POLL_MS: u64 = 25;
 
 static BUTTON_PENDING: AtomicBool = AtomicBool::new(false);
@@ -116,7 +120,7 @@ pub async fn run(profile: GpdProfile) -> ! {
     }
     let (mut device, provisioning) = Device::open(
         phy,
-        product::gpd_store(flash),
+        product::gpd_store(flash, profile.kind),
         profile,
         eui64,
         |key: &mut [u8]| {
@@ -159,20 +163,42 @@ pub async fn run(profile: GpdProfile) -> ! {
     let interval = Duration::from_secs(product::SENSOR_REPORT_INTERVAL_S);
     let mut next_report = Instant::now();
     let mut sequence = 0u32;
+    #[cfg(feature = "lab-switch-cycle")]
+    let mut next_cycle = Instant::now() + LAB_CYCLE;
+    #[cfg(feature = "lab-switch-cycle")]
+    if profile.kind == GpdKind::Switch {
+        log::warn!(
+            "[GPD] LAB build: Off/On/Toggle every {} s",
+            LAB_CYCLE.as_secs()
+        );
+    }
     loop {
         if profile.kind == GpdKind::Sensor && Instant::now() >= next_report {
             report(&mut device, &mut led, &mut sequence).await;
             next_report = Instant::now() + interval;
         }
+        #[cfg(feature = "lab-switch-cycle")]
+        if profile.kind == GpdKind::Switch && Instant::now() >= next_cycle {
+            let command = [SwitchCommand::Off, SwitchCommand::On, SwitchCommand::Toggle]
+                [(sequence % 3) as usize];
+            sequence = sequence.wrapping_add(1);
+            send_switch(&mut device, &mut led, command).await;
+            next_cycle = Instant::now() + LAB_CYCLE;
+        }
 
-        let sleep_ms = if profile.kind == GpdKind::Sensor {
-            next_report
+        let deadline = match profile.kind {
+            GpdKind::Sensor => Some(next_report),
+            #[cfg(feature = "lab-switch-cycle")]
+            GpdKind::Switch => Some(next_cycle),
+            #[cfg(not(feature = "lab-switch-cycle"))]
+            GpdKind::Switch => None,
+        };
+        let sleep_ms = deadline.map_or(IDLE_SLEEP_MS, |deadline| {
+            deadline
                 .saturating_duration_since(Instant::now())
                 .as_millis()
                 .min(u64::from(IDLE_SLEEP_MS)) as u32
-        } else {
-            IDLE_SLEEP_MS
-        };
+        });
         if !sleep(&mut device, &mut button, sleep_ms) {
             continue;
         }
@@ -191,12 +217,7 @@ pub async fn run(profile: GpdProfile) -> ! {
                     report(&mut device, &mut led, &mut sequence).await;
                     next_report = Instant::now() + interval;
                 }
-                GpdKind::Switch => {
-                    let counter = device.next_frame_counter();
-                    let sent = device.switch(SwitchCommand::Toggle).await;
-                    log::info!("[GPD] Toggle fc {counter}: {sent:?}");
-                    flash_result(&mut led, sent.is_ok()).await;
-                }
+                GpdKind::Switch => send_switch(&mut device, &mut led, SwitchCommand::Toggle).await,
             },
         }
         // Drop the release edge of the press just handled.
@@ -268,6 +289,13 @@ async fn report(device: &mut Device, led: &mut Led0, sequence: &mut u32) {
         report.temperature_centi_celsius,
         report.humidity_centi_percent
     );
+    flash_result(led, sent.is_ok()).await;
+}
+
+async fn send_switch(device: &mut Device, led: &mut Led0, command: SwitchCommand) {
+    let counter = device.next_frame_counter();
+    let sent = device.switch(command).await;
+    log::info!("[GPD] {command:?} fc {counter}: {sent:?}");
     flash_result(led, sent.is_ok()).await;
 }
 

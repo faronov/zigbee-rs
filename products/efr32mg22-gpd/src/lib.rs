@@ -26,32 +26,51 @@ pub const SWITCH_MODEL_ID: u16 = 0xF400;
 
 /// No resident bootloader: the image starts at 0x0.
 pub const APPLICATION_START: u32 = 0x0000_0000;
-pub const APPLICATION_END: u32 = 0x0007_4000;
-/// GPD journal: two 8 KiB sectors directly above the application.
+pub const APPLICATION_END: u32 = 0x0007_0000;
+/// GPD journals: one two-sector journal per device kind, so flashing the
+/// other image never touches (or reprovisions) this kind's identity.
 pub const GPD_JOURNAL_START: u32 = APPLICATION_END;
 pub const GPD_JOURNAL_SECTOR_SIZE: usize = FLASH_PAGE_SIZE;
-pub const GPD_JOURNAL_SIZE: usize = 2 * GPD_JOURNAL_SECTOR_SIZE;
+/// Size of one kind's journal (two sectors).
+pub const GPD_KIND_JOURNAL_SIZE: usize = 2 * GPD_JOURNAL_SECTOR_SIZE;
+/// Switch journal `0x70000..0x74000`.
+pub const SWITCH_JOURNAL_START: u32 = GPD_JOURNAL_START;
+/// Sensor journal `0x74000..0x78000` (the location of the first hardware
+/// commissioning; must not move, or the sensor loses its identity).
+pub const SENSOR_JOURNAL_START: u32 = SWITCH_JOURNAL_START + GPD_KIND_JOURNAL_SIZE as u32;
+/// Both journals.
+pub const GPD_JOURNAL_SIZE: usize = 2 * GPD_KIND_JOURNAL_SIZE;
 /// Never written by this product. `0x7C000..0x80000` is the Zigbee sensor
 /// product's security journal and stays intact across a GPD reflash.
 pub const UNTOUCHED_START: u32 = GPD_JOURNAL_START + GPD_JOURNAL_SIZE as u32;
 
+const _: () = assert!(SENSOR_JOURNAL_START == 0x0007_4000);
 const _: () = assert!(UNTOUCHED_START == 0x0007_8000);
 const _: () = assert!(FLASH_CAPACITY == 512 * 1024);
 const _: () = assert!((UNTOUCHED_START as usize) < FLASH_CAPACITY);
 const _: () = assert!(GPD_JOURNAL_SECTOR_SIZE == 8 * 1024);
 
-/// The flash window of the GPD journal.
+/// The flash window of the GPD journals.
 pub type GpdPartition = FlashPartition<GPD_JOURNAL_START, GPD_JOURNAL_SIZE>;
-/// The GPD journal of this product.
+/// The GPD journal of one device kind.
 pub type GpdStore = GpdJournal<GpdPartition, GPD_JOURNAL_SECTOR_SIZE>;
 
-/// Open the GPD journal, consuming the board's unique flash handle: this
-/// product writes nothing outside the journal partition.
-pub fn gpd_store(_flash: Efr32s2Flash) -> GpdStore {
+/// Offset of `kind`'s journal inside [`GpdPartition`].
+pub const fn journal_offset(kind: GpdKind) -> u32 {
+    match kind {
+        GpdKind::Switch => SWITCH_JOURNAL_START - GPD_JOURNAL_START,
+        GpdKind::Sensor => SENSOR_JOURNAL_START - GPD_JOURNAL_START,
+    }
+}
+
+/// Open `kind`'s GPD journal, consuming the board's unique flash handle:
+/// this product writes nothing outside that kind's two sectors.
+pub fn gpd_store(_flash: Efr32s2Flash, kind: GpdKind) -> GpdStore {
     // SAFETY: the unique `Efr32s2Flash` handle is consumed by value and this
     // is the only partition minted from it.
     let partition = unsafe { GpdPartition::new_unchecked() };
-    GpdJournal::new(partition, 0, GPD_JOURNAL_SECTOR_SIZE as u32)
+    let first = journal_offset(kind);
+    GpdJournal::new(partition, first, first + GPD_JOURNAL_SECTOR_SIZE as u32)
 }
 
 /// The default global Trust Center link key `ZigBeeAlliance09`.
@@ -152,6 +171,17 @@ mod tests {
             region("UNTOUCHED"),
             (UNTOUCHED_START, FLASH_CAPACITY as u32 - UNTOUCHED_START)
         );
+    }
+
+    #[test]
+    fn journals_are_disjoint_per_kind() {
+        let span = |k| {
+            let start = GPD_JOURNAL_START + journal_offset(k);
+            start..start + GPD_KIND_JOURNAL_SIZE as u32
+        };
+        assert_eq!(span(GpdKind::Switch), 0x70000..0x74000);
+        assert_eq!(span(GpdKind::Sensor), 0x74000..0x78000);
+        assert!(span(GpdKind::Sensor).end <= UNTOUCHED_START);
     }
 
     #[test]
