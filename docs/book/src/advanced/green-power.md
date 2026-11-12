@@ -3,7 +3,8 @@
 > **Status: Proxy Basic and the unidirectional GPD app (MG22 sensor and
 > switch) are implemented on the `green-power` branch. The MG22 GPD
 > sensor and switch are lab-tested on hardware directly against ZHA; the
-> proxy is host-tested only.** Bidirectional operation, the full
+> Proxy Basic is lab-tested on the ESP32-H2-Zero router against ZHA
+> (2026-11-12, see §6.1).** Bidirectional operation, the full
 > proxy and Combo/Sink are still design only. Spec
 > references are to GP 1.0a (docs-09-5499-26) and GP 1.1 where noted.
 
@@ -18,7 +19,7 @@
 | Runtime proxy (`zigbee-runtime/green-power`): protocol-3 demux, GPEP 242 dispatch, Device_annce hooks, `gp_poll` / `gp_next_wait_us`, clear on leave | implemented | end-to-end host test: sink Pairing → tunnelled L3 Notification decrypted by a sink → replay dropped → reboot restore |
 | `GpProxyJournal` (two sectors, 1024-byte slots, EPID-bound, CRC + commit marker) | implemented | host tests: rollover, interrupted write, CRC fallback, erased, generation exhaustion, bad geometry |
 | `router-app/green-power`: product store (missing store is an error), restore after APS tables, persist when dirty, clear on reset / stale fresh join, receive slice bounded by tunnelling deadlines | implemented | lifecycle test |
-| ESP32-H2 router example `green-power` + 8 KiB `zbnv` journal at 0x3F8000 | builds | not flashed |
+| ESP32-H2 router example `green-power` + 8 KiB `zbnv` journal at 0x3F8000 | lab-tested on hardware (2026-11-12) | Waveshare ESP32-H2-Zero, app-only flash over the shipped router (joined state kept, no rejoin): Proxy Commissioning Mode, Commissioning Notification tunnelled to ZHA, Pairing → proxy table entry persisted, groupcast Notification decoded by ZHA, table restored after reset without re-pairing (§6.1) |
 | `efr32s2-hal::trng` (MG22 CRYPTOACC BA431 TRNG: GSDK init, conditioning KAT, health-failure reinit) | implemented | host model tests; lab bin `s2-trng` built, not run |
 | `apps/gpd` (`gpd-app`): provisioning, `GpdJournal`, beacon scan for a permit-join network, unidirectional commissioning, L3 Multi-Cluster Reports and switch commands, CCA backoff | implemented | host tests: sink-side decode of commissioning (key unwrap), reports and Toggle; counter never reused across reboot; failed reservation transmits nothing; journal rollover / interrupted write / CRC fallback |
 | `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch lab-tested the same day with a separate SrcID (0x7A6B9879) and journal: commissioned, Off/On/Toggle events in HA every 30 s (`lab-switch-cycle` build), counter resumed at 16 after reset and accepted. Re-flashing the sensor resumed its own SrcID (counter 80) and ZHA accepted it |
@@ -387,6 +388,12 @@ No board crate gets GP storage. Products own the partitions.
 - `lab-switch-cycle` (lab only, never shipped): the switch sends
   Off/On/Toggle every 30 s without a button press, because hwlab cannot
   press BTN0.
+- BTN0 long press (sensor) is hardware-proven (2026-11-12): held ~5 s by
+  the user → `[GPD] long press: recommission` → scan → commissioned on
+  channel 15 in 2.5 s with the same SrcID, key and journal, LED0 lit while
+  scanning. The three commissioning GPDFs used counters 1176–1178 and the
+  next report used 1179 (no reuse). BTN0 is the WSTK button labelled
+  **PB0**; PB1 does nothing in this firmware.
 - NWK alias: zigpy gives a GPD the NWK `derive_alias(SrcID)` (the low 16
   bits). The first switch identity used a salt that only changed the high
   16 bits, so sensor and switch on one chip shared alias 0x9879. zigpy
@@ -543,6 +550,81 @@ used by other work is not touched.
    same GPD through the shared proxy table.
 8. **Soak:** 24 h with periodic reports. Then re-check the feature-off images
    for size and behaviour.
+
+### 6.1 Results: ESP32-H2-Zero proxy (2026-11-12)
+
+The proxy ran on the Waveshare ESP32-H2-Zero router (NWK 0x8C23, PAN
+0xDFE9, channel 15). The coordinator is EZSP (bellows), HA 2026.11.0,
+zigpy 2.4.1. The GPD was the MG22 sensor (SrcID 0x293C9879, level 3).
+All times are EET.
+
+- **Image:** `cargo build --release --locked --no-default-features
+  --features router,waveshare-h2-zero,green-power`.
+  - `app.bin` 512,096 B, sha256 `3537c4c2…cbb6a`; ELF 995,920 B.
+  - The earlier build of the same commit had `58612ccf…0d2a`. The only
+    difference is the build time embedded by `esp_app_desc!`: with that
+    timestamp the bytes reproduce exactly.
+- **Flash:** app only, 0x10000–0x8E000 (126 sectors), verified.
+  Bootloader, partition table, otadata, ota_1 and `zbnv` were unchanged.
+  The GP window 0x3F8000–0x3FA000 read back all 0xFF (empty) before
+  pairing.
+- **Boot:** resumed NWK 0x8C23 with no association or rejoin;
+  `0 GP proxy table entries restored`.
+- **Proxy Commissioning Mode:** each `zha.permit` produced
+  `[GP] proxy commissioning mode entered` in the same second.
+  - When the window expires, the proxy leaves the mode silently, with no
+    log line (open issue below).
+  - The router LED follows the NWK permit-join timer, which ends at the
+    same time.
+- **Commissioning Notification:** zigpy received a CN for 0x293C9879 with
+  `gpp_short_addr=0x8C23` at 16:53:20.018. The router logged the matching
+  CN TX, broadcast with alias source 0x9879 and the derived alias sequence.
+- **Pairing:**
+  - 16:59:51.9: the GPD logged the BTN0 long press. It was commissioned
+    at 16:59:54.4.
+  - zigpy then sent GP Pairing (`add_sink`) three times, once per
+    commissioning GPDF, using commissioned groupcast to group 0x0B84.
+  - Each Pairing produced `GP proxy table saved`. The window holds three
+    committed 1 KiB records, generations 0–2, each with the `ZBGP` magic,
+    the network EPID, the SrcID, group 0x0B84 and counters 1176–1178.
+  - Every Pairing wrote a new record, even when only the counter changed.
+- **Operational forwarding:** the router matched every report (fc
+  1179–1188) to the entry and logged `[GP] GPDF … Notification`.
+  - Its groupcast GP Notification reached zigpy at 17:05:21.314 (fc 1184)
+    and 17:06:21.436 (fc 1185). The 17:06:21.436 frame is attributed by an
+    exact match with the router's TX at 17:06:21.252: APS counter 0, ZCL
+    tsn 1, alias 0x9879 and seq 0x94. The 17:05:21.314 frame (APS counter
+    3, ZCL tsn 4) is consistent with the router's pre-reset counters
+    (its last CN used APS counter 2 and ZCL tsn 3).
+  - zigpy decoded both as MultiClusterReporting and updated the HA
+    entities.
+  - In the other cycles, IKEA proxies (0x1AA4, 0x7B65) tunnelled the same
+    GPDF within the 15 ms D_min. Our pending forward was then cancelled by
+    the duplicate rule (A.3.5.2.1), so no APS TX was logged. This mesh
+    therefore cannot attribute every report to a single proxy.
+  - The coordinator also hears the GPD directly, so an HA update alone does
+    not prove forwarding.
+- **Persistence:** after a debug-module system reset at 17:05:33 the
+  router resumed NWK 0x8C23 and logged `1 GP proxy table entries
+  restored`. It forwarded the next report at 17:06:21 (above) with no
+  Commissioning or Pairing traffic.
+- **Not covered:**
+  - a GPD out of the coordinator's range;
+  - an over-the-air capture of tunnelling timing;
+  - replay and bad-MIC tests on air;
+  - the soak test;
+  - bidirectional and Combo operation.
+- **Open issues:**
+  - The proxy logs nothing when the commissioning window expires
+    (`poll()` clears it silently), and nothing when a pending forward is
+    cancelled by another proxy's copy. A debug counter would make the
+    forwarding share visible.
+  - zigpy's repeated Pairings cost one journal record each. The 8 KiB
+    window holds 8 slots and rolls over safely, but an unchanged entry
+    should not be rewritten.
+  - Pre-existing, not GP: `[NWK] Frame counter replay from <nwk>` warnings
+    print the NWK source rather than the auxiliary-header source. The
+    router's direct link to the coordinator is weak (LQI ~22–33).
 
 ## 7. Open questions for the user
 
