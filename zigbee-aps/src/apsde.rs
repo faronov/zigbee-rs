@@ -877,7 +877,13 @@ impl<M: MacDriver> ApsLayer<M> {
                     ApsAddress::Group(g) => g,
                     _ => return Err(ApsStatus::InvalidParameter),
                 };
-                (ShortAddress(0xFFFF), ApsDeliveryMode::Group)
+                // R22 §2.2.4.1.1: without NWK multicast a group-addressed
+                // frame is a NWK broadcast to every rx-on-when-idle device
+                // (0xFFFD), not to all devices including sleepy ones.
+                (
+                    ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
+                    ApsDeliveryMode::Group,
+                )
             }
             ApsAddressMode::Extended => {
                 let ieee = match req.dst_address {
@@ -7802,6 +7808,39 @@ mod tests {
         let result = block_on(aps.apsde_data_request(&request));
         assert_eq!(result.unwrap_err(), ApsStatus::SecurityFail);
         assert!(aps.nwk().mac().tx_history().is_empty());
+    }
+
+    /// R22 §2.2.4.1.1: a group-addressed APS frame is carried as a NWK
+    /// broadcast to the rx-on-when-idle devices (0xFFFD), never to 0xFFFF.
+    #[test]
+    #[cfg(feature = "router")]
+    fn group_frames_are_nwk_broadcast_to_rx_on_when_idle_devices() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        let request = ApsdeDataRequest {
+            dst_addr_mode: ApsAddressMode::Group,
+            dst_address: ApsAddress::Group(0x0B84),
+            dst_endpoint: 0xFF,
+            profile_id: 0x0104,
+            cluster_id: 0x0006,
+            src_endpoint: 0x01,
+            payload: &[0x01, 0x00, 0x02],
+            tx_options: ApsTxOptions {
+                use_nwk_key: true,
+                ..ApsTxOptions::default()
+            },
+            radius: 0,
+            alias_src_addr: None,
+            alias_seq: None,
+        };
+        block_on(aps.apsde_data_request(&request)).unwrap();
+        let sent = &aps.nwk().mac().tx_history()[0];
+        let frame = sent.payload.as_slice();
+        assert_eq!(
+            u16::from_le_bytes([frame[2], frame[3]]),
+            ShortAddress::BROADCAST_RX_ON_WHEN_IDLE.0,
+            "NWK destination"
+        );
+        assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), LOCAL_SHORT.0);
     }
 
     /// Finding F8: APS security is end-to-end with a pairwise key and is
