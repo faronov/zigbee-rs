@@ -741,11 +741,12 @@ running the nRF 802.15.4 sniffer on channel 15.
       Seen at every forward, for example 22:41:57–22:41:59.
     - The alias TX path is GP-only (added in 9f118e3). The fix is to record
       `(alias, seq)` in the BTT when originating a broadcast with an alias.
-      It is not done yet.
+      Fixed in 99ebba6; see 6.3.
   - **NWK destination of groupcast Notifications.** Ours go to 0xFFFF. The
     spec (A.3.5.2) requires 0xFFFD, and IKEA sends 0xFFFD. The APS group →
     NWK 0xFFFF mapping (`zigbee-aps/src/apsde.rs`) predates GP. Commissioning
-    Notifications already use 0xFFFD.
+    Notifications already use 0xFFFD. Fixed on master's side in branch
+    `aps-group-fffd` (6a1b276); see 6.3.
   - **Alias sequence offset:** IKEA's operational Notifications use alias
     seq MAC − 12 rather than the commissioned-groupcast −13 (A.3.6.3.3.2) we
     use. As a result, the BTT never merges their copy with ours. This is an
@@ -756,6 +757,40 @@ running the nRF 802.15.4 sniffer on channel 15.
     application profile (A.3.5.2.1 (iii)).
   - **APS counter:** ours is the router's own APS counter. Other proxies
     reuse the alias NWK sequence.
+
+### 6.3 Fixes after 6.2 (host-tested; hardware re-check pending)
+
+- **APS group → NWK 0xFFFD** (branch `aps-group-fffd`, 6a1b276, based on
+  master 7e7342c; cherry-picked here as 94d6127):
+  - R22 §2.2.4.1.1: a group-addressed APS frame is a NWK broadcast to the
+    rx-on-when-idle devices, `ShortAddress::BROADCAST_RX_ON_WHEN_IDLE`.
+  - Host test `group_frames_are_nwk_broadcast_to_rx_on_when_idle_devices`
+    fails on master (0xFFFF) and passes with the fix.
+  - Every image that sends groupcasts changes. Size delta over the standard
+    image set (same worktree path): 0 B everywhere except −4 B `.text` on
+    `efr32mg22-sensor` and `nrf52833-ed`; `.data`/`.bss` unchanged.
+- **Alias broadcasts recorded in the BTT** (99ebba6, `green-power` only):
+  - When a router sends a broadcast under a GP alias, it records
+    `(alias, seq)` in the BTT. A neighbour's relay of it then takes the BTT
+    duplicate path: it is not delivered or relayed again, and it counts as
+    that neighbour's passive acknowledgement (R22 §3.6.5).
+  - Host test `a_neighbours_relay_of_an_alias_broadcast_is_its_passive_ack`
+    fails without the fix (the echo is delivered back) and passes with it.
+    CI now runs the `zigbee-nwk` `router,green-power` tests and clippy.
+  - Feature-off images built from the same path as master + 6a1b276 are
+    identical (BL702 ×2, EFR32MG1, TLSR8258 ×2) or differ only in panic
+    `Location` line/column words (the other 9).
+- **GP H2-Zero image** (`router,waveshare-h2-zero,green-power`): app.bin
+  515,376 B (sha `4a2a89ad…c996`), ending at 0x8DD30 in ota_0. Against the
+  ce7e806 image: `.text` +172, `.rodata` +72, `.data`/`.bss` +0.
+- **Still to prove on hardware:** one original plus neighbour relays per
+  forward (no radius-28 echo relays, no retransmissions), and Notifications
+  addressed to NWK 0xFFFD.
+- **HA battery entity "unknown":** this is not a regression. The MG22 lab GPD
+  sends no battery attribute (`battery_half_percent: None`; it logs
+  "no battery report" at boot). The quirk always adds a Battery entity, so the
+  entity has been `unknown` since it was created on 2026-11-11. At each
+  Pairing ZHA re-initialises the entities: unavailable → unknown at 22:00:43.
 
 ## 7. Open questions for the user
 
