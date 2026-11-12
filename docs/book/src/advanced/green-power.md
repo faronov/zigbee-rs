@@ -22,11 +22,17 @@
 | ESP32-H2 router example `green-power` + 8 KiB `zbnv` journal at 0x3F8000 | lab-tested on hardware (2026-11-12) | Waveshare ESP32-H2-Zero, app-only flash over the shipped router (joined state kept, no rejoin): Proxy Commissioning Mode, Commissioning Notification tunnelled to ZHA, Pairing → proxy table entry persisted, groupcast Notification decoded by ZHA, table restored after reset without re-pairing (§6.1) |
 | `efr32s2-hal::trng` (MG22 CRYPTOACC BA431 TRNG: GSDK init, conditioning KAT, health-failure reinit) | implemented | host model tests; lab bin `s2-trng` built, not run |
 | `apps/gpd` (`gpd-app`): provisioning, `GpdJournal`, beacon scan for a permit-join network, unidirectional commissioning, L3 Multi-Cluster Reports and switch commands, CCA backoff | implemented | host tests: sink-side decode of commissioning (key unwrap), reports and Toggle; counter never reused across reboot; failed reservation transmits nothing; journal rollover / interrupted write / CRC fallback |
-| `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch lab-tested the same day with a separate SrcID (0x7A6B9879) and journal: commissioned, Off/On/Toggle events in HA every 30 s (`lab-switch-cycle` build), counter resumed at 16 after reset and accepted. Re-flashing the sensor resumed its own SrcID (counter 80) and ZHA accepted it. Battery reporting (IADC0 AVDD, 470f1e3): host-tested and built, not yet on hardware |
-| ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity entities; battery voltage/percentage entities added in 470f1e3 (not yet deployed); switch event entity with `off`/`on`/`toggle` |
+| `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch lab-tested the same day with a separate SrcID (0x7A6B9879) and journal: commissioned, Off/On/Toggle events in HA every 30 s (`lab-switch-cycle` build), counter resumed at 16 after reset and accepted. Re-flashing the sensor resumed its own SrcID (counter 80) and ZHA accepted it. Battery reporting (IADC0 AVDD, 331f8ea): host-tested and built, not yet on hardware |
+| ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity entities; battery voltage/percentage entities added in 331f8ea (not yet deployed); switch event entity with `off`/`on`/`toggle` |
 | Bidirectional GPD, full proxy, Combo/Sink | not started | — |
 
 Implementation notes that differ from the design below:
+
+- Commit ids: on 2026-11-13 `green-power` was rebased onto master 5c2762e
+  (which merged `aps-group-fffd`); the cherry-pick 94d6127 dropped out.
+  Ids in §6 name the commits the hardware images were built from.
+  99ebba6 has the same tree as the rebased f11c437. Earlier ids (ce7e806,
+  9f118e3, …) predate the APS fix and have no tree-identical rebased commit.
 
 - The MAC sequence number travels on `MacFrame` (`mac_sequence()`), not
   on `McpsDataIndication`.
@@ -399,7 +405,7 @@ No board crate gets GP storage. Products own the partitions.
   the channel and recommission; the sensor reports every 60 s; EM2 with
   the radio idled between events. Temperature is the die sensor and the
   humidity is **synthetic** (BRD4183A has no humidity sensor).
-- Battery (470f1e3): before each report the sensor measures AVDD with one
+- Battery (331f8ea): before each report the sensor measures AVDD with one
   calibrated IADC0 conversion (`efr32s2-hal::iadc`, AVDD/4 against the
   1.21 V band-gap, `SCALE0` from the DEVINFO gain/offset words as GSDK
   `IADC_init` computes them; disabled again after the read). The board
@@ -416,7 +422,7 @@ No board crate gets GP storage. Products own the partitions.
   sensor product's security journal).
 - Measured (release): 41,228 B file-backed flash, `.bss` 2,312 B;
   29.9 KiB linked stack. Sensor and switch are the same size. Battery
-  reporting (470f1e3) adds 884 B (`.text` +812, `.rodata` +72, same build
+  reporting (331f8ea) adds 884 B (`.text` +812, `.rodata` +72, same build
   path); `.data`/`.bss` unchanged; sensor `.bin` 42,264 B.
 - `lab-switch-cycle` (lab only, never shipped): the switch sends
   Off/On/Toggle every 30 s without a button press, because hwlab cannot
@@ -836,7 +842,7 @@ running the nRF 802.15.4 sniffer on channel 15.
   "no battery report" at boot). The quirk always adds a Battery entity, so the
   entity has been `unknown` since it was created on 2026-11-11. At each
   Pairing ZHA re-initialises the entities: unavailable → unknown at 22:00:43.
-  Addressed by 470f1e3 (measured AVDD reported as battery voltage and
+  Addressed by 331f8ea (measured AVDD reported as battery voltage and
   percentage, plus a Battery voltage entity in the quirk). This is not yet
   flashed or deployed.
 
