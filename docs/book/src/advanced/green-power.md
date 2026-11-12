@@ -635,7 +635,7 @@ All times are EET.
   - replay and bad-MIC tests on air;
   - the soak test;
   - bidirectional and Combo operation.
-- **Fixed after this run (host-tested, hardware re-check pending):**
+- **Fixed after this run (host-tested, hardware re-checked in 6.2):**
   - Commissioning mode now logs `entered by 0x…, window … s`,
     `window replaced`, and `left: Explicit | FirstPairing | Timeout`. A
     window that elapsed before the next GP command is logged as a timeout
@@ -655,6 +655,107 @@ All times are EET.
   - Pre-existing, not GP: `[NWK] Frame counter replay from <nwk>` warnings
     print the NWK source rather than the auxiliary-header source. The
     router's direct link to the coordinator is weak (LQI ~22–33).
+
+### 6.2 Results: ce7e806 re-check with an air capture (2026-11-12)
+
+Same network, router and GPD as 6.1. Times are EET. hwlab session
+`2026-11-12T194925Z-gp-h2-ce7e806-flash-sniff` recorded three streams for
+55 min (21:49:25–22:44:25): the router UART, the GPD VCOM, and an nRF52840
+running the nRF 802.15.4 sniffer on channel 15.
+
+- **Image and flash:** `app.bin` 515,136 B, sha256 `f8b4c7b6…cb95`.
+  - Written to ota_0 only (0x10000–0x8E000, 126 sectors) against a fresh
+    full backup (`d8dd3f5b…a37c`).
+  - An independent readback of 515,136 B from 0x10000 matched the sha.
+  - Bootloader, partition table, otadata, ota_1 and `zbnv` were not
+    written.
+- **Boot (21:50:24):** resumed NWK 0x8C23 with parent 0x4A76 and no rejoin;
+  `1 GP proxy table entries restored`.
+- **Attribution on air:** every proxy's GP Notification carries alias
+  source 0x9879, so the MAC source of the radius-30 copy identifies the
+  originating proxy.
+  - **Coverage:** 57 GPDFs between boot and the end of the capture: 54
+    data frames (fc 1469–1478 and 1482–1525) and 3 commissioning frames.
+  - **Final router counters:** `forwards sent 12 cancelled 45`, and
+    12 + 45 = 57.
+  - **Our sends:** the 12 sends are 11 data Notifications (fc 1469, 1470,
+    1493, 1496, 1498, 1501, 1503, 1515, 1521, 1523, 1524) plus one
+    Commissioning Notification. Each one was seen on air from MAC 0x8C23,
+    28–43 ms after the GPDF. For fc 1493 the sniffer missed our radius-30
+    original. The router's TX log at 22:11:54.540 and our own relays of that
+    sequence (below) attribute it.
+  - **Our cancellations:** for each of the 45 cancelled frames another
+    proxy originated a copy first, usually IKEA 0x1AA4 at +8–20 ms. While
+    commissioning mode was open, routers 0xD586, 0x43FD, 0x1F0F, 0xF94D and
+    0x04F8 also originated copies.
+  - **Race:** in 5 of our 11 data sends another proxy's copy was on air
+    first, 17–37 ms after the GPDF, while ours went out at 29–38 ms. Our
+    transmission was already committed, so the duplicate rule could not
+    cancel it. This race is expected.
+  - **Forwarding share:** about 20% of data GPDFs (11 of 54).
+- **zigpy distinguishes our copy from IKEA's** (debug log). It decodes our
+  groupcast Notification as `MultiClusterReporting`, multicast to group
+  0x0B84. It decodes IKEA's broadcast copy, and the coordinator's own direct
+  reception through `gpepIncomingMessageHandler` (`UNPROCESSED`), as
+  undefined command ids, because the command is still encrypted.
+- **Proxy Commissioning Mode:** `zha.permit` was issued at 21:59:25,
+  22:03:25, 22:07:25 and 22:11:26, each for 254 s.
+  - `entered by 0x0000, window Some(254) s` at 21:59:25.397.
+  - `window replaced, window Some(254) s` at 22:03:25.716, 22:07:25.993 and
+    22:11:26.334.
+  - `left: Timeout` at 22:15:40.336. This is 254 s after the last
+    replacement, and 0.23 s after `Permit joining: duration=0`.
+- **Re-commissioning (PB0 long press):**
+  - The GPD logged `long press: recommission` at 22:00:41.375 and
+    `commissioned on channel 15` at 22:00:43.877.
+  - It sent three Commissioning GPDFs (MAC seq 132–134, GPD counters
+    1479–1481).
+  - Our router logged all three. Its Commissioning Notifications for the
+    first two were cancelled by other proxies' copies. It sent the third at
+    22:00:43.894: NWK dst 0xFFFD, alias seq 122 (MAC 134 − 12), radius 30.
+  - zigpy logged `Sent GP Pairing … (add_sink=True)` three times
+    (22:00:43.915, 22:00:44.047, 22:00:44.096). The router received all three
+    Pairings from 0x0000.
+- **Pairing write skip:** none of the three Pairings wrote a record.
+  - Before the press, the GP window held generations 16–20; the newest was
+    gen 20 with counter 1469.
+  - The Pairing counters (≤ 1481) were within the 16-value stride. The next
+    record was the stride checkpoint: gen 21, counter 1485, at 22:03:53.644.
+  - Later checkpoints followed at counter 1501 (22:19:55) and counter 1517
+    (22:35:57).
+  - The final window holds gens 16–23, at counters 1402, 1418, …, 1517.
+  - In the 6.1 run the same three Pairings had written three records.
+- **HA:** the GP sensor entities kept updating (temperature at 22:42:57,
+  humidity at 22:45:58).
+- **Open issues found by the capture:**
+  - **Echoes of our own alias broadcasts are relayed again.**
+    - The NWK layer drops frames whose source is its own address, but an
+      alias source is not its own address. It also does not record its own
+      originated broadcast in the BTT.
+    - So when neighbours relay our alias Notification back (radius 29), the
+      router delivers it locally again and relays it again with radius 28,
+      up to 4 times.
+    - Neighbour relays also do not count as passive acknowledgements, so
+      the original is retransmitted up to 3 extra times.
+    - The cost is about 8 frames per forward where 1–2 should be enough.
+      Seen at every forward, for example 22:41:57–22:41:59.
+    - The alias TX path is GP-only (added in 9f118e3). The fix is to record
+      `(alias, seq)` in the BTT when originating a broadcast with an alias.
+      It is not done yet.
+  - **NWK destination of groupcast Notifications.** Ours go to 0xFFFF. The
+    spec (A.3.5.2) requires 0xFFFD, and IKEA sends 0xFFFD. The APS group →
+    NWK 0xFFFF mapping (`zigbee-aps/src/apsde.rs`) predates GP. Commissioning
+    Notifications already use 0xFFFD.
+  - **Alias sequence offset:** IKEA's operational Notifications use alias
+    seq MAC − 12 rather than the commissioned-groupcast −13 (A.3.6.3.3.2) we
+    use. As a result, the BTT never merges their copy with ours. This is an
+    interoperability note, not a defect in our proxy.
+  - **Forwarding in commissioning mode:** while in commissioning mode we
+    forward data GPDFs as ordinary Notifications. The other proxies switch
+    to Commissioning Notifications (−12). The spec leaves this to the
+    application profile (A.3.5.2.1 (iii)).
+  - **APS counter:** ours is the router's own APS counter. Other proxies
+    reuse the alias NWK sequence.
 
 ## 7. Open questions for the user
 
