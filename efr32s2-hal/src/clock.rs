@@ -17,6 +17,12 @@ const CMU_CLKEN0: u32 = CMU_BASE + 0x064;
 const CMU_CLKEN1: u32 = CMU_BASE + 0x068;
 /// xG22 `CMU_CRYPTOACCCLKCTRL` (PKEN bit 0, AESEN bit 1).
 #[cfg(feature = "efr32mg22")]
+const CMU_IADCCLKCTRL: u32 = CMU_BASE + 0x180;
+#[cfg(feature = "efr32mg22")]
+const CMU_IADCCLKCTRL_CLKSEL_MASK: u32 = 0x3;
+#[cfg(feature = "efr32mg22")]
+const CMU_IADCCLKCTRL_CLKSEL_FSRCO: u32 = 0x2;
+#[cfg(feature = "efr32mg22")]
 const CMU_CRYPTOACCCLKCTRL: u32 = CMU_BASE + 0x260;
 #[cfg(feature = "efr32mg22")]
 const CMU_CRYPTOACCCLKCTRL_PKEN_AESEN: u32 = 0x3;
@@ -223,6 +229,21 @@ pub fn enable_bus_clock(clock: BusClock) {
     }
     #[cfg(not(all(feature = "efr32mg22", target_arch = "arm", target_os = "none")))]
     let _ = clock;
+}
+
+/// Clock IADC0 from FSRCO (20 MHz) instead of EM01GRPACLK, so the IADC
+/// timing does not depend on the HFXO/DPLL state (xG22).
+#[cfg(feature = "efr32mg22")]
+pub(crate) fn select_iadc_clock_fsrco() {
+    #[cfg(all(target_arch = "arm", target_os = "none"))]
+    unsafe {
+        write(CMU_LOCK, CMU_LOCK_UNLOCK);
+        modify(
+            CMU_IADCCLKCTRL,
+            CMU_IADCCLKCTRL_CLKSEL_MASK,
+            CMU_IADCCLKCTRL_CLKSEL_FSRCO,
+        );
+    }
 }
 
 /// Open the CRYPTOACC bus clock and its PK/AES engine clocks (xG22), as

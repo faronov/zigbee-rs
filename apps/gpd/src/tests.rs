@@ -391,6 +391,7 @@ fn reports_are_encrypted_with_fresh_counters_and_repeated() {
         block_on(d.report_environment(EnvironmentReport {
             temperature_centi_celsius: 2150,
             humidity_centi_percent: None,
+            battery_voltage_100mv: None,
             battery_half_percent: None,
         })),
         Err(GpdError::NotCommissioned)
@@ -400,6 +401,7 @@ fn reports_are_encrypted_with_fresh_counters_and_repeated() {
     let used = block_on(d.report_environment(EnvironmentReport {
         temperature_centi_celsius: -125,
         humidity_centi_percent: Some(4875),
+        battery_voltage_100mv: Some(29),
         battery_half_percent: Some(30),
     }))
     .unwrap()
@@ -416,6 +418,7 @@ fn reports_are_encrypted_with_fresh_counters_and_repeated() {
     expected.extend_from_slice(&[
         0x02, 0x04, 0x00, 0x00, 0x29, 0x83, 0xFF, // temp -1.25
         0x05, 0x04, 0x00, 0x00, 0x21, 0x0B, 0x13, // hum 48.75
+        0x01, 0x00, 0x20, 0x00, 0x20, 0x1D, // battery 2.9 V
         0x01, 0x00, 0x21, 0x00, 0x20, 0x1E, // battery 15 %
     ]);
     assert_eq!(clear, expected);
@@ -503,4 +506,38 @@ fn forget_channel_requires_recommissioning() {
     let (phy, flash) = into_parts(d);
     let (d, _) = open(phy, flash, switch_profile());
     assert_eq!(d.record().channel, None);
+}
+
+#[test]
+fn battery_curve_maps_voltage_and_clamped_percentage() {
+    let curve = BatteryCurve {
+        empty_mv: 1_800,
+        full_mv: 3_000,
+    };
+    assert_eq!(curve.voltage_100mv(3_300), 33);
+    assert_eq!(curve.voltage_100mv(2_949), 29);
+    assert_eq!(curve.voltage_100mv(2_950), 30);
+    assert_eq!(curve.voltage_100mv(u16::MAX), 0xFE);
+    assert_eq!(curve.half_percent(1_700), 0);
+    assert_eq!(curve.half_percent(1_800), 0);
+    assert_eq!(curve.half_percent(2_400), 100);
+    assert_eq!(curve.half_percent(2_403), 101);
+    assert_eq!(curve.half_percent(3_000), 200);
+    assert_eq!(curve.half_percent(3_300), 200);
+    let degenerate = BatteryCurve {
+        empty_mv: 3_000,
+        full_mv: 3_000,
+    };
+    assert_eq!(degenerate.half_percent(3_300), 0);
+    let base = EnvironmentReport {
+        temperature_centi_celsius: 2_000,
+        humidity_centi_percent: Some(5_000),
+        battery_voltage_100mv: None,
+        battery_half_percent: None,
+    };
+    let report = curve.apply(base, 2_700);
+    assert_eq!(report.battery_voltage_100mv, Some(27));
+    assert_eq!(report.battery_half_percent, Some(150));
+    assert_eq!(report.temperature_centi_celsius, 2_000);
+    assert_eq!(report.humidity_centi_percent, Some(5_000));
 }

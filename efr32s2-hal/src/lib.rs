@@ -22,6 +22,8 @@ pub mod flash;
 pub mod gecko_bootloader;
 pub mod gpio;
 pub mod i2c;
+#[cfg(feature = "efr32mg22")]
+pub mod iadc;
 pub mod peripherals;
 pub mod power;
 pub mod radio;

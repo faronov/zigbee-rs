@@ -3,14 +3,17 @@
 - Sensor (examples/efr32mg22-gpd, bin efr32mg22-gpd-sensor): DeviceID 0x33
   (IndoorEnvironmentSensor), manufacturer 0x6D6B, model 0xF300. Sends
   security level 3 Multi-Cluster Reporting (0xA2) frames with temperature
-  (0x0402/0x0000, int16, 0.01 degC), humidity (0x0405/0x0000, uint16, 0.01 %)
-  and optionally battery (0x0001/0x0021, uint8, 0.5 %).
+  (0x0402/0x0000, int16, 0.01 degC), humidity (0x0405/0x0000, uint16, 0.01 %),
+  battery voltage (0x0001/0x0020, uint8, 100 mV) and battery remaining
+  (0x0001/0x0021, uint8, 0.5 %).
 - Switch (bin efr32mg22-gpd-switch): DeviceID 0x02 (OnOffSwitch),
   manufacturer 0x6D6B, model 0xF400. Sends Off (0x20), On (0x21) and
   Toggle (0x22).
 
 On the BRD4183A dev kit the temperature is the EFR32 die sensor and the
-humidity is SYNTHETIC (no humidity sensor fitted).
+humidity is SYNTHETIC (no humidity sensor fitted). The battery values are the
+measured AVDD supply (VMCU): the WSTK's 3.3 V with its power switch at AEM
+(100 %), the CR2032 coin cell with the switch at BAT.
 
 Copy to <HA config>/custom_zha_quirks/ (requires ZHA with Green Power
 support, Home Assistant 2026.11 or later).
@@ -23,7 +26,7 @@ from typing import Any
 
 from zha.application.platforms.sensor import BaseSensor
 from zha.application.platforms.sensor.const import SensorDeviceClass, SensorStateClass
-from zha.units import PERCENTAGE, UnitOfTemperature
+from zha.units import PERCENTAGE, UnitOfElectricPotential, UnitOfTemperature
 from zigpy.device import GreenPowerCommandReceived
 from zigpy.zgp.types import DeviceID, GPDCommandID
 
@@ -116,6 +119,15 @@ class ZigbeeRsBattery(ZigbeeRsGreenPowerSensor):
     _attr_suggested_display_precision = 0
 
 
+class ZigbeeRsBatteryVoltage(ZigbeeRsGreenPowerSensor):
+    """Battery voltage (0x0001 BatteryVoltage, 100 mV)."""
+
+    _cluster_id, _attribute_id, _invalid, _divisor = 0x0001, 0x0020, 0xFF, 10
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
+    _attr_suggested_display_precision = 1
+
+
 (
     GreenPowerQuirkBuilder()
     .applies_to(
@@ -128,6 +140,11 @@ class ZigbeeRsBattery(ZigbeeRsGreenPowerSensor):
     )
     .adds_entity(ZigbeeRsHumidity, unique_id_suffix="humidity", fallback_name="Humidity")
     .adds_entity(ZigbeeRsBattery, unique_id_suffix="battery", fallback_name="Battery")
+    .adds_entity(
+        ZigbeeRsBatteryVoltage,
+        unique_id_suffix="battery_voltage",
+        fallback_name="Battery voltage",
+    )
     .friendly_name(manufacturer="zigbee-rs", model="GP sensor")
     .add_to_registry()
 )

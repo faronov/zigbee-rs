@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use efr32mg22_devkit::{Button0, Led0, resources::BoardResources};
 use efr32mg22_gpd_product as product;
-use efr32s2_hal::{power, rtcc, trng::Trng, vectors::Interrupt};
+use efr32s2_hal::{iadc::SupplyMonitor, power, rtcc, trng::Trng, vectors::Interrupt};
 use embassy_time::{Duration, Instant, Timer};
 use gpd_app::{EnvironmentReport, GpdDevice, GpdKind, GpdProfile, SwitchCommand};
 use zigbee_mac::RadioPhy;
@@ -73,6 +73,7 @@ pub async fn run(profile: GpdProfile) -> ! {
         radio,
         rtcc,
         flash,
+        supply,
     } = BoardResources::take().unwrap_or_else(|| halt());
 
     let clocks = efr32mg22_devkit::init_clocks(clocks);
@@ -89,6 +90,7 @@ pub async fn run(profile: GpdProfile) -> ! {
     power::set_em2_debug(cfg!(feature = "em2-debug"));
 
     let mut led = led0.into_led();
+    let mut supply = supply.into_monitor();
     let mut button = button0.into_button();
     BUTTON_PENDING.store(false, Ordering::Release);
     cortex_m::peripheral::NVIC::unpend(Interrupt::GPIO_EVEN);
@@ -106,7 +108,7 @@ pub async fn run(profile: GpdProfile) -> ! {
         efr32mg22_devkit::MCU_PART
     );
     if profile.kind == GpdKind::Sensor {
-        log::warn!("[GPD] die temperature, SYNTHETIC humidity, no battery report");
+        log::warn!("[GPD] die temperature, SYNTHETIC humidity, battery = AVDD (VMCU)");
     }
 
     let phy: Efr32s2RadioPhy = Efr32s2RadioPhy::new(radio).unwrap_or_else(|error| {
@@ -174,7 +176,7 @@ pub async fn run(profile: GpdProfile) -> ! {
     }
     loop {
         if profile.kind == GpdKind::Sensor && Instant::now() >= next_report {
-            report(&mut device, &mut led, &mut sequence).await;
+            report(&mut device, &mut led, &mut supply, &mut sequence).await;
             next_report = Instant::now() + interval;
         }
         #[cfg(feature = "lab-switch-cycle")]
@@ -214,7 +216,7 @@ pub async fn run(profile: GpdProfile) -> ! {
             }
             Press::Short => match profile.kind {
                 GpdKind::Sensor => {
-                    report(&mut device, &mut led, &mut sequence).await;
+                    report(&mut device, &mut led, &mut supply, &mut sequence).await;
                     next_report = Instant::now() + interval;
                 }
                 GpdKind::Switch => send_switch(&mut device, &mut led, SwitchCommand::Toggle).await,
@@ -274,20 +276,34 @@ async fn commission(device: &mut Device, led: &mut Led0) {
     flash_result(led, result.is_ok()).await;
 }
 
-async fn report(device: &mut Device, led: &mut Led0, sequence: &mut u32) {
-    let report = EnvironmentReport {
+async fn report(
+    device: &mut Device,
+    led: &mut Led0,
+    supply: &mut SupplyMonitor,
+    sequence: &mut u32,
+) {
+    let mut report = EnvironmentReport {
         temperature_centi_celsius: power::die_temperature_centi_celsius(),
         // SYNTHETIC: 50.00 %..59.90 % sawtooth, no humidity sensor fitted.
         humidity_centi_percent: Some(5_000 + ((*sequence % 100) as u16) * 10),
+        battery_voltage_100mv: None,
         battery_half_percent: None,
     };
+    // Measured with the radio idle, before the report is transmitted.
+    let supply_mv = supply.avdd_millivolts();
+    match supply_mv {
+        Ok(mv) => report = product::BATTERY.apply(report, mv),
+        Err(error) => log::warn!("[GPD] supply measurement failed: {error:?}"),
+    }
     *sequence = sequence.wrapping_add(1);
     let counter = device.next_frame_counter();
     let sent = device.report_environment(report).await;
     log::info!(
-        "[GPD] report fc {counter} {} c°C {:?} c% : {sent:?}",
+        "[GPD] report fc {counter} {} c°C {:?} c% {:?} mV {:?} half-% : {sent:?}",
         report.temperature_centi_celsius,
-        report.humidity_centi_percent
+        report.humidity_centi_percent,
+        supply_mv.ok(),
+        report.battery_half_percent
     );
     flash_result(led, sent.is_ok()).await;
 }

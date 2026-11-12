@@ -14,7 +14,7 @@
 #![no_std]
 
 use efr32s2_hal::flash::{Efr32s2Flash, FLASH_CAPACITY, FLASH_PAGE_SIZE, FlashPartition};
-use gpd_app::{ALL_CHANNELS, GpdJournal, GpdKind, GpdProfile};
+use gpd_app::{ALL_CHANNELS, BatteryCurve, GpdJournal, GpdKind, GpdProfile};
 use zigbee_gp::types::{KeyType, SecurityLevel};
 
 /// Manufacturer ID shared by the zigbee-rs products.
@@ -122,6 +122,14 @@ pub const SENSOR_REPORT_INTERVAL_S: u64 = 60;
 /// Button press longer than this recommissions.
 pub const LONG_PRESS_MS: u64 = 3_000;
 
+/// CR2032 coin cell on the BRD4183A/BRD4001A battery holder: 3.0 V fresh,
+/// 1.8 V (the EFR32MG22 minimum supply) empty, linear in between. On the
+/// WSTK's regulated 3.3 V the percentage clamps to 100 %.
+pub const BATTERY: BatteryCurve = BatteryCurve {
+    empty_mv: 1_800,
+    full_mv: 3_000,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +163,14 @@ mod tests {
             }
         };
         (field("ORIGIN"), field("LENGTH"))
+    }
+
+    #[test]
+    fn battery_curve_is_a_cr2032() {
+        assert_eq!(BATTERY.half_percent(3_300), 200);
+        assert_eq!(BATTERY.half_percent(2_400), 100);
+        assert_eq!(BATTERY.half_percent(1_800), 0);
+        assert_eq!(BATTERY.voltage_100mv(3_000), 30);
     }
 
     #[test]

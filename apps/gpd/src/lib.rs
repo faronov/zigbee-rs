@@ -180,8 +180,50 @@ pub struct EnvironmentReport {
     pub temperature_centi_celsius: i16,
     /// Relative humidity in 0.01 % (ZCL 0x0405/0x0000).
     pub humidity_centi_percent: Option<u16>,
+    /// Battery voltage in 100 mV (ZCL 0x0001/0x0020).
+    pub battery_voltage_100mv: Option<u8>,
     /// Battery remaining in 0.5 % (ZCL 0x0001/0x0021).
     pub battery_half_percent: Option<u8>,
+}
+
+/// Linear battery curve: converts a measured supply voltage into the ZCL
+/// Power Configuration battery attributes of an [`EnvironmentReport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryCurve {
+    /// Voltage reported as 0 %.
+    pub empty_mv: u16,
+    /// Voltage reported as 100 % (must exceed `empty_mv`).
+    pub full_mv: u16,
+}
+
+impl BatteryCurve {
+    /// `BatteryVoltage` (0x0020) in 100 mV, rounded; 0xFF (invalid) is
+    /// never produced, 25.4 V saturates.
+    pub const fn voltage_100mv(self, millivolts: u16) -> u8 {
+        let v = (millivolts as u32 + 50) / 100;
+        if v > 0xFE { 0xFE } else { v as u8 }
+    }
+
+    /// `BatteryPercentageRemaining` (0x0021) in 0.5 %, clamped to 0..=200.
+    pub const fn half_percent(self, millivolts: u16) -> u8 {
+        if millivolts <= self.empty_mv || self.full_mv <= self.empty_mv {
+            0
+        } else if millivolts >= self.full_mv {
+            200
+        } else {
+            let span = (self.full_mv - self.empty_mv) as u32;
+            ((((millivolts - self.empty_mv) as u32) * 200 + span / 2) / span) as u8
+        }
+    }
+
+    /// Fill both battery attributes of `report` from `millivolts`.
+    pub const fn apply(self, report: EnvironmentReport, millivolts: u16) -> EnvironmentReport {
+        EnvironmentReport {
+            battery_voltage_100mv: Some(self.voltage_100mv(millivolts)),
+            battery_half_percent: Some(self.half_percent(millivolts)),
+            ..report
+        }
+    }
 }
 
 /// Switch command.
@@ -553,6 +595,9 @@ impl<P: RadioPhy + PlatformServices, S: GpdStore> GpdDevice<P, S> {
         )?;
         if let Some(h) = report.humidity_centi_percent {
             r = r.uint16(0x0405, 0x0000, h)?;
+        }
+        if let Some(v) = report.battery_voltage_100mv {
+            r = r.uint8(0x0001, 0x0020, v)?;
         }
         if let Some(b) = report.battery_half_percent {
             r = r.uint8(0x0001, 0x0021, b)?;

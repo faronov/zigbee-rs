@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use efr32s2_hal::{
     clock::ClockControl,
     gpio::{Disabled, Level, Pin, Pull},
+    iadc::{Iadc0Token, SupplyMonitor},
     peripherals::Peripherals,
     radio::RadioToken,
     rtcc::RtccToken,
@@ -31,6 +32,8 @@ pub struct BoardResources {
     /// Raw, exclusive internal-flash controller. Product code bounds it to
     /// its selected partitions before using it for persistence.
     pub flash: Efr32s2Flash,
+    /// IADC0 measurement of the supply (AVDD).
+    pub supply: SupplyToken,
 }
 
 impl BoardResources {
@@ -74,6 +77,7 @@ impl BoardResources {
             radio: peripherals.radio,
             rtcc: peripherals.rtcc,
             flash: peripherals.flash,
+            supply: SupplyToken(peripherals.iadc0),
         })
     }
 }
@@ -100,6 +104,21 @@ impl Button0Token {
         let mut pin = self.0.into_input(Pull::None);
         configure_button_interrupt(&mut pin);
         Button0::from_pin(pin)
+    }
+}
+
+/// Exclusive IADC0 ownership for supply measurements.
+///
+/// On BRD4183A AVDD and IOVDD are VMCU: the WSTK's regulated
+/// 3.3 V when its power switch is at AEM, or the coin cell (CR2032) when it
+/// is at BAT. The measured voltage therefore is the battery voltage only
+/// with the switch at BAT.
+pub struct SupplyToken(Iadc0Token);
+
+impl SupplyToken {
+    /// Measure AVDD (= VMCU) with IADC0.
+    pub fn into_monitor(self) -> SupplyMonitor {
+        self.0.into_supply_monitor()
     }
 }
 

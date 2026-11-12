@@ -70,6 +70,7 @@ async fn main(_spawner: Spawner) {
         radio,
         rtcc,
         flash,
+        supply: _,
     } = BoardResources::take().unwrap_or_else(|| platform::halt());
 
     let clocks = efr32mg22_devkit::init_clocks(clocks);
