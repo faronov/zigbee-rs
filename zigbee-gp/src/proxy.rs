@@ -196,6 +196,16 @@ impl ProxyEntry {
         }
     }
 
+    /// Whether `self` and `other` differ at most in the frame counter.
+    fn same_except_counter(&mut self, other: &Self) -> bool {
+        let counters = (self.frame_counter, self.persisted_counter);
+        self.frame_counter = other.frame_counter;
+        self.persisted_counter = other.persisted_counter;
+        let same = *self == *other;
+        (self.frame_counter, self.persisted_counter) = counters;
+        same
+    }
+
     /// Whether any sink communication mode remains.
     pub fn has_sinks(&self) -> bool {
         self.derived_group || !self.unicast_sinks.is_empty() || !self.groups.is_empty()
@@ -432,6 +442,8 @@ struct Pending {
     link: GppGpdLink,
     frame: TxFrame,
     dests: heapless::Vec<Dest, MAX_DESTINATIONS>,
+    /// At least one destination was handed out by `poll`.
+    started: bool,
 }
 
 /// One gpTxQueue entry: a GPDF waiting for the GPD's next `rxAfterTx`
@@ -498,13 +510,62 @@ pub enum GroupChange {
     Leave(u16),
 }
 
+/// Why the proxy left commissioning mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommissioningExit {
+    /// The originating sink sent Proxy Commissioning Mode (exit).
+    Explicit,
+    /// A GP Pairing arrived and the window requested exit on first pairing.
+    FirstPairing,
+    /// The commissioning window elapsed (reported by
+    /// [`Proxy::take_commissioning_timeout`]).
+    Timeout,
+}
+
+/// Commissioning mode transition caused by a Green Power cluster command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommissioningEvent {
+    /// Commissioning mode entered. `window_s` is `None` when the window
+    /// ends only on an explicit exit or the first pairing.
+    Entered {
+        originator: u16,
+        window_s: Option<u16>,
+    },
+    /// The originator sent a new enter command while the proxy was in
+    /// commissioning mode; the previous window ends and this one starts.
+    Replaced { window_s: Option<u16> },
+    /// Commissioning mode left.
+    Left(CommissioningExit),
+}
+
 /// Effects of a received Green Power cluster command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommandEffects {
     /// GPEP group membership changes.
     pub groups: heapless::Vec<GroupChange, 4>,
-    /// Commissioning mode was entered (true) or left (false).
-    pub commissioning: Option<bool>,
+    /// Commissioning mode transition, if any.
+    pub commissioning: Option<CommissioningEvent>,
+}
+
+/// GPDF forwarding counters (wrapping), for diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ForwardStats {
+    /// GPDF forwards (GP Notification / Commissioning Notification) whose
+    /// first transmission [`Proxy::poll`] handed out.
+    pub sent: u32,
+    /// GPDF forwards cancelled before any transmission because another
+    /// proxy tunnelled the same GPDF first (A.3.5.2.1).
+    pub cancelled: u32,
+}
+
+/// Our pending forward of a GPDF that another proxy's GP Notification
+/// cancelled (returned by [`Proxy::on_server_command`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelledForward {
+    /// GPD of the cancelled forward.
+    pub gpd_id: GpdId,
+    /// Security frame counter / sequence number of the GPDF.
+    pub frame_counter: u32,
 }
 
 /// The Green Power proxy state machine with `N` Proxy Table entries and a
@@ -517,6 +578,9 @@ pub struct Proxy<const N: usize, const Q: usize> {
     commissioning: Option<CommissioningState>,
     pending: heapless::Vec<Pending, Q>,
     dirty: bool,
+    /// The commissioning window elapsed and the owner was not told yet.
+    commissioning_timed_out: bool,
+    stats: ForwardStats,
     #[cfg(feature = "proxy-bidirectional")]
     bidi: Bidirectional,
 }
@@ -568,6 +632,11 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             commissioning: None,
             pending: heapless::Vec::new(),
             dirty: false,
+            commissioning_timed_out: false,
+            stats: ForwardStats {
+                sent: 0,
+                cancelled: 0,
+            },
             #[cfg(feature = "proxy-bidirectional")]
             bidi: Bidirectional {
                 capable: false,
@@ -595,6 +664,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         self.table.clear();
         self.pending.clear();
         self.commissioning = None;
+        self.commissioning_timed_out = false;
         self.dup = DuplicateFilter::new(crate::dup::DUPLICATE_TIMEOUT_MS);
         self.dirty = true;
         #[cfg(feature = "proxy-bidirectional")]
@@ -678,6 +748,27 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     /// Whether the proxy is in commissioning mode.
     pub fn in_commissioning_mode(&self) -> bool {
         self.commissioning.is_some()
+    }
+
+    /// Returns and clears the "commissioning window elapsed" event. The
+    /// window is closed by [`poll`](Self::poll) or by the next Green Power
+    /// cluster command once its deadline passed; check this after both.
+    pub fn take_commissioning_timeout(&mut self) -> bool {
+        core::mem::take(&mut self.commissioning_timed_out)
+    }
+
+    /// GPDF forwarding counters since start-up.
+    pub fn forward_stats(&self) -> ForwardStats {
+        self.stats
+    }
+
+    fn expire_commissioning(&mut self, now_ms: u32) {
+        if let Some(c) = self.commissioning
+            && c.deadline_ms.is_some_and(|d| due(now_ms, d))
+        {
+            self.commissioning = None;
+            self.commissioning_timed_out = true;
+        }
     }
 
     /// Proxy Table entries.
@@ -787,13 +878,13 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     /// Process timers and return the next due transmission, if any. Call
     /// repeatedly until it returns `None`.
     pub fn poll(&mut self, now_ms: u32) -> Option<GpTx> {
-        if let Some(c) = self.commissioning
-            && c.deadline_ms.is_some_and(|d| due(now_ms, d))
-        {
-            self.commissioning = None;
-        }
+        self.expire_commissioning(now_ms);
         let idx = self.pending.iter().position(|p| due(now_ms, p.due_ms))?;
         let p = &mut self.pending[idx];
+        if p.origin.is_some() && !p.started {
+            self.stats.sent = self.stats.sent.wrapping_add(1);
+        }
+        p.started = true;
         let d = p.dests.remove(0);
         let tx = GpTx {
             dest: d.addr,
@@ -819,11 +910,33 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         self.pending.push(p).map_err(|_| Error::BufferFull)
     }
 
-    fn cancel(&mut self, gpd: &GpdId, counter: u32) {
+    /// Drop pending forwards of GPDF (`gpd`, `counter`) for which `drop`
+    /// holds; counts those not yet transmitted as cancelled.
+    fn cancel_where(
+        &mut self,
+        gpd: &GpdId,
+        counter: u32,
+        mut drop: impl FnMut(&Pending) -> bool,
+    ) -> Option<CancelledForward> {
+        let mut cancelled = None;
+        let stats = &mut self.stats;
         self.pending.retain(|p| {
-            !p.origin
-                .is_some_and(|(g, c)| g.matches(gpd) && c == counter)
+            let same = p
+                .origin
+                .is_some_and(|(g, c)| g.matches(gpd) && c == counter);
+            if !same || !drop(p) {
+                return true;
+            }
+            if !p.started {
+                stats.cancelled = stats.cancelled.wrapping_add(1);
+                cancelled = Some(CancelledForward {
+                    gpd_id: *gpd,
+                    frame_counter: counter,
+                });
+            }
+            false
         });
+        cancelled
     }
 
     /// Process a received GPDF.
@@ -1045,6 +1158,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 payload,
             },
             dests,
+            started: false,
         })
     }
 
@@ -1150,6 +1264,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 payload: buf,
             },
             dests,
+            started: false,
         }) {
             Ok(()) => GpdfOutcome::CommissioningNotification,
             Err(_) => GpdfOutcome::Dropped(DropReason::QueueFull),
@@ -1177,7 +1292,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             }
             client_cmd::PAIRING => {
                 let p = Pairing::decode(payload)?;
-                self.on_pairing(&p, &mut fx)?;
+                self.on_pairing(&p, now_ms, &mut fx)?;
             }
             client_cmd::RESPONSE => {
                 let r = Response::decode(payload)?;
@@ -1210,6 +1325,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         now_ms: u32,
         fx: &mut CommandEffects,
     ) {
+        self.expire_commissioning(now_ms);
         if let Some(c) = self.commissioning
             && c.originator != src_nwk
         {
@@ -1218,7 +1334,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         }
         if !m.enter {
             if self.commissioning.take().is_some() {
-                fx.commissioning = Some(false);
+                fx.commissioning = Some(CommissioningEvent::Left(CommissioningExit::Explicit));
             }
             return;
         }
@@ -1227,13 +1343,23 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             (None, 0) => Some(self.config.default_commissioning_window_s),
             (None, _) => None,
         };
-        self.commissioning = Some(CommissioningState {
-            originator: src_nwk,
-            deadline_ms: window.map(|w| now_ms.wrapping_add(w as u32 * 1000)),
-            exit_on_first_pairing: m.exit_mode & exit_mode::ON_FIRST_PAIRING != 0,
-            unicast: m.unicast,
+        let replaced = self
+            .commissioning
+            .replace(CommissioningState {
+                originator: src_nwk,
+                deadline_ms: window.map(|w| now_ms.wrapping_add(w as u32 * 1000)),
+                exit_on_first_pairing: m.exit_mode & exit_mode::ON_FIRST_PAIRING != 0,
+                unicast: m.unicast,
+            })
+            .is_some();
+        fx.commissioning = Some(if replaced {
+            CommissioningEvent::Replaced { window_s: window }
+        } else {
+            CommissioningEvent::Entered {
+                originator: src_nwk,
+                window_s: window,
+            }
         });
-        fx.commissioning = Some(true);
     }
 
     fn mode_supported(mode: CommunicationMode) -> bool {
@@ -1248,12 +1374,13 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         }
     }
 
-    fn on_pairing(&mut self, p: &Pairing, fx: &mut CommandEffects) -> Result<()> {
+    fn on_pairing(&mut self, p: &Pairing, now_ms: u32, fx: &mut CommandEffects) -> Result<()> {
+        self.expire_commissioning(now_ms);
         if let Some(c) = self.commissioning
             && c.exit_on_first_pairing
         {
             self.commissioning = None;
-            fx.commissioning = Some(false);
+            fx.commissioning = Some(CommissioningEvent::Left(CommissioningExit::FirstPairing));
         }
         let idx = self.find(&p.gpd_id);
         if p.remove_gpd {
@@ -1304,6 +1431,9 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             return Ok(());
         }
 
+        // An unchanged entry is not written again; a counter-only change
+        // follows the frame-counter persistence stride (as for GPDFs).
+        let before = idx.map(|i| self.table[i].clone());
         let i = match idx {
             Some(i) => i,
             None => {
@@ -1313,6 +1443,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 self.table.len() - 1
             }
         };
+        let stride = self.config.counter_persist_stride.max(1);
         let e = &mut self.table[i];
         e.active = true;
         e.valid = true;
@@ -1333,7 +1464,6 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         }
         if let Some(fc) = p.frame_counter {
             e.frame_counter = fc;
-            e.persisted_counter = fc;
         }
         if let Some(a) = p.assigned_alias {
             e.assigned_alias = Some(a);
@@ -1372,7 +1502,12 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             }
             _ => return Err(Error::Unsupported),
         }
-        self.dirty = true;
+        if before.is_none_or(|b| !e.same_except_counter(&b))
+            || e.frame_counter.wrapping_sub(e.persisted_counter) >= stride
+        {
+            e.persisted_counter = e.frame_counter;
+            self.dirty = true;
+        }
         Ok(())
     }
 
@@ -1599,35 +1734,37 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     /// Process an overheard client → server command (GP Notification,
     /// GP Commissioning Notification, GP Tunneling Stop) sent by another
     /// proxy, cancelling our own pending forward of the same GPDF
-    /// (A.3.5.2.1).
-    pub fn on_server_command(&mut self, src_nwk: u16, command_id: u8, payload: &[u8]) {
+    /// (A.3.5.2.1). Returns the cancelled forward, if one had not been
+    /// transmitted yet.
+    pub fn on_server_command(
+        &mut self,
+        src_nwk: u16,
+        command_id: u8,
+        payload: &[u8],
+    ) -> Option<CancelledForward> {
         if src_nwk == self.own_nwk {
-            return;
+            return None;
         }
         let (gpd, counter, rx_after_tx, other) = match command_id {
             server_cmd::NOTIFICATION => match Notification::decode(payload) {
                 Ok(n) => (n.gpd_id, n.frame_counter, n.rx_after_tx, n.proxy_info),
-                Err(_) => return,
+                Err(_) => return None,
             },
             server_cmd::COMMISSIONING_NOTIFICATION => {
                 match CommissioningNotification::decode(payload) {
                     Ok(n) => (n.gpd_id, n.frame_counter, n.rx_after_tx, n.proxy_info),
-                    Err(_) => return,
+                    Err(_) => return None,
                 }
             }
-            _ => return,
+            _ => return None,
         };
         if !rx_after_tx {
-            self.cancel(&gpd, counter);
-            return;
+            return self.cancel_where(&gpd, counter, |_| true);
         }
         let own = self.own_nwk;
-        self.pending.retain(|p| {
-            let same = p
-                .origin
-                .is_some_and(|(g, c)| g.matches(&gpd) && c == counter);
-            if !same || !p.rx_after_tx {
-                return !same;
+        self.cancel_where(&gpd, counter, |p| {
+            if !p.rx_after_tx {
+                return true;
             }
             let (other_short, other_link) = match other {
                 ProxyInfo::Link { gpp_short, link } => (gpp_short, link),
@@ -1635,14 +1772,14 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                     gpp_short,
                     distance,
                 } => (gpp_short, GppGpdLink(distance)),
-                ProxyInfo::None => return true,
+                ProxyInfo::None => return false,
             };
             let ours = (p.link.link_quality(), p.link.0 & 0x3F);
             let theirs = (other_link.link_quality(), other_link.0 & 0x3F);
             // Keep ours only if we are strictly better, or equal with the
             // lower short address.
-            ours > theirs || (ours == theirs && own < other_short)
-        });
+            !(ours > theirs || (ours == theirs && own < other_short))
+        })
     }
 
     /// Process a received `Device_annce` / Update Device: refresh unicast
@@ -1690,6 +1827,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 link: GppGpdLink(0),
                 frame: TxFrame::DeviceAnnce { alias: nwk },
                 dests,
+                started: false,
             });
         }
     }
@@ -1929,7 +2067,13 @@ mod tests {
                 &mut reply,
             )
             .unwrap();
-        assert_eq!(fx.commissioning, Some(true));
+        assert_eq!(
+            fx.commissioning,
+            Some(CommissioningEvent::Entered {
+                originator: 0,
+                window_s: Some(180)
+            })
+        );
         assert_eq!(
             p.on_gpdf(&mut aes, &f, GppGpdLink(0xC0 | 30), 10),
             GpdfOutcome::CommissioningNotification
@@ -1971,7 +2115,11 @@ mod tests {
                 &mut reply,
             )
             .unwrap();
-        assert_eq!(fx.commissioning, Some(false));
+        assert_eq!(
+            fx.commissioning,
+            Some(CommissioningEvent::Left(CommissioningExit::Explicit))
+        );
+        assert!(!p.take_commissioning_timeout());
     }
 
     #[test]
@@ -1989,8 +2137,111 @@ mod tests {
         assert_eq!(p.next_deadline(), Some(100 + 180_000));
         p.poll(100 + 179_999);
         assert!(p.in_commissioning_mode());
+        assert!(!p.take_commissioning_timeout());
         p.poll(100 + 180_000);
         assert!(!p.in_commissioning_mode());
+        // Reported exactly once.
+        assert!(p.take_commissioning_timeout());
+        p.poll(100 + 180_001);
+        assert!(!p.take_commissioning_timeout());
+    }
+
+    fn pcm(enter: bool, exit: u8, window_s: Option<u16>) -> heapless::Vec<u8, 8> {
+        let mut b = [0u8; 8];
+        let n = ProxyCommissioningMode {
+            enter,
+            exit_mode: exit,
+            window_s,
+            channel: None,
+            unicast: false,
+        }
+        .encode(&mut b)
+        .unwrap();
+        heapless::Vec::from_slice(&b[..n]).unwrap()
+    }
+
+    #[test]
+    fn commissioning_window_replaced_then_left_on_first_pairing() {
+        let mut p = P::new(ProxyConfig::default());
+        p.set_own_nwk(0x1234);
+        let mut reply = None;
+        let pcm_cmd = client_cmd::PROXY_COMMISSIONING_MODE;
+        let fx = p
+            .on_client_command(0, pcm_cmd, &zha_pcm(true), 0, &mut reply)
+            .unwrap();
+        assert!(matches!(
+            fx.commissioning,
+            Some(CommissioningEvent::Entered { .. })
+        ));
+        // ZHA re-opening permit-join replaces the running window.
+        let first_pairing = exit_mode::ON_FIRST_PAIRING;
+        let fx = p
+            .on_client_command(
+                0,
+                pcm_cmd,
+                &pcm(true, first_pairing, None),
+                1_000,
+                &mut reply,
+            )
+            .unwrap();
+        assert_eq!(
+            fx.commissioning,
+            Some(CommissioningEvent::Replaced { window_s: None })
+        );
+        // The replacement has no deadline: the old 180 s one is gone.
+        assert_eq!(p.next_deadline(), None);
+        p.poll(1_000 + 180_000);
+        assert!(p.in_commissioning_mode());
+        assert!(!p.take_commissioning_timeout());
+        let fx = p
+            .on_client_command(0, client_cmd::PAIRING, &zha_pairing(1), 2_000, &mut reply)
+            .unwrap();
+        assert_eq!(
+            fx.commissioning,
+            Some(CommissioningEvent::Left(CommissioningExit::FirstPairing))
+        );
+        assert!(!p.in_commissioning_mode());
+        // Leaving twice reports nothing.
+        let fx = p
+            .on_client_command(0, pcm_cmd, &zha_pcm(false), 3_000, &mut reply)
+            .unwrap();
+        assert_eq!(fx.commissioning, None);
+    }
+
+    #[test]
+    fn elapsed_window_is_a_timeout_not_a_replacement() {
+        let mut p = P::new(ProxyConfig::default());
+        let mut reply = None;
+        let pcm_cmd = client_cmd::PROXY_COMMISSIONING_MODE;
+        p.on_client_command(0, pcm_cmd, &pcm(true, 0, Some(10)), 0, &mut reply)
+            .unwrap();
+        // No poll ran since the deadline; the next enter starts a new window.
+        let fx = p
+            .on_client_command(0, pcm_cmd, &zha_pcm(true), 10_000, &mut reply)
+            .unwrap();
+        assert!(p.take_commissioning_timeout());
+        assert_eq!(
+            fx.commissioning,
+            Some(CommissioningEvent::Entered {
+                originator: 0,
+                window_s: Some(180)
+            })
+        );
+        // An explicit exit after expiry is not reported twice.
+        p.on_client_command(0, pcm_cmd, &pcm(true, 0, Some(10)), 20_000, &mut reply)
+            .unwrap();
+        assert!(!p.take_commissioning_timeout());
+        let fx = p
+            .on_client_command(0, pcm_cmd, &zha_pcm(false), 30_000, &mut reply)
+            .unwrap();
+        assert!(p.take_commissioning_timeout());
+        assert_eq!(fx.commissioning, None);
+        // Leave / factory reset drops a pending report.
+        p.on_client_command(0, pcm_cmd, &pcm(true, 0, Some(1)), 40_000, &mut reply)
+            .unwrap();
+        p.poll(41_000);
+        p.clear();
+        assert!(!p.take_commissioning_timeout());
     }
 
     #[test]
@@ -2018,6 +2269,228 @@ mod tests {
         let len = n.encode(&mut b).unwrap();
         p.on_server_command(0x4321, server_cmd::NOTIFICATION, &b[..len]);
         assert!(p.poll(1000).is_none());
+    }
+
+    /// Encrypted OFF GPDF of SRC with KEY_C0, NWK part (no MAC header).
+    fn secure_off(fc: u32, rx_after_tx: bool) -> heapless::Vec<u8, 64> {
+        let params = crate::frame::GpdfParams {
+            frame_type: FrameType::Data,
+            auto_commissioning: false,
+            src_id: Some(SRC),
+            security_level: SecurityLevel::Encrypted,
+            individual_key: false,
+            rx_after_tx,
+            to_gpd: false,
+            frame_counter: fc,
+        };
+        let mut out = [0u8; 64];
+        let n = security::build_gpdf(
+            &mut SoftwareAesProvider,
+            Some(&KEY_C0),
+            &params,
+            fc as u8,
+            cmd::OFF,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let mac = crate::frame::parse_mac(&out[..n]).unwrap();
+        heapless::Vec::from_slice(&out[mac.payload_offset..n]).unwrap()
+    }
+
+    /// Another proxy's GP Notification of SRC's frame `fc`.
+    fn others_notification(fc: u32, rx_after_tx: bool, info: ProxyInfo) -> heapless::Vec<u8, 48> {
+        let n = Notification {
+            gpd_id: GpdId::SrcId(SRC),
+            also_unicast: false,
+            also_derived_group: false,
+            also_commissioned_group: true,
+            security_level: SecurityLevel::Encrypted,
+            key_type: KeyType::GpdGroupKey,
+            rx_after_tx,
+            tx_queue_full: false,
+            bidirectional_cap: false,
+            frame_counter: fc,
+            command_id: cmd::OFF,
+            payload: Some(&[]),
+            proxy_info: info,
+        };
+        let mut b = [0u8; 48];
+        let len = n.encode(&mut b).unwrap();
+        heapless::Vec::from_slice(&b[..len]).unwrap()
+    }
+
+    #[test]
+    fn forward_stats_count_sent_and_cancelled_forwards() {
+        let mut p = paired_proxy(1);
+        let mut aes = SoftwareAesProvider;
+        let notify = server_cmd::NOTIFICATION;
+        assert_eq!(p.forward_stats(), ForwardStats::default());
+
+        // fc 2: we tunnel first.
+        let raw = secure_off(2, false);
+        let f = parse(&raw, 2, None).unwrap();
+        assert_eq!(
+            p.on_gpdf(&mut aes, &f, GppGpdLink(0), 0),
+            GpdfOutcome::Notification
+        );
+        assert!(p.poll(1_000).is_some());
+        assert!(p.poll(1_000).is_none());
+        // A late duplicate from another proxy cancels nothing.
+        let late = others_notification(2, false, ProxyInfo::None);
+        assert_eq!(p.on_server_command(0x4321, notify, &late), None);
+
+        // fc 3: another proxy tunnels first; ours is cancelled.
+        let raw = secure_off(3, false);
+        let f = parse(&raw, 3, None).unwrap();
+        p.on_gpdf(&mut aes, &f, GppGpdLink(0), 2_000);
+        // Our own Notification (heard back) cancels nothing.
+        let own = others_notification(3, false, ProxyInfo::None);
+        assert_eq!(p.on_server_command(0x1234, notify, &own), None);
+        // Another GPDF's Notification cancels nothing.
+        let other_fc = others_notification(4, false, ProxyInfo::None);
+        assert_eq!(p.on_server_command(0x4321, notify, &other_fc), None);
+        assert_eq!(
+            p.on_server_command(0x4321, notify, &own),
+            Some(CancelledForward {
+                gpd_id: GpdId::SrcId(SRC),
+                frame_counter: 3
+            })
+        );
+        assert!(p.poll(3_000).is_none());
+        assert_eq!(
+            p.forward_stats(),
+            ForwardStats {
+                sent: 1,
+                cancelled: 1
+            }
+        );
+    }
+
+    #[test]
+    fn rx_after_tx_forward_cancelled_only_by_a_better_proxy() {
+        let mut p = paired_proxy(1);
+        let mut aes = SoftwareAesProvider;
+        let notify = server_cmd::NOTIFICATION;
+        let link = GppGpdLink(0x80 | 30);
+        let raw = secure_off(2, true);
+        let f = parse(&raw, 2, None).unwrap();
+        assert_eq!(p.on_gpdf(&mut aes, &f, link, 0), GpdfOutcome::Notification);
+        // A worse proxy does not cancel ours.
+        let worse = ProxyInfo::Link {
+            gpp_short: 0x0001,
+            link: GppGpdLink(0x80 | 10),
+        };
+        assert_eq!(
+            p.on_server_command(0x0001, notify, &others_notification(2, true, worse)),
+            None
+        );
+        // A better one does.
+        let better = ProxyInfo::Link {
+            gpp_short: 0x4321,
+            link: GppGpdLink(0xC0 | 40),
+        };
+        assert!(
+            p.on_server_command(0x4321, notify, &others_notification(2, true, better))
+                .is_some()
+        );
+        assert!(p.poll(1_000).is_none());
+        assert_eq!(
+            p.forward_stats(),
+            ForwardStats {
+                sent: 0,
+                cancelled: 1
+            }
+        );
+    }
+
+    fn pair(p: &mut P, pairing: &[u8]) -> CommandEffects {
+        let mut reply = None;
+        p.on_client_command(0, client_cmd::PAIRING, pairing, 0, &mut reply)
+            .unwrap()
+    }
+
+    #[test]
+    fn repeated_pairing_does_not_rewrite_the_table() {
+        // ZHA sends the same GP Pairing for every commissioning GPDF.
+        let mut p = paired_proxy(1176);
+        let fx = pair(&mut p, &zha_pairing(1176));
+        assert!(fx.groups.is_empty());
+        assert!(!p.take_dirty(), "identical pairing");
+        // Counter-only changes follow the persistence stride.
+        pair(&mut p, &zha_pairing(1177));
+        pair(&mut p, &zha_pairing(1178));
+        assert!(!p.take_dirty(), "counter +2");
+        assert_eq!(p.entries()[0].frame_counter, 1178);
+        pair(&mut p, &zha_pairing(1176 + 15));
+        assert!(!p.take_dirty(), "counter +15");
+        pair(&mut p, &zha_pairing(1176 + 16));
+        assert!(p.take_dirty(), "counter +16 since the last write");
+        pair(&mut p, &zha_pairing(1176 + 17));
+        assert!(!p.take_dirty(), "stride restarts at the written value");
+        // GPDFs and Pairings share the stride.
+        let mut aes = SoftwareAesProvider;
+        let raw = secure_off(1176 + 31, false);
+        let f = parse(&raw, 0, None).unwrap();
+        p.on_gpdf(&mut aes, &f, GppGpdLink(0), 0);
+        assert!(!p.take_dirty(), "GPDF +15");
+        pair(&mut p, &zha_pairing(1176 + 32));
+        assert!(p.take_dirty(), "pairing completes the stride");
+    }
+
+    #[test]
+    fn pairing_counter_decrease_is_persisted() {
+        let mut p = paired_proxy(1000);
+        // A re-commissioned GPD restarted its counter: a stale persisted
+        // value above it would reject its frames after a reboot.
+        pair(&mut p, &zha_pairing(5));
+        assert!(p.take_dirty());
+        assert_eq!(p.entries()[0].frame_counter, 5);
+        pair(&mut p, &zha_pairing(5));
+        assert!(!p.take_dirty());
+    }
+
+    #[test]
+    fn pairing_changing_the_entry_is_persisted() {
+        let mut p = paired_proxy(1);
+        // New key.
+        let mut b = [0u8; 64];
+        let mut pr = Pairing::decode(&zha_pairing(1)).unwrap();
+        pr.key = Some([0x11; 16]);
+        let n = pr.encode(&mut b).unwrap();
+        pair(&mut p, &b[..n]);
+        assert!(p.take_dirty(), "key");
+        // Another sink group.
+        pr.sink = PairingSink::Group(0x1234);
+        let n = pr.encode(&mut b).unwrap();
+        let fx = pair(&mut p, &b[..n]);
+        assert_eq!(&fx.groups[..], &[GroupChange::Join(0x1234)]);
+        assert!(p.take_dirty(), "group");
+        // Inactive entry re-activated.
+        p.table[0].active = false;
+        pair(&mut p, &b[..n]);
+        assert!(p.take_dirty(), "activation");
+        // Removal is always written.
+        let rm = Pairing {
+            gpd_id: GpdId::SrcId(SRC),
+            add_sink: false,
+            remove_gpd: true,
+            communication_mode: CommunicationMode::CommissionedGroupcast,
+            gpd_fixed: false,
+            mac_seq_cap: false,
+            security_level: SecurityLevel::None,
+            key_type: KeyType::NoKey,
+            sink: PairingSink::None,
+            device_id: None,
+            frame_counter: None,
+            key: None,
+            assigned_alias: None,
+            groupcast_radius: None,
+        };
+        let n = rm.encode(&mut b).unwrap();
+        pair(&mut p, &b[..n]);
+        assert!(p.take_dirty(), "removal");
+        assert!(p.entries().is_empty());
     }
 
     #[test]

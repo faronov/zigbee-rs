@@ -196,4 +196,15 @@ fn log_summary(app: &App) {
             neighbor.lqi
         );
     }
+    #[cfg(feature = "green-power")]
+    {
+        let proxy = app.node().device().gp_proxy();
+        let stats = proxy.forward_stats();
+        log::info!(
+            "[ESP32-H2] GP proxy entries {} | forwards sent {} cancelled {} (other proxy first)",
+            proxy.entries().len(),
+            stats.sent,
+            stats.cancelled
+        );
+    }
 }

@@ -30,8 +30,8 @@ use zigbee_aps::apsde::{ApsdeDataIndication, ApsdeDataRequest};
 use zigbee_aps::{ApsAddress, ApsAddressMode};
 use zigbee_gp::cluster::GppGpdLink;
 use zigbee_gp::proxy::{
-    CommandEffects, DestAddr, GpTx, GpdfOutcome, GroupChange, MAX_TX_PAYLOAD, Proxy, ProxyConfig,
-    TxFrame,
+    CommandEffects, CommissioningEvent, CommissioningExit, DestAddr, GpTx, GpdfOutcome,
+    GroupChange, MAX_TX_PAYLOAD, Proxy, ProxyConfig, TxFrame,
 };
 use zigbee_gp::{GP_CLUSTER_ID, GP_ENDPOINT, GP_PROFILE_ID};
 use zigbee_mac::{MacDriver, McpsDataIndication};
@@ -289,11 +289,14 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         if fc & 0x03 == ZCL_CLUSTER_SPECIFIC {
             if to_client {
                 let mut reply = None;
-                match self
+                let result = self
                     .green_power
                     .proxy
-                    .on_client_command(src_addr, command, payload, now_ms, &mut reply)
-                {
+                    .on_client_command(src_addr, command, payload, now_ms, &mut reply);
+                // A window that elapsed before this command is reported
+                // ahead of what the command did.
+                self.gp_log_commissioning_timeout();
+                match result {
                     Ok(effects) => self.gp_apply_effects(&effects),
                     Err(error) => log::warn!("[GP] client cmd 0x{:02X}: {:?}", command, error),
                 }
@@ -307,9 +310,18 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             } else {
                 // Another proxy's GP Notification: lets us drop a duplicate
                 // of the same GPDF still waiting out its tunnelling delay.
-                self.green_power
+                if let Some(cancelled) = self
+                    .green_power
                     .proxy
-                    .on_server_command(src_addr, command, payload);
+                    .on_server_command(src_addr, command, payload)
+                {
+                    log::debug!(
+                        "[GP] forward {:?} fc {} cancelled: 0x{:04X} tunnelled it first",
+                        cancelled.gpd_id,
+                        cancelled.frame_counter,
+                        src_addr
+                    );
+                }
             }
         } else if fc & 0x03 == 0 && to_client && command == ZCL_READ_ATTRIBUTES {
             self.gp_read_attributes(src_addr, tsn, payload);
@@ -335,10 +347,31 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                 }
             }
         }
-        if let Some(enter) = effects.commissioning {
+        match effects.commissioning {
+            Some(CommissioningEvent::Entered {
+                originator,
+                window_s,
+            }) => log::info!(
+                "[GP] proxy commissioning mode entered by 0x{:04X}, window {:?} s",
+                originator,
+                window_s
+            ),
+            Some(CommissioningEvent::Replaced { window_s }) => log::info!(
+                "[GP] proxy commissioning window replaced, window {:?} s",
+                window_s
+            ),
+            Some(CommissioningEvent::Left(reason)) => {
+                log::info!("[GP] proxy commissioning mode left: {:?}", reason)
+            }
+            None => {}
+        }
+    }
+
+    fn gp_log_commissioning_timeout(&mut self) {
+        if self.green_power.proxy.take_commissioning_timeout() {
             log::info!(
-                "[GP] proxy commissioning mode {}",
-                if enter { "entered" } else { "left" }
+                "[GP] proxy commissioning mode left: {:?}",
+                CommissioningExit::Timeout
             );
         }
     }
@@ -452,7 +485,9 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                 Some(frame) => frame,
                 None => {
                     let now_ms = self.gp_now_ms();
-                    let Some(tx) = self.green_power.proxy.poll(now_ms) else {
+                    let tx = self.green_power.proxy.poll(now_ms);
+                    self.gp_log_commissioning_timeout();
+                    let Some(tx) = tx else {
                         break;
                     };
                     OutFrame {

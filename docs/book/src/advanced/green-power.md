@@ -55,6 +55,16 @@ Implementation notes that differ from the design below:
     word is such a field.
   - Built with `-Zlocation-detail=none`, all 11 non-TLSR images are
     byte-identical.
+  - Re-checked after the logging and write-skip fixes, against master
+    7e7342c, with both trees built from the same worktree path (the
+    absolute path changes string lengths in path-dependency panic
+    locations):
+    - BL702 router and sensor, EFR32MG1 sensor, TLSR8258 router and
+      sensor: byte-identical.
+    - MG22 sensor, ESP32-C6 router, ESP32-H2 router (devkit and
+      Waveshare H2-Zero), ESP32-H2 sensor (also the light-sleep build),
+      nRF52833 ED, nRF52840 router and ZBT-1 router: panic `Location`
+      line/column fields only. Section layout is unchanged.
 
 **Measured cost (ESP32-H2 router, release, `green-power` on vs off):**
 `.text` +25,284 B, `.rodata` +1,572 B, `.data` +320 B, `.bss` +2,280 B
@@ -267,8 +277,14 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
    - *Proxy Table Request:* answer from the table.
 4. On the first transmission the proxy may defer, using the LQI-based
    tunnelling delay (Dmin 15 ms … Dmax 100 ms). Its own pending Notification
-   is cancelled if an identical one from another proxy is heard first *(verify
-   1.1 rule)*.
+   is cancelled if an identical one from another proxy is heard first
+   (A.3.5.2.1). `Proxy::forward_stats()` counts forwards sent and cancelled,
+   and the runtime logs each cancellation at debug level.
+5. Commissioning mode transitions are reported as `CommissioningEvent`
+   (entered with its window, replaced by a new enter from the same sink, or
+   left on explicit exit / first pairing). A window that elapses is
+   reported once by `Proxy::take_commissioning_timeout()`. The runtime logs
+   all of them at info level.
 
 ### 3.3 Persistence
 
@@ -288,8 +304,12 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
 **Proxy-side GPD frame counter**
 
 - Authoritative in RAM.
-- Checkpointed lazily: after a counter delta of 256, after 60 s, or on table
-  changes.
+- Checkpointed lazily: when it has advanced by `counter_persist_stride`
+  (default 16) since the last written value, or with any other table
+  change. GPDFs and GP Pairings share the stride.
+- A GP Pairing that changes nothing but the counter, and does not complete
+  the stride, is not written. A counter decrease (a re-commissioned GPD) is
+  always written, so the stored value never exceeds the live one.
 - After a reset, frames in the window up to the last checkpoint could be
   replayed through the proxy. The sink checks counters again (zigpy keeps
   `frame_counter`). This is the same documented trade-off as the NWK replay
@@ -572,8 +592,8 @@ All times are EET.
   `0 GP proxy table entries restored`.
 - **Proxy Commissioning Mode:** each `zha.permit` produced
   `[GP] proxy commissioning mode entered` in the same second.
-  - When the window expires, the proxy leaves the mode silently, with no
-    log line (open issue below).
+  - When the window expires, the proxy left the mode silently, with no
+    log line (fixed since, see below).
   - The router LED follows the NWK permit-join timer, which ends at the
     same time.
 - **Commissioning Notification:** zigpy received a CN for 0x293C9879 with
@@ -587,7 +607,8 @@ All times are EET.
   - Each Pairing produced `GP proxy table saved`. The window holds three
     committed 1 KiB records, generations 0–2, each with the `ZBGP` magic,
     the network EPID, the SrcID, group 0x0B84 and counters 1176–1178.
-  - Every Pairing wrote a new record, even when only the counter changed.
+  - Every Pairing wrote a new record, even when only the counter changed
+    (fixed since, see below).
 - **Operational forwarding:** the router matched every report (fc
   1179–1188) to the entry and logged `[GP] GPDF … Notification`.
   - Its groupcast GP Notification reached zigpy at 17:05:21.314 (fc 1184)
@@ -614,14 +635,23 @@ All times are EET.
   - replay and bad-MIC tests on air;
   - the soak test;
   - bidirectional and Combo operation.
+- **Fixed after this run (host-tested, hardware re-check pending):**
+  - Commissioning mode now logs `entered by 0x…, window … s`,
+    `window replaced`, and `left: Explicit | FirstPairing | Timeout`. A
+    window that elapsed before the next GP command is logged as a timeout
+    before that command's own transition.
+  - Forwards sent and cancelled by another proxy's copy (A.3.5.2.1) are
+    counted. Each cancellation is logged at debug level. The ESP32-H2
+    router prints `GP proxy entries … | forwards sent … cancelled …` with
+    its 60 s neighbour summary.
+  - A Pairing that changes nothing is not written. A counter-only change
+    follows the 16-value persistence stride (see 3.3). zigpy's three
+    Pairings in this run would now cost one record instead of three.
+  - Cost on the Waveshare H2-Zero GP router: `.text` +2,632 B, `.rodata`
+    +376 B, `.data` +32 B, `.bss` +8 B (app image 512,096 B → 515,136 B).
+    Feature-off images keep their size and layout (see the identity
+    re-check above).
 - **Open issues:**
-  - The proxy logs nothing when the commissioning window expires
-    (`poll()` clears it silently), and nothing when a pending forward is
-    cancelled by another proxy's copy. A debug counter would make the
-    forwarding share visible.
-  - zigpy's repeated Pairings cost one journal record each. The 8 KiB
-    window holds 8 slots and rolls over safely, but an unchanged entry
-    should not be rewritten.
   - Pre-existing, not GP: `[NWK] Frame counter replay from <nwk>` warnings
     print the NWK source rather than the auxiliary-header source. The
     router's direct link to the coordinator is weak (LQI ~22–33).
