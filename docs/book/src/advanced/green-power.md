@@ -22,8 +22,8 @@
 | ESP32-H2 router example `green-power` + 8 KiB `zbnv` journal at 0x3F8000 | lab-tested on hardware (2026-11-12) | Waveshare ESP32-H2-Zero, app-only flash over the shipped router (joined state kept, no rejoin): Proxy Commissioning Mode, Commissioning Notification tunnelled to ZHA, Pairing → proxy table entry persisted, groupcast Notification decoded by ZHA, table restored after reset without re-pairing (§6.1) |
 | `efr32s2-hal::trng` (MG22 CRYPTOACC BA431 TRNG: GSDK init, conditioning KAT, health-failure reinit) | implemented | host model tests; lab bin `s2-trng` built, not run |
 | `apps/gpd` (`gpd-app`): provisioning, `GpdJournal`, beacon scan for a permit-join network, unidirectional commissioning, L3 Multi-Cluster Reports and switch commands, CCA backoff | implemented | host tests: sink-side decode of commissioning (key unwrap), reports and Toggle; counter never reused across reboot; failed reservation transmits nothing; journal rollover / interrupted write / CRC fallback |
-| `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch lab-tested the same day with a separate SrcID (0x7A6B9879) and journal: commissioned, Off/On/Toggle events in HA every 30 s (`lab-switch-cycle` build), counter resumed at 16 after reset and accepted. Re-flashing the sensor resumed its own SrcID (counter 80) and ZHA accepted it |
-| ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity entities (battery not reported by the MG22 build); switch event entity with `off`/`on`/`toggle` |
+| `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch lab-tested the same day with a separate SrcID (0x7A6B9879) and journal: commissioned, Off/On/Toggle events in HA every 30 s (`lab-switch-cycle` build), counter resumed at 16 after reset and accepted. Re-flashing the sensor resumed its own SrcID (counter 80) and ZHA accepted it. Battery reporting (IADC0 AVDD, 470f1e3): host-tested and built, not yet on hardware |
+| ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity entities; battery voltage/percentage entities added in 470f1e3 (not yet deployed); switch event entity with `off`/`on`/`toggle` |
 | Bidirectional GPD, full proxy, Combo/Sink | not started | — |
 
 Implementation notes that differ from the design below:
@@ -390,7 +390,8 @@ No board crate gets GP storage. Products own the partitions.
   `ZigBeeAlliance09`. Each commissioning frame consumes a frame counter,
   because zigpy stores the commissioning counter as the replay floor.
 - Operation: Multi-Cluster Reporting (0xA2) with temperature (0x0402),
-  humidity (0x0405) and optional battery (0x0001/0x0021); switch commands
+  humidity (0x0405) and optional battery voltage and percentage
+  (0x0001/0x0020 in 100 mV, 0x0001/0x0021 in 0.5 %); switch commands
   Off/On/Toggle (0x20–0x22). Each GPDF is sent twice with the same counter
   (sinks and proxies drop the duplicate), after CCA with random backoff.
 - MG22 composition (`examples/efr32mg22-gpd`): commission once at boot if
@@ -398,13 +399,25 @@ No board crate gets GP storage. Products own the partitions.
   the channel and recommission; the sensor reports every 60 s; EM2 with
   the radio idled between events. Temperature is the die sensor and the
   humidity is **synthetic** (BRD4183A has no humidity sensor).
+- Battery (470f1e3): before each report the sensor measures AVDD with one
+  calibrated IADC0 conversion (`efr32s2-hal::iadc`, AVDD/4 against the
+  1.21 V band-gap, `SCALE0` from the DEVINFO gain/offset words as GSDK
+  `IADC_init` computes them; disabled again after the read). The board
+  exposes it as `SupplyToken`; `gpd-app::BatteryCurve` converts millivolts
+  into both ZCL attributes and the product selects a CR2032 curve
+  (1.8 V = 0 %, 3.0 V = 100 %). On BRD4183A AVDD is VMCU: the WSTK's
+  regulated 3.3 V with its power switch at AEM (so the percentage clamps to
+  100 %), the coin cell only with the switch at BAT. A failed measurement
+  omits both attributes and logs a warning.
 - Flash map: application 0x0–0x70000 (no bootloader), one GPD journal per
   device kind (switch 0x70000–0x74000, sensor 0x74000–0x78000), so
   swapping the sensor and switch images on one board keeps both
   identities; 0x78000–0x80000 never written (0x7C000 keeps the Zigbee
   sensor product's security journal).
 - Measured (release): 41,228 B file-backed flash, `.bss` 2,312 B;
-  29.9 KiB linked stack. Sensor and switch are the same size.
+  29.9 KiB linked stack. Sensor and switch are the same size. Battery
+  reporting (470f1e3) adds 884 B (`.text` +812, `.rodata` +72, same build
+  path); `.data`/`.bss` unchanged; sensor `.bin` 42,264 B.
 - `lab-switch-cycle` (lab only, never shipped): the switch sends
   Off/On/Toggle every 30 s without a button press, because hwlab cannot
   press BTN0.
@@ -747,10 +760,15 @@ running the nRF 802.15.4 sniffer on channel 15.
     NWK 0xFFFF mapping (`zigbee-aps/src/apsde.rs`) predates GP. Commissioning
     Notifications already use 0xFFFD. Fixed on master's side in branch
     `aps-group-fffd` (6a1b276); see 6.3.
-  - **Alias sequence offset:** IKEA's operational Notifications use alias
-    seq MAC − 12 rather than the commissioned-groupcast −13 (A.3.6.3.3.2) we
-    use. As a result, the BTT never merges their copy with ours. This is an
-    interoperability note, not a defect in our proxy.
+  - **Alias sequence offset (corrected 2026-11-13):** the IKEA frames
+    with alias seq MAC − 12 are **Commissioning Notifications** (cmd 0x04,
+    broadcast without a group), for which −12 is the correct offset; they
+    are not operational Notifications. In the 6.3 re-check IKEA 0x1AA4 and
+    0x7B65 sent only Commissioning Notifications for our GPD, so every
+    operational Notification on the air was ours. Our commissioned-groupcast
+    offset is −13; EmberZNet (GSDK 4.5, certified) uses −9 for that case
+    (`EMBER_GP_NOTIFICATION_COMMISSIONED_GROUPCAST_SEQUENCE_NUMBER_OFFSET`).
+    Open: check A.3.6.3.3.2 before changing `alias_seq::COMMISSIONED_GROUPCAST`.
   - **Forwarding in commissioning mode:** while in commissioning mode we
     forward data GPDFs as ordinary Notifications. The other proxies switch
     to Commissioning Notifications (−12). The spec leaves this to the
@@ -758,7 +776,7 @@ running the nRF 802.15.4 sniffer on channel 15.
   - **APS counter:** ours is the router's own APS counter. Other proxies
     reuse the alias NWK sequence.
 
-### 6.3 Fixes after 6.2 (host-tested; hardware re-check pending)
+### 6.3 Fixes after 6.2 (hardware re-checked 2026-11-13)
 
 - **APS group → NWK 0xFFFD** (branch `aps-group-fffd`, 6a1b276, based on
   master 7e7342c; cherry-picked here as 94d6127):
@@ -783,14 +801,44 @@ running the nRF 802.15.4 sniffer on channel 15.
 - **GP H2-Zero image** (`router,waveshare-h2-zero,green-power`): app.bin
   515,376 B (sha `4a2a89ad…c996`), ending at 0x8DD30 in ota_0. Against the
   ce7e806 image: `.text` +172, `.rodata` +72, `.data`/`.bss` +0.
-- **Still to prove on hardware:** one original plus neighbour relays per
-  forward (no radius-28 echo relays, no retransmissions), and Notifications
-  addressed to NWK 0xFFFD.
+- **Hardware re-check (2026-11-13, 00:19–00:44 EET):**
+  - App-only flash of `4a2a89ad…c996` to ota_0 at 0x10000 (126 sectors up
+    to 0x8E000), read back and sha-verified. Boot at 00:20:01 resumed NWK
+    0x8C23 (PAN 0xDFE9, channel 15, parent 0x4A76) without a rejoin and
+    restored 1 GP proxy table entry.
+  - 25-minute capture: router log, GPD VCOM and the nRF52840 sniffer on
+    channel 15 (`2026-11-12T221855Z-gp-h2-99ebba6-flash-sniff`).
+  - **No echo relays:** 0x8C23 sent no radius-28/29 copy of any
+    operational Notification (cmd 0x00); before the fix every forward had up
+    to 4 radius-28 echoes. Its only radius-28/29 frames are ordinary relays
+    of other proxies' Commissioning Notifications (cmd 0x04).
+  - **Groupcast addressing:** all 77 frames from 0x8C23 carrying our alias
+    went to NWK 0xFFFD; all 29 operational Notifications carried APS group
+    0x0B84, radius 30.
+  - **Copies per forward:** 12 forwards on the air, 1–4 radius-30 copies
+    each (29 in total, mean 2.4) about 510 ms apart. These are passive-ack
+    retries within `nwkMaxBroadcastRetries` = 3 (R22 default): the router
+    stops early once every router neighbour has relayed, otherwise it
+    retries. Neighbour relays (0x1AA4, 0x43FD, 0x4A76, 0x670B, 0xD586, …)
+    now count as passive acks. Retries continue when a router neighbour,
+    for example the weakly linked coordinator, is not heard relaying.
+  - **Counters vs air:** 24 GPDFs from 00:20:08 to 00:43:10. The router's
+    00:43:01 summary read `forwards sent 11 cancelled 12`, and the 00:43:10
+    GPDF was forwarded after it. Every `sent` increment matches a forward
+    seen on the air (00:20:08, 00:25:09, 00:26:09, 00:32:09, 00:33:09,
+    00:35:10, 00:36:10, 00:38:10, 00:40:10, 00:41:10, 00:42:10, 00:43:10).
+    No other proxy originated an operational Notification. The "cancelled"
+    reports therefore rest on other proxies' Commissioning Notifications.
+  - **HA:** the humidity entity changed every 60 s with no gap, 26 updates
+    from 00:19:08 to 00:44:11 EET.
 - **HA battery entity "unknown":** this is not a regression. The MG22 lab GPD
-  sends no battery attribute (`battery_half_percent: None`; it logs
+  sent no battery attribute (`battery_half_percent: None`; it logged
   "no battery report" at boot). The quirk always adds a Battery entity, so the
   entity has been `unknown` since it was created on 2026-11-11. At each
   Pairing ZHA re-initialises the entities: unavailable → unknown at 22:00:43.
+  Addressed by 470f1e3 (measured AVDD reported as battery voltage and
+  percentage, plus a Battery voltage entity in the quirk). This is not yet
+  flashed or deployed.
 
 ## 7. Open questions for the user
 
