@@ -100,6 +100,7 @@ jobs:
       - run: cargo test -p zigbee-zcl --no-default-features --features float32 --locked
       - run: cargo test -p zigbee-zcl --no-default-features --features float64 --locked
       - run: cargo test -p zigbee-zcl --features green-power --locked
+      - run: cargo test -p zigbee-nwk --features router,green-power --locked
       # nRF product crates are excluded from the root workspace (they pull in
       # `embassy-nrf`), but their battery-curve and profile logic is
       # host-testable because the hardware dependencies are
@@ -398,6 +399,7 @@ jobs:
       - run: cargo clippy -p zigbee-zcl --no-default-features --features float32 --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --no-default-features --features float64 --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --all-targets --features green-power --locked -- -D warnings
+      - run: cargo clippy -p zigbee-nwk --all-targets --features router,green-power --locked -- -D warnings
 
   fmt:
     name: Format
