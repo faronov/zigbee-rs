@@ -47,6 +47,8 @@ Implementation notes that differ from the design below:
   stride − 1 on restore, so no frame accepted before a power loss is
   accepted again. The cost is up to stride − 1 new frames per GPD rejected
   as stale after a reboot (§3.3).
+- A counter-only change is journalled as a 32-byte compact record instead
+  of a new 1 KiB snapshot, about 24× less flash wear (§3.3).
 - The corrected ZCL GP cluster is behind `zigbee-zcl/green-power`
   (enabled by `zigbee-runtime/green-power`). Without the feature,
   `clusters/green_power_legacy.rs` (master's skeleton, verbatim) is
@@ -370,28 +372,84 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
 
 No board crate gets GP storage. Products own the partitions.
 
-**Flash endurance.** Every record is a 1024-byte slot, so a two-sector
-journal of 4 KiB sectors erases each sector once per 8 writes (8 KiB
-sectors: once per 16). Each GPD causes one write per `N` frames. Years
-until 10,000 erase cycles per sector (internal flash: nRF52, EFR32,
-STM32WB); the ESP32, TLSR8258 and BL702 SPI flash is rated for 100,000
-cycles, ten times longer:
+**Compact counter records** (`zigbee-runtime/src/gp_store.rs`,
+`GP_COUNTER_RECORD_SIZE` = 32). A change that only moves security frame
+counters no longer rewrites the 1 KiB snapshot. The journal appends one
+32-byte record per changed entry after the newest full record, in the
+same sector:
 
-| GPDs reporting every 60 s | `N` = 16 (before) | `N` = 64 (default) | `N` = 128 |
+| Bytes | Field |
+|---|---|
+| 0..4 | magic `ZBGC` |
+| 4 | version 1 |
+| 5 | entry index in the full record |
+| 6..8 | zero |
+| 8..12 | generation of the full record it amends |
+| 12..16 | GPD tag: CRC32 of the entry's encoded GPD ID bytes |
+| 16..20 | frame counter (LE) |
+| 20..24 | CRC32 of bytes 0..20 |
+| 24..28 | commit marker `CMIT`, written after the body |
+| 28..32 | left erased |
+
+- On load the newest full record is read, then the 32-byte units after
+  it are walked up to the first fully erased unit. A record is applied
+  only if its CRC and commit marker are valid and its generation, index
+  and GPD tag match an entry that carries a counter
+  (`ProxyEntry::encoded_layout`). Torn, corrupt or foreign records are
+  skipped; a later valid record wins.
+- `commit` compares the new snapshot with the stored one with the counter
+  bytes masked. Identical: nothing is written. Only counters differ: one
+  record per changed entry, each read back. Anything structural (entry
+  added or removed, flags, groups, key, a re-pair) or a full sector: a new
+  full record with a new generation, which makes every older counter
+  record stale, rolling over to the other sector as before.
+- The first GPDFs after a pairing set `in_range` and `first_to_forward`
+  (Table 39 flags) without a write of their own, so the next stride write
+  after a pairing is one full record; after that only counter records.
+- Geometry: the 24-byte body and the 4-byte marker must be multiples of
+  the flash write size and the 32-byte unit of the read size. All current
+  products qualify (write size ≤ 4); other geometries keep the full-record
+  path only.
+- Compatibility: the full-record format is unchanged, so the GP
+  partitions already written by the earlier firmware (H2-Zero, ZBT-1
+  0x4A76) load as-is and start taking counter records. Older firmware
+  ignores `ZBGC` units and never writes over them (it only uses fully
+  erased slots).
+- Downgrade caveat: an older image restores only the full record's
+  counter plus its skip-ahead (`N − 1`), so a counter recorded only in
+  compact records more than `N − 1` past that value could be accepted
+  again by the older image. Downgrading the router firmware therefore
+  reopens a replay window for frames sent since the last full record.
+- Host tests (`gp_store`): compact records fill a sector (96 per 4 KiB)
+  then roll over; an unchanged snapshot is not written; a structural
+  change drops older counter records (including a higher counter from
+  before a re-pair); torn and corrupt records are skipped; records for
+  another generation, index or GPD are ignored; a hand-built legacy
+  journal loads byte-identical and accepts counter records; end to end
+  with `Proxy`, real GPDFs and AES: reboot skip-ahead from a compact
+  record rejects every replay and accepts the first frame above the
+  floor.
+
+**Flash endurance.** A full record is a 1024-byte slot; the rest of the
+sector takes 32-byte counter records. A 4 KiB sector therefore takes 1
+full + 96 counter updates per erase (8 KiB: 1 + 224), against 4 (8)
+updates per erase before. Each GPD causes one counter update per `N`
+frames. Years until 10,000 erase cycles per sector (internal flash:
+nRF52, EFR32, STM32WB); the ESP32, TLSR8258 and BL702 SPI flash is rated
+for 100,000 cycles, ten times longer:
+
+| GPDs reporting every 60 s | `N` = 16 | `N` = 64 (default) | `N` = 64, full records only (before) |
 |---|---:|---:|---:|
-| 1, 4 KiB sectors (nRF52, STM32WB) | 2.4 y | 9.7 y | 19.5 y |
-| 1, 8 KiB sectors (EFR32MG21, ZBT-1) | 4.9 y | 19.5 y | 39 y |
-| 10, 4 KiB sectors | 0.24 y | 0.97 y | 1.9 y |
-| 10, 8 KiB sectors | 0.49 y | 1.9 y | 3.9 y |
+| 1, 4 KiB sectors (nRF52, STM32WB, ESP32, TLSR, BL702) | 59 y | 236 y | 9.7 y |
+| 1, 8 KiB sectors (EFR32MG21, ZBT-1) | 137 y | 548 y | 19.5 y |
+| 10, 4 KiB sectors | 5.9 y | 23.6 y | 0.97 y |
+| 10, 8 KiB sectors | 13.7 y | 55 y | 1.9 y |
 
-`N` = 64 is the smallest power of two that keeps one 60 s GPD near ten
-years on the weakest flash (4 KiB, 10,000 cycles: ten years need at most
-one write per 65.7 min). A larger `N` mostly costs reboot losses (above).
-Ten busy GPDs on 10,000-cycle internal flash still wear out in one to two
-years; the fix is smaller records, not a larger `N`: the snapshot rewrites
-every entry in a 1 KiB slot, while a counter-only record of about 32 B
-would fit 32 records per 1 KiB and stretch the same numbers about 30×
-(open, not implemented).
+`N` = 64 stays the default: it was chosen to keep one 60 s GPD near ten
+years with full records only, and with compact records it leaves margin
+for ten GPDs, structural changes and re-pairs. A product with a
+switch-only, proxy-only deployment can now pick a small `N` (fewer
+frames lost after a reboot) at an acceptable wear cost.
 
 ### 3.4 ZCL
 
