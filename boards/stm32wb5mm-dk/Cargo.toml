@@ -1,0 +1,19 @@
+[package]
+name = "stm32wb5mm-dk"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for the ST STM32WB5MM-DK discovery kit"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone: Embassy is pinned by git in stm32wb-hal.
+[workspace]
+
+[dependencies]
+stm32wb-hal = { path = "../../stm32wb-hal", features = ["stm32wb55vg"] }
+
+# Local ST MAC layout and mailbox-acknowledgement fixes: see
+# vendor/embassy-stm32-wpan/LOCAL-PATCHES.md.
+[patch."https://github.com/embassy-rs/embassy"]
+embassy-stm32-wpan = { path = "../../vendor/embassy-stm32-wpan" }

@@ -1,0 +1,26 @@
+[package]
+name = "stm32wb5mm-dk-router-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product identity, flash layout and persistence for the STM32WB5MM-DK Zigbee router"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone: the Embassy git dependencies of the target build must not enter
+# the root lockfile.
+[workspace]
+
+[dependencies]
+router-app = { path = "../../apps/router" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[target.'cfg(target_os = "none")'.dependencies]
+stm32wb-hal = { path = "../../stm32wb-hal", features = ["stm32wb55vg"] }
+
+# Local ST MAC layout and mailbox-acknowledgement fixes: see
+# vendor/embassy-stm32-wpan/LOCAL-PATCHES.md.
+[patch."https://github.com/embassy-rs/embassy"]
+embassy-stm32-wpan = { path = "../../vendor/embassy-stm32-wpan" }
