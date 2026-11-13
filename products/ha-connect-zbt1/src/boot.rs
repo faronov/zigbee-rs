@@ -424,7 +424,10 @@ mod tests {
             // The GP window, the router tables and the journal lie outside
             // the view.
             assert!(view.write(BELOW_PERSISTENCE as u32, &word).is_err());
-            assert!(view.write(crate::CHILD_TABLE_PARTITION_START, &word).is_err());
+            assert!(
+                view.write(crate::CHILD_TABLE_PARTITION_START, &word)
+                    .is_err()
+            );
             let mut byte = [0];
             assert!(view.read(JOURNAL_START, &mut byte).is_err());
         }
