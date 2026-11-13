@@ -92,10 +92,14 @@ ZHA creates the temperature and occupancy entities on its own. It creates
 Analog Input entities only for some manufacturers, so endpoints 2–4 need
 the quirk in
 `products/stm32wb5mm-dk-router/integrations/zha_quirk_stm32wb5mm_dk.py`
-(through `custom_quirks_path`).
+(through `custom_quirks_path`). Copy the file into the custom-quirks
+directory and reload the ZHA config entry; Home Assistant does not need a
+restart. The quirk has been deployed this way on a live ZHA installation,
+where it applied to the DK and its distance, inclination and sound-level
+entities updated, including in-range ToF readings.
 `integrations/z2m_stm32wb5mm_dk.mjs` is the matching Zigbee2MQTT external
-converter. Both were checked against current zigpy/ZHA and
-zigbee-herdsman-converters with simulated devices only.
+converter. It has been checked against current zigbee-herdsman-converters
+with simulated devices only and has not run in a live Zigbee2MQTT.
 
 ## Coprocessor prerequisites
 
