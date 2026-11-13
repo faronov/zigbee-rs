@@ -16590,7 +16590,7 @@ mod parent_router_tests {
         // Secured NWK data frame under the GPD alias.
         assert_eq!(nwk[1] & 0x02, 0x02);
         assert_eq!(u16::from_le_bytes([nwk[4], nwk[5]]), SRC as u16);
-        assert_eq!(nwk[7], GPDF_MAC_SEQ.wrapping_sub(13));
+        assert_eq!(nwk[7], GPDF_MAC_SEQ.wrapping_sub(9));
 
         // The sink decrypts a GP Notification for the GPD.
         let nwk_frame: heapless::Vec<u8, 128> = heapless::Vec::from_slice(nwk).unwrap();
@@ -16606,6 +16606,9 @@ mod parent_router_tests {
         };
         assert_eq!(aps.src_addr, ShortAddress(SRC as u16));
         // APS group frame: FC, group, cluster, profile, src EP, counter.
+        // GP 1.1.2 A.3.6.3.3.2: the APS counter equals the alias NWK
+        // sequence number.
+        assert_eq!(aps.payload[8], GPDF_MAC_SEQ.wrapping_sub(9));
         let zcl = &aps.payload[9..];
         assert_eq!(zcl[2], server_cmd::NOTIFICATION);
         let decoded = Notification::decode(&zcl[3..]).unwrap();

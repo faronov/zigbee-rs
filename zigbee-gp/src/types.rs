@@ -302,8 +302,14 @@ pub fn src_id_ieee(src_id: u32) -> IeeeAddress {
     [b[0], b[1], b[2], b[3], 0, 0, 0, 0]
 }
 
-/// Alias NWK sequence-number offsets (GP spec A.3.6.3.3.2), applied to the
-/// triggering GPDF MAC sequence number.
+/// Alias sequence-number offsets, subtracted (mod 256) from the triggering
+/// GPDF MAC sequence number. The result is used both as the alias NWK
+/// sequence number and as the APS counter.
+///
+/// Source: GP Basic 1.1.2 (CSA 14-0563-19) A.3.6.3.3.2. GP 1.0a (095499r26)
+/// had 13 for the commissioned groupcast GP Notification; 1.1 changed it to
+/// 9, which EmberZNet (`EMBER_GP_NOTIFICATION_COMMISSIONED_GROUPCAST_
+/// SEQUENCE_NUMBER_OFFSET`) also uses.
 pub mod alias_seq {
     /// Derived groupcast GP Notification.
     pub const DERIVED_GROUPCAST: u8 = 0;
@@ -314,7 +320,7 @@ pub mod alias_seq {
     /// GP Commissioning Notification.
     pub const COMMISSIONING_NOTIFICATION: u8 = 12;
     /// Commissioned groupcast GP Notification.
-    pub const COMMISSIONED_GROUPCAST: u8 = 13;
+    pub const COMMISSIONED_GROUPCAST: u8 = 9;
     /// Broadcast GP Notification.
     pub const BROADCAST_NOTIFICATION: u8 = 14;
 
@@ -327,6 +333,19 @@ pub mod alias_seq {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GP Basic 1.1.2 A.3.6.3.3.2, one line per forwarded command type.
+    #[test]
+    fn alias_sequence_offsets_match_gp_1_1_2() {
+        use alias_seq::*;
+        let mac_seq = 0x05;
+        assert_eq!(derive(mac_seq, DERIVED_GROUPCAST), 0x05);
+        assert_eq!(derive(mac_seq, PAIRING_SEARCH), 0xFB);
+        assert_eq!(derive(mac_seq, TUNNELING_STOP), 0xFA);
+        assert_eq!(derive(mac_seq, COMMISSIONING_NOTIFICATION), 0xF9);
+        assert_eq!(derive(mac_seq, COMMISSIONED_GROUPCAST), 0xFC);
+        assert_eq!(derive(mac_seq, BROADCAST_NOTIFICATION), 0xF7);
+    }
 
     #[test]
     fn alias_derivation_matches_spec_rules() {

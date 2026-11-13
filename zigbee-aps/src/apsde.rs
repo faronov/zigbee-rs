@@ -1022,6 +1022,16 @@ impl<M: MacDriver> ApsLayer<M> {
         }
 
         // Normal (non-encrypted, non-fragmented) send
+        // GP 1.1.2 A.3.6.3.3.2: an alias frame's APS counter has the same
+        // value as its alias NWK sequence number, so every proxy tunnelling
+        // the same GPDF sends an identical APS header; this device's own
+        // counter is left untouched.
+        #[cfg(feature = "green-power")]
+        let aps_counter = match req.alias_src_addr.and(req.alias_seq) {
+            Some(alias_seq) => alias_seq,
+            None => self.next_aps_counter(),
+        };
+        #[cfg(not(feature = "green-power"))]
         let aps_counter = self.next_aps_counter();
         let aps_header = self.build_data_header(delivery_mode, req, aps_counter, false, false);
 
@@ -7963,12 +7973,17 @@ mod tests {
                 ..ApsTxOptions::default()
             },
         );
-        block_on(aps.apsde_data_request(&request)).unwrap();
+        let aps_counter_before = aps.aps_counter;
+        let confirm = block_on(aps.apsde_data_request(&request)).unwrap();
         let frame = aps.nwk().mac().tx_history()[0].payload.as_slice();
         assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), 0x5AA5);
         assert_eq!(frame[7], 0x37);
         assert_eq!(aps.nwk().nib().network_address, LOCAL_SHORT);
         assert_eq!(aps.nwk().nib().sequence_number, 0x10);
+        // GP 1.1.2 A.3.6.3.3.2: the APS counter equals the alias sequence
+        // number and this device's own APS counter is not consumed.
+        assert_eq!(confirm.aps_counter, 0x37);
+        assert_eq!(aps.aps_counter, aps_counter_before);
 
         // The next ordinary frame uses this device's own identity again.
         let mut plain = gp_alias_request(
@@ -7981,7 +7996,8 @@ mod tests {
         );
         plain.alias_src_addr = None;
         plain.alias_seq = None;
-        block_on(aps.apsde_data_request(&plain)).unwrap();
+        let plain_confirm = block_on(aps.apsde_data_request(&plain)).unwrap();
+        assert_eq!(plain_confirm.aps_counter, aps_counter_before);
         let frame = aps.nwk().mac().tx_history()[1].payload.as_slice();
         assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), LOCAL_SHORT.0);
         assert_eq!(frame[7], 0x10);

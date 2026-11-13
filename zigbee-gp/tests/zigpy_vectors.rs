@@ -482,13 +482,14 @@ mod proxy {
         );
         let tx = p.poll(1000 + D_MIN_MS).unwrap();
         assert_eq!(tx.dest, DestAddr::Group(0x0B84));
-        // Commissioned-groupcast alias: derived alias, MAC seq − 13.
+        // Commissioned-groupcast alias: derived alias, MAC seq − 9
+        // (GP 1.1.2 A.3.6.3.3.2).
         let (alias, seq) = tx.alias.unwrap();
         assert_eq!(
             alias,
             zigbee_gp::types::derive_alias(&GpdId::SrcId(v::SRC_ID))
         );
-        assert_eq!(seq, 0x11u8.wrapping_sub(13));
+        assert_eq!(seq, 0x11u8.wrapping_sub(9));
         let (id, payload) = gp_command(&tx);
         assert_eq!(id, server_cmd::NOTIFICATION);
         assert_eq!(payload, v::NOTIFICATION_COMM_GROUP_L3);

@@ -1987,7 +1987,7 @@ mod tests {
         assert!(p.poll(1000 + D_MIN_MS - 1).is_none());
         let tx = p.poll(1000 + D_MIN_MS).unwrap();
         assert_eq!(tx.dest, DestAddr::Group(0x0B84));
-        assert_eq!(tx.alias, Some((0x4321, 0x20u8.wrapping_sub(13))));
+        assert_eq!(tx.alias, Some((0x4321, 0x20u8.wrapping_sub(9))));
         let TxFrame::GpCommand {
             command_id,
             payload,

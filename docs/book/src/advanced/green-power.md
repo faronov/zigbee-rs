@@ -22,8 +22,8 @@
 | ESP32-H2 router example `green-power` + 8 KiB `zbnv` journal at 0x3F8000 | lab-tested on hardware (2026-11-12) | Waveshare ESP32-H2-Zero, app-only flash over the shipped router (joined state kept, no rejoin): Proxy Commissioning Mode, Commissioning Notification tunnelled to ZHA, Pairing → proxy table entry persisted, groupcast Notification decoded by ZHA, table restored after reset without re-pairing (§6.1) |
 | `efr32s2-hal::trng` (MG22 CRYPTOACC BA431 TRNG: GSDK init, conditioning KAT, health-failure reinit) | implemented | host model tests; lab bin `s2-trng` built, not run |
 | `apps/gpd` (`gpd-app`): provisioning, `GpdJournal`, beacon scan for a permit-join network, unidirectional commissioning, L3 Multi-Cluster Reports and switch commands, CCA backoff | implemented | host tests: sink-side decode of commissioning (key unwrap), reports and Toggle; counter never reused across reboot; failed reservation transmits nothing; journal rollover / interrupted write / CRC fallback |
-| `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch lab-tested the same day with a separate SrcID (0x7A6B9879) and journal: commissioned, Off/On/Toggle events in HA every 30 s (`lab-switch-cycle` build), counter resumed at 16 after reset and accepted. Re-flashing the sensor resumed its own SrcID (counter 80) and ZHA accepted it. Battery reporting (IADC0 AVDD, 331f8ea): host-tested and built, not yet on hardware |
-| ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity entities; battery voltage/percentage entities added in 331f8ea (not yet deployed); switch event entity with `off`/`on`/`toggle` |
+| `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch lab-tested the same day with a separate SrcID (0x7A6B9879) and journal: commissioned, Off/On/Toggle events in HA every 30 s (`lab-switch-cycle` build), counter resumed at 16 after reset and accepted. Re-flashing the sensor resumed its own SrcID (counter 80) and ZHA accepted it. Battery reporting (IADC0 AVDD, 331f8ea) lab-tested on hardware 2026-11-13: 3355 mV → 34 × 100 mV, 200 half-% (WSTK 3.3 V); HA shows 3.4 V / 100 % (§6.4) |
+| ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity entities; battery voltage/percentage entities (331f8ea) deployed 2026-11-13 and showing 3.4 V / 100 %; switch event entity with `off`/`on`/`toggle` |
 | Bidirectional GPD, full proxy, Combo/Sink | not started | — |
 
 Implementation notes that differ from the design below:
@@ -270,7 +270,7 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
    | State | Action |
    |---|---|
    | Commissioning mode, any GPD | Commissioning Notification after the tunnelling delay. Unicast to the commissioning sink if that was requested, otherwise broadcast 0xFFFD. If security fails, set `security_failed` and append the MIC |
-   | Operational, entry found | Check security level and key type against the entry, check the frame counter is above the stored one, decrypt (level 3). Then send a GP Notification for each sink group (alias source = derived or entry alias, alias seq = MAC seq), and lightweight/full unicast to each listed sink |
+   | Operational, entry found | Check security level and key type against the entry, check the frame counter is above the stored one, decrypt (level 3). Then send a GP Notification for each sink group (alias source = derived or entry alias; alias NWK seq and APS counter = MAC seq − 9, GP 1.1.2 A.3.6.3.3.2), and lightweight/full unicast to each listed sink |
    | Operational, no entry | Drop |
 
 3. Handle GPEP commands:
@@ -774,13 +774,13 @@ running the nRF 802.15.4 sniffer on channel 15.
     operational Notification on the air was ours. Our commissioned-groupcast
     offset is −13; EmberZNet (GSDK 4.5, certified) uses −9 for that case
     (`EMBER_GP_NOTIFICATION_COMMISSIONED_GROUPCAST_SEQUENCE_NUMBER_OFFSET`).
-    Open: check A.3.6.3.3.2 before changing `alias_seq::COMMISSIONED_GROUPCAST`.
+    Resolved in §6.4: GP 1.1.2 A.3.6.3.3.2 says −9 (GP 1.0a said −13).
   - **Forwarding in commissioning mode:** while in commissioning mode we
     forward data GPDFs as ordinary Notifications. The other proxies switch
     to Commissioning Notifications (−12). The spec leaves this to the
     application profile (A.3.5.2.1 (iii)).
   - **APS counter:** ours is the router's own APS counter. Other proxies
-    reuse the alias NWK sequence.
+    reuse the alias NWK sequence. Fixed in §6.4.
 
 ### 6.3 Fixes after 6.2 (hardware re-checked 2026-11-13)
 
@@ -843,8 +843,50 @@ running the nRF 802.15.4 sniffer on channel 15.
   entity has been `unknown` since it was created on 2026-11-11. At each
   Pairing ZHA re-initialises the entities: unavailable → unknown at 22:00:43.
   Addressed by 331f8ea (measured AVDD reported as battery voltage and
-  percentage, plus a Battery voltage entity in the quirk). This is not yet
-  flashed or deployed.
+  percentage, plus a Battery voltage entity in the quirk); hardware-checked
+  in §6.4.
+
+### 6.4 GPD battery on hardware and the alias sequence rule (2026-11-13)
+
+- **MG22 GPD battery (331f8ea image `f7376833…c456`, 42,264 B):**
+  - Fresh full backup (`…-de7e3feddaff.bin`), app-only program at 0x0
+    (6 sectors, 0x0–0xC000), read back sha-verified. 0x70000, 0x78000 and
+    0x7C000–0x80000 read back identical to the backup; 0x74000 differs only
+    by the GPD's own counter reservations after the reboots.
+  - VCOM 08:42:56 EET: `Resumed SrcID 0x293C9879 counter 2160 channel 15`
+    (the old image's last report was fc 2131; each boot reserves 16), then
+    `report fc 2160 … Some(3355) mV Some(200) half-%`. A second boot at
+    08:43:01 (probe readback) resumed at 2176 and read 3354 mV. No
+    re-commissioning.
+  - Quirk deployed to `/config/custom_zha_quirks`, ZHA config entry
+    reloaded at 08:45:26 (no HA restart). 08:46:02: Battery 100 % and
+    Battery voltage 3.4 V; temperature and humidity continue every 60 s.
+  - The WSTK supplies 3.3 V (switch at AEM), so 100 % is expected. The
+    CR2032 curve (1800–3000 mV) has not been seen on a coin cell.
+- **Alias sequence rule:** GP Basic 1.1.2 (CSA 14-0563-19) A.3.6.3.3.2:
+  derived groupcast Notification = MAC seq; Pairing Search −10; Tunneling
+  Stop −11; Commissioning Notification −12; **commissioned groupcast
+  Notification −9**; broadcast Notification −14; Device_annce 0x00. The
+  same value is used as the alias NWK sequence number **and** the APS
+  counter. GP 1.0a (095499r26) had −13 for the commissioned groupcast;
+  our −13 came from 1.0a.
+  - EmberZNet (GSDK 4.5 `green-power-common.h`): commissioned groupcast 9,
+    Commissioning Notification 12, derived groupcast exact; it sets
+    `apsFrame->sequence` to the same value.
+  - IKEA (air, `2026-11-12T221855Z`): 66 radius-30 Commissioning
+    Notifications from 0x1AA4/0x7B65 all have APS counter = alias NWK
+    seq = MAC − 12. Ours (29 operational Notifications) had our own APS
+    counter.
+  - Fix: `alias_seq::COMMISSIONED_GROUPCAST` = 9, and an alias frame's APS
+    counter is the alias seq without consuming the router's own counter
+    (`zigbee-aps`, `green-power` only). Host tests
+    `alias_sequence_offsets_match_gp_1_1_2`,
+    `gp_alias_replaces_nwk_source_and_sequence_for_one_frame` and
+    `gp_proxy_tunnels_paired_gpdf_and_restores_its_table` fail without it.
+    Feature-off images: 5 of 14 byte-identical, 9 differ only in panic
+    locations. GP H2-Zero app image 515,392 B (sha `63b74365…1a5a`),
+    `.text` +20 B, `.rodata`/`.data`/`.bss` unchanged.
+  - Not yet on hardware.
 
 ## 7. Open questions for the user
 
