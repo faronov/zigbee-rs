@@ -1,0 +1,44 @@
+//! The embassy-stm32-wpan crate aims to provide safe use of the commands necessary to interface
+//! with the Cortex C0 CPU2 coprocessor of STM32WB microcontrollers. It implements safe wrappers
+//! around the Transport Layer, and in particular the system, memory, BLE and Mac channels.
+//!
+//! # Design
+//!
+//! This crate loosely follows the Application Note 5289 "How to build wireless applications with
+//! STM32WB MCUs"; several of the startup procedures laid out in Annex 14.1 are implemented using
+//! inline copies of the code contained within the `stm32wb_copro` C library.
+//!
+//! BLE commands are sent through [bt_hci]'s controller traits, which the BLE
+//! `ControllerAdapter` implements. The ST vendor (ACI) commands and events are
+//! declared by the `stm32wb_hci` crate.
+
+#![no_std]
+#![allow(async_fn_in_trait)]
+#![allow(unsafe_op_in_unsafe_fn)]
+#![doc = include_str!("../README.md")]
+// #![warn(missing_docs)]
+#![allow(static_mut_refs)] // TODO: Fix
+
+// This mod MUST go first, so that the others see its macros.
+pub(crate) mod fmt;
+
+// The high-level API needs the BLE host stack, which the link-layer-only library lacks.
+#[cfg(all(feature = "wba", feature = "wb-hci", not(feature = "ble-stack-llo")))]
+pub mod bluetooth;
+
+#[cfg(all(feature = "wb", feature = "wb-mac"))]
+pub mod net;
+
+#[cfg(feature = "wb")]
+mod wb;
+
+#[cfg(feature = "wb")]
+pub use wb::*;
+
+#[cfg(feature = "wba")]
+mod wba;
+
+#[cfg(feature = "wba")]
+pub use wba::*;
+
+mod util;

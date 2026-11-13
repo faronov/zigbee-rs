@@ -183,5 +183,10 @@ efr32mg22 = [
     "dep:embassy-time", "dep:embassy-futures",
 ]
 
+# STM32WB coprocessor MAC mapping (`stm32wb::Stm32wbMac`). Dependency-free:
+# the IPCC/mailbox transport lives in `stm32wb-hal`, so enabling this adds no
+# crates to any lockfile.
+stm32wb = []
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

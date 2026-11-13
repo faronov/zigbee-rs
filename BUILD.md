@@ -25,7 +25,7 @@ file is a certification claim.
 
 | use | pinned version |
 |---|---|
-| workspace, nRF, BL702, CC2340, EFR32 | `nightly-2026-03-23` |
+| workspace, nRF, BL702, CC2340, EFR32, STM32WB | `nightly-2026-03-23` |
 | ESP32-C6/H2 and PHY6222 | `nightly-2026-08-01` |
 | Telink host tools | Rust `1.94.1` |
 | Telink target | `tc32-1.98.1-20261003-31a272` (LLVM 23.1.2) |
@@ -378,6 +378,59 @@ the journal, and averaged 13.2 µA in slow-poll EM2. The 2026-10-31 local
 build is 231,052 B; `.data` is 336 B, `.bss` is 14,600 B, and the linked
 available stack is 17,656 B (14 KiB gate). Neither chip has an OTA
 packaging path.
+
+## STM32WB5MM-DK
+
+The STM32WB55 runs the Zigbee stack on CPU1. The IEEE 802.15.4 MAC runs
+on CPU2 as ST's `stm32wb5x_Mac_802_15_4_fw.bin`, version 1.24.0, under
+FUS 1.2.0. ST binaries are not in this repository.
+
+Before flashing:
+
+1. Install that coprocessor image with ST's tools, or with HWLab's
+   `stm32wb` FUS operations.
+2. Confirm that SFSA is `0xE1`. The product linker script places the
+   journals directly below `0x080E1000` and fails the link if the secure
+   boundary moves.
+
+```bash
+cd examples/stm32wb5mm-dk-router
+cargo +nightly-2026-03-23 build --release --locked
+cargo +nightly-2026-03-23 clippy --release --locked -- -D warnings
+```
+
+The layers are split as follows:
+
+| Crate | Provides |
+|---|---|
+| `stm32wb-hal` | IPCC/MAC transport, flash, identity and reset |
+| board crate | VCOM USART1 (PB6/PB7), buttons and the fitted peripherals |
+| product crate | identity, layout, journals, router policy, actions, LED/LCD/sensor mapping |
+| `zigbee-mac` (`stm32wb` feature) | maps MLME/MCPS onto the coprocessor SAP |
+
+The default build enables every on-board peripheral: `rgb-led`, `lcd`,
+`touch`, `sensors` and `mic`. Use `--no-default-features` for the plain
+router, or `--no-default-features --features <list>` for a subset.
+
+The 2026-11-14 builds (application slot `0x08000000..0x080D3000`, 844 KiB;
+the settings journal follows at `0x080D3000`):
+
+| Image | text | data | bss |
+|---|---|---|---|
+| plain router (`--no-default-features`) | 388,422 | 32 | 39,352 |
+| `rgb-led` | 390,878 | 48 | 39,480 |
+| `lcd` | 398,426 | 48 | 41,584 |
+| `touch` (implies `lcd`) | 405,374 | 48 | 41,888 |
+| `mic` | 409,482 | 32 | 52,504 |
+| `sensors` | 425,834 | 56 | 41,416 |
+| default (all) | 449,510 | 72 | 57,136 |
+
+The default raw binary is 449,602 B (plain: 388,482 B). One DK has joined a ZHA network as a
+router and relayed traffic on air.
+
+Beacon response, child association and indirect delivery have not been
+observed yet (see the
+[STM32WB guide](docs/book/src/platform-guides/stm32wb.md)).
 
 ## Telink TLSR8258
 

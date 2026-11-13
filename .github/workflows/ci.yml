@@ -87,6 +87,7 @@ jobs:
       - run: cargo test -p zigbee-runtime --all-features --locked
       - run: cargo test -p zigbee-tests --all-features --locked
       - run: cargo test -p zigbee-zdo --features router --locked
+      - run: cargo test -p zigbee-mac --features stm32wb --lib stm32wb --locked
       - run: cargo test -p zigbee-runtime --no-default-features --locked
       # Do not combine these with --workspace/--all-features: unification hid
       # missing mandatory TCLK features in both production frontends.
@@ -301,6 +302,30 @@ jobs:
             manifest: efr32s2-hal/Cargo.toml
             workspace: efr32s2-hal
             features: "efr32mg22,isr-ack"
+          # Chip-independent logic (word flash, MAC address/confirm mapping);
+          # the chip feature only builds for the target.
+          - name: STM32WB HAL
+            manifest: stm32wb-hal/Cargo.toml
+            workspace: stm32wb-hal
+            features: ""
+          - name: STM32WB5MM-DK router product
+            manifest: products/stm32wb5mm-dk-router/Cargo.toml
+            workspace: products/stm32wb5mm-dk-router
+            features: ""
+          # Sensor endpoints (EP2/EP3 Analog Input, temperature, occupancy)
+          # and the EP4 sound-level endpoint compile independently.
+          - name: STM32WB5MM-DK router product (sensors, sound)
+            manifest: products/stm32wb5mm-dk-router/Cargo.toml
+            workspace: products/stm32wb5mm-dk-router
+            features: "sensors,sound"
+          - name: STM32WB5MM-DK router product (sensors)
+            manifest: products/stm32wb5mm-dk-router/Cargo.toml
+            workspace: products/stm32wb5mm-dk-router
+            features: sensors
+          - name: STM32WB5MM-DK router product (sound)
+            manifest: products/stm32wb5mm-dk-router/Cargo.toml
+            workspace: products/stm32wb5mm-dk-router
+            features: sound
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
@@ -352,6 +377,7 @@ jobs:
       - run: cargo clippy -p sensor-sed-app --all-targets --features ota --locked -- -D warnings
       - run: cargo clippy -p zigbee-runtime --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zdo --features router --locked -- -D warnings
+      - run: cargo clippy -p zigbee-mac --features stm32wb --all-targets --locked -- -D warnings
       - run: cargo clippy -p zigbee-runtime --no-default-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --no-default-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --no-default-features --features float32 --locked -- -D warnings
@@ -411,6 +437,10 @@ jobs:
           cargo fmt --manifest-path examples/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path efr32mg1-hal/Cargo.toml -- --check
           cargo fmt --manifest-path efr32s2-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path stm32wb-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/stm32wb5mm-dk/Cargo.toml -- --check
+          cargo fmt --manifest-path products/stm32wb5mm-dk-router/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/stm32wb5mm-dk-router/Cargo.toml -- --check
           cargo fmt --manifest-path tools/efr32s2-lab/Cargo.toml -- --check
           cargo fmt --manifest-path phy6222-hal/Cargo.toml -- --check
           cargo fmt --manifest-path boards/efr32mg1-tradfri/Cargo.toml -- --check
@@ -2355,6 +2385,83 @@ jobs:
   # ── Deploy Book + Web Flasher to GitHub Pages ────────────────
   # Documentation may publish after core checks pass. Firmware is included
   # only when every original firmware dependency passes; otherwise install is disabled.
+  build-stm32wb:
+    name: Build STM32WB5MM-DK router
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv7em-none-eabihf
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            examples/stm32wb5mm-dk-router
+            boards/stm32wb5mm-dk
+            stm32wb-hal
+            tools/stm32wb5mm-dk-lab
+          key: thumbv7em-stm32wb-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('examples/stm32wb5mm-dk-router/Cargo.lock', 'boards/stm32wb5mm-dk/Cargo.lock', 'stm32wb-hal/Cargo.lock', 'tools/stm32wb5mm-dk-lab/Cargo.lock', 'products/stm32wb5mm-dk-router/link/**', 'vendor/embassy-stm32-wpan/**') }}
+      # The HAL's compile-time ST MAC ABI asserts (src/st_abi.rs) only
+      # build with a chip feature.
+      - name: Clippy STM32WB HAL and DK board (target)
+        run: |
+          cargo clippy --manifest-path stm32wb-hal/Cargo.toml --release --locked \
+            --target thumbv7em-none-eabihf --features stm32wb55vg -- -D warnings
+          cargo clippy --manifest-path boards/stm32wb5mm-dk/Cargo.toml --release --locked \
+            --target thumbv7em-none-eabihf -- -D warnings
+          for features in rgb-led lcd sensors touch mic rgb-led,lcd,sensors,touch,mic; do
+            cargo clippy --manifest-path boards/stm32wb5mm-dk/Cargo.toml --release --locked \
+              --target thumbv7em-none-eabihf --features "$features" -- -D warnings
+          done
+      # One diagnostic per fitted peripheral; see tools/stm32wb5mm-dk-lab.
+      - name: Build STM32WB5MM-DK peripheral lab (release)
+        working-directory: tools/stm32wb5mm-dk-lab
+        run: |
+          cargo build --release --locked --bins
+          cargo clippy --release --locked --bins -- -D warnings
+      # The product linker script asserts the journal window ends at the
+      # CPU2 secure boundary (SFSA 0xE1 with the MAC 1.24.0 coprocessor
+      # image) and leaves at least 16 KiB of stack. Each board peripheral
+      # (RGB LED, LCD, touch key, I2C sensors, PDM microphone) is an
+      # optional feature; the plain router and every single-peripheral
+      # image must link and stay warning-free on their own.
+      - name: Build STM32WB5MM-DK router feature images (release)
+        working-directory: examples/stm32wb5mm-dk-router
+        run: |
+          cargo build --release --locked --no-default-features
+          cargo clippy --release --locked --no-default-features -- -D warnings
+          for features in rgb-led lcd touch sensors mic; do
+            cargo build --release --locked --no-default-features --features "$features"
+            cargo clippy --release --locked --no-default-features --features "$features" -- -D warnings
+          done
+      # Default image (all peripherals); built last so the artifact
+      # steps below package it.
+      - name: Build STM32WB5MM-DK router (release)
+        working-directory: examples/stm32wb5mm-dk-router
+        run: |
+          cargo build --release --locked
+          cargo clippy --release --locked -- -D warnings
+      - name: Create firmware artifacts
+        run: |
+          ELF=examples/stm32wb5mm-dk-router/target/thumbv7em-none-eabihf/release/stm32wb5mm-dk-router
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+          ./tools/firmware-size-report.sh stm32wb5mm-dk-router ${ELF}.bin ${ELF}.size.json
+          NM="$NM" ./tools/check-role-symbols.sh parent "$ELF"
+      - name: Upload STM32WB5MM-DK router firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stm32wb5mm-dk-router-firmware
+          path: |
+            examples/stm32wb5mm-dk-router/target/thumbv7em-none-eabihf/release/stm32wb5mm-dk-router.bin
+            examples/stm32wb5mm-dk-router/target/thumbv7em-none-eabihf/release/stm32wb5mm-dk-router.hex
+            examples/stm32wb5mm-dk-router/target/thumbv7em-none-eabihf/release/stm32wb5mm-dk-router.size.json
+          if-no-files-found: error
+
   deploy-site:
     name: Deploy Site
     needs: [check, test, clippy, fmt, doc, build-esp32c6, build-esp32h2, build-bl702]

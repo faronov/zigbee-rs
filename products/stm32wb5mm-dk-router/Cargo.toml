@@ -1,0 +1,41 @@
+[package]
+name = "stm32wb5mm-dk-router-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product identity, flash layout and persistence for the STM32WB5MM-DK Zigbee router"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone: the Embassy git dependencies of the target build must not enter
+# the root lockfile.
+[workspace]
+
+[features]
+default = []
+# On-board I2C sensors as ZCL endpoints (Temperature, Occupancy, two Analog
+# Inputs); see `sensor_profile`.
+sensors = ["zigbee-runtime/float32", "zigbee-zcl/float32"]
+# PDM microphone sound level as an Analog Input endpoint.
+sound = ["zigbee-runtime/float32", "zigbee-zcl/float32"]
+
+[dependencies]
+heapless = "0.9"
+libm = "0.2"
+router-app = { path = "../../apps/router" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-mac = { path = "../../zigbee-mac", default-features = false }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[dev-dependencies]
+zigbee-mac = { path = "../../zigbee-mac", default-features = false, features = ["mock"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["router"] }
+
+[target.'cfg(target_os = "none")'.dependencies]
+stm32wb-hal = { path = "../../stm32wb-hal", features = ["stm32wb55vg"] }
+
+# Local ST MAC layout and mailbox-acknowledgement fixes: see
+# vendor/embassy-stm32-wpan/LOCAL-PATCHES.md.
+[patch."https://github.com/embassy-rs/embassy"]
+embassy-stm32-wpan = { path = "../../vendor/embassy-stm32-wpan" }

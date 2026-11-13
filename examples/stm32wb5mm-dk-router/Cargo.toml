@@ -1,0 +1,78 @@
+[package]
+name = "stm32wb5mm-dk-router"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Zigbee Router on the ST STM32WB5MM-DK. CPU2 must run ST's IEEE 802.15.4
+# MAC firmware (stm32wb5x_Mac_802_15_4_fw.bin) under FUS 1.2.0; see
+# docs/book/src/platform-guides/stm32wb.md.
+#   cargo build --release                        # router + every DK peripheral
+#   cargo build --release --no-default-features  # plain router (buttons, VCOM)
+[workspace]
+
+[features]
+default = ["rgb-led", "lcd", "touch", "sensors", "mic"]
+# Lifecycle colours on the TLC59731 RGB LED.
+rgb-led = ["stm32wb5mm-dk/rgb-led"]
+# Network/traffic/sensor pages on the 128x64 SSD1315 OLED.
+lcd = ["stm32wb5mm-dk/lcd", "dep:embedded-graphics", "dep:zigbee-display"]
+# TSC touch key: tap = next LCD page, hold = first page.
+touch = ["lcd", "stm32wb5mm-dk/touch"]
+# STTS22H, ISM330DHCX and VL53L0X as ZCL clusters (EP1-EP3).
+sensors = [
+    "stm32wb5mm-dk/sensors",
+    "stm32wb5mm-dk-router-product/sensors",
+    "dep:embedded-hal-bus",
+    "dep:zigbee-sensor",
+    "dep:zigbee-stts22h",
+    "dep:zigbee-lsm6dso",
+    "dep:zigbee-vl53l0x",
+]
+# MP23DB01HP sound level as Analog Input (EP4).
+mic = ["stm32wb5mm-dk/mic", "stm32wb5mm-dk-router-product/sound", "dep:zigbee-pdm"]
+
+[dependencies]
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["stm32wb"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["router"] }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+router-app = { path = "../../apps/router", features = ["router"] }
+stm32wb-hal = { path = "../../stm32wb-hal", features = ["stm32wb55vg"] }
+stm32wb5mm-dk = { path = "../../boards/stm32wb5mm-dk" }
+stm32wb5mm-dk-router-product = { path = "../../products/stm32wb5mm-dk-router" }
+
+# Same Embassy commit as stm32wb-hal.
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87" }
+static_cell = "2"
+
+# Peripheral features (see [features]); generic part drivers from
+# faronov/zigbee-rs-drivers at the same revision as the board crate.
+embedded-graphics = { version = "0.8", optional = true }
+embedded-hal-bus = { version = "0.3", optional = true }
+zigbee-display = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-sensor = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-stts22h = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-lsm6dso = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-vl53l0x = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-pdm = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+
+# CPU2 never shares CPU1 memory outside the IPCC mailbox, so a CPU1-local
+# critical section is sufficient.
+cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+log = "0.4"
+
+[profile.release]
+opt-level = "s"
+debug = 2
+lto = true
+codegen-units = 1
+
+# Local ST MAC layout and mailbox-acknowledgement fixes: see
+# vendor/embassy-stm32-wpan/LOCAL-PATCHES.md.
+[patch."https://github.com/embassy-rs/embassy"]
+embassy-stm32-wpan = { path = "../../vendor/embassy-stm32-wpan" }

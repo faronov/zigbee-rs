@@ -28,6 +28,7 @@ members = [
 exclude = [
     "vendor/esp-hal",
     "vendor/esp-radio",
+    "vendor/embassy-stm32-wpan",
     "examples/nrf52840-sensor",
     "examples/nrf52840-sensor-uf2",
     "examples/nrf52840-router",
@@ -76,6 +77,10 @@ exclude = [
     "examples/efr32mg22-sensor",
     "examples/ha-connect-zbt1",
     "phy6222-hal",
+    "stm32wb-hal",
+    "boards/stm32wb5mm-dk",
+    "products/stm32wb5mm-dk-router",
+    "examples/stm32wb5mm-dk-router",
 ]
 
 [workspace.package]
