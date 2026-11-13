@@ -571,13 +571,17 @@ from the EFR32 `gecko-recovery` option below.
 - **ZBT-1 loader-linked router.** `examples/ha-connect-zbt1` feature
   `zrs-boot` (router role only; `ed`/`sed` refuse it at compile time) links
   the router into the primary slot of `products/ha-connect-zbt1/boot/
-  zbt1.layout` (application `0x8200`, cap 473,856 B). `build.rs` checks
+  zbt1.layout` (application `0x8200`, cap 465,664 B). `build.rs` checks
   that the layout keeps the direct map's security journal and reserves its
-  router tables (`0xF4000..0xFC000`), so a direct-linked and a
-  loader-linked router resume the same child/APS tables and frame
-  counters. The product module `boot` (`products/ha-connect-zbt1/src/
-  boot.rs`) owns the flash split (a `StagingFlash` view below the router
-  tables: writes only to the secondary slot and the trial log), the loader
+  router tables (`0xF4000..0xFC000`) and, for a Green Power build, its GP
+  Proxy Table journal (`0xF0000..0xF4000`), so a direct-linked and a
+  loader-linked router resume the same child/APS/Proxy tables and frame
+  counters. Layout version 2 shrank both slots by 8 KiB to make room for
+  the GP journal (version 1 slots ended at `0xF4000` and covered it), so
+  the loader-linked router is `router,zrs-boot` with the GP Proxy Basic;
+  `router-core,zrs-boot` is the same router without it. The product module `boot` (`products/ha-connect-zbt1/src/
+  boot.rs`) owns the flash split (a `StagingFlash` view below the GP
+  journal: writes only to the secondary slot and the trial log), the loader
   channel, the identity (`0x1234`/`0x2101`, file version `0x25MMmmpp`,
   ELF symbol `ZRS_OTA_IDENTITY`) and `TrialConfirm`. The router confirms
   once per boot when its status is `Online` **and** it has decrypted at
@@ -621,7 +625,7 @@ from the EFR32 `gecko-recovery` option below.
 | nRF52840 ProMicro UF2 (`promicro-uf2`) | MBR+S140 `0x0..0x26000`, boot guard `0xF0000..0xF4000`, UF2, MBR params | `0x26000..0x2A000` | `0x2A000..0x8C000` | `0x8C000..0xEE000` | `0xEE000..0xF0000` | 396,032 B |
 | EFR32MG22 devkit (`efr32mg22-sensor/boot/devkit.layout`) | none (router tables reclaimed) | `0x0..0x4000` | `0x4000..0x40000` | `0x40000..0x7C000` | `0x7C000..0x80000` | 236,288 B |
 | EFR32MG21 devkit (`efr32mg21-sensor/boot/devkit.layout`), F1024 only | Gecko `0x0..0x4000`, router tables `0x74000..0x7C000` | `0x4000..0x8000` | `0x80000..0xC0000` | `0xC0000..0x100000` | `0x7C000..0x80000` | 252,672 B |
-| ZBT-1 (`ha-connect-zbt1/boot/zbt1.layout`) | Gecko `0x0..0x4000`, router tables `0xF4000..0xFC000` | `0x4000..0x8000` | `0x8000..0x7E000` | `0x7E000..0xF4000` | `0xFC000..0x100000` | 473,856 B |
+| ZBT-1 (`ha-connect-zbt1/boot/zbt1.layout`, version 2) | Gecko `0x0..0x4000`, GP Proxy Table `0xF0000..0xF4000`, router tables `0xF4000..0xFC000` | `0x4000..0x8000` | `0x8000..0x7C000` | `0x7C000..0xF0000` | `0xFC000..0x100000` | 465,664 B (version 1: 473,856 B, slots `0x8000..0x7E000..0xF4000`) |
 | PB-03F (`pb03f-kit/boot/pb03f.layout`) | ROM/factory `0x0..0x2000`, ROM-boot table `0x2000..0x3000`, factory data `0x3000..0x5000`, load data `0x5000..0x6000`, router tables `0x7A000..0x7E000` | `0x6000..0xA000` | `0x10000..0x43000` | `0x43000..0x76000` | `0x7E000..0x80000` | 200,448 B (`app-max`) |
 
 The application cap is the slot minus its last sector (the trailer), the
@@ -943,7 +947,8 @@ loader with `watchdog-ms = 8000`.
 | EFR32MG22 `ed,zrs-boot` (warn-level logs) | 204,484 B (was 229,788 B) | 236,288 B |
 | EFR32MG21 `sed,zrs-boot` | 234,272 B | 252,672 B |
 | EFR32MG21 `ed,zrs-boot` | 229,988 B | 252,672 B |
-| ZBT-1 `router,zrs-boot` (now `router-core,zrs-boot`; info logs, trial confirm, no OTA client) | 357,544 B (+2,048 vs the direct router's 355,496 B); `.bss` 39,184 B (unchanged), stack 58,096 B | 473,856 B |
+| ZBT-1 `router,zrs-boot` (now `router-core,zrs-boot`; info logs, trial confirm, no OTA client) | 357,544 B (+2,048 vs the direct router's 355,496 B); `.bss` 39,184 B (unchanged), stack 58,096 B | 473,856 B (layout v1) |
+| ZBT-1 `router,zrs-boot` with Green Power (layout v2) | 385,862 B signed (slot margin 81,082 B); `.bss` 41,232 B, stack 56,048 B | 465,664 B |
 
 Shipped default images: with these changes reverted in the same worktree,
 the nRF52840 UF2 (ProMicro, 228,840 B) and EFR32MG22 sensor (234,160 B)

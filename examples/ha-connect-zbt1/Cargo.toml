@@ -13,9 +13,9 @@ autobins = false
 #   cargo build --release --no-default-features --features sed
 # `router` includes the Green Power proxy; `router-core` is the router
 # without it. Loader-linked router (primary slot of boot/zbt1.layout,
-# chained after the Gecko Bootloader; no GP window there), in its own
-# target dir:
-#   cargo build --release --no-default-features --features router-core,zrs-boot \
+# chained after the Gecko Bootloader; the layout reserves the GP window),
+# in its own target dir:
+#   cargo build --release --no-default-features --features router,zrs-boot \
 #     --target-dir target/zrs-boot
 [[bin]]
 name = "ha-connect-zbt1-ed"
@@ -69,7 +69,7 @@ router = ["router-core", "green-power"]
 # The router without Green Power (also the loader-linked router's base).
 router-core = ["router-app/router", "zigbee-runtime/router", "efr32s2-hal/isr-ack"]
 # Green Power Proxy Basic: tunnels GPDFs to the sink and journals the Proxy
-# Table at 0xF0000 (direct map only, not with `zrs-boot`).
+# Table at 0xF0000 (direct map and loader layout).
 green-power = [
     "router-core",
     "router-app/green-power",
@@ -86,7 +86,8 @@ em2-debug = []
 # Router image for the zigbee-rs loader (products/ha-connect-zbt1/boot/
 # zbt1.layout): linked into the primary slot, confirms its trial once back
 # on the network. Upgrades are staged over SWD (no Zigbee OTA client).
-# Router role only (src/platform.rs); combine with `router-core`.
+# Router role only (src/platform.rs); combine with `router` (or
+# `router-core` for the loader-linked router without Green Power).
 zrs-boot = ["ha-connect-zbt1-product/zrs-boot"]
 # TEST-ONLY trial-expiry bench image: never confirms, so the loader reports
 # the expired trial and keeps booting it (overwrite mode).

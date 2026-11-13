@@ -12,14 +12,13 @@
 //! Product identity, policy, TX power and the journals are owned by
 //! `products/ha-connect-zbt1`; physical resources by `boards/ha-connect-zbt1`.
 //!
-//! With feature `zrs-boot` (combined with `router-core`: the loader
-//! layout's secondary slot covers the GP window) the image runs from the
-//! primary slot of the zigbee-rs loader
-//! (`products/ha-connect-zbt1/boot/zbt1.layout`), chained after the Gecko
-//! Bootloader. It logs which loader started it and, once back on the
-//! network, confirms an image the loader installed on trial
-//! (`product::boot::TrialConfirm`). Router tables and the security journal
-//! stay at the direct map's addresses.
+//! With feature `zrs-boot` (combined with `router`, or `router-core`
+//! without Green Power) the image runs from the primary slot of the
+//! zigbee-rs loader (`products/ha-connect-zbt1/boot/zbt1.layout`), chained
+//! after the Gecko Bootloader. It logs which loader started it and, once
+//! back on the network, confirms an image the loader installed on trial
+//! (`product::boot::TrialConfirm`). The GP Proxy Table journal, the router
+//! tables and the security journal stay at the direct map's addresses.
 
 #![no_std]
 #![no_main]

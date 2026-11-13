@@ -14,7 +14,7 @@ from pathlib import Path
 
 FLASH_START = 0x00004000
 FLASH_END = 0x000F0000
-# 0xF0000..0xF4000: router GP Proxy Table journal (direct map);
+# 0xF0000..0xF4000: router GP Proxy Table journal (direct map and loader layout);
 # 0xF4000..0xFC000: router child/APS journals; 0xFC000..: security journal.
 PERSISTENCE_END = 0x00100000
 RAM_START = 0x20000000
@@ -57,6 +57,14 @@ def loader_layout_bounds(path: Path) -> tuple[int, int]:
         key, sep, value = line.split("#", 1)[0].partition("=")
         if sep and key.strip() == "app-max":
             app_len = min(app_len, zrs_boot_ota.parse_number(value))
+    # Both slots must end below the router persistence: the GP Proxy Table
+    # journal at FLASH_END, then the router tables and the security journal.
+    for name, slot in (("primary", layout.primary), ("secondary", layout.secondary)):
+        if not (FLASH_START < slot.start and slot.end <= FLASH_END):
+            fail(
+                f"{path}: {name} slot 0x{slot.start:08X}..0x{slot.end:08X} overlaps "
+                f"the persistence above 0x{FLASH_END:08X}"
+            )
     start = layout.app_start
     end = start + app_len
     if not (FLASH_START < start and end <= FLASH_END):

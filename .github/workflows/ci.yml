@@ -2210,9 +2210,10 @@ jobs:
       # chained after the Gecko Bootloader (products/ha-connect-zbt1/boot/
       # zbt1.layout, feature zrs-boot). Its release is signed with a key
       # generated for this run only (test-signed, never for a board whose
-      # loader trusts the release key). The loader's secondary slot covers
-      # the direct map's GP Proxy Table journal, so the loader-linked router
-      # is built without Green Power (`router-core`).
+      # loader trusts the release key). The loader layout reserves the GP
+      # Proxy Table journal below the router tables, so the loader-linked
+      # router keeps Green Power (`router`); `router-core,zrs-boot` is the
+      # same router without it and must keep linking.
       - name: Install imgtool
         run: |
           python3 -m venv "$RUNNER_TEMP/imgtool"
@@ -2228,7 +2229,11 @@ jobs:
         working-directory: examples/ha-connect-zbt1
         run: |
           cargo build --release --locked --no-default-features \
-            --features router-core,zrs-boot --target-dir target/zrs-boot
+            --features router-core,zrs-boot --target-dir target/zrs-boot-core
+          python3 tools/verify-layout.py --layout ../../products/ha-connect-zbt1/boot/zbt1.layout \
+            target/zrs-boot-core/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-router
+          cargo build --release --locked --no-default-features \
+            --features router,zrs-boot --target-dir target/zrs-boot
           ELF=target/zrs-boot/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-router
           python3 tools/verify-layout.py --layout ../../products/ha-connect-zbt1/boot/zbt1.layout "$ELF"
           # Signature, identity, version and slot fit of the release.
@@ -2243,18 +2248,7 @@ jobs:
             cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
               --no-default-features --features "$role" -- -D warnings
           done
-          # Green Power cannot be combined with the loader layout.
-          if cargo build --release --locked --no-default-features \
-              --features router,zrs-boot --target-dir target/zrs-boot \
-              2> "$RUNNER_TEMP/zbt1-gp-zrs-boot.log"; then
-            echo "router (Green Power) + zrs-boot must not build" >&2
-            exit 1
-          fi
-          grep -qF 'green-power needs the direct map' "$RUNNER_TEMP/zbt1-gp-zrs-boot.log" || {
-            cat "$RUNNER_TEMP/zbt1-gp-zrs-boot.log" >&2
-            exit 1
-          }
-          for features in router-core,zrs-boot router-core,trial-no-confirm; do
+          for features in router,zrs-boot router-core,zrs-boot router,trial-no-confirm; do
             cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
               --no-default-features --features "$features" \
               --target-dir target/zrs-boot -- -D warnings

@@ -13,7 +13,7 @@ compile_error!(
 );
 
 #[cfg(all(feature = "zrs-boot", not(feature = "router-core")))]
-compile_error!("feature `zrs-boot` is the loader-linked router: combine it with `router-core`");
+compile_error!("feature `zrs-boot` is the loader-linked router: combine it with `router`");
 
 use ha_connect_zbt1::resources::BoardResources;
 use ha_connect_zbt1_product as product;

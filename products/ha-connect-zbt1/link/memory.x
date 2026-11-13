@@ -6,7 +6,8 @@
  * written. 0xF0000..0xF4000 holds the router role's Green Power Proxy Table
  * journal and 0xF4000..0xFC000 its child-table and APS journals; every role
  * image links this same map, so no role's code can overlap another role's
- * persistence. Keep in sync with src/journal.rs.
+ * persistence. The loader layout (boot/zbt1.layout) reserves both windows
+ * as well. Keep in sync with src/journal.rs.
  */
 MEMORY
 {

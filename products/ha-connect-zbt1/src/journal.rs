@@ -7,7 +7,7 @@
 //! Directly below it, `0xF4000..0xFC000` is reserved for the router role's
 //! child-table and APS binding/group journals (two 16 KiB partitions of two
 //! 8 KiB sectors), and `0xF0000..0xF4000` for its Green Power Proxy Table
-//! journal (direct map only: the loader layout's secondary slot covers it).
+//! journal (the loader layout `boot/zbt1.layout` reserves it as well).
 //! Every role image links the same application window, so a reflash to
 //! another role can never overwrite another role's persistence.
 
@@ -20,8 +20,8 @@ pub const FLASH_SIZE: usize = ha_connect_zbt1::INTERNAL_FLASH_CAPACITY;
 pub const BOOTLOADER_SIZE: usize = 16 * 1024;
 pub const APPLICATION_START: u32 = FLASH_START + BOOTLOADER_SIZE as u32;
 pub const APPLICATION_END: u32 = 0x000F_0000;
-/// Router-role Green Power Proxy Table journal (direct map; unused by the
-/// end-device roles and by loader-linked images).
+/// Router-role Green Power Proxy Table journal (direct map and loader
+/// layout; unused by the end-device roles).
 pub const GP_PROXY_TABLE_PARTITION_START: u32 = APPLICATION_END;
 pub const GP_PROXY_TABLE_PARTITION_SIZE: usize = 16 * 1024;
 /// Router-role child-table journal (unused by the end-device roles).

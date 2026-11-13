@@ -74,11 +74,6 @@ pub fn router_stores(flash: Efr32s2Flash) -> (Efr32s2Flash, ChildStore, ApsTable
     )
 }
 
-#[cfg(all(feature = "green-power", feature = "zrs-boot"))]
-compile_error!(
-    "green-power needs the direct map: boot/zbt1.layout's secondary slot covers the GP window"
-);
-
 #[cfg(feature = "green-power")]
 pub type GpProxyTableFlash = FlashPartition<
     { crate::journal::GP_PROXY_TABLE_PARTITION_START },
