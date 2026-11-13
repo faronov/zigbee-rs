@@ -11,11 +11,26 @@ publish = false
 # the root lockfile.
 [workspace]
 
+[features]
+default = []
+# On-board I2C sensors as ZCL endpoints (Temperature, Occupancy, two Analog
+# Inputs); see `sensor_profile`.
+sensors = ["zigbee-runtime/float32", "zigbee-zcl/float32"]
+# PDM microphone sound level as an Analog Input endpoint.
+sound = ["zigbee-runtime/float32", "zigbee-zcl/float32"]
+
 [dependencies]
+libm = "0.2"
 router-app = { path = "../../apps/router" }
 zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-mac = { path = "../../zigbee-mac", default-features = false }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[dev-dependencies]
+heapless = "0.9"
+zigbee-mac = { path = "../../zigbee-mac", default-features = false, features = ["mock"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["router"] }
 
 [target.'cfg(target_os = "none")'.dependencies]
 stm32wb-hal = { path = "../../stm32wb-hal", features = ["stm32wb55vg"] }

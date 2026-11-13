@@ -11,9 +11,12 @@ MLME/MCPS primitives over the IPCC mailbox.
 ```text
 apps/router (Basic + Identify, range extender, endpoint 1)
         ↓
-products/stm32wb5mm-dk-router   identity, NV journals, linker layout
+products/stm32wb5mm-dk-router   identity, NV journals, linker layout,
+                                button/touch actions, LED palette,
+                                LCD pages, sensor → ZCL mapping
         ↓
-boards/stm32wb5mm-dk            B1/B2 buttons, USART1 VCP pins
+boards/stm32wb5mm-dk            pins and fitted parts: B1/B2, USART1 VCP,
+                                RGB LED, OLED, TSC key, I2C3 sensors, PDM mic
         ↓
 stm32wb-hal                     clocks, HSEM-guarded flash, identity,
                                 IPCC MAC transport (embassy-stm32-wpan)
@@ -22,7 +25,77 @@ zigbee-mac::stm32wb::Stm32wbMac (MLME/MCPS mapping, ParentMacDriver)
 ```
 
 `examples/stm32wb5mm-dk-router` is the composition root. It holds the
-platform startup, the VCP logger and the event loop.
+platform startup, the VCP logger, the event loop and one small task per
+peripheral group (`ui`, `sensing`, `sound`). Generic part drivers come
+from [`zigbee-rs-drivers`](https://github.com/faronov/zigbee-rs-drivers),
+pinned by revision.
+
+## On-board peripherals
+
+Every peripheral is a Cargo feature of the example. The default build
+enables all of them; `--no-default-features` is the plain router.
+
+| Feature | Part (UM2825) | Use |
+|---|---|---|
+| `rgb-led` | TLC59731 RGB LED | lifecycle colour |
+| `lcd` | SSD1315 128×64 OLED, SPI1 | three text pages |
+| `touch` (implies `lcd`) | TSC key (group 6, shield group 4) | page navigation |
+| `sensors` | STTS22H, ISM330DHCX, VL53L0X on I2C3 | ZCL endpoints 1–3 |
+| `mic` | MP23DB01HP PDM microphone, SAI1 + DMA | ZCL endpoint 4 |
+
+The IR LED and the QSPI flash are fitted but not used.
+
+### Inputs
+
+| Input | Gesture | Action |
+|---|---|---|
+| B1 | short press | factory-new: start commissioning; joined: open this router for joining for 180 s (local NWK permit only, no Mgmt_Permit_Joining broadcast) |
+| B1 | hold 3 s | journal-aware factory reset |
+| B2 | short press | identify endpoint 1 for 10 s |
+| B2 | hold 3 s | close this router for joining |
+| touch key | tap | next LCD page |
+| touch key | hold | first LCD page |
+
+### LED colours
+
+| State | Colour |
+|---|---|
+| booting | dim white |
+| searching | orange blink |
+| joined | green, off after 30 s |
+| permit-join open | slow blue blink |
+| identify | fast magenta blink |
+| error | red |
+
+### LCD pages
+
+- **Network:** role and NWK address, PAN ID and channel, extended PAN ID,
+  parent and its LQI, neighbour/child/route counts, permit-join countdown.
+- **Traffic:** MAC TX ok/no-ACK/CCA/other failures, indirect frames
+  delivered/handed to CPU2, RX drops, NWK frame counter, uptime.
+- **Sensors:** temperature, distance, inclination and motion, sound level.
+
+### ZCL mapping
+
+| EP | Device type | Cluster | Source |
+|---|---|---|---|
+| 1 | Range Extender 0x0008 | Temperature Measurement 0x0402 | STTS22H |
+| 1 | | Occupancy Sensing 0x0406 | ISM330DHCX motion, 60 s hold (not a PIR) |
+| 2 | Simple Sensor 0x000C | Analog Input 0x000C, mm (BACnet units 30), 0–2000 | VL53L0X; no target = 2000 with Reliability OVER_RANGE |
+| 3 | Simple Sensor 0x000C | Analog Input, degrees from vertical (units 90), 0–180 | ISM330DHCX gravity |
+| 4 | Simple Sensor 0x000C | Analog Input, dB (units 199), 0–130 | MP23DB01HP; uncalibrated, unweighted, nominal −41 dBFS sensitivity |
+
+A missing or failing sensor reports Reliability NO_SENSOR with the FAULT
+status flag; temperature reports the invalid value 0x8000.
+
+ZHA creates the temperature and occupancy entities on its own. It creates
+Analog Input entities only for some manufacturers, so endpoints 2–4 need
+the quirk in
+`products/stm32wb5mm-dk-router/integrations/zha_quirk_stm32wb5mm_dk.py`
+(through `custom_quirks_path`).
+`integrations/z2m_stm32wb5mm_dk.mjs` is the matching Zigbee2MQTT external
+converter. Both were checked against current zigpy/ZHA and
+zigbee-herdsman-converters with simulated devices only.
 
 ## Coprocessor prerequisites
 
@@ -165,9 +238,24 @@ Host tests cover:
 - the HAL flash adapter and identity;
 - the product layout and storage.
 
-CI builds and clippy-checks the HAL, the board and the example. The CI job
-also checks that the image contains the router symbols
+CI builds and clippy-checks the HAL, the board, the peripheral lab, and
+the example in its default, plain and single-peripheral configurations.
+The CI job also checks that the image contains the router symbols
 (`tools/check-role-symbols.sh parent`).
+
+Peripheral image (all features), on the same DK:
+
+- each part passed its own diagnostic in `tools/stm32wb5mm-dk-lab` first;
+- all three I2C sensors probed;
+- after a ZHA remove (Mgmt_Leave), the node cleared its credentials and
+  security journal, rejoined as a new address and was interviewed with
+  all four endpoints;
+- ZHA shows the temperature (20.0 °C) and occupancy entities, and the
+  node sends reports for 0x0402, 0x0406 and the three Analog Inputs.
+
+Not yet confirmed by an observer: the LED colours, the LCD pages, touch
+navigation, and B1/B2 on the peripheral image. A VL53L0X in-range
+reading has not been confirmed either. The sound level is uncalibrated.
 
 Open hardware gates:
 

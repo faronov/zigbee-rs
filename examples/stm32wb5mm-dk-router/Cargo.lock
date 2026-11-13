@@ -47,6 +47,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "az"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
+
+[[package]]
 name = "bare-metal"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -457,6 +463,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-graphics"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e8da660bb0c829b34a56a965490597f82a55e767b91f9543be80ce8ccb416fe"
+dependencies = [
+ "az",
+ "byteorder",
+ "embedded-graphics-core",
+ "float-cmp",
+ "micromath",
+]
+
+[[package]]
+name = "embedded-graphics-core"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95743bef3ff70fcba3930246c4e6872882bbea0dcc6da2ca860112e0cd4bd09f"
+dependencies = [
+ "az",
+ "byteorder",
+]
+
+[[package]]
 name = "embedded-hal"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -478,6 +507,16 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c4c685bbef7fe13c3c6dd4da26841ed3980ef33e841cddfa15ce8a8fb3f1884"
 dependencies = [
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
+name = "embedded-hal-bus"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "513e0b3a8fb7d3013a8ae17a834283f170deaf7d0eeab0a7c1a36ad4dd356d22"
+dependencies = [
+ "critical-section",
  "embedded-hal 1.0.0",
 ]
 
@@ -531,6 +570,15 @@ name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+
+[[package]]
+name = "float-cmp"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "futures-core"
@@ -610,6 +658,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "litrs"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -648,6 +702,12 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "micromath"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3c8dda44ff03a2f238717214da50f65d5a53b45cd213a7370424ffdb6fae815"
 
 [[package]]
 name = "nb"
@@ -873,7 +933,14 @@ dependencies = [
 name = "stm32wb5mm-dk"
 version = "0.1.0"
 dependencies = [
+ "cortex-m",
+ "critical-section",
+ "embassy-time",
+ "embedded-hal 1.0.0",
  "stm32wb-hal",
+ "zigbee-display",
+ "zigbee-ssd1306",
+ "zigbee-tlc59731",
 ]
 
 [[package]]
@@ -885,15 +952,23 @@ dependencies = [
  "embassy-executor",
  "embassy-sync",
  "embassy-time",
+ "embedded-graphics",
+ "embedded-hal-bus",
  "log",
  "router-app",
  "static_cell",
  "stm32wb-hal",
  "stm32wb5mm-dk",
  "stm32wb5mm-dk-router-product",
+ "zigbee-display",
+ "zigbee-lsm6dso",
  "zigbee-mac",
+ "zigbee-pdm",
  "zigbee-runtime",
+ "zigbee-sensor",
+ "zigbee-stts22h",
  "zigbee-types",
+ "zigbee-vl53l0x",
  "zigbee-zcl",
 ]
 
@@ -901,9 +976,11 @@ dependencies = [
 name = "stm32wb5mm-dk-router-product"
 version = "0.1.0"
 dependencies = [
+ "libm",
  "router-app",
  "stm32wb-hal",
  "zigbee-aps",
+ "zigbee-mac",
  "zigbee-runtime",
  "zigbee-zcl",
 ]
@@ -1213,6 +1290,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-display"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+dependencies = [
+ "embedded-graphics-core",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "zigbee-sensor",
+]
+
+[[package]]
+name = "zigbee-lsm6dso"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "zigbee-sensor",
+]
+
+[[package]]
 name = "zigbee-mac"
 version = "0.1.0"
 dependencies = [
@@ -1234,6 +1332,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-pdm"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+
+[[package]]
 name = "zigbee-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1250,8 +1353,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-sensor"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+]
+
+[[package]]
+name = "zigbee-ssd1306"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+dependencies = [
+ "embedded-graphics-core",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "zigbee-display",
+]
+
+[[package]]
+name = "zigbee-stts22h"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "zigbee-sensor",
+]
+
+[[package]]
+name = "zigbee-tlc59731"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+dependencies = [
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
 name = "zigbee-types"
 version = "0.1.0"
+
+[[package]]
+name = "zigbee-vl53l0x"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "zigbee-sensor",
+]
 
 [[package]]
 name = "zigbee-zcl"

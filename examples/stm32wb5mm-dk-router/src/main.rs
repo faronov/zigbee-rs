@@ -6,14 +6,28 @@
 //! parent MAC contract, and [`router_app::ParentRouterApp`] runs the Zigbee
 //! router on top: routing, association, durable child and APS tables.
 //!
-//! Button B1: short press re-arms commissioning after a Leave; a 3 s hold
-//! commits a journal-aware factory reset. Log: ST-LINK VCOM (USART1,
-//! 115200 8N1), with a periodic table and coprocessor summary.
+//! Buttons ([`product::actions`]): B1 short press commissions, or opens
+//! permit-join for 180 s once joined; a 3 s hold commits a journal-aware
+//! factory reset. B2 short press identifies for 10 s; a hold closes
+//! permit-join. Log: ST-LINK VCOM (USART1, 115200 8N1), with a periodic
+//! table and coprocessor summary.
+//!
+//! Default features add the DK peripherals as separate tasks that never
+//! hold the router: the RGB LED, the OLED pages and the touch key
+//! ([`ui`]), the I2C sensors ([`sensing`]) and the microphone ([`sound`]).
+//! Readings reach the ZCL clusters through [`shared`] in this loop.
 
 #![no_std]
 #![no_main]
 
 mod platform;
+#[cfg(feature = "sensors")]
+mod sensing;
+mod shared;
+#[cfg(feature = "mic")]
+mod sound;
+#[cfg(any(feature = "rgb-led", feature = "lcd"))]
+mod ui;
 mod vcom_log;
 
 use embassy_executor::Spawner;
@@ -28,14 +42,13 @@ use stm32wb_hal::embassy_stm32_wpan::sub::mm::MemoryManager;
 use stm32wb_hal::mac::WbTransport;
 use stm32wb5mm_dk_router_product::{
     self as product,
-    button::{ButtonGesture, ButtonGestures},
+    actions::{self, Action, Input},
+    button::ButtonGestures,
     router::RouterProfile,
     storage::{ApsTableStore, ChildStore, SecurityStore},
 };
 use zigbee_mac::stm32wb::Stm32wbMac;
-use zigbee_runtime::{
-    ZigbeeDevice, node::ZigbeeNode, power::PowerMode, profile::ApplicationProfile, role::Router,
-};
+use zigbee_runtime::{ZigbeeDevice, node::ZigbeeNode, power::PowerMode, role::Router};
 use zigbee_types::ChannelMask;
 use zigbee_zcl::clusters::basic::PowerSource;
 
@@ -56,6 +69,14 @@ type App = ParentRouterApp<
 const ARCHETYPE: NodeArchetype = NodeArchetype::ParentRouter;
 /// Period of the neighbour/child/coprocessor summary on VCOM.
 const SUMMARY_PERIOD: Duration = Duration::from_secs(60);
+/// Period of publishing network state and applying sensor readings.
+#[cfg(any(
+    feature = "rgb-led",
+    feature = "lcd",
+    feature = "sensors",
+    feature = "mic"
+))]
+const SHARE_PERIOD: Duration = Duration::from_millis(250);
 
 /// Returns mailbox buffers to CPU2; must run for the life of the MAC.
 #[embassy_executor::task]
@@ -66,6 +87,19 @@ async fn run_memory_manager(mut memory_manager: MemoryManager<'static>) {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let started = platform::start(spawner, product::ROUTER_MODEL);
+    #[cfg(any(feature = "rgb-led", feature = "lcd"))]
+    spawner.spawn(
+        ui::run(ui::Ui::new(
+            started.spi1,
+            #[cfg(feature = "touch")]
+            started.touch,
+        ))
+        .unwrap_or_else(|_| halt()),
+    );
+    #[cfg(feature = "sensors")]
+    spawner.spawn(sensing::run(started.sensor_bus).unwrap_or_else(|_| halt()));
+    #[cfg(feature = "mic")]
+    spawner.spawn(sound::run(started.mic).unwrap_or_else(|_| halt()));
     let (transport, memory_manager) =
         match stm32wb_hal::mac::start(started.ipcc, platform::Irqs, started.rng).await {
             Ok(parts) => parts,
@@ -82,18 +116,26 @@ async fn main(spawner: Spawner) {
         platform::fatal(app.parts_mut(), ARCHETYPE, error);
     }
 
-    let button = started.button_b1;
-    let mut gestures = ButtonGestures::new();
+    let (b1, b2) = (started.button_b1, started.button_b2);
+    let (mut b1_gestures, mut b2_gestures) = (ButtonGestures::new(), ButtonGestures::new());
     let mut awaiting_since: Option<Instant> = None;
     let mut next_summary = Instant::now() + SUMMARY_PERIOD;
+    #[cfg(any(
+        feature = "rgb-led",
+        feature = "lcd",
+        feature = "sensors",
+        feature = "mic"
+    ))]
+    let mut next_share = Instant::now();
     let mut step_errors = platform::StepErrors::new();
     loop {
-        match gestures.sample(button.is_low(), Instant::now().as_millis()) {
-            Some(ButtonGesture::FactoryReset) => factory_reset(app).await,
-            Some(ButtonGesture::CommissioningRequest) if !app.request_commissioning() => {
-                log::info!("[WB] B1 ignored: joined or reset pending");
-            }
-            Some(ButtonGesture::CommissioningRequest) | None => {}
+        let now_ms = Instant::now().as_millis();
+        let inputs = [
+            b1_gestures.sample(b1.is_low(), now_ms).map(Input::B1),
+            b2_gestures.sample(b2.is_low(), now_ms).map(Input::B2),
+        ];
+        for input in inputs.into_iter().flatten() {
+            perform(app, actions::action(input)).await;
         }
         if app.awaiting_commissioning_request() {
             let since = *awaiting_since.get_or_insert_with(Instant::now);
@@ -129,6 +171,105 @@ async fn main(spawner: Spawner) {
             next_summary += SUMMARY_PERIOD;
             log_summary(app);
         }
+        #[cfg(any(
+            feature = "rgb-led",
+            feature = "lcd",
+            feature = "sensors",
+            feature = "mic"
+        ))]
+        if Instant::now() >= next_share {
+            next_share = Instant::now() + SHARE_PERIOD;
+            share(app);
+        }
+    }
+}
+
+/// Carry out a button action ([`product::actions`]).
+async fn perform(app: &mut App, action: Action) {
+    match action {
+        Action::FactoryReset => factory_reset(app).await,
+        Action::CommissionOrPermitJoin => {
+            if app.request_commissioning() {
+                log::info!("[WB] B1: commissioning requested");
+            } else if app.node().device().is_joined() {
+                permit_joining(app, actions::PERMIT_JOIN_SECS).await;
+            } else {
+                log::info!("[WB] B1 ignored: reset pending");
+            }
+        }
+        Action::ClosePermitJoin => permit_joining(app, 0).await,
+        Action::Identify => {
+            let device = app.node_mut().device_mut();
+            if device.start_identify(product::ENDPOINT, actions::IDENTIFY_SECS) {
+                log::info!("[WB] B2: identify {} s", actions::IDENTIFY_SECS);
+            } else {
+                log::warn!("[WB] B2: identify unavailable");
+            }
+        }
+        // Touch-key actions are handled by the display task.
+        Action::NextPage | Action::FirstPage => {}
+    }
+}
+
+/// Open (`secs` > 0) or close joining through this router (local NWK only;
+/// no network-wide Mgmt_Permit_Joining broadcast).
+async fn permit_joining(app: &mut App, secs: u8) {
+    match app.node_mut().device_mut().permit_joining(secs).await {
+        Ok(()) => log::info!("[WB] permit join {secs} s"),
+        Err(error) => log::warn!("[WB] permit join {secs} s failed: {error:?}"),
+    }
+}
+
+/// Publish network state for the peripheral tasks and apply their sensor
+/// readings to the ZCL profile (reported by the runtime as they change).
+#[cfg(any(
+    feature = "rgb-led",
+    feature = "lcd",
+    feature = "sensors",
+    feature = "mic"
+))]
+fn share(app: &mut App) {
+    #[cfg(any(feature = "rgb-led", feature = "lcd"))]
+    shared::NETWORK.set(network_snapshot(app));
+    #[cfg(any(feature = "sensors", feature = "mic"))]
+    app.node_mut().profile_mut().apply(&shared::SENSORS.get());
+}
+
+#[cfg(any(feature = "rgb-led", feature = "lcd"))]
+fn network_snapshot(app: &App) -> product::screen::NetworkSnapshot {
+    let device = app.node().device();
+    let nwk = device.bdb().zdo().nwk();
+    let nib = nwk.nib();
+    let neighbors = nwk.neighbor_table();
+    let stats = nwk.mac().stats();
+    let count = |n: usize| u8::try_from(n).unwrap_or(u8::MAX);
+    let parent = (device.is_joined() && nib.parent_address.0 < 0xFFF8).then(|| {
+        let lqi = neighbors
+            .iter()
+            .find(|n| n.network_address == nib.parent_address)
+            .map_or(0, |n| n.lqi);
+        (nib.parent_address.0, lqi)
+    });
+    product::screen::NetworkSnapshot {
+        state: product::screen::State::default(),
+        short_address: nib.network_address.0,
+        pan_id: nib.pan_id.0,
+        channel: nib.logical_channel,
+        extended_pan_id: nib.extended_pan_id,
+        parent,
+        neighbours: count(neighbors.len()),
+        children: count(neighbors.children().count()),
+        routes: count(nwk.routing_table().len()),
+        permit_join_secs: nib.permit_joining.then_some(nib.permit_joining_duration),
+        nwk_frame_counter: nib.outgoing_frame_counter,
+        tx_ok: stats.tx_ok,
+        tx_no_ack: stats.tx_no_ack,
+        tx_cca: stats.tx_channel_access_failures,
+        tx_other: stats.tx_other_failures,
+        rx_dropped: stats.rx_dropped,
+        indirect_delivered: stats.indirect_delivered,
+        indirect_handed_off: stats.indirect_handed_off,
+        uptime_secs: Instant::now().as_secs() as u32,
     }
 }
 
@@ -170,21 +311,16 @@ fn compose(transport: WbTransport) -> &'static mut App {
     static APP: StaticCell<App> = StaticCell::new();
 
     let profile = PROFILE.init(product::router::router_profile());
-    let device = ZigbeeDevice::builder(mac)
+    let builder = ZigbeeDevice::builder(mac)
         .power_mode(PowerMode::AlwaysOn)
         .manufacturer(product::MANUFACTURER)
         .model(product::ROUTER_MODEL)
         .date_code(product::DATE_CODE)
         .sw_build(product::SW_BUILD)
         .power_source(PowerSource::MainsSinglePhase)
-        .channels(ChannelMask::ALL_2_4GHZ)
-        .endpoint(
-            profile.endpoint(),
-            profile.profile_id(),
-            profile.device_id(),
-            |endpoint| profile.configure_endpoint(endpoint),
-        )
-        .build_router_into(DEVICE.uninit());
+        .channels(ChannelMask::ALL_2_4GHZ);
+    let device =
+        product::router::declare_endpoints(builder, profile).build_router_into(DEVICE.uninit());
 
     let security_store = SECURITY.init(stores.security);
     // Before ZigbeeNode construction: persisted keys/counters may never be

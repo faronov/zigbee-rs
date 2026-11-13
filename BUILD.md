@@ -404,14 +404,28 @@ The layers are split as follows:
 | Crate | Provides |
 |---|---|
 | `stm32wb-hal` | IPCC/MAC transport, flash, identity and reset |
-| board crate | VCOM USART1 (PB6/PB7) and the buttons |
-| product crate | identity, layout, journals and the router policy |
+| board crate | VCOM USART1 (PB6/PB7), buttons and the fitted peripherals |
+| product crate | identity, layout, journals, router policy, actions, LED/LCD/sensor mapping |
 | `zigbee-mac` (`stm32wb` feature) | maps MLME/MCPS onto the coprocessor SAP |
 
-The 2026-11-13 image is a 387,138 B raw binary (387,082 B of text) with
-39,360 B of static RAM. The application slot is `0x08000000..0x080D5000`
-(872 KiB). One DK has joined a ZHA network as a router and relayed
-traffic on air.
+The default build enables every on-board peripheral: `rgb-led`, `lcd`,
+`touch`, `sensors` and `mic`. Use `--no-default-features` for the plain
+router, or `--no-default-features --features <list>` for a subset.
+
+The 2026-11-13 builds (application slot `0x08000000..0x080D5000`, 872 KiB):
+
+| Image | text | data | bss |
+|---|---|---|---|
+| plain router (`--no-default-features`) | 388,326 | 32 | 39,352 |
+| `rgb-led` | 390,782 | 48 | 39,480 |
+| `lcd` | 398,326 | 48 | 41,584 |
+| `touch` (implies `lcd`) | 405,270 | 48 | 41,888 |
+| `mic` | 409,390 | 32 | 52,504 |
+| `sensors` | 422,858 | 56 | 41,696 |
+| default (all) | 446,538 | 64 | 57,416 |
+
+The default raw binary is 446,626 B. One DK has joined a ZHA network as a
+router and relayed traffic on air.
 
 Beacon response, child association and indirect delivery have not been
 observed yet (see the

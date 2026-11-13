@@ -24,11 +24,18 @@
 
 #![no_std]
 
+pub mod actions;
 pub mod button;
+pub mod indication;
 pub mod layout;
+pub mod measure;
 pub mod router;
+pub mod screen;
+#[cfg(any(feature = "sensors", feature = "sound"))]
+pub mod sensor_profile;
 #[cfg(target_os = "none")]
 pub mod storage;
+pub mod touch;
 
 pub const MANUFACTURER: &str = "Zigbee-RS";
 pub const ROUTER_MODEL: &str = "STM32WB5MM-DK-Router";

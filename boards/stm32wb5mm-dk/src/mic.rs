@@ -44,6 +44,10 @@ pub const MIC_BIT_ORDER_MSB: bool = true;
 /// Microphone turn-on time to discard after [`Microphone::start`]
 /// (measured: the level is still falling 80 ms after the clock starts).
 pub const SETTLE_MS: u64 = 250;
+/// MP23DB01HP sensitivity: −41 dBFS at 94 dB SPL (datasheet typical,
+/// ±1 dB), in 0.01 dB, relative to the full scale of a 1-bit PDM stream.
+/// Nominal: the board is not acoustically calibrated.
+pub const SENSITIVITY_CENTI_DBFS: i16 = -4_100;
 
 /// SAI1 resources of the microphone.
 pub struct MicPins {
