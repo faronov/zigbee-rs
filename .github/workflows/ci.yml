@@ -360,6 +360,24 @@ jobs:
             manifest: products/stm32wb5mm-dk-router/Cargo.toml
             workspace: products/stm32wb5mm-dk-router
             features: sound
+          # Shared STM32WB router kit (layout, SFSA guard, button policy)
+          # and the two P-NUCLEO-WB55 products built on it.
+          - name: STM32WB router kit
+            manifest: products/stm32wb-router/Cargo.toml
+            workspace: products/stm32wb-router
+            features: ""
+          - name: STM32WB router kit (Green Power proxy)
+            manifest: products/stm32wb-router/Cargo.toml
+            workspace: products/stm32wb-router
+            features: green-power
+          - name: Nucleo-WB55 router product
+            manifest: products/nucleo-wb55-router/Cargo.toml
+            workspace: products/nucleo-wb55-router
+            features: ""
+          - name: WB55 USB dongle router product
+            manifest: products/wb55-dongle-router/Cargo.toml
+            workspace: products/wb55-dongle-router
+            features: ""
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
@@ -482,6 +500,15 @@ jobs:
           cargo fmt --manifest-path boards/stm32wb5mm-dk/Cargo.toml -- --check
           cargo fmt --manifest-path products/stm32wb5mm-dk-router/Cargo.toml -- --check
           cargo fmt --manifest-path examples/stm32wb5mm-dk-router/Cargo.toml -- --check
+          cargo fmt --manifest-path products/stm32wb-router/Cargo.toml -- --check
+          cargo fmt --manifest-path apps/stm32wb-router/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/nucleo-wb55/Cargo.toml -- --check
+          cargo fmt --manifest-path products/nucleo-wb55-router/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/nucleo-wb55-router/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/wb55-usb-dongle/Cargo.toml -- --check
+          cargo fmt --manifest-path products/wb55-dongle-router/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/wb55-dongle-router/Cargo.toml -- --check
+          cargo fmt --manifest-path tools/stm32wb-fus-shim/Cargo.toml -- --check
           cargo fmt --manifest-path tools/efr32s2-lab/Cargo.toml -- --check
           cargo fmt --manifest-path phy6222-hal/Cargo.toml -- --check
           cargo fmt --manifest-path boards/efr32mg1-tradfri/Cargo.toml -- --check
@@ -2494,7 +2521,7 @@ jobs:
             boards/stm32wb5mm-dk
             stm32wb-hal
             tools/stm32wb5mm-dk-lab
-          key: thumbv7em-stm32wb-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('examples/stm32wb5mm-dk-router/Cargo.lock', 'boards/stm32wb5mm-dk/Cargo.lock', 'stm32wb-hal/Cargo.lock', 'tools/stm32wb5mm-dk-lab/Cargo.lock', 'products/stm32wb5mm-dk-router/link/**', 'vendor/embassy-stm32-wpan/**') }}
+          key: thumbv7em-stm32wb-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('examples/stm32wb5mm-dk-router/Cargo.lock', 'boards/stm32wb5mm-dk/Cargo.lock', 'stm32wb-hal/Cargo.lock', 'tools/stm32wb5mm-dk-lab/Cargo.lock', 'products/stm32wb-router/link/**', 'vendor/embassy-stm32-wpan/**') }}
       # The HAL's compile-time ST MAC ABI asserts (src/st_abi.rs) only
       # build with a chip feature.
       - name: Clippy STM32WB HAL and DK board (target)
@@ -2554,6 +2581,96 @@ jobs:
             examples/stm32wb5mm-dk-router/target/thumbv7em-none-eabihf/release/stm32wb5mm-dk-router.bin
             examples/stm32wb5mm-dk-router/target/thumbv7em-none-eabihf/release/stm32wb5mm-dk-router.hex
             examples/stm32wb5mm-dk-router/target/thumbv7em-none-eabihf/release/stm32wb5mm-dk-router.size.json
+          if-no-files-found: error
+
+  # P-NUCLEO-WB55 kit: the Nucleo-WB55 (ST-LINK VCP log) and the USB dongle
+  # (USB CDC log) routers on the shared STM32WB router kit, plus the SRAM
+  # FUS helper that services the dongle's coprocessor through ROM DFU.
+  build-nucleo-wb55:
+    name: Build P-NUCLEO-WB55 routers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv7em-none-eabihf
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            examples/nucleo-wb55-router
+            examples/wb55-dongle-router
+            boards/nucleo-wb55
+            boards/wb55-usb-dongle
+            apps/stm32wb-router
+            tools/stm32wb-fus-shim
+          key: thumbv7em-nucleo-wb55-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('examples/nucleo-wb55-router/Cargo.lock', 'examples/wb55-dongle-router/Cargo.lock', 'boards/nucleo-wb55/Cargo.lock', 'boards/wb55-usb-dongle/Cargo.lock', 'apps/stm32wb-router/Cargo.lock', 'products/stm32wb-router/link/**', 'vendor/embassy-stm32-wpan/**') }}
+      - name: Clippy boards and shared router app (target)
+        run: |
+          for board in nucleo-wb55 wb55-usb-dongle; do
+            cargo clippy --manifest-path boards/$board/Cargo.toml --release --locked \
+              --target thumbv7em-none-eabihf -- -D warnings
+          done
+          for features in "" green-power usb-log green-power,usb-log; do
+            # The app takes no chip feature (the example picks the
+            # package); lint it against the Nucleo's STM32WB55RG.
+            cargo clippy --manifest-path apps/stm32wb-router/Cargo.toml --release --locked \
+              --target thumbv7em-none-eabihf --features "stm32wb-hal/stm32wb55rg,$features" -- -D warnings
+          done
+      # The shim links at 0x20008000 with no .data/.bss (asserted by
+      # shim.x); it must stay well inside the SRAM1 window that ROM DFU
+      # accepts.
+      - name: Build STM32WB FUS helper (release)
+        working-directory: tools/stm32wb-fus-shim
+        run: |
+          cargo build --release --locked
+          cargo clippy --release --locked -- -D warnings
+      # Without Green Power (`--no-default-features`) and the stock image;
+      # the dongle's stock image also carries the USB CDC log.
+      - name: Build Nucleo-WB55 router (release)
+        working-directory: examples/nucleo-wb55-router
+        run: |
+          cargo build --release --locked --no-default-features
+          cargo clippy --release --locked --no-default-features -- -D warnings
+          cargo build --release --locked
+          cargo clippy --release --locked -- -D warnings
+      - name: Build WB55 USB dongle router (release)
+        working-directory: examples/wb55-dongle-router
+        run: |
+          for features in "" usb-log green-power; do
+            cargo build --release --locked --no-default-features --features "$features"
+            cargo clippy --release --locked --no-default-features --features "$features" -- -D warnings
+          done
+          cargo build --release --locked
+          cargo clippy --release --locked -- -D warnings
+      - name: Create firmware artifacts
+        run: |
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          for image in nucleo-wb55-router wb55-dongle-router; do
+            ELF=examples/$image/target/thumbv7em-none-eabihf/release/$image
+            "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+            "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
+            ./tools/firmware-size-report.sh $image ${ELF}.bin ${ELF}.size.json
+            NM="$NM" ./tools/check-role-symbols.sh parent "$ELF"
+          done
+          SHIM=tools/stm32wb-fus-shim/target/thumbv7em-none-eabihf/release/stm32wb-fus-shim
+          "$OBJCOPY" -O binary "$SHIM" "${SHIM}.bin"
+          ./tools/firmware-size-report.sh stm32wb-fus-shim ${SHIM}.bin ${SHIM}.size.json
+      - name: Upload P-NUCLEO-WB55 firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nucleo-wb55-firmware
+          path: |
+            examples/nucleo-wb55-router/target/thumbv7em-none-eabihf/release/nucleo-wb55-router.bin
+            examples/nucleo-wb55-router/target/thumbv7em-none-eabihf/release/nucleo-wb55-router.hex
+            examples/nucleo-wb55-router/target/thumbv7em-none-eabihf/release/nucleo-wb55-router.size.json
+            examples/wb55-dongle-router/target/thumbv7em-none-eabihf/release/wb55-dongle-router.bin
+            examples/wb55-dongle-router/target/thumbv7em-none-eabihf/release/wb55-dongle-router.hex
+            examples/wb55-dongle-router/target/thumbv7em-none-eabihf/release/wb55-dongle-router.size.json
+            tools/stm32wb-fus-shim/target/thumbv7em-none-eabihf/release/stm32wb-fus-shim.bin
+            tools/stm32wb-fus-shim/target/thumbv7em-none-eabihf/release/stm32wb-fus-shim.size.json
           if-no-files-found: error
 
   deploy-site:

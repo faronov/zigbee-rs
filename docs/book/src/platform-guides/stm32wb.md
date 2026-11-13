@@ -1,22 +1,38 @@
-# STM32WB (STM32WB5MM-DK)
+# STM32WB (STM32WB5MM-DK, P-NUCLEO-WB55)
 
-The STM32WB5MM-DK runs zigbee-rs as a **Zigbee router**. CPU1 (Cortex-M4)
-runs the whole pure-Rust Zigbee stack: NWK, APS, ZDO, BDB, ZCL and the
-runtime. CPU2 (Cortex-M0+) owns the radio and runs ST's IEEE 802.15.4 MAC
-coprocessor firmware. No ST Zigbee stack is involved. CPU1 issues
-MLME/MCPS primitives over the IPCC mailbox.
+Three STM32WB55 boards run zigbee-rs as a **Zigbee router**:
+
+- the STM32WB5MM-DK;
+- the Nucleo-WB55 (MB1355C);
+- the USB dongle (MB1293C).
+
+The Nucleo-WB55 and the USB dongle are the two boards of the
+P-NUCLEO-WB55 kit.
+
+CPU1 (Cortex-M4) runs the whole pure-Rust Zigbee stack: NWK, APS, ZDO,
+BDB, ZCL and the runtime. CPU2 (Cortex-M0+) owns the radio and runs ST's
+IEEE 802.15.4 MAC coprocessor firmware. No ST Zigbee stack is involved.
+CPU1 issues MLME/MCPS primitives over the IPCC mailbox.
 
 ## Layering
 
 ```text
 apps/router (Basic + Identify, range extender, endpoint 1)
         ↓
-products/stm32wb5mm-dk-router   identity, NV journals, linker layout,
-                                button/touch actions, LED palette,
-                                LCD pages, sensor → ZCL mapping
+apps/stm32wb-router             shared CPU1 bring-up: IPCC/MAC start,
+                                memory-manager task, router composition,
+                                event loop, VCP or USB CDC log, LED task
+        ↓
+products/<board>-router         identity, button map; the DK adds LCD
+                                pages and sensor → ZCL mapping
+products/stm32wb-router         shared kit: linker layout, NV journals,
+                                SFSA guard, router policy, gesture
+                                classifier, button actions, LED palette
         ↓
 boards/stm32wb5mm-dk            pins and fitted parts: B1/B2, USART1 VCP,
                                 RGB LED, OLED, TSC key, I2C3 sensors, PDM mic
+boards/nucleo-wb55              SW1-SW3, LED1-LED3, USART1 VCP
+boards/wb55-usb-dongle          SW1, LED1-LED3, USB FS
         ↓
 stm32wb-hal                     clocks, HSEM-guarded flash, identity,
                                 IPCC MAC transport (embassy-stm32-wpan)
@@ -24,13 +40,17 @@ stm32wb-hal                     clocks, HSEM-guarded flash, identity,
 zigbee-mac::stm32wb::Stm32wbMac (MLME/MCPS mapping, ParentMacDriver)
 ```
 
-`examples/stm32wb5mm-dk-router` is the composition root. It holds the
-platform startup, the VCP logger, the event loop and one small task per
-peripheral group (`ui`, `sensing`, `sound`). Generic part drivers come
-from [`zigbee-rs-drivers`](https://github.com/faronov/zigbee-rs-drivers),
+`examples/<board>-router` is the composition root. It holds the platform
+startup, the interrupt bindings and the board's own tasks. The DK adds
+one small task per peripheral group (`ui`, `sensing`, `sound`). Generic
+part drivers come from
+[`zigbee-rs-drivers`](https://github.com/faronov/zigbee-rs-drivers),
 pinned by revision.
 
-## On-board peripherals
+Green Power Proxy Basic is on by default on all three boards (feature
+`green-power`). `--no-default-features` builds the router without it.
+
+## STM32WB5MM-DK peripherals
 
 Every peripheral is a Cargo feature of the example. The default build
 enables all of them; `--no-default-features` is the plain router.
@@ -135,6 +155,60 @@ entities updated, including in-range ToF readings.
 converter. It has been checked against current zigbee-herdsman-converters
 with simulated devices only and has not run in a live Zigbee2MQTT.
 
+## P-NUCLEO-WB55 kit
+
+Both boards carry a 1 MiB STM32WB55 (RG on the Nucleo, CG on the dongle).
+Both use the same shared linker layout, NV journals and status palette as
+the DK. Neither has sensors or a display: each image is a plain Range
+Extender on endpoint 1 (Basic, Identify). Each also runs a Green Power
+proxy by default.
+
+| | Nucleo-WB55 (MB1355C) | USB dongle (MB1293C) |
+|---|---|---|
+| Example | `examples/nucleo-wb55-router` | `examples/wb55-dongle-router` |
+| Model identifier | `Nucleo-WB55-Router` | `WB55-Dongle-Router` |
+| LEDs (active high) | LED1 blue PB5, LED2 green PB0, LED3 red PB1 | LED1 blue PA4, LED2 green PB0, LED3 red PB1 |
+| Buttons (active low) | SW1 PC4, SW2 PD0, SW3 PD1 | SW1 PA10 |
+| Log | ST-LINK VCP: USART1 PB6, 115200 8N1 | USB CDC ACM on the dongle's own port (`usb-log`, default) |
+| Programming | ST-LINK (CN15) | ROM USB DFU (SW2 on BOOT0, then replug) |
+
+On the dongle, the log enumerates as `1209:0001`, the pid.codes test
+VID/PID pair. The manufacturer string is "Zigbee-RS", the product string
+is the model identifier, and the serial number is the EUI-64.
+
+| Button | Short press | Hold 3 s |
+|---|---|---|
+| SW1 (both) | factory-new: start commissioning; joined: open this router for joining for 180 s | journal-aware factory reset |
+| SW2 (Nucleo) | identify endpoint 1 for 10 s | close this router for joining |
+| SW3 (Nucleo) | restart, resuming from the journals | — |
+
+The three discrete LEDs show the DK's status palette. Each LED whose
+colour channel is non-zero is lit:
+
+| State | LEDs |
+|---|---|
+| booting | all three (white) |
+| searching | red + green blinking (amber) |
+| joined | green, off after 30 s |
+| permit-join open | slow blue blink |
+| identify | fast red + blue blink (magenta) |
+| error | red |
+
+### Dongle coprocessor service without a probe
+
+The dongle has no SWD connector. Its ROM USB DFU bootloader (ST AN3156)
+can read and write memory, but it has no FUS command. The FUS upgrade and
+the stack install therefore run through `tools/stm32wb-fus-shim`: a
+2.7 KiB CPU1 helper that HWLab's `stm32dfu` plugin loads into SRAM1 at
+`0x2000_8000` and enters by leaving DFU. The helper performs one FUS step
+per run (info, upgrade, delete, start) through the same mailbox sequence
+as the SWD driver. It writes a result block that the host reads back over
+DFU once the reset has returned the part to the bootloader.
+
+The helper never writes flash. The DFU plugin stages the ST images below
+SFSA and refuses every write at or above it. The plugin never sends a mass
+erase.
+
 ## Coprocessor prerequisites
 
 CPU2 must run the following firmware:
@@ -164,7 +238,7 @@ everything from `0x080E_1000` upwards. A different stack or FUS version
 moves SFSA. The product asserts the boundary it was built for:
 `layout::EXPECTED_SECURE_START`, plus the assertions in `link/memory.x`.
 
-## Memory layout (1 MiB STM32WB55VG)
+## Memory layout (1 MiB STM32WB55VG/RG/CG)
 
 | Region | Range | Owner |
 |---|---|---|
@@ -256,6 +330,19 @@ read-back. The VCP is USART1 (PB6/PB7) at 115200 baud.
 
 Product identity is `Zigbee-RS` / `STM32WB5MM-DK-Router`. The IEEE address
 is the factory EUI-64 from the OTP/UID.
+
+The Nucleo-WB55 builds and flashes the same way from
+`examples/nucleo-wb55-router`, over its ST-LINK on CN15. Its VCP is also
+USART1 (PB6) at 115200 baud.
+
+The dongle image comes from `examples/wb55-dongle-router`. To load it:
+
+1. Set SW2 to BOOT0 and replug the dongle. It enumerates as ROM DFU
+   (`0483:df11`).
+2. Program `0x0800_0000` with HWLab's `stm32dfu` plugin, which backs up
+   `0x0800_0000..SFSA`, erases only the pages it writes, and verifies.
+3. Set SW2 back and replug. The router starts and its log appears on
+   the dongle's own USB CDC port.
 
 ## Validation status
 
