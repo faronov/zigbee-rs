@@ -2131,7 +2131,8 @@ jobs:
           # `router` includes the Green Power Proxy Basic; `router-core` is
           # the same router without it and must keep linking.
           cargo build --release --locked --no-default-features --features router-core
-          cargo build --release --locked --no-default-features --features router into the primary slot of the zigbee-rs loader
+          cargo build --release --locked --no-default-features --features router
+      # The leaf roles linked into the primary slot of the zigbee-rs loader
       # (products/efr32mg21-sensor/boot/devkit.layout, feature zrs-boot);
       # build.rs checks the layout against link/memory.x. The router image
       # does not fit the 252,672 B slot.
