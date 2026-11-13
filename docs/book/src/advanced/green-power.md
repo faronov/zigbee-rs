@@ -886,7 +886,27 @@ running the nRF 802.15.4 sniffer on channel 15.
     Feature-off images: 5 of 14 byte-identical, 9 differ only in panic
     locations. GP H2-Zero app image 515,392 B (sha `63b74365…1a5a`),
     `.text` +20 B, `.rodata`/`.data`/`.bss` unchanged.
-  - Not yet on hardware.
+  - **On hardware (2026-11-13, H2-Zero, 1a58ca8):** app-only flash of
+    `63b74365…` to ota_0 (0x10000–0x8E000; fresh backup `c3fc8f77…`),
+    readback sha matched. Boot at 09:04:49 EET resumed 0x8C23 (PAN 0xDFE9,
+    ch 15) without rejoin and restored 1 GP proxy entry. 14-minute capture
+    (`2026-11-13T070350Z-gp-h2-1a58ca8-flash-sniff`, router log + GPD VCOM
+    + nRF52840 sniffer):
+    - Every radius-30 frame from 0x8C23 for SrcID 0x293C9879 had
+      NWK seq = APS counter = GPDF MAC seq − 9 (151→142 … 162→153), dst
+      0xFFFD.
+    - 12 GPDFs (fc 2199–2210) forwarded; the router's 09:17:49 summary read
+      `forwards sent 12 cancelled 0`. fc 2197 arrived during programming and
+      fc 2198 during the readback; neither was forwarded. No other proxy
+      originated a Notification for this GPD.
+    - No radius-28 echo from 0x8C23. 16 radius-30 copies for 12 forwards:
+      9 forwards had 1 copy, 3 had 2–3 copies about 515 ms apart. In those
+      3 cycles every neighbour except 0x43FD (the next hop) relayed within
+      110 ms, and 0x43FD relayed only after the retry. These are
+      spec-conforming passive-ack retries; before the echo fix the mean was
+      2.4 copies.
+    - HA temperature changed every 60 s from 09:04:04 to 09:18:06 with no
+      gap.
 
 ## 7. Open questions for the user
 
