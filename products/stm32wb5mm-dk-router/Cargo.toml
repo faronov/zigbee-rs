@@ -18,6 +18,9 @@ default = []
 sensors = ["zigbee-runtime/float32", "zigbee-zcl/float32"]
 # PDM microphone sound level as an Analog Input endpoint.
 sound = ["zigbee-runtime/float32", "zigbee-zcl/float32"]
+# Green Power Proxy Basic: the GP Proxy Table journal (`storage::open`). The
+# window is reserved in every image.
+green-power = ["router-app/green-power", "zigbee-runtime/green-power"]
 
 [dependencies]
 heapless = "0.9"

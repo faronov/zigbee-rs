@@ -571,13 +571,17 @@ from the EFR32 `gecko-recovery` option below.
 - **ZBT-1 loader-linked router.** `examples/ha-connect-zbt1` feature
   `zrs-boot` (router role only; `ed`/`sed` refuse it at compile time) links
   the router into the primary slot of `products/ha-connect-zbt1/boot/
-  zbt1.layout` (application `0x8200`, cap 473,856 B). `build.rs` checks
+  zbt1.layout` (application `0x8200`, cap 465,664 B). `build.rs` checks
   that the layout keeps the direct map's security journal and reserves its
-  router tables (`0xF4000..0xFC000`), so a direct-linked and a
-  loader-linked router resume the same child/APS tables and frame
-  counters. The product module `boot` (`products/ha-connect-zbt1/src/
-  boot.rs`) owns the flash split (a `StagingFlash` view below the router
-  tables: writes only to the secondary slot and the trial log), the loader
+  router tables (`0xF4000..0xFC000`) and, for a Green Power build, its GP
+  Proxy Table journal (`0xF0000..0xF4000`), so a direct-linked and a
+  loader-linked router resume the same child/APS/Proxy tables and frame
+  counters. Layout version 2 shrank both slots by 8 KiB to make room for
+  the GP journal (version 1 slots ended at `0xF4000` and covered it), so
+  the loader-linked router is `router,zrs-boot` with the GP Proxy Basic;
+  `router-core,zrs-boot` is the same router without it. The product module `boot` (`products/ha-connect-zbt1/src/
+  boot.rs`) owns the flash split (a `StagingFlash` view below the GP
+  journal: writes only to the secondary slot and the trial log), the loader
   channel, the identity (`0x1234`/`0x2101`, file version `0x25MMmmpp`,
   ELF symbol `ZRS_OTA_IDENTITY`) and `TrialConfirm`. The router confirms
   once per boot when its status is `Online` **and** it has decrypted at
@@ -621,7 +625,7 @@ from the EFR32 `gecko-recovery` option below.
 | nRF52840 ProMicro UF2 (`promicro-uf2`) | MBR+S140 `0x0..0x26000`, boot guard `0xF0000..0xF4000`, UF2, MBR params | `0x26000..0x2A000` | `0x2A000..0x8C000` | `0x8C000..0xEE000` | `0xEE000..0xF0000` | 396,032 B |
 | EFR32MG22 devkit (`efr32mg22-sensor/boot/devkit.layout`) | none (router tables reclaimed) | `0x0..0x4000` | `0x4000..0x40000` | `0x40000..0x7C000` | `0x7C000..0x80000` | 236,288 B |
 | EFR32MG21 devkit (`efr32mg21-sensor/boot/devkit.layout`), F1024 only | Gecko `0x0..0x4000`, router tables `0x74000..0x7C000` | `0x4000..0x8000` | `0x80000..0xC0000` | `0xC0000..0x100000` | `0x7C000..0x80000` | 252,672 B |
-| ZBT-1 (`ha-connect-zbt1/boot/zbt1.layout`) | Gecko `0x0..0x4000`, router tables `0xF4000..0xFC000` | `0x4000..0x8000` | `0x8000..0x7E000` | `0x7E000..0xF4000` | `0xFC000..0x100000` | 473,856 B |
+| ZBT-1 (`ha-connect-zbt1/boot/zbt1.layout`, version 2) | Gecko `0x0..0x4000`, GP Proxy Table `0xF0000..0xF4000`, router tables `0xF4000..0xFC000` | `0x4000..0x8000` | `0x8000..0x7C000` | `0x7C000..0xF0000` | `0xFC000..0x100000` | 465,664 B (version 1: 473,856 B, slots `0x8000..0x7E000..0xF4000`) |
 | PB-03F (`pb03f-kit/boot/pb03f.layout`) | ROM/factory `0x0..0x2000`, ROM-boot table `0x2000..0x3000`, factory data `0x3000..0x5000`, load data `0x5000..0x6000`, router tables `0x7A000..0x7E000` | `0x6000..0xA000` | `0x10000..0x43000` | `0x43000..0x76000` | `0x7E000..0x80000` | 200,448 B (`app-max`) |
 
 The application cap is the slot minus its last sector (the trailer), the
@@ -943,7 +947,8 @@ loader with `watchdog-ms = 8000`.
 | EFR32MG22 `ed,zrs-boot` (warn-level logs) | 204,484 B (was 229,788 B) | 236,288 B |
 | EFR32MG21 `sed,zrs-boot` | 234,272 B | 252,672 B |
 | EFR32MG21 `ed,zrs-boot` | 229,988 B | 252,672 B |
-| ZBT-1 `router,zrs-boot` (info logs, trial confirm, no OTA client) | 357,544 B (+2,048 vs the direct router's 355,496 B); `.bss` 39,184 B (unchanged), stack 58,096 B | 473,856 B |
+| ZBT-1 `router,zrs-boot` (now `router-core,zrs-boot`; info logs, trial confirm, no OTA client) | 357,544 B (+2,048 vs the direct router's 355,496 B); `.bss` 39,184 B (unchanged), stack 58,096 B | 473,856 B (layout v1) |
+| ZBT-1 `router,zrs-boot` with Green Power (layout v2) | 385,871 B signed (slot margin 81,073 B); `.bss` 41,232 B, stack 56,048 B | 465,664 B |
 
 Shipped default images: with these changes reverted in the same worktree,
 the nRF52840 UF2 (ProMicro, 228,840 B) and EFR32MG22 sensor (234,160 B)
@@ -1714,7 +1719,10 @@ Bootloader at `0x0..0x4000`.
 - **Loader:** the `efr32s2-boot` `ha-connect-zbt1` build (16 KiB
   `loader.bin` at `0x4000`), with overwrite, one P-256 key (own key),
   3 trial boots and an 8 s watchdog request (`PERSEL` 11).
-- **Application:** `examples/ha-connect-zbt1` built as `router,zrs-boot`,
+- **Application:** `examples/ha-connect-zbt1` built as `router,zrs-boot`
+  (now spelled `router-core,zrs-boot`: Green Power, on by default in the
+  router, is a compile error with the loader because its secondary slot
+  overlaps the GP journal at `0xF0000`),
   TEST-ONLY versions 0.1.0–0.1.3 (357,564 B; the TEST-ONLY marker adds
   20 B). The 0.1.2 image is a `router,trial-no-confirm` build.
 - **Test images:** padded secondary images were signed with imgtool 2.4.0,
@@ -1750,7 +1758,32 @@ Notes:
   or anything from `0xF4000` up, and never restore a full backup (that
   rolls back the frame counters).
 - **Board state.** Loader plus confirmed TEST-ONLY 0.1.3 loader-linked
-  router.
+  router (superseded by layout v2, below).
+
+### ZBT-1 layout v2 with Green Power (2026-11-13)
+
+The same board, with loader layout version 2: slots shrunk by 8 KiB
+(primary `0x8000..0x7C000`, secondary `0x7C000..0xF0000`) and the GP
+Proxy Table window `0xF0000..0xF4000` reserved. The application is
+`router,zrs-boot` with the Green Power Proxy Basic, from `green-power`
+commit `2e54ea7`, TEST-ONLY versions 0.2.0 and 0.2.1 (385,902/385,903 B
+signed with the own key). The secondary test image was padded with
+imgtool 2.4.0, `--slot-size 0x74000 --pad`. **Validation level:
+lab-tested on one board.** The Proxy Table held no entry: the MG22 GPD
+was not re-commissioned during this test, so no forwarding through the
+ZBT-1 was observed.
+
+| step | result |
+|---|---|
+| Preparation | Full backup read twice, identical, SHA-256 `d7305f91…`. Journal gate passed: `0x4A76`, PAN `0xDFE9`, channel 15, NWK counter limit `0x68400`, TCLK `0x1C80D`, 2 children, APS empty. Gecko `c84f5462…` and the v1 loader in place; `0xF0000..0xF4000` erased |
+| Install | Erased `0x4000..0xF4000` (120 sectors, verified 0xFF). Programmed the v2 loader (16 KiB, SHA-256 `97496ec6…`) at `0x4000` and signed 0.2.0 (`7fc4e168…`) at `0x8000`; both read back and compared |
+| First boot | `loader Own`, `trial permanent 0`, `valid security journal preserved`, `Resume: addr=0x4A76 PAN=0xDFE9 ch=15`, `0 GP proxy table entries restored`, `router online` 93 ms after reset. The 60 s summary printed `GP proxy entries 0 \| forwards sent 0 cancelled 0`. No rejoin; the two children re-parented after `Parent_annce` |
+| Upgrade 0.2.0→0.2.1 | Padded 0.2.1 (`2e5aa167…`, 475,136 B, ends at `0xF0000`) staged in the secondary over SWD. After the reset: `trial testing 1`, then `trial confirm: testing 1 -> confirmed` 1.7 s after boot. Reset to banner ≈10.5 s (install copy) |
+| Retention | Final backup `28f41b72…` passed the journal gate: same identity, counters forward only (NWK `0x68400`→`0x69000`, TCLK `0x1C80D`→`0x1D40D`). Gecko and the v2 loader unchanged; the primary equals the padded 0.2.1 except the trial-log sector `0x7A000`; secondary first sector and trailer erased; the GP window is still erased. ZHA shows `0x4A76` available (last seen 17:27 EET) |
+
+Board state: v2 loader plus confirmed TEST-ONLY 0.2.1 loader-linked
+router with GP. Restore rule unchanged: never write `0x0..0x4000` or
+from `0xF4000` up.
 
 ## Open decisions
 

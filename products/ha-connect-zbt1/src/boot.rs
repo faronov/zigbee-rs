@@ -11,10 +11,12 @@
 //! ([`TrialConfirm`]). The overwrite loader cannot revert, so an
 //! unconfirmed image keeps running and the loader only reports it.
 //!
-//! The router tables (`0xF4000..0xFC000`) and the security journal
-//! (`0xFC000..`) keep the addresses of the direct map (`link/memory.x`), so
-//! a direct-linked router and a loader-linked one resume the same network
-//! state and frame counters.
+//! The Green Power Proxy Table journal (`0xF0000..0xF4000`), the router
+//! tables (`0xF4000..0xFC000`) and the security journal (`0xFC000..`) keep
+//! the addresses of the direct map (`link/memory.x`), so a direct-linked
+//! router and a loader-linked one resume the same network state, GP Proxy
+//! Table and frame counters. Loader-version 1 layouts ended the secondary
+//! slot at `0xF4000`, over the GP window; version 2 ends both slots below it.
 //!
 //! # Identity
 //!
@@ -40,7 +42,8 @@ use layout::{
 };
 
 // The loader layout keeps the direct map's persistence: the security
-// journal and, reserved, the router tables and the Gecko Bootloader.
+// journal and, reserved, the GP Proxy Table journal, the router tables and
+// the Gecko Bootloader.
 const _: () = assert!(JOURNAL_START == crate::PERSISTENCE_PARTITION_START);
 const _: () = assert!(JOURNAL_END == crate::PERSISTENCE_PARTITION_END);
 const _: () = assert!(reserves(0, crate::APPLICATION_START));
@@ -48,11 +51,15 @@ const _: () = assert!(reserves(
     crate::CHILD_TABLE_PARTITION_START,
     crate::PERSISTENCE_PARTITION_START
 ));
+const _: () = assert!(reserves(
+    crate::GP_PROXY_TABLE_PARTITION_START,
+    crate::CHILD_TABLE_PARTITION_START
+));
 // Gecko starts whatever is at the direct map's application start: the
-// loader lives there, and both slots end below the router tables.
+// loader lives there, and both slots end below the GP Proxy Table journal.
 const _: () = assert!(LOADER_START == crate::APPLICATION_START);
-const _: () = assert!(PRIMARY_SLOT + SLOT_SIZE <= BELOW_ROUTER_TABLES as u32);
-const _: () = assert!(SECONDARY_SLOT + SLOT_SIZE <= BELOW_ROUTER_TABLES as u32);
+const _: () = assert!(PRIMARY_SLOT + SLOT_SIZE <= BELOW_PERSISTENCE as u32);
+const _: () = assert!(SECONDARY_SLOT + SLOT_SIZE <= BELOW_PERSISTENCE as u32);
 const _: () = assert!(LOADER_INFO_ADDR < PRIMARY_SLOT);
 
 /// Whether the layout reserves exactly `[start, end)`.
@@ -93,12 +100,13 @@ pub const OTA_IDENTITY: [u32; 2] = [
     FILE_VERSION,
 ];
 
-/// First byte of the router tables: the slots, the loader and the Gecko
-/// Bootloader lie below it.
-pub const BELOW_ROUTER_TABLES: usize = crate::CHILD_TABLE_PARTITION_START as usize;
+/// First byte of the router persistence (the GP Proxy Table journal, then
+/// the router tables and the security journal): the slots, the loader and
+/// the Gecko Bootloader lie below it.
+pub const BELOW_PERSISTENCE: usize = crate::GP_PROXY_TABLE_PARTITION_START as usize;
 
-/// Internal flash below the router tables (absolute addresses).
-pub type LowFlash = FlashPartition<0, BELOW_ROUTER_TABLES>;
+/// Internal flash below the router persistence (absolute addresses).
+pub type LowFlash = FlashPartition<0, BELOW_PERSISTENCE>;
 
 /// The confirm's flash view: [`LowFlash`] bounded by [`StagingFlash`], which
 /// admits writes only into the secondary slot and the running image's
@@ -107,12 +115,12 @@ pub type LowFlash = FlashPartition<0, BELOW_ROUTER_TABLES>;
 pub type BootFlash = StagingFlash<LowFlash>;
 
 /// Split the unique internal-flash handle into the loader view (below the
-/// router tables) and the handle for [`crate::router::router_stores`] and
-/// [`crate::storage::security_store`], whose partitions start at the router
-/// tables.
+/// router persistence) and the handle for [`crate::router::router_stores`],
+/// the GP Proxy Table store and [`crate::storage::security_store`], whose
+/// partitions start at the GP window.
 pub fn split_flash(flash: Efr32s2Flash) -> (Efr32s2Flash, BootFlash) {
-    // SAFETY: `LowFlash` ends where the router tables begin (asserted
-    // above), the returned handle is only used through the router-table and
+    // SAFETY: `LowFlash` ends where the GP window begins (asserted above),
+    // the returned handle is only used through the GP, router-table and
     // security-journal partitions above it, and this function consumes the
     // only safe handle before minting the window. Flash is used from one
     // executor; no interrupt handler issues MSC operations.
@@ -199,7 +207,7 @@ mod tests {
 
     static TEST_KEYS: [TrustedKey; 1] = [TrustedKey::new(*TEST_KEY_XY)];
 
-    /// Flash below the router tables with the EFR32 geometry (8 KiB pages,
+    /// Flash below the router persistence with the EFR32 geometry (8 KiB pages,
     /// 4-byte writes that only clear bits) and a write log.
     struct MockFlash {
         bytes: Vec<u8>,
@@ -211,7 +219,7 @@ mod tests {
         /// `running` in the primary slot, `staged` (padded, with the
         /// request magic) in the secondary.
         fn new(running: &[u8], staged: Option<&[u8]>) -> Self {
-            let mut bytes = std::vec![0xFF; BELOW_ROUTER_TABLES];
+            let mut bytes = std::vec![0xFF; BELOW_PERSISTENCE];
             let primary = PRIMARY_SLOT as usize;
             bytes[primary..primary + running.len()].copy_from_slice(running);
             if let Some(image) = staged {
@@ -413,8 +421,13 @@ mod tests {
             for from in [0x0, LOADER_START, PRIMARY_SLOT] {
                 assert!(view.erase(from, from + 0x2000).is_err(), "{from:#X}");
             }
-            // The router tables and the journal lie outside the view.
-            assert!(view.write(BELOW_ROUTER_TABLES as u32, &word).is_err());
+            // The GP window, the router tables and the journal lie outside
+            // the view.
+            assert!(view.write(BELOW_PERSISTENCE as u32, &word).is_err());
+            assert!(
+                view.write(crate::CHILD_TABLE_PARTITION_START, &word)
+                    .is_err()
+            );
             let mut byte = [0];
             assert!(view.read(JOURNAL_START, &mut byte).is_err());
         }

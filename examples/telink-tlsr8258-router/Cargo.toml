@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+# The production router carries the Green Power Proxy Basic (default-on for
+# every router image); `--no-default-features --features router-core`
+# (`scripts/tlsr8258.sh build router-core`) builds it without GP.
+default = ["router"]
+router = ["router-core", "green-power"]
+router-core = []
+# Green Power Proxy Basic with its durable Proxy Table at 0x6E000.
+green-power = [
+    "router-core",
+    "router-app/green-power",
+    "zigbee-runtime/green-power",
+    "tlsr8258-tb04-product/green-power",
+]
 # Lab-only images; production builds enable neither.
 # Debugger-driven secured / Trust Center rejoin request cell.
 lab-rejoin-trigger = ["router-app/rejoin-request"]

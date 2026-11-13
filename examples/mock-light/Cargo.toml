@@ -7,6 +7,13 @@ edition = "2024"
 name = "mock-light"
 path = "src/main.rs"
 
+[features]
+# Green Power Proxy Basic, on in every router composition. The host demo
+# keeps its Proxy Table in RAM (`RamGpProxyStore`); firmware products use a
+# flash journal.
+default = ["green-power"]
+green-power = ["router-app/green-power", "zigbee-runtime/green-power"]
+
 [dependencies]
 router-app = { path = "../../apps/router", features = ["router"] }
 zigbee-aps = { path = "../../zigbee-aps" }

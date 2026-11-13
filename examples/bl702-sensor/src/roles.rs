@@ -8,7 +8,7 @@
 //! `--no-default-features --features diagnostic-logging,<role>` to see
 //! them), and a factory-new node re-arms commissioning on a timer.
 
-#[cfg(all(feature = "ed", feature = "router"))]
+#[cfg(all(feature = "ed", feature = "router-core"))]
 compile_error!("enable exactly one mains role feature (ed or router)");
 #[cfg(all(feature = "production", feature = "diagnostic-logging"))]
 compile_error!("select either production or diagnostic-logging, not both");

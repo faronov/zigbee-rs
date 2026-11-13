@@ -5,15 +5,16 @@
 //! 0xFD000..0xFE000  secondary-slot trailer sector (bootloader-owned)
 //! 0xFB000..0xFD000  router APS binding/group journal
 //! 0xF9000..0xFB000  router child-table journal
-//! 0x87000..0xF9000  secondary slot, unused by the router image
+//! 0xF7000..0xF9000  router Green Power Proxy Table journal (`green-power`)
+//! 0x87000..0xF7000  secondary slot, unused by the router image
 //! ```
 //!
 //! The router image carries no Zigbee OTA client, so the top of the
 //! secondary slot below its trailer sector holds the two router journals.
 //! The trailer sector, which the bootloader reads for a pending swap, is
 //! never touched. A future router OTA path must cap staged images at
-//! `CHILD_TABLE_PARTITION_START - SECONDARY_SLOT` (0x72000 bytes) or move
-//! these journals. The SED's OTA writer may overwrite them; the shared
+//! `GP_PROXY_TABLE_PARTITION_START - SECONDARY_SLOT` (0x70000 bytes) or
+//! move these journals. The SED's OTA writer may overwrite them; the shared
 //! security journal's role tag keeps a later router from resuming that
 //! state.
 //!
@@ -56,6 +57,17 @@ const _: () = assert!(
         == APS_TABLE_PARTITION_START as usize
 );
 const _: () = assert!(CHILD_TABLE_PARTITION_START == 0x000F_9000);
+
+/// Green Power Proxy Table journal: two 4 KiB sectors below the child
+/// journal (reserved in every router image; used with `green-power`).
+pub const GP_PROXY_TABLE_PARTITION_SIZE: usize = GP_PROXY_TABLE_SECTOR_SIZE * 2;
+pub const GP_PROXY_TABLE_PARTITION_START: u32 =
+    CHILD_TABLE_PARTITION_START - GP_PROXY_TABLE_PARTITION_SIZE as u32;
+const GP_PROXY_TABLE_SECTOR_SIZE: usize = 4096;
+const _: () = assert!(GP_PROXY_TABLE_PARTITION_START == 0x000F_7000);
+const _: () = assert!(GP_PROXY_TABLE_PARTITION_START > SECONDARY_SLOT);
+const _: () = assert!(GP_PROXY_TABLE_PARTITION_START.is_multiple_of(SECTOR_SIZE));
+const _: () = assert!(GP_PROXY_TABLE_SECTOR_SIZE.is_multiple_of(SECTOR_SIZE as usize));
 const _: () = assert!(CHILD_TABLE_PARTITION_START > SECONDARY_SLOT);
 const _: () = assert!(CHILD_TABLE_PARTITION_START.is_multiple_of(SECTOR_SIZE));
 const _: () = assert!(CHILD_JOURNAL_SECTOR_SIZE.is_multiple_of(SECTOR_SIZE as usize));
@@ -89,12 +101,21 @@ pub type ApsTableFlash<'a, F> =
 pub type ChildStore<'a, F> = ChildTableJournal<ChildTableFlash<'a, F>>;
 pub type ApsTableStore<'a, F> = ApsTableJournal<ApsTableFlash<'a, F>>;
 pub type RouterSecurityStore<'a, F> = SecurityStore<SharedFlash<'a, F>>;
+#[cfg(feature = "green-power")]
+pub type GpProxyTableFlash<'a, F> =
+    FlashWindow<SharedFlash<'a, F>, GP_PROXY_TABLE_PARTITION_START, GP_PROXY_TABLE_PARTITION_SIZE>;
+/// Green Power Proxy Table journal on two 4 KiB sectors.
+#[cfg(feature = "green-power")]
+pub type GpProxyTableStore<'a, F> =
+    zigbee_runtime::gp_store::GpProxyJournal<GpProxyTableFlash<'a, F>, GP_PROXY_TABLE_SECTOR_SIZE>;
 
 /// The router's three journals over the one shared flash.
 pub struct RouterStores<'a, F> {
     pub security: RouterSecurityStore<'a, F>,
     pub children: ChildStore<'a, F>,
     pub aps: ApsTableStore<'a, F>,
+    #[cfg(feature = "green-power")]
+    pub gp_proxy_table: GpProxyTableStore<'a, F>,
 }
 
 /// Split the shared main flash into the security, child and APS journals.
@@ -115,6 +136,12 @@ where
             FlashWindow::new(SharedFlash::new(flash)),
             0,
             APS_TABLE_JOURNAL_SECTOR_SIZE as u32,
+        ),
+        #[cfg(feature = "green-power")]
+        gp_proxy_table: GpProxyTableStore::new(
+            FlashWindow::new(SharedFlash::new(flash)),
+            0,
+            GP_PROXY_TABLE_SECTOR_SIZE as u32,
         ),
     }
 }
@@ -148,8 +175,13 @@ mod tests {
             APS_TABLE_PARTITION_START as usize + APS_TABLE_PARTITION_SIZE,
             0x000F_D000
         );
+        assert_eq!(GP_PROXY_TABLE_PARTITION_START, 0x000F_7000);
+        assert_eq!(
+            GP_PROXY_TABLE_PARTITION_START as usize + GP_PROXY_TABLE_PARTITION_SIZE,
+            CHILD_TABLE_PARTITION_START as usize
+        );
         // Room a future router OTA could stage without touching them.
-        assert_eq!(CHILD_TABLE_PARTITION_START - SECONDARY_SLOT, 0x7_2000);
+        assert_eq!(GP_PROXY_TABLE_PARTITION_START - SECONDARY_SLOT, 0x7_0000);
     }
 
     #[test]
@@ -184,5 +216,29 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0xFF)
         );
+    }
+
+    #[cfg(feature = "green-power")]
+    #[test]
+    fn gp_window_confines_writes_below_the_child_journal() {
+        let flash = RefCell::new(MockMainFlash::new());
+        let stores = router_stores(&flash);
+        let mut gp = stores.gp_proxy_table.into_storage();
+        gp.erase(0, SECTOR_SIZE).unwrap();
+        gp.write(0, &[0x3C; 4]).unwrap();
+        gp.write(GP_PROXY_TABLE_PARTITION_SIZE as u32 - 1, &[0xC3])
+            .unwrap();
+        assert_eq!(
+            gp.write(GP_PROXY_TABLE_PARTITION_SIZE as u32, &[0; 4]),
+            Err(PartitionError::OutOfBounds)
+        );
+        let bytes = &flash.borrow().bytes;
+        let start = GP_PROXY_TABLE_PARTITION_START as usize;
+        let last = CHILD_TABLE_PARTITION_START as usize - 1;
+        assert_eq!(&bytes[start..start + 4], &[0x3C; 4]);
+        assert_eq!(bytes[last], 0xC3);
+        assert!(bytes[..start].iter().all(|byte| *byte == 0xFF));
+        assert!(bytes[start + 4..last].iter().all(|byte| *byte == 0xFF));
+        assert!(bytes[last + 1..].iter().all(|byte| *byte == 0xFF));
     }
 }

@@ -396,6 +396,13 @@ fn compose(transport: WbTransport) -> (&'static mut App, product::storage::Setti
         log::error!("[WB] invalid composition: {error:?}");
         halt()
     });
+    #[cfg(feature = "green-power")]
+    let app = {
+        static GP_STORE: StaticCell<product::storage::GpProxyTableStore> = StaticCell::new();
+        let mut app = app;
+        app.set_green_power_store(GP_STORE.init(stores.gp_proxy_table));
+        app
+    };
     (APP.init(app), stores.settings)
 }
 
@@ -440,6 +447,17 @@ fn log_summary(app: &App) {
             neighbor.relationship,
             neighbor.rx_on_when_idle,
             neighbor.lqi
+        );
+    }
+    #[cfg(feature = "green-power")]
+    {
+        let proxy = app.node().device().gp_proxy();
+        let stats = proxy.forward_stats();
+        log::info!(
+            "[WB] GP proxy entries {} | forwards sent {} cancelled {}",
+            proxy.entries().len(),
+            stats.sent,
+            stats.cancelled
         );
     }
 }

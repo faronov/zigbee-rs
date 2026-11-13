@@ -15,6 +15,7 @@ zigbee-aps = { version = "0.1.0", path = "../zigbee-aps" }
 zigbee-zdo = { version = "0.1.0", path = "../zigbee-zdo" }
 zigbee-bdb = { version = "0.1.0", path = "../zigbee-bdb", default-features = false }
 zigbee-zcl = { version = "0.1.0", path = "../zigbee-zcl", default-features = false }
+zigbee-gp = { version = "0.1.0", path = "../zigbee-gp", optional = true, features = ["proxy"] }
 log = "0.4"
 
 [features]
@@ -56,6 +57,17 @@ router = [
 ]
 trust-center = ["router", "zigbee-aps/trust-center", "zigbee-bdb/trust-center"]
 ota = []
+# Green Power Proxy Basic (GP 1.1) for routers: GPDF reception, Proxy Table,
+# GP Notification / Commissioning Notification tunnelling with NWK aliasing.
+# Requires `router`. Off by default: images built without it are unchanged.
+green-power = [
+    "router",
+    "dep:zigbee-gp",
+    "zigbee-mac/green-power",
+    "zigbee-aps/green-power",
+    "zigbee-nwk/green-power",
+    "zigbee-zcl/green-power",
+]
 # Deprecated item-by-item `save_state`/`restore_state` persistence. It does not
 # persist the Trust Center link key, APS keys, bindings or groups; production
 # devices use `SecurityStateStore`. Kept only for tests and mock examples.

@@ -30,6 +30,9 @@ pub struct Peripherals {
     pub radio: RadioToken,
     pub rtcc: RtccToken,
     pub wdog: WdogToken,
+    /// IADC0, used for supply measurements (xG22).
+    #[cfg(feature = "efr32mg22")]
+    pub iadc0: crate::iadc::Iadc0Token,
 }
 
 impl Peripherals {
@@ -56,6 +59,8 @@ impl Peripherals {
                 radio: RadioToken::new(),
                 rtcc: RtccToken::new(),
                 wdog: WdogToken::new(),
+                #[cfg(feature = "efr32mg22")]
+                iadc0: crate::iadc::Iadc0Token::new(),
             })
     }
 }
@@ -76,5 +81,7 @@ mod tests {
         assert_eq!(size_of::<I2c0Token>(), 0);
         assert_eq!(size_of::<RtccToken>(), 0);
         assert_eq!(size_of::<WdogToken>(), 0);
+        #[cfg(feature = "efr32mg22")]
+        assert_eq!(size_of::<crate::iadc::Iadc0Token>(), 0);
     }
 }

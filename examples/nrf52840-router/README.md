@@ -60,6 +60,10 @@ cargo +nightly-2026-03-23 build --release --locked          # nrf52840-ed
 cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router
 ```
 
+The `router` feature also enables the Green Power Proxy Basic (default-on
+for every router; see the Green Power chapter); `router-core` builds the
+router without it.
+
 The linker consumes `products/nrf52840-router/link/memory.x`; the product's
 Rust constants and linker `ASSERT`s independently protect the two-page
 security journal.

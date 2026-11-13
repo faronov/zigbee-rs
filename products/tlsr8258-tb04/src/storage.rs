@@ -149,3 +149,48 @@ pub type ApsTableStore = ApsTableJournal<ApsTableFlash>;
 pub const fn aps_table_store(token: ApsTablePartition) -> ApsTableStore {
     ApsTableJournal::new(aps_table_flash(token), APS_SECTOR_A, APS_SECTOR_B)
 }
+
+/// Exclusive ownership of the router's Green Power Proxy Table partition.
+#[cfg(feature = "green-power")]
+pub struct GpProxyTablePartition(());
+
+/// [`split_flash`] plus the router's Green Power Proxy Table partition.
+#[cfg(feature = "green-power")]
+pub const fn split_flash_with_gp(
+    _token: OnboardFlash,
+) -> (
+    SecurityPartition,
+    ChildTablePartition,
+    ApsTablePartition,
+    GpProxyTablePartition,
+) {
+    (
+        SecurityPartition(()),
+        ChildTablePartition(()),
+        ApsTablePartition(()),
+        GpProxyTablePartition(()),
+    )
+}
+
+#[cfg(feature = "green-power")]
+const GP_SECTOR_SIZE: usize = zigbee_runtime::gp_store::GP_PROXY_JOURNAL_SECTOR_SIZE;
+#[cfg(feature = "green-power")]
+const _: () = assert!(crate::GP_PROXY_TABLE_PARTITION_SIZE == GP_SECTOR_SIZE * 2);
+
+/// Green Power Proxy Table journal on two 4 KiB sectors.
+#[cfg(feature = "green-power")]
+pub type GpProxyTableStore = zigbee_runtime::gp_store::GpProxyJournal<GuardedFlash>;
+
+#[cfg(feature = "green-power")]
+pub const fn gp_proxy_table_store(_token: GpProxyTablePartition) -> GpProxyTableStore {
+    // SAFETY: as for `security_flash`; `GpProxyTablePartition` is unique and
+    // the const asserts keep the window below the APS journal and above the
+    // image limit.
+    let flash = GuardedFlash(unsafe {
+        FlashRegion::new(
+            crate::GP_PROXY_TABLE_PARTITION_START,
+            crate::GP_PROXY_TABLE_PARTITION_SIZE,
+        )
+    });
+    zigbee_runtime::gp_store::GpProxyJournal::new(flash, 0, GP_SECTOR_SIZE as u32)
+}

@@ -22,12 +22,16 @@ pub mod flash;
 pub mod gecko_bootloader;
 pub mod gpio;
 pub mod i2c;
+#[cfg(feature = "efr32mg22")]
+pub mod iadc;
 pub mod peripherals;
 pub mod power;
 pub mod radio;
 pub mod rtcc;
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
+#[cfg(feature = "efr32mg22")]
+pub mod trng;
 pub mod usart;
 pub mod vectors;
 pub mod watchdog;

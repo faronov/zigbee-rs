@@ -19,6 +19,13 @@ pub type ChildStore = ChildTableJournal<ChildTableFlash, JOURNAL_SECTOR_SIZE>;
 pub type ApsTableStore = ApsTableJournal<ApsTableFlash, JOURNAL_SECTOR_SIZE>;
 pub type SecurityStore = SecurityStateJournal<SecurityFlash>;
 pub type SettingsStore = SettingsJournal<SettingsFlash, SETTINGS_SECTOR_SIZE>;
+#[cfg(feature = "green-power")]
+pub type GpProxyTableFlash =
+    WordPerDoubleWord<FlashWindow<GP_PROXY_TABLE_START, JOURNAL_PHYSICAL_SIZE>>;
+/// Green Power Proxy Table journal, same geometry as the router journals.
+#[cfg(feature = "green-power")]
+pub type GpProxyTableStore =
+    zigbee_runtime::gp_store::GpProxyJournal<GpProxyTableFlash, JOURNAL_SECTOR_SIZE>;
 
 const SECTOR_A: u32 = 0;
 const SECTOR_B: u32 = JOURNAL_SECTOR_SIZE as u32;
@@ -41,6 +48,8 @@ pub struct RouterStores {
     pub aps_tables: ApsTableStore,
     pub security: SecurityStore,
     pub settings: SettingsStore,
+    #[cfg(feature = "green-power")]
+    pub gp_proxy_table: GpProxyTableStore,
 }
 
 /// Open the four journals. Call once.
@@ -60,6 +69,9 @@ pub fn open() -> Result<RouterStores, StorageError> {
             FlashWindow::<SETTINGS_START, SETTINGS_PHYSICAL_SIZE>::steal(),
         )
     };
+    // SAFETY: as above; the GP window is disjoint from every other window.
+    #[cfg(feature = "green-power")]
+    let gp = unsafe { FlashWindow::<GP_PROXY_TABLE_START, JOURNAL_PHYSICAL_SIZE>::steal() };
     Ok(RouterStores {
         children: ChildStore::new_with_sector_size(
             children.map_err(StorageError::Flash)?.into_word_flash(),
@@ -80,6 +92,12 @@ pub fn open() -> Result<RouterStores, StorageError> {
             settings.map_err(StorageError::Flash)?.into_word_flash(),
             0,
             SETTINGS_SECTOR_SIZE as u32,
+        ),
+        #[cfg(feature = "green-power")]
+        gp_proxy_table: GpProxyTableStore::new(
+            gp.map_err(StorageError::Flash)?.into_word_flash(),
+            SECTOR_A,
+            SECTOR_B,
         ),
     })
 }

@@ -12,7 +12,8 @@
 //!
 //! | Region | Range |
 //! |--------|-------|
-//! | Application | `0x0000_0000..0x000F_A000` (1000 KiB) |
+//! | Application | `0x0000_0000..0x000F_8000` (992 KiB) |
+//! | Router GP Proxy Table journal | `0x000F_8000..0x000F_A000` |
 //! | Router child/APS journals | `0x000F_A000..0x000F_E000` |
 //! | Security journal | `0x000F_E000..0x0010_0000` |
 

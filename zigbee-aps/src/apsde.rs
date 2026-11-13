@@ -858,6 +858,19 @@ impl<M: MacDriver> ApsLayer<M> {
             );
             return Err(ApsStatus::SecurityFail);
         }
+        // Green Power alias transmission (GP 1.1 A.3.6.3.3) is only defined
+        // for single unacknowledged NWK-secured frames: an APS ACK would be
+        // addressed to the alias, and APS security/fragmentation bind the
+        // frame to this device's own identity.
+        #[cfg(feature = "green-power")]
+        if req.alias_src_addr.is_some()
+            && (req.alias_seq.is_none()
+                || req.tx_options.ack_request
+                || req.tx_options.security_enabled
+                || req.payload.len() > APS_MAX_PAYLOAD)
+        {
+            return Err(ApsStatus::IllegalRequest);
+        }
         // Determine NWK destination and APS delivery mode
         let (nwk_dst, delivery_mode) = match req.dst_addr_mode {
             ApsAddressMode::Short => {
@@ -1009,6 +1022,16 @@ impl<M: MacDriver> ApsLayer<M> {
         }
 
         // Normal (non-encrypted, non-fragmented) send
+        // GP 1.1.2 A.3.6.3.3.2: an alias frame's APS counter has the same
+        // value as its alias NWK sequence number, so every proxy tunnelling
+        // the same GPDF sends an identical APS header; this device's own
+        // counter is left untouched.
+        #[cfg(feature = "green-power")]
+        let aps_counter = match req.alias_src_addr.and(req.alias_seq) {
+            Some(alias_seq) => alias_seq,
+            None => self.next_aps_counter(),
+        };
+        #[cfg(not(feature = "green-power"))]
         let aps_counter = self.next_aps_counter();
         let aps_header = self.build_data_header(delivery_mode, req, aps_counter, false, false);
 
@@ -1030,6 +1053,10 @@ impl<M: MacDriver> ApsLayer<M> {
             &aps_buf[..core::cmp::min(12, total_len)],
         );
 
+        #[cfg(feature = "green-power")]
+        if let Some((alias_addr, alias_seq)) = req.alias_src_addr.zip(req.alias_seq) {
+            self.nwk.set_tx_alias(alias_addr, alias_seq);
+        }
         let nwk_result = self
             .nwk
             .nlde_data_request(
@@ -7906,6 +7933,111 @@ mod tests {
         };
         block_on(aps.apsde_data_request(&zdo)).unwrap();
         assert_eq!(aps.nwk().mac().tx_history().len(), 1);
+    }
+
+    #[cfg(feature = "green-power")]
+    fn gp_alias_request(
+        mode: ApsAddressMode,
+        address: ApsAddress,
+        tx_options: ApsTxOptions,
+    ) -> ApsdeDataRequest<'static> {
+        ApsdeDataRequest {
+            dst_addr_mode: mode,
+            dst_address: address,
+            dst_endpoint: 242,
+            profile_id: 0xA1E0,
+            cluster_id: 0x0021,
+            src_endpoint: 242,
+            payload: &[0x19, 0x01, 0x00, 0x08, 0x00],
+            tx_options,
+            radius: 0,
+            alias_src_addr: Some(ShortAddress(0x5AA5)),
+            alias_seq: Some(0x37),
+        }
+    }
+
+    /// GP 1.1 A.3.6.3.3: a GP Notification tunnelled with an alias carries
+    /// the alias as NWK source address and sequence number, while this
+    /// device's NIB address and sequence counter are left untouched and the
+    /// alias is consumed by that one frame.
+    #[test]
+    #[cfg(all(feature = "router", feature = "green-power"))]
+    fn gp_alias_replaces_nwk_source_and_sequence_for_one_frame() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        aps.nwk_mut().nib_mut().sequence_number = 0x10;
+        let request = gp_alias_request(
+            ApsAddressMode::Group,
+            ApsAddress::Group(0x0B84),
+            ApsTxOptions {
+                use_nwk_key: true,
+                ..ApsTxOptions::default()
+            },
+        );
+        let aps_counter_before = aps.aps_counter;
+        let confirm = block_on(aps.apsde_data_request(&request)).unwrap();
+        let frame = aps.nwk().mac().tx_history()[0].payload.as_slice();
+        assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), 0x5AA5);
+        assert_eq!(frame[7], 0x37);
+        assert_eq!(aps.nwk().nib().network_address, LOCAL_SHORT);
+        assert_eq!(aps.nwk().nib().sequence_number, 0x10);
+        // GP 1.1.2 A.3.6.3.3.2: the APS counter equals the alias sequence
+        // number and this device's own APS counter is not consumed.
+        assert_eq!(confirm.aps_counter, 0x37);
+        assert_eq!(aps.aps_counter, aps_counter_before);
+
+        // The next ordinary frame uses this device's own identity again.
+        let mut plain = gp_alias_request(
+            ApsAddressMode::Group,
+            ApsAddress::Group(0x0B84),
+            ApsTxOptions {
+                use_nwk_key: true,
+                ..ApsTxOptions::default()
+            },
+        );
+        plain.alias_src_addr = None;
+        plain.alias_seq = None;
+        let plain_confirm = block_on(aps.apsde_data_request(&plain)).unwrap();
+        assert_eq!(plain_confirm.aps_counter, aps_counter_before);
+        let frame = aps.nwk().mac().tx_history()[1].payload.as_slice();
+        assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), LOCAL_SHORT.0);
+        assert_eq!(frame[7], 0x10);
+        assert_eq!(aps.nwk().nib().sequence_number, 0x11);
+    }
+
+    /// An alias may not be combined with APS ACK, APS security or a missing
+    /// alias sequence: those would bind the frame to an identity the alias
+    /// does not own.
+    #[test]
+    #[cfg(all(feature = "router", feature = "green-power"))]
+    fn gp_alias_rejects_ack_security_and_partial_alias() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        let unicast = (
+            ApsAddressMode::Short,
+            ApsAddress::Short(ShortAddress(0x0000)),
+        );
+        for options in [
+            ApsTxOptions {
+                ack_request: true,
+                ..ApsTxOptions::default()
+            },
+            ApsTxOptions {
+                security_enabled: true,
+                ..ApsTxOptions::default()
+            },
+        ] {
+            let request = gp_alias_request(unicast.0, unicast.1, options);
+            assert_eq!(
+                block_on(aps.apsde_data_request(&request)).unwrap_err(),
+                ApsStatus::IllegalRequest
+            );
+        }
+        let mut partial = gp_alias_request(unicast.0, unicast.1, ApsTxOptions::default());
+        partial.alias_seq = None;
+        assert_eq!(
+            block_on(aps.apsde_data_request(&partial)).unwrap_err(),
+            ApsStatus::IllegalRequest
+        );
+        assert!(aps.nwk().mac().tx_history().is_empty());
     }
 
     /// Split a secured APS frame into (header bytes, security header,

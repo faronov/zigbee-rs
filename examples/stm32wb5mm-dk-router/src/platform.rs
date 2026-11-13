@@ -196,6 +196,18 @@ impl Diagnostics for LogDiagnostics {
             DiagnosticEvent::SecureRejoinLimitReached { failures } => {
                 log::warn!("[WB] secure rejoin limit reached at {failures}")
             }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableRestored { count } => {
+                log::info!("[WB] {count} GP proxy table entries restored")
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableDiscarded { error } => {
+                log::warn!("[WB] GP proxy table discarded: {error:?}")
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableSaved => log::info!("[WB] GP proxy table saved"),
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableCleared => log::info!("[WB] GP proxy table cleared"),
             DiagnosticEvent::FactoryReset => log::info!("[WB] security journal reset"),
             DiagnosticEvent::Fatal(error) => log::error!("[WB] fatal: {error:?}"),
             _ => {}

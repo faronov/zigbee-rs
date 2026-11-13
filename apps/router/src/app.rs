@@ -942,6 +942,21 @@ enum LeaveCascadeControl {
     Completed { rejoin: bool },
 }
 
+/// Whether a stored GP Proxy Table holds entries or is unreadable (and so
+/// must be rewritten empty). Only a flash failure is an error.
+#[cfg(feature = "green-power")]
+fn stored_gp_proxy_table_needs_clear(
+    store: &mut dyn zigbee_runtime::gp_store::GpProxyStore,
+) -> Result<bool, RouterAppError> {
+    use zigbee_runtime::gp_store::{GpStoreError, PersistentGpProxyTable};
+    let mut snapshot = PersistentGpProxyTable::default();
+    match store.load_into(&mut snapshot) {
+        Ok(loaded) => Ok(loaded && !snapshot.is_empty()),
+        Err(GpStoreError::Hardware) => Err(GpStoreError::Hardware.into()),
+        Err(_) => Ok(true),
+    }
+}
+
 struct RouterCore<'a, M, S, P, R, C, A, K, St, Sv, D, O>
 where
     M: MacDriver,
@@ -952,6 +967,9 @@ where
     node: RouterNode<'a, M, S, P, R>,
     children: C,
     aps_tables: A,
+    /// Product-owned durable Green Power Proxy Table store.
+    #[cfg(feature = "green-power")]
+    gp_store: Option<&'a mut dyn zigbee_runtime::gp_store::GpProxyStore>,
     policy: &'static RouterPolicy,
     parts: RouterParts<St, Sv, D>,
     last_tick_us: u32,
@@ -1022,6 +1040,8 @@ where
             node,
             children,
             aps_tables,
+            #[cfg(feature = "green-power")]
+            gp_store: None,
             policy,
             parts,
             last_tick_us: now,
@@ -1320,6 +1340,106 @@ where
             }
             self.node.complete_binding_persistence().await?;
         }
+        #[cfg(feature = "green-power")]
+        self.persist_gp_proxy_table_if_dirty()?;
+        Ok(())
+    }
+
+    /// Only router and coordinator frontends run the GP proxy; an always-on
+    /// end device never needs a Proxy Table store.
+    #[cfg(feature = "green-power")]
+    const GP_ROLE: bool = !matches!(K::DEVICE_TYPE, DeviceType::EndDevice);
+
+    /// Attach the product-owned durable Proxy Table store.
+    #[cfg(feature = "green-power")]
+    fn set_gp_store(&mut self, store: &'a mut dyn zigbee_runtime::gp_store::GpProxyStore) {
+        self.gp_store = Some(store);
+    }
+
+    // Out of line: the Proxy Table snapshot frame must not stack on top of
+    // the APS/child journal frames of the caller (TLSR/BL702 chain budgets).
+    #[cfg(feature = "green-power")]
+    #[inline(never)]
+    fn restore_gp_proxy_table(&mut self) -> Result<(), RouterAppError> {
+        if !Self::GP_ROLE {
+            return Ok(());
+        }
+        use zigbee_runtime::gp_store::GpStoreError;
+        let Some(store) = self.gp_store.as_deref_mut() else {
+            return Err(RouterAppError::GreenPowerStoreMissing);
+        };
+        let event = match self.node.device_mut().restore_gp_proxy_table(store) {
+            Ok(count) => DiagnosticEvent::GpProxyTableRestored { count },
+            Err(
+                error @ (GpStoreError::Corrupt | GpStoreError::ForeignNetwork | GpStoreError::Full),
+            ) => {
+                self.node
+                    .device_mut()
+                    .clear_persisted_gp_proxy_table(store)?;
+                DiagnosticEvent::GpProxyTableDiscarded { error }
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.parts.diagnostics.record(event);
+        Ok(())
+    }
+
+    // Out of line: the Proxy Table snapshot frame must not stack on top of
+    // the APS/child journal frames of the caller (TLSR/BL702 chain budgets).
+    #[cfg(feature = "green-power")]
+    #[inline(never)]
+    fn persist_gp_proxy_table_if_dirty(&mut self) -> Result<(), RouterAppError> {
+        if !Self::GP_ROLE {
+            return Ok(());
+        }
+        let store = self.gp_store.as_deref_mut();
+        let Some(store) = store else {
+            return Err(RouterAppError::GreenPowerStoreMissing);
+        };
+        if self.node.device_mut().save_gp_proxy_table_if_dirty(store)? {
+            self.parts
+                .diagnostics
+                .record(DiagnosticEvent::GpProxyTableSaved);
+        }
+        Ok(())
+    }
+
+    /// Clear the live and durable Proxy Table (leave, factory reset, or a
+    /// failed commissioning). An already empty table is not rewritten.
+    #[cfg(feature = "green-power")]
+    fn clear_gp_proxy_table(&mut self) -> Result<(), RouterAppError> {
+        if !Self::GP_ROLE {
+            return Ok(());
+        }
+        let live_empty = self.node.device().gp_proxy().entries().is_empty();
+        let Some(store) = self.gp_store.as_deref_mut() else {
+            return Err(RouterAppError::GreenPowerStoreMissing);
+        };
+        if live_empty && !stored_gp_proxy_table_needs_clear(store)? {
+            return Ok(());
+        }
+        self.node
+            .device_mut()
+            .clear_persisted_gp_proxy_table(store)?;
+        self.parts
+            .diagnostics
+            .record(DiagnosticEvent::GpProxyTableCleared);
+        Ok(())
+    }
+
+    /// Before fresh steering or formation: drop a stored Proxy Table that
+    /// cannot belong to the network about to be joined.
+    #[cfg(feature = "green-power")]
+    fn clear_stale_gp_proxy_table_before_fresh(&mut self) -> Result<(), RouterAppError> {
+        if !Self::GP_ROLE {
+            return Ok(());
+        }
+        let Some(store) = self.gp_store.as_deref_mut() else {
+            return Err(RouterAppError::GreenPowerStoreMissing);
+        };
+        if stored_gp_proxy_table_needs_clear(store)? {
+            self.clear_gp_proxy_table()?;
+        }
         Ok(())
     }
 
@@ -1338,6 +1458,8 @@ where
                 .diagnostics
                 .record(DiagnosticEvent::ApsTablesCleared);
         }
+        #[cfg(feature = "green-power")]
+        self.clear_gp_proxy_table()?;
         Ok(())
     }
 
@@ -1356,6 +1478,8 @@ where
                 .diagnostics
                 .record(DiagnosticEvent::ApsTablesCleared);
         }
+        #[cfg(feature = "green-power")]
+        self.clear_stale_gp_proxy_table_before_fresh()?;
         Ok(())
     }
 
@@ -1383,6 +1507,9 @@ where
         self.checkpoint_security()?;
         self.restore_children()?;
         self.restore_aps_tables()?;
+        // After the APS group table: GP restores its GPEP group membership.
+        #[cfg(feature = "green-power")]
+        self.restore_gp_proxy_table()?;
         self.tombstone_retired_core_key_replay_counters()?;
         self.node.reset_remote_reporting();
         self.retry_delay_ms = self.policy.join_retry_initial_ms;
@@ -1909,7 +2036,16 @@ where
             }
         }
 
+        // Tunnel due GP Notifications before blocking on receive, and wake
+        // for the next one (the tunnelling delay is 15-100 ms).
+        #[cfg(feature = "green-power")]
+        await_out_of_line!(self.node.device_mut().gp_poll());
         let timeout_us = self.next_wait_us(false);
+        #[cfg(feature = "green-power")]
+        let timeout_us = match self.node.device_mut().gp_next_wait_us() {
+            Some(gp_wait_us) => timeout_us.min(gp_wait_us),
+            None => timeout_us,
+        };
         if timeout_us != 0 {
             let started_us = self.now_us();
             O::on_before_receive(self.node.device(), timeout_us);
@@ -2352,6 +2488,16 @@ where
         &mut self.core.node
     }
 
+    /// Attach the product-owned durable Green Power Proxy Table store.
+    /// Required before [`Self::run`]/`step` when `green-power` is enabled.
+    #[cfg(feature = "green-power")]
+    pub fn set_green_power_store(
+        &mut self,
+        store: &'a mut dyn zigbee_runtime::gp_store::GpProxyStore,
+    ) {
+        self.core.set_gp_store(store);
+    }
+
     pub const fn children(&self) -> &NoChildren {
         &self.core.children
     }
@@ -2497,6 +2643,16 @@ where
 
     pub fn node_mut(&mut self) -> &mut RouterNode<'a, M, S, P, Router> {
         &mut self.core.node
+    }
+
+    /// Attach the product-owned durable Green Power Proxy Table store.
+    /// Required before [`Self::run`]/`step` when `green-power` is enabled.
+    #[cfg(feature = "green-power")]
+    pub fn set_green_power_store(
+        &mut self,
+        store: &'a mut dyn zigbee_runtime::gp_store::GpProxyStore,
+    ) {
+        self.core.set_gp_store(store);
     }
 
     pub const fn children(&self) -> &PersistentChildren<C> {
@@ -2722,6 +2878,15 @@ where
 
     pub fn node_mut(&mut self) -> &mut RouterNode<'a, M, S, P, Router> {
         self.coordinator.node_mut()
+    }
+
+    /// Attach the product-owned durable Green Power Proxy Table store.
+    #[cfg(feature = "green-power")]
+    pub fn set_green_power_store(
+        &mut self,
+        store: &'a mut dyn zigbee_runtime::gp_store::GpProxyStore,
+    ) {
+        self.coordinator.set_green_power_store(store);
     }
 
     pub fn provision_install_code(
@@ -3225,6 +3390,16 @@ where
         &mut self.core.node
     }
 
+    /// Attach the product-owned durable Green Power Proxy Table store.
+    /// Required before [`Self::run`]/`step` when `green-power` is enabled.
+    #[cfg(feature = "green-power")]
+    pub fn set_green_power_store(
+        &mut self,
+        store: &'a mut dyn zigbee_runtime::gp_store::GpProxyStore,
+    ) {
+        self.core.set_gp_store(store);
+    }
+
     pub const fn children(&self) -> &PersistentChildren<C> {
         &self.core.children
     }
@@ -3424,6 +3599,16 @@ where
 
     pub fn node_mut(&mut self) -> &mut RouterNode<'a, M, S, P, Router> {
         &mut self.core.node
+    }
+
+    /// Attach the product-owned durable Green Power Proxy Table store.
+    /// Required before [`Self::run`]/`step` when `green-power` is enabled.
+    #[cfg(feature = "green-power")]
+    pub fn set_green_power_store(
+        &mut self,
+        store: &'a mut dyn zigbee_runtime::gp_store::GpProxyStore,
+    ) {
+        self.core.set_gp_store(store);
     }
 
     pub const fn children(&self) -> &PersistentChildren<C> {

@@ -66,6 +66,73 @@ use zigbee_zcl::{ClusterDirection, DeviceId};
 
 const LOCAL_IEEE: [u8; 8] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
 const COORDINATOR_IEEE: [u8; 8] = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x00, 0x01];
+/// With `green-power`, every routing frontend requires a durable GP Proxy
+/// Table store: give each test app its own leaked RAM store. Without the
+/// feature the app is returned unchanged.
+trait WithTestGpStore: Sized {
+    fn with_test_gp_store(self) -> Self;
+}
+
+#[cfg(not(feature = "green-power"))]
+impl<T> WithTestGpStore for T {
+    fn with_test_gp_store(self) -> Self {
+        self
+    }
+}
+
+#[cfg(feature = "green-power")]
+fn leaked_gp_store() -> &'static mut zigbee_runtime::gp_store::RamGpProxyStore {
+    Box::leak(Box::new(zigbee_runtime::gp_store::RamGpProxyStore::new()))
+}
+
+#[cfg(feature = "green-power")]
+macro_rules! impl_with_test_gp_store {
+    ($app:ident < $($gen:ident),* > where $($bounds:tt)*) => {
+        impl<'a, $($gen),*> WithTestGpStore for router_app::$app<'a, $($gen),*>
+        where
+            $($bounds)*
+        {
+            fn with_test_gp_store(mut self) -> Self {
+                self.set_green_power_store(leaked_gp_store());
+                self
+            }
+        }
+    };
+}
+
+#[cfg(feature = "green-power")]
+mod gp_test_store_impls {
+    use super::{WithTestGpStore, leaked_gp_store};
+    use router_app::{ApsTableLifecycle, Diagnostics, RouterObserver, StatusSink, Supervisor};
+    use zigbee_mac::{MacDriver, ParentMacDriver};
+    use zigbee_runtime::child_store::ChildTableStore;
+    use zigbee_runtime::profile::ApplicationProfile;
+    use zigbee_runtime::role::{RelayRouter, Router};
+    use zigbee_runtime::security_store::SecurityStateStore;
+
+    impl_with_test_gp_store!(RelayRouterApp<M, S, P, St, Sv, D, O> where
+        M: MacDriver, S: SecurityStateStore, P: ApplicationProfile, St: StatusSink,
+        Sv: Supervisor, D: Diagnostics, O: RouterObserver<M, RelayRouter>,);
+    impl_with_test_gp_store!(ParentRouterApp<M, S, P, C, St, Sv, D, O, A> where
+        M: ParentMacDriver, S: SecurityStateStore, P: ApplicationProfile, C: ChildTableStore,
+        St: StatusSink, Sv: Supervisor, D: Diagnostics, O: RouterObserver<M, Router>,
+        A: ApsTableLifecycle<M, S, P, Router>,);
+    impl_with_test_gp_store!(DistributedRouterApp<M, S, P, C, St, Sv, D, O, A> where
+        M: ParentMacDriver, S: SecurityStateStore, P: ApplicationProfile, C: ChildTableStore,
+        St: StatusSink, Sv: Supervisor, D: Diagnostics, O: RouterObserver<M, Router>,
+        A: ApsTableLifecycle<M, S, P, Router>,);
+    impl_with_test_gp_store!(CoordinatorApp<M, S, P, C, St, Sv, D, O, A> where
+        M: ParentMacDriver, S: SecurityStateStore, P: ApplicationProfile, C: ChildTableStore,
+        St: StatusSink, Sv: Supervisor, D: Diagnostics, O: RouterObserver<M, Router>,
+        A: ApsTableLifecycle<M, S, P, Router>,);
+    #[cfg(feature = "trust-center")]
+    impl_with_test_gp_store!(TrustCenterCoordinatorApp<M, S, P, C, T, St, Sv, D, O, A> where
+        M: ParentMacDriver, S: SecurityStateStore, P: ApplicationProfile, C: ChildTableStore,
+        T: zigbee_runtime::trust_center_store::TrustCenterDeviceStore, St: StatusSink,
+        Sv: Supervisor, D: Diagnostics, O: RouterObserver<M, Router>,
+        A: ApsTableLifecycle<M, S, P, Router>,);
+}
+
 const EXTENDED_PAN_ID: [u8; 8] = [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE];
 const PAN_ID: u16 = 0x1A62;
 const SHORT_ADDRESS: u16 = 0x3344;
@@ -1112,7 +1179,8 @@ fn assert_bind_store_failure_recovers_after_reboot(aps_secured: bool) {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     block_on(app.initialize()).unwrap();
     let mac = app.node_mut().device_mut().mac_mut();
     mac.clear_tx_history();
@@ -1146,7 +1214,8 @@ fn assert_bind_store_failure_recovers_after_reboot(aps_secured: bool) {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     block_on(reboot.initialize()).unwrap();
     let mac = reboot.node_mut().device_mut().mac_mut();
     mac.clear_tx_history();
@@ -1208,7 +1277,8 @@ fn failed_initial_aps_restore_blocks_step_and_can_be_retried() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     assert!(matches!(
         block_on(app.initialize()),
         Err(RouterAppError::ApsTables(_))
@@ -1285,7 +1355,8 @@ fn secured_bind_and_unbind_retry_each_durable_boundary_without_reapplying() {
                 &POLICY,
                 RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
             )
-            .unwrap();
+            .unwrap()
+            .with_test_gp_store();
             block_on(app.initialize()).unwrap();
             let mac = app.node_mut().device_mut().mac_mut();
             mac.clear_tx_history();
@@ -1416,7 +1487,8 @@ fn binding_ack_transport_failure_retains_ack_and_prepared_response() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     block_on(app.initialize()).unwrap();
     let mac = app.node_mut().device_mut().mac_mut();
     mac.clear_tx_history();
@@ -1753,7 +1825,8 @@ fn relay_is_zero_child_forwarding_frontend_with_bounded_receive_and_static_obser
     let mut app = RelayRouterApp::<_, _, _, _, _, _, RelayMetricsObserver>::new_observed(
         node, NoChildren, &POLICY, parts,
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     assert!(matches!(
         block_on(app.step()),
@@ -1954,7 +2027,8 @@ fn parent_frontend_rejects_coordinator_persistence_without_consuming_counters() 
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     assert_eq!(
         block_on(app.initialize()),
@@ -1986,7 +2060,8 @@ fn distributed_frontend_fails_closed_without_a_provisioned_global_key() {
             RecordingDiagnostics::default(),
         ),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
 
@@ -2020,7 +2095,8 @@ fn distributed_frontend_forms_and_persists_a_router_owned_pan() {
             RecordingDiagnostics::default(),
         ),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
 
@@ -2061,7 +2137,8 @@ fn distributed_pending_join_action_cannot_fall_back_to_network_steering() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert!(!app.node().device().is_joined());
@@ -2099,7 +2176,9 @@ fn failed_fresh_commissioning_retries_with_bounded_exponential_delay() {
         TestSupervisor::default(),
         RecordingDiagnostics::default(),
     );
-    let mut app = RelayRouterApp::new(node, NoChildren, &FAST_RETRY_POLICY, parts).unwrap();
+    let mut app = RelayRouterApp::new(node, NoChildren, &FAST_RETRY_POLICY, parts)
+        .unwrap()
+        .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert!(!app.node().device().is_joined());
@@ -2163,7 +2242,8 @@ fn basic_reset_preserves_parent_network_and_child_state() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert!(app.node().device().is_joined());
@@ -2217,7 +2297,8 @@ fn urgent_parent_reset_preempts_due_retry_and_clears_journals_before_steering() 
         &FAST_RETRY_POLICY,
         parts,
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert!(!app.node().device().is_joined());
@@ -2318,7 +2399,8 @@ fn parent_restores_children_before_receive_and_does_not_rewrite_clean_table() {
         &POLICY,
         parts,
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert_eq!(&*PARENT_ORDER.lock().unwrap(), &["restore"]);
@@ -2348,7 +2430,8 @@ fn parent_persists_only_when_dirty_and_clears_children_before_recommission() {
         &POLICY,
         parts,
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert_eq!(app.children().store().loads, 1);
@@ -2416,7 +2499,8 @@ fn parent_resumes_and_completes_a_durable_remove_device_transaction() {
             RecordingDiagnostics::default(),
         ),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert_eq!(
@@ -2499,7 +2583,8 @@ fn secured_remove_device_store_failure_reboots_before_ack_or_child_leave() {
             &POLICY,
             RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
         )
-        .unwrap();
+        .unwrap()
+        .with_test_gp_store();
         block_on(app.initialize()).unwrap();
         app.node_mut().device_mut().mac_mut().clear_tx_history();
         let mac = app.node_mut().device_mut().mac_mut();
@@ -2542,7 +2627,8 @@ fn secured_remove_device_store_failure_reboots_before_ack_or_child_leave() {
             &POLICY,
             RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
         )
-        .unwrap();
+        .unwrap()
+        .with_test_gp_store();
         block_on(app.initialize()).unwrap();
         app.node_mut().device_mut().mac_mut().clear_tx_history();
         let mac = app.node_mut().device_mut().mac_mut();
@@ -2618,7 +2704,8 @@ fn secured_remove_device_replay_failure_blocks_ack_and_child_leave_until_retry()
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let mac = app.node_mut().device_mut().mac_mut();
@@ -2689,7 +2776,8 @@ fn child_reassignment_store_failure_reboots_without_releasing_response() {
             &POLICY,
             RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
         )
-        .unwrap();
+        .unwrap()
+        .with_test_gp_store();
 
         block_on(app.initialize()).unwrap();
         child_store.fail_next_store();
@@ -2732,7 +2820,8 @@ fn child_reassignment_store_failure_reboots_without_releasing_response() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(rebooted.initialize()).unwrap();
     let mac = rebooted.node_mut().device_mut().mac_mut();
@@ -2786,7 +2875,8 @@ fn secured_reassignment_response_follows_durable_intent_with_a_ram_replay_floor(
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let conflict = || McpsDataIndication {
@@ -2861,7 +2951,8 @@ fn sleepy_child_reassignment_commits_only_after_poll_delivery() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let mac = app.node_mut().device_mut().mac_mut();
@@ -2972,7 +3063,8 @@ fn remove_device_cancels_a_sleepy_child_reassignment_response() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let mac = app.node_mut().device_mut().mac_mut();
@@ -3062,7 +3154,8 @@ fn child_departure_store_failure_reboots_without_device_left_notification() {
             &POLICY,
             RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
         )
-        .unwrap();
+        .unwrap()
+        .with_test_gp_store();
 
         block_on(app.initialize()).unwrap();
         child_store.fail_next_store();
@@ -3101,7 +3194,8 @@ fn child_departure_store_failure_reboots_without_device_left_notification() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(rebooted.initialize()).unwrap();
     let mac = rebooted.node_mut().device_mut().mac_mut();
@@ -3170,7 +3264,8 @@ fn child_departure_releases_device_left_without_a_nwk_replay_write() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let mac = app.node_mut().device_mut().mac_mut();
@@ -3237,7 +3332,8 @@ fn remove_children_cascade_store_failure_reboots_before_child_or_parent_action()
             &POLICY,
             RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
         )
-        .unwrap();
+        .unwrap()
+        .with_test_gp_store();
 
         block_on(app.initialize()).unwrap();
         child_store.fail_next_store();
@@ -3278,7 +3374,8 @@ fn remove_children_cascade_store_failure_reboots_before_child_or_parent_action()
             RecordingDiagnostics::default(),
         ),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(rebooted.initialize()).unwrap();
     let mac = rebooted.node_mut().device_mut().mac_mut();
@@ -3358,7 +3455,8 @@ fn remove_children_cascade_acts_after_durable_intent_without_a_nwk_replay_write(
             RecordingDiagnostics::default(),
         ),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let mac = app.node_mut().device_mut().mac_mut();
@@ -3430,7 +3528,8 @@ fn remove_children_cascade_waits_for_two_sleepy_children_and_device_left_submiss
             RecordingDiagnostics::default(),
         ),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let mac = app.node_mut().device_mut().mac_mut();
@@ -3567,7 +3666,8 @@ fn parent_restores_and_clears_durable_aps_tables_with_network_lifecycle() {
             RecordingDiagnostics::default(),
         ),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert_eq!(
@@ -3611,6 +3711,123 @@ fn parent_restores_and_clears_durable_aps_tables_with_network_lifecycle() {
             .iter()
             .any(|event| matches!(event, DiagnosticEvent::ApsTablesCleared))
     );
+}
+
+/// GP Proxy Basic lifecycle: the router frontend refuses to start without a
+/// durable Proxy Table store, restores a stored table (and its GPEP group)
+/// after the APS tables, and wipes it on factory reset.
+#[cfg(feature = "green-power")]
+#[test]
+fn parent_restores_and_clears_durable_gp_proxy_table_with_network_lifecycle() {
+    use zigbee_gp::proxy::{ProxyEntry, SinkGroup};
+    use zigbee_gp::types::{GpdId, KeyType, SecurityLevel};
+    use zigbee_runtime::gp_store::{GpProxyStore, PersistentGpProxyTable, RamGpProxyStore};
+
+    const GP_GROUP: u16 = 0x0B84;
+    const GPEP: u8 = 242;
+
+    // No store: an explicit error, never a silently non-durable proxy.
+    {
+        let mut profile = profile();
+        let mut device = parent_device(&mut profile);
+        let mut security = security_store(false);
+        let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+        let mut app = ParentRouterApp::new_with_aps_tables(
+            node,
+            PersistentChildren::new(CountingChildStore::default()),
+            PersistentApsTables::new(RamApsTableStore::new()),
+            &POLICY,
+            RouterParts::new(
+                NoStatus,
+                TestSupervisor::default(),
+                RecordingDiagnostics::default(),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            block_on(app.initialize()),
+            Err(RouterAppError::GreenPowerStoreMissing)
+        ));
+    }
+
+    let mut entry = ProxyEntry::new(GpdId::SrcId(0x8765_4321));
+    entry.security_level = SecurityLevel::Encrypted;
+    entry.key_type = KeyType::IndividualKey;
+    entry.key = Some([0x5A; 16]);
+    entry.frame_counter = 7;
+    entry.groupcast_radius = 0xFF;
+    entry
+        .groups
+        .push(SinkGroup {
+            group: GP_GROUP,
+            alias: None,
+        })
+        .unwrap();
+    let mut gp_store = RamGpProxyStore::new();
+    gp_store
+        .store(&PersistentGpProxyTable::capture(EXTENDED_PAN_ID, &[entry]).unwrap())
+        .unwrap();
+
+    let mut profile = profile();
+    let mut device = parent_device(&mut profile);
+    let mut security = security_store(false);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let mut app = ParentRouterApp::new_with_aps_tables(
+        node,
+        PersistentChildren::new(CountingChildStore::default()),
+        PersistentApsTables::new(RamApsTableStore::new()),
+        &POLICY,
+        RouterParts::new(
+            NoStatus,
+            TestSupervisor::default(),
+            RecordingDiagnostics::default(),
+        ),
+    )
+    .unwrap();
+    app.set_green_power_store(&mut gp_store);
+
+    block_on(app.initialize()).unwrap();
+    let proxy_entries = app.node().device().gp_proxy().entries();
+    assert_eq!(proxy_entries.len(), 1);
+    // Skipped ahead by the counter persistence stride on restore.
+    assert_eq!(
+        proxy_entries[0].frame_counter,
+        7 + zigbee_gp::proxy::DEFAULT_COUNTER_PERSIST_STRIDE - 1
+    );
+    assert!(
+        app.node()
+            .device()
+            .bdb()
+            .zdo()
+            .aps()
+            .group_table()
+            .is_member(GP_GROUP, GPEP)
+    );
+    assert!(
+        app.parts()
+            .diagnostics
+            .events
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::GpProxyTableRestored { count: 1 }))
+    );
+
+    app.node_mut()
+        .device_mut()
+        .user_action(UserAction::FactoryReset);
+    let events = block_on(app.step()).unwrap();
+    assert!(matches!(events.tick, Some(StackEvent::Left)));
+    assert!(app.node().device().gp_proxy().entries().is_empty());
+    assert!(
+        app.parts()
+            .diagnostics
+            .events
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::GpProxyTableCleared))
+    );
+    drop(app);
+    let mut reloaded = PersistentGpProxyTable::default();
+    assert!(gp_store.load_into(&mut reloaded).unwrap());
+    assert!(reloaded.is_empty());
 }
 
 /// Range extender plus a Groups server: the minimal endpoint on which a
@@ -3726,7 +3943,8 @@ fn received_groups_commands_persist_the_aps_group_table() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     block_on(app.initialize()).unwrap();
     block_on(app.step()).unwrap();
     let initial = app.aps_tables_mut().store_mut().load().unwrap();
@@ -3815,7 +4033,8 @@ fn application_transport_key_is_persisted_before_replay_commit_and_ack() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let mac = app.node_mut().device_mut().mac_mut();
@@ -3891,7 +4110,8 @@ fn application_transport_key_retries_after_reboot_before_aps_table_commit() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let mac = app.node_mut().device_mut().mac_mut();
@@ -3927,7 +4147,8 @@ fn application_transport_key_retries_after_reboot_before_aps_table_commit() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(rebooted.initialize()).unwrap();
     let mac = rebooted.node_mut().device_mut().mac_mut();
@@ -3980,7 +4201,8 @@ fn application_transport_key_retries_after_reboot_before_replay_commit() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let mac = app.node_mut().device_mut().mac_mut();
@@ -4017,7 +4239,8 @@ fn application_transport_key_retries_after_reboot_before_replay_commit() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(rebooted.initialize()).unwrap();
     let restored_snapshot = rebooted
@@ -4121,7 +4344,8 @@ fn application_key_replacement_tombstone_failure_retries_after_reboot() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     block_on(app.initialize()).unwrap();
     app.node_mut().device_mut().mac_mut().set_rx_delay_us(0);
     app.node_mut()
@@ -4179,7 +4403,8 @@ fn application_key_replacement_tombstone_failure_retries_after_reboot() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(rebooted.initialize()).unwrap();
     let retained = replay_counters(rebooted.node_mut().device_and_security_store_mut().1);
@@ -4226,7 +4451,8 @@ fn deferred_parent_reset_preserves_journals_until_the_caller_commits() {
         &POLICY,
         parts,
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     app.node_mut()
@@ -4273,7 +4499,8 @@ fn runtime_run_again_shortens_the_next_monotonic_receive_window() {
         &RUN_AGAIN_POLICY,
         parts,
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     app.node_mut()
@@ -4335,7 +4562,8 @@ fn coordinator_frontend_forms_then_restarts_the_same_persisted_pan() {
             &POLICY,
             parts,
         )
-        .unwrap();
+        .unwrap()
+        .with_test_gp_store();
 
         block_on(app.initialize()).unwrap();
         assert_eq!(app.node().device().device_type(), DeviceType::Coordinator);
@@ -4374,7 +4602,8 @@ fn coordinator_frontend_forms_then_restarts_the_same_persisted_pan() {
             &POLICY,
             parts,
         )
-        .unwrap();
+        .unwrap()
+        .with_test_gp_store();
 
         block_on(app.initialize()).unwrap();
         assert_eq!(app.node().device().short_address(), 0x0000);
@@ -4409,7 +4638,8 @@ fn trust_center_factory_reset_is_cross_journal_crash_safe() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert!(app.node().device().is_joined());
@@ -4472,7 +4702,8 @@ fn trust_center_replay_floor_is_reapplied_after_restoring_device_keys() {
             &POLICY,
             RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
         )
-        .unwrap();
+        .unwrap()
+        .with_test_gp_store();
         block_on(app.initialize()).unwrap();
         app.provision_trust_center_link_key(CHILD_IEEE, CHILD_KEY)
             .unwrap();
@@ -4541,7 +4772,8 @@ fn trust_center_replay_floor_is_reapplied_after_restoring_device_keys() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     assert!(block_on(rebooted.initialize()).is_err());
     assert!(!rebooted.trust_center().is_initialized());
     let request_key = [ApsCommandId::RequestKey as u8, 0x04];
@@ -4659,7 +4891,8 @@ fn trust_center_local_device_left_store_failure_requeues_before_child_cleanup() 
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     app.provision_trust_center_link_key(CHILD_IEEE, CHILD_KEY)
@@ -4756,7 +4989,8 @@ fn trust_center_device_left_replay_failure_retries_ack_after_tc_commit() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     app.provision_trust_center_link_key(PARENT_IEEE, PARENT_KEY)
@@ -4843,7 +5077,8 @@ fn trust_center_app_handles_repeated_device_left_and_denied_unknown_secured_rejo
             &POLICY,
             RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
         )
-        .unwrap();
+        .unwrap()
+        .with_test_gp_store();
         block_on(app.initialize()).unwrap();
         app.provision_trust_center_link_key(PARENT, PARENT_KEY)
             .unwrap();
@@ -4870,7 +5105,8 @@ fn trust_center_app_handles_repeated_device_left_and_denied_unknown_secured_rejo
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     block_on(app.initialize()).unwrap();
     app.node_mut().device_mut().mac_mut().clear_tx_history();
     for (index, status) in [
@@ -4947,7 +5183,8 @@ fn remote_device_announce_closes_initial_key_intent_through_the_receive_path() {
             &POLICY,
             RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
         )
-        .unwrap();
+        .unwrap()
+        .with_test_gp_store();
         block_on(app.initialize()).unwrap();
         app.provision_trust_center_link_key(PARENT, [0x5A; 16])
             .unwrap();
@@ -4977,7 +5214,8 @@ fn remote_device_announce_closes_initial_key_intent_through_the_receive_path() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     block_on(app.initialize()).unwrap();
 
     for (index, announced_short) in [PARENT_SHORT, CHILD_SHORT].into_iter().enumerate() {
@@ -5067,7 +5305,8 @@ fn trust_center_local_device_left_cleanup_store_failure_retries_cleanup_only() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     app.provision_trust_center_link_key(CHILD_IEEE, CHILD_KEY)
@@ -5132,7 +5371,8 @@ fn trust_center_app_commits_and_completes_network_key_rotation_in_order() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let old_sequence = app
@@ -5193,7 +5433,8 @@ fn network_key_rotation_retains_previous_key_and_recovers_failed_replacement() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     let old_key = app
@@ -5264,7 +5505,8 @@ fn network_key_rotation_retains_previous_key_and_recovers_failed_replacement() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     block_on(rebooted.initialize()).unwrap();
 
     assert!(rebooted.trust_center().network_key_rotation().is_none());
@@ -5354,7 +5596,8 @@ fn network_key_rotation_retains_previous_key_and_recovers_failed_replacement() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     block_on(recovered.initialize()).unwrap();
     let retained = replay_counters(recovered.node_mut().device_and_security_store_mut().1);
     assert!(!retained.contains(&old_replay));
@@ -5404,7 +5647,8 @@ fn network_key_rotation_rearms_own_sleepy_child_and_honors_profile_window() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     block_on(app.initialize()).unwrap();
     app.node_mut().device_mut().mac_mut().clear_tx_history();
     block_on(app.request_network_key_rotation()).unwrap();
@@ -5441,7 +5685,8 @@ fn network_key_rotation_rearms_own_sleepy_child_and_honors_profile_window() {
         &POLICY,
         RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
     block_on(app.initialize()).unwrap();
     block_on(app.step()).unwrap();
     assert!(
@@ -5544,7 +5789,8 @@ fn repeated_secure_rejoin_failure_resets_and_clears_parent_state() {
         &REJOIN_POLICY,
         parts,
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert!(!app.node().device().is_joined());
@@ -5635,7 +5881,8 @@ fn unlimited_secure_rejoin_backs_off_and_keeps_parent_state() {
         &NEVER_RESET_POLICY,
         parts,
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert!(app.node().device().secure_rejoin_pending());
@@ -5883,6 +6130,7 @@ mod key_power_cuts {
             RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
         )
         .unwrap()
+        .with_test_gp_store()
     }
 
     fn poll_child(app: &mut CutApp<'_>) -> Result<(), RouterAppError> {
@@ -6279,7 +6527,9 @@ fn leave_without_rejoin_stays_factory_new_until_commissioning_is_requested() {
         TestSupervisor::default(),
         RecordingDiagnostics::default(),
     );
-    let mut app = RelayRouterApp::new(node, NoChildren, &FAST_RETRY_POLICY, parts).unwrap();
+    let mut app = RelayRouterApp::new(node, NoChildren, &FAST_RETRY_POLICY, parts)
+        .unwrap()
+        .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     assert!(app.node().device().is_joined());
@@ -6405,7 +6655,9 @@ fn product_requested_reset_still_recommissions_immediately() {
         TestSupervisor::default(),
         RecordingDiagnostics::default(),
     );
-    let mut app = RelayRouterApp::new(node, NoChildren, &FAST_RETRY_POLICY, parts).unwrap();
+    let mut app = RelayRouterApp::new(node, NoChildren, &FAST_RETRY_POLICY, parts)
+        .unwrap()
+        .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     block_on(app.urgent_factory_reset_and_recommission()).unwrap();
@@ -6438,7 +6690,8 @@ fn exhausted_device_annce_backs_off_instead_of_resetting_in_a_tight_loop() {
         &POLICY,
         parts,
     )
-    .unwrap();
+    .unwrap()
+    .with_test_gp_store();
 
     block_on(app.initialize()).unwrap();
     app.node_mut()
@@ -6588,7 +6841,9 @@ fn router_keeps_its_network_when_its_parent_leaves() {
         TestSupervisor::default(),
         RecordingDiagnostics::default(),
     );
-    let mut app = RelayRouterApp::new(node, NoChildren, &RouterPolicy::DEFAULT, parts).unwrap();
+    let mut app = RelayRouterApp::new(node, NoChildren, &RouterPolicy::DEFAULT, parts)
+        .unwrap()
+        .with_test_gp_store();
     block_on(app.initialize()).unwrap();
     assert!(app.node().device().is_joined());
 
@@ -6641,7 +6896,9 @@ fn leave_with_rejoin_keeps_network_state_while_the_rejoin_fails() {
         TestSupervisor::default(),
         RecordingDiagnostics::default(),
     );
-    let mut app = RelayRouterApp::new(node, NoChildren, &PATIENT_REJOIN_POLICY, parts).unwrap();
+    let mut app = RelayRouterApp::new(node, NoChildren, &PATIENT_REJOIN_POLICY, parts)
+        .unwrap()
+        .with_test_gp_store();
     block_on(app.initialize()).unwrap();
 
     let events = deliver(
@@ -6693,7 +6950,9 @@ fn trust_center_leave_without_rejoin_removes_a_router_behind_another_router() {
         TestSupervisor::default(),
         RecordingDiagnostics::default(),
     );
-    let mut app = RelayRouterApp::new(node, NoChildren, &FAST_RETRY_POLICY, parts).unwrap();
+    let mut app = RelayRouterApp::new(node, NoChildren, &FAST_RETRY_POLICY, parts)
+        .unwrap()
+        .with_test_gp_store();
     block_on(app.initialize()).unwrap();
     assert!(app.node().device().is_joined());
 
@@ -6723,7 +6982,9 @@ fn leave_request_from_an_unrelated_router_is_ignored() {
         TestSupervisor::default(),
         RecordingDiagnostics::default(),
     );
-    let mut app = RelayRouterApp::new(node, NoChildren, &RouterPolicy::DEFAULT, parts).unwrap();
+    let mut app = RelayRouterApp::new(node, NoChildren, &RouterPolicy::DEFAULT, parts)
+        .unwrap()
+        .with_test_gp_store();
     block_on(app.initialize()).unwrap();
 
     for rejoin in [false, true] {

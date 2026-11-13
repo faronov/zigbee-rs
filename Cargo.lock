@@ -1062,6 +1062,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpd-app"
+version = "0.1.0"
+dependencies = [
+ "embassy-futures",
+ "embedded-storage",
+ "heapless 0.9.2",
+ "zigbee-crypto",
+ "zigbee-gp",
+ "zigbee-mac",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1557,6 +1569,7 @@ name = "router-app"
 version = "0.1.0"
 dependencies = [
  "zigbee-aps",
+ "zigbee-gp",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-runtime",
@@ -2064,6 +2077,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-gp"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.9.2",
+ "zigbee-crypto",
+ "zigbee-types",
+]
+
+[[package]]
 name = "zigbee-mac"
 version = "0.1.0"
 dependencies = [
@@ -2106,6 +2128,7 @@ dependencies = [
  "log",
  "zigbee-aps",
  "zigbee-bdb",
+ "zigbee-gp",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-types",

@@ -371,6 +371,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-gp"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "zigbee-crypto",
+ "zigbee-types",
+]
+
+[[package]]
 name = "zigbee-mac"
 version = "0.1.0"
 dependencies = [
@@ -400,6 +409,7 @@ dependencies = [
  "log",
  "zigbee-aps",
  "zigbee-bdb",
+ "zigbee-gp",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-types",

@@ -718,13 +718,24 @@ impl RouterObserver<TelinkRouterMac, Router> for TelinkJoinObserver {
 /// see. Temporaries stay on the stack.
 static SECURITY_SLOT: RootSlot<{ size_of::<SecurityStore>() }> = RootSlot::new();
 static PROFILE_SLOT: RootSlot<{ size_of::<RouterProfile>() }> = RootSlot::new();
+#[cfg(feature = "green-power")]
+static GP_STORE_SLOT: RootSlot<{ size_of::<tlsr8258_tb04_product::storage::GpProxyTableStore>() }> =
+    RootSlot::new();
 // The application and its `run()` future have unnameable types, so these two
 // sizes are fixed here and `place` proves at compile time that each slot
 // fits with less than `ROOT_SLOT_SLACK` bytes left over.
 static APP_SLOT: RootSlot<APP_SLOT_BYTES> = RootSlot::new();
 static FUTURE_SLOT: RootSlot<FUTURE_SLOT_BYTES> = RootSlot::new();
+#[cfg(not(feature = "green-power"))]
 const APP_SLOT_BYTES: usize = 2416;
+#[cfg(not(feature = "green-power"))]
 const FUTURE_SLOT_BYTES: usize = 4248;
+// Green Power adds the Proxy Table store reference to the app and the
+// GP receive/forward state to the root future.
+#[cfg(feature = "green-power")]
+const APP_SLOT_BYTES: usize = 2420;
+#[cfg(feature = "green-power")]
+const FUTURE_SLOT_BYTES: usize = 4256;
 const ROOT_SLOT_SLACK: usize = 64;
 
 fn place<T: 'static, const N: usize>(slot: &'static RootSlot<N>, value: T) -> &'static mut T {
@@ -817,8 +828,12 @@ fn init() -> Pin<&'static mut impl Future> {
     // Hardware AES is installed before any key material is touched below.
     let device = build_device(ieee_address, resources.aes, &leds, profile);
 
+    #[cfg(not(feature = "green-power"))]
     let (security_partition, child_partition, aps_partition) =
         tlsr8258_tb04_product::storage::split_flash(resources.flash);
+    #[cfg(feature = "green-power")]
+    let (security_partition, child_partition, aps_partition, gp_partition) =
+        tlsr8258_tb04_product::storage::split_flash_with_gp(resources.flash);
     let security_store = place(
         &SECURITY_SLOT,
         tlsr8258_tb04_product::storage::security_store(security_partition),
@@ -860,6 +875,11 @@ fn init() -> Pin<&'static mut impl Future> {
         // adapters. Constructor failure is therefore still fail-closed.
         Err(_) => halted(),
     };
+    #[cfg(feature = "green-power")]
+    app.set_green_power_store(place(
+        &GP_STORE_SLOT,
+        tlsr8258_tb04_product::storage::gp_proxy_table_store(gp_partition),
+    ));
 
     // The shared parent app now owns commissioning, child restore/persist/
     // clear, bounded receive, tick, rejoin, and retry behavior. The device

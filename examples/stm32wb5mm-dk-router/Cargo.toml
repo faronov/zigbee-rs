@@ -8,12 +8,17 @@ publish = false
 # Zigbee Router on the ST STM32WB5MM-DK. CPU2 must run ST's IEEE 802.15.4
 # MAC firmware (stm32wb5x_Mac_802_15_4_fw.bin) under FUS 1.2.0; see
 # docs/book/src/platform-guides/stm32wb.md.
-#   cargo build --release                        # router + every DK peripheral
-#   cargo build --release --no-default-features  # plain router (buttons, VCOM)
+#   cargo build --release                        # router + GP proxy + every DK peripheral
+#   cargo build --release --no-default-features --features green-power
+#                                                # plain router + GP proxy (buttons, VCOM)
+#   cargo build --release --no-default-features  # plain router without Green Power
 [workspace]
 
 [features]
-default = ["rgb-led", "lcd", "touch", "sensors", "mic"]
+default = ["green-power", "rgb-led", "lcd", "touch", "sensors", "mic"]
+# Green Power Proxy Basic: tunnels GPDFs to the sink and journals the Proxy
+# Table at 0x080CF000.
+green-power = ["router-app/green-power", "stm32wb5mm-dk-router-product/green-power"]
 # Lifecycle colours on the TLC59731 RGB LED.
 rgb-led = ["stm32wb5mm-dk/rgb-led"]
 # Network/traffic/sensor pages on the 128x64 SSD1315 OLED.

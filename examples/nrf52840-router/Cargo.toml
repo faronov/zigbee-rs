@@ -9,6 +9,8 @@ autobins = false
 # unification never links router code into the End Device image:
 #   cargo build --release                                       # ed (default)
 #   cargo build --release --no-default-features --features router
+# `router` includes the Green Power proxy; `--features router-core` builds
+# the router without it.
 [[bin]]
 name = "nrf52840-ed"
 path = "src/main.rs"
@@ -17,7 +19,7 @@ required-features = ["ed"]
 [[bin]]
 name = "nrf52840-router"
 path = "src/router.rs"
-required-features = ["router"]
+required-features = ["router-core"]
 
 [features]
 default = ["ed"]
@@ -26,13 +28,23 @@ default = ["ed"]
 ed = []
 # Router: parent MAC over the interrupt-driven PHY (Imm-Ack from the RADIO
 # ISR, Frame Pending from a HAL source-match table), ParentRouterApp,
-# durable child and APS tables, text log on VCOM.
-router = [
+# durable child and APS tables, text log on VCOM, plus the Green Power
+# proxy (`green-power`).
+router = ["router-core", "green-power"]
+# The router without Green Power.
+router-core = [
     "zigbee-mac/nrf-isr-phy",
     "dep:static_cell",
     "dep:embassy-sync",
     "router-app/router",
     "zigbee-runtime/router",
+]
+# Green Power Proxy Basic: tunnels GPDFs to the sink and journals the Proxy
+# Table at 0xF8000. Part of `router`.
+green-power = [
+    "router-core",
+    "router-app/green-power",
+    "nrf52840-router-product/green-power",
 ]
 
 [dependencies]

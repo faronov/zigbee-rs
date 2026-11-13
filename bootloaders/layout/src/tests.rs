@@ -381,7 +381,7 @@ fn committed_layouts_are_valid() {
         (
             "products/ha-connect-zbt1/boot/zbt1.layout",
             EFR32S2,
-            473_856,
+            465_664,
         ),
         ("products/pb03f-kit/boot/pb03f.layout", CM0, 200_448),
     ];

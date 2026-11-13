@@ -5,9 +5,10 @@
 //! takes its Frame Pending bit from a bounded source table the core arms,
 //! so the core's software pending set is empty) under
 //! [`router_app::ParentRouterApp`]: beacons, association, indirect TX to
-//! sleepy children, routing, durable child and APS tables. Status goes to
-//! the console and the WS2812 on GPIO8; BOOT (GPIO9)
-//! re-arms commissioning after a Leave.
+//! sleepy children, routing, durable child and APS tables, and a GP Proxy
+//! Basic with a durable Proxy Table (`router-core` builds without it). Status goes
+//! to the console and the WS2812 on GPIO8; BOOT (GPIO9) re-arms
+//! commissioning after a Leave.
 //!
 //! No OTA client: this image is installed over the serial/JTAG link into
 //! `ota_0`. The router never enters light sleep (`macRxOnWhenIdle`).
@@ -157,6 +158,13 @@ fn compose(
         log::error!("[ESP32-H2] invalid composition: {:?}", error);
         halt()
     });
+    #[cfg(feature = "green-power")]
+    let app = {
+        static GP_STORE: StaticCell<product::router::GpProxyTableStore> = StaticCell::new();
+        let mut app = app;
+        app.set_green_power_store(GP_STORE.init(product::router::gp_proxy_table_store()));
+        app
+    };
     APP.init(app)
 }
 
@@ -186,6 +194,17 @@ fn log_summary(app: &App) {
             neighbor.relationship,
             neighbor.rx_on_when_idle,
             neighbor.lqi
+        );
+    }
+    #[cfg(feature = "green-power")]
+    {
+        let proxy = app.node().device().gp_proxy();
+        let stats = proxy.forward_stats();
+        log::info!(
+            "[ESP32-H2] GP proxy entries {} | forwards sent {} cancelled {} (other proxy first)",
+            proxy.entries().len(),
+            stats.sent,
+            stats.cancelled
         );
     }
 }

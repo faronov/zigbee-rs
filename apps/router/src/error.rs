@@ -34,6 +34,13 @@ pub enum RouterAppError {
     ApsTables(ApsTableStoreError),
     Binding(BindingPersistenceError),
     ChildStore(ChildStoreError),
+    /// Green Power Proxy Table persistence failed.
+    #[cfg(feature = "green-power")]
+    GreenPower(zigbee_runtime::gp_store::GpStoreError),
+    /// `green-power` is enabled but the product gave no Proxy Table store;
+    /// GP 1.1 requires the Proxy Table to survive a reboot.
+    #[cfg(feature = "green-power")]
+    GreenPowerStoreMissing,
     #[cfg(feature = "trust-center")]
     TrustCenter(TrustCenterRuntimeError),
     Mac(MacError),
@@ -42,6 +49,13 @@ pub enum RouterAppError {
 impl From<NodeError> for RouterAppError {
     fn from(error: NodeError) -> Self {
         Self::Node(error)
+    }
+}
+
+#[cfg(feature = "green-power")]
+impl From<zigbee_runtime::gp_store::GpStoreError> for RouterAppError {
+    fn from(error: zigbee_runtime::gp_store::GpStoreError) -> Self {
+        Self::GreenPower(error)
     }
 }
 

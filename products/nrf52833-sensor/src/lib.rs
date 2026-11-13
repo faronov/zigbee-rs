@@ -16,7 +16,8 @@
 //! |-|------------------|------------------|
 //! | Flash | 1 MiB | 512 KiB |
 //! | RAM | 256 KiB | 128 KiB |
-//! | Application flash | 1016 KiB | 488 KiB |
+//! | Application flash | 1016 KiB | 480 KiB |
+//! | Router GP Proxy Table journal | — | `0x0007_8000..0x0007_A000` |
 //! | Router child/APS journals | — | `0x0007_A000..0x0007_E000` |
 //! | Security journal | `0x000F_E000` | `0x0007_E000` |
 //! | Model string | `nRF52840-Sensor` | `nRF52833-Sensor` |

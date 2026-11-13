@@ -11,6 +11,11 @@ publish = false
 # repository's root workspace membership.
 [workspace]
 
+[features]
+# Green Power Proxy Basic: the router's GP Proxy Table journal
+# (`router::gp_proxy_table_store`). The window is reserved in every image.
+green-power = ["router-app/green-power", "zigbee-runtime/green-power"]
+
 [dependencies]
 router-app = { path = "../../apps/router" }
 zigbee-aps = { path = "../../zigbee-aps" }

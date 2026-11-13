@@ -413,6 +413,10 @@ impl<M: MacDriver> NwkLayer<M> {
         discover_route: bool,
         kind: crate::IndirectFrameKind,
     ) -> Result<NldeDataConfirm, NwkStatus> {
+        // Consume the one-shot alias first so it can never leak into a later
+        // frame, whatever path this request takes.
+        #[cfg(feature = "green-power")]
+        let alias = self.tx_alias.take();
         #[cfg(not(feature = "router"))]
         let _ = kind;
         if !self.joined {
@@ -527,7 +531,13 @@ impl<M: MacDriver> NwkLayer<M> {
                 self.routing.clear_route_record_required(dst_addr);
             }
         }
+        #[cfg(not(feature = "green-power"))]
         let seq = self.nib.next_seq();
+        #[cfg(feature = "green-power")]
+        let seq = match alias {
+            Some((_, alias_seq)) => alias_seq,
+            None => self.nib.next_seq(),
+        };
 
         // Build NWK header
         // Note: multicast flag is ONLY for group-addressed frames (via APS group delivery).
@@ -561,7 +571,10 @@ impl<M: MacDriver> NwkLayer<M> {
                 end_device_initiator: false, // Maximise compatibility with older stacks
             },
             dst_addr,
+            #[cfg(not(feature = "green-power"))]
             src_addr: self.nib.network_address,
+            #[cfg(feature = "green-power")]
+            src_addr: alias.map_or(self.nib.network_address, |(alias_addr, _)| alias_addr),
             radius,
             seq_number: seq,
             dst_ieee: None,
@@ -627,6 +640,18 @@ impl<M: MacDriver> NwkLayer<M> {
         // acknowledgement by its router neighbours, like a relayed one.
         #[cfg(feature = "router")]
         if mac_result.is_ok() && next_hop == ShortAddress::BROADCAST && self.can_route() {
+            // An alias source (GP 1.1 A.3.6.3.3) escapes the own-source
+            // receive filter. Recording the transaction makes a neighbour's
+            // relay of it a BTT duplicate, i.e. its passive acknowledgement,
+            // instead of a new broadcast we would deliver and relay again.
+            #[cfg(feature = "green-power")]
+            if alias.is_some() && !self.btr.record(header.src_addr, seq) {
+                log::debug!(
+                    "[NWK] BTT full: alias 0x{:04X} seq={} not recorded",
+                    header.src_addr.0,
+                    seq
+                );
+            }
             self.track_broadcast(header.src_addr, seq, &nwk_buf[..total_len], header.radius);
         }
 
@@ -7177,6 +7202,49 @@ mod tests {
         pass_time(&mut router, 500_001);
         block_on(router.process_pending_routing());
         assert_eq!(router.mac.tx_history().len(), 3);
+    }
+
+    /// GP 1.1 A.3.6.3.3: a broadcast sent under a Green Power alias carries
+    /// the GPD's alias address, so the own-source filter cannot recognise a
+    /// neighbour's relay of it. The originating router records the alias
+    /// transaction in its BTT, so that relay is a duplicate and the passive
+    /// acknowledgement of our forward (R22 §3.6.5): it is neither delivered,
+    /// relayed again nor answered with a retransmission.
+    #[test]
+    #[cfg(all(feature = "router", feature = "green-power"))]
+    fn a_neighbours_relay_of_an_alias_broadcast_is_its_passive_ack() {
+        const ALIAS: ShortAddress = ShortAddress(0x9879);
+        let mut router = node(DeviceType::Router, OUR_ADDR);
+        neighbour_with_cost(&mut router, PEER, 1);
+        router.set_tx_alias(ALIAS, 0x6E);
+        block_on(router.nlde_data_request(
+            ShortAddress::BROADCAST_RX_ON_WHEN_IDLE,
+            30,
+            &[0x01],
+            false,
+            false,
+        ))
+        .expect("alias broadcast sent");
+        assert_eq!(router.mac.tx_history().len(), 1);
+        assert!(router.btr.is_duplicate(ALIAS, 0x6E));
+
+        let own = recorded_frame(&router, 0);
+        let (mut header, consumed) = NwkHeader::parse(&own).unwrap();
+        assert_eq!((header.src_addr, header.seq_number), (ALIAS, 0x6E));
+        header.radius -= 1;
+        let mut buf = [0u8; 128];
+        let len = encode(&header, &own[consumed..], &mut buf);
+        assert!(
+            block_on(router.process_incoming_nwk_frame_from(&buf[..len], 200, Some(PEER)))
+                .is_none(),
+            "our own forward is not delivered back to the GP proxy"
+        );
+        drain_scheduled_broadcasts(&mut router);
+        assert_eq!(
+            router.mac.tx_history().len(),
+            1,
+            "PEER relayed it: no echo relay and no retransmission"
+        );
     }
 
     // ── Route Reply correlation (R22 §3.6.3.5) ───────────────

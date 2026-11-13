@@ -9,6 +9,10 @@ router bin always shows status on it (`status-led` is part of the
 `router` feature); the ED takes `--features ed,status-led`; see the ESP32
 platform guide.
 
+The `router` feature also enables the Green Power Proxy Basic (default-on
+for every router; see the Green Power chapter); `router-core` builds the
+router without it.
+
 ## Architecture
 
 ```text

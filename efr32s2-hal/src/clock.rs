@@ -15,6 +15,17 @@ const CMU_SYSCLKCTRL: u32 = CMU_BASE + 0x070;
 const CMU_CLKEN0: u32 = CMU_BASE + 0x064;
 #[cfg(feature = "efr32mg22")]
 const CMU_CLKEN1: u32 = CMU_BASE + 0x068;
+/// xG22 `CMU_CRYPTOACCCLKCTRL` (PKEN bit 0, AESEN bit 1).
+#[cfg(feature = "efr32mg22")]
+const CMU_IADCCLKCTRL: u32 = CMU_BASE + 0x180;
+#[cfg(feature = "efr32mg22")]
+const CMU_IADCCLKCTRL_CLKSEL_MASK: u32 = 0x3;
+#[cfg(feature = "efr32mg22")]
+const CMU_IADCCLKCTRL_CLKSEL_FSRCO: u32 = 0x2;
+#[cfg(feature = "efr32mg22")]
+const CMU_CRYPTOACCCLKCTRL: u32 = CMU_BASE + 0x260;
+#[cfg(feature = "efr32mg22")]
+const CMU_CRYPTOACCCLKCTRL_PKEN_AESEN: u32 = 0x3;
 /// Present on both xG21 and xG22 at the same offset.
 const CMU_RADIOCLKCTRL: u32 = CMU_BASE + 0x280;
 
@@ -218,6 +229,53 @@ pub fn enable_bus_clock(clock: BusClock) {
     }
     #[cfg(not(all(feature = "efr32mg22", target_arch = "arm", target_os = "none")))]
     let _ = clock;
+}
+
+/// Clock IADC0 from FSRCO (20 MHz) instead of EM01GRPACLK, so the IADC
+/// timing does not depend on the HFXO/DPLL state (xG22).
+#[cfg(feature = "efr32mg22")]
+pub(crate) fn select_iadc_clock_fsrco() {
+    #[cfg(all(target_arch = "arm", target_os = "none"))]
+    unsafe {
+        write(CMU_LOCK, CMU_LOCK_UNLOCK);
+        modify(
+            CMU_IADCCLKCTRL,
+            CMU_IADCCLKCTRL_CLKSEL_MASK,
+            CMU_IADCCLKCTRL_CLKSEL_FSRCO,
+        );
+    }
+}
+
+/// Open the CRYPTOACC bus clock and its PK/AES engine clocks (xG22), as
+/// GSDK `cryptoacc_management_acquire` does before touching the TRNG.
+#[cfg(feature = "efr32mg22")]
+pub fn enable_cryptoacc() {
+    #[cfg(all(target_arch = "arm", target_os = "none"))]
+    unsafe {
+        write(CMU_LOCK, CMU_LOCK_UNLOCK);
+        write(CMU_CLKEN1 + SET_ALIAS_OFFSET, 1 << BusClock::CRYPTOACC.bit);
+        write(
+            CMU_CRYPTOACCCLKCTRL + SET_ALIAS_OFFSET,
+            CMU_CRYPTOACCCLKCTRL_PKEN_AESEN,
+        );
+    }
+}
+
+/// Gate the CRYPTOACC clocks again (`cryptoacc_management_release`).
+#[cfg(feature = "efr32mg22")]
+pub fn disable_cryptoacc() {
+    #[cfg(all(target_arch = "arm", target_os = "none"))]
+    unsafe {
+        write(CMU_LOCK, CMU_LOCK_UNLOCK);
+        write(
+            CMU_CRYPTOACCCLKCTRL + CLEAR_ALIAS_OFFSET,
+            CMU_CRYPTOACCCLKCTRL_PKEN_AESEN,
+        );
+        write(
+            CMU_CLKEN1 + CLEAR_ALIAS_OFFSET,
+            1 << BusClock::CRYPTOACC.bit,
+        );
+    }
 }
 
 /// Open the radio-subsystem bus clocks and enable the radio clock tree.

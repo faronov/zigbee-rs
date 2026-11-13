@@ -6,7 +6,8 @@
 //!
 //! Directly below it, `0x74000..0x7C000` is reserved for the router role's
 //! child-table and APS binding/group journals (two 16 KiB partitions of two
-//! 8 KiB sectors). Every role image links the same application window, so a
+//! 8 KiB sectors), and `0x70000..0x74000` for its Green Power Proxy Table
+//! journal. Every role image links the same application window, so a
 //! reflash to another role can never overwrite another role's persistence.
 
 use efr32s2_hal::flash::{Efr32s2Flash, FLASH_CAPACITY, FLASH_PAGE_SIZE, FlashError};
@@ -17,9 +18,13 @@ pub const FLASH_START: u32 = 0x0000_0000;
 pub const FLASH_SIZE: usize = FLASH_CAPACITY;
 pub const BOOTLOADER_SIZE: usize = 16 * 1024;
 pub const APPLICATION_START: u32 = FLASH_START + BOOTLOADER_SIZE as u32;
-pub const APPLICATION_END: u32 = 0x0007_4000;
+pub const APPLICATION_END: u32 = 0x0007_0000;
+/// Router-role Green Power Proxy Table journal (unused by the end-device
+/// roles).
+pub const GP_PROXY_TABLE_PARTITION_START: u32 = APPLICATION_END;
+pub const GP_PROXY_TABLE_PARTITION_SIZE: usize = 16 * 1024;
 /// Router-role child-table journal (unused by the end-device roles).
-pub const CHILD_TABLE_PARTITION_START: u32 = APPLICATION_END;
+pub const CHILD_TABLE_PARTITION_START: u32 = 0x0007_4000;
 pub const CHILD_TABLE_PARTITION_SIZE: usize = 16 * 1024;
 /// Router-role APS binding/group journal (unused by the end-device roles).
 pub const APS_TABLE_PARTITION_START: u32 =
@@ -40,7 +45,11 @@ const _: () = assert!(FLASH_SIZE == 512 * 1024);
 const _: () = assert!(BOOTLOADER_SIZE == 16 * 1024);
 const _: () = assert!(APPLICATION_START as usize == BOOTLOADER_SIZE);
 const _: () = assert!(APPLICATION_START < APPLICATION_END);
-const _: () = assert!(APPLICATION_END == CHILD_TABLE_PARTITION_START);
+const _: () = assert!(
+    GP_PROXY_TABLE_PARTITION_START + GP_PROXY_TABLE_PARTITION_SIZE as u32
+        == CHILD_TABLE_PARTITION_START
+);
+const _: () = assert!(GP_PROXY_TABLE_PARTITION_SIZE == 2 * FLASH_PAGE_SIZE);
 const _: () = assert!(
     APS_TABLE_PARTITION_START + APS_TABLE_PARTITION_SIZE as u32 == PERSISTENCE_PARTITION_START
 );

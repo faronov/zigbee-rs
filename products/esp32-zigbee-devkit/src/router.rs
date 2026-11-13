@@ -38,6 +38,8 @@ pub const fn router_profile() -> RouterProfile {
 pub use stores::{
     ApsTableFlash, ApsTableStore, ChildStore, ChildTableFlash, FlashWindow, router_stores,
 };
+#[cfg(all(target_os = "none", feature = "green-power"))]
+pub use stores::{GpProxyTableFlash, GpProxyTableStore, gp_proxy_table_store};
 
 #[cfg(target_os = "none")]
 mod stores {
@@ -68,6 +70,23 @@ mod stores {
             ChildStore::new_with_sector_size(ChildTableFlash::new(), SECTOR_A, SECTOR_B),
             ApsTableStore::new_with_sector_size(ApsTableFlash::new(), SECTOR_A, SECTOR_B),
         )
+    }
+
+    #[cfg(feature = "green-power")]
+    pub type GpProxyTableFlash = FlashWindow<
+        { crate::layout::GP_PROXY_TABLE_OFFSET },
+        { crate::layout::GP_PROXY_TABLE_SIZE as usize },
+    >;
+    /// Green Power Proxy Table journal on two 4 KiB flash sectors.
+    #[cfg(feature = "green-power")]
+    pub type GpProxyTableStore =
+        zigbee_runtime::gp_store::GpProxyJournal<GpProxyTableFlash, SECTOR>;
+
+    /// The router's GP Proxy Table journal (`layout` asserts it is disjoint
+    /// from the other journals and the NV pages).
+    #[cfg(feature = "green-power")]
+    pub fn gp_proxy_table_store() -> GpProxyTableStore {
+        GpProxyTableStore::new(GpProxyTableFlash::new(), SECTOR_A, SECTOR_B)
     }
 }
 

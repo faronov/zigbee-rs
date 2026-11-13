@@ -2,9 +2,11 @@ MEMORY
 {
   /* STM32WB55VG die of the STM32WB5MMG module: 1 MiB flash, of which CPU2
    * (FUS 1.2.0 + 802.15.4 MAC 1.24.0) owns 0x080E1000.. (SFSA = 0xE1).
-   * 0x080D3000..0x080D5000 holds the settings journal and
-   * 0x080D5000..0x080E1000 the router journals (src/layout.rs). */
-  FLASH            : ORIGIN = 0x08000000, LENGTH = 844K
+   * 0x080CF000..0x080D3000 holds the Green Power Proxy Table journal,
+   * 0x080D3000..0x080D5000 the settings journal and 0x080D5000..0x080E1000
+   * the router journals (src/layout.rs). */
+  FLASH            : ORIGIN = 0x08000000, LENGTH = 828K
+  GP_PROXY_TABLE   : ORIGIN = 0x080CF000, LENGTH = 16K
   SETTINGS         : ORIGIN = 0x080D3000, LENGTH = 8K
   ROUTER_JOURNALS  : ORIGIN = 0x080D5000, LENGTH = 48K
   /* SRAM1. SRAM2a starts with the 10 KiB IPCC mailbox (tl_mbox.x, from
@@ -12,8 +14,10 @@ MEMORY
   RAM              : ORIGIN = 0x20000000, LENGTH = 192K
 }
 
-ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) == ORIGIN(SETTINGS),
-  "STM32WB application must end exactly at the settings journal");
+ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) == ORIGIN(GP_PROXY_TABLE),
+  "STM32WB application must end exactly at the GP Proxy Table journal");
+ASSERT(ORIGIN(GP_PROXY_TABLE) + LENGTH(GP_PROXY_TABLE) == ORIGIN(SETTINGS),
+  "STM32WB GP Proxy Table journal must end exactly at the settings journal");
 ASSERT(ORIGIN(SETTINGS) == 0x080D3000,
   "STM32WB settings journal must start at 0x080D3000 (src/layout.rs)");
 ASSERT(ORIGIN(SETTINGS) + LENGTH(SETTINGS) == ORIGIN(ROUTER_JOURNALS),

@@ -5,9 +5,9 @@
 //! sequence so its bytes stay identical to the hardware-validated build.
 
 #[cfg(any(
-    all(feature = "ed", feature = "router"),
+    all(feature = "ed", feature = "router-core"),
     all(feature = "ed", feature = "sed"),
-    all(feature = "router", feature = "sed"),
+    all(feature = "router-core", feature = "sed"),
 ))]
 compile_error!(
     "enable exactly one role feature (sed, ed or router); use --no-default-features for ed/router"
@@ -191,30 +191,42 @@ impl Diagnostics for LogDiagnostics {
             } => log::info!(
                 "[MG21] online: addr=0x{short_address:04X} ch={channel} pan=0x{pan_id:04X}"
             ),
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildrenRestored { count } => {
                 log::info!("[MG21] {count} children restored")
             }
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildTableDiscarded { error } => {
                 log::warn!("[MG21] child table discarded: {error:?}")
             }
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildTableSaved => log::info!("[MG21] child table saved"),
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildRemovalCompleted {
                 short_address,
                 delivered,
                 ..
             } => log::info!("[MG21] child 0x{short_address:04X} removed (delivered={delivered})"),
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ApsTablesRestored { count } => {
                 log::info!("[MG21] {count} APS table entries restored")
             }
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ApsTablesDiscarded { error } => {
                 log::warn!("[MG21] APS tables discarded: {error:?}")
             }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableRestored { count } => {
+                log::info!("[MG21] {count} GP proxy table entries restored")
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableDiscarded { error } => {
+                log::warn!("[MG21] GP proxy table discarded: {error:?}")
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableSaved => log::info!("[MG21] GP proxy table saved"),
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableCleared => log::info!("[MG21] GP proxy table cleared"),
             DiagnosticEvent::StackEvent(StackEventSummary::PermitJoinChanged { open }) => {
                 log::info!("[MG21] permit join {open}")
             }

@@ -4,8 +4,8 @@
 //! slot of the zigbee-rs loader layout
 //! (`products/ha-connect-zbt1/boot/zbt1.layout`) — the image the loader in
 //! `bootloaders/efr32s2-boot` (deployment `ha-connect-zbt1`, chained at
-//! 0x4000) verifies and starts. Both keep the router tables and the
-//! security journal where the direct map has them.
+//! 0x4000) verifies and starts. Both keep the GP Proxy Table journal, the
+//! router tables and the security journal where the direct map has them.
 
 use std::{env, fs, path::PathBuf};
 
@@ -46,9 +46,20 @@ fn main() {
             .iter()
             .any(|r| r.region.start == tables && r.region.len() == tables_len);
         assert!(
-            tables_reserved || env::var_os("CARGO_FEATURE_ROUTER").is_none(),
+            tables_reserved || env::var_os("CARGO_FEATURE_ROUTER_CORE").is_none(),
             "{LAYOUT} reclaims the router tables ({tables:#X}, {tables_len} B) for the \
              slots: feature `router` cannot be combined with `zrs-boot`"
+        );
+        // Likewise the Green Power Proxy Table journal.
+        let (gp, gp_len) = region(&direct, "GP_PROXY_TABLE");
+        let gp_reserved = layout
+            .reserved
+            .iter()
+            .any(|r| r.region.start == gp && r.region.len() == gp_len);
+        assert!(
+            gp_reserved || env::var_os("CARGO_FEATURE_GREEN_POWER").is_none(),
+            "{LAYOUT} hands the GP Proxy Table journal ({gp:#X}, {gp_len} B) to the \
+             slots: feature `green-power` cannot be combined with `zrs-boot`"
         );
         let mut script = layout.app_memory_x();
         // Keep the product's stack-floor assertions.

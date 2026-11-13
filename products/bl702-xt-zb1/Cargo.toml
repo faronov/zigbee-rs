@@ -11,6 +11,9 @@ publish = false
 # Mains roles of the role template (always-on End Device and Router policy,
 # router journals); the sensor SED builds without it.
 roles = ["dep:router-app"]
+# Green Power Proxy Basic for the router role: the GP Proxy Table journal
+# at 0xF7000 (`router::RouterStores::gp_proxy_table`).
+green-power = ["roles", "router-app/green-power", "zigbee-runtime/green-power"]
 # LAB ONLY: never confirm an installed image, so the loader's trial expiry
 # (`trial boot 1..N`, then `image unconfirmed`) can be checked on hardware.
 # Never publish an image built with it.

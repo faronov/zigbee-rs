@@ -5,17 +5,20 @@
 //! each Imm-Ack in time, with Frame Pending from the HAL source-match table
 //! the core arms for queued indirect frames) under
 //! [`router_app::ParentRouterApp`]: beacons, association, indirect TX to
-//! sleepy children, routing, durable child and APS tables.
+//! sleepy children, routing, durable child and APS tables, and a Green Power
+//! Proxy Basic with a durable Proxy Table at `0xF0000` (`router-core` builds
+//! without it).
 //!
 //! Product identity, policy, TX power and the journals are owned by
 //! `products/ha-connect-zbt1`; physical resources by `boards/ha-connect-zbt1`.
 //!
-//! With feature `zrs-boot` the image runs from the primary slot of the
+//! With feature `zrs-boot` (combined with `router`, or `router-core`
+//! without Green Power) the image runs from the primary slot of the
 //! zigbee-rs loader (`products/ha-connect-zbt1/boot/zbt1.layout`), chained
 //! after the Gecko Bootloader. It logs which loader started it and, once
 //! back on the network, confirms an image the loader installed on trial
-//! (`product::boot::TrialConfirm`). Router tables and the security journal
-//! stay at the direct map's addresses.
+//! (`product::boot::TrialConfirm`). The GP Proxy Table journal, the router
+//! tables and the security journal stay at the direct map's addresses.
 
 #![no_std]
 #![no_main]
@@ -237,6 +240,8 @@ fn compose(
         .build_router_into(DEVICE.uninit());
 
     let (flash, child_store, aps_store) = product::router::router_stores(flash);
+    #[cfg(feature = "green-power")]
+    let (flash, gp_store) = product::router::gp_proxy_table_store(flash);
     let security_store = SECURITY.init(platform::open_security_store(flash));
     // Before ZigbeeNode construction: persisted keys/counters may never be
     // resumed under a different EUI-64, nor by a different role image.
@@ -261,6 +266,13 @@ fn compose(
         log::error!("[ZBT1] invalid composition: {error:?}");
         halt()
     });
+    #[cfg(feature = "green-power")]
+    let app = {
+        static GP_STORE: StaticCell<product::router::GpProxyTableStore> = StaticCell::new();
+        let mut app = app;
+        app.set_green_power_store(GP_STORE.init(gp_store));
+        app
+    };
     APP.init(app)
 }
 
@@ -311,6 +323,17 @@ fn log_summary(app: &App) {
             child.network_address.0,
             child.rx_on_when_idle,
             child.lqi
+        );
+    }
+    #[cfg(feature = "green-power")]
+    {
+        let proxy = app.node().device().gp_proxy();
+        let stats = proxy.forward_stats();
+        log::info!(
+            "[ZBT1] GP proxy entries {} | forwards sent {} cancelled {} (other proxy first)",
+            proxy.entries().len(),
+            stats.sent,
+            stats.cancelled
         );
     }
 }
@@ -401,6 +424,18 @@ impl Diagnostics for LogDiagnostics {
             DiagnosticEvent::SecureRejoinLimitReached { failures } => {
                 log::warn!("[ZBT1] secure rejoin limit reached at {failures}")
             }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableRestored { count } => {
+                log::info!("[ZBT1] {count} GP proxy table entries restored")
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableDiscarded { error } => {
+                log::warn!("[ZBT1] GP proxy table discarded: {error:?}")
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableSaved => log::info!("[ZBT1] GP proxy table saved"),
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableCleared => log::info!("[ZBT1] GP proxy table cleared"),
             DiagnosticEvent::FactoryReset => log::info!("[ZBT1] security journal reset"),
             DiagnosticEvent::Fatal(error) => log::error!("[ZBT1] fatal: {error:?}"),
             _ => {}

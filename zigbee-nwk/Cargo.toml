@@ -16,6 +16,8 @@ log = "0.4"
 default = []
 router = []
 trace = []
+# Green Power alias transmission (GP 1.1 A.3.6.3.3). Off by default.
+green-power = []
 
 [dev-dependencies]
 zigbee-mac = { version = "0.1.0", path = "../zigbee-mac", features = ["mock"] }

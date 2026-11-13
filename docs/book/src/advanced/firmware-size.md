@@ -155,8 +155,11 @@ Additional artifacts and physical limits:
 - The PHY6252 EVK image links within its physical XIP slot; its hardware
   path remains unverified. Only the PB-03F-Kit (PHY6252) has hardware
   evidence.
-- TLSR8258 physical application boundary: 458,752 B (`0x70000`), followed by
-  APS/child/security journals at `0x70000`/`0x72000`/`0x74000`.
+- TLSR8258 physical application boundary: 450,560 B (`0x6E000`) since
+  2026-11-13, followed by the Green Power Proxy Table journal at `0x6E000`
+  and the APS/child/security journals at `0x70000`/`0x72000`/`0x74000`.
+  Older snapshots below were measured against the former 458,752 B
+  (`0x70000`) boundary.
 
 The TLSR8258 router's former 430,080 B (`0x69000`) regression budget replaced
 the pre-R22 356,352 B baseline and was set above the earlier 427,776 B image.
@@ -206,6 +209,17 @@ Every production build must retain:
 There is no arbitrary regression-budget failure. A size report is not proof of
 physical fit: product linker assertions, layout checks, and image/OTA
 validation remain independent, mandatory checks.
+
+## Green Power in router images (2026-11-13)
+
+Every router image carries the Green Power Proxy Basic by default; the
+`router-core` builds are the GP-off routers. The GP Proxy Basic costs
+about 23.5 KB (TLSR8258) to 32.4 KB (ESP32-H2) of flash, 2.0–2.3 KB of
+`.bss` and 16–48 B of static stack. The per-target table, limits and gates
+are in [Green Power §4.1](./green-power.md). The `-router` rows of
+`tools/mac-footprint-baseline.json` were refreshed with GP on, and
+`-router-core` and STM32WB5MM-DK rows were added; the other rows are
+unchanged.
 
 ## Why the application model remains small
 

@@ -496,6 +496,10 @@ pub struct McpsDataIndication {
 pub struct MacFrame {
     buf: [u8; MAX_MAC_PAYLOAD],
     len: usize,
+    /// MAC header sequence number of the received frame. Green Power uses it
+    /// as the replay/duplicate counter of unsecured GPDFs (GP 1.1 A.3.6.1.3).
+    #[cfg(feature = "green-power")]
+    mac_sequence: u8,
 }
 
 impl MacFrame {
@@ -503,7 +507,23 @@ impl MacFrame {
         Self {
             buf: [0u8; MAX_MAC_PAYLOAD],
             len: 0,
+            #[cfg(feature = "green-power")]
+            mac_sequence: 0,
         }
+    }
+
+    /// MAC sequence number of the received frame (0 when the producer did
+    /// not record one).
+    #[cfg(feature = "green-power")]
+    pub fn mac_sequence(&self) -> u8 {
+        self.mac_sequence
+    }
+
+    /// Record the MAC sequence number of the received frame.
+    #[cfg(feature = "green-power")]
+    pub fn with_mac_sequence(mut self, sequence: u8) -> Self {
+        self.mac_sequence = sequence;
+        self
     }
 
     pub fn from_slice(data: &[u8]) -> Option<Self> {

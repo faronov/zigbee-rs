@@ -54,8 +54,13 @@ fits.
 ## Build
 
 ```bash
-./scripts/tlsr8258.sh build router
+./scripts/tlsr8258.sh build router        # with Green Power (journal at 0x6E000)
+./scripts/tlsr8258.sh build router-core   # without
 ```
+
+The default router carries the Green Power Proxy Basic. Its stack gate adds
+`tools/tlsr8258-router-gp-stack-gate.args`; `router-core` must link no GP
+store.
 
 Flashable image:
 

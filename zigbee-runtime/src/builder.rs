@@ -80,6 +80,8 @@ macro_rules! emit_device_literal {
     ($bdb:expr; $($(#[$attr:meta])* $field:ident: $value:expr,)*) => {
         ZigbeeDevice {
             bdb: $bdb,
+            #[cfg(feature = "green-power")]
+            green_power: crate::green_power::GreenPowerState::new(),
             $($(#[$attr])* $field: $value,)*
         }
     };
@@ -94,6 +96,11 @@ macro_rules! emit_device_literal {
 macro_rules! emit_device_writes {
     ($dst:ident; $($(#[$attr:meta])* $field:ident: $value:expr,)*) => {{
         $($(#[$attr])* core::ptr::addr_of_mut!((*$dst).$field).write($value);)*
+        // Out of line, so its temporary stays off the builder's frame.
+        #[cfg(feature = "green-power")]
+        crate::green_power::GreenPowerState::write_into(core::ptr::addr_of_mut!(
+            (*$dst).green_power
+        ));
 
         // Exhaustiveness guard: no `..` rest pattern, so a `ZigbeeDevice`
         // field that the list above does not write fails to compile.
@@ -101,6 +108,8 @@ macro_rules! emit_device_writes {
         fn _every_field_is_written<M: MacDriver, R: DeviceRole>(device: ZigbeeDevice<M, R>) {
             let ZigbeeDevice {
                 bdb: _,
+                #[cfg(feature = "green-power")]
+                green_power: _,
                 $($(#[$attr])* $field: _,)*
             } = device;
         }

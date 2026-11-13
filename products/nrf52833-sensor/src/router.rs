@@ -2,8 +2,9 @@
 //!
 //! The router keeps its child table and APS binding/group tables in two
 //! product-owned journals at `0x7A000..0x7E000`, directly below the security
-//! journal. Every role image (sensor SED, End Device, Router) links the same
-//! 488 KiB application window (`link/memory.x`), so a reflash to another role
+//! journal, and its Green Power Proxy Table journal at `0x78000..0x7A000`.
+//! Every role image (sensor SED, End Device, Router) links the same 480 KiB
+//! application window (`link/memory.x`), so a reflash to another role
 //! can never overwrite another role's persistence.
 
 use router_app::RouterPolicy;
@@ -16,9 +17,14 @@ use crate::ENDPOINT;
 /// nRF52833 NVMC erase page.
 pub const FLASH_PAGE_SIZE: usize = 4096;
 /// End of the application window (`link/memory.x` `FLASH`).
-pub const APPLICATION_END: u32 = 0x0007_A000;
+pub const APPLICATION_END: u32 = 0x0007_8000;
+/// Router-role Green Power Proxy Table journal: two 4 KiB pages. Reserved in
+/// every image; only `green-power` builds open it.
+pub const GP_PROXY_TABLE_PARTITION_START: u32 = APPLICATION_END;
+pub const GP_PROXY_TABLE_PARTITION_SIZE: usize = 2 * FLASH_PAGE_SIZE;
 /// Router-role child-table journal: two 4 KiB pages.
-pub const CHILD_TABLE_PARTITION_START: u32 = APPLICATION_END;
+pub const CHILD_TABLE_PARTITION_START: u32 =
+    GP_PROXY_TABLE_PARTITION_START + GP_PROXY_TABLE_PARTITION_SIZE as u32;
 pub const CHILD_TABLE_PARTITION_SIZE: usize = 2 * FLASH_PAGE_SIZE;
 /// Router-role APS binding/group journal: two 4 KiB pages.
 pub const APS_TABLE_PARTITION_START: u32 =
@@ -27,7 +33,9 @@ pub const APS_TABLE_PARTITION_SIZE: usize = 2 * FLASH_PAGE_SIZE;
 /// First byte of the protected security journal (`storage.rs`).
 pub const SECURITY_PARTITION_START: u32 = 0x0007_E000;
 
-const _: () = assert!(APPLICATION_END == 488 * 1024);
+const _: () = assert!(APPLICATION_END == 480 * 1024);
+const _: () = assert!(CHILD_TABLE_PARTITION_START == 0x0007_A000);
+const _: () = assert!(GP_PROXY_TABLE_PARTITION_START.is_multiple_of(FLASH_PAGE_SIZE as u32));
 const _: () = assert!(
     APS_TABLE_PARTITION_START + APS_TABLE_PARTITION_SIZE as u32 == SECURITY_PARTITION_START
 );
@@ -95,10 +103,31 @@ mod target {
             ApsTableStore::new_with_sector_size(aps, SECTOR_A, SECTOR_B),
         )
     }
+
+    #[cfg(feature = "green-power")]
+    pub type GpProxyTableFlash =
+        NvmcPartition<GP_PROXY_TABLE_PARTITION_START, GP_PROXY_TABLE_PARTITION_SIZE>;
+    /// Green Power Proxy Table journal on two 4 KiB NVMC pages.
+    #[cfg(feature = "green-power")]
+    pub type GpProxyTableStore =
+        zigbee_runtime::gp_store::GpProxyJournal<GpProxyTableFlash, FLASH_PAGE_SIZE>;
+
+    /// Mint the GP Proxy Table journal; the NVMC handle is passed through
+    /// exactly as by [`router_stores`].
+    #[cfg(feature = "green-power")]
+    pub fn gp_proxy_table_store(nvmc: Nvmc<'_>) -> (Nvmc<'_>, GpProxyTableStore) {
+        // SAFETY: the GP window is disjoint from the child, APS and security
+        // windows and from the application (const and linker assertions),
+        // and it is driven from the same single application task.
+        let gp = unsafe { GpProxyTableFlash::steal() };
+        (nvmc, GpProxyTableStore::new(gp, SECTOR_A, SECTOR_B))
+    }
 }
 
 #[cfg(target_os = "none")]
 pub use target::{ApsTableFlash, ApsTableStore, ChildStore, ChildTableFlash, router_stores};
+#[cfg(all(target_os = "none", feature = "green-power"))]
+pub use target::{GpProxyTableFlash, GpProxyTableStore, gp_proxy_table_store};
 
 #[cfg(test)]
 mod tests {
@@ -120,6 +149,11 @@ mod tests {
 
     #[test]
     fn router_journals_fill_the_window_below_the_security_journal() {
+        assert_eq!(GP_PROXY_TABLE_PARTITION_START, 0x0007_8000);
+        assert_eq!(
+            GP_PROXY_TABLE_PARTITION_START as usize + GP_PROXY_TABLE_PARTITION_SIZE,
+            CHILD_TABLE_PARTITION_START as usize
+        );
         assert_eq!(CHILD_TABLE_PARTITION_START, 0x0007_A000);
         assert_eq!(APS_TABLE_PARTITION_START, 0x0007_C000);
         assert_eq!(

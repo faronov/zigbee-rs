@@ -174,6 +174,13 @@ impl PersistentApsTables {
             groups: groups.clone(),
             application_keys: Vec::new(),
         };
+        // GPEP memberships are owned and restored by the GP Proxy Table.
+        #[cfg(feature = "green-power")]
+        let snapshot = {
+            let mut snapshot = snapshot;
+            snapshot.groups.remove_all_groups(zigbee_gp::GP_ENDPOINT);
+            snapshot
+        };
         snapshot.validate()?;
         Ok(snapshot)
     }
@@ -203,6 +210,9 @@ impl PersistentApsTables {
         self.extended_pan_id = extended_pan_id;
         self.bindings.clone_from(bindings);
         self.groups.clone_from(groups);
+        // GPEP memberships are owned and restored by the GP Proxy Table.
+        #[cfg(feature = "green-power")]
+        self.groups.remove_all_groups(zigbee_gp::GP_ENDPOINT);
         self.application_keys.clear();
         self.validate()?;
         let snapshot = self;
@@ -1067,6 +1077,29 @@ mod tests {
         assert!(tables.groups.add_group(0x1234, 1));
         assert!(tables.groups.add_group(0x1234, 2));
         tables
+    }
+
+    /// GPEP (242) memberships belong to the GP Proxy Table: the APS snapshot
+    /// drops them instead of rejecting the whole table as corrupt.
+    #[cfg(feature = "green-power")]
+    #[test]
+    fn capture_excludes_green_power_endpoint_groups() {
+        let mut groups = GroupTable::new();
+        assert!(groups.add_group(0x1234, 1));
+        assert!(groups.add_group(0x0B84, zigbee_gp::GP_ENDPOINT));
+        let bindings = BindingTable::new();
+        let plain = PersistentApsTables::capture(EPID, &bindings, &groups).unwrap();
+        assert!(plain.groups().is_member(0x1234, 1));
+        assert!(!plain.groups().is_member(0x0B84, zigbee_gp::GP_ENDPOINT));
+        let secured = PersistentApsTables::capture_with_security(
+            EPID,
+            &bindings,
+            &groups,
+            &ApsSecurity::new(),
+        )
+        .unwrap();
+        assert!(secured.groups().is_member(0x1234, 1));
+        assert!(!secured.groups().is_member(0x0B84, zigbee_gp::GP_ENDPOINT));
     }
 
     #[test]

@@ -16,3 +16,7 @@ float64 = []
 ota = []
 constrained-memory = []
 compact-single-endpoint = []
+# Green Power cluster with the GP 1.1 attribute/command identifiers.
+# Without it the pre-GP skeleton is kept so images that do not use Green
+# Power stay byte-identical; it is removed once GP is enabled by default.
+green-power = []

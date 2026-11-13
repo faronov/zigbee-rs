@@ -11,6 +11,8 @@ autobins = false
 #   cargo build --release                                       # sed (default)
 #   cargo build --release --no-default-features --features ed
 #   cargo build --release --no-default-features --features router
+# `router` includes the Green Power proxy; `--features router-core` builds
+# the router without it.
 [[bin]]
 name = "nrf52833-sensor"
 path = "src/main.rs"
@@ -24,7 +26,7 @@ required-features = ["ed"]
 [[bin]]
 name = "nrf52833-router"
 path = "src/router.rs"
-required-features = ["router"]
+required-features = ["router-core"]
 
 [features]
 default = ["sed"]
@@ -42,8 +44,10 @@ ed = [
 ]
 # Router: parent MAC over the interrupt-driven PHY (Imm-Ack from the RADIO
 # ISR, Frame Pending from a HAL source-match table), ParentRouterApp,
-# durable child and APS tables.
-router = [
+# durable child and APS tables, plus the Green Power proxy (`green-power`).
+router = ["router-core", "green-power"]
+# The router without Green Power.
+router-core = [
     "dep:router-app",
     "zigbee-mac/nrf-isr-phy",
     "dep:static_cell",
@@ -52,6 +56,13 @@ router = [
     "nrf52833-sensor-product/mains",
     "router-app/router",
     "zigbee-runtime/router",
+]
+# Green Power Proxy Basic: tunnels GPDFs to the sink and journals the Proxy
+# Table at 0x78000. Part of `router`.
+green-power = [
+    "router-core",
+    "router-app/green-power",
+    "nrf52833-sensor-product/green-power",
 ]
 # External I2C sensor (pick one; SDA=P0.26, SCL=P0.27 on the PCA10100
 # Arduino header). Forwards to the product crate too, since BME280 adds a

@@ -13,6 +13,10 @@ DevKitM-1 default is GRB), e.g.
 `--no-default-features --features router,waveshare-h2-zero`; see the ESP32
 platform guide.
 
+The `router` feature also enables the Green Power Proxy Basic (default-on
+for every router; see the Green Power chapter); `router-core` builds the
+router without it.
+
 ## Composition
 
 `main.rs` owns ESP startup, radio/AES resources, BOOT input, LED, on-chip

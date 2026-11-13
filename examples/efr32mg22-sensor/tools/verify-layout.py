@@ -35,9 +35,19 @@ def checked_slice(data: bytes, offset: int, size: int, description: str) -> byte
 
 
 def main() -> None:
+    global FLASH_END
     parser = argparse.ArgumentParser()
     parser.add_argument("elf", type=Path)
+    parser.add_argument(
+        "--flash-end",
+        type=lambda v: int(v, 0),
+        default=FLASH_END,
+        help="application end (default 0x74000; products with a lower journal pass theirs)",
+    )
     args = parser.parse_args()
+    if not (FLASH_START < args.flash_end <= FLASH_END):
+        fail(f"--flash-end must be within 0x{FLASH_START:08X}..0x{FLASH_END:08X}")
+    FLASH_END = args.flash_end
     data = args.elf.read_bytes()
 
     if data[:6] != b"\x7fELF\x01\x01":
@@ -272,10 +282,12 @@ def main() -> None:
         f"  load=0x{first_load:08X}..0x{highest_load:08X} "
         f"(span={highest_load - first_load} bytes, file-backed={loaded_bytes} bytes)"
     )
-    print(
-        f"  persistence=0x{FLASH_END:08X}..0x{PERSISTENCE_END:08X} "
+    detail = (
         "(child 16K, APS 16K, security 16K; 8192-byte sectors)"
+        if FLASH_END == 0x00074000
+        else "(product-defined journals; 8192-byte sectors)"
     )
+    print(f"  persistence=0x{FLASH_END:08X}..0x{PERSISTENCE_END:08X} {detail}")
     print(
         f"  BSS={bss_bytes} bytes RAM-static-end=0x{ram_static_end:08X} "
         f"stack={stack_bytes} bytes"
