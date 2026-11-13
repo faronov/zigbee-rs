@@ -20,12 +20,17 @@ sensors = ["zigbee-runtime/float32", "zigbee-zcl/float32"]
 sound = ["zigbee-runtime/float32", "zigbee-zcl/float32"]
 # Green Power Proxy Basic: the GP Proxy Table journal (`storage::open`). The
 # window is reserved in every image.
-green-power = ["router-app/green-power", "zigbee-runtime/green-power"]
+green-power = [
+    "router-app/green-power",
+    "stm32wb-router-product/green-power",
+    "zigbee-runtime/green-power",
+]
 
 [dependencies]
 heapless = "0.9"
 libm = "0.2"
 router-app = { path = "../../apps/router" }
+stm32wb-router-product = { path = "../stm32wb-router" }
 zigbee-aps = { path = "../../zigbee-aps" }
 zigbee-mac = { path = "../../zigbee-mac", default-features = false }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }

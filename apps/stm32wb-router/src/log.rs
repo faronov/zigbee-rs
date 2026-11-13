@@ -1,18 +1,21 @@
-//! `log` backend on the ST-LINK virtual COM port (USART1 TX PB6, 115200 8N1).
+//! Non-blocking `log` backend of the STM32WB routers.
 //!
 //! `log!` only formats one line into a stack buffer and copies it into
 //! [`PIPE`] (a few microseconds in a critical section), dropping the whole
 //! line when the pipe is full, so logging never stalls the IPCC handlers or
-//! the Zigbee step. The [`drain`] task moves the pipe to USART1 by DMA.
+//! the Zigbee step. A transport task of the composition root moves the pipe
+//! out: [`drain_uart`] to an ST-LINK virtual COM port by DMA, or
+//! [`crate::usb_log`] to a USB CDC ACM port.
 //!
 //! Fatal paths ([`emergency`]) run with interrupts disabled and write the
-//! remaining pipe plus their message with blocking register access.
+//! remaining pipe plus their message to USART1 with blocking register
+//! access, when USART1 carries the log; otherwise they stay silent.
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pipe::Pipe};
-use stm32wb5mm_dk::VcomTx;
+use stm32wb_hal::embassy_stm32::{mode::Async, usart::UartTx};
 
 const PIPE_BYTES: usize = 2048;
 const LINE_BYTES: usize = 192;
@@ -111,9 +114,14 @@ pub fn init() {
     log::set_max_level(log::LevelFilter::Info);
 }
 
-/// Move queued log bytes to VCOM.
-#[embassy_executor::task]
-pub async fn drain(mut tx: VcomTx) {
+/// Wait for queued log bytes and move up to `chunk.len()` of them out.
+pub async fn read(chunk: &mut [u8]) -> usize {
+    PIPE.read(chunk).await
+}
+
+/// Move queued log bytes to a virtual COM port; run it in its own task.
+/// [`emergency`] takes USART1 over on a fault path.
+pub async fn drain_uart(mut tx: UartTx<'static, Async>) -> ! {
     let mut chunk = [0u8; 64];
     loop {
         let count = PIPE.read(&mut chunk).await;
@@ -157,7 +165,8 @@ fn blocking_write(bytes: &[u8]) {
 /// queued log and `args` synchronously. Interrupts stay disabled.
 pub fn emergency(args: core::fmt::Arguments<'_>) {
     cortex_m::interrupt::disable();
-    // USART1 is enabled once `drain` owns it; before that, no VCOM.
+    // USART1 is enabled once `drain_uart` owns it; before that (or on a
+    // board without a USART1 log), no output.
     if reg_read(CR1) & CR1_UE == 0 {
         return;
     }
@@ -173,14 +182,14 @@ pub fn emergency(args: core::fmt::Arguments<'_>) {
     blocking_write(line.as_bytes());
 }
 
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+/// Body of the composition root's `#[panic_handler]`.
+pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     emergency(format_args!("PANIC: {info}"));
     crate::platform::halt()
 }
 
-#[cortex_m_rt::exception]
-unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
+/// Body of the composition root's `HardFault` handler.
+pub fn hard_fault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
     emergency(format_args!(
         "HARDFAULT pc={:08X} lr={:08X}",
         frame.pc(),

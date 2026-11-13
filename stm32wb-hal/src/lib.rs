@@ -14,7 +14,7 @@
 //! - [`hsem`]: the hardware semaphores shared with CPU2.
 //!
 //! Only [`word_flash`] is hardware independent; the rest requires one chip
-//! feature (`stm32wb55vg`, `stm32wb55rg`).
+//! feature (`stm32wb55vg`, `stm32wb55rg`, `stm32wb55cg`).
 
 #![no_std]
 

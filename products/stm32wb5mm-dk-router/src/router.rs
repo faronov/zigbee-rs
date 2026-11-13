@@ -1,26 +1,15 @@
 //! Router policy and profile for the STM32WB5MM-DK.
+//!
+//! The bounded [`ROUTER_POLICY`] and the plain Range Extender come from the
+//! shared STM32WB router product.
 
-use router_app::RouterPolicy;
+pub use stm32wb_router_product::policy::ROUTER_POLICY;
 use zigbee_mac::MacDriver;
 use zigbee_runtime::builder::DeviceBuilder;
-#[cfg(not(any(feature = "sensors", feature = "sound")))]
-use zigbee_runtime::profile::{ApplicationProfile, DeviceProfile, RangeExtender};
-#[cfg(not(any(feature = "sensors", feature = "sound")))]
-use {crate::ENDPOINT, zigbee_aps::PROFILE_HOME_AUTOMATION, zigbee_zcl::DeviceId};
-
-/// Same bounded receive slice and retry policy as the other routers. The
-/// coprocessor sends Imm-Acks and holds indirect frames itself, so the slice
-/// only bounds how long button and display work may wait.
-pub static ROUTER_POLICY: RouterPolicy = RouterPolicy {
-    max_receive_slice_us: 20_000,
-    join_retry_initial_ms: 5_000,
-    join_retry_max_ms: 60_000,
-    secure_rejoin_failure_limit: 0,
-};
 
 /// HA Range Extender: Basic + Identify on a routing, child-capable node.
 #[cfg(not(any(feature = "sensors", feature = "sound")))]
-pub type RouterProfile = DeviceProfile<RangeExtender>;
+pub type RouterProfile = stm32wb_router_product::policy::RangeExtenderProfile;
 
 /// Range Extender plus the on-board sensor endpoints
 /// ([`crate::sensor_profile`]).
@@ -29,12 +18,7 @@ pub type RouterProfile = crate::sensor_profile::DkProfile;
 
 #[cfg(not(any(feature = "sensors", feature = "sound")))]
 pub const fn router_profile() -> RouterProfile {
-    DeviceProfile::new(
-        ENDPOINT,
-        PROFILE_HOME_AUTOMATION,
-        DeviceId::RANGE_EXTENDER,
-        RangeExtender,
-    )
+    stm32wb_router_product::policy::range_extender_profile()
 }
 
 #[cfg(any(feature = "sensors", feature = "sound"))]
@@ -48,12 +32,7 @@ pub fn declare_endpoints<M: MacDriver>(
     profile: &RouterProfile,
 ) -> DeviceBuilder<M> {
     #[cfg(not(any(feature = "sensors", feature = "sound")))]
-    return builder.endpoint(
-        profile.endpoint(),
-        profile.profile_id(),
-        profile.device_id(),
-        |endpoint| profile.configure_endpoint(endpoint),
-    );
+    return stm32wb_router_product::policy::declare_range_extender(builder, profile);
     #[cfg(any(feature = "sensors", feature = "sound"))]
     profile.declare_endpoints(builder)
 }

@@ -1,0 +1,49 @@
+[package]
+name = "stm32wb-router-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Firmware composition shared by the STM32WB Zigbee router examples"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone: Embassy is pinned by git in stm32wb-hal. Target-only: build it
+# through an example (`examples/*wb*-router`) or with
+# `cargo build --target thumbv7em-none-eabihf --features stm32wb-hal/stm32wb55rg`.
+[workspace]
+
+[features]
+default = []
+# Log on a USB CDC ACM port (boards without an ST-LINK).
+usb-log = ["dep:embassy-usb"]
+# Green Power Proxy Basic: journal the GP Proxy Table at 0x080CF000.
+green-power = [
+    "router-app/green-power",
+    "stm32wb-router-product/green-power",
+    "zigbee-runtime/green-power",
+]
+
+[dependencies]
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["stm32wb"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["router"] }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+router-app = { path = "../router", features = ["router"] }
+# No chip feature: the example selects the STM32WB55 package.
+stm32wb-hal = { path = "../../stm32wb-hal" }
+stm32wb-router-product = { path = "../../products/stm32wb-router" }
+
+# Same Embassy commit as stm32wb-hal.
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87" }
+embassy-usb = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", optional = true, default-features = false, features = ["device", "class-cdc-acm"] }
+static_cell = "2"
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+log = "0.4"
+
+# Local ST MAC layout and mailbox-acknowledgement fixes: see
+# vendor/embassy-stm32-wpan/LOCAL-PATCHES.md.
+[patch."https://github.com/embassy-rs/embassy"]
+embassy-stm32-wpan = { path = "../../vendor/embassy-stm32-wpan" }

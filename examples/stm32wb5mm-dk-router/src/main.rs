@@ -1,10 +1,9 @@
 //! STM32WB5MM-DK Zigbee Router.
 //!
-//! CPU2 runs ST's IEEE 802.15.4 MAC firmware: it sends Imm-Acks, answers
-//! data polls with Frame Pending, holds indirect frames for sleepy children
-//! and transmits beacons. [`Stm32wbMac`] maps that MAC onto zigbee-rs's
-//! parent MAC contract, and [`router_app::ParentRouterApp`] runs the Zigbee
-//! router on top: routing, association, durable child and APS tables.
+//! The coprocessor MAC, the router composition, the shared button actions
+//! and the log come from [`stm32wb_router_app`] (shared with the
+//! Nucleo-WB55 and USB dongle routers); this composition root adds the DK
+//! peripherals.
 //!
 //! Buttons ([`product::actions`]): B1 short press commissions, or opens
 //! permit-join for 180 s once joined; a 3 s hold commits a journal-aware
@@ -28,53 +27,33 @@ mod shared;
 mod sound;
 #[cfg(any(feature = "rgb-led", feature = "lcd"))]
 mod ui;
-mod vcom_log;
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Instant};
-use platform::{LogDiagnostics, LogStatus, ResetSupervisor, halt};
-use router_app::{
-    DiagnosticEvent, Diagnostics, NoObserver, NodeArchetype, ParentRouterApp, PersistentApsTables,
-    PersistentChildren, RouterStatus, StatusSink, Supervisor,
-};
-use static_cell::StaticCell;
-use stm32wb_hal::embassy_stm32_wpan::sub::mm::MemoryManager;
-use stm32wb_hal::mac::WbTransport;
+#[cfg(any(
+    feature = "rgb-led",
+    feature = "lcd",
+    feature = "sensors",
+    feature = "mic"
+))]
+use embassy_time::Duration;
+use embassy_time::Instant;
+use stm32wb_router_app::platform as wb_platform;
+use stm32wb_router_app::router::{self, ARCHETYPE, Identity, RouterCells, SUMMARY_PERIOD};
 use stm32wb5mm_dk_router_product::{
     self as product,
     actions::{self, Action, Input},
     button::ButtonGestures,
     router::RouterProfile,
-    storage::{ApsTableStore, ChildStore, SecurityStore},
 };
 #[cfg(feature = "sensors")]
 use stm32wb5mm_dk_router_product::{motion::MotionHoldPersistence, storage::SettingsStore};
-use zigbee_mac::stm32wb::Stm32wbMac;
-use zigbee_runtime::{ZigbeeDevice, node::ZigbeeNode, power::PowerMode, role::Router};
-use zigbee_types::ChannelMask;
-use zigbee_zcl::clusters::basic::PowerSource;
 
-type Mac = Stm32wbMac<WbTransport>;
-type App = ParentRouterApp<
-    'static,
-    Mac,
-    SecurityStore,
-    RouterProfile,
-    ChildStore,
-    LogStatus,
-    ResetSupervisor,
-    LogDiagnostics,
-    NoObserver,
-    PersistentApsTables<ApsTableStore>,
->;
+type App = router::App<RouterProfile>;
 
 /// Durable Occupancy Sensing motion hold ([`product::motion`]).
 #[cfg(feature = "sensors")]
 type MotionHold = MotionHoldPersistence<SettingsStore>;
 
-const ARCHETYPE: NodeArchetype = NodeArchetype::ParentRouter;
-/// Period of the neighbour/child/coprocessor summary on VCOM.
-const SUMMARY_PERIOD: Duration = Duration::from_secs(60);
 /// Period of publishing network state and applying sensor readings.
 #[cfg(any(
     feature = "rgb-led",
@@ -84,11 +63,15 @@ const SUMMARY_PERIOD: Duration = Duration::from_secs(60);
 ))]
 const SHARE_PERIOD: Duration = Duration::from_millis(250);
 
-/// Returns mailbox buffers to CPU2; must run for the life of the MAC.
-#[embassy_executor::task]
-async fn run_memory_manager(mut memory_manager: MemoryManager<'static>) {
-    memory_manager.run_queue().await
-}
+static CELLS: RouterCells<RouterProfile> = RouterCells::new();
+
+const IDENTITY: Identity = Identity {
+    manufacturer: product::MANUFACTURER,
+    model: product::ROUTER_MODEL,
+    date_code: product::DATE_CODE,
+    sw_build: product::SW_BUILD,
+    role: product::role::ROUTER,
+};
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -100,30 +83,31 @@ async fn main(spawner: Spawner) {
             #[cfg(feature = "touch")]
             started.touch,
         ))
-        .unwrap_or_else(|_| halt()),
+        .unwrap_or_else(|_| wb_platform::halt()),
     );
     #[cfg(feature = "sensors")]
-    spawner.spawn(sensing::run(started.sensor_bus).unwrap_or_else(|_| halt()));
+    spawner.spawn(sensing::run(started.sensor_bus).unwrap_or_else(|_| wb_platform::halt()));
     #[cfg(feature = "mic")]
-    spawner.spawn(sound::run(started.mic).unwrap_or_else(|_| halt()));
-    let (transport, memory_manager) =
-        match stm32wb_hal::mac::start(started.ipcc, platform::Irqs, started.rng).await {
-            Ok(parts) => parts,
-            Err(error) => {
-                log::error!("[WB] coprocessor MAC start failed: {error:?}");
-                halt()
-            }
-        };
-    spawner.spawn(run_memory_manager(memory_manager).unwrap_or_else(|_| halt()));
-    log::info!("[WB] coprocessor MAC running");
+    spawner.spawn(sound::run(started.mic).unwrap_or_else(|_| wb_platform::halt()));
+    let transport = stm32wb_router_app::mac_started(
+        spawner,
+        stm32wb_hal::mac::start(started.ipcc, platform::Irqs, started.rng).await,
+    );
 
-    let (app, settings) = compose(transport);
+    let (app, settings) = router::compose(
+        &CELLS,
+        transport,
+        &IDENTITY,
+        product::router::router_profile,
+        product::router::declare_endpoints,
+        wb_platform::parts(shared::publish_status, actions::B1.name),
+    );
     #[cfg(feature = "sensors")]
     let mut motion_hold = MotionHold::new(settings);
     #[cfg(not(feature = "sensors"))]
     let _ = settings;
     if let Err(error) = app.initialize().await {
-        platform::fatal(app.parts_mut(), ARCHETYPE, error);
+        wb_platform::fatal(app.parts_mut(), ARCHETYPE, error);
     }
 
     let (b1, b2) = (started.button_b1, started.button_b2);
@@ -137,17 +121,17 @@ async fn main(spawner: Spawner) {
         feature = "mic"
     ))]
     let mut next_share = Instant::now();
-    let mut step_errors = platform::StepErrors::new();
+    let mut step_errors = wb_platform::StepErrors::new();
     loop {
         let now_ms = Instant::now().as_millis();
         let inputs = [
             b1_gestures.sample(b1.is_low(), now_ms).map(Input::B1),
             b2_gestures.sample(b2.is_low(), now_ms).map(Input::B2),
         ];
-        for input in inputs.into_iter().flatten() {
+        for action in inputs.into_iter().flatten().filter_map(actions::action) {
             perform(
                 app,
-                actions::action(input),
+                action,
                 #[cfg(feature = "sensors")]
                 &mut motion_hold,
             )
@@ -169,23 +153,10 @@ async fn main(spawner: Spawner) {
             Ok(_) => step_errors.ok(),
             Err(error) => step_errors.handle(app.parts_mut(), ARCHETYPE, error).await,
         }
-        if mac(app).transport().faulted() {
-            // Opcode and leading octets of the notification CPU2 left
-            // pending identify an ABI or sequencing fault after the reset.
-            let mut raw = [0u8; 16];
-            let len = stm32wb_hal::mac::pending_notification(&mut raw);
-            log::error!(
-                "[WB] IPCC mailbox stalled; pending notification len {} {:02X?}",
-                len,
-                &raw[..len.min(raw.len())]
-            );
-            // Let the VCP drain the fault line before the reset.
-            embassy_time::Timer::after_millis(200).await;
-            app.parts_mut().supervisor.reset();
-        }
+        router::reset_if_mailbox_faulted(app).await;
         if Instant::now() >= next_summary {
             next_summary += SUMMARY_PERIOD;
-            log_summary(app);
+            router::log_summary(app);
         }
         #[cfg(any(
             feature = "rgb-led",
@@ -207,44 +178,19 @@ async fn main(spawner: Spawner) {
 /// Carry out a button action ([`product::actions`]).
 async fn perform(app: &mut App, action: Action, #[cfg(feature = "sensors")] hold: &mut MotionHold) {
     match action {
-        Action::FactoryReset => {
-            // A new commissioning starts from the default motion hold, even
-            // in the same network.
-            #[cfg(feature = "sensors")]
-            if let Err(error) = hold.forget() {
-                log::warn!("[WB] motion hold not forgotten: {error:?}");
-            }
-            factory_reset(app).await
-        }
-        Action::CommissionOrPermitJoin => {
-            if app.request_commissioning() {
-                log::info!("[WB] B1: commissioning requested");
-            } else if app.node().device().is_joined() {
-                permit_joining(app, actions::PERMIT_JOIN_SECS).await;
-            } else {
-                log::info!("[WB] B1 ignored: reset pending");
-            }
-        }
-        Action::ClosePermitJoin => permit_joining(app, 0).await,
-        Action::Identify => {
-            let device = app.node_mut().device_mut();
-            if device.start_identify(product::ENDPOINT, actions::IDENTIFY_SECS) {
-                log::info!("[WB] B2: identify {} s", actions::IDENTIFY_SECS);
-            } else {
-                log::warn!("[WB] B2: identify unavailable");
-            }
+        Action::Router(action, button) => {
+            router::perform(app, action, button, || {
+                // A new commissioning starts from the default motion hold,
+                // even in the same network.
+                #[cfg(feature = "sensors")]
+                if let Err(error) = hold.forget() {
+                    log::warn!("[WB] motion hold not forgotten: {error:?}");
+                }
+            })
+            .await
         }
         // Touch-key actions are handled by the display task.
         Action::NextPage | Action::FirstPage => {}
-    }
-}
-
-/// Open (`secs` > 0) or close joining through this router (local NWK only;
-/// no network-wide Mgmt_Permit_Joining broadcast).
-async fn permit_joining(app: &mut App, secs: u8) {
-    match app.node_mut().device_mut().permit_joining(secs).await {
-        Ok(()) => log::info!("[WB] permit join {secs} s"),
-        Err(error) => log::warn!("[WB] permit join {secs} s failed: {error:?}"),
     }
 }
 
@@ -322,142 +268,12 @@ fn network_snapshot(app: &App) -> product::screen::NetworkSnapshot {
     }
 }
 
-fn mac(app: &App) -> &Mac {
-    app.node().device().bdb().zdo().nwk().mac()
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    stm32wb_router_app::log::panic(info)
 }
 
-async fn factory_reset(app: &mut App) -> ! {
-    app.parts_mut().status.set(RouterStatus::Resetting {
-        archetype: ARCHETYPE,
-    });
-    log::info!("[WB] B1 hold: committing durable factory reset");
-    match app.urgent_factory_reset_and_recommission().await {
-        Ok(()) => {
-            let parts = app.parts_mut();
-            parts.diagnostics.record(DiagnosticEvent::FactoryReset);
-            parts.supervisor.reset()
-        }
-        Err(error) => platform::fatal(app.parts_mut(), ARCHETYPE, error),
-    }
-}
-
-/// Build MAC, device, stores and app into static storage, and hand back the
-/// settings journal. Not inlined, so the builder temporaries are released
-/// before the run loop.
-#[inline(never)]
-fn compose(transport: WbTransport) -> (&'static mut App, product::storage::SettingsStore) {
-    let ieee = stm32wb_hal::identity::eui64();
-    platform::check_ieee(ieee);
-    let mac = Stm32wbMac::new(transport, ieee);
-
-    let stores = product::storage::open().unwrap_or_else(|error| {
-        log::error!("[WB] journals unavailable: {error:?}");
-        halt()
-    });
-
-    static SECURITY: StaticCell<SecurityStore> = StaticCell::new();
-    static PROFILE: StaticCell<RouterProfile> = StaticCell::new();
-    static DEVICE: StaticCell<ZigbeeDevice<Mac, Router>> = StaticCell::new();
-    static APP: StaticCell<App> = StaticCell::new();
-
-    let profile = PROFILE.init(product::router::router_profile());
-    let builder = ZigbeeDevice::builder(mac)
-        .power_mode(PowerMode::AlwaysOn)
-        .manufacturer(product::MANUFACTURER)
-        .model(product::ROUTER_MODEL)
-        .date_code(product::DATE_CODE)
-        .sw_build(product::SW_BUILD)
-        .power_source(PowerSource::MainsSinglePhase)
-        .channels(ChannelMask::ALL_2_4GHZ);
-    let device =
-        product::router::declare_endpoints(builder, profile).build_router_into(DEVICE.uninit());
-
-    let security_store = SECURITY.init(stores.security);
-    // Before ZigbeeNode construction: persisted keys/counters may never be
-    // resumed under a different EUI-64, nor by a different role image.
-    platform::guard_outcome(
-        "IEEE identity",
-        device.reset_security_state_if_identity_changed(security_store, ieee),
-    );
-    platform::guard_outcome(
-        "role",
-        security_store.select_role_tag(product::role::ROUTER),
-    );
-
-    let node = ZigbeeNode::new(device, security_store, profile);
-    let app = ParentRouterApp::new_with_aps_tables(
-        node,
-        PersistentChildren::new(stores.children),
-        PersistentApsTables::new(stores.aps_tables),
-        &product::router::ROUTER_POLICY,
-        platform::parts(),
-    )
-    .unwrap_or_else(|error| {
-        log::error!("[WB] invalid composition: {error:?}");
-        halt()
-    });
-    #[cfg(feature = "green-power")]
-    let app = {
-        static GP_STORE: StaticCell<product::storage::GpProxyTableStore> = StaticCell::new();
-        let mut app = app;
-        app.set_green_power_store(GP_STORE.init(stores.gp_proxy_table));
-        app
-    };
-    (APP.init(app), stores.settings)
-}
-
-/// Neighbour/child/route tables and coprocessor counters on VCOM.
-#[inline(never)]
-fn log_summary(app: &App) {
-    let nwk = app.node().device().bdb().zdo().nwk();
-    let neighbors = nwk.neighbor_table();
-    log::info!(
-        "[WB] neighbours {} children {} routes {} logdrop {}",
-        neighbors.len(),
-        neighbors.children().count(),
-        nwk.routing_table().len(),
-        vcom_log::dropped_lines(),
-    );
-    // The VCP logger truncates long lines; keep each under ~120 columns.
-    let stats = nwk.mac().stats();
-    log::info!(
-        "[WB] tx ok {} noack {} cca {} other {} | rx drop {} cmd drop {} stray {}",
-        stats.tx_ok,
-        stats.tx_no_ack,
-        stats.tx_channel_access_failures,
-        stats.tx_other_failures,
-        stats.rx_dropped,
-        stats.commands_dropped,
-        stats.stray_confirms,
-    );
-    log::info!(
-        "[WB] indirect {}/{} exp {} fail {} | beacon {} sync-loss {} other {}",
-        stats.indirect_delivered,
-        stats.indirect_handed_off,
-        stats.indirect_expired,
-        stats.indirect_failed,
-        stats.beacon_refreshes,
-        stats.sync_loss,
-        stats.other_events,
-    );
-    for neighbor in neighbors.iter() {
-        log::info!(
-            "[WB]  nbr 0x{:04X} {:?} rx_on={} lqi={}",
-            neighbor.network_address.0,
-            neighbor.relationship,
-            neighbor.rx_on_when_idle,
-            neighbor.lqi
-        );
-    }
-    #[cfg(feature = "green-power")]
-    {
-        let proxy = app.node().device().gp_proxy();
-        let stats = proxy.forward_stats();
-        log::info!(
-            "[WB] GP proxy entries {} | forwards sent {} cancelled {}",
-            proxy.entries().len(),
-            stats.sent,
-            stats.cancelled
-        );
-    }
+#[cortex_m_rt::exception]
+unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
+    stm32wb_router_app::log::hard_fault(frame)
 }

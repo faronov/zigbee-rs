@@ -1,6 +1,7 @@
 MEMORY
 {
-  /* STM32WB55VG die of the STM32WB5MMG module: 1 MiB flash, of which CPU2
+  /* Every 1 MiB STM32WB55 router product (STM32WB5MM-DK's STM32WB55VG,
+   * Nucleo-WB55's STM32WB55RG, USB dongle's STM32WB55CG): CPU2
    * (FUS 1.2.0 + 802.15.4 MAC 1.24.0) owns 0x080E1000.. (SFSA = 0xE1).
    * 0x080CF000..0x080D3000 holds the Green Power Proxy Table journal,
    * 0x080D3000..0x080D5000 the settings journal and 0x080D5000..0x080E1000

@@ -11,15 +11,26 @@
 //! | touch key | tap | next display page |
 //! | touch key | hold | first display page |
 
+//!
+//! The router actions and their timings are shared with the other STM32WB
+//! routers ([`stm32wb_router_product::actions`]).
+
 use crate::button::ButtonGesture;
+pub use stm32wb_router_product::actions::{
+    Action as RouterAction, ButtonMap, IDENTIFY_SECS, PERMIT_JOIN_SECS,
+};
 
-/// Local permit-join window opened by B1 on a joined router.
-pub const PERMIT_JOIN_SECS: u8 = 180;
-/// Local identify time started by B2.
-pub const IDENTIFY_SECS: u16 = 10;
-
-// 0 would close and 0xFF would open indefinitely.
-const _: () = assert!(PERMIT_JOIN_SECS > 0 && PERMIT_JOIN_SECS < 0xFF);
+/// B1 and B2 as shared router button maps.
+pub const B1: ButtonMap = ButtonMap {
+    name: "B1",
+    short_press: Some(RouterAction::CommissionOrPermitJoin),
+    long_hold: Some(RouterAction::FactoryReset),
+};
+pub const B2: ButtonMap = ButtonMap {
+    name: "B2",
+    short_press: Some(RouterAction::Identify),
+    long_hold: Some(RouterAction::ClosePermitJoin),
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
@@ -30,24 +41,23 @@ pub enum Input {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Request commissioning; if the app refuses because the node is
-    /// joined, open permit-join instead.
-    CommissionOrPermitJoin,
-    FactoryReset,
-    Identify,
-    ClosePermitJoin,
+    /// A shared router action, named by the button that requested it.
+    Router(RouterAction, &'static str),
     NextPage,
     FirstPage,
 }
 
-pub const fn action(input: Input) -> Action {
-    match input {
-        Input::B1(ButtonGesture::ShortPress) => Action::CommissionOrPermitJoin,
-        Input::B1(ButtonGesture::LongHold) => Action::FactoryReset,
-        Input::B2(ButtonGesture::ShortPress) => Action::Identify,
-        Input::B2(ButtonGesture::LongHold) => Action::ClosePermitJoin,
-        Input::Touch(ButtonGesture::ShortPress) => Action::NextPage,
-        Input::Touch(ButtonGesture::LongHold) => Action::FirstPage,
+/// `None` for an unmapped gesture (every DK gesture is mapped).
+pub const fn action(input: Input) -> Option<Action> {
+    let (map, gesture) = match input {
+        Input::B1(gesture) => (&B1, gesture),
+        Input::B2(gesture) => (&B2, gesture),
+        Input::Touch(ButtonGesture::ShortPress) => return Some(Action::NextPage),
+        Input::Touch(ButtonGesture::LongHold) => return Some(Action::FirstPage),
+    };
+    match map.action(gesture) {
+        Some(action) => Some(Action::Router(action, map.name)),
+        None => None,
     }
 }
 
@@ -67,16 +77,22 @@ mod tests {
         ];
         let resets = inputs
             .iter()
-            .filter(|i| action(**i) == Action::FactoryReset)
+            .filter(|i| {
+                matches!(
+                    action(**i),
+                    Some(Action::Router(RouterAction::FactoryReset, _))
+                )
+            })
             .count();
         assert_eq!(resets, 1);
         assert_eq!(
             action(Input::B1(ButtonGesture::LongHold)),
-            Action::FactoryReset
+            Some(Action::Router(RouterAction::FactoryReset, "B1"))
         );
         assert_eq!(
             action(Input::B2(ButtonGesture::ShortPress)),
-            Action::Identify
+            Some(Action::Router(RouterAction::Identify, "B2"))
         );
+        assert!(inputs.iter().all(|i| action(*i).is_some()));
     }
 }
