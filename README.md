@@ -248,6 +248,7 @@ path-level evidence unless the row names the current MAC or image.
 | Home Assistant Connect ZBT-1 (EFR32MG21) | always-on End Device (Basic + Identify) | yes | on `SoftMacCore<Efr32s2RadioPhy>`: ZHA join, interview, Identify and journal reset/resume on one dongle, keeping its Gecko Bootloader; Router role, OTA and long-duration runs remain open |
 | TLSR8258 TB-04 | environmental sleepy End Device | yes | prior evidence (hand-written MAC) covers the SUSPEND primitive; the current `SoftMacCore` image and repeated application/network acceptance remain open |
 | TLSR8258 TB-04 | child-capable router | yes | prior evidence covers join/restart/Link Status/relay; corrected-image child acceptance remains open |
+| STM32WB5MM-DK (STM32WB55, ST 802.15.4 MAC on CPU2) | router | yes | on `Stm32wbMac` over IPCC: ZHA join/interview as Router, Link Status, broadcast relay, RREP and journal reset/resume on one board with a sniffer; beacon response, child association/indirect delivery, OTA and long-duration runs remain open |
 
 See [BUILD.md](BUILD.md) for pinned commands, partition boundaries, and exact
 remaining gates, and
