@@ -3789,7 +3789,11 @@ fn parent_restores_and_clears_durable_gp_proxy_table_with_network_lifecycle() {
     block_on(app.initialize()).unwrap();
     let proxy_entries = app.node().device().gp_proxy().entries();
     assert_eq!(proxy_entries.len(), 1);
-    assert_eq!(proxy_entries[0].frame_counter, 7);
+    // Skipped ahead by the counter persistence stride on restore.
+    assert_eq!(
+        proxy_entries[0].frame_counter,
+        7 + zigbee_gp::proxy::DEFAULT_COUNTER_PERSIST_STRIDE - 1
+    );
     assert!(
         app.node()
             .device()

@@ -83,15 +83,26 @@ pub const DEFAULT_TX_QUEUE_LIFETIME_MS: u32 = 10_000;
 /// start of the triggering GPDF, in µs.
 pub const GP_TX_OFFSET_US: u32 = 5_000;
 
+/// Default [`ProxyConfig::counter_persist_stride`].
+pub const DEFAULT_COUNTER_PERSIST_STRIDE: u32 = 64;
+
 /// Proxy configuration selected by the product.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProxyConfig {
     /// Commissioning window used when a Proxy Commissioning Mode command
     /// requests neither a window nor an exit mode.
     pub default_commissioning_window_s: u16,
-    /// Persist a forwarded frame counter only after it advanced by this many
-    /// values since the last persisted value (flash wear trade-off; sinks run
-    /// their own freshness check). 1 persists every update.
+    /// Persist a protected GPD's frame counter only after it advanced by
+    /// this many values since the last persisted value, and on
+    /// [`Proxy::restore`] skip it ahead by `stride - 1`: every counter
+    /// accepted before a reboot was below `persisted + stride`, so none is
+    /// accepted again after it. 1 persists every update and skips nothing.
+    ///
+    /// The trade-off is flash wear against frames lost after a reboot: up to
+    /// `stride - 1` genuinely new frames per GPD are rejected as stale until
+    /// its counter passes the skipped-ahead floor. The default 64 keeps one
+    /// GPD reporting every 60 s near ten years of a 10k-cycle, 4 KiB-sector
+    /// two-sector journal (one write per ~64 min; see the GP design doc).
     pub counter_persist_stride: u32,
     /// gpTxQueueEntryLifetime of a GPDF queued by a GP Response, ms
     /// (bidirectional proxies only).
@@ -102,7 +113,7 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             default_commissioning_window_s: DEFAULT_COMMISSIONING_WINDOW_S,
-            counter_persist_stride: 16,
+            counter_persist_stride: DEFAULT_COUNTER_PERSIST_STRIDE,
             tx_queue_lifetime_ms: DEFAULT_TX_QUEUE_LIFETIME_MS,
         }
     }
@@ -777,7 +788,17 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     }
 
     /// Restore an entry from persistent storage.
-    pub fn restore(&mut self, entry: ProxyEntry) -> Result<()> {
+    ///
+    /// A protected entry's frame counter is skipped ahead to the highest
+    /// value the proxy may have accepted before the reboot (`stored +
+    /// counter_persist_stride - 1`), so no frame it saw is accepted again.
+    /// The persisted value stays the stored one: the first frame above the
+    /// floor is persisted.
+    pub fn restore(&mut self, mut entry: ProxyEntry) -> Result<()> {
+        if entry.security_level.is_protected() {
+            let skip = self.config.counter_persist_stride.max(1) - 1;
+            entry.frame_counter = entry.persisted_counter.saturating_add(skip);
+        }
         if let Some(i) = self.find(&entry.gpd_id) {
             self.table[i] = entry;
             return Ok(());
@@ -2412,6 +2433,7 @@ mod tests {
 
     #[test]
     fn repeated_pairing_does_not_rewrite_the_table() {
+        const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
         // ZHA sends the same GP Pairing for every commissioning GPDF.
         let mut p = paired_proxy(1176);
         let fx = pair(&mut p, &zha_pairing(1176));
@@ -2422,20 +2444,151 @@ mod tests {
         pair(&mut p, &zha_pairing(1178));
         assert!(!p.take_dirty(), "counter +2");
         assert_eq!(p.entries()[0].frame_counter, 1178);
-        pair(&mut p, &zha_pairing(1176 + 15));
-        assert!(!p.take_dirty(), "counter +15");
-        pair(&mut p, &zha_pairing(1176 + 16));
-        assert!(p.take_dirty(), "counter +16 since the last write");
-        pair(&mut p, &zha_pairing(1176 + 17));
+        pair(&mut p, &zha_pairing(1176 + S - 1));
+        assert!(!p.take_dirty(), "counter +stride-1");
+        pair(&mut p, &zha_pairing(1176 + S));
+        assert!(p.take_dirty(), "counter +stride since the last write");
+        pair(&mut p, &zha_pairing(1176 + S + 1));
         assert!(!p.take_dirty(), "stride restarts at the written value");
         // GPDFs and Pairings share the stride.
         let mut aes = SoftwareAesProvider;
-        let raw = secure_off(1176 + 31, false);
+        let raw = secure_off(1176 + 2 * S - 1, false);
         let f = parse(&raw, 0, None).unwrap();
         p.on_gpdf(&mut aes, &f, GppGpdLink(0), 0);
-        assert!(!p.take_dirty(), "GPDF +15");
-        pair(&mut p, &zha_pairing(1176 + 32));
+        assert!(!p.take_dirty(), "GPDF +stride-1");
+        pair(&mut p, &zha_pairing(1176 + 2 * S));
         assert!(p.take_dirty(), "pairing completes the stride");
+    }
+
+    /// The Proxy Table snapshot the runtime journals when the proxy
+    /// reports it dirty.
+    type Flash = heapless::Vec<heapless::Vec<u8, MAX_ENTRY_ENCODED_LEN>, 4>;
+
+    fn journal(p: &P) -> Flash {
+        let mut out = [0u8; MAX_ENTRY_ENCODED_LEN];
+        p.entries()
+            .iter()
+            .map(|e| {
+                let n = e.encode(&mut out).unwrap();
+                heapless::Vec::from_slice(&out[..n]).unwrap()
+            })
+            .collect()
+    }
+
+    /// A fresh (rebooted) proxy restored from `flash`.
+    fn reboot(config: ProxyConfig, flash: &Flash) -> P {
+        let mut rebooted = P::new(config);
+        rebooted.set_own_nwk(0x1234);
+        for bytes in flash {
+            let (entry, used) = ProxyEntry::decode(bytes).unwrap();
+            assert_eq!(used, bytes.len());
+            rebooted.restore(entry).unwrap();
+        }
+        rebooted
+    }
+
+    fn gpdf(p: &mut P, fc: u32, now_ms: u32) -> GpdfOutcome {
+        let raw = secure_off(fc, false);
+        let f = parse(&raw, fc as u8, None).unwrap();
+        p.on_gpdf(&mut SoftwareAesProvider, &f, GppGpdLink(0), now_ms)
+    }
+
+    #[test]
+    fn reboot_skips_the_counter_ahead_by_the_stride() {
+        const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
+        let mut p = paired_proxy(1000);
+        let flash = journal(&p);
+        // Accept frames up to the last one before the next write.
+        let mut now = 0;
+        for fc in [1001, 1000 + S / 2, 1000 + S - 1] {
+            now += 1_000;
+            assert_eq!(gpdf(&mut p, fc, now), GpdfOutcome::Notification);
+            assert!(!p.take_dirty(), "fc {fc} is inside the stride");
+        }
+        // Power loss: the flash still holds 1000.
+        let mut p = reboot(p.config, &flash);
+        let floor = 1000 + S - 1;
+        assert_eq!(p.entries()[0].frame_counter, floor);
+        // Replays of everything accepted before the reboot are stale.
+        for fc in [1000, 1001, 1000 + S / 2, floor] {
+            now += 1_000;
+            assert_eq!(
+                gpdf(&mut p, fc, now),
+                GpdfOutcome::Dropped(DropReason::Stale),
+                "replayed fc {fc}"
+            );
+        }
+        assert!(!p.take_dirty());
+        // The first frame above the floor is forwarded and persisted.
+        now += 1_000;
+        assert_eq!(gpdf(&mut p, floor + 1, now), GpdfOutcome::Notification);
+        assert!(p.take_dirty(), "first frame after the reboot is written");
+        // ...after which the stride batches again.
+        now += 1_000;
+        assert_eq!(gpdf(&mut p, floor + S, now), GpdfOutcome::Notification);
+        assert!(!p.take_dirty());
+        now += 1_000;
+        assert_eq!(gpdf(&mut p, floor + S + 1, now), GpdfOutcome::Notification);
+        assert!(p.take_dirty());
+    }
+
+    #[test]
+    fn reboot_after_a_write_rejects_replays_below_the_new_floor() {
+        const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
+        let mut p = paired_proxy(1000);
+        assert_eq!(gpdf(&mut p, 1000 + S, 1_000), GpdfOutcome::Notification);
+        assert!(p.take_dirty(), "written at 1000+stride");
+        let flash = journal(&p);
+        assert_eq!(
+            gpdf(&mut p, 1000 + 2 * S - 1, 2_000),
+            GpdfOutcome::Notification
+        );
+        assert!(!p.take_dirty());
+        let mut p = reboot(p.config, &flash);
+        // The snapshot written at 1000+stride bounds every accepted counter.
+        assert_eq!(p.entries()[0].frame_counter, 1000 + 2 * S - 1);
+        assert_eq!(
+            gpdf(&mut p, 1000 + 2 * S - 1, 3_000),
+            GpdfOutcome::Dropped(DropReason::Stale)
+        );
+        assert_eq!(gpdf(&mut p, 1000 + 2 * S, 4_000), GpdfOutcome::Notification);
+    }
+
+    #[test]
+    fn stride_one_restores_the_exact_counter() {
+        let mut p = P::new(ProxyConfig {
+            counter_persist_stride: 1,
+            ..ProxyConfig::default()
+        });
+        p.set_own_nwk(0x1234);
+        pair(&mut p, &zha_pairing(1000));
+        assert!(p.take_dirty());
+        assert_eq!(gpdf(&mut p, 1001, 1_000), GpdfOutcome::Notification);
+        assert!(p.take_dirty(), "stride 1 writes every frame");
+        let mut p = reboot(p.config, &journal(&p));
+        assert_eq!(p.entries()[0].frame_counter, 1001);
+        assert_eq!(
+            gpdf(&mut p, 1001, 2_000),
+            GpdfOutcome::Dropped(DropReason::Stale)
+        );
+        assert_eq!(gpdf(&mut p, 1002, 3_000), GpdfOutcome::Notification);
+    }
+
+    #[test]
+    fn skip_ahead_saturates_and_leaves_unprotected_entries_alone() {
+        let mut p = paired_proxy(u32::MAX - 3);
+        let p2 = reboot(p.config, &journal(&p));
+        assert_eq!(p2.entries()[0].frame_counter, u32::MAX, "exhausted");
+        // An unsecured MAC-sequence entry keeps its 8-bit window.
+        let mut pr = Pairing::decode(&zha_pairing(7)).unwrap();
+        pr.security_level = SecurityLevel::None;
+        pr.key_type = KeyType::NoKey;
+        pr.key = None;
+        let mut b = [0u8; 64];
+        let n = pr.encode(&mut b).unwrap();
+        pair(&mut p, &b[..n]);
+        let p3 = reboot(p.config, &journal(&p));
+        assert_eq!(p3.entries()[0].frame_counter, 7);
     }
 
     #[test]

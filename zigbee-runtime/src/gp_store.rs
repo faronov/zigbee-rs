@@ -18,10 +18,13 @@
 //! The proxy marks its table dirty when an entry changes and, for incoming
 //! GPD frame counters, only every
 //! [`ProxyConfig::counter_persist_stride`](zigbee_gp::proxy::ProxyConfig)
-//! frames, which bounds flash wear. After a power loss a GPD frame whose
-//! counter lies between the persisted and the last accepted value is
-//! accepted once more; a stride of 1 removes that window at the cost of one
-//! journal write per received GPDF.
+//! frames, which bounds flash wear. On restore it skips each protected
+//! entry's counter ahead by `stride - 1`, the most it can have accepted
+//! since the last write, so no frame seen before a power loss is accepted
+//! again; the price is up to `stride - 1` new frames per GPD rejected as
+//! stale after a reboot. The only remaining window is a frame accepted
+//! after its write was triggered but before the journal write in the same
+//! router loop pass completed.
 
 use embedded_storage::nor_flash::NorFlash;
 use zigbee_gp::proxy::{MAX_ENTRY_ENCODED_LEN, ProxyEntry};

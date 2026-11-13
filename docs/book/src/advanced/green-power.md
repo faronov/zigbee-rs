@@ -43,10 +43,10 @@ Implementation notes that differ from the design below:
   group snapshot drops them and the GP restore re-adds them after the APS
   restore.
 - The proxy persists the per-GPD security frame counter with a stride
-  (`ProxyConfig::counter_persist_stride`, default 16). After a power loss
-  up to stride − 1 already-tunnelled frames could be accepted once more by
-  this proxy; zigpy's sink checks the counter again. A stride of 1 removes
-  the window at the cost of one flash slot per frame.
+  (`ProxyConfig::counter_persist_stride`, default 64) and skips it ahead by
+  stride − 1 on restore, so no frame accepted before a power loss is
+  accepted again. The cost is up to stride − 1 new frames per GPD rejected
+  as stale after a reboot (§3.3).
 - The corrected ZCL GP cluster is behind `zigbee-zcl/green-power`
   (enabled by `zigbee-runtime/green-power`). Without the feature,
   `clusters/green_power_legacy.rs` (master's skeleton, verbatim) is
@@ -188,9 +188,11 @@ requires Proxy Basic on every router, so the router builds turn it on:
   `--features router-core` / `scripts/tlsr8258.sh build router-core`).
 - STM32WB5MM-DK: `green-power` is in the example's default features;
   `--no-default-features` builds the router without GP.
-- ZBT-1 with the `zrs-boot` loader: `green-power` is a compile error,
-  because the loader's secondary slot overlaps the GP window at 0xF0000.
-  Loader builds use `router-core,zrs-boot`.
+- ZBT-1 with the `zrs-boot` loader: `router,zrs-boot` includes GP. Loader
+  layout version 2 shrank both slots by 8 KiB (cap 465,664 B) and reserves
+  the GP window `0xF0000..0xF4000` below the router tables, so direct and
+  loader-linked routers share the same Proxy Table journal. The GP-off
+  loader build is `router-core,zrs-boot`.
 - Sensors, EDs, SEDs and the GPD apps are unchanged.
 
 The GP-off builds must stay byte-identical to master's routers (apart from
@@ -328,15 +330,32 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
 
 - Authoritative in RAM.
 - Checkpointed lazily: when it has advanced by `counter_persist_stride`
-  (default 16) since the last written value, or with any other table
+  (`N`, default 64) since the last written value, or with any other table
   change. GPDFs and GP Pairings share the stride.
 - A GP Pairing that changes nothing but the counter, and does not complete
   the stride, is not written. A counter decrease (a re-commissioned GPD) is
   always written, so the stored value never exceeds the live one.
-- After a reset, frames in the window up to the last checkpoint could be
-  replayed through the proxy. The sink checks counters again (zigpy keeps
-  `frame_counter`). This is the same documented trade-off as the NWK replay
-  floors.
+- Skip-ahead on restore: every counter accepted since the last write is
+  below `stored + N`, so `Proxy::restore` sets a protected entry's counter
+  to `stored + N − 1` (saturating) and keeps `stored` as the persisted
+  value. Replays of anything seen before the reboot are dropped as stale;
+  the first frame above the floor is forwarded and written at once. Entries
+  without security (MAC sequence window) are restored unchanged.
+- Cost: after a router reboot up to `N − 1` genuinely new frames per GPD
+  are rejected by this proxy until the GPD's counter passes the floor:
+  about an hour for a sensor reporting every 60 s, or up to 63 presses of a
+  GP switch that only this proxy hears. A sink that hears the GPD directly
+  (or through another proxy) is unaffected. A product with a switch-only,
+  proxy-only deployment can choose a smaller `N` (wear scales with `1/N`).
+- Remaining window: a frame accepted after its write was triggered but
+  before the journal write in the same router loop pass completed. The sink
+  checks counters again (zigpy keeps `frame_counter`).
+- Host tests (`zigbee-gp` proxy tests): reboot skip-ahead rejects replays
+  of every pre-reboot counter and accepts the first frame above the floor;
+  a reboot after a stride write uses the new floor; stride 1 restores the
+  exact counter; saturation at `u32::MAX`; unsecured entries keep their
+  counter. The runtime and `router-app` lifecycle tests restore through
+  the journal.
 
 **GPD outgoing frame counter (security levels 2/3)**
 
@@ -351,15 +370,28 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
 
 No board crate gets GP storage. Products own the partitions.
 
-**Flash endurance (open).** Every record is a 1024-byte slot. With one GPD
-reporting every 60 s and the default stride of 16, the proxy writes one
-slot every 16 min, so a two-sector journal of 4 KiB sectors erases each
-sector about every 2.1 h: about 10,000 cycles in 2.4 years. Each extra
-GPD shortens that proportionally. 8 KiB sectors (EFR32MG21, ZBT-1) halve
-the rate. This matters on internal flash rated for 10,000 cycles (nRF52,
-EFR32, STM32WB); the ESP32 and TLSR8258 SPI flash is rated for 100,000.
-Options before production: a larger stride, a bigger partition, or a
-smaller slot per record.
+**Flash endurance.** Every record is a 1024-byte slot, so a two-sector
+journal of 4 KiB sectors erases each sector once per 8 writes (8 KiB
+sectors: once per 16). Each GPD causes one write per `N` frames. Years
+until 10,000 erase cycles per sector (internal flash: nRF52, EFR32,
+STM32WB); the ESP32, TLSR8258 and BL702 SPI flash is rated for 100,000
+cycles, ten times longer:
+
+| GPDs reporting every 60 s | `N` = 16 (before) | `N` = 64 (default) | `N` = 128 |
+|---|---:|---:|---:|
+| 1, 4 KiB sectors (nRF52, STM32WB) | 2.4 y | 9.7 y | 19.5 y |
+| 1, 8 KiB sectors (EFR32MG21, ZBT-1) | 4.9 y | 19.5 y | 39 y |
+| 10, 4 KiB sectors | 0.24 y | 0.97 y | 1.9 y |
+| 10, 8 KiB sectors | 0.49 y | 1.9 y | 3.9 y |
+
+`N` = 64 is the smallest power of two that keeps one 60 s GPD near ten
+years on the weakest flash (4 KiB, 10,000 cycles: ten years need at most
+one write per 65.7 min). A larger `N` mostly costs reboot losses (above).
+Ten busy GPDs on 10,000-cycle internal flash still wear out in one to two
+years; the fix is smaller records, not a larger `N`: the snapshot rewrites
+every entry in a 1 KiB slot, while a counter-only record of about 32 B
+would fit 32 records per 1 KiB and stretch the same numbers about 30×
+(open, not implemented).
 
 ### 3.4 ZCL
 
@@ -586,8 +618,9 @@ TLSR8258 sensor and ED share the router's `memory.x`, so their flash limit
 dropped by 8 KiB to 0x6E000; they use about 194 KB.
 
 GP stays off where the router does not link on master (EFR32MG22,
-CC2340R5, PB-03F, PHY6222, EFR32MG1) and in ZBT-1 `zrs-boot` loader
-builds.
+CC2340R5, PB-03F, PHY6222, EFR32MG1). The ZBT-1 `zrs-boot` loader build
+has GP since loader layout version 2 (signed image 385,862 B in the
+465,664 B cap, `.bss` 41,232 B, stack 56,048 B).
 
 Feature-off identity against master 67044d2 (firmware-identical to
 dd44367). Both trees were built from the same checkout path, because
@@ -761,7 +794,7 @@ All times are EET.
     router prints `GP proxy entries … | forwards sent … cancelled …` with
     its 60 s neighbour summary.
   - A Pairing that changes nothing is not written. A counter-only change
-    follows the 16-value persistence stride (see 3.3). zigpy's three
+    follows the 16-value persistence stride (the default then; now 64, see 3.3). zigpy's three
     Pairings in this run would now cost one record instead of three.
   - Cost on the Waveshare H2-Zero GP router: `.text` +2,632 B, `.rodata`
     +376 B, `.data` +32 B, `.bss` +8 B (app image 512,096 B → 515,136 B).
@@ -835,7 +868,7 @@ running the nRF 802.15.4 sniffer on channel 15.
 - **Pairing write skip:** none of the three Pairings wrote a record.
   - Before the press, the GP window held generations 16–20; the newest was
     gen 20 with counter 1469.
-  - The Pairing counters (≤ 1481) were within the 16-value stride. The next
+  - The Pairing counters (≤ 1481) were within the 16-value stride (the default then). The next
     record was the stride checkpoint: gen 21, counter 1485, at 22:03:53.644.
   - Later checkpoints followed at counter 1501 (22:19:55) and counter 1517
     (22:35:57).

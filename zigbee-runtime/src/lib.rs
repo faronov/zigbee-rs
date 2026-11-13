@@ -16624,13 +16624,18 @@ mod parent_router_tests {
         block_on(router.gp_poll());
         assert!(router.mac().tx_history().is_empty());
 
-        // The table survives a reboot with its group and frame counter.
+        // The table survives a reboot with its group and its frame counter,
+        // skipped ahead by the persistence stride (every counter accepted
+        // since the last write is below stored + stride).
         let mut store = crate::gp_store::RamGpProxyStore::new();
         assert!(router.save_gp_proxy_table_if_dirty(&mut store).unwrap());
         assert!(!router.save_gp_proxy_table_if_dirty(&mut store).unwrap());
         let mut rebooted = centralized_router();
         assert_eq!(rebooted.restore_gp_proxy_table(&mut store).unwrap(), 1);
-        assert_eq!(rebooted.gp_proxy().entries()[0].frame_counter, 2);
+        assert_eq!(
+            rebooted.gp_proxy().entries()[0].frame_counter,
+            2 + zigbee_gp::proxy::DEFAULT_COUNTER_PERSIST_STRIDE - 1
+        );
         assert!(
             rebooted
                 .bdb
