@@ -948,7 +948,7 @@ loader with `watchdog-ms = 8000`.
 | EFR32MG21 `sed,zrs-boot` | 234,272 B | 252,672 B |
 | EFR32MG21 `ed,zrs-boot` | 229,988 B | 252,672 B |
 | ZBT-1 `router,zrs-boot` (now `router-core,zrs-boot`; info logs, trial confirm, no OTA client) | 357,544 B (+2,048 vs the direct router's 355,496 B); `.bss` 39,184 B (unchanged), stack 58,096 B | 473,856 B (layout v1) |
-| ZBT-1 `router,zrs-boot` with Green Power (layout v2) | 385,862 B signed (slot margin 81,082 B); `.bss` 41,232 B, stack 56,048 B | 465,664 B |
+| ZBT-1 `router,zrs-boot` with Green Power (layout v2) | 385,871 B signed (slot margin 81,073 B); `.bss` 41,232 B, stack 56,048 B | 465,664 B |
 
 Shipped default images: with these changes reverted in the same worktree,
 the nRF52840 UF2 (ProMicro, 228,840 B) and EFR32MG22 sensor (234,160 B)
@@ -1758,7 +1758,32 @@ Notes:
   or anything from `0xF4000` up, and never restore a full backup (that
   rolls back the frame counters).
 - **Board state.** Loader plus confirmed TEST-ONLY 0.1.3 loader-linked
-  router.
+  router (superseded by layout v2, below).
+
+### ZBT-1 layout v2 with Green Power (2026-11-13)
+
+The same board, with loader layout version 2: slots shrunk by 8 KiB
+(primary `0x8000..0x7C000`, secondary `0x7C000..0xF0000`) and the GP
+Proxy Table window `0xF0000..0xF4000` reserved. The application is
+`router,zrs-boot` with the Green Power Proxy Basic, from `green-power`
+commit `2e54ea7`, TEST-ONLY versions 0.2.0 and 0.2.1 (385,902/385,903 B
+signed with the own key). The secondary test image was padded with
+imgtool 2.4.0, `--slot-size 0x74000 --pad`. **Validation level:
+lab-tested on one board.** The Proxy Table held no entry: the MG22 GPD
+was not re-commissioned during this test, so no forwarding through the
+ZBT-1 was observed.
+
+| step | result |
+|---|---|
+| Preparation | Full backup read twice, identical, SHA-256 `d7305f91…`. Journal gate passed: `0x4A76`, PAN `0xDFE9`, channel 15, NWK counter limit `0x68400`, TCLK `0x1C80D`, 2 children, APS empty. Gecko `c84f5462…` and the v1 loader in place; `0xF0000..0xF4000` erased |
+| Install | Erased `0x4000..0xF4000` (120 sectors, verified 0xFF). Programmed the v2 loader (16 KiB, SHA-256 `97496ec6…`) at `0x4000` and signed 0.2.0 (`7fc4e168…`) at `0x8000`; both read back and compared |
+| First boot | `loader Own`, `trial permanent 0`, `valid security journal preserved`, `Resume: addr=0x4A76 PAN=0xDFE9 ch=15`, `0 GP proxy table entries restored`, `router online` 93 ms after reset. The 60 s summary printed `GP proxy entries 0 \| forwards sent 0 cancelled 0`. No rejoin; the two children re-parented after `Parent_annce` |
+| Upgrade 0.2.0→0.2.1 | Padded 0.2.1 (`2e5aa167…`, 475,136 B, ends at `0xF0000`) staged in the secondary over SWD. After the reset: `trial testing 1`, then `trial confirm: testing 1 -> confirmed` 1.7 s after boot. Reset to banner ≈10.5 s (install copy) |
+| Retention | Final backup `28f41b72…` passed the journal gate: same identity, counters forward only (NWK `0x68400`→`0x69000`, TCLK `0x1C80D`→`0x1D40D`). Gecko and the v2 loader unchanged; the primary equals the padded 0.2.1 except the trial-log sector `0x7A000`; secondary first sector and trailer erased; the GP window is still erased. ZHA shows `0x4A76` available (last seen 17:27 EET) |
+
+Board state: v2 loader plus confirmed TEST-ONLY 0.2.1 loader-linked
+router with GP. Restore rule unchanged: never write `0x0..0x4000` or
+from `0xF4000` up.
 
 ## Open decisions
 
