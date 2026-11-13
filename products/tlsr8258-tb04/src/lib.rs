@@ -55,6 +55,12 @@ pub const SECURITY_PARTITION_SIZE: usize = 8 * 1024;
 pub const APS_TABLE_PARTITION_START: u32 = 0x0007_0000;
 pub const APS_TABLE_PARTITION_SIZE: usize = 8 * 1024;
 
+/// Router Green Power Proxy Table journal partition (two 4 KiB erase
+/// sectors) directly below the APS journal. Every image's linker map ends
+/// the application here (`_gp_nv_start_`); only the router writes it.
+pub const GP_PROXY_TABLE_PARTITION_START: u32 = 0x0006_E000;
+pub const GP_PROXY_TABLE_PARTITION_SIZE: usize = 8 * 1024;
+
 /// Product-owned child-table journal partition (two 4 KiB erase sectors).
 ///
 /// Kept strictly before the security partition and below Telink's factory
@@ -65,6 +71,10 @@ const FACTORY_EUI_SECTOR_START: u32 = 0x0007_6000;
 
 const _: () =
     assert!(SECURITY_PARTITION_START as usize + SECURITY_PARTITION_SIZE <= FLASH_CAPACITY);
+const _: () = assert!(
+    GP_PROXY_TABLE_PARTITION_START + GP_PROXY_TABLE_PARTITION_SIZE as u32
+        <= APS_TABLE_PARTITION_START
+);
 const _: () = assert!(
     APS_TABLE_PARTITION_START + APS_TABLE_PARTITION_SIZE as u32 <= CHILD_TABLE_PARTITION_START
 );
@@ -90,6 +100,12 @@ mod tests {
 
     #[test]
     fn child_table_partition_precedes_security_and_factory_data() {
+        assert_eq!(GP_PROXY_TABLE_PARTITION_START, 0x6E000);
+        assert_eq!(
+            GP_PROXY_TABLE_PARTITION_START as usize + GP_PROXY_TABLE_PARTITION_SIZE,
+            APS_TABLE_PARTITION_START as usize,
+            "the GP and APS journals must never share an erase sector"
+        );
         assert_eq!(APS_TABLE_PARTITION_START, 0x70000);
         assert_eq!(APS_TABLE_PARTITION_SIZE, 0x2000);
         assert_eq!(

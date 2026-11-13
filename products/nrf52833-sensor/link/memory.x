@@ -6,13 +6,15 @@ MEMORY
   /* Do not shrink this reservation without verifying the journal's */
   /* sector-rollover margin — the Zigbee frame counters live there and */
   /* reusing a counter after a power loss breaks network security. */
-  /* 0x0007A000..0x0007DFFF (pages 122-125) hold the router role's
+  /* 0x00078000..0x00079FFF (pages 120-121) hold the router role's Green
+   * Power Proxy Table journal and 0x0007A000..0x0007DFFF (pages 122-125) its
    * child-table and APS journals (src/router.rs). Every role image (sensor
    * SED, End Device, Router) links this same map, so no role's code can
    * overlap another role's persistence. */
-  FLASH         : ORIGIN = 0x00000000, LENGTH = 488K
-  ROUTER_TABLES : ORIGIN = 0x0007A000, LENGTH = 16K
-  RAM           : ORIGIN = 0x20000000, LENGTH = 128K
+  FLASH          : ORIGIN = 0x00000000, LENGTH = 480K
+  GP_PROXY_TABLE : ORIGIN = 0x00078000, LENGTH = 8K
+  ROUTER_TABLES  : ORIGIN = 0x0007A000, LENGTH = 16K
+  RAM            : ORIGIN = 0x20000000, LENGTH = 128K
 }
 
 /* Post-link boundary checks.
@@ -32,8 +34,12 @@ _security_partition_end   = 0x00080000;
 
 ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= _security_partition_start,
   "nRF52833 application flash overlaps the protected security journal partition");
-ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) == ORIGIN(ROUTER_TABLES),
-  "nRF52833 application must end at the router-table journals");
+ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) == ORIGIN(GP_PROXY_TABLE),
+  "nRF52833 application must end at the GP Proxy Table journal");
+ASSERT(ORIGIN(GP_PROXY_TABLE) + LENGTH(GP_PROXY_TABLE) == ORIGIN(ROUTER_TABLES),
+  "nRF52833 GP Proxy Table journal must end at the router-table journals");
+ASSERT(ORIGIN(ROUTER_TABLES) == 0x0007A000,
+  "nRF52833 router-table journals must stay at 0x0007A000");
 ASSERT(ORIGIN(ROUTER_TABLES) + LENGTH(ROUTER_TABLES) == _security_partition_start,
   "nRF52833 router-table journals must end at the security journal");
 ASSERT(_security_partition_end == 512K,

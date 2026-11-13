@@ -121,6 +121,22 @@ impl GreenPowerState {
         }
     }
 
+    /// Initialize `*dst` in place.
+    ///
+    /// Out of line on purpose: the device builder writes `ZigbeeDevice` in
+    /// place, and constructing this value inside the builder kept a
+    /// temporary in the builder's frame, which sits on the deepest boot
+    /// stack chain (`compose -> assemble_into -> NwkLayer::write_into`).
+    ///
+    /// # Safety
+    ///
+    /// `dst` must be valid for writes and properly aligned.
+    #[inline(never)]
+    pub(crate) unsafe fn write_into(dst: *mut Self) {
+        // SAFETY: the caller guarantees `dst` is writable and aligned.
+        unsafe { dst.write(Self::new()) }
+    }
+
     /// Drop all network-bound GP state (leave / factory reset). The emptied
     /// table is reported dirty so the product persists the reset.
     pub(crate) fn clear(&mut self) {
@@ -441,17 +457,20 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             self.green_power.proxy.on_alias_device_annce(nwk);
             return;
         }
+        // The Dmin..Dmax alias-defence delay (A.3.5.2.1) only has to
+        // differ between proxies, not be secret: draw it from the NWK
+        // jitter mixer like the broadcast jitter and Parent Announce timer,
+        // so no platform entropy harvester or DRBG (software AES on
+        // TLSR8258) is linked into router images for it.
+        let now_us = self.bdb.zdo().nwk().mac().monotonic_micros();
+        let ieee_mix = ieee.iter().fold(u32::from(nwk), |acc, &b| {
+            acc.rotate_left(5) ^ u32::from(b).wrapping_mul(0x9E37_79B9)
+        });
+        let random = zigbee_nwk::routing::routing_random_sample(now_us ^ ieee_mix);
         let now_ms = self.gp_now_ms();
-        let mut random = [0u8; 4];
-        let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
-        if mac.fill_random(&mut random).is_err() {
-            // Without entropy the conflict announcement still goes out, at
-            // the deterministic end of the Dmin..Dmax window.
-            random = [0xFF; 4];
-        }
         self.green_power
             .proxy
-            .on_device_annce(nwk, ieee, now_ms, u32::from_le_bytes(random));
+            .on_device_annce(nwk, ieee, now_ms, random);
     }
 
     /// Microseconds until [`gp_poll`](Self::gp_poll) has work, `None` when

@@ -87,6 +87,19 @@ def _nrf_role(name: str, crate: str, role: str) -> Image:
                  f"target/thumbv7em-none-eabihf/release/{name}", args)
 
 
+def _core(name: str, crate: str, target: str, binary: str,
+          no_default: bool = True, extra: tuple[str, ...] = (),
+          toolchain: str = RUST_TOOLCHAIN) -> Image:
+    """A router bin built without Green Power (`router-core`).
+
+    Green Power is on in every production router image; the `-core` row is
+    the same router without it, so the GP cost stays visible.
+    """
+    args = [*extra] + (["--no-default-features"] if no_default else [])
+    return Image(name, f"examples/{crate}", f"target/{target}/release/{binary}",
+                 args + ["--features", "router-core", "--bin", binary], toolchain)
+
+
 def _uf2(board: str, feature: str) -> Image:
     return Image(
         f"nrf52840-sensor-uf2-{board}", "examples/nrf52840-sensor-uf2",
@@ -155,8 +168,12 @@ IMAGES: list[Image] = [
     _nrf("nrf52833-sensor-sht31", "nrf52833-sensor", "sensor-sht31"),
     _nrf_role("nrf52833-ed", "nrf52833-sensor", "ed"),
     _nrf_role("nrf52833-router", "nrf52833-sensor", "router"),
+    _core("nrf52833-router-core", "nrf52833-sensor", "thumbv7em-none-eabihf",
+          "nrf52833-router"),
     _nrf_role("nrf52840-ed", "nrf52840-router", ""),
     _nrf_role("nrf52840-router", "nrf52840-router", "router"),
+    _core("nrf52840-router-core", "nrf52840-router", "thumbv7em-none-eabihf",
+          "nrf52840-router"),
     _uf2("promicro", "board-promicro"),
     _uf2("mdk", "board-mdk"),
     _uf2("pca10059", "board-nrf-dongle"),
@@ -168,6 +185,8 @@ IMAGES: list[Image] = [
           no_default=False),
     _role("bl702-router", "bl702-sensor", "riscv32imc-unknown-none-elf",
           "router", no_default=False),
+    _core("bl702-router-core", "bl702-sensor", "riscv32imc-unknown-none-elf",
+          "bl702-router", no_default=False),
     Image("cc2340-sensor-fallback", "examples/cc2340-sensor",
           "target/fallback/thumbv6m-none-eabi/release/cc2340-sensor",
           ["--target-dir", "target/fallback"], env_unset=["CC2340_SDK_DIR"]),
@@ -186,9 +205,13 @@ IMAGES: list[Image] = [
     # MG22 router does not fit 32 KiB SRAM (its link is rejected).
     _efr32s2("efr32mg21-ed", "efr32mg21-sensor", "ed"),
     _efr32s2("efr32mg21-router", "efr32mg21-sensor", "router"),
+    _core("efr32mg21-router-core", "efr32mg21-sensor",
+          "thumbv8m.main-none-eabihf", "efr32mg21-router"),
     _efr32s2("efr32mg22-ed", "efr32mg22-sensor", "ed"),
     _efr32s2("ha-connect-zbt1-ed", "ha-connect-zbt1", ""),
     _efr32s2("ha-connect-zbt1-router", "ha-connect-zbt1", "router"),
+    _core("ha-connect-zbt1-router-core", "ha-connect-zbt1",
+          "thumbv8m.main-none-eabihf", "ha-connect-zbt1-router"),
     _efr32s2("ha-connect-zbt1-sed", "ha-connect-zbt1", "sed"),
     _esp("esp32c6", False),
     _esp("esp32c6", True),
@@ -196,8 +219,14 @@ IMAGES: list[Image] = [
     _esp("esp32h2", True),
     _esp_role("esp32c6", "ed"),
     _esp_role("esp32c6", "router"),
+    _core("esp32c6-router-core", "esp32c6-sensor", "riscv32imac-unknown-none-elf",
+          "esp32c6-router", extra=("-Z", "build-std=core,alloc"),
+          toolchain=ESP_PHY_TOOLCHAIN),
     _esp_role("esp32h2", "ed"),
     _esp_role("esp32h2", "router"),
+    _core("esp32h2-router-core", "esp32h2-sensor", "riscv32imac-unknown-none-elf",
+          "esp32h2-router", extra=("-Z", "build-std=core,alloc"),
+          toolchain=ESP_PHY_TOOLCHAIN),
     Image("phy6222-sensor", "examples/phy6222-sensor",
           f"{_PHY_TARGET}/phy6222/thumbv6m-none-eabi/release/phy6222-sensor",
           ["--target-dir", f"{_PHY_TARGET}/phy6222"], ESP_PHY_TOOLCHAIN),
@@ -209,6 +238,14 @@ IMAGES: list[Image] = [
           f"{_PHY_TARGET}/pb03f/thumbv6m-none-eabi/release/pb03f-zigbee",
           ["--bin", "pb03f-zigbee", "--target-dir", f"{_PHY_TARGET}/pb03f"],
           ESP_PHY_TOOLCHAIN),
+    # STM32WB5MM-DK router without the optional board peripherals, with and
+    # without Green Power (the stock image adds LED/LCD/touch/sensors/mic).
+    Image("stm32wb5mm-dk-router", "examples/stm32wb5mm-dk-router",
+          "target/thumbv7em-none-eabihf/release/stm32wb5mm-dk-router",
+          ["--no-default-features", "--features", "green-power"]),
+    Image("stm32wb5mm-dk-router-core", "examples/stm32wb5mm-dk-router",
+          "target/thumbv7em-none-eabihf/release/stm32wb5mm-dk-router",
+          ["--no-default-features"]),
     _phy_ed("phy6222-ed", "examples/phy6222-sensor", "phy6222-ed",
             "production,phy6222,ed"),
     _phy_ed("phy6252-ed", "examples/phy6222-sensor", "phy6222-ed",
@@ -221,6 +258,7 @@ IMAGES: list[Image] = [
             "telink-tlsr8258-sensor"),
     _telink("tlsr8258-ed", "ed", "telink-tlsr8258-ed"),
     _telink("tlsr8258-router", "router", "telink-tlsr8258-router"),
+    _telink("tlsr8258-router-core", "router-core", "telink-tlsr8258-router"),
 ]
 
 

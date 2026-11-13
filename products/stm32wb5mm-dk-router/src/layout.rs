@@ -18,9 +18,12 @@ pub const SETTINGS_PHYSICAL_SIZE: usize = 2 * PAGE_SIZE;
 pub const SETTINGS_SECTOR_SIZE: usize = 2048;
 
 /// End of the application image (`FLASH` in `link/memory.x`).
-pub const APPLICATION_END: u32 = 0x080D_3000;
+pub const APPLICATION_END: u32 = 0x080C_F000;
+/// Green Power Proxy Table journal (same geometry as the router journals).
+/// Reserved in every image; only `green-power` builds open it.
+pub const GP_PROXY_TABLE_START: u32 = APPLICATION_END;
 /// Small application settings (the Occupancy Sensing motion hold).
-pub const SETTINGS_START: u32 = APPLICATION_END;
+pub const SETTINGS_START: u32 = GP_PROXY_TABLE_START + JOURNAL_PHYSICAL_SIZE as u32;
 /// The router journals keep the addresses of the first commissioned
 /// images, so an upgrade retains the network state.
 pub const CHILD_TABLE_START: u32 = SETTINGS_START + SETTINGS_PHYSICAL_SIZE as u32;
@@ -39,6 +42,7 @@ const _: () = assert!(NV_END == EXPECTED_SECURE_START);
 const _: () = assert!(JOURNAL_PHYSICAL_SIZE == 2 * 2 * JOURNAL_SECTOR_SIZE);
 const _: () = assert!(SETTINGS_PHYSICAL_SIZE == 2 * 2 * SETTINGS_SECTOR_SIZE);
 const _: () = assert!(CHILD_TABLE_START == 0x080D_5000);
+const _: () = assert!(SETTINGS_START == 0x080D_3000);
 
 #[cfg(test)]
 mod tests {
@@ -46,11 +50,12 @@ mod tests {
 
     #[test]
     fn journals_are_contiguous_below_the_secure_area() {
+        assert_eq!(GP_PROXY_TABLE_START, 0x080C_F000);
         assert_eq!(SETTINGS_START, 0x080D_3000);
         assert_eq!(CHILD_TABLE_START, 0x080D_5000);
         assert_eq!(APS_TABLE_START, 0x080D_9000);
         assert_eq!(SECURITY_START, 0x080D_D000);
         assert_eq!(NV_END, 0x080E_1000);
-        assert_eq!((APPLICATION_END - FLASH_BASE) / 1024, 844);
+        assert_eq!((APPLICATION_END - FLASH_BASE) / 1024, 828);
     }
 }

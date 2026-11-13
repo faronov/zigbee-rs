@@ -5,8 +5,8 @@
 //! takes its Frame Pending bit from a bounded source table the core arms,
 //! so the core's software pending set is empty) under
 //! [`router_app::ParentRouterApp`]: beacons, association, indirect TX to
-//! sleepy children, routing, durable child and APS tables (and, with
-//! `green-power`, a GP Proxy Basic with a durable Proxy Table). Status goes
+//! sleepy children, routing, durable child and APS tables, and a GP Proxy
+//! Basic with a durable Proxy Table (`router-core` builds without it). Status goes
 //! to the console and the WS2812 on GPIO8; BOOT (GPIO9) re-arms
 //! commissioning after a Leave.
 //!

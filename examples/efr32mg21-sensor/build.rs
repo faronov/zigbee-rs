@@ -44,10 +44,25 @@ fn main() {
             .iter()
             .any(|r| r.region.start == tables && r.region.len() == tables_len);
         assert!(
-            tables_reserved || env::var_os("CARGO_FEATURE_ROUTER").is_none(),
+            tables_reserved || env::var_os("CARGO_FEATURE_ROUTER_CORE").is_none(),
             "{LAYOUT} reclaims the router tables ({tables:#X}, {tables_len} B) for the \
-             slots: feature `router` cannot be combined with `zrs-boot`"
+             slots: feature `router-core` cannot be combined with `zrs-boot`"
         );
+        // The GP Proxy Table journal must stay outside every region the
+        // loader writes.
+        if env::var_os("CARGO_FEATURE_GREEN_POWER").is_some() {
+            let (gp, gp_len) = region(&direct, "GP_PROXY_TABLE");
+            let gp = zrs_boot_layout::Region {
+                start: gp,
+                end: gp + gp_len,
+            };
+            for written in [&layout.loader, &layout.primary, &layout.secondary] {
+                assert!(
+                    !written.overlaps(&gp),
+                    "{LAYOUT}: the GP Proxy Table journal overlaps a loader region"
+                );
+            }
+        }
         let mut script = layout.app_memory_x();
         // Keep the product's stack-floor assertions.
         for statement in stack_asserts(&direct) {

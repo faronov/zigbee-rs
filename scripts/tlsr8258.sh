@@ -7,7 +7,7 @@ mode="${2:-sensor}"
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/tlsr8258.sh <check|build|flash> [sensor|sensor-retention|sensor-retention-10s|ed|router]
+usage: scripts/tlsr8258.sh <check|build|flash> [sensor|sensor-retention|sensor-retention-10s|ed|router|router-core]
        scripts/tlsr8258.sh <dump|dump-activate> <address> [word-count]
 
 Production firmware:
@@ -15,7 +15,9 @@ Production firmware:
   sensor-retention       feature-gated LOW32K proof, 250 ms wake-stress poll
   sensor-retention-10s   feature-gated 10 s steady-state LOW32K proof
   ed           always-on (RX-on-when-idle) non-routing End Device
-  router       always-on join/relay router with hardware AES
+  router       always-on join/relay router with hardware AES and the
+               Green Power Proxy Basic
+  router-core  the router without Green Power
 
 SWire memory dumps are served by the standalone radio harness script
 (examples/telink-tlsr8258-radio/scripts/tlsr8258.sh), which also builds the
@@ -48,6 +50,10 @@ case "$action:$mode" in
     check:runtime-router|build:runtime-router|flash:runtime-router)
         exec "$ROOT_DIR/tools/tlsr8258-firmware.sh" "$action" \
             examples/telink-tlsr8258-router telink-tlsr8258-router
+        ;;
+    check:router-core|build:router-core|flash:router-core)
+        exec "$ROOT_DIR/tools/tlsr8258-firmware.sh" "$action" \
+            examples/telink-tlsr8258-router telink-tlsr8258-router router-core
         ;;
     dump:*|dump-activate:*)
         exec "$ROOT_DIR/examples/telink-tlsr8258-radio/scripts/tlsr8258.sh" "$@"

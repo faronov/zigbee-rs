@@ -20,6 +20,9 @@ mains = ["dep:router-app"]
 # Adds a Pressure Measurement cluster to the profile for the BME280 variant.
 # Keep in sync with the `sensor-bme280` feature in examples/nrf52833-sensor.
 sensor-bme280 = []
+# Green Power Proxy Basic for the router role: the GP Proxy Table journal
+# (`router::gp_proxy_table_store`). The window is reserved in every image.
+green-power = ["mains", "router-app/green-power", "zigbee-runtime/green-power"]
 
 [dependencies]
 router-app = { path = "../../apps/router", default-features = false, optional = true }

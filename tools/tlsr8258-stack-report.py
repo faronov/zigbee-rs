@@ -45,7 +45,10 @@ Exit status with `--check`: 1 when any gate fails:
   LABEL=REGEX=BYTES` exceeds its budget (or nothing matches);
 * a function with unresolved indirect call sites is not matched by a
   `--allow-unresolved REGEX`. Allowlisting only records that the site was
-  reviewed; it does NOT prove the unresolved edges are bounded.
+  reviewed; it does NOT prove the unresolved edges are bounded;
+* an `--indirect-edge CALLER_REGEX=CALLEE_REGEX` matches no unresolved
+  caller or no callee. A reviewed edge resolves the caller's indirect sites
+  to the named implementations, so their frames count in every bound.
 
 Arguments may be read from a file with `@FILE` (one argument per line, `#`
 comments and blank lines ignored).
@@ -538,6 +541,37 @@ def chain_budget(graph, svc_prefix, names, item, svc_parent=None):
     return result, None
 
 
+def add_indirect_edges(functions, unresolved, pretty, specs):
+    """Attach reviewed `CALLER_REGEX=CALLEE_REGEX` targets to unresolved sites.
+
+    A `dyn Trait` call whose vtable is built elsewhere (for example a
+    product-owned store attached at startup) has no local vtable literal, so
+    `resolve_indirect` leaves it unbounded. A reviewed edge names the trait
+    implementations that call can reach; the edges then count in every path
+    and chain budget. Returns failure strings for specs matching nothing.
+    """
+    failures = []
+    for spec in specs:
+        caller_pattern, separator, callee_pattern = spec.partition("=")
+        if not separator or not caller_pattern or not callee_pattern:
+            failures.append(f"indirect edge {spec!r}: expected CALLER_REGEX=CALLEE_REGEX")
+            continue
+        caller_regex, callee_regex = re.compile(caller_pattern), re.compile(callee_pattern)
+        callers = [name for name in unresolved if caller_regex.search(pretty(name))]
+        callees = [name for name in functions if callee_regex.search(pretty(name))]
+        if not callers:
+            failures.append(f"indirect edge {spec!r}: no unresolved caller matches")
+        if not callees:
+            failures.append(f"indirect edge {spec!r}: no callee matches")
+        for caller in callers:
+            for callee in callees:
+                if callee != caller:
+                    functions[caller]["calls"].setdefault(callee, "indirect")
+            if callees:
+                unresolved.pop(caller, None)
+    return failures
+
+
 def unreviewed(names, patterns):
     regexes = [re.compile(pattern) for pattern in patterns]
     return sorted(name for name in names if not any(regex.search(name) for regex in regexes))
@@ -584,6 +618,10 @@ def main():
                         help="worst SVC path through any matching function must stay <= BYTES")
     parser.add_argument("--allow-unresolved", action="append", default=[], metavar="REGEX",
                         help="reviewed function allowed to keep unresolved indirect call sites")
+    parser.add_argument("--indirect-edge", action="append", default=[],
+                        metavar="CALLER_REGEX=CALLEE_REGEX",
+                        help="reviewed targets of a caller's unresolved indirect sites; the "
+                             "edges are counted and the caller is no longer unresolved")
     args = parser.parse_args()
     svc_roots = args.svc_root or ["_rust_entry"]
 
@@ -598,6 +636,7 @@ def main():
     unresolved, taken_count = resolve_indirect(functions, elf.read_word, args.indirect)
     pretty = demangler(args.cxxfilt, compact=args.compact)
     pretty.prime(list(functions))
+    edge_failures = add_indirect_edges(functions, unresolved, pretty, args.indirect_edge)
     excluded = []
     if args.exclude:
         # What-if pruning: drop every edge into a matching function so the
@@ -639,6 +678,7 @@ def main():
               "unresolved_indirect": {pretty(n)[:args.width]: c for n, c in unresolved.items()}, "roots": {}, "large_frames": [], "focus": [], "recursion": [],
               "indirect_branches": []}
     failures = layout_failures(layout, args.declared_svc, args.declared_irq, args.min_gap)
+    failures.extend(edge_failures)
     frame_allow = parse_frame_allow(args.frame_allow)
     for root in svc_roots + [args.irq_root]:
         if root not in functions:

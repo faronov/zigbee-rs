@@ -11,7 +11,8 @@ autobins = false
 # end-device image:
 #   cargo build --release                                       # sed (default)
 #   cargo build --release --no-default-features --features ed
-#   cargo build --release --no-default-features --features router
+#   cargo build --release --no-default-features --features router       # + GP proxy
+#   cargo build --release --no-default-features --features router-core  # no GP
 [[bin]]
 name = "efr32mg21-sensor"
 path = "src/main.rs"
@@ -25,7 +26,7 @@ required-features = ["ed"]
 [[bin]]
 name = "efr32mg21-router"
 path = "src/router.rs"
-required-features = ["router"]
+required-features = ["router-core"]
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
@@ -62,8 +63,16 @@ sed = ["dep:sensor-sed-app", "efr32mg21-sensor-product/sed"]
 # Always-on End Device: router-app AlwaysOnEndDeviceApp, end-device MAC.
 ed = []
 # Router: parent MAC (interrupt Imm-Ack, HAL-owned Frame Pending), ParentRouterApp,
-# durable child and APS tables.
-router = ["router-app/router", "zigbee-runtime/router", "efr32s2-hal/isr-ack"]
+# durable child and APS tables, and the Green Power Proxy Basic (default-on
+# for every router image; `router-core` is the router without it).
+router = ["router-core", "green-power"]
+router-core = ["router-app/router", "zigbee-runtime/router", "efr32s2-hal/isr-ack"]
+# Green Power Proxy Basic with its durable Proxy Table at 0x70000.
+green-power = [
+    "router-core",
+    "router-app/green-power",
+    "efr32mg21-sensor-product/green-power",
+]
 # Keep the debug interface powered in EM2 (SWD attach while asleep).
 # Off by default so EM2 current is representative.
 em2-debug = []

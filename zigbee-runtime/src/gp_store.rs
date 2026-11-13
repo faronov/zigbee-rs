@@ -109,21 +109,34 @@ impl PersistentGpProxyTable {
 
     /// Rebuild a snapshot from its stored parts, validating every entry.
     pub fn from_parts(extended_pan_id: IeeeAddress, payload: &[u8]) -> Result<Self, GpStoreError> {
+        Self::validate_payload(payload)?;
+        let mut snapshot = Self::empty(extended_pan_id);
+        snapshot.set_validated(extended_pan_id, payload);
+        Ok(snapshot)
+    }
+
+    /// Validate a stored payload in place, without a snapshot-sized copy.
+    fn validate_payload(payload: &[u8]) -> Result<(), GpStoreError> {
         if payload.is_empty() || payload.len() > MAX_ENCODED_GP_PROXY_TABLE_LEN {
             return Err(GpStoreError::Corrupt);
         }
-        let mut snapshot = Self::empty(extended_pan_id);
-        snapshot.payload[..payload.len()].copy_from_slice(payload);
-        snapshot.len = payload.len();
         let mut count = 0usize;
-        for entry in snapshot.entries() {
+        for entry in Self::entries_in(payload) {
             entry?;
             count += 1;
         }
         if count != payload[0] as usize || count > GP_PROXY_TABLE_ENTRIES {
             return Err(GpStoreError::Corrupt);
         }
-        Ok(snapshot)
+        Ok(())
+    }
+
+    /// Overwrite with a payload [`validate_payload`](Self::validate_payload)
+    /// accepted.
+    fn set_validated(&mut self, extended_pan_id: IeeeAddress, payload: &[u8]) {
+        self.extended_pan_id = extended_pan_id;
+        self.payload[..payload.len()].copy_from_slice(payload);
+        self.len = payload.len();
     }
 
     pub fn extended_pan_id(&self) -> IeeeAddress {
@@ -146,15 +159,20 @@ impl PersistentGpProxyTable {
     /// Decode the stored entries. Trailing bytes or a malformed entry yield
     /// [`GpStoreError::Corrupt`].
     pub fn entries(&self) -> impl Iterator<Item = Result<ProxyEntry, GpStoreError>> + '_ {
+        Self::entries_in(self.payload())
+    }
+
+    /// Decode the entries of a non-empty encoded payload.
+    fn entries_in(payload: &[u8]) -> impl Iterator<Item = Result<ProxyEntry, GpStoreError>> + '_ {
         let mut at = 1usize;
-        let mut left = self.payload[0] as usize;
+        let mut left = payload[0] as usize;
         let mut failed = false;
         core::iter::from_fn(move || {
             if failed {
                 return None;
             }
             if left == 0 {
-                if at != self.len {
+                if at != payload.len() {
                     failed = true;
                     return Some(Err(GpStoreError::Corrupt));
                 }
@@ -162,10 +180,8 @@ impl PersistentGpProxyTable {
             }
             left -= 1;
             let decoded = (|| {
-                let n = *self.payload[..self.len]
-                    .get(at)
-                    .ok_or(GpStoreError::Corrupt)? as usize;
-                let bytes = self.payload[..self.len]
+                let n = *payload.get(at).ok_or(GpStoreError::Corrupt)? as usize;
+                let bytes = payload
                     .get(at + 1..at + 1 + n)
                     .ok_or(GpStoreError::Corrupt)?;
                 let (entry, used) = ProxyEntry::decode(bytes).map_err(|_| GpStoreError::Corrupt)?;
@@ -330,9 +346,12 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         ))
     }
 
-    /// Scan both sectors, decoding the newest valid record into `snapshot`.
-    /// Equal generations prefer scan order.
-    fn scan(&mut self, snapshot: &mut PersistentGpProxyTable) -> Result<bool, GpStoreError> {
+    /// Scan both sectors, copying the newest valid record into `snapshot`
+    /// (when given). Equal generations prefer scan order.
+    fn scan(
+        &mut self,
+        mut snapshot: Option<&mut PersistentGpProxyTable>,
+    ) -> Result<bool, GpStoreError> {
         if !self.geometry_ok() {
             return Err(GpStoreError::Hardware);
         }
@@ -347,16 +366,17 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
                 if best.is_some_and(|(best_generation, _)| generation <= best_generation) {
                     continue;
                 }
-                let mut extended_pan_id = [0u8; 8];
-                extended_pan_id
-                    .copy_from_slice(&record[RECORD_EPID_OFFSET..RECORD_EPID_OFFSET + 8]);
-                if let Ok(decoded) = PersistentGpProxyTable::from_parts(
-                    extended_pan_id,
-                    &record[RECORD_PAYLOAD_OFFSET..RECORD_PAYLOAD_OFFSET + len],
-                ) {
-                    *snapshot = decoded;
-                    best = Some((generation, sector));
+                let payload = &record[RECORD_PAYLOAD_OFFSET..RECORD_PAYLOAD_OFFSET + len];
+                if PersistentGpProxyTable::validate_payload(payload).is_err() {
+                    continue;
                 }
+                if let Some(snapshot) = snapshot.as_deref_mut() {
+                    let mut extended_pan_id = [0u8; 8];
+                    extended_pan_id
+                        .copy_from_slice(&record[RECORD_EPID_OFFSET..RECORD_EPID_OFFSET + 8]);
+                    snapshot.set_validated(extended_pan_id, payload);
+                }
+                best = Some((generation, sector));
             }
         }
         self.current = best;
@@ -432,8 +452,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
 
     fn commit(&mut self, snapshot: &PersistentGpProxyTable) -> Result<(), GpStoreError> {
         if !self.scanned {
-            let mut scratch = PersistentGpProxyTable::default();
-            self.scan(&mut scratch)?;
+            self.scan(None)?;
         }
         let (generation, sector, slot) = match self.current {
             Some((generation, sector)) => {
@@ -462,7 +481,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
 
 impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyStore for GpProxyJournal<S, SECTOR_SIZE> {
     fn load_into(&mut self, snapshot: &mut PersistentGpProxyTable) -> Result<bool, GpStoreError> {
-        self.scan(snapshot)
+        self.scan(Some(snapshot))
     }
 
     fn store(&mut self, snapshot: &PersistentGpProxyTable) -> Result<(), GpStoreError> {

@@ -4,7 +4,7 @@
 //! `NrfRadioPhy`, defmt over RTT) so its image stays identical to the
 //! hardware-validated build.
 
-#[cfg(all(feature = "ed", feature = "router"))]
+#[cfg(all(feature = "ed", feature = "router-core"))]
 compile_error!(
     "enable exactly one role feature (ed or router); use --no-default-features for router"
 );
@@ -263,6 +263,18 @@ impl Diagnostics for LogDiagnostics {
             DiagnosticEvent::SecureRejoinLimitReached { failures } => {
                 log::warn!("[NRF] secure rejoin limit reached at {failures}")
             }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableRestored { count } => {
+                log::info!("[NRF] {} GP proxy table entries restored", count)
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableDiscarded { error } => {
+                log::warn!("[NRF] GP proxy table discarded: {:?}", error)
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableSaved => log::info!("[NRF] GP proxy table saved"),
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableCleared => log::info!("[NRF] GP proxy table cleared"),
             DiagnosticEvent::FactoryReset => log::info!("[NRF] security journal reset"),
             DiagnosticEvent::Fatal(error) => log::error!("[NRF] fatal: {error:?}"),
             _ => {}

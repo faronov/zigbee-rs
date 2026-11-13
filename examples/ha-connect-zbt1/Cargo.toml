@@ -11,9 +11,11 @@ autobins = false
 #   cargo build --release                                       # ed (default)
 #   cargo build --release --no-default-features --features router
 #   cargo build --release --no-default-features --features sed
-# Loader-linked router (primary slot of boot/zbt1.layout, chained after the
-# Gecko Bootloader), in its own target dir:
-#   cargo build --release --no-default-features --features router,zrs-boot \
+# `router` includes the Green Power proxy; `router-core` is the router
+# without it. Loader-linked router (primary slot of boot/zbt1.layout,
+# chained after the Gecko Bootloader; no GP window there), in its own
+# target dir:
+#   cargo build --release --no-default-features --features router-core,zrs-boot \
 #     --target-dir target/zrs-boot
 [[bin]]
 name = "ha-connect-zbt1-ed"
@@ -23,7 +25,7 @@ required-features = ["ed"]
 [[bin]]
 name = "ha-connect-zbt1-router"
 path = "src/router.rs"
-required-features = ["router"]
+required-features = ["router-core"]
 
 [[bin]]
 name = "ha-connect-zbt1-sed"
@@ -62,8 +64,17 @@ default = ["ed"]
 # Always-on End Device (the original image).
 ed = []
 # Router: parent MAC (interrupt Imm-Ack, HAL-owned Frame Pending), ParentRouterApp,
-# durable child and APS tables.
-router = ["router-app/router", "zigbee-runtime/router", "efr32s2-hal/isr-ack"]
+# durable child and APS tables, plus the Green Power proxy (`green-power`).
+router = ["router-core", "green-power"]
+# The router without Green Power (also the loader-linked router's base).
+router-core = ["router-app/router", "zigbee-runtime/router", "efr32s2-hal/isr-ack"]
+# Green Power Proxy Basic: tunnels GPDFs to the sink and journals the Proxy
+# Table at 0xF0000 (direct map only, not with `zrs-boot`).
+green-power = [
+    "router-core",
+    "router-app/green-power",
+    "ha-connect-zbt1-product/green-power",
+]
 # Sleepy End Device: sensor-sed-app lifecycle, EM2 between slow polls.
 sed = [
     "dep:sensor-sed-app",
@@ -75,7 +86,7 @@ em2-debug = []
 # Router image for the zigbee-rs loader (products/ha-connect-zbt1/boot/
 # zbt1.layout): linked into the primary slot, confirms its trial once back
 # on the network. Upgrades are staged over SWD (no Zigbee OTA client).
-# Router role only (src/platform.rs).
+# Router role only (src/platform.rs); combine with `router-core`.
 zrs-boot = ["ha-connect-zbt1-product/zrs-boot"]
 # TEST-ONLY trial-expiry bench image: never confirms, so the loader reports
 # the expired trial and keeps booting it (overwrite mode).

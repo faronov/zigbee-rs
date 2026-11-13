@@ -32,6 +32,10 @@ sed = ["dep:sensor-sed-app"]
 # above the Gecko Bootloader (boot/zbt1.layout): layout constants, the
 # release version and the trial confirm (`boot`). No OTA client.
 zrs-boot = ["dep:mcuboot-image"]
+# Green Power Proxy Basic for the router role: the GP Proxy Table journal
+# at 0xF0000 (`router::gp_proxy_table_store`). Direct map only: the loader
+# layout's secondary slot covers that window, so it excludes `zrs-boot`.
+green-power = ["router-app/green-power", "zigbee-runtime/green-power"]
 
 [dev-dependencies]
 zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }

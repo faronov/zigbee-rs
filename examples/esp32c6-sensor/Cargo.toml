@@ -10,7 +10,8 @@ autobins = false
 # end-device image:
 #   cargo build --release                                       # sed (default)
 #   cargo build --release --no-default-features --features ed
-#   cargo build --release --no-default-features --features router
+#   cargo build --release --no-default-features --features router       # with Green Power
+#   cargo build --release --no-default-features --features router-core  # without it
 [[bin]]
 name = "esp32c6-sensor"
 path = "src/main.rs"
@@ -24,7 +25,7 @@ required-features = ["ed"]
 [[bin]]
 name = "esp32c6-router"
 path = "src/router.rs"
-required-features = ["router"]
+required-features = ["router-core"]
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }
@@ -62,9 +63,13 @@ default = ["sed"]
 sed = ["dep:sensor-sed-app", "esp32-zigbee-devkit-product/sed"]
 # Always-on End Device: router-app AlwaysOnEndDeviceApp, end-device MAC.
 ed = ["dep:router-app", "dep:zigbee-nwk", "esp32-zigbee-devkit-product/roles"]
-# Router: parent MAC (hardware auto-ACK with Frame Pending from the PHY's
-# source table), ParentRouterApp, durable child and APS tables.
-router = [
+# Router: `router-core` plus the Green Power proxy (GP is on in every
+# router image; `--features router-core` builds the router without it).
+router = ["router-core", "green-power"]
+# Router without Green Power: parent MAC (hardware auto-ACK with Frame
+# Pending from the PHY's source table), ParentRouterApp, durable child and
+# APS tables.
+router-core = [
     "dep:router-app",
     "router-app/router",
     "zigbee-runtime/router",
@@ -79,6 +84,13 @@ status-led = ["esp32-zigbee-devkit-product/status-led"]
 # Lab only, never in shipped images: red, green, blue for 3 s each when the
 # LED starts, to check the colour byte order of the board.
 status-led-selftest = ["status-led", "esp32-zigbee-devkit-product/status-led-selftest"]
+# Green Power Proxy Basic on the router: tunnels GPDFs to the sink and
+# journals the Proxy Table in `zbnv`. Part of `router`.
+green-power = [
+    "router-core",
+    "router-app/green-power",
+    "esp32-zigbee-devkit-product/green-power",
+]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
 # Accept only signed MCUboot envelopes over OTA (see the product's

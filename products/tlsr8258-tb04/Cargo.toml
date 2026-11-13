@@ -15,6 +15,9 @@ router = [
     "zigbee-runtime/router",
     "zigbee-runtime/compact-single-endpoint",
 ]
+# Green Power Proxy Basic for the router: the GP Proxy Table journal at
+# 0x6E000 (`storage::gp_proxy_table_store`).
+green-power = ["router", "router-app/green-power", "zigbee-runtime/green-power"]
 # Always-on (RX-on-when-idle) non-routing End Device. Pulls the shared
 # router app without its parent/router feature, so no parent MAC, child
 # table or routing code can link.

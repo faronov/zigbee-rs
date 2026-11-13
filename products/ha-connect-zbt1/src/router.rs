@@ -1,7 +1,8 @@
 //! Router-role persistence, policy and profile for the ZBT-1.
 //!
 //! The router keeps its child table and APS binding/group tables in two
-//! product-owned journals at `0xF4000..0xFC000` (see `journal.rs`); the
+//! product-owned journals at `0xF4000..0xFC000` (see `journal.rs`), and its
+//! Green Power Proxy Table at `0xF0000..0xF4000` (direct map only); the
 //! end-device roles link the same application window and never touch them.
 
 use efr32s2_hal::flash::{Efr32s2Flash, FLASH_PAGE_SIZE, FlashPartition};
@@ -71,6 +72,32 @@ pub fn router_stores(flash: Efr32s2Flash) -> (Efr32s2Flash, ChildStore, ApsTable
         ChildStore::new_with_sector_size(children, SECTOR_A, SECTOR_B),
         ApsTableStore::new_with_sector_size(aps, SECTOR_A, SECTOR_B),
     )
+}
+
+#[cfg(all(feature = "green-power", feature = "zrs-boot"))]
+compile_error!(
+    "green-power needs the direct map: boot/zbt1.layout's secondary slot covers the GP window"
+);
+
+#[cfg(feature = "green-power")]
+pub type GpProxyTableFlash = FlashPartition<
+    { crate::journal::GP_PROXY_TABLE_PARTITION_START },
+    { crate::journal::GP_PROXY_TABLE_PARTITION_SIZE },
+>;
+/// Green Power Proxy Table journal on two 8 KiB MSC pages.
+#[cfg(feature = "green-power")]
+pub type GpProxyTableStore =
+    zigbee_runtime::gp_store::GpProxyJournal<GpProxyTableFlash, FLASH_PAGE_SIZE>;
+
+/// Mint the GP Proxy Table journal; the flash handle is passed through
+/// exactly as by [`router_stores`].
+#[cfg(feature = "green-power")]
+pub fn gp_proxy_table_store(flash: Efr32s2Flash) -> (Efr32s2Flash, GpProxyTableStore) {
+    // SAFETY: the GP window is disjoint from the child, APS and security
+    // windows and from the application (journal.rs and link/memory.x
+    // assert it), and it is driven from the single application task.
+    let gp = unsafe { GpProxyTableFlash::new_unchecked() };
+    (flash, GpProxyTableStore::new(gp, SECTOR_A, SECTOR_B))
 }
 
 #[cfg(test)]

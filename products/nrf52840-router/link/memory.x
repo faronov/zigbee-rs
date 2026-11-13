@@ -1,10 +1,12 @@
 MEMORY
 {
   /* nRF52840: 1 MiB flash, 256 KiB RAM. */
-  /* 0x000FA000..0x000FDFFF (pages 250-253) hold the router role's
+  /* 0x000F8000..0x000F9FFF (pages 248-249) hold the router role's Green
+   * Power Proxy Table journal and 0x000FA000..0x000FDFFF (pages 250-253) its
    * child-table and APS journals (src/router.rs). Both role images link this
    * same map, so neither role's code can overlap the router's persistence. */
-  FLASH            : ORIGIN = 0x00000000, LENGTH = 1000K
+  FLASH            : ORIGIN = 0x00000000, LENGTH = 992K
+  GP_PROXY_TABLE   : ORIGIN = 0x000F8000, LENGTH = 8K
   ROUTER_TABLES    : ORIGIN = 0x000FA000, LENGTH = 16K
   SECURITY_JOURNAL : ORIGIN = 0x000FE000, LENGTH = 8K
   RAM              : ORIGIN = 0x20000000, LENGTH = 256K
@@ -17,8 +19,12 @@ MEMORY
 _security_partition_start = ORIGIN(SECURITY_JOURNAL);
 _security_partition_end   = ORIGIN(SECURITY_JOURNAL) + LENGTH(SECURITY_JOURNAL);
 
-ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) == ORIGIN(ROUTER_TABLES),
-  "nRF52840 application must end exactly at the router-table journals");
+ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) == ORIGIN(GP_PROXY_TABLE),
+  "nRF52840 application must end exactly at the GP Proxy Table journal");
+ASSERT(ORIGIN(GP_PROXY_TABLE) + LENGTH(GP_PROXY_TABLE) == ORIGIN(ROUTER_TABLES),
+  "nRF52840 GP Proxy Table journal must end exactly at the router-table journals");
+ASSERT(ORIGIN(ROUTER_TABLES) == 0x000FA000,
+  "nRF52840 router-table journals must stay at 0x000FA000");
 ASSERT(ORIGIN(ROUTER_TABLES) + LENGTH(ROUTER_TABLES) == ORIGIN(SECURITY_JOURNAL),
   "nRF52840 router-table journals must end exactly at the security journal");
 ASSERT(ORIGIN(SECURITY_JOURNAL) == 0x000FE000,

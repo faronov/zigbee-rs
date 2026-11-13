@@ -113,6 +113,10 @@ fn main() {
             RouterParts::new(NoStatus, NoSupervisor, AttemptCounter::default()),
         )
         .expect("valid forwarding-light composition");
+        #[cfg(feature = "green-power")]
+        let mut gp_store = zigbee_runtime::gp_store::RamGpProxyStore::new();
+        #[cfg(feature = "green-power")]
+        app.set_green_power_store(&mut gp_store);
 
         app.initialize().await.expect("resume light router");
         println!(

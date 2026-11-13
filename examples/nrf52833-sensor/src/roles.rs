@@ -6,9 +6,9 @@
 //! hardware-validated build.
 
 #[cfg(any(
-    all(feature = "ed", feature = "router"),
+    all(feature = "ed", feature = "router-core"),
     all(feature = "ed", feature = "sed"),
-    all(feature = "router", feature = "sed"),
+    all(feature = "router-core", feature = "sed"),
 ))]
 compile_error!(
     "enable exactly one role feature (sed, ed or router); use --no-default-features for ed/router"
@@ -217,27 +217,27 @@ impl Diagnostics for LogDiagnostics {
             } => log::info!(
                 "[NRF] online: addr=0x{short_address:04X} ch={channel} pan=0x{pan_id:04X}"
             ),
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildrenRestored { count } => {
                 log::info!("[NRF] {count} children restored")
             }
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildTableDiscarded { error } => {
                 log::warn!("[NRF] child table discarded: {error:?}")
             }
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildTableSaved => log::info!("[NRF] child table saved"),
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildRemovalCompleted {
                 short_address,
                 delivered,
                 ..
             } => log::info!("[NRF] child 0x{short_address:04X} removed (delivered={delivered})"),
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ApsTablesRestored { count } => {
                 log::info!("[NRF] {count} APS table entries restored")
             }
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ApsTablesDiscarded { error } => {
                 log::warn!("[NRF] APS tables discarded: {error:?}")
             }
@@ -271,6 +271,18 @@ impl Diagnostics for LogDiagnostics {
             DiagnosticEvent::SecureRejoinLimitReached { failures } => {
                 log::warn!("[NRF] secure rejoin limit reached at {failures}")
             }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableRestored { count } => {
+                log::info!("[NRF] {count} GP proxy table entries restored")
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableDiscarded { error } => {
+                log::warn!("[NRF] GP proxy table discarded: {error:?}")
+            }
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableSaved => log::info!("[NRF] GP proxy table saved"),
+            #[cfg(feature = "green-power")]
+            DiagnosticEvent::GpProxyTableCleared => log::info!("[NRF] GP proxy table cleared"),
             DiagnosticEvent::FactoryReset => log::info!("[NRF] security journal reset"),
             DiagnosticEvent::Fatal(error) => log::error!("[NRF] fatal: {error:?}"),
             _ => {}

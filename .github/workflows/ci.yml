@@ -109,6 +109,7 @@ jobs:
       - run: cargo test --manifest-path products/nrf52840-sensor/Cargo.toml --features sensor-bme280 --locked
       - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml --locked
       - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml --features sensor-bme280 --locked
+      - run: cargo test --manifest-path products/nrf52833-sensor/Cargo.toml --features green-power --locked
 
   standalone-host:
     name: Host ${{ matrix.name }}
@@ -175,6 +176,10 @@ jobs:
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
             features: esp32h2,roles,green-power
+          - name: ESP32-C6 router product (Green Power proxy)
+            manifest: products/esp32-zigbee-devkit/Cargo.toml
+            workspace: products/esp32-zigbee-devkit
+            features: esp32c6,roles,green-power
           - name: ESP32-C6 light-sleep product
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
@@ -205,6 +210,10 @@ jobs:
             manifest: products/nrf52840-router/Cargo.toml
             workspace: products/nrf52840-router
             features: ""
+          - name: nRF52840 router product (Green Power proxy)
+            manifest: products/nrf52840-router/Cargo.toml
+            workspace: products/nrf52840-router
+            features: green-power
           - name: EFR32MG21 board
             manifest: boards/efr32mg21-devkit/Cargo.toml
             workspace: boards/efr32mg21-devkit
@@ -217,6 +226,10 @@ jobs:
             manifest: products/efr32mg21-sensor/Cargo.toml
             workspace: products/efr32mg21-sensor
             features: sed
+          - name: EFR32MG21 sensor product (router Green Power proxy)
+            manifest: products/efr32mg21-sensor/Cargo.toml
+            workspace: products/efr32mg21-sensor
+            features: green-power
           - name: EFR32MG22 board
             manifest: boards/efr32mg22-devkit/Cargo.toml
             workspace: boards/efr32mg22-devkit
@@ -253,6 +266,10 @@ jobs:
             manifest: products/ha-connect-zbt1/Cargo.toml
             workspace: products/ha-connect-zbt1
             features: zrs-boot
+          - name: Home Assistant Connect ZBT-1 product (Green Power proxy)
+            manifest: products/ha-connect-zbt1/Cargo.toml
+            workspace: products/ha-connect-zbt1
+            features: green-power
           - name: PHY6222 sensor product
             manifest: products/phy62x2-evk/Cargo.toml
             workspace: products/phy62x2-evk
@@ -325,6 +342,10 @@ jobs:
             manifest: products/stm32wb5mm-dk-router/Cargo.toml
             workspace: products/stm32wb5mm-dk-router
             features: ""
+          - name: STM32WB5MM-DK router product (Green Power proxy)
+            manifest: products/stm32wb5mm-dk-router/Cargo.toml
+            workspace: products/stm32wb5mm-dk-router
+            features: green-power
           # Sensor endpoints (EP2/EP3 Analog Input, temperature, occupancy)
           # and the EP4 sound-level endpoint compile independently.
           - name: STM32WB5MM-DK router product (sensors, sound)
@@ -619,8 +640,8 @@ jobs:
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
           ./tools/firmware-size-report.sh nrf52840-always-on-end-device ${ELF}.bin ${ELF}.size.json
           IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
-          if [ "$IMAGE_BYTES" -gt 1024000 ]; then
-            echo "nRF52840 always-on End Device ($IMAGE_BYTES B) overruns application flash ending at 0x000FA000" >&2
+          if [ "$IMAGE_BYTES" -gt 1015808 ]; then
+            echo "nRF52840 always-on End Device ($IMAGE_BYTES B) overruns application flash ending at 0x000F8000" >&2
             exit 1
           fi
           SYMS="$("$NM" --demangle "$ELF")"
@@ -756,8 +777,8 @@ jobs:
           # at 0x0007E000. memory.x asserts the region boundary at link
           # time; this asserts the produced image against it as well.
           IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
-          if [ "$IMAGE_BYTES" -gt 499712 ]; then
-            echo "nRF52833 image ($IMAGE_BYTES B) overruns the 488 KiB application flash region" >&2
+          if [ "$IMAGE_BYTES" -gt 491520 ]; then
+            echo "nRF52833 image ($IMAGE_BYTES B) overruns the 480 KiB application flash region" >&2
             exit 1
           fi
           LAYOUT="$("$NM" -n "$ELF")"
@@ -826,6 +847,17 @@ jobs:
       # is its own build and dependency feature unification never mixes them.
       - name: Build nRF role images (release)
         run: |
+          # `router` includes the Green Power Proxy Basic; `router-core` is
+          # the same router without it and must keep linking.
+          (cd examples/nrf52833-sensor &&
+            cargo build --release --locked --no-default-features --features router-core &&
+            cargo clippy --release --locked --target thumbv7em-none-eabihf \
+              --no-default-features --features router-core -- -D warnings)
+          (cd examples/nrf52840-router &&
+            cargo build --release --locked --no-default-features --features router-core &&
+            cargo clippy --release --locked --target thumbv7em-none-eabihf \
+              --no-default-features --features router-core -- -D warnings)
+          # The shipped GP routers are built last, so the artifacts below are them.
           (cd examples/nrf52833-sensor &&
             cargo build --release --locked --no-default-features --features ed &&
             cargo build --release --locked --no-default-features --features router)
@@ -848,8 +880,8 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           D33=examples/nrf52833-sensor/target/thumbv7em-none-eabihf/release
           D40=examples/nrf52840-router/target/thumbv7em-none-eabihf/release
-          # image, application-flash limit (= router-table journal start)
-          for spec in "$D33/nrf52833-ed 499712" "$D33/nrf52833-router 499712" "$D40/nrf52840-router 1024000"; do
+          # image, application-flash limit (= GP Proxy Table journal start)
+          for spec in "$D33/nrf52833-ed 491520" "$D33/nrf52833-router 491520" "$D40/nrf52840-router 1015808"; do
             read -r ELF LIMIT <<<"$spec"
             "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
             "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
@@ -1096,7 +1128,10 @@ jobs:
       - name: Build and check ESP32-C6 always-on ED and router images
         working-directory: examples/esp32c6-sensor
         run: |
-          for role in ed router; do
+          # `router` includes the Green Power Proxy Basic; `router-core` (the
+          # router without it) must keep linking. `router` is built last, so
+          # the checks below measure the shipped GP router.
+          for role in ed router-core router; do
             cargo build --release --locked -Z build-std=core,alloc \
               --no-default-features --features "$role"
             cargo clippy --release --locked -Z build-std=core,alloc \
@@ -1231,7 +1266,10 @@ jobs:
       - name: Build and check ESP32-H2 always-on ED and router images
         working-directory: examples/esp32h2-sensor
         run: |
-          for role in ed router; do
+          # `router` includes the Green Power Proxy Basic; `router-core` (the
+          # router without it) must keep linking. `router` is built last, so
+          # the checks below measure the shipped GP router.
+          for role in ed router-core router; do
             cargo build --release --locked -Z build-std=core,alloc \
               --no-default-features --features "$role"
             cargo clippy --release --locked -Z build-std=core,alloc \
@@ -1463,6 +1501,7 @@ jobs:
           cargo test --locked --manifest-path products/bl702-xt-zb1/layout/Cargo.toml --target "$HOST_TARGET"
           cargo test --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET"
           cargo test --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" --features roles
+          cargo test --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" --features green-power
           # Parent radio (FPT, receive ring, completion bits) host tests.
           cargo test --locked -p zigbee-mac --features bl702 --lib bl702
           cargo clippy --locked --manifest-path bl702-hal/Cargo.toml --target "$HOST_TARGET" -- -D warnings
@@ -1471,6 +1510,7 @@ jobs:
           cargo clippy --locked --manifest-path products/bl702-xt-zb1/layout/Cargo.toml --target "$HOST_TARGET" --all-targets -- -D warnings
           cargo clippy --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" --all-targets -- -D warnings
           cargo clippy --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" --all-targets --features roles -- -D warnings
+          cargo clippy --locked --manifest-path products/bl702-xt-zb1/Cargo.toml --target "$HOST_TARGET" --all-targets --features green-power -- -D warnings
           cargo clippy --locked --manifest-path bl702-hal/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
           cargo clippy --locked --manifest-path boards/bl702-xt-zb1/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
           cargo clippy --locked --manifest-path bootloaders/bl702-boot/Cargo.toml --target riscv32imc-unknown-none-elf -- -D warnings
@@ -1491,6 +1531,12 @@ jobs:
       - name: Build and check BL702 End Device and Router
         working-directory: examples/bl702-sensor
         run: |
+          # `router` includes the Green Power Proxy Basic; `router-core` is
+          # the same router without it and must keep linking. The shipped
+          # GP router is built after it, so the checks below measure it.
+          cargo build --release --locked --features router-core --bin bl702-router
+          cargo clippy --release --locked --target riscv32imc-unknown-none-elf \
+            --features router-core --bin bl702-router -- -D warnings
           for role in ed router; do
             cargo build --release --locked --features "$role" --bin "bl702-$role"
             cargo clippy --release --locked --target riscv32imc-unknown-none-elf \
@@ -2082,8 +2128,10 @@ jobs:
         run: |
           cargo build --release --locked
           cargo build --release --locked --no-default-features --features ed
-          cargo build --release --locked --no-default-features --features router
-      # The leaf roles linked into the primary slot of the zigbee-rs loader
+          # `router` includes the Green Power Proxy Basic; `router-core` is
+          # the same router without it and must keep linking.
+          cargo build --release --locked --no-default-features --features router-core
+          cargo build --release --locked --no-default-features --features router into the primary slot of the zigbee-rs loader
       # (products/efr32mg21-sensor/boot/devkit.layout, feature zrs-boot);
       # build.rs checks the layout against link/memory.x. The router image
       # does not fit the 252,672 B slot.
@@ -2097,7 +2145,7 @@ jobs:
       - name: Clippy EFR32MG21 role compositions
         working-directory: examples/efr32mg21-sensor
         run: |
-          for role in sed ed router; do
+          for role in sed ed router router-core; do
             cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
               --no-default-features --features "$role" -- -D warnings
           done
@@ -2153,13 +2201,18 @@ jobs:
         working-directory: examples/ha-connect-zbt1
         run: |
           cargo build --release --locked
+          # `router` includes the Green Power Proxy Basic; `router-core` is
+          # the same router without it and must keep linking.
+          cargo build --release --locked --no-default-features --features router-core
           cargo build --release --locked --no-default-features --features router
           cargo build --release --locked --no-default-features --features sed
       # The router linked into the primary slot of the zigbee-rs loader
       # chained after the Gecko Bootloader (products/ha-connect-zbt1/boot/
       # zbt1.layout, feature zrs-boot). Its release is signed with a key
       # generated for this run only (test-signed, never for a board whose
-      # loader trusts the release key).
+      # loader trusts the release key). The loader's secondary slot covers
+      # the direct map's GP Proxy Table journal, so the loader-linked router
+      # is built without Green Power (`router-core`).
       - name: Install imgtool
         run: |
           python3 -m venv "$RUNNER_TEMP/imgtool"
@@ -2175,7 +2228,7 @@ jobs:
         working-directory: examples/ha-connect-zbt1
         run: |
           cargo build --release --locked --no-default-features \
-            --features router,zrs-boot --target-dir target/zrs-boot
+            --features router-core,zrs-boot --target-dir target/zrs-boot
           ELF=target/zrs-boot/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-router
           python3 tools/verify-layout.py --layout ../../products/ha-connect-zbt1/boot/zbt1.layout "$ELF"
           # Signature, identity, version and slot fit of the release.
@@ -2186,11 +2239,22 @@ jobs:
       - name: Clippy ZBT-1 role compositions
         working-directory: examples/ha-connect-zbt1
         run: |
-          for role in ed router sed; do
+          for role in ed router router-core sed; do
             cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
               --no-default-features --features "$role" -- -D warnings
           done
-          for features in router,zrs-boot router,trial-no-confirm; do
+          # Green Power cannot be combined with the loader layout.
+          if cargo build --release --locked --no-default-features \
+              --features router,zrs-boot --target-dir target/zrs-boot \
+              2> "$RUNNER_TEMP/zbt1-gp-zrs-boot.log"; then
+            echo "router (Green Power) + zrs-boot must not build" >&2
+            exit 1
+          fi
+          grep -qF 'green-power needs the direct map' "$RUNNER_TEMP/zbt1-gp-zrs-boot.log" || {
+            cat "$RUNNER_TEMP/zbt1-gp-zrs-boot.log" >&2
+            exit 1
+          }
+          for features in router-core,zrs-boot router-core,trial-no-confirm; do
             cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
               --no-default-features --features "$features" \
               --target-dir target/zrs-boot -- -D warnings
@@ -2459,13 +2523,15 @@ jobs:
       # image) and leaves at least 16 KiB of stack. Each board peripheral
       # (RGB LED, LCD, touch key, I2C sensors, PDM microphone) is an
       # optional feature; the plain router and every single-peripheral
-      # image must link and stay warning-free on their own.
+      # image must link and stay warning-free on their own. Green Power
+      # (default-on) is one of these features, so `--no-default-features`
+      # is the router without it.
       - name: Build STM32WB5MM-DK router feature images (release)
         working-directory: examples/stm32wb5mm-dk-router
         run: |
           cargo build --release --locked --no-default-features
           cargo clippy --release --locked --no-default-features -- -D warnings
-          for features in rgb-led lcd touch sensors mic; do
+          for features in green-power rgb-led lcd touch sensors mic; do
             cargo build --release --locked --no-default-features --features "$features"
             cargo clippy --release --locked --no-default-features --features "$features" -- -D warnings
           done

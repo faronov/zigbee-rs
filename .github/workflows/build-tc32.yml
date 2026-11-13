@@ -144,6 +144,10 @@ jobs:
           ./scripts/tlsr8258.sh build sensor
           cp examples/telink-tlsr8258-sensor/target/tc32-unknown-none-elf/release/telink-tlsr8258-sensor.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor.bin
+          # `router` includes the Green Power Proxy Basic; `router-core` is
+          # the same router without it and must pass the same layout and
+          # stack gates. The shipped GP router is built after it.
+          ./scripts/tlsr8258.sh build router-core
           ./scripts/tlsr8258.sh build router
           cp examples/telink-tlsr8258-router/target/tc32-unknown-none-elf/release/telink-tlsr8258-router.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-router.bin
@@ -159,7 +163,8 @@ jobs:
           ./tools/firmware-size-report.sh telink-tlsr8258-sensor-retention-10s \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-10s.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-sensor-retention-10s.size.json
-          # The linker/layout hard-stop remains the APS journal at physical 0x70000.
+          # The linker/layout hard-stop is the GP Proxy Table journal at
+          # physical 0x6E000 (below the APS journal at 0x70000).
           ./tools/firmware-size-report.sh telink-tlsr8258-router \
             target/tlsr8258-artifacts/telink-tlsr8258-router.bin \
             target/tlsr8258-artifacts/telink-tlsr8258-router.size.json
@@ -273,6 +278,14 @@ jobs:
             --manifest-path examples/telink-tlsr8258-radio/Cargo.toml \
             --release --locked --target "$HOST_TARGET" --tests -- \
             -D warnings -A clippy::assertions_on_constants
+          # Router product with its Green Power Proxy Table partition.
+          cargo "+${HOST_RUST_TOOLCHAIN}" test \
+            --manifest-path products/tlsr8258-tb04/Cargo.toml \
+            --release --locked --target "$HOST_TARGET" --features green-power
+          cargo "+${HOST_RUST_TOOLCHAIN}" clippy \
+            --manifest-path products/tlsr8258-tb04/Cargo.toml \
+            --release --locked --target "$HOST_TARGET" --all-targets \
+            --features green-power -- -D warnings
           cargo "+${HOST_RUST_TOOLCHAIN}" test \
             --manifest-path products/tlsr8258-tb04/Cargo.toml \
             --release --locked --target "$HOST_TARGET" \

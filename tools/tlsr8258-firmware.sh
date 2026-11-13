@@ -64,6 +64,7 @@ verify_layout() {
     local security_nv_start=0 security_nv_end=0
     local child_nv_start=0 child_nv_end=0
     local aps_nv_start=0 aps_nv_end=0
+    local gp_nv_start=0 gp_nv_end=0
     local value name
 
     while read -r value _ name; do
@@ -98,6 +99,8 @@ verify_layout() {
             _child_nv_end_) child_nv_end=$((16#$value)) ;;
             _aps_nv_start_) aps_nv_start=$((16#$value)) ;;
             _aps_nv_end_) aps_nv_end=$((16#$value)) ;;
+            _gp_nv_start_) gp_nv_start=$((16#$value)) ;;
+            _gp_nv_end_) gp_nv_end=$((16#$value)) ;;
         esac
     done < <("$LLVM_NM" "$elf")
 
@@ -221,6 +224,16 @@ verify_layout() {
             "$size" "$aps_nv_start" >&2
         exit 1
     fi
+    # Product layouts reserve the router Green Power Proxy Table journal
+    # directly below the APS journal; the image must end below it.
+    if (( gp_nv_start != 0 || gp_nv_end != 0 )); then
+        if (( gp_nv_start >= gp_nv_end || gp_nv_end > aps_nv_start ||
+              size > gp_nv_start )); then
+            printf 'layout-check FAIL: image is %d bytes, GP NV [0x%X..0x%X), APS NV starts at 0x%X\n' \
+                "$size" "$gp_nv_start" "$gp_nv_end" "$aps_nv_start" >&2
+            exit 1
+        fi
+    fi
     # The journals must be ordered below Telink's factory EUI/config sectors.
     # Reaching 0x76000 would erase the device identity; reaching 0x77000 would
     # also erase factory configuration and ADC calibration.
@@ -320,11 +333,31 @@ verify_layout() {
         # HW-04: declared SVC stack (router 20 KiB; leaf sensor/ED 24 KiB),
         # a 64 B guard directly below it, and >= 4 KiB of unused RAM between
         # every static/DMA byte and the guard. The gap is margin, not stack.
-        local expected_svc_bottom=0x849C00 stack_gate
+        local expected_svc_bottom=0x849C00 stack_gate gp_stack_gate=() gp_linked=0
+        if "$LLVM_NM" -C "$elf" | awk '
+            index($0, "zigbee_runtime::gp_store::GpProxyJournal") { found = 1 }
+            END { exit(found ? 0 : 1) }
+        '; then
+            gp_linked=1
+        fi
         case "$binary_name" in
             telink-tlsr8258-router)
                 expected_svc_bottom=0x84AC00
                 stack_gate=tlsr8258-router-stack-gate.args
+                # The default router carries Green Power; router-core must not.
+                if [[ "$image_feature" == router-core ]]; then
+                    if (( gp_linked )); then
+                        echo "stack-layout FAIL: router-core links the GP Proxy Table store" >&2
+                        exit 1
+                    fi
+                else
+                    if (( ! gp_linked )); then
+                        echo "stack-layout FAIL: the router does not link the GP Proxy Table store" >&2
+                        exit 1
+                    fi
+                    gp_stack_gate=(@"$ROOT_DIR/tools/tlsr8258-router-gp-stack-gate.args")
+                    stack_gate="$stack_gate + tlsr8258-router-gp-stack-gate.args"
+                fi
                 ;;
             telink-tlsr8258-sensor) stack_gate=tlsr8258-sensor-stack-gate.args ;;
             telink-tlsr8258-ed) stack_gate=tlsr8258-ed-stack-gate.args ;;
@@ -354,7 +387,7 @@ verify_layout() {
         # the authoritative runtime evidence.
         TC32_TOOLCHAIN="$TC32_TOOLCHAIN" python3 "$ROOT_DIR/tools/tlsr8258-stack-report.py" "$elf" \
             --objdump "$LLVM_OBJDUMP" --compact --check \
-            @"$ROOT_DIR/tools/$stack_gate" > /dev/null
+            @"$ROOT_DIR/tools/${stack_gate%% + *}" ${gp_stack_gate[@]+"${gp_stack_gate[@]}"} > /dev/null
         printf 'stack-layout OK: svc=[0x%X..0x%X) %d B, guard=[0x%X..0x%X), gap to rf_dma_end=%d B; %s passed\n' \
             "$svc_bottom" "$svc_top" "$((svc_top - svc_bottom))" \
             "$svc_guard_start" "$svc_guard_end" "$((svc_guard_start - rf_dma_end))" "$stack_gate"
@@ -403,10 +436,14 @@ verify_layout() {
         echo "ed-role OK: leaf-only, no sleep path, single block_on root"
     fi
 
-    printf 'layout-check OK: image=%d B flash_limit=0x%X ram_code=%d B data=0x%X bss_end=0x%X rf_dma=[0x%X..0x%X) (rx=0x%X tx=0x%X ack=0x%X) aps_nv=[0x%X..0x%X) child_nv=[0x%X..0x%X) sec_nv=[0x%X..0x%X)\n' \
-        "$size" "$aps_nv_start" "$((ramcode_end - ramcode_start))" "$sdata" "$ebss" \
+    local flash_limit=$aps_nv_start
+    if (( gp_nv_start != 0 )); then
+        flash_limit=$gp_nv_start
+    fi
+    printf 'layout-check OK: image=%d B flash_limit=0x%X ram_code=%d B data=0x%X bss_end=0x%X rf_dma=[0x%X..0x%X) (rx=0x%X tx=0x%X ack=0x%X) gp_nv=[0x%X..0x%X) aps_nv=[0x%X..0x%X) child_nv=[0x%X..0x%X) sec_nv=[0x%X..0x%X)\n' \
+        "$size" "$flash_limit" "$((ramcode_end - ramcode_start))" "$sdata" "$ebss" \
         "$rf_dma_start" "$rf_dma_end" "$rf_rx_buf" "$rf_tx_buf" "$rf_ack_tx_buf" \
-        "$aps_nv_start" "$aps_nv_end" "$child_nv_start" "$child_nv_end" \
+        "$gp_nv_start" "$gp_nv_end" "$aps_nv_start" "$aps_nv_end" "$child_nv_start" "$child_nv_end" \
         "$security_nv_start" "$security_nv_end"
 }
 

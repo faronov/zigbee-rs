@@ -12,11 +12,12 @@ test = false
 bench = false
 
 # Router (`--features router --bin bl702-router`): hardware auto-ACK with
-# the M154 Frame Pending table (`zigbee_mac::bl702::parent_phy`).
+# the M154 Frame Pending table (`zigbee_mac::bl702::parent_phy`), plus the
+# Green Power Proxy Basic; `--features router-core` builds it without GP.
 [[bin]]
 name = "bl702-router"
 path = "src/bin/router.rs"
-required-features = ["router"]
+required-features = ["router-core"]
 test = false
 bench = false
 
@@ -40,7 +41,12 @@ ota-soak = ["dep:bl702-xt-zb1-layout", "dep:embedded-storage", "dep:mcuboot-imag
 # LAB ONLY: the sensor never confirms an installed image (loader trial
 # expiry check); `BL702_LAB_NO_CONFIRM=1 ./build-image.sh`. Never publish.
 lab-no-confirm = ["bl702-xt-zb1-product/lab-no-confirm"]
-router = ["dep:router-app", "dep:static_cell", "dep:portable-atomic", "dep:zigbee-nwk", "bl702-xt-zb1-product/roles", "router-app/router", "zigbee-runtime/router"]
+# Router with the Green Power Proxy Basic (default-on for every router
+# image); `router-core` is the router without it.
+router = ["router-core", "green-power"]
+router-core = ["dep:router-app", "dep:static_cell", "dep:portable-atomic", "dep:zigbee-nwk", "bl702-xt-zb1-product/roles", "router-app/router", "zigbee-runtime/router"]
+# Green Power Proxy Basic with its durable Proxy Table at 0xF7000.
+green-power = ["router-core", "router-app/green-power", "bl702-xt-zb1-product/green-power"]
 
 [dependencies]
 bl702-hal = { path = "../../bl702-hal" }

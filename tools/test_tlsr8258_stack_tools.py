@@ -233,6 +233,25 @@ class GateTest(unittest.TestCase):
         report.resolve_indirect(functions, words.get, "local")
         self.assertEqual(functions["caller"]["calls"], {"handler": "indirect"})
 
+    def test_reviewed_indirect_edge_bounds_a_dyn_store_call(self):
+        functions = {
+            "app::persist": {"calls": {}},
+            "Journal as Store>::store": {"calls": {}},
+            "Journal as Store>::load_into": {"calls": {}},
+            "other::dispatch": {"calls": {}},
+        }
+        unresolved = {"app::persist": 1, "other::dispatch": 2}
+        failures = report.add_indirect_edges(
+            functions, unresolved, lambda name: name,
+            [r"^app::persist$=^Journal as Store>::", r"^nothing$=^Journal", "malformed"])
+        self.assertEqual(
+            functions["app::persist"]["calls"],
+            {"Journal as Store>::store": "indirect", "Journal as Store>::load_into": "indirect"})
+        self.assertEqual(unresolved, {"other::dispatch": 2})
+        self.assertEqual(len(failures), 2)
+        self.assertIn("no unresolved caller", failures[0])
+        self.assertIn("CALLER_REGEX=CALLEE_REGEX", failures[1])
+
     def test_new_unresolved_indirect_site_is_reported(self):
         names = ["a::dispatch", "b::new_dyn_call"]
         self.assertEqual(report.unreviewed(names, [r"^a::dispatch$"]), ["b::new_dyn_call"])

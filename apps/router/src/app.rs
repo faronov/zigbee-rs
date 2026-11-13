@@ -1356,7 +1356,10 @@ where
         self.gp_store = Some(store);
     }
 
+    // Out of line: the Proxy Table snapshot frame must not stack on top of
+    // the APS/child journal frames of the caller (TLSR/BL702 chain budgets).
     #[cfg(feature = "green-power")]
+    #[inline(never)]
     fn restore_gp_proxy_table(&mut self) -> Result<(), RouterAppError> {
         if !Self::GP_ROLE {
             return Ok(());
@@ -1381,7 +1384,10 @@ where
         Ok(())
     }
 
+    // Out of line: the Proxy Table snapshot frame must not stack on top of
+    // the APS/child journal frames of the caller (TLSR/BL702 chain budgets).
     #[cfg(feature = "green-power")]
+    #[inline(never)]
     fn persist_gp_proxy_table_if_dirty(&mut self) -> Result<(), RouterAppError> {
         if !Self::GP_ROLE {
             return Ok(());

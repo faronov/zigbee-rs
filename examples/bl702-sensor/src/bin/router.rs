@@ -4,7 +4,9 @@
 //! endpoint 1) under [`router_app::ParentRouterApp`] with persistent child
 //! and APS tables (`products/bl702-xt-zb1/src/router.rs`, journals at
 //! `0xF9000..0xFD000`) and the shared security journal (role tag
-//! `product::role::ROUTER`). No Zigbee OTA client.
+//! `product::role::ROUTER`). With `green-power` (part of `router`) also a
+//! Green Power Proxy Basic with its Proxy Table journal at `0xF7000`;
+//! `router-core` builds without it. No Zigbee OTA client.
 //!
 //! Radio: [`zigbee_mac::bl702::parent_phy::Bl702ParentRadioPhy`]. The M154
 //! hardware sends every Imm-Ack and takes Frame Pending from its own
@@ -152,6 +154,14 @@ fn compose(started: roles::Started) -> &'static mut App {
         roles::parts(),
     ) else {
         hal::halt()
+    };
+    #[cfg(feature = "green-power")]
+    let app = {
+        static GP_STORE: StaticCell<product::router::GpProxyTableStore<'static, MainFlash>> =
+            StaticCell::new();
+        let mut app = app;
+        app.set_green_power_store(GP_STORE.init(stores.gp_proxy_table));
+        app
     };
     APP.init(app)
 }

@@ -3,7 +3,8 @@
 //! A true parent router: [`NrfRouterMac`] (the shared `SoftMacCore` in the
 //! `Parent<8, 8, 0>` role) under [`router_app::ParentRouterApp`]: beacons,
 //! association, indirect TX to sleepy children, routing, durable child and
-//! APS tables. The interrupt-driven PHY sends every Imm-Ack from the RADIO
+//! APS tables, and a Green Power Proxy Basic with a durable Proxy Table
+//! (`--features router-core` builds without it). The interrupt-driven PHY sends every Imm-Ack from the RADIO
 //! interrupt, timed by TIMER0/PPI to the 192 µs turnaround, and sets Frame
 //! Pending from its source-match table, which the core fills through
 //! `RadioPhy::set_ack_frame_pending` (PENDING = 0). LED1 shows the online
@@ -119,6 +120,8 @@ fn compose(
         .build_router_into(DEVICE.uninit());
 
     let (nvmc, child_store, aps_store) = product::router::router_stores(nvmc);
+    #[cfg(feature = "green-power")]
+    let (nvmc, gp_store) = product::router::gp_proxy_table_store(nvmc);
     let security_store = SECURITY.init(roles::open_security_store(nvmc));
     // Before ZigbeeNode construction: persisted keys/counters may never be
     // resumed under a different EUI-64, nor by a different role image.
@@ -143,6 +146,13 @@ fn compose(
         log::error!("[NRF] invalid composition: {error:?}");
         halt()
     });
+    #[cfg(feature = "green-power")]
+    let app = {
+        static GP_STORE: StaticCell<product::router::GpProxyTableStore> = StaticCell::new();
+        let mut app = app;
+        app.set_green_power_store(GP_STORE.init(gp_store));
+        app
+    };
     APP.init(app)
 }
 
@@ -180,6 +190,17 @@ fn log_summary(app: &App) {
             neighbor.relationship,
             neighbor.rx_on_when_idle,
             neighbor.lqi
+        );
+    }
+    #[cfg(feature = "green-power")]
+    {
+        let proxy = app.node().device().gp_proxy();
+        let stats = proxy.forward_stats();
+        log::info!(
+            "[NRF] GP proxy entries {} | forwards sent {} cancelled {} (other proxy first)",
+            proxy.entries().len(),
+            stats.sent,
+            stats.cancelled
         );
     }
 }

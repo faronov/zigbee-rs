@@ -13,7 +13,8 @@ import sys
 from pathlib import Path
 
 FLASH_START = 0x00004000
-FLASH_END = 0x000F4000
+FLASH_END = 0x000F0000
+# 0xF0000..0xF4000: router GP Proxy Table journal (direct map);
 # 0xF4000..0xFC000: router child/APS journals; 0xFC000..: security journal.
 PERSISTENCE_END = 0x00100000
 RAM_START = 0x20000000
@@ -315,7 +316,7 @@ def main() -> None:
     )
     print(
         f"  persistence=0x{FLASH_END:08X}..0x{PERSISTENCE_END:08X} "
-        "(child 16K, APS 16K, security 16K; 8192-byte sectors)"
+        "(GP 16K, child 16K, APS 16K, security 16K; 8192-byte sectors)"
     )
     print(
         f"  BSS={bss_bytes} bytes RAM-static-end=0x{ram_static_end:08X} "

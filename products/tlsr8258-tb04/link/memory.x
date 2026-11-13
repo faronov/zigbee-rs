@@ -7,7 +7,9 @@
  *   0x850000             top of SRAM
  *
  * A is the RAM-code preload size rounded up to 256 bytes. The product-owned
- * NV partitions occupy flash 0x70000..0x76000:
+ * NV partitions occupy flash 0x6E000..0x76000:
+ *   0x6E000..0x70000  router Green Power Proxy Table journal (reserved in
+ *                     every image; only the router writes it)
  *   0x70000..0x72000  APS binding/group journal
  *   0x72000..0x74000  child-table journal (router/coordinator child records)
  *   0x74000..0x76000  security journal (frame counters, keys, network state)
@@ -20,7 +22,7 @@
  */
 MEMORY
 {
-    FLASH : ORIGIN = 0x00000000, LENGTH = 0x70000
+    FLASH : ORIGIN = 0x00000000, LENGTH = 0x6E000
     RAM   : ORIGIN = 0x00840000, LENGTH = 0x10000
 }
 
@@ -161,6 +163,8 @@ SECTIONS
     _bin_size_ = _code_size_ + SIZEOF(.data);
     _bin_size_div_16 = (_bin_size_ + 15) / 16;
     _etext = _dstored_;
+    _gp_nv_start_ = 0x6E000;
+    _gp_nv_end_ = 0x70000;
     _aps_nv_start_ = 0x70000;
     _aps_nv_end_ = 0x72000;
     _child_nv_start_ = 0x72000;
@@ -220,6 +224,10 @@ SECTIONS
     _assert_retention_stacks_unretained = ASSERT(!_retention_image_enabled_ ||
         _svc_stack_guard_start >= _retention_limit_,
         "ERROR: retention stacks/guard must live in the non-retained upper 32 KiB");
+    _assert_image_below_gp_nv = ASSERT(_bin_size_ <= _gp_nv_start_,
+        "ERROR: firmware image overlaps the GP Proxy Table journal at 0x6E000");
+    _assert_gp_nv_before_aps_nv = ASSERT(_gp_nv_end_ <= _aps_nv_start_,
+        "ERROR: GP Proxy Table journal overlaps the APS-table journal");
     _assert_image_below_aps_nv = ASSERT(_bin_size_ <= _aps_nv_start_,
         "ERROR: firmware image overlaps APS-table journal at 0x70000");
     _assert_aps_nv_before_child_nv = ASSERT(_aps_nv_end_ <= _child_nv_start_,

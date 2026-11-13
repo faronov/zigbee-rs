@@ -24,3 +24,6 @@ zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 [features]
 # Sleepy sensor role policy (pulls in the SED lifecycle crate).
 sed = ["dep:sensor-sed-app"]
+# Green Power Proxy Basic for the router role: the GP Proxy Table journal
+# at 0x70000 (`router::gp_proxy_table_store`).
+green-power = ["router-app/green-power", "zigbee-runtime/green-power"]

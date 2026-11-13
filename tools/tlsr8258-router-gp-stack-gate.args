@@ -1,0 +1,10 @@
+# HW-04 static stack gate addendum for the Green Power router ELF (the default
+# `router` build). tools/tlsr8258-firmware.sh passes it after
+# tlsr8258-router-stack-gate.args; the GP-off `router-core` build omits it
+# because it links no GP store.
+
+# Green Power: the product-owned GP Proxy Table store is attached as
+# `&mut dyn GpProxyStore`, so its calls carry no local vtable. The router has
+# exactly one implementation, the product's GpProxyJournal; count it.
+--indirect-edge
+RouterCore<.*>::(activate_network|clear_gp_proxy_table|clear_stale_gp_proxy_table_before_fresh|restore_gp_proxy_table|persist_gp_proxy_table_if_dirty|persist_aps_tables_if_dirty::\{closure#0\})$=^<zigbee_runtime::gp_store::GpProxyJournal<.*> as zigbee_runtime::gp_store::GpProxyStore>::(load_into|store)$

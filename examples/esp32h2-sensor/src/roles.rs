@@ -5,18 +5,21 @@
 //! sequence so its bytes stay identical to the validated build.
 
 #[cfg(any(
-    all(feature = "ed", feature = "router"),
+    all(feature = "ed", feature = "router-core"),
     all(feature = "ed", feature = "sed"),
-    all(feature = "router", feature = "sed"),
+    all(feature = "router-core", feature = "sed"),
 ))]
 compile_error!(
     "enable exactly one role feature (sed, ed or router); use --no-default-features for ed/router"
 );
 
-#[cfg(all(feature = "status-led", not(any(feature = "ed", feature = "router"))))]
+#[cfg(all(
+    feature = "status-led",
+    not(any(feature = "ed", feature = "router-core"))
+))]
 compile_error!("`status-led` is for the mains roles (ed, router)");
 
-#[cfg(all(feature = "light-sleep", any(feature = "ed", feature = "router")))]
+#[cfg(all(feature = "light-sleep", any(feature = "ed", feature = "router-core")))]
 compile_error!("`light-sleep` is a sleepy-sensor feature; the mains roles keep RX on");
 
 use embassy_time::Instant;
@@ -237,17 +240,17 @@ impl Diagnostics for LogDiagnostics {
                 channel,
                 pan_id
             ),
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildrenRestored { count } => {
                 log::info!("[ESP32-H2] {} children restored", count)
             }
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildTableDiscarded { error } => {
                 log::warn!("[ESP32-H2] child table discarded: {:?}", error)
             }
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildTableSaved => log::info!("[ESP32-H2] child table saved"),
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ChildRemovalCompleted {
                 short_address,
                 delivered,
@@ -257,11 +260,11 @@ impl Diagnostics for LogDiagnostics {
                 short_address,
                 delivered
             ),
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ApsTablesRestored { count } => {
                 log::info!("[ESP32-H2] {} APS table entries restored", count)
             }
-            #[cfg(feature = "router")]
+            #[cfg(feature = "router-core")]
             DiagnosticEvent::ApsTablesDiscarded { error } => {
                 log::warn!("[ESP32-H2] APS tables discarded: {:?}", error)
             }

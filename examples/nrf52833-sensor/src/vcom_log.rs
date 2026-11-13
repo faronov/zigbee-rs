@@ -101,7 +101,7 @@ const fn level_tag(level: log::Level) -> &'static str {
 }
 
 /// Lines dropped because the pipe was full.
-#[cfg(feature = "router")]
+#[cfg(feature = "router-core")]
 pub fn dropped_lines() -> u32 {
     DROPPED_LINES.load(Ordering::Relaxed)
 }
