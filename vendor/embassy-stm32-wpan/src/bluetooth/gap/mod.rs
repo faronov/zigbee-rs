@@ -1,0 +1,19 @@
+//! GAP (Generic Access Profile) implementation for WBA BLE stack
+//!
+//! This module provides high-level APIs for:
+//! - Advertising (broadcaster/peripheral role)
+//! - Scanning (observer role)
+//! - Connection management (central/peripheral roles)
+
+pub mod aci_gap;
+pub(crate) mod advertiser;
+pub mod connection;
+pub mod scanner;
+pub mod types;
+
+pub use connection::{
+    Connection, ConnectionInitParams, ConnectionInterval, ConnectionManager, ConnectionParams, DisconnectReason,
+    GapEvent, MAX_CONNECTIONS,
+};
+pub use scanner::{ParsedAdvData, ScanParams, ScanProcedure, ScanType, Scanner, ScanningFilterPolicy};
+pub use types::{AdvData, AdvParams, AdvType, BdAddr, BdAddrType, OwnAddressType};

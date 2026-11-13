@@ -1,0 +1,50 @@
+[package]
+name = "stm32wb-hal"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "STM32WB CPU1 support for zigbee-rs: coprocessor MAC transport, EUI-64, entropy and dual-core flash access"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone: the Embassy git dependencies must not enter the root lockfile.
+[workspace]
+
+[features]
+default = []
+# One feature per STM32WB55 package; the STM32WB5MMG module carries a
+# 1 MiB / 256 KiB STM32WB55VG die. Without a chip feature only the
+# hardware-independent logic is built, which is what the host tests use.
+stm32wb55vg = ["_chip", "embassy-stm32/stm32wb55vg", "embassy-stm32-wpan/stm32wb55vg"]
+stm32wb55rg = ["_chip", "embassy-stm32/stm32wb55rg", "embassy-stm32-wpan/stm32wb55rg"]
+_chip = [
+    "dep:embassy-stm32",
+    "dep:embassy-stm32-wpan",
+    "dep:embassy-time",
+    "dep:embassy-futures",
+    "dep:cortex-m",
+]
+
+[dependencies]
+zigbee-mac = { path = "../zigbee-mac", features = ["stm32wb"] }
+zigbee-types = { path = "../zigbee-types" }
+heapless = "0.9"
+embedded-storage = "0.3"
+log = "0.4"
+cortex-m = { version = "0.7", optional = true }
+
+# embassy-stm32-wpan (with the `wb-mac` coprocessor channel) is only
+# published from git; every Embassy crate is pinned to the same commit.
+# The product owns the memory map, so `memory-x` stays off.
+embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", optional = true, features = ["unstable-pac", "time-driver-any", "exti"] }
+embassy-stm32-wpan = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", optional = true, features = ["wb-mac"] }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", optional = true }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", optional = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+# Local ST MAC layout and mailbox-acknowledgement fixes: see
+# vendor/embassy-stm32-wpan/LOCAL-PATCHES.md.
+[patch."https://github.com/embassy-rs/embassy"]
+embassy-stm32-wpan = { path = "../vendor/embassy-stm32-wpan" }

@@ -1,0 +1,422 @@
+use core::mem::MaybeUninit;
+
+use aligned::{A4, Aligned};
+
+use crate::wb::cmd::{AclDataPacket, CmdPacket};
+#[cfg(feature = "wb-mac")]
+use crate::wb::consts::C_SIZE_CMD_STRING;
+use crate::wb::consts::{POOL_SIZE, TL_CS_EVT_SIZE, TL_EVT_HEADER_SIZE, TL_PACKET_HEADER_SIZE};
+use crate::wb::unsafe_linked_list::LinkedListNode;
+
+#[derive(Debug, Copy, Clone)]
+#[repr(C, packed)]
+pub struct SafeBootInfoTable {
+    version: u32,
+}
+
+#[derive(Debug, Copy, Clone)]
+#[repr(C, packed)]
+pub struct FusInfoTable {
+    pub version: u32,
+    pub memory_size: u32,
+    pub fus_info: u32,
+}
+
+/**
+ * Version
+ * \[0:3\]   = Build - 0: Untracked - 15:Released - x: Tracked version
+ * \[4:7\]   = branch - 0: Mass Market - x: ...
+ * \[8:15\]  = Subversion
+ * \[16:23\] = Version minor
+ * \[24:31\] = Version major
+ *
+ * Memory Size
+ * \[0:7\]   = Flash ( Number of 4k sector)
+ * \[8:15\]  = Reserved ( Shall be set to 0 - may be used as flash extension )
+ * \[16:23\] = SRAM2b ( Number of 1k sector)
+ * \[24:31\] = SRAM2a ( Number of 1k sector)
+ */
+/// Type of a wireless stack, as reported in the `info_stack` word of the wireless
+/// firmware info table (ST's `INFO_STACK_TYPE_*` constants in `shci.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum StackType {
+    /// No wireless stack installed.
+    None,
+    BleFull,
+    BleHci,
+    BleLight,
+    BleBeacon,
+    BleBasic,
+    BleFullExtAdv,
+    BleHciExtAdv,
+    ThreadFtd,
+    ThreadMtd,
+    ZigbeeFfd,
+    ZigbeeRfd,
+    /// MAC 802.15.4 only (`stm32wb5x_Mac_802_15_4_fw.bin`).
+    Mac,
+    BleThreadFtdStatic,
+    BleThreadFtdDynamic,
+    BleThreadLightDynamic,
+    LldTests802154,
+    PhyValid802154,
+    PhyValidBle,
+    LldTestsBle,
+    RlvBle,
+    Rlv802154,
+    BleZigbeeFfdStatic,
+    BleZigbeeRfdStatic,
+    BleZigbeeFfdDynamic,
+    BleZigbeeRfdDynamic,
+    Rlv,
+    /// BLE + MAC 802.15.4 combo (`stm32wb5x_BLE_Mac_802_15_4_fw.bin`).
+    BleMacStatic,
+    NvmBackup,
+    NvmRestore,
+    /// Any other value in the `INFO_STACK_TYPE_MASK` range.
+    Other(u8),
+}
+
+impl StackType {
+    /// Decode the `info_stack` word of the wireless firmware info table.
+    pub fn from_info_stack(info_stack: u32) -> Self {
+        match (info_stack & 0xff) as u8 {
+            0x00 => Self::None,
+            0x01 => Self::BleFull,
+            0x02 => Self::BleHci,
+            0x03 => Self::BleLight,
+            0x04 => Self::BleBeacon,
+            0x05 => Self::BleBasic,
+            0x06 => Self::BleFullExtAdv,
+            0x07 => Self::BleHciExtAdv,
+            0x10 => Self::ThreadFtd,
+            0x11 => Self::ThreadMtd,
+            0x30 => Self::ZigbeeFfd,
+            0x31 => Self::ZigbeeRfd,
+            0x40 => Self::Mac,
+            0x50 => Self::BleThreadFtdStatic,
+            0x51 => Self::BleThreadFtdDynamic,
+            0x52 => Self::BleThreadLightDynamic,
+            0x60 => Self::LldTests802154,
+            0x61 => Self::PhyValid802154,
+            0x62 => Self::PhyValidBle,
+            0x63 => Self::LldTestsBle,
+            0x64 => Self::RlvBle,
+            0x65 => Self::Rlv802154,
+            0x70 => Self::BleZigbeeFfdStatic,
+            0x71 => Self::BleZigbeeRfdStatic,
+            0x78 => Self::BleZigbeeFfdDynamic,
+            0x79 => Self::BleZigbeeRfdDynamic,
+            0x80 => Self::Rlv,
+            0x90 => Self::BleMacStatic,
+            0xF0 => Self::NvmBackup,
+            0xF1 => Self::NvmRestore,
+            other => Self::Other(other),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+#[repr(C, packed)]
+pub struct WirelessFwInfoTable {
+    pub version: u32,
+    pub memory_size: u32,
+    pub info_stack: u32,
+    pub reserved: u32,
+}
+
+impl WirelessFwInfoTable {
+    pub fn version_major(&self) -> u8 {
+        let version = self.version;
+        (version >> 24) as u8
+    }
+
+    pub fn version_minor(&self) -> u8 {
+        let version = self.version;
+        (version >> 16) as u8
+    }
+
+    pub fn subversion(&self) -> u8 {
+        let version = self.version;
+        (version >> 8) as u8
+    }
+
+    /// Size of FLASH, expressed in number of 4K sectors.
+    pub fn flash_size(&self) -> u8 {
+        let memory_size = self.memory_size;
+        memory_size as u8
+    }
+
+    /// Size of SRAM2a, expressed in number of 1K sectors.
+    pub fn sram2a_size(&self) -> u8 {
+        let memory_size = self.memory_size;
+        (memory_size >> 24) as u8
+    }
+
+    /// Size of SRAM2b, expressed in number of 1K sectors.
+    pub fn sram2b_size(&self) -> u8 {
+        let memory_size = self.memory_size;
+        (memory_size >> 16) as u8
+    }
+
+    /// Type of the installed wireless stack (ST's `INFO_STACK_TYPE_*` constants).
+    pub fn stack_type(&self) -> StackType {
+        StackType::from_info_stack(self.info_stack)
+    }
+}
+
+/// Marker written by the FUS into the first word of the device info table when it is
+/// running on CPU2. In that case the table does not have the [`DeviceInfoTable`] layout;
+/// it is a [`FusDeviceInfoTable`] instead (see ST's `mbox_def.h`).
+pub const FUS_DEVICE_INFO_TABLE_VALIDITY_KEYWORD: u32 = 0xA94656B9;
+
+/// Device info table as rewritten by the FUS while it is running on CPU2.
+///
+/// The FUS writes this over the device info table handed to it via the reference table.
+/// It reports both the FUS itself and the wireless stack installed in flash (if any).
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct FusDeviceInfoTable {
+    pub device_info_table_state: u32,
+    pub state_flags: u32,
+    pub safe_boot_version: u32,
+    pub fus_version: u32,
+    pub fus_memory_size: u32,
+    pub wireless_stack_version: u32,
+    pub wireless_stack_memory_size: u32,
+    pub wireless_firmware_ble_info: u32,
+    pub wireless_firmware_thread_info: u32,
+    pub reserved2: u32,
+    pub uid64: u64,
+    pub device_id: u16,
+}
+
+impl FusDeviceInfoTable {
+    pub fn is_valid(&self) -> bool {
+        self.device_info_table_state == FUS_DEVICE_INFO_TABLE_VALIDITY_KEYWORD
+    }
+}
+
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct DeviceInfoTable {
+    pub safe_boot_info_table: SafeBootInfoTable,
+    pub fus_info_table: FusInfoTable,
+    pub wireless_fw_info_table: WirelessFwInfoTable,
+}
+
+/// The bluetooth reference table, as defined in figure 67 of STM32WX AN5289.
+#[derive(Debug)]
+#[repr(C)]
+pub struct BleTable {
+    /// A pointer to the buffer that is used for sending BLE commands.
+    pub pcmd_buffer: *mut CmdPacket,
+    /// A pointer to the buffer used for storing Command statuses.
+    pub pcs_buffer: *const u8,
+    /// A pointer to the event queue, over which IPCC BLE events are sent. This may be accessed via
+    /// [crate::sub::ble::Ble::tl_read].
+    pub pevt_queue: *const u8,
+    /// A pointer to the buffer that is used for sending HCI (Host-Controller Interface) ACL
+    /// (Asynchronous Connection-oriented Logical transport) commands (unused).
+    pub phci_acl_data_buffer: *mut AclDataPacket,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct ThreadTable {
+    pub nostack_buffer: *const u8,
+    pub clicmdrsp_buffer: *const u8,
+    pub otcmdrsp_buffer: *const u8,
+    pub clinot_buffer: *const u8,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct LldTestsTable {
+    pub clicmdrsp_buffer: *const u8,
+    pub m0cmd_buffer: *const u8,
+}
+
+// TODO: use later
+#[derive(Debug)]
+#[repr(C)]
+pub struct BleLldTable {
+    pub cmdrsp_buffer: *const u8,
+    pub m0cmd_buffer: *const u8,
+}
+
+// TODO: use later
+#[derive(Debug)]
+#[repr(C)]
+pub struct ZigbeeTable {
+    pub notif_m0_to_m4_buffer: *const u8,
+    pub appli_cmd_m4_to_m0_bufer: *const u8,
+    pub request_m0_to_m4_buffer: *const u8,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct SysTable {
+    pub pcmd_buffer: *mut CmdPacket,
+    pub sys_queue: *const LinkedListNode,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct MemManagerTable {
+    pub spare_ble_buffer: *const u8,
+    pub spare_sys_buffer: *const u8,
+
+    pub blepool: *const u8,
+    pub blepoolsize: u32,
+
+    pub pevt_free_buffer_queue: *mut LinkedListNode,
+
+    pub traces_evt_pool: *const u8,
+    pub tracespoolsize: u32,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct TracesTable {
+    pub traces_queue: *const u8,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct Mac802_15_4Table {
+    pub p_cmdrsp_buffer: *const u8,
+    pub p_notack_buffer: *const u8,
+    pub evt_queue: *const u8,
+}
+
+/// Reference table. Contains pointers to all other tables.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct RefTable {
+    pub device_info_table: *const DeviceInfoTable,
+    pub ble_table: *const BleTable,
+    pub thread_table: *const ThreadTable,
+    pub sys_table: *const SysTable,
+    pub mem_manager_table: *const MemManagerTable,
+    pub traces_table: *const TracesTable,
+    pub mac_802_15_4_table: *const Mac802_15_4Table,
+    pub zigbee_table: *const ZigbeeTable,
+    pub lld_tests_table: *const LldTestsTable,
+    pub ble_lld_table: *const BleLldTable,
+}
+
+// --------------------- ref table ---------------------
+#[unsafe(link_section = "TL_REF_TABLE")]
+pub static mut TL_REF_TABLE: MaybeUninit<RefTable> = MaybeUninit::zeroed();
+
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut TL_DEVICE_INFO_TABLE: Aligned<A4, MaybeUninit<DeviceInfoTable>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut TL_BLE_TABLE: Aligned<A4, MaybeUninit<BleTable>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut TL_THREAD_TABLE: Aligned<A4, MaybeUninit<ThreadTable>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut TL_LLD_TESTS_TABLE: Aligned<A4, MaybeUninit<LldTestsTable>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut TL_BLE_LLD_TABLE: Aligned<A4, MaybeUninit<BleLldTable>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut TL_SYS_TABLE: Aligned<A4, MaybeUninit<SysTable>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut TL_MEM_MANAGER_TABLE: Aligned<A4, MaybeUninit<MemManagerTable>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut TL_TRACES_TABLE: Aligned<A4, MaybeUninit<TracesTable>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut TL_MAC_802_15_4_TABLE: Aligned<A4, MaybeUninit<Mac802_15_4Table>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut TL_ZIGBEE_TABLE: Aligned<A4, MaybeUninit<ZigbeeTable>> = Aligned(MaybeUninit::zeroed());
+
+// --------------------- tables ---------------------
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut FREE_BUF_QUEUE: Aligned<A4, MaybeUninit<LinkedListNode>> = Aligned(MaybeUninit::zeroed());
+
+#[allow(dead_code)]
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut TRACES_EVT_QUEUE: Aligned<A4, MaybeUninit<LinkedListNode>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut CS_BUFFER: Aligned<A4, MaybeUninit<[u8; TL_PACKET_HEADER_SIZE + TL_EVT_HEADER_SIZE + TL_CS_EVT_SIZE]>> =
+    Aligned(MaybeUninit::zeroed());
+
+#[allow(dead_code)]
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut EVT_QUEUE: Aligned<A4, MaybeUninit<LinkedListNode>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut SYSTEM_EVT_QUEUE: Aligned<A4, MaybeUninit<LinkedListNode>> = Aligned(MaybeUninit::zeroed());
+
+// --------------------- app tables ---------------------
+#[cfg(feature = "wb-mac")]
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut MAC_802_15_4_CMD_BUFFER: Aligned<A4, MaybeUninit<CmdPacket>> = Aligned(MaybeUninit::zeroed());
+
+#[cfg(feature = "wb-mac")]
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut MAC_802_15_4_NOTIF_RSP_EVT_BUFFER: MaybeUninit<
+    Aligned<A4, [u8; TL_PACKET_HEADER_SIZE + TL_EVT_HEADER_SIZE + 255]>,
+> = MaybeUninit::zeroed();
+
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut EVT_POOL: Aligned<A4, MaybeUninit<[u8; POOL_SIZE]>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut SYS_CMD_BUF: Aligned<A4, MaybeUninit<CmdPacket>> = Aligned(MaybeUninit::zeroed());
+
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut SYS_SPARE_EVT_BUF: Aligned<A4, MaybeUninit<[u8; TL_PACKET_HEADER_SIZE + TL_EVT_HEADER_SIZE + 255]>> =
+    Aligned(MaybeUninit::zeroed());
+
+#[allow(dead_code)]
+#[cfg(feature = "wb-mac")]
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut MAC_802_15_4_CNFINDNOT: Aligned<A4, MaybeUninit<[u8; C_SIZE_CMD_STRING]>> =
+    Aligned(MaybeUninit::zeroed());
+
+#[cfg(feature = "wb-ble")]
+#[unsafe(link_section = "MB_MEM1")]
+pub static mut BLE_CMD_BUFFER: Aligned<A4, MaybeUninit<CmdPacket>> = Aligned(MaybeUninit::zeroed());
+
+#[cfg(feature = "wb-ble")]
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut BLE_SPARE_EVT_BUF: Aligned<A4, MaybeUninit<[u8; TL_PACKET_HEADER_SIZE + TL_EVT_HEADER_SIZE + 255]>> =
+    Aligned(MaybeUninit::zeroed());
+
+#[cfg(feature = "wb-ble")]
+#[unsafe(link_section = "MB_MEM2")]
+//                                                 fuck these "magic" numbers from ST ---v---v
+pub static mut HCI_ACL_DATA_BUFFER: Aligned<A4, MaybeUninit<[u8; TL_PACKET_HEADER_SIZE + 5 + 251]>> =
+    Aligned(MaybeUninit::zeroed());
+
+#[cfg(feature = "wb-thread")]
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut THREAD_CMD_BUFFER: Aligned<A4, MaybeUninit<CmdPacket>> = Aligned(MaybeUninit::zeroed());
+
+#[cfg(feature = "wb-thread")]
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut THREAD_NOTIF_RSP_EVT_BUFFER: Aligned<
+    A4,
+    MaybeUninit<[u8; TL_PACKET_HEADER_SIZE + TL_EVT_HEADER_SIZE + 255]>,
+> = Aligned(MaybeUninit::zeroed());
+
+#[cfg(feature = "wb-thread")]
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut THREAD_CLI_CMD_BUFFER: Aligned<A4, MaybeUninit<CmdPacket>> = Aligned(MaybeUninit::zeroed());
+
+#[cfg(feature = "wb-thread")]
+#[unsafe(link_section = "MB_MEM2")]
+pub static mut THREAD_CLI_NOT_BUFFER: Aligned<A4, MaybeUninit<CmdPacket>> = Aligned(MaybeUninit::zeroed());

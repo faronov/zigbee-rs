@@ -77,6 +77,9 @@ pub mod efr32;
 #[cfg(any(feature = "efr32mg21", feature = "efr32mg22"))]
 pub mod efr32s2;
 
+#[cfg(any(test, feature = "stm32wb"))]
+pub mod stm32wb;
+
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 
