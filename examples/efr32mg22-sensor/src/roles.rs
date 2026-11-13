@@ -39,6 +39,7 @@ pub fn start(model: &str) -> Started {
         radio,
         rtcc,
         flash,
+        supply: _,
     } = BoardResources::take().unwrap_or_else(|| halt());
 
     let clocks = efr32mg22_devkit::init_clocks(clocks);
