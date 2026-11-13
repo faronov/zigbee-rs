@@ -12,6 +12,28 @@ publish = false
 
 [dependencies]
 stm32wb-hal = { path = "../../stm32wb-hal", features = ["stm32wb55vg"] }
+# Peripheral features only (see [features]).
+embedded-hal = { version = "1.0", optional = true }
+cortex-m = { version = "0.7", optional = true }
+critical-section = { version = "1.1", optional = true }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", optional = true }
+# Generic part drivers (faronov/zigbee-rs-drivers, branch stm32wb5mm-dk).
+zigbee-tlc59731 = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
+zigbee-display = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
+zigbee-ssd1306 = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
+
+[features]
+default = []
+# TLC59731 RGB LED (EasySet on PA7, shared with the LCD's SPI1 MOSI).
+rgb-led = ["dep:embedded-hal", "dep:cortex-m", "dep:critical-section", "dep:embassy-time", "dep:zigbee-tlc59731"]
+# 0.96" 128x64 SSD1315 OLED on SPI1.
+lcd = ["dep:embedded-hal", "dep:cortex-m", "dep:zigbee-display", "dep:zigbee-ssd1306"]
+# I2C3: STTS22H, ISM330DHCX and VL53L0X.
+sensors = []
+# TSC touch key (group 6) with its shield (group 4).
+touch = []
+# MP23DB01HP PDM microphone on SAI1 block A.
+mic = []
 
 # Local ST MAC layout and mailbox-acknowledgement fixes: see
 # vendor/embassy-stm32-wpan/LOCAL-PATCHES.md.

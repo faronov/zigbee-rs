@@ -38,6 +38,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "az"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
+
+[[package]]
 name = "bare-metal"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -404,6 +410,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-graphics-core"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95743bef3ff70fcba3930246c4e6872882bbea0dcc6da2ca860112e0cd4bd09f"
+dependencies = [
+ "az",
+ "byteorder",
+]
+
+[[package]]
 name = "embedded-hal"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -676,7 +692,14 @@ dependencies = [
 name = "stm32wb5mm-dk"
 version = "0.1.0"
 dependencies = [
+ "cortex-m",
+ "critical-section",
+ "embassy-time",
+ "embedded-hal 1.0.0",
  "stm32wb-hal",
+ "zigbee-display",
+ "zigbee-ssd1306",
+ "zigbee-tlc59731",
 ]
 
 [[package]]
@@ -808,6 +831,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-display"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+dependencies = [
+ "embedded-graphics-core",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "zigbee-sensor",
+]
+
+[[package]]
 name = "zigbee-mac"
 version = "0.1.0"
 dependencies = [
@@ -815,6 +849,34 @@ dependencies = [
  "log",
  "zigbee-crypto",
  "zigbee-types",
+]
+
+[[package]]
+name = "zigbee-sensor"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+]
+
+[[package]]
+name = "zigbee-ssd1306"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+dependencies = [
+ "embedded-graphics-core",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "zigbee-display",
+]
+
+[[package]]
+name = "zigbee-tlc59731"
+version = "0.1.0"
+source = "git+https://github.com/faronov/zigbee-rs-drivers?rev=1f8d89e712c141889f36a77f68c7b6746189d9a2#1f8d89e712c141889f36a77f68c7b6746189d9a2"
+dependencies = [
+ "embedded-hal 1.0.0",
 ]
 
 [[package]]
