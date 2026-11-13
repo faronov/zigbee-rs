@@ -95,6 +95,19 @@ build/layout/package-tested. Earlier ESP32-C6 images demonstrated:
 - OTA Image Notify/query/block transfer and writes into `ota_1`;
 - transfer progress through 18.3% before intentional cancellation.
 
-Complete C6 verification, activation, reboot into the new version, and retained
-commissioned state remain open. The earlier run is not an exact-image rerun of
-the recorded 368,032 B application image.
+On 2026-11-13 a signed TEST-ONLY build (`light-sleep,signed-ota`, built with
+`tools/create-esp32-ota.py --sign-key`) completed a ZHA upgrade from 0.2.0 to
+0.2.1 on one DevKit:
+
+- a 419,640 B container, downloaded in about 43 min, with two parent-loss
+  rejoins during the download that kept the address and staged data;
+- `slot 1 verified`, `otadata` sector 1 seq 2, reboot into `ota_1`;
+- pending verify, then `running image confirmed` after the resume, with no
+  rejoin;
+- the same NWK address `0xFA41` and forward-only frame counters.
+
+Details and observations are in
+[the bootloader results](../../docs/book/src/advanced/bootloader.md#esp32-c6-signed-zha-ota-2026-11-13).
+The signed test build is about +13.0 KB flash and +352 B `.bss` against the
+unsigned light-sleep image. The default unsigned image, sleep current,
+power-loss recovery and rollback have no C6 hardware run.

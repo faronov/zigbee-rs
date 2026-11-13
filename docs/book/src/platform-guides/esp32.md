@@ -632,16 +632,44 @@ An earlier 4 MiB ESP32-H2 revision 1.2 image demonstrated:
 - retained IEEE address, PAN, parent, network credentials, and counters.
 
 Fresh factory-reset commissioning and long-duration power behavior remain
-separate gates. Pending verification, confirmation and rollback are host-tested
-only; no OTA boot of either chip has exercised them. Neither current H2 variant above has hardware execution
+separate gates. Pending verification and confirmation were exercised on
+hardware only by the signed TEST-ONLY runs below and in the
+[bootloader results](../advanced/bootloader.md#esp32-h2-signed-zha-ota-2026-11-10);
+rollback is host-tested only. Neither current H2 variant above has hardware execution
 evidence. Removing artificial size budgets does not close those hardware gates.
 
 ### ESP32-C6
 
 Earlier C6 hardware runs demonstrated commissioning/reporting and OTA transfer
-to 18.3% before intentional cancellation. Complete C6
-verification/activation/reboot remains open. The former regression budgets
-are not live build gates.
+to 18.3% before intentional cancellation. The former regression budgets are
+not live build gates.
+
+On 2026-11-13 a signed TEST-ONLY sensor (`light-sleep,signed-ota`) completed
+a ZHA upgrade from 0.2.0 to 0.2.1 on one DevKit
+([results](../advanced/bootloader.md#esp32-c6-signed-zha-ota-2026-11-13)):
+
+- about 43 min download of a 419,640 B container; two parent-loss rejoins
+  during the download kept `0xFA41` and the staged data;
+- verification, `otadata` switch, reboot into `ota_1`;
+- `PendingVerify`, then `running image confirmed` after resuming without a
+  rejoin;
+- forward-only outgoing NWK frame counter (93,187 before, 113,664 after).
+
+An earlier attempt was aborted by zigpy when the parent was reflashed. A
+second failed because downlink to the device was missing for about 15 min
+after a parent change; that recovered without intervention, and the cause
+was not established. Sleep current, power loss during staging or install,
+and rollback remain open. Wrong-key and downgrade refusal were shown on the
+H2 only.
+
+Observations from the run, tracked separately:
+
+- ZHA shows the IEEE address byte-reversed (`88:96:f6:fe:ff:f9:55:62` for
+  eFuse MAC `60:55:F9:F6:96:88`); the H2 shows the same pattern.
+- Rejoin picks the shallowest parent and does not avoid the parent that
+  just failed.
+- A MAC `NoAck` to the parent is logged as `ZCL frame send failed:
+  NoShortAddress`.
 
 Role images on an ESP32-C6 DevKit (hwlab, ZHA coordinator, channel 15):
 
