@@ -19727,3 +19727,74 @@ mod legacy_nv_update_id_tests {
         assert_eq!(device.save_state(&mut failing), Err(NvError::HardwareError));
     }
 }
+
+// Kept at the end of the file: inserting code above existing functions
+// shifts their panic-location line numbers and changes every image built
+// from this crate.
+impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
+    /// Start (or with `0` stop) local identification on `endpoint`, as if
+    /// IdentifyTime had been written to `seconds` — for example from a
+    /// product button. Returns `false` when the endpoint has no Identify
+    /// server cluster. The time counts down in [`tick`](Self::tick) like a
+    /// remotely started identify.
+    pub fn start_identify(&mut self, endpoint: u8, seconds: u16) -> bool {
+        self.identify_clusters
+            .iter_mut()
+            .find(|entry| entry.endpoint == endpoint)
+            .is_some_and(|entry| {
+                entry
+                    .cluster
+                    .attributes_mut()
+                    .set_raw(
+                        zigbee_zcl::clusters::identify::ATTR_IDENTIFY_TIME,
+                        zigbee_zcl::data_types::ZclValue::U16(seconds),
+                    )
+                    .is_ok()
+            })
+    }
+}
+
+#[cfg(test)]
+mod start_identify_tests {
+    use super::ZigbeeDevice;
+    use zigbee_mac::mock::MockMac;
+    use zigbee_zcl::data_types::ZclValue;
+
+    const IEEE_ADDRESS: [u8; 8] = [0x02, 0x49, 0x44, 0x45, 0x4E, 0x54, 0x30, 0x31];
+
+    fn identify_time(device: &ZigbeeDevice<MockMac>, endpoint: u8) -> Option<ZclValue> {
+        let clusters: [crate::ClusterRef<'_>; 0] = [];
+        device
+            .with_cluster(endpoint, crate::ClusterId::IDENTIFY, &clusters, |cluster| {
+                cluster
+                    .attributes()
+                    .get(zigbee_zcl::AttributeId(0x0000))
+                    .cloned()
+            })
+            .flatten()
+    }
+
+    /// A local identify request behaves like a written IdentifyTime and only
+    /// reaches an endpoint that declares the Identify server.
+    #[test]
+    fn start_identify_sets_and_ticks_the_local_identify_time() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .endpoint(1, 0x0104, zigbee_zcl::DeviceId(0x0008), |ep| {
+                ep.cluster_server(crate::ClusterId::IDENTIFY)
+            })
+            .endpoint(2, 0x0104, zigbee_zcl::DeviceId(0x000C), |ep| {
+                ep.cluster_server(crate::ClusterId::ANALOG_INPUT)
+            })
+            .build();
+        assert!(!device.is_identifying(1));
+        assert!(device.start_identify(1, 10));
+        assert!(device.is_identifying(1));
+        assert_eq!(identify_time(&device, 1), Some(ZclValue::U16(10)));
+        device.tick_identify_clusters(4);
+        assert_eq!(identify_time(&device, 1), Some(ZclValue::U16(6)));
+        assert!(!device.start_identify(2, 10), "no Identify on endpoint 2");
+        assert!(!device.start_identify(9, 10), "no endpoint 9");
+        assert!(device.start_identify(1, 0));
+        assert!(!device.is_identifying(1));
+    }
+}
