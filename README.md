@@ -236,7 +236,7 @@ path-level evidence unless the row names the current MAC or image.
 | nRF52840 DK | environmental sleepy End Device | yes | prior evidence (deleted `NrfMac`) covers commissioning, reporting, AES, persistence, and reset/resume; the current `SoftMacCore` image has no hardware run |
 | nRF52833 DK | environmental sleepy End Device | yes | prior evidence (deleted `NrfMac`) covers commissioning, reporting, AES, persistence, and reset/resume; the current `SoftMacCore` image has no hardware run |
 | nRF52840 DK | always-on End Device | yes | commissioning/resume and continuous-RX HIL remain open |
-| ESP32-C6 | environmental sleepy End Device + OTA | yes | prior C6 evidence covers commissioning/reporting and OTA to 18.3%; complete activation remains open |
+| ESP32-C6 | environmental sleepy End Device + OTA | yes | commissioning/reporting and reset/resume; a signed TEST-ONLY 0.2.0→0.2.1 ZHA OTA activated, confirmed and kept its network on one board; sleep current and power-loss recovery remain open |
 | ESP32-H2 | environmental sleepy End Device + OTA | yes | prior H2 evidence covers v1→v2 activation, reboot, and retained commissioned state |
 | BL702 XT-ZB1 | environmental sleepy End Device + OTA | yes | on `SoftMacCore`: commissioning/interview, journal reset/resume, Idle sleep, and a signed 0.1.0→0.1.1 OTA with loader install and retained network on one board; power-loss recovery remains open |
 | PHY6222/PHY6252 EVK | environmental sleepy End Device | yes | the variants occupy 135,680/135,744 B of the 187,104 B XIP slot (ends below the PHY6252 security partition at 0x3E000); the radio driver is shared with the hardware-proven PB-03F-Kit, but the EVK image itself remains hardware-unverified |

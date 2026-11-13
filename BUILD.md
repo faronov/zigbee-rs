@@ -160,8 +160,10 @@ Earlier hardware runs provide narrow path evidence:
 
 - H2: a full v1→v2 download, activation, reboot, and retained commissioned
   state were demonstrated.
-- C6: commissioning/reporting and transfer through 18.3% were demonstrated;
-  complete activation remains open.
+- C6: commissioning/reporting were demonstrated, and a signed TEST-ONLY
+  0.2.0→0.2.1 ZHA OTA completed download, activation, reboot, confirm and
+  network retention on 2026-11-13. The default (unsigned) image has no
+  OTA hardware run.
 
 Those runs are not recorded as reruns of the exact 369,248 B and 354,096 B
 images in the recorded measurement table. That C6 image fits its physical OTA

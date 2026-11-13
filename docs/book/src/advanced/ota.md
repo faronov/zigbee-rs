@@ -183,7 +183,7 @@ device following the reset.
 
 | product | staging/activation | status |
 |---|---|---|
-| ESP32-C6 | inactive `ota_0`/`ota_1`, appended SHA-256, redundant `otadata` | prior C6 run reached 18.3%; current exact image has build/layout evidence only |
+| ESP32-C6 | same product writer/layout as H2; optional `signed-ota` | signed sensor (TEST-ONLY): ZHA upgrade 0.2.0→0.2.1 (about 43 min, two parent-loss rejoins during the download) activated, rebooted into `ota_1`, confirmed and kept `0xFA41` with forward-only frame counters ([results](./bootloader.md#esp32-c6-signed-zha-ota-2026-11-13)). Refusal runs were done on the H2 only. Default builds have no signature check and no exact-image OTA run. |
 | ESP32-H2 | same product writer/layout; optional `signed-ota` (`SignedEspWriter`: MCUboot envelope, ECDSA P-256, version check against the container) | prior H2 run demonstrated v1→v2 activation/reboot/network retention. Signed thermometer (TEST-ONLY): ZHA upgrade 0.2.0→0.2.1 (about 44 min) activated, rebooted, confirmed and kept its network; wrong-key and disguised-downgrade images were downloaded and refused at verify, `otadata` unchanged ([results](./bootloader.md#esp32-h2-signed-zha-ota-2026-11-10)). Default builds have no signature check. |
 | EFR32MG1 | Gecko Bootloader storage slot 0 through `BootloaderFlashAccess` | writer implemented; real Zigbee download/install/reboot open |
 | nRF52840/52833 | no writer in current products | `NoOta` |

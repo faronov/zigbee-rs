@@ -1785,6 +1785,125 @@ Board state: v2 loader plus confirmed TEST-ONLY 0.2.1 loader-linked
 router with GP. Restore rule unchanged: never write `0x0..0x4000` or
 from `0xF4000` up.
 
+### ESP32-C6 signed ZHA OTA (2026-11-13)
+
+Upgrade only. The wrong-key and downgrade refusals were proven on the H2
+([above](#esp32-h2-signed-zha-ota-2026-11-10)) with the same product
+writer; they were not repeated on the C6.
+
+**Board.**
+- ESP32-C6 DevKit on USB, hwlab `espusbjtag` probe `60:55:F9:F6:96:88`;
+  console `/dev/cu.usbmodem14601`. Secure boot and flash encryption are
+  off.
+- Initial state: unsigned `esp32c6-sensor` 0.1.0 (light sleep), not
+  joined. The earlier 18.3% C6 transfer had been cancelled on purpose.
+
+**Backup.** Full 4 MiB read before any write, SHA-256 `cee883fa…`. It
+holds old frame counters in `zbnv` and must never be restored as a whole.
+
+**Images** (`tools/create-esp32-ota.py --chip esp32c6 --features
+light-sleep --sign-key <own key>`, TEST-ONLY):
+
+| image | version | file | SHA-256 |
+|---|---|---|---|
+| base | 0.2.0, `0x00020000` | signed `.app.bin`, programmed into `ota_0` (`0x10000`) only | `f86a1692…` |
+| upgrade | 0.2.1, `0x00020001` | `.ota`, 419,640 B; inner image 419,392 B | `7d680e28…` |
+
+The signed test build is +13,006 B file-backed flash (`.text` +12,462,
+`.rodata` +376, `.data` +168) and +352 B `.bss` against the unsigned
+light-sleep image. Default builds are unchanged.
+
+**Join.** Programming `ota_0` with no `otadata` or `zbnv` write gave a
+fresh join:
+- First permit window: joined as `0x9CD9` and received the NWK key, but
+  Verify-Key got no Confirm-Key. The device left with
+  `TrustCenterLinkKeyExchangeFailure`, as designed.
+- Second window: joined as `0xFA41` via `0x4A76` (LQI 216), Confirm-Key
+  SUCCESS, ZHA interview complete. Endpoint 1 lists output cluster
+  `0x0019`, and ZHA created the update entity with `installed_version
+  0x00020000`.
+
+**Procedure:** as for the H2 (publish, reload the ZHA entry, JTAG
+`ndmreset`, `update_entity` and `update.install` inside the 60 s fast-poll
+window).
+
+**Attempt 1: aborted by the server.** At 22.5% (offset 96,288), parent
+`0x4A76` (the ZBT-1) stopped acknowledging while it was being reflashed
+for unrelated work. The device rejoined via `0x1F0F` with the same address,
+and zigpy aborted on the re-announce. Device log: `Server aborted the
+download at offset 96288; keeping staged data`. Same pattern as the H2
+attempt 1.
+
+**Attempt 2: no downlink.** After the reset the device resumed under
+`0x1F0F`. Its uplink reached HA (`0xFA41 → 0x1F0F → 0x43FD → 0x0000`), but
+every APS ACK timed out, and the install failed within about 13 s. A 100 s
+sniff on channel 15 showed no frame with NWK destination `0xFA41`, while
+the coordinator still reached `0x1F0F` through `0x43FD`. The device's
+parent-loss rejoin chose `0x1F0F` again each time. About 15 min later,
+downlink worked on the same parent without any intervention: a sniff
+showed `0x0000 → 0x43FD → 0x1F0F → 0xFA41`, and ZHA attribute reads
+answered. The cause was not established; a stale coordinator route
+towards the old parent is a hypothesis, not a finding.
+
+**Attempt 3 (0.2.0 → 0.2.1): pass.**
+- **Download:** install issued 17:39:56, 100% at 18:23:10 (about 43 min,
+  about 2.3%/min).
+- **Parent changes during the download:** two "polls to parent failing"
+  secure rejoins, both keeping `0xFA41` and the staged data:
+  1. at about 11%, via `0x1F0F` (depth 2, LQI 156);
+  2. at about 15%, via `0x4A76` (no rejoin response after 9 attempts),
+     then via `0xD586` (depth 4, LQI 184), accepted.
+
+  zigpy did not abort either time.
+- **Link counters** (two console captures covering the download): 109 MAC
+  `NoAck`, 98 NWK route errors surfacing as `NoShortAddress`, 13
+  frame-counter replays from neighbours. Retries absorbed them all.
+- **Device log:**
+  - `slot 1 verified (419392 bytes)`;
+  - `Server says upgrade NOW`;
+  - `otadata sector 1 -> seq 2 (slot 1)`;
+  - reboot, then `Loaded app from partition at offset 0x200000`;
+  - `OTA boot check: Ok(PendingVerify { slot: 1 })`;
+  - `Resume: addr=0xFA41 … parent=0xD586`, no rejoin;
+  - `running image confirmed` 11 s after the reboot.
+- **HA:** `installed_version 0x00020001`.
+- **JTAG `otadata`:** sector 0 seq 1, state 2 (VALID); sector 1 seq 2,
+  state 2 (VALID).
+- **Second reset:** boots `0x200000` with `Ok(Confirmed)`, version 131073,
+  resumes as `0xFA41`.
+- **Frame counters (sniffer):** outgoing NWK counter 93,187 before the
+  upgrade and 113,664 after the reboot, forward only (the reserved block
+  was skipped).
+
+**Final state.**
+- **Board:** C6 `0xFA41`, parent `0xD586`, running confirmed TEST-ONLY
+  0.2.1 from `ota_1`. `ota_0` keeps the signed 0.2.0 base.
+- **HA:** `/config/zigpy_ota` restored to its original four files (SHA-256
+  checked), and the ZHA entry reloaded. The only remaining C6 file offers
+  `0x00000002`, which is older than the installed version.
+
+**Not covered:** sleep current (the native USB session vetoes PMU sleep),
+power loss during staging or install, and rollback of an unconfirmed
+image.
+
+**Observations (not fixed here; tracked separately):**
+- **IEEE byte order.** The eFuse MAC is `60:55:F9:F6:96:88`, but the NIB
+  logs `[62, 55, F9, FF, FE, F6, 96, 88]` and ZHA shows
+  `88:96:f6:fe:ff:f9:55:62`. The OUI is at the low end and the first octet
+  has its universal/local bit set. The H2 shows the same pattern.
+- **Rejoin parent choice.** Rejoin prefers the shallowest parent and does
+  not avoid the parent that just failed. In attempt 2 the device kept
+  rejoining via `0x1F0F` while that path delivered no downlink.
+- **`NoShortAddress` label.** A MAC `NoAck` to the parent surfaces as an
+  NWK `RouteError` and then as `ZCL frame send failed: NoShortAddress`.
+  The label does not describe the cause.
+
+**Sessions** (hwlab): `2026-11-13T145154Z-c6-ota-join2`,
+`…150416Z-c6-ota-install-a1`, `…152007Z-c6-ota-install-a2`,
+`…153238Z-c6-ota-1f0f-sniff`, `…153654Z-c6-ota-downlink-test`,
+`…153907Z-c6-ota-install-a3`, `…160144Z-c6-ota-install-a3b`,
+`…162453Z-c6-ota-post-fc-sniff`.
+
 ## Open decisions
 
 Resolved in Phase 2 step 2:

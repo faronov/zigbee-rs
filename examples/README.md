@@ -107,7 +107,7 @@ git `rev`.
 | [`nrf52840-sensor`](nrf52840-sensor/) | PCA10056 / nRF52840 | `Idle` / `Idle` | fitted LED, `NoOta` | build/layout; prior sensor-path evidence |
 | [`nrf52833-sensor`](nrf52833-sensor/) | PCA10100 / nRF52833 | `Idle` / `Idle` | fitted LED, `NoOta` | build/layout; prior sensor-path evidence |
 | [`nrf52840-sensor-uf2`](nrf52840-sensor-uf2/) | ProMicro, MDK, PCA10059, or DK | `Idle` / `Idle` | board-dependent status, `NoOta` | build/layout matrix; bootloader compatibility remains board-specific |
-| [`esp32c6-sensor`](esp32c6-sensor/) | ESP32-C6 DevKit | `Active` / `Active` | `NoStatus`, OTA | real `esp-radio`; prior commissioning/reporting and 18.3% OTA evidence; activation open |
+| [`esp32c6-sensor`](esp32c6-sensor/) | ESP32-C6 DevKit | `Active` / `Active` | `NoStatus`, OTA | real `esp-radio`; HIL: commissioning/reporting, reset/resume, signed TEST-ONLY 0.2.0→0.2.1 ZHA OTA with activation and confirm |
 | [`esp32h2-sensor`](esp32h2-sensor/) | ESP32-H2 | `Active` / `Active` | active-low LED, OTA | real `esp-radio`; prior complete v1→v2 OTA evidence |
 | [`bl702-sensor`](bl702-sensor/) | XT-ZB1 / BL702 | `Idle` / `Idle` | `NoStatus`, signed OTA with own loader | HIL: join, interview, Idle long poll, leave, reset/resume, 0.1.0→0.1.1 OTA; sleep current unmeasured |
 | [`phy6222-sensor`](phy6222-sensor/) | PHY6222/PHY6252 EVK | `Idle` / `Idle` | fitted status, `NoOta` | exact feature images build/layout-tested; hardware path open |
