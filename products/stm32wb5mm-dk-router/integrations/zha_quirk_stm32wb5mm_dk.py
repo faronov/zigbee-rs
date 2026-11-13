@@ -36,6 +36,10 @@ Notes:
     microphone's nominal sensitivity, not a calibrated SPL (dBA) reading.
   * AnalogInput Description (0x001C) is not implemented by the firmware, so
     entity names come from translation_key / fallback_name only.
+  * zha-quirks 2.4.x drops suggested_display_precision, so HA would show the
+    raw single float (19.0200004577637); attribute_converter rounds instead.
+  * ZHA would make the temperature entity "primary" and name it after the
+    device; the quirk marks it non-primary so it stays "Temperature".
 """
 
 try:
@@ -66,10 +70,18 @@ except ImportError:
     )
 
 from zigpy.zcl.clusters.general import AnalogInput
-from zigpy.zcl.clusters.measurement import OccupancySensing
+from zigpy.zcl.clusters.measurement import OccupancySensing, TemperatureMeasurement
 
 (
     QuirkBuilder("Zigbee-RS", "STM32WB5MM-DK-Router")
+    # ZHA names its weight-picked "primary" entity after the device. With the
+    # default occupancy entity gone, temperature would win; this multi-sensor
+    # board has no single main feature, so keep every entity named.
+    .change_entity_metadata(
+        endpoint_id=1,
+        cluster_id=TemperatureMeasurement.cluster_id,
+        new_primary=False,
+    )
     # EP1: ZHA's default occupancy entity has no name (HA shows the device
     # name); "Motion" below replaces it.
     .prevent_default_entity_creation(
@@ -106,6 +118,7 @@ from zigpy.zcl.clusters.measurement import OccupancySensing
         state_class=SensorStateClass.MEASUREMENT,
         unit=UnitOfLength.MILLIMETERS,
         suggested_display_precision=0,
+        attribute_converter=round,
         unique_id_suffix="distance",
         translation_key="distance",
         fallback_name="Distance",
@@ -118,6 +131,7 @@ from zigpy.zcl.clusters.measurement import OccupancySensing
         state_class=SensorStateClass.MEASUREMENT,
         unit=DEGREE,
         suggested_display_precision=1,
+        attribute_converter=lambda value: round(value, 1),
         unique_id_suffix="inclination",
         translation_key="inclination",
         fallback_name="Inclination",
@@ -132,6 +146,7 @@ from zigpy.zcl.clusters.measurement import OccupancySensing
         state_class=SensorStateClass.MEASUREMENT,
         unit=UnitOfSoundPressure.DECIBEL,
         suggested_display_precision=0,
+        attribute_converter=round,
         unique_id_suffix="sound_level",
         translation_key="sound_level",
         fallback_name="Sound level",
