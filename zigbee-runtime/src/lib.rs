@@ -19798,3 +19798,7 @@ mod start_identify_tests {
         assert!(!device.is_identifying(1));
     }
 }
+
+/// Small durable application settings (declared last: keeps the line
+/// numbers above, which panic locations embed, unchanged).
+pub mod settings_journal;

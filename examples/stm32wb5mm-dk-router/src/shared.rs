@@ -48,7 +48,10 @@ impl<T: Copy> Shared<T> {
         self.0.lock(Cell::get)
     }
 
-    #[cfg_attr(not(any(feature = "rgb-led", feature = "lcd")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "rgb-led", feature = "lcd", feature = "sensors")),
+        allow(dead_code)
+    )]
     pub fn set(&self, value: T) {
         self.0.lock(|cell| cell.set(value))
     }
@@ -74,6 +77,12 @@ pub static NETWORK: Shared<NetworkSnapshot> = Shared::new(NetworkSnapshot::EMPTY
 /// Latest sensor readings, refreshed by the sensor tasks.
 #[cfg(any(feature = "lcd", feature = "sensors", feature = "mic"))]
 pub static SENSORS: Shared<SensorSnapshot> = Shared::new(SensorSnapshot::EMPTY);
+
+/// Occupancy Sensing motion hold, seconds: written by the router loop
+/// from the ZCL attribute, read by the sensing task.
+#[cfg(feature = "sensors")]
+pub static MOTION_HOLD_SECS: Shared<u16> =
+    Shared::new(stm32wb5mm_dk_router_product::motion::DEFAULT_HOLD_SECS);
 
 /// Record a lifecycle change for the indicator and display tasks.
 pub fn publish_status(status: RouterStatus) {

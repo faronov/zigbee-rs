@@ -20,6 +20,7 @@ sensors = ["zigbee-runtime/float32", "zigbee-zcl/float32"]
 sound = ["zigbee-runtime/float32", "zigbee-zcl/float32"]
 
 [dependencies]
+heapless = "0.9"
 libm = "0.2"
 router-app = { path = "../../apps/router" }
 zigbee-aps = { path = "../../zigbee-aps" }
@@ -28,7 +29,6 @@ zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 
 [dev-dependencies]
-heapless = "0.9"
 zigbee-mac = { path = "../../zigbee-mac", default-features = false, features = ["mock"] }
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["router"] }
 

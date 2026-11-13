@@ -111,7 +111,7 @@ former-budget rows.
 | ESP32-H2 sensor default / `light-sleep` | 365,920 / 376,640 | 356,352 each | -9,568 / -20,288 | application images; above former budget |
 | TLSR8258 default / LOW32K 250 ms / LOW32K 10 s | 290,616 / 295,548 / 295,552 | 294,912 / 299,008 / 299,008 | 4,296 / 3,460 / 3,456 | raw binaries |
 | TLSR8258 parent router | 436,072 | 430,080 | -5,992 | raw binary; above former budget |
-| STM32WB5MM-DK router plain / all peripherals (default) | 388,386 / 446,626 | 892,928 each | 504,542 / 446,302 | raw binaries from `0x08000000`; the application slot ends at the journals (`0x080D5000`) |
+| STM32WB5MM-DK router plain / all peripherals (default) | 388,482 / 449,602 | 864,256 each | 475,774 / 414,654 | raw binaries from `0x08000000`; the application slot ends at the settings journal (`0x080D3000`) |
 
 The measurements use:
 

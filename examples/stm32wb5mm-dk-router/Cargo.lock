@@ -976,6 +976,7 @@ dependencies = [
 name = "stm32wb5mm-dk-router-product"
 version = "0.1.0"
 dependencies = [
+ "heapless",
  "libm",
  "router-app",
  "stm32wb-hal",

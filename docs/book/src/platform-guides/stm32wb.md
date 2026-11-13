@@ -37,7 +37,7 @@ enables all of them; `--no-default-features` is the plain router.
 
 | Feature | Part (UM2825) | Use |
 |---|---|---|
-| `rgb-led` | TLC59731 RGB LED | lifecycle colour |
+| `rgb-led` | LD4, TLC59731 RGB LED (needs JP5 ON, JP4 OFF) | lifecycle colour |
 | `lcd` | SSD1315 128×64 OLED, SPI1 | three text pages |
 | `touch` (implies `lcd`) | TSC key (group 6, shield group 4) | page navigation |
 | `sensors` | STTS22H, ISM330DHCX, VL53L0X on I2C3 | ZCL endpoints 1–3 |
@@ -57,6 +57,22 @@ The IR LED and the QSPI flash are fitted but not used.
 | touch key | hold | first LCD page |
 
 ### LED colours
+
+These are the colours of **LD4**, the RGB LED. UM2825 puts it behind the
+IR-LED selector: JP5 must be ON and JP4 OFF. PH1 (`GPIO_SELECT2`) gates its
+data line during a write. The firmware follows ST's BSP
+(`stm32wb5mm_dk.c`) for both select polarity and colour order (OUT0/1/2 =
+red/green/blue).
+
+The other LEDs are not driven by the firmware:
+
+- **LD3** is the ST-LINK COM indicator. It glows steady red once the host
+  has initialised the ST-LINK, so it is normal while the board sits on
+  USB.
+- **LD1** (red) flags a USB power fault.
+- **LD2** (green) shows 5 V.
+
+After the 30 s green, an idle joined router keeps LD4 off.
 
 | State | Colour |
 |---|---|
@@ -80,7 +96,7 @@ The IR LED and the QSPI flash are fitted but not used.
 | EP | Device type | Cluster | Source |
 |---|---|---|---|
 | 1 | Range Extender 0x0008 | Temperature Measurement 0x0402 | STTS22H |
-| 1 | | Occupancy Sensing 0x0406 | ISM330DHCX motion, 60 s hold (not a PIR) |
+| 1 | | Occupancy Sensing 0x0406, sensor type physical contact | ISM330DHCX motion (not a PIR); the hold is `PIROccupiedToUnoccupiedDelay` 0x0010 |
 | 2 | Simple Sensor 0x000C | Analog Input 0x000C, mm (BACnet units 30), 0–2000 | VL53L0X; no target = 2000 with Reliability OVER_RANGE |
 | 3 | Simple Sensor 0x000C | Analog Input, degrees from vertical (units 90), 0–180 | ISM330DHCX gravity |
 | 4 | Simple Sensor 0x000C | Analog Input, dB (units 199), 0–130 | MP23DB01HP; uncalibrated, unweighted, nominal −41 dBFS sensitivity |
@@ -88,9 +104,27 @@ The IR LED and the QSPI flash are fitted but not used.
 A missing or failing sensor reports Reliability NO_SENSOR with the FAULT
 status flag; temperature reports the invalid value 0x8000.
 
-ZHA creates the temperature and occupancy entities on its own. It creates
-Analog Input entities only for some manufacturers, so endpoints 2–4 need
-the quirk in
+The motion hold, `PIROccupiedToUnoccupiedDelay` (0x0010), is read-write and
+defaults to 60 s:
+
+- `product::motion` keeps a written value in the settings journal, bound to
+  the network's extended PAN ID.
+- After a reset in the same network, the router restores that value.
+- A factory reset, or joining another network, returns it to 60 s.
+
+The other PIR and ultrasonic delay and threshold attributes (0x0011,
+0x0012, 0x0020, 0x0021) are not declared.
+
+ZHA creates the temperature entity on its own. The quirk changes three
+things on endpoint 1:
+
+- it replaces ZHA's unnamed occupancy entity with a **Motion** binary
+  sensor (device class motion: Detected/Clear);
+- it keeps "Occupied to unoccupied delay", which is the hold;
+- it drops "Unoccupied to occupied delay", which is not implemented.
+
+ZHA creates Analog Input entities only for some manufacturers, so
+endpoints 2–4 also need the quirk in
 `products/stm32wb5mm-dk-router/integrations/zha_quirk_stm32wb5mm_dk.py`
 (through `custom_quirks_path`). Copy the file into the custom-quirks
 directory and reload the ZHA config entry; Home Assistant does not need a
@@ -134,7 +168,8 @@ moves SFSA. The product asserts the boundary it was built for:
 
 | Region | Range | Owner |
 |---|---|---|
-| Application | `0x0800_0000..0x080D_5000` (852 KiB) | product linker script |
+| Application | `0x0800_0000..0x080D_3000` (844 KiB) | product linker script |
+| Settings journal (motion hold) | `0x080D_3000..0x080D_5000` | product |
 | Child-table journal | `0x080D_5000..0x080D_9000` | product |
 | APS-table journal | `0x080D_9000..0x080D_D000` | product |
 | Security journal (frame counters) | `0x080D_D000..0x080E_1000` | product |
@@ -142,7 +177,10 @@ moves SFSA. The product asserts the boundary it was built for:
 | SRAM1 (CPU1) | `0x2000_0000..0x2003_0000` | application |
 | SRAM2a/2b shared | `0x2003_0000..` | IPCC mailbox (`TL_REF_TABLE` at `0x2003_0000`) |
 
-Each journal uses two 4 KiB logical sectors. STM32WB flash programs 64-bit
+Each router journal uses two 4 KiB logical sectors. The settings journal
+(`zigbee-runtime::settings_journal`) is a CRC-checked single-record log
+with a commit marker and a generation counter, on two 2 KiB logical
+sectors. STM32WB flash programs 64-bit
 double-words exactly once between erases, so the HAL's
 word-per-double-word adapter (`stm32wb-hal::word_flash`) stores each
 logical sector on two physical pages. The adapter preserves the journal's
@@ -171,7 +209,7 @@ HAL's `FlashWindow` bound.
 | TX power | `phyTransmitPower` (−20..+6 dBm) | programmed; level not measured |
 | MAC-layer security | not used (Zigbee secures at NWK/APS) | — |
 | PAN-coordinator start | not offered | — |
-| CCA threshold | not exposed (only `phyCCAMode`) | — |
+| CCA threshold | not exposed (only `phyCCAMode`); CSMA backoff PIBs left at the ST defaults | — |
 
 The module documentation of `zigbee-mac::stm32wb` lists the semantic
 deviations. Three of them matter most:
@@ -255,11 +293,39 @@ Peripheral image (all features), on the same DK:
   security journal, rejoined as a new address and was interviewed with
   all four endpoints;
 - ZHA shows the temperature (20.0 °C) and occupancy entities, and the
-  node sends reports for 0x0402, 0x0406 and the three Analog Inputs.
+  node sends reports for 0x0402, 0x0406 and the three Analog Inputs;
+- with the quirk, ZHA shows Motion, Distance, Inclination and Sound level.
 
-Not yet confirmed by an observer: the LED colours, the LCD pages, touch
-navigation, and B1/B2 on the peripheral image. A VL53L0X in-range
-reading has not been confirmed either. The sound level is uncalibrated.
+A write of 20 s to "Occupied to unoccupied delay" in ZHA reached the device
+(`motion hold 20 s stored`). After a reset the device restored 20 s
+(`motion hold 20 s restored`), and a ZCL read returned 20. The image
+upgrade that added the settings region resumed the network from the
+unchanged router journals.
+
+The user confirmed on the board:
+
+- all three LCD pages;
+- touch-key page navigation.
+
+The user reported a steady red LED. That was LD3, the ST-LINK COM
+indicator, not LD4.
+
+Still to be confirmed by an observer:
+
+- the LD4 colour sequence (with JP5 ON and JP4 OFF);
+- B1 and B2 actions on the peripheral image.
+
+The sound level is uncalibrated.
+
+Channel-access failures:
+
+- On channel 15, which overlaps Wi-Fi channels 1–5, a live router with 23
+  neighbours counted 53 channel-access failures in about 11 000 confirmed
+  transmissions (≈0.5 %).
+- The count did not grow during a 3-minute passive watch.
+- This rate is expected with CSMA-CA in a busy band, not a configuration
+  fault.
+- NWK broadcast relays already use `nwkcMaxBroadcastJitter`.
 
 Open hardware gates:
 

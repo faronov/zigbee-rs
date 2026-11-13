@@ -10,7 +10,8 @@
 //! ¹ feature `sensors`; ² feature `sound`.
 //!
 //! Occupancy uses sensor type *physical contact* (3): the IMU detects the
-//! board being moved or touched, not a person in the room.
+//! board being moved or touched, not a person in the room. Its writable
+//! `PIROccupiedToUnoccupiedDelay` is the motion hold; see [`crate::motion`].
 //!
 //! Analog Input reports `Reliability` (0x0067) and the `FAULT` bit of
 //! `StatusFlags` when a reading is unavailable: *over range* (2) when the
@@ -35,9 +36,7 @@ use zigbee_zcl::clusters::analog_input::{
     ATTR_RELIABILITY, ATTR_RESOLUTION, ATTR_STATUS_FLAGS, AnalogInputCluster,
 };
 #[cfg(feature = "sensors")]
-use zigbee_zcl::clusters::occupancy::{
-    ATTR_OCCUPANCY, OccupancyCluster, SENSOR_TYPE_PHYSICAL_CONTACT,
-};
+use zigbee_zcl::clusters::occupancy::ATTR_OCCUPANCY;
 #[cfg(feature = "sensors")]
 use zigbee_zcl::clusters::temperature::{
     ATTR_MEASURED_VALUE as TEMPERATURE_MEASURED_VALUE, TemperatureCluster,
@@ -49,6 +48,8 @@ use zigbee_zcl::{ClusterId, DeviceId};
 use crate::ENDPOINT;
 #[cfg(feature = "sensors")]
 use crate::measure::MAX_DISTANCE_MM;
+#[cfg(feature = "sensors")]
+use crate::motion::MotionOccupancyCluster;
 use crate::screen::SensorSnapshot;
 
 pub const DISTANCE_ENDPOINT: u8 = 2;
@@ -214,7 +215,7 @@ pub struct DkProfile {
     #[cfg(feature = "sensors")]
     temperature: TemperatureCluster,
     #[cfg(feature = "sensors")]
-    occupancy: OccupancyCluster,
+    occupancy: MotionOccupancyCluster,
     #[cfg(feature = "sensors")]
     distance: AnalogEndpoint,
     #[cfg(feature = "sensors")]
@@ -242,7 +243,7 @@ impl DkProfile {
             #[cfg(feature = "sensors")]
             temperature,
             #[cfg(feature = "sensors")]
-            occupancy: OccupancyCluster::new(SENSOR_TYPE_PHYSICAL_CONTACT),
+            occupancy: MotionOccupancyCluster::new(),
             #[cfg(feature = "sensors")]
             distance: AnalogEndpoint::new(DISTANCE),
             #[cfg(feature = "sensors")]
@@ -295,6 +296,13 @@ impl DkProfile {
     #[cfg(feature = "sensors")]
     pub fn set_occupied(&mut self, occupied: bool) {
         self.occupancy.set_occupied(occupied);
+    }
+
+    /// The Occupancy Sensing cluster, for the motion hold and its
+    /// persistence.
+    #[cfg(feature = "sensors")]
+    pub fn occupancy_mut(&mut self) -> &mut MotionOccupancyCluster {
+        &mut self.occupancy
     }
 
     /// ToF distance: `Some(mm)` for a valid range, `None` when no target is

@@ -5,11 +5,21 @@ Zigbee Router (manufacturer code 0).
 
 ZHA only creates entities for the Analog Input cluster (0x000C) for a few
 vendors, so endpoints 2..4 show nothing without this quirk. The quirk adds one
-sensor entity per endpoint on AnalogInput.present_value (0x0055, single float):
+sensor entity per endpoint on AnalogInput.present_value (0x0055, single float)
+and renames the IMU occupancy:
 
     EP1  Basic / Identify / Temperature Measurement / Occupancy Sensing
-         -> left untouched; ZHA's default temperature and occupancy entities
-            are kept.
+         -> ZHA's default temperature entity is kept.
+         -> Occupancy (0x0000) is IMU *motion* (sensor type 3, physical
+            contact: the board was moved), not presence. ZHA's unnamed
+            default occupancy entity is replaced by a "Motion" binary sensor
+            (device class motion: Detected / Clear).
+         -> PIROccupiedToUnoccupiedDelay (0x0010) is the motion hold time,
+            writable and kept across resets by the firmware (default 60 s):
+            ZHA's "Occupied to unoccupied delay" entity is kept.
+         -> The firmware has no unoccupied -> occupied delay (0x0011 reads
+            UNSUPPORTED_ATTRIBUTE), so ZHA's "Unoccupied to occupied delay"
+            entity is not created.
     EP2  AnalogInput  "Distance"     VL53L0X time-of-flight distance, mm,
                                      0..2000 (EngineeringUnits 30).
     EP3  AnalogInput  "Inclination"  tilt from vertical derived from the IMU
@@ -32,7 +42,10 @@ try:
     # Canonical location in newer ZHA (quirks v2 API moved to zha-quirks).
     from zhaquirks.builder import (
         DEGREE,
+        BinarySensorDeviceClass,
+        EntityType,
         QuirkBuilder,
+        ReportingConfig,
         SensorDeviceClass,
         SensorStateClass,
         UnitOfLength,
@@ -40,7 +53,8 @@ try:
     )
 except ImportError:
     # Older zigpy where the quirks v2 API lives in zigpy itself.
-    from zigpy.quirks.v2 import QuirkBuilder
+    from zigpy.quirks.v2 import EntityType, QuirkBuilder, ReportingConfig
+    from zigpy.quirks.v2.homeassistant.binary_sensor import BinarySensorDeviceClass
     from zigpy.quirks.v2.homeassistant import (
         DEGREE,
         UnitOfLength,
@@ -52,9 +66,37 @@ except ImportError:
     )
 
 from zigpy.zcl.clusters.general import AnalogInput
+from zigpy.zcl.clusters.measurement import OccupancySensing
 
 (
     QuirkBuilder("Zigbee-RS", "STM32WB5MM-DK-Router")
+    # EP1: ZHA's default occupancy entity has no name (HA shows the device
+    # name); "Motion" below replaces it.
+    .prevent_default_entity_creation(
+        endpoint_id=1,
+        cluster_id=OccupancySensing.cluster_id,
+        function=lambda entity: type(entity).__name__ == "Occupancy",
+    )
+    # EP1: 0x0011 is not implemented by the firmware.
+    .prevent_default_entity_creation(
+        endpoint_id=1,
+        cluster_id=OccupancySensing.cluster_id,
+        unique_id_suffix="pir_u_to_o_delay",
+    )
+    # EP1: IMU motion, held for PIROccupiedToUnoccupiedDelay seconds.
+    .binary_sensor(
+        OccupancySensing.AttributeDefs.occupancy.name,
+        OccupancySensing.cluster_id,
+        endpoint_id=1,
+        entity_type=EntityType.STANDARD,
+        device_class=BinarySensorDeviceClass.MOTION,
+        reporting_config=ReportingConfig(
+            min_interval=0, max_interval=900, reportable_change=1
+        ),
+        unique_id_suffix="motion",
+        translation_key="motion",
+        fallback_name="Motion",
+    )
     # EP2: VL53L0X ToF distance (mm). 2000 + Reliability OVER_RANGE = no target.
     .sensor(
         AnalogInput.AttributeDefs.present_value.name,

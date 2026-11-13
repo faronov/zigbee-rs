@@ -412,19 +412,20 @@ The default build enables every on-board peripheral: `rgb-led`, `lcd`,
 `touch`, `sensors` and `mic`. Use `--no-default-features` for the plain
 router, or `--no-default-features --features <list>` for a subset.
 
-The 2026-11-13 builds (application slot `0x08000000..0x080D5000`, 872 KiB):
+The 2026-11-14 builds (application slot `0x08000000..0x080D3000`, 844 KiB;
+the settings journal follows at `0x080D3000`):
 
 | Image | text | data | bss |
 |---|---|---|---|
-| plain router (`--no-default-features`) | 388,326 | 32 | 39,352 |
-| `rgb-led` | 390,782 | 48 | 39,480 |
-| `lcd` | 398,326 | 48 | 41,584 |
-| `touch` (implies `lcd`) | 405,270 | 48 | 41,888 |
-| `mic` | 409,390 | 32 | 52,504 |
-| `sensors` | 422,858 | 56 | 41,696 |
-| default (all) | 446,538 | 64 | 57,416 |
+| plain router (`--no-default-features`) | 388,422 | 32 | 39,352 |
+| `rgb-led` | 390,878 | 48 | 39,480 |
+| `lcd` | 398,426 | 48 | 41,584 |
+| `touch` (implies `lcd`) | 405,374 | 48 | 41,888 |
+| `mic` | 409,482 | 32 | 52,504 |
+| `sensors` | 425,834 | 56 | 41,416 |
+| default (all) | 449,510 | 72 | 57,136 |
 
-The default raw binary is 446,626 B. One DK has joined a ZHA network as a
+The default raw binary is 449,602 B (plain: 388,482 B). One DK has joined a ZHA network as a
 router and relayed traffic on air.
 
 Beacon response, child association and indirect delivery have not been

@@ -112,7 +112,8 @@ pub async fn run(bus: SensorBus) -> ! {
             None
         };
         let now = Instant::now().as_millis();
-        let occupied = accel.map(|a| motion.update(a, now));
+        let hold_ms = u64::from(shared::MOTION_HOLD_SECS.get()) * 1_000;
+        let occupied = accel.map(|a| motion.update(a, now, hold_ms));
         let inclination = accel.and_then(|[x, y, z]| measure::inclination_centi_deg(x, y, z));
 
         let slow = tick.is_multiple_of(SLOW_PERIOD_TICKS);

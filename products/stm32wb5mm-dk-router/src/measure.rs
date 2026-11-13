@@ -25,11 +25,9 @@ pub fn inclination_centi_deg(x_mg: i32, y_mg: i32, z_mg: i32) -> Option<u16> {
 /// Change of acceleration between two samples, on any axis, that counts
 /// as motion. The ISM330DHCX noise at the default rate is a few mg.
 pub const MOTION_THRESHOLD_MG: i32 = 50;
-/// How long the product stays "occupied" after the last motion.
-pub const OCCUPANCY_HOLD_MS: u64 = 60_000;
-
 /// Motion from successive accelerometer samples: occupied while the board
-/// was moved within the last [`OCCUPANCY_HOLD_MS`].
+/// was moved within the hold time (the Occupancy Sensing
+/// `PIROccupiedToUnoccupiedDelay`, see [`crate::motion`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MotionDetector {
     last: Option<[i32; 3]>,
@@ -45,8 +43,8 @@ impl MotionDetector {
     }
 
     /// Feed one sample (mg) taken at `now_ms`; returns whether the board
-    /// counts as occupied.
-    pub fn update(&mut self, accel_mg: [i32; 3], now_ms: u64) -> bool {
+    /// counts as occupied with a hold of `hold_ms`.
+    pub fn update(&mut self, accel_mg: [i32; 3], now_ms: u64, hold_ms: u64) -> bool {
         if let Some(last) = self.last {
             let moved = last
                 .iter()
@@ -57,13 +55,14 @@ impl MotionDetector {
             }
         }
         self.last = Some(accel_mg);
-        self.occupied(now_ms)
+        self.occupied(now_ms, hold_ms)
     }
 
-    /// Whether motion was seen within the hold time before `now_ms`.
-    pub fn occupied(&self, now_ms: u64) -> bool {
+    /// Whether motion was seen within `hold_ms` before `now_ms`. A zero
+    /// hold still reports the sample in which motion was seen.
+    pub fn occupied(&self, now_ms: u64, hold_ms: u64) -> bool {
         self.last_motion_ms
-            .is_some_and(|at| now_ms.saturating_sub(at) < OCCUPANCY_HOLD_MS)
+            .is_some_and(|at| now_ms.saturating_sub(at) < hold_ms.max(1))
     }
 }
 
@@ -109,26 +108,50 @@ mod tests {
 
     #[test]
     fn motion_holds_occupancy_then_clears() {
+        const HOLD: u64 = 60_000;
         let mut motion = MotionDetector::new();
         let rest = [-34, -1_018, 19];
-        assert!(!motion.update(rest, 0), "first sample has no reference");
         assert!(
-            !motion.update([-30, -1_015, 22], 200),
+            !motion.update(rest, 0, HOLD),
+            "first sample has no reference"
+        );
+        assert!(
+            !motion.update([-30, -1_015, 22], 200, HOLD),
             "noise is not motion"
         );
-        assert!(motion.update([-34, -900, 19], 400), "a nudge is motion");
-        assert!(motion.update(rest, 600), "settling back is motion too");
-        assert!(motion.update(rest, 600 + OCCUPANCY_HOLD_MS - 1));
-        assert!(!motion.update(rest, 600 + OCCUPANCY_HOLD_MS));
+        assert!(
+            motion.update([-34, -900, 19], 400, HOLD),
+            "a nudge is motion"
+        );
+        assert!(
+            motion.update(rest, 600, HOLD),
+            "settling back is motion too"
+        );
+        assert!(motion.update(rest, 600 + HOLD - 1, HOLD));
+        assert!(!motion.update(rest, 600 + HOLD, HOLD));
+    }
+
+    #[test]
+    fn motion_hold_follows_the_configured_delay() {
+        let mut motion = MotionDetector::new();
+        let rest = [0, 0, 1_000];
+        motion.update(rest, 0, 5_000);
+        assert!(motion.update([0, 200, 1_000], 1_000, 5_000));
+        // A shorter hold written later applies to the same motion.
+        assert!(!motion.occupied(3_000, 1_000));
+        assert!(motion.occupied(3_000, 5_000));
+        // Zero hold: occupied only in the sample that saw motion.
+        assert!(motion.update([0, 0, 1_000], 4_000, 0));
+        assert!(!motion.occupied(4_001, 0));
     }
 
     #[test]
     fn threshold_is_exclusive() {
         let mut motion = MotionDetector::new();
-        motion.update([0, 0, 1_000], 0);
-        assert!(!motion.update([MOTION_THRESHOLD_MG, 0, 1_000], 1));
-        assert!(!motion.update([0, 0, 1_000], 2));
-        assert!(motion.update([MOTION_THRESHOLD_MG + 1, 0, 1_000], 3));
+        motion.update([0, 0, 1_000], 0, 60_000);
+        assert!(!motion.update([MOTION_THRESHOLD_MG, 0, 1_000], 1, 60_000));
+        assert!(!motion.update([0, 0, 1_000], 2, 60_000));
+        assert!(motion.update([MOTION_THRESHOLD_MG + 1, 0, 1_000], 3, 60_000));
     }
 
     #[test]

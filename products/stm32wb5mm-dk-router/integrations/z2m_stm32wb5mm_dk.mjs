@@ -7,8 +7,10 @@
 //   EP1  0x0104 / 0x0008 Range Extender
 //        Basic, Identify,
 //        msTemperatureMeasurement (centi-degC, -40..125 C),
-//        msOccupancySensing - occupancy is derived from IMU *motion* with a
-//        60 s hold time; it is NOT a PIR sensor.
+//        msOccupancySensing - occupancy is derived from IMU *motion*; it is
+//        NOT a PIR sensor. The hold after the last motion is pirOToUDelay
+//        (0x0010, writable, kept across resets, default 60 s), published as
+//        `occupancy_timeout`. pirUToODelay/threshold are not implemented.
 //   EP2  genAnalogInput - VL53L0X ToF distance, presentValue in mm, 0..2000.
 //        NOTE: 2000 mm means "no target in range": the device then reports
 //        presentValue = 2000 together with reliability (0x0067) = 2
@@ -57,6 +59,7 @@ export default {
         }),
         m.occupancy({
             reporting: false, // device self-configures 0..3600 s
+            pirConfig: ['otu_delay'], // motion hold, seconds
         }),
         m.numeric({
             name: 'distance',

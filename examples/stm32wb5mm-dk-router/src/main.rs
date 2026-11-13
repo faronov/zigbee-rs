@@ -47,6 +47,8 @@ use stm32wb5mm_dk_router_product::{
     router::RouterProfile,
     storage::{ApsTableStore, ChildStore, SecurityStore},
 };
+#[cfg(feature = "sensors")]
+use stm32wb5mm_dk_router_product::{motion::MotionHoldPersistence, storage::SettingsStore};
 use zigbee_mac::stm32wb::Stm32wbMac;
 use zigbee_runtime::{ZigbeeDevice, node::ZigbeeNode, power::PowerMode, role::Router};
 use zigbee_types::ChannelMask;
@@ -65,6 +67,10 @@ type App = ParentRouterApp<
     NoObserver,
     PersistentApsTables<ApsTableStore>,
 >;
+
+/// Durable Occupancy Sensing motion hold ([`product::motion`]).
+#[cfg(feature = "sensors")]
+type MotionHold = MotionHoldPersistence<SettingsStore>;
 
 const ARCHETYPE: NodeArchetype = NodeArchetype::ParentRouter;
 /// Period of the neighbour/child/coprocessor summary on VCOM.
@@ -111,7 +117,11 @@ async fn main(spawner: Spawner) {
     spawner.spawn(run_memory_manager(memory_manager).unwrap_or_else(|_| halt()));
     log::info!("[WB] coprocessor MAC running");
 
-    let app = compose(transport);
+    let (app, settings) = compose(transport);
+    #[cfg(feature = "sensors")]
+    let mut motion_hold = MotionHold::new(settings);
+    #[cfg(not(feature = "sensors"))]
+    let _ = settings;
     if let Err(error) = app.initialize().await {
         platform::fatal(app.parts_mut(), ARCHETYPE, error);
     }
@@ -135,7 +145,13 @@ async fn main(spawner: Spawner) {
             b2_gestures.sample(b2.is_low(), now_ms).map(Input::B2),
         ];
         for input in inputs.into_iter().flatten() {
-            perform(app, actions::action(input)).await;
+            perform(
+                app,
+                actions::action(input),
+                #[cfg(feature = "sensors")]
+                &mut motion_hold,
+            )
+            .await;
         }
         if app.awaiting_commissioning_request() {
             let since = *awaiting_since.get_or_insert_with(Instant::now);
@@ -179,15 +195,27 @@ async fn main(spawner: Spawner) {
         ))]
         if Instant::now() >= next_share {
             next_share = Instant::now() + SHARE_PERIOD;
-            share(app);
+            share(
+                app,
+                #[cfg(feature = "sensors")]
+                &mut motion_hold,
+            );
         }
     }
 }
 
 /// Carry out a button action ([`product::actions`]).
-async fn perform(app: &mut App, action: Action) {
+async fn perform(app: &mut App, action: Action, #[cfg(feature = "sensors")] hold: &mut MotionHold) {
     match action {
-        Action::FactoryReset => factory_reset(app).await,
+        Action::FactoryReset => {
+            // A new commissioning starts from the default motion hold, even
+            // in the same network.
+            #[cfg(feature = "sensors")]
+            if let Err(error) = hold.forget() {
+                log::warn!("[WB] motion hold not forgotten: {error:?}");
+            }
+            factory_reset(app).await
+        }
         Action::CommissionOrPermitJoin => {
             if app.request_commissioning() {
                 log::info!("[WB] B1: commissioning requested");
@@ -228,11 +256,32 @@ async fn permit_joining(app: &mut App, secs: u8) {
     feature = "sensors",
     feature = "mic"
 ))]
-fn share(app: &mut App) {
+fn share(app: &mut App, #[cfg(feature = "sensors")] hold: &mut MotionHold) {
     #[cfg(any(feature = "rgb-led", feature = "lcd"))]
     shared::NETWORK.set(network_snapshot(app));
     #[cfg(any(feature = "sensors", feature = "mic"))]
     app.node_mut().profile_mut().apply(&shared::SENSORS.get());
+    #[cfg(feature = "sensors")]
+    sync_motion_hold(app, hold);
+}
+
+/// Restore the motion hold written in this network, persist a written one,
+/// and hand the current value to the sensing task.
+#[cfg(feature = "sensors")]
+fn sync_motion_hold(app: &mut App, hold: &mut MotionHold) {
+    let network = app.node().device().joined_extended_pan_id();
+    let occupancy = app.node_mut().profile_mut().occupancy_mut();
+    match hold.sync(network, occupancy) {
+        Ok(product::motion::HoldSync::Unchanged) => {}
+        Ok(product::motion::HoldSync::Restored(secs)) => {
+            log::info!("[WB] motion hold {secs} s restored")
+        }
+        Ok(product::motion::HoldSync::Stored(secs)) => {
+            log::info!("[WB] motion hold {secs} s stored")
+        }
+        Err(error) => log::warn!("[WB] motion hold not persisted: {error:?}"),
+    }
+    shared::MOTION_HOLD_SECS.set(occupancy.hold_secs());
 }
 
 #[cfg(any(feature = "rgb-led", feature = "lcd"))]
@@ -292,10 +341,11 @@ async fn factory_reset(app: &mut App) -> ! {
     }
 }
 
-/// Build MAC, device, stores and app into static storage. Not inlined, so
-/// the builder temporaries are released before the run loop.
+/// Build MAC, device, stores and app into static storage, and hand back the
+/// settings journal. Not inlined, so the builder temporaries are released
+/// before the run loop.
 #[inline(never)]
-fn compose(transport: WbTransport) -> &'static mut App {
+fn compose(transport: WbTransport) -> (&'static mut App, product::storage::SettingsStore) {
     let ieee = stm32wb_hal::identity::eui64();
     platform::check_ieee(ieee);
     let mac = Stm32wbMac::new(transport, ieee);
@@ -346,7 +396,7 @@ fn compose(transport: WbTransport) -> &'static mut App {
         log::error!("[WB] invalid composition: {error:?}");
         halt()
     });
-    APP.init(app)
+    (APP.init(app), stores.settings)
 }
 
 /// Neighbour/child/route tables and coprocessor counters on VCOM.

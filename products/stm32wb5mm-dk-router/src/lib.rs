@@ -29,6 +29,7 @@ pub mod button;
 pub mod indication;
 pub mod layout;
 pub mod measure;
+pub mod motion;
 pub mod router;
 pub mod screen;
 #[cfg(any(feature = "sensors", feature = "sound"))]
