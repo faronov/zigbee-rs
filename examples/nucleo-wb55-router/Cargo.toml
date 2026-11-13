@@ -1,0 +1,45 @@
+[package]
+name = "nucleo-wb55-router"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Zigbee Router on the ST Nucleo-WB55 (MB1355C). CPU2 must run ST's IEEE
+# 802.15.4 MAC firmware (stm32wb5x_Mac_802_15_4_fw.bin) under FUS 1.2.0;
+# see docs/book/src/platform-guides/stm32wb.md.
+#   cargo build --release                        # router + GP proxy
+#   cargo build --release --no-default-features  # router without Green Power
+[workspace]
+
+[features]
+default = ["green-power"]
+# Green Power Proxy Basic: tunnels GPDFs to the sink and journals the Proxy
+# Table at 0x080CF000.
+green-power = ["stm32wb-router-app/green-power"]
+
+[dependencies]
+stm32wb-hal = { path = "../../stm32wb-hal", features = ["stm32wb55rg"] }
+stm32wb-router-app = { path = "../../apps/stm32wb-router" }
+nucleo-wb55 = { path = "../../boards/nucleo-wb55" }
+nucleo-wb55-router-product = { path = "../../products/nucleo-wb55-router" }
+
+# Same Embassy commit as stm32wb-hal.
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", features = ["platform-cortex-m", "executor-thread"] }
+
+# CPU2 never shares CPU1 memory outside the IPCC mailbox, so a CPU1-local
+# critical section is sufficient.
+cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+log = "0.4"
+
+[profile.release]
+opt-level = "s"
+debug = 2
+lto = true
+codegen-units = 1
+
+# Local ST MAC layout and mailbox-acknowledgement fixes: see
+# vendor/embassy-stm32-wpan/LOCAL-PATCHES.md.
+[patch."https://github.com/embassy-rs/embassy"]
+embassy-stm32-wpan = { path = "../../vendor/embassy-stm32-wpan" }
