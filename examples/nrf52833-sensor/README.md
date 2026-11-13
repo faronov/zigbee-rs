@@ -23,6 +23,10 @@ cargo +nightly-2026-03-23 build --release --locked --no-default-features --featu
 cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router
 ```
 
+The `router` feature also enables the Green Power Proxy Basic (default-on
+for every router; see the Green Power chapter); `router-core` builds the
+router without it.
+
 The ED and router images send Imm-Acks from the RADIO ISR (`NrfIsrRadioPhy`).
 See the [nRF platform guide](../../docs/book/src/platform-guides/nrf.md#node-roles).
 

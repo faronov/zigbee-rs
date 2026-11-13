@@ -284,7 +284,8 @@ older image, program its full image again.
 One bin per role, mutually exclusive features: `bl702-sensor` (default,
 sleepy), `bl702-ed` (`--features ed --bin bl702-ed`, always-on End Device) and
 `bl702-router` (`--features router --bin bl702-router`, parent MAC with
-hardware auto-ACK and the M154 Frame Pending table). The role images are
+hardware auto-ACK and the M154 Frame Pending table; with the Green Power
+Proxy Basic, `--features router-core` without it). The role images are
 build-, symbol- and host-tested only; see the
 [BL702 guide](../../docs/book/src/platform-guides/bl702.md#role-images).
 

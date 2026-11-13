@@ -4,7 +4,9 @@
 > switch) are implemented on the `green-power` branch. The MG22 GPD
 > sensor and switch are lab-tested on hardware directly against ZHA; the
 > Proxy Basic is lab-tested on the ESP32-H2-Zero router against ZHA
-> (2026-11-12, see §6.1).** Bidirectional operation, the full
+> (2026-11-12, see §6.1). Since 2026-11-13 the Proxy Basic is on by
+> default in every router build (§2, §4.1); only the ESP32-H2-Zero router
+> is hardware-tested.** Bidirectional operation, the full
 > proxy and Combo/Sink are still design only. Spec
 > references are to GP 1.0a (docs-09-5499-26) and GP 1.1 where noted.
 
@@ -24,6 +26,7 @@
 | `apps/gpd` (`gpd-app`): provisioning, `GpdJournal`, beacon scan for a permit-join network, unidirectional commissioning, L3 Multi-Cluster Reports and switch commands, CCA backoff | implemented | host tests: sink-side decode of commissioning (key unwrap), reports and Toggle; counter never reused across reboot; failed reservation transmits nothing; journal rollover / interrupted write / CRC fallback |
 | `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch lab-tested the same day with a separate SrcID (0x7A6B9879) and journal: commissioned, Off/On/Toggle events in HA every 30 s (`lab-switch-cycle` build), counter resumed at 16 after reset and accepted. Re-flashing the sensor resumed its own SrcID (counter 80) and ZHA accepted it. Battery reporting (IADC0 AVDD, 331f8ea) lab-tested on hardware 2026-11-13: 3355 mV → 34 × 100 mV, 200 half-% (WSTK 3.3 V); HA shows 3.4 V / 100 % (§6.4) |
 | ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity entities; battery voltage/percentage entities (331f8ea) deployed 2026-11-13 and showing 3.4 V / 100 %; switch event entity with `off`/`on`/`toggle` |
+| Default-on in every router (`router` = `router-core` + `green-power`) with a product-owned Proxy Table partition: ESP32-C6/H2 (`zbnv` 0x3F8000), nRF52840 (0xF8000), nRF52833 (0x78000), EFR32MG21 (0x70000), ZBT-1 (0xF0000), STM32WB5MM-DK (0x080CF000), BL702 (0xF7000), TLSR8258 (0x6E000), mock-light (RAM store) | implemented | every image builds and passes its layout and stack gates; product host tests with and without `green-power`; hardware: ESP32-H2-Zero only (§6). The other targets compile only |
 | Bidirectional GPD, full proxy, Combo/Sink | not started | — |
 
 Implementation notes that differ from the design below:
@@ -176,8 +179,22 @@ What this means for the design:
 
 ## 2. Layers and feature flags
 
-Every flag is **off by default**, so shipped images stay byte-identical.
-That has to be proven with an ELF/bin diff before merging.
+The protocol crates keep every GP flag **off by default**. Zigbee 3.0
+requires Proxy Basic on every router, so the router builds turn it on:
+
+- Multi-role examples (ESP32-C6/H2, nRF52833/40, EFR32MG21, ZBT-1, BL702,
+  TLSR8258): `router = ["router-core", "green-power"]`. The GP-off router
+  is `--no-default-features --features router-core` (BL702 and TLSR8258:
+  `--features router-core` / `scripts/tlsr8258.sh build router-core`).
+- STM32WB5MM-DK: `green-power` is in the example's default features;
+  `--no-default-features` builds the router without GP.
+- ZBT-1 with the `zrs-boot` loader: `green-power` is a compile error,
+  because the loader's secondary slot overlaps the GP window at 0xF0000.
+  Loader builds use `router-core,zrs-boot`.
+- Sensors, EDs, SEDs and the GPD apps are unchanged.
+
+The GP-off builds must stay byte-identical to master's routers (apart from
+panic `Location` line/column fields); §4.1 records the proof.
 
 | Layer | Feature (`zigbee-gp` / `zigbee-runtime` / `router-app`) | Contents |
 |---|---|---|
@@ -334,6 +351,16 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
 
 No board crate gets GP storage. Products own the partitions.
 
+**Flash endurance (open).** Every record is a 1024-byte slot. With one GPD
+reporting every 60 s and the default stride of 16, the proxy writes one
+slot every 16 min, so a two-sector journal of 4 KiB sectors erases each
+sector about every 2.1 h: about 10,000 cycles in 2.4 years. Each extra
+GPD shortens that proportionally. 8 KiB sectors (EFR32MG21, ZBT-1) halve
+the rate. This matters on internal flash rated for 10,000 cycles (nRF52,
+EFR32, STM32WB); the ESP32 and TLSR8258 SPI flash is rated for 100,000.
+Options before production: a larger stride, a bigger partition, or a
+smaller slot per record.
+
 ### 3.4 ZCL
 
 - Fix the attribute IDs in `zigbee-zcl/src/clusters/green_power.rs`:
@@ -360,6 +387,16 @@ No board crate gets GP storage. Products own the partitions.
   `compact-single-endpoint` (`MAX_ENDPOINTS` = 2) needs checking for room.
 
 ### 3.5 Router integration
+
+Implemented: the product owns a `GpProxyJournal` over its GP partition and
+the composition root attaches it with `set_green_power_store`; a router
+built with `green-power` and no store fails `GreenPowerStoreMissing`
+instead of running without persistence. The Device_annce alias defence
+draws its delay from the NWK routing jitter PRNG, not
+`MacDriver::fill_random`: on TLSR8258 `fill_random` links CTR_DRBG and
+software AES, which the router image must not contain.
+
+Design notes:
 
 - `apps/router` gains a `green-power` feature that forwards to the runtime.
 - The product provides:
@@ -482,7 +519,10 @@ No board crate gets GP storage. Products own the partitions.
     profile.
   - Later candidates: PHY6222 / PB-03F, TLSR8258 sensor, ESP32-H2.
 
-## 4. Size estimates (not measured)
+## 4. Size estimates
+
+§4.1 has the measured Proxy Basic cost; the rest of this section is the
+original estimate.
 
 The figures assume Thumb-2 `opt-level=s`. Scale them by roughly 1.2–1.4 for
 TC32 and RISC-V. RAM covers static tables, not journal sector buffers; the
@@ -516,6 +556,63 @@ It is already joined to the user's ZHA (nwk 0x045B,
 the tightest of the routers, so it is the most demanding place to measure
 Proxy Basic. Fallback: an ESP32-C6/H2 router, which has plenty of room but
 is not visible in hwlab right now.
+
+### 4.1 Measured: Proxy Basic default-on (2026-11-13)
+
+Release, `--locked`, the CI toolchains, measured with
+`tools/mac-footprint.py` (`flash` = file-backed allocated bytes, `stack` =
+static direct-call bound). Each row compares the default `router` with
+`router-core` built from the same tree.
+
+| Router image | flash GP / core | Δ flash | Δ `.bss` | Δ stack | Limit and fit |
+|---|---:|---:|---:|---:|---|
+| ESP32-H2 devkit | 516,568 / 485,490 | +31,078 | +2,296 | +32 | `ota_0` 2,031,616 B |
+| ESP32-H2-Zero (Waveshare) | 515,514 / 483,066 | +32,448 | +2,296 | +32 | `ota_0` 2,031,616 B |
+| ESP32-C6 | 532,642 / 501,688 | +30,954 | +2,296 | +32 | `ota_0` 2,031,616 B |
+| nRF52840 | 389,352 / 361,884 | +27,468 | +2,304 | +40 | app 1,015,808 B (to 0xF8000) |
+| nRF52833 | 389,924 / 362,492 | +27,432 | +2,304 | +40 | app 491,520 B (to 0x78000) |
+| EFR32MG21 | 382,468 / 355,528 | +26,940 | +2,048 | +48 | app 442,368 B (0x4000–0x70000) |
+| ZBT-1 (direct map) | 382,652 / 355,400 | +27,252 | +2,048 | +48 | app 966,656 B (0x4000–0xF0000) |
+| STM32WB5MM-DK plain | 415,858 / 388,114 | +27,744 | +2,304 | +32 | app 847,872 B (to 0x080CF000) |
+| STM32WB5MM-DK all peripherals (default) | 477,574 / 449,370 | +28,204 | +2,304 | +32 | as above |
+| BL702 XT-ZB1 | 339,150 / 312,142 | +27,008 | +2,296 | +32 | app 482,304 B; stack gate gap 3,840 B (min 3,072) |
+| TLSR8258 TB-04 | 287,809 / 264,260 | +23,549 | +2,304 | +16 | raw `.bin` 317,248 / 293,708 B of 450,560 (to 0x6E000); SVC gap 4,696 B (min 4,096); every chain budget +16 B and still inside its unchanged budget |
+
+All gates pass: the TLSR8258 router stack gate (with the GP addendum
+`tools/tlsr8258-router-gp-stack-gate.args`), the BL702 stack gate, the
+EFR32MG21/ZBT-1 layout checkers and the linker assertions on every GP
+partition. The TLSR8258 router links no CTR_DRBG or software AES. The
+TLSR8258 sensor and ED share the router's `memory.x`, so their flash limit
+dropped by 8 KiB to 0x6E000; they use about 194 KB.
+
+GP stays off where the router does not link on master (EFR32MG22,
+CC2340R5, PB-03F, PHY6222, EFR32MG1) and in ZBT-1 `zrs-boot` loader
+builds.
+
+Feature-off identity against master 67044d2 (firmware-identical to
+dd44367). Both trees were built from the same checkout path, because
+absolute source paths are embedded in panic messages. 51 images were
+compared, with each master `router` image paired with the branch's
+`router-core` image:
+
+- 14 images are byte-identical: BL702 ED and sensor, the CC2340R5 ED,
+  EFR32MG1, PHY6222 and PHY6252, and every TLSR8258 image including the
+  router.
+- 29 differ only in panic `Location` line/column fields. These are the
+  sensors, EDs and SEDs, and the STM32WB GP-off router.
+- 8 routers (BL702, EFR32MG21, ZBT-1, ESP32-C6, ESP32-H2 and H2-Zero,
+  nRF52833/40) are not byte-identical. The cause is the feature rename:
+  `router-core` instead of `router` changes the example crate's metadata
+  hash, which changes the link order. They contain the same symbols with
+  the same sizes, and the text, rodata, data and bss totals are equal.
+  Once alignment padding is counted, the file-backed size changes as
+  follows:
+  - EFR32MG21: −4 B;
+  - H2-Zero: +4 B;
+  - ZBT-1: +8 B;
+  - the other five: unchanged.
+
+  `.bss` is unchanged.
 
 ## 5. Risks
 
@@ -925,9 +1022,8 @@ running the nRF 802.15.4 sniffer on channel 15.
    CC2531) in hwlab for the timing claims?
 6. Are the gated NWK/APS alias changes in shared code acceptable? With the
    feature off they compile out.
-7. When `green-power` is on, approve the flash and RAM growth on router
-   images (table above). Should it later become default-on for routers, as
-   Zigbee 3.0 compliance requires?
+7. ~~Approve the router growth and make it default-on?~~ Approved
+   2026-11-13: default-on in every router build (§2, §4.1).
 8. Is Combo/Sink (layer c) wanted on a specific router product, such as a
    light or relay endpoint for direct switch pairing?
 

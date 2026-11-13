@@ -91,11 +91,13 @@ cargo +nightly-2026-03-23 build --release --locked --features sensor-bme280
 cargo +nightly-2026-03-23 build --release --locked --features sensor-sht31
 
 cargo +nightly-2026-03-23 build --release --locked --no-default-features --features ed
-cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router
+cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router       # with Green Power
+cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router-core  # without
 
 cd ../nrf52840-router
 cargo +nightly-2026-03-23 build --release --locked          # always-on End Device
-cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router
+cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router       # with Green Power
+cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router-core  # without
 ```
 
 The sensor products use `Idle` for both fast and slow waits and pair their
@@ -408,9 +410,12 @@ The layers are split as follows:
 | product crate | identity, layout, journals, router policy, actions, LED/LCD/sensor mapping |
 | `zigbee-mac` (`stm32wb` feature) | maps MLME/MCPS onto the coprocessor SAP |
 
-The default build enables every on-board peripheral: `rgb-led`, `lcd`,
-`touch`, `sensors` and `mic`. Use `--no-default-features` for the plain
-router, or `--no-default-features --features <list>` for a subset.
+The default build enables every on-board peripheral (`rgb-led`, `lcd`,
+`touch`, `sensors` and `mic`) and the Green Power Proxy Basic
+(`green-power`, journal at `0x080CF000`, so the application slot ends
+there). Use `--no-default-features` for the plain router without GP, or
+`--no-default-features --features <list>` for a subset. The table below
+predates GP; the GP cost is in the Green Power chapter (§4.1).
 
 The 2026-11-14 builds (application slot `0x08000000..0x080D3000`, 844 KiB;
 the settings journal follows at `0x080D3000`):

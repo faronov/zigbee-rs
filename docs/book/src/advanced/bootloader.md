@@ -943,7 +943,7 @@ loader with `watchdog-ms = 8000`.
 | EFR32MG22 `ed,zrs-boot` (warn-level logs) | 204,484 B (was 229,788 B) | 236,288 B |
 | EFR32MG21 `sed,zrs-boot` | 234,272 B | 252,672 B |
 | EFR32MG21 `ed,zrs-boot` | 229,988 B | 252,672 B |
-| ZBT-1 `router,zrs-boot` (info logs, trial confirm, no OTA client) | 357,544 B (+2,048 vs the direct router's 355,496 B); `.bss` 39,184 B (unchanged), stack 58,096 B | 473,856 B |
+| ZBT-1 `router,zrs-boot` (now `router-core,zrs-boot`; info logs, trial confirm, no OTA client) | 357,544 B (+2,048 vs the direct router's 355,496 B); `.bss` 39,184 B (unchanged), stack 58,096 B | 473,856 B |
 
 Shipped default images: with these changes reverted in the same worktree,
 the nRF52840 UF2 (ProMicro, 228,840 B) and EFR32MG22 sensor (234,160 B)
@@ -1714,7 +1714,10 @@ Bootloader at `0x0..0x4000`.
 - **Loader:** the `efr32s2-boot` `ha-connect-zbt1` build (16 KiB
   `loader.bin` at `0x4000`), with overwrite, one P-256 key (own key),
   3 trial boots and an 8 s watchdog request (`PERSEL` 11).
-- **Application:** `examples/ha-connect-zbt1` built as `router,zrs-boot`,
+- **Application:** `examples/ha-connect-zbt1` built as `router,zrs-boot`
+  (now spelled `router-core,zrs-boot`: Green Power, on by default in the
+  router, is a compile error with the loader because its secondary slot
+  overlaps the GP journal at `0xF0000`),
   TEST-ONLY versions 0.1.0–0.1.3 (357,564 B; the TEST-ONLY marker adds
   20 B). The 0.1.2 image is a `router,trial-no-confirm` build.
 - **Test images:** padded secondary images were signed with imgtool 2.4.0,
