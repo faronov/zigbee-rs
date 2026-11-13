@@ -18,9 +18,9 @@ cortex-m = { version = "0.7", optional = true }
 critical-section = { version = "1.1", optional = true }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", optional = true }
 # Generic part drivers (faronov/zigbee-rs-drivers, branch stm32wb5mm-dk).
-zigbee-tlc59731 = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
-zigbee-display = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
-zigbee-ssd1306 = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
+zigbee-tlc59731 = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-display = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-ssd1306 = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
 
 [features]
 default = []

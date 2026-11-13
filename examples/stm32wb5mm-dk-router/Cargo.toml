@@ -53,12 +53,12 @@ static_cell = "2"
 # faronov/zigbee-rs-drivers at the same revision as the board crate.
 embedded-graphics = { version = "0.8", optional = true }
 embedded-hal-bus = { version = "0.3", optional = true }
-zigbee-display = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
-zigbee-sensor = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
-zigbee-stts22h = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
-zigbee-lsm6dso = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
-zigbee-vl53l0x = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
-zigbee-pdm = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "1f8d89e712c141889f36a77f68c7b6746189d9a2", optional = true }
+zigbee-display = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-sensor = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-stts22h = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-lsm6dso = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-vl53l0x = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
+zigbee-pdm = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "d431b657366cc075bb2fee9afe01434992b7121e", optional = true }
 
 # CPU2 never shares CPU1 memory outside the IPCC mailbox, so a CPU1-local
 # critical section is sufficient.
