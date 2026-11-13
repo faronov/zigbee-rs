@@ -902,10 +902,10 @@ fn apply_radio_policy(cfg: &mut Config) {
     cfg.rx_queue_size = cfg.rx_queue_size.max(RADIO_RX_QUEUE_DEPTH);
 }
 
-/// Read the IEEE EUI-64 address from the ESP32 eFuse factory MAC.
+/// Read the factory EUI-64 from the ESP32-C6/H2 eFuse, in over-the-air order.
 ///
-/// The 6-byte factory MAC is converted to EUI-64 by inserting FF:FE in the
-/// middle and flipping the U/L bit (standard MAC-48 → EUI-64).
+/// Same value as ESP-IDF `esp_read_mac(ESP_MAC_IEEE802154)`: base-MAC OUI,
+/// the `MAC_EXT` bytes, then the base-MAC NIC (see `crate::esp_identity`).
 fn read_efuse_ieee() -> IeeeAddress {
     const EFUSE_RD_MAC_SYS_0: *const u32 = 0x600B_0844 as *const u32;
     const EFUSE_RD_MAC_SYS_1: *const u32 = 0x600B_0848 as *const u32;
@@ -915,34 +915,8 @@ fn read_efuse_ieee() -> IeeeAddress {
     // SAFETY: as above.
     let hi = unsafe { core::ptr::read_volatile(EFUSE_RD_MAC_SYS_1) };
 
-    // ESP-IDF convention (esp_efuse_mac_get_default): MAC bytes are
-    // [hi[15:8], hi[7:0], lo[31:24], lo[23:16], lo[15:8], lo[7:0]].
-    let mac = [
-        (hi >> 8) as u8,
-        hi as u8,
-        (lo >> 24) as u8,
-        (lo >> 16) as u8,
-        (lo >> 8) as u8,
-        lo as u8,
-    ];
-    log::info!(
-        "[ESP] MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        mac[0],
-        mac[1],
-        mac[2],
-        mac[3],
-        mac[4],
-        mac[5]
-    );
-
-    [
-        mac[0] ^ 0x02,
-        mac[1],
-        mac[2],
-        0xFF,
-        0xFE,
-        mac[3],
-        mac[4],
-        mac[5],
-    ]
+    let ieee = crate::esp_identity::ieee_from_efuse_mac_words(lo, hi);
+    // Display order (OUI first), as Zigbee coordinators show it.
+    log::info!("[ESP] EUI-64: {:016X}", u64::from_le_bytes(ieee));
+    ieee
 }

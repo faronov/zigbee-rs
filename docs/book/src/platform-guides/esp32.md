@@ -36,6 +36,32 @@ usable CCA/retry engine), and 10 dBm through
 `RadioPhy::DEFAULT_TX_POWER_DBM`. This migration is build-, layout-, symbol-
 and host-tested only; the hardware evidence below predates it.
 
+### Device identity (EUI-64)
+
+The IEEE address equals ESP-IDF `esp_read_mac(ESP_MAC_IEEE802154)`, the
+value `esp-zigbee-sdk` uses: base-MAC OUI, the two eFuse `MAC_EXT` bytes,
+then the base-MAC NIC (`zigbee_mac::esp_identity`). With base MAC
+`60:55:F9:F6:96:88` and `MAC_EXT` `ff:fe` a coordinator shows
+`60:55:f9:ff:fe:f6:96:88`. `MAC_EXT` is copied verbatim like ESP-IDF does;
+a part with the field unprogrammed (the C6 lab board reads `00:00`) shows
+`60:55:f9:00:00:f6:96:88`. The U/L bit is not changed. The stack stores
+the address in over-the-air order (least-significant octet first).
+
+Images before `esp-ieee-order` byte-reversed this address and flipped the
+U/L bit (ZHA showed `88:96:f6:fe:ff:f9:55:62`). After the update every ESP
+binary, including the default SED, compares the persisted EUI-64 with the
+eFuse one before the node starts. On a mismatch it clears the network
+state, keeps the outgoing frame-counter reservations, and joins as a new
+device. Remove the old entry from the coordinator and re-pair.
+
+Lab evidence (ESP32-C6 v0.0, base MAC `60:55:F9:F6:96:88`, `MAC_EXT`
+`00:00`): the old ZHA entry `88:96:f6:fe:ff:f9:55:62` was removed, and the
+fixed default SED, flashed into `ota_0` over its retained journal, joined
+as `60:55:f9:00:00:f6:96:88` (NWK `0x6330`). The ZHA interview and reporting
+setup completed, and after a reset the node resumed under the same EUI-64
+without clearing its state. The ESP32-H2 images share the code path but have
+not been re-paired on hardware.
+
 ## Node roles
 
 Each example crate has one bin per role, following the

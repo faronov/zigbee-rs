@@ -254,6 +254,25 @@ fn main() -> ! {
     let profile = PROFILE.init(profile);
     let device = build_device(peripherals.IEEE802154, peripherals.AES, profile);
 
+    // Persisted keys and counters belong to the EUI-64 they were joined
+    // under. If it changed (the pre-fix ESP derivation was byte-reversed),
+    // start factory-new instead of failing the restore; the outgoing counter
+    // reservations are kept.
+    let ieee = device.mac().pib().extended_address();
+    match device.reset_security_state_if_identity_changed(security, ieee) {
+        Ok(false) => {}
+        Ok(true) => esp_println::println!(
+            "[ESP32-C6] EUI-64 changed; cleared network state for a fresh join"
+        ),
+        // Not formatting the error keeps its Debug impl out of the image.
+        Err(_) => {
+            esp_println::println!("[ESP32-C6] FATAL: identity guard failed");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
     let node = ZigbeeNode::new(device, security, profile);
     let parts = SensorSedParts {
         wake: SensorWake::new(button, sleep),

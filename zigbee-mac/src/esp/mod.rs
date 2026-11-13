@@ -12,7 +12,8 @@
 //!
 //! # Features
 //! - Hardware auto-ACK and address filtering, software ACK-wait window
-//! - EUI-64 address from eFuse factory MAC
+//! - EUI-64 address from eFuse, as ESP-IDF `esp_read_mac(ESP_MAC_IEEE802154)`
+//!   (see `crate::esp_identity`)
 //! - Bounded, fail-closed hardware AES-128 for Zigbee security
 //! - Hardware RNG service while the RF subsystem is active
 //! - Retained light sleep through [`crate::RadioPhy::sleep`] / `wake`
