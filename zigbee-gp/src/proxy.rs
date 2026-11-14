@@ -1817,13 +1817,13 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         if src_nwk == self.own_nwk {
             return None;
         }
-        let (gpd, counter, rx_after_tx, other_bidi, other) = match command_id {
+        let (gpd, counter, rx_after_tx, other_usable, other) = match command_id {
             server_cmd::NOTIFICATION => match Notification::decode(payload) {
                 Ok(n) => (
                     n.gpd_id,
                     n.frame_counter,
                     n.rx_after_tx,
-                    n.bidirectional_cap,
+                    n.bidirectional_cap & !n.tx_queue_full,
                     n.proxy_info,
                 ),
                 Err(_) => return None,
@@ -1850,9 +1850,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             if !p.rx_after_tx {
                 return true;
             }
-            // Only a bidirectional-capable forwarder with a better link
-            // pre-empts us (GP 1.1.1 A.3.5.2.1).
-            if !other_bidi {
+            // A forwarder unable to queue the reply must not pre-empt us.
+            if !other_usable {
                 return false;
             }
             let (other_short, other_link) = match other {
@@ -1865,9 +1864,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             };
             let ours = (p.link.link_quality(), p.link.0 & 0x3F);
             let theirs = (other_link.link_quality(), other_link.0 & 0x3F);
-            // Keep ours only if we are strictly better, or equal with the
-            // lower short address.
-            !(ours > theirs || (ours == theirs && own < other_short))
+            theirs > ours || (theirs == ours && other_short <= own)
         })
     }
 
@@ -2389,13 +2386,14 @@ mod tests {
 
     /// Another proxy's GP Notification of SRC's frame `fc`.
     fn others_notification(fc: u32, rx_after_tx: bool, info: ProxyInfo) -> heapless::Vec<u8, 48> {
-        others_notification_bidi(fc, rx_after_tx, rx_after_tx, info)
+        others_notification_bidi(fc, rx_after_tx, rx_after_tx, false, info)
     }
 
     fn others_notification_bidi(
         fc: u32,
         rx_after_tx: bool,
         bidi: bool,
+        queue_full: bool,
         info: ProxyInfo,
     ) -> heapless::Vec<u8, 48> {
         let n = Notification {
@@ -2406,7 +2404,7 @@ mod tests {
             security_level: SecurityLevel::Encrypted,
             key_type: KeyType::GpdGroupKey,
             rx_after_tx,
-            tx_queue_full: false,
+            tx_queue_full: queue_full,
             bidirectional_cap: bidi,
             frame_counter: fc,
             command_id: cmd::OFF,
@@ -2493,7 +2491,16 @@ mod tests {
             p.on_server_command(
                 0x4321,
                 notify,
-                &others_notification_bidi(2, true, false, better)
+                &others_notification_bidi(2, true, false, false, better)
+            ),
+            None
+        );
+        // A proxy with a full queue cannot accept the sink's response.
+        assert_eq!(
+            p.on_server_command(
+                0x4321,
+                notify,
+                &others_notification_bidi(2, true, true, true, better)
             ),
             None
         );
@@ -2514,6 +2521,30 @@ mod tests {
                 cancelled: 1
             }
         );
+    }
+
+    #[test]
+    fn rx_after_tx_equal_link_prefers_lower_short_address() {
+        for (other_short, cancelled) in [(0x0001, true), (0x4321, false)] {
+            let mut p = paired_proxy(1);
+            let raw = secure_off(2, true);
+            let frame = parse(&raw, 2, None).unwrap();
+            let link = GppGpdLink(0x80 | 30);
+            p.on_gpdf(&mut SoftwareAesProvider, &frame, link, 0);
+            let info = ProxyInfo::Link {
+                gpp_short: other_short,
+                link,
+            };
+            assert_eq!(
+                p.on_server_command(
+                    other_short,
+                    server_cmd::NOTIFICATION,
+                    &others_notification(2, true, info)
+                )
+                .is_some(),
+                cancelled
+            );
+        }
     }
 
     fn pair(p: &mut P, pairing: &[u8]) -> CommandEffects {

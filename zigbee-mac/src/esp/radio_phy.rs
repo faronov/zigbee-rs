@@ -116,10 +116,10 @@ pub const DEFAULT_TX_POWER_DBM: i8 = 10;
 #[cfg(feature = "timed-tx")]
 pub const TIMED_TX_START_LEAD_US: u32 = 425;
 
-/// How far behind its instant a timed transmission may still start, in µs
-/// (`timed-tx`). Later than that it is [`PhyError::Missed`]; a GPD's
-/// receive window is open for at least gpdMinRxWindow (0.576 ms,
-/// GP 1.1 A.1.5.2.1), so a frame this late still lands in it.
+/// Software deadline tolerance in µs (`timed-tx`); attempts checked later
+/// than this return [`PhyError::Missed`]. Interrupts between the check and
+/// radio start can still delay a frame. A GPD's receive window is at least
+/// gpdMinRxWindow (0.576 ms, GP 1.1 A.1.5.2.1).
 #[cfg(feature = "timed-tx")]
 pub const TIMED_TX_LATE_US: u32 = 300;
 
@@ -562,18 +562,18 @@ impl<'a> EspRadioPhy<'a> {
         padded[..frame.len()].copy_from_slice(frame);
 
         TX_COMPLETE.store(false, Ordering::Release);
-        while let Err(error) = self
-            .driver
-            .transmit_raw_discarding(&padded[..frame.len() + 2], false)
-        {
-            if error != esp_radio::ieee802154::Error::Busy {
-                return Err(map_radio_error(error));
-            }
-            if self.monotonic_micros().wrapping_sub(start_at_us) as i32 > TIMED_TX_LATE_US as i32 {
-                return Err(PhyError::Missed);
-            }
-            core::hint::spin_loop();
-        }
+        // Check before every attempt, including the first; a Busy retry may
+        // have been delayed past the deadline since the preceding check.
+        crate::phy::transmit_with_deadline(
+            start_at_us,
+            TIMED_TX_LATE_US,
+            || Instant::now().as_micros() as u32,
+            || {
+                self.driver
+                    .transmit_raw_discarding(&padded[..frame.len() + 2], false)
+                    .map_err(map_radio_error)
+            },
+        )?;
 
         let deadline = esp_hal::time::Instant::now()
             + esp_hal::time::Duration::from_micros(TX_DONE_TIMEOUT_US);

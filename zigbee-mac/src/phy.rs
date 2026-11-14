@@ -364,9 +364,98 @@ pub trait RadioPhy {
     }
 }
 
+#[cfg(all(
+    feature = "timed-tx",
+    any(test, feature = "esp32c6", feature = "esp32h2")
+))]
+#[inline(always)]
+pub(crate) fn transmit_with_deadline(
+    start_at_us: u32,
+    late_us: u32,
+    mut now: impl FnMut() -> u32,
+    mut transmit: impl FnMut() -> Result<(), PhyError>,
+) -> Result<(), PhyError> {
+    loop {
+        if now().wrapping_sub(start_at_us) as i32 > late_us as i32 {
+            return Err(PhyError::Missed);
+        }
+        match transmit() {
+            Err(PhyError::ChannelBusy) => core::hint::spin_loop(),
+            result => return result,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "timed-tx")]
+    #[test]
+    fn timed_transmit_rejects_late_first_attempt() {
+        assert_eq!(
+            transmit_with_deadline(1_000, 300, || 1_301, || panic!("transmitted late")),
+            Err(PhyError::Missed)
+        );
+    }
+
+    #[cfg(feature = "timed-tx")]
+    #[test]
+    fn timed_transmit_rechecks_deadline_after_busy() {
+        use core::cell::Cell;
+
+        let attempts = Cell::new(0);
+        let clock_reads = Cell::new(0);
+        let result = transmit_with_deadline(
+            1_000,
+            300,
+            || {
+                let reads = clock_reads.get();
+                clock_reads.set(reads + 1);
+                if reads == 0 { 1_300 } else { 1_301 }
+            },
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(PhyError::ChannelBusy)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result, Err(PhyError::Missed));
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[cfg(feature = "timed-tx")]
+    #[test]
+    fn timed_transmit_allows_boundary_across_clock_wrap_and_preserves_errors() {
+        use core::cell::Cell;
+
+        let start = u32::MAX - 100;
+        let attempts = Cell::new(0);
+        assert_eq!(
+            transmit_with_deadline(
+                start,
+                300,
+                || start.wrapping_add(300),
+                || {
+                    attempts.set(attempts.get() + 1);
+                    if attempts.get() == 1 {
+                        Err(PhyError::ChannelBusy)
+                    } else {
+                        Ok(())
+                    }
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(
+            transmit_with_deadline(start, 300, || start, || Err(PhyError::Hardware)),
+            Err(PhyError::Hardware)
+        );
+    }
 
     #[test]
     fn received_frame_owns_fcs_free_bytes() {

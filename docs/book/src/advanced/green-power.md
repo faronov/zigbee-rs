@@ -327,8 +327,10 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
    ≥ −85 High, ≥ −95 Moderate, else Poor), which matches what commercial
    proxies report on air (§6.8). A pending Notification is cancelled if an
    identical one from another proxy is heard first (A.3.5.2.1); for
-   rxAfterTx frames only if that proxy is bidirectional-capable and has a
-   better link (or an equal link and a lower address). `Proxy::forward_stats()` counts forwards sent and cancelled,
+   rxAfterTx frames only if that proxy is bidirectional-capable, its TX queue
+   is not full when reported, and it has a better link (or an equal link and
+   a lower address). Commissioning Notifications do not report the TX-queue
+   state. `Proxy::forward_stats()` counts forwards sent and cancelled,
    and the runtime logs each cancellation at debug level.
 5. Commissioning mode transitions are reported as `CommissioningEvent`
    (entered with its window, replaced by a new enter from the same sink, or
@@ -789,6 +791,28 @@ after, in the same checkout path (flash = code + rodata + data):
 | ZBT-1 `router,zrs-boot` | −52 B | 0 |
 | Nucleo-WB55 router (default) | −64 B | 0 |
 | MG22 GPD sensor (default) | byte-identical | 0 |
+
+The follow-up TX-queue suppression and timed-TX deadline checks were also
+measured in the same checkout path against the preceding M4 build.
+`llvm-size` reports:
+
+| Image | `text` delta | `data` / `bss` delta |
+|---|---:|---:|
+| ESP32-C6 router | −4 B | 0 / 0 |
+| ESP32-H2-Zero router | −4 B | 0 / 0 |
+| ESP32-H2-Zero router `+green-power-bidirectional` | 0 | 0 / 0 |
+| nRF52833 / nRF52840 router | −4 / −4 B | 0 / 0 |
+| EFR32MG21 router | −4 B | 0 / 0 |
+| ZBT-1 `router,zrs-boot` | −4 B | 0 / 0 |
+| Nucleo-WB55 router (default) | −4 B | 0 / 0 |
+| WB55 USB dongle router | −4 B | 0 / 0 |
+| STM32WB5MM-DK router (default) | 0 | 0 / 0 |
+| BL702 router | 0 | 0 / 0 |
+| TLSR8258 router | −24 B | 0 / 0 |
+
+The GP-off H2 `router-core` image has the same section sizes as the
+previously saved build; its only byte differences are 11
+`core::panic::Location` line numbers in `radio_phy.rs`.
 
 ## 5. Risks
 
@@ -1361,6 +1385,16 @@ GPDF arrived while the H2 was relaying a broadcast NWK_addr_req and was
 handled more than 20.3 ms after its end, so the frame was not sent late.
 The stall source is not yet identified. Each of the 11 triggered cycles
 otherwise logged `TempMaster GPDF sent (15 B)`.
+
+The follow-up deadline check runs before the first radio attempt and every
+retry after `Busy`; host regressions cover a late first attempt, an expired
+retry, the inclusive boundary, clock wrap and other radio errors. With that
+change on the H2 (app SHA-256 `4db51a0c…6771d72`, app-only flash after a
+verified full backup), the same nRF injection produced four replies at
+19,984–20,015 µs after the GPDF end (hwlab session
+`2026-11-14T212013Z-m4-deadline-regression`). This is still a software
+deadline: an interrupt or driver delay between the final check and radio
+start can make a frame late; the test does not prove a hard bound.
 
 Not yet changed (minor deviations): a proxy without bidirectional
 capability should send rxAfterTx Commissioning Notifications with the
