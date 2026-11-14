@@ -2584,8 +2584,8 @@ jobs:
           if-no-files-found: error
 
   # P-NUCLEO-WB55 kit: the Nucleo-WB55 (ST-LINK VCP log) and the USB dongle
-  # (USB CDC log) routers on the shared STM32WB router kit, plus the SRAM
-  # FUS helper that services the dongle's coprocessor through ROM DFU.
+  # (USB CDC log) routers on the shared STM32WB router kit, plus the
+  # flash-resident FUS sequencer that services the dongle's coprocessor.
   build-nucleo-wb55:
     name: Build P-NUCLEO-WB55 routers
     runs-on: ubuntu-latest
@@ -2618,14 +2618,14 @@ jobs:
             cargo clippy --manifest-path apps/stm32wb-router/Cargo.toml --release --locked \
               --target thumbv7em-none-eabihf --features "stm32wb-hal/stm32wb55rg,$features" -- -D warnings
           done
-      # The shim links at 0x20008000 with no .data/.bss (asserted by
-      # shim.x); it must stay well inside the SRAM1 window that ROM DFU
-      # accepts.
-      - name: Build STM32WB FUS helper (release)
+      # The sequencer links at 0x08000000 with no .data/.bss (asserted by
+      # shim.x); its decision table and CRC checks run as host tests.
+      - name: Build and test STM32WB FUS sequencer
         working-directory: tools/stm32wb-fus-shim
         run: |
           cargo build --release --locked
           cargo clippy --release --locked -- -D warnings
+          cargo test --lib --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       # Without Green Power (`--no-default-features`) and the stock image;
       # the dongle's stock image also carries the USB CDC log.
       - name: Build Nucleo-WB55 router (release)
