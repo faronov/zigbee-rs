@@ -104,11 +104,17 @@ pub const ESP_PENDING_RX: usize = crate::soft_mac::DEFAULT_PENDING_RX;
 pub const DEFAULT_TX_POWER_DBM: i8 = 10;
 
 /// Time from handing a frame to the radio (`transmit_raw_discarding`) until
-/// its first preamble symbol is on air, in µs (`timed-tx`). The radio
-/// leaves receive, ramps up the transmitter and starts the SHR;
-/// [`RadioPhy::transmit_at`] issues the command this much early.
+/// its first preamble symbol is on air, in µs (`timed-tx`), including the
+/// lag of the RX_DONE time stamp behind the true end of the received
+/// frame. The radio leaves receive, ramps up the transmitter and starts the
+/// SHR; [`RadioPhy::transmit_at`] issues the command this much early.
+///
+/// Calibrated on air (ESP32-H2, 2026-11-14, nRF52840 radio-lab capture,
+/// SFD time stamps): with 150 µs a GP TempMaster reply started
+/// 20,275 µs (20,273–20,280, n = 5) after the end of the triggering GPDF
+/// instead of 20,000 µs, so the lead is 150 + 275 µs.
 #[cfg(feature = "timed-tx")]
-pub const TIMED_TX_START_LEAD_US: u32 = 150;
+pub const TIMED_TX_START_LEAD_US: u32 = 425;
 
 /// How far behind its instant a timed transmission may still start, in µs
 /// (`timed-tx`). Later than that it is [`PhyError::Missed`]; a GPD's
