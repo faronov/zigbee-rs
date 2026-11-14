@@ -86,6 +86,13 @@ Each feature selects a board crate and a product linker layout. Preserve the
 resident bootloader/SoftDevice regions and always package ELF → Intel HEX →
 UF2; do not infer an address from a flat binary.
 
+### Radio lab dongle
+
+`tools/nrf52840-radio-lab` is a sniffer and raw-frame transmitter for a
+PCA10059 that still has Nordic's Open USB DFU bootloader (not a UF2
+bootloader). It is a test instrument, not a product image. See
+[Sniffing & Frame Injection](../advanced/radio-lab.md).
+
 ## Persistence and identity
 
 | product | application end | security journal |

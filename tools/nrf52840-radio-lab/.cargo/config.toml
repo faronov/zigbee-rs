@@ -1,0 +1,9 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+# Linked after the MBR for Nordic's Open USB DFU bootloader; flash with
+# hwlab `nrf802154` `dfu_program` or `nrfutil`. See README.md.
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+]
