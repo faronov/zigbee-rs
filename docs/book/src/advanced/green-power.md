@@ -10,7 +10,8 @@
 > TempMaster with timed TX, MG22 GPD with `rxAfterTx`) is implemented
 > opt-in. The H2's reply timing and the MG22's bidirectional commissioning
 > into ZHA are lab-tested on hardware, but through a third-party
-> TempMaster (IKEA), not yet through our proxy (§6.7, §6.9). The full proxy and Combo/Sink
+> TempMaster (IKEA), not through our proxy. M4 hardware gate 2 was
+> accepted as partial on 2026-11-14 (gate 1 + gate 2b, §6.7, §6.9). The full proxy and Combo/Sink
 > are still design only. Spec
 > references are to GP 1.0a (docs-09-5499-26) and GP 1.1 where noted.
 
@@ -1289,8 +1290,10 @@ Open hardware gates:
    `TIMED_TX_START_LEAD_US`.~~ Done 2026-11-14 (§6.8).
 2. Full bidirectional commissioning of the MG22 GPD into ZHA through the
    H2-Zero, with the coordinator and other proxies unable to answer.
-   *Partly done 2026-11-14 (§6.9): commissioned into ZHA through IKEA
-   0x43FD as TempMaster; our H2 has not yet been appointed.*
+   *Partial, accepted 2026-11-14 (§6.9): the H2's reply timing on air
+   (gate 1) plus the MG22 commissioned into ZHA through IKEA 0x43FD as
+   TempMaster (gate 2b). Commissioning through our H2 as TempMaster is
+   not hardware-proven; no relocation retest is planned.*
 3. ~~Reports after commissioning and a GPD reset (counter and key
    retained).~~ Done 2026-11-14 (§6.9).
 
@@ -1331,7 +1334,8 @@ Causes:
    unidirectional proxy that forwards first therefore wins, and the
    coordinator always wins when the GPD is in its range. Bidirectional
    commissioning through our proxy needs the GPD out of the coordinator's
-   range and our proxy to forward first. Not fixed here (zigpy).
+   range and our proxy to forward first. Fixed upstream in zigpy PR
+   #1970 (open, not deployed in HA; §6.9).
 5. VINDSTYRKA forwarded at ~70 ms even at −86 dBm / LQ 1, i.e. not by the
    1.1.1 formula; the H2 adds ~10 ms of processing to its computed delay.
 
@@ -1422,13 +1426,25 @@ at once and every 60 s. ZHA accepted fc 4448 and fc 4449 (humidity
 entity updated at 19:53:40 and 19:54:40 UTC; device `last_seen` current).
 The proxies, including the H2, kept forwarding.
 
-**Our proxy as TempMaster: still open.** zigpy appoints the first
+**Our proxy as TempMaster: not proven, gate 2 accepted as partial.** zigpy appoints the first
 notifier. A spec-conformant election (A.3.6.2.3: the bidirectional-capable
 candidate with the best link) would also choose IKEA (−86 dBm) over the H2
 (−90 dBm) at this placement. The H2's ZHA signature lacks endpoint 242,
 so a manual GP Response through ZHA's cluster-command service is not
 possible either. Gate 2 through our proxy needs the H2-Zero closer to
-the MG22 (Link quality ≥ 2, forwarded within ~64 ms).
+the MG22 (Link quality ≥ 2, forwarded within ~64 ms). On 2026-11-14
+the user accepted gate 1 + gate 2b as the M4 gate-2 evidence, with no
+relocation retest.
+
+**zigpy fix upstream.** [zigpy PR #1970](https://github.com/zigpy/zigpy/pull/1970)
+(branch `faronov:gp-tempmaster-election`) addresses both findings:
+- it elects the TempMaster per A.3.6.2.3 within Dmax (100 ms): bidirectional
+  proxies with room in gpTxQueue first, then the best link, then the lowest
+  address;
+- it ignores a Commissioning GPDF whose outgoing counter is below the last
+  accepted frame counter for the same key.
+
+The PR adds zigpy unit tests. It is open and not deployed in the user's HA.
 
 **M5 note.** After an H2 reboot, the proxy drops up to 63 frames per GPD
 (`counter_persist_stride` 64, skip-ahead on restore). Consider persisting
@@ -1468,8 +1484,9 @@ more often or using a smaller window in M5.
    first on the platform where it can be proven. GPD bidirectional mode.
    *(M4: implemented opt-in on ESP32-H2 and MG22, host-tested; H2 reply
    timing and MG22 commissioning into ZHA (third-party TempMaster),
-   reset and reports lab-tested; our proxy as TempMaster for the MG22
-   open, §6.9.)*
+   reset and reports lab-tested; gate 2 accepted as partial (gate 1 +
+   gate 2b), our proxy as TempMaster for a real GPD not proven; zigpy
+   PR #1970 open, §6.9.)*
 5. Full proxy (channel switch, unicast modes, key types, IEEE ApplicationID).
 6. Combo/Sink with translation table.
 
