@@ -197,17 +197,28 @@ colour channel is non-zero is lit:
 ### Dongle coprocessor service without a probe
 
 The dongle has no SWD connector. Its ROM USB DFU bootloader (ST AN3156)
-can read and write memory, but it has no FUS command. The FUS upgrade and
-the stack install therefore run through `tools/stm32wb-fus-shim`: a
-2.7 KiB CPU1 helper that HWLab's `stm32dfu` plugin loads into SRAM1 at
-`0x2000_8000` and enters by leaving DFU. The helper performs one FUS step
-per run (info, upgrade, delete, start) through the same mailbox sequence
-as the SWD driver. It writes a result block that the host reads back over
-DFU once the reset has returned the part to the bootloader.
+can program flash, but it has no FUS command. The FUS upgrade and the
+stack install therefore run through `tools/stm32wb-fus-shim`, a
+flash-resident sequencer that HWLab's `stm32dfu` plugin programs at
+`0x0800_0000`. On each normal boot it performs one FUS step, chosen from
+what CPU2 reports, and logs it to the page at `0x080C_0000`. The LEDs
+show the result, and the host reads the log back over DFU. See the tool's
+README for the decision table and the host procedure.
 
-The helper never writes flash. The DFU plugin stages the ST images below
+The sequencer erases nothing. The DFU plugin stages the ST images below
 SFSA and refuses every write at or above it. The plugin never sends a mass
-erase.
+erase. Once CPU2 runs the MAC, the router image replaces the sequencer at
+`0x0800_0000`.
+
+On hardware (MB1293C, factory FUS 0.5.3 with BLE 1.0.0) the sequence took
+two runs:
+
+1. FUS 0.5.3 → 1.2.0 (ST's "for FUS 0.5.3" image), delete BLE, SFSA 0xF4;
+2. after the MAC was staged at `0x080E_1000`: install, start MAC 1.24.0,
+   SFSA 0xE1.
+
+The router image then joined ZHA as `WB55-Dongle-Router`, a mains-powered
+Router.
 
 ## Coprocessor prerequisites
 
@@ -242,7 +253,8 @@ moves SFSA. The product asserts the boundary it was built for:
 
 | Region | Range | Owner |
 |---|---|---|
-| Application | `0x0800_0000..0x080D_3000` (844 KiB) | product linker script |
+| Application | `0x0800_0000..0x080C_F000` (828 KiB) | product linker script |
+| Green Power Proxy Table journal | `0x080C_F000..0x080D_3000` | product |
 | Settings journal (motion hold) | `0x080D_3000..0x080D_5000` | product |
 | Child-table journal | `0x080D_5000..0x080D_9000` | product |
 | APS-table journal | `0x080D_9000..0x080D_D000` | product |
@@ -337,11 +349,11 @@ USART1 (PB6) at 115200 baud.
 
 The dongle image comes from `examples/wb55-dongle-router`. To load it:
 
-1. Set SW2 to BOOT0 and replug the dongle. It enumerates as ROM DFU
+1. Set SW2 to BOOT0 and press RESET (or replug). It enumerates as ROM DFU
    (`0483:df11`).
 2. Program `0x0800_0000` with HWLab's `stm32dfu` plugin, which backs up
    `0x0800_0000..SFSA`, erases only the pages it writes, and verifies.
-3. Set SW2 back and replug. The router starts and its log appears on
+3. Set SW2 back and press RESET. The router starts and its log appears on
    the dongle's own USB CDC port.
 
 ## Validation status
