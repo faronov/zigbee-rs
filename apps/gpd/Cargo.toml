@@ -16,5 +16,11 @@ zigbee-crypto = { path = "../../zigbee-crypto" }
 zigbee-gp = { path = "../../zigbee-gp", features = ["gpd"] }
 zigbee-mac = { path = "../../zigbee-mac" }
 
+[features]
+# Bidirectional commissioning: Commissioning GPDFs with rxAfterTx, a
+# receive window at gpdRxOffset, Commissioning Reply handling and Success.
+# Off by default; a product opts in together with its receive policy.
+bidirectional = []
+
 [dev-dependencies]
 embassy-futures = "0.1"

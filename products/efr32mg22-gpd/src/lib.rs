@@ -117,6 +117,24 @@ pub const SENSOR: GpdProfile = profile(GpdKind::Sensor, 0x33, SENSOR_MODEL_ID, S
 /// On/Off switch (GP DeviceID 0x02 "On/Off Switch").
 pub const SWITCH: GpdProfile = profile(GpdKind::Switch, 0x02, SWITCH_MODEL_ID, SWITCH_COMMANDS);
 
+/// Bidirectional commissioning policy (`bidirectional` feature).
+///
+/// A proxy answers an rxAfterTx Commissioning GPDF only once the sink's
+/// GP Response has come back through the network, so the reply normally
+/// arrives on the second or a later attempt: six attempts 500 ms apart
+/// cover a sink round trip of up to about 2.5 s. The receiver opens 1 ms
+/// before gpdRxOffset and stays on 4 ms, for the proxy's timing error and
+/// the MG22 receiver start-up.
+#[cfg(feature = "bidirectional")]
+pub const BIDIRECTIONAL: gpd_app::BidirectionalPolicy = gpd_app::BidirectionalPolicy {
+    attempts: 6,
+    attempt_gap_ms: 500,
+    rx_open_us: 19_000,
+    rx_window_us: 4_000,
+};
+#[cfg(feature = "bidirectional")]
+const _: () = assert!(BIDIRECTIONAL.is_valid());
+
 /// Sensor reporting interval.
 pub const SENSOR_REPORT_INTERVAL_S: u64 = 60;
 /// Button press longer than this recommissions.

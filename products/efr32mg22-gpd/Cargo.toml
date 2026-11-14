@@ -15,3 +15,8 @@ publish = false
 efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg22"] }
 gpd-app = { path = "../../apps/gpd" }
 zigbee-gp = { path = "../../zigbee-gp", features = ["gpd"] }
+
+[features]
+# Bidirectional commissioning (rxAfterTx, Commissioning Reply): exposes
+# `BIDIRECTIONAL`. Off by default; the default images do not change.
+bidirectional = ["gpd-app/bidirectional"]

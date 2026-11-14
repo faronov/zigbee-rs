@@ -262,7 +262,12 @@ async fn classify(button: &mut Button0) -> Press {
 async fn commission(device: &mut Device, led: &mut Led0) {
     log::info!("[GPD] commissioning: scanning for a network that permits joining");
     led.on();
+    #[cfg(not(feature = "bidirectional"))]
     let result = device.commission().await;
+    #[cfg(feature = "bidirectional")]
+    let result = device
+        .commission_bidirectional(product::BIDIRECTIONAL)
+        .await;
     led.off();
     match result {
         Ok(network) => log::info!(

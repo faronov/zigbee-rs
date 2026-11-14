@@ -11,6 +11,11 @@
 //!   channel of a network that permits joining, and protected reports and
 //!   switch commands.
 //!
+//! With the `bidirectional` feature, [`GpdDevice::commission_bidirectional`]
+//! sends Commissioning GPDFs with `rxAfterTx`, listens at gpdRxOffset after
+//! each one, applies the Commissioning Reply delivered by the TempMaster
+//! proxy and confirms with Success.
+//!
 //! Commissioning is unidirectional (no `rxAfterTx`): the sink accepts it
 //! while its commissioning window is open (zigpy finalizes on the first
 //! Commissioning GPDF without `rxAfterTx`). The GPD key travels in the
@@ -130,6 +135,50 @@ pub enum GpdError {
     NotCommissioned,
     /// The profile is invalid (channel mask, security level, key type).
     InvalidProfile,
+    /// Bidirectional commissioning: no Commissioning Reply arrived in any
+    /// receive window.
+    #[cfg(feature = "bidirectional")]
+    NoCommissioningReply,
+    /// Bidirectional commissioning: the Commissioning Reply asks for a
+    /// security level or key type other than the profile's.
+    #[cfg(feature = "bidirectional")]
+    CommissioningRejected,
+}
+
+/// Receive policy of bidirectional commissioning (product-owned).
+#[cfg(feature = "bidirectional")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BidirectionalPolicy {
+    /// Commissioning GPDFs with `rxAfterTx` before giving up. The first
+    /// one is normally unanswered: the proxy learns the GP Response from
+    /// the sink after tunnelling it and delivers it on the next one.
+    pub attempts: u8,
+    /// Gap between attempts, in milliseconds (covers the sink's round
+    /// trip through the network).
+    pub attempt_gap_ms: u32,
+    /// Receiver start after the end of the Commissioning GPDF, in
+    /// microseconds; at most gpdRxOffset (20 ms) minus the expected proxy
+    /// timing error.
+    pub rx_open_us: u32,
+    /// Receive window length, in microseconds; at least gpdMinRxWindow
+    /// (0.576 ms) plus the timing error on both sides.
+    pub rx_window_us: u32,
+}
+
+#[cfg(feature = "bidirectional")]
+impl BidirectionalPolicy {
+    /// GP 1.1 gpdRxOffset: a TempMaster starts the reply 20 ms after the
+    /// end of the GPDF that carried `rxAfterTx`.
+    pub const GPD_RX_OFFSET_US: u32 = 20_000;
+
+    /// At least one attempt, a non-empty window, and a window that opens
+    /// no later than gpdRxOffset and is still open after it.
+    pub const fn is_valid(&self) -> bool {
+        self.attempts > 0
+            && self.rx_window_us > 0
+            && self.rx_open_us <= Self::GPD_RX_OFFSET_US
+            && self.rx_open_us.saturating_add(self.rx_window_us) > Self::GPD_RX_OFFSET_US
+    }
 }
 
 impl From<PhyError> for GpdError {
@@ -552,6 +601,171 @@ impl<P: RadioPhy + PlatformServices, S: GpdStore> GpdDevice<P, S> {
             .ok_or(GpdError::NoPermitJoinNetwork)?;
         self.commission_on(network.channel).await?;
         Ok(network)
+    }
+
+    /// Scan for a joinable network and commission bidirectionally on its
+    /// channel.
+    #[cfg(feature = "bidirectional")]
+    pub async fn commission_bidirectional(
+        &mut self,
+        policy: BidirectionalPolicy,
+    ) -> Result<JoinableNetwork, GpdError> {
+        let network = self
+            .scan_for_joinable_network()
+            .await?
+            .ok_or(GpdError::NoPermitJoinNetwork)?;
+        self.commission_bidirectional_on(network.channel, policy)
+            .await?;
+        Ok(network)
+    }
+
+    /// Bidirectional commissioning on `channel`: send Commissioning GPDFs
+    /// with `rxAfterTx` until a Commissioning Reply arrives in the receive
+    /// window, apply it (a delivered key replaces the GPD key), send a
+    /// protected Success and persist `channel` as operational.
+    ///
+    /// The channel is persisted only after Success was transmitted, so an
+    /// unanswered GPD stays uncommissioned and can retry.
+    #[cfg(feature = "bidirectional")]
+    pub async fn commission_bidirectional_on(
+        &mut self,
+        channel: u8,
+        policy: BidirectionalPolicy,
+    ) -> Result<(), GpdError> {
+        if !(11..=26).contains(&channel)
+            || !policy.is_valid()
+            || self.profile.gpd_commands.len()
+                > zigbee_gp::commissioning::MAX_COMMISSIONING_COMMANDS
+        {
+            return Err(GpdError::InvalidProfile);
+        }
+        self.phy.set_channel(channel)?;
+        let mut reply = None;
+        for attempt in 0..policy.attempts {
+            if attempt > 0 {
+                self.phy
+                    .delay_micros(policy.attempt_gap_ms.saturating_mul(1000))
+                    .await;
+            }
+            self.ensure_counter()?;
+            let mut payload = self.commissioning_payload();
+            payload.rx_on_capability = true;
+            let mut out = [0u8; MAX_GPD_FRAME];
+            let len = self.gpd.commissioning_frame(
+                &mut self.phy,
+                &mut self.counter,
+                &self.profile.key_wrap_key,
+                payload,
+                true,
+                &mut out,
+            )?;
+            match self.transmit(&out[..len]).await {
+                Ok(()) => {}
+                Err(GpdError::ChannelBusy) => continue,
+                Err(e) => return Err(e),
+            }
+            reply = self.receive_commissioning_reply(policy).await?;
+            if reply.is_some() {
+                break;
+            }
+        }
+        let reply = reply.ok_or(GpdError::NoCommissioningReply)?;
+        self.apply_commissioning_reply(&reply)?;
+        self.ensure_counter()?;
+        let mut out = [0u8; MAX_GPD_FRAME];
+        let len =
+            self.gpd
+                .simple_frame(&mut self.phy, &mut self.counter, cmd::SUCCESS, &mut out)?;
+        self.transmit_repeated(&out[..len]).await?;
+        let mut r = self.record;
+        r.channel = Some(channel);
+        self.store.store(&r)?;
+        self.record = r;
+        Ok(())
+    }
+
+    /// Listen in the rxAfterTx window that follows a transmitted GPDF and
+    /// return the first Commissioning Reply addressed to this GPD. Other
+    /// traffic on the channel is skipped.
+    #[cfg(feature = "bidirectional")]
+    async fn receive_commissioning_reply(
+        &mut self,
+        policy: BidirectionalPolicy,
+    ) -> Result<Option<zigbee_gp::commissioning::CommissioningReply>, GpdError> {
+        // `try_transmit` returns at the end of the frame.
+        self.phy.delay_micros(policy.rx_open_us).await;
+        let start = self.phy.monotonic_micros();
+        let mut rx = PhyRxFrame::EMPTY;
+        loop {
+            let elapsed = self.phy.monotonic_micros().wrapping_sub(start);
+            if elapsed >= policy.rx_window_us {
+                return Ok(None);
+            }
+            if !self
+                .phy
+                .receive(policy.rx_window_us - elapsed, &mut rx)
+                .await?
+            {
+                return Ok(None);
+            }
+            let Ok(downlink) =
+                zigbee_gp::gpd::parse_downlink(&mut self.phy, self.gpd.config(), rx.as_slice())
+            else {
+                continue;
+            };
+            if downlink.command_id != cmd::COMMISSIONING_REPLY {
+                continue;
+            }
+            if let Ok(reply) =
+                zigbee_gp::commissioning::CommissioningReply::decode(&downlink.payload)
+            {
+                return Ok(Some(reply));
+            }
+        }
+    }
+
+    /// Check the reply against the profile and adopt a delivered key.
+    #[cfg(feature = "bidirectional")]
+    fn apply_commissioning_reply(
+        &mut self,
+        reply: &zigbee_gp::commissioning::CommissioningReply,
+    ) -> Result<(), GpdError> {
+        let protected = self.profile.security_level.is_protected();
+        if reply.security_level != self.profile.security_level
+            || (protected && reply.key_type != self.profile.key_type)
+        {
+            return Err(GpdError::CommissioningRejected);
+        }
+        let key = zigbee_gp::gpd::reply_key(
+            &mut self.phy,
+            &self.profile.key_wrap_key,
+            self.record.src_id,
+            reply,
+        )?;
+        let Some(key) = key else {
+            return Ok(());
+        };
+        if !protected {
+            return Err(GpdError::CommissioningRejected);
+        }
+        if key != self.record.key {
+            let mut r = self.record;
+            r.key = key;
+            self.store.store(&r)?;
+            self.record = r;
+            self.gpd = Gpd::new(
+                GpdConfig {
+                    src_id: r.src_id,
+                    security: Some(GpdSecurity {
+                        level: self.profile.security_level,
+                        key_type: self.profile.key_type,
+                        key,
+                    }),
+                },
+                0,
+            )?;
+        }
+        Ok(())
     }
 
     /// Send one operational command on the commissioned channel. Returns the

@@ -63,6 +63,26 @@ struct MockPhy {
     /// CCA attempts that report busy before the channel clears.
     busy: u32,
     delays: Vec<u32>,
+    /// Answer to each transmitted GPDF with `rxAfterTx`, in order:
+    /// `(start after the end of the GPDF in µs, frame)`; `None` or an
+    /// exhausted list leaves the window empty.
+    replies: Vec<Option<(u32, Vec<u8>)>>,
+    /// Unrelated frames heard first in every rxAfterTx window.
+    rx_noise: Vec<Vec<u8>>,
+    /// The scheduled reply: `(start time, frame)`.
+    timed_rx: Option<(u32, Vec<u8>)>,
+    /// End time of every transmitted GPDF with `rxAfterTx`.
+    rx_after_tx_ends: Vec<u32>,
+    /// Every receive window: `(open, close)`.
+    rx_windows: Vec<(u32, u32)>,
+}
+
+/// Whether `frame` is a GPDF with `rxAfterTx`.
+fn requests_rx_after_tx(frame: &[u8]) -> bool {
+    parse_mac(frame)
+        .ok()
+        .and_then(|mac| parse(&frame[mac.payload_offset..], mac.seq, mac.src_ieee).ok())
+        .is_some_and(|g| g.header.rx_after_tx)
 }
 
 impl RadioPhy for MockPhy {
@@ -79,6 +99,17 @@ impl RadioPhy for MockPhy {
         }
         self.now_us += 1_000;
         self.sent.push((self.channel, frame.to_vec()));
+        if requests_rx_after_tx(frame) {
+            self.rx_after_tx_ends.push(self.now_us);
+            self.pending_rx = self.rx_noise.iter().map(|f| (0xC0, f.clone())).collect();
+            self.timed_rx = if self.replies.is_empty() {
+                None
+            } else {
+                self.replies
+                    .remove(0)
+                    .map(|(offset, f)| (self.now_us + offset, f))
+            };
+        }
         if frame.last() == Some(&0x07) && frame.len() == 8 {
             self.pending_rx = self
                 .beacons
@@ -95,7 +126,18 @@ impl RadioPhy for MockPhy {
     }
 
     async fn receive(&mut self, timeout_us: u32, frame: &mut PhyRxFrame) -> Result<bool, PhyError> {
+        self.rx_windows
+            .push((self.now_us, self.now_us + timeout_us));
         if self.pending_rx.is_empty() {
+            if let Some((at, f)) = self.timed_rx.take() {
+                // The preamble must start inside the window.
+                if (self.now_us..self.now_us + timeout_us).contains(&at) {
+                    // SHR + PHR + PSDU (with FCS) at 32 µs per byte.
+                    self.now_us = at + (6 + f.len() as u32 + 2) * 32;
+                    frame.set(&f, 0xC0)?;
+                    return Ok(true);
+                }
+            }
             self.now_us += timeout_us;
             return Ok(false);
         }
@@ -540,4 +582,252 @@ fn battery_curve_maps_voltage_and_clamped_percentage() {
     assert_eq!(report.battery_half_percent, Some(150));
     assert_eq!(report.temperature_centi_celsius, 2_000);
     assert_eq!(report.humidity_centi_percent, Some(5_000));
+}
+
+#[cfg(feature = "bidirectional")]
+mod bidirectional {
+    use zigbee_gp::commissioning::CommissioningReply;
+    use zigbee_gp::frame::{FrameType, GpdfParams};
+
+    use super::*;
+
+    /// Product-like policy: listen 1 ms early, 4 ms long.
+    const POLICY: BidirectionalPolicy = BidirectionalPolicy {
+        attempts: 3,
+        attempt_gap_ms: 400,
+        rx_open_us: 19_000,
+        rx_window_us: 4_000,
+    };
+
+    /// zigpy's reply: echoes the commissioned level and key type, no key.
+    fn zigpy_reply() -> CommissioningReply {
+        CommissioningReply {
+            pan_id: None,
+            security_level: SecurityLevel::Encrypted,
+            key_type: KeyType::IndividualKey,
+            key: None,
+        }
+    }
+
+    /// Unprotected GPP → GPD Commissioning Reply as a TempMaster proxy
+    /// sends it (zigbee-gp `Proxy::take_downlink`).
+    fn reply_frame(src_id: u32, reply: &CommissioningReply) -> Vec<u8> {
+        let mut payload = [0u8; 40];
+        let n = reply.encode(&mut payload).unwrap();
+        let params = GpdfParams {
+            frame_type: FrameType::Data,
+            auto_commissioning: false,
+            src_id: Some(src_id),
+            security_level: SecurityLevel::None,
+            individual_key: false,
+            rx_after_tx: false,
+            to_gpd: true,
+            frame_counter: 0,
+        };
+        let mut out = [0u8; 64];
+        let len = security::build_gpdf(
+            &mut SoftwareAesProvider,
+            None,
+            &params,
+            0x5A,
+            cmd::COMMISSIONING_REPLY,
+            &payload[..n],
+            &mut out,
+        )
+        .unwrap();
+        out[..len].to_vec()
+    }
+
+    fn gpdfs(phy: &MockPhy) -> Vec<Vec<u8>> {
+        phy.sent
+            .iter()
+            .filter(|(_, f)| f.len() > 8)
+            .map(|(_, f)| f.clone())
+            .collect()
+    }
+
+    fn advertised_counter(frame: &[u8]) -> u32 {
+        let mac = parse_mac(frame).unwrap();
+        let g = parse(&frame[mac.payload_offset..], mac.seq, None).unwrap();
+        assert!(g.header.rx_after_tx);
+        assert_eq!(g.payload[0], cmd::COMMISSIONING);
+        let p = CommissioningPayload::decode(&g.payload[1..]).unwrap();
+        assert!(p.rx_on_capability);
+        p.security.unwrap().outgoing_counter.unwrap()
+    }
+
+    #[test]
+    fn reply_in_the_window_is_confirmed_with_success() {
+        let (d, _) = open(MockPhy::default(), MockFlash::new(), sensor_profile());
+        let src_id = d.record().src_id;
+        let (mut phy, flash) = into_parts(d);
+        // First GPDF unanswered (the proxy has no GP Response yet), the
+        // second one answered at gpdRxOffset after other channel traffic.
+        phy.replies = std::vec![None, Some((20_000, reply_frame(src_id, &zigpy_reply())))];
+        let mut nwk = std::vec![0x41, 0x88, 0x10, 0x62, 0x1A, 0xFF, 0xFF, 0x00, 0x00];
+        nwk.extend_from_slice(&[0x08, 0x00, 0xFD, 0xFF, 0x00, 0x00, 0x1E, 0x10]);
+        phy.rx_noise = std::vec![nwk, reply_frame(src_id ^ 1, &zigpy_reply())];
+        let (mut d, _) = open(phy, flash, sensor_profile());
+
+        block_on(d.commission_bidirectional_on(15, POLICY)).unwrap();
+        assert_eq!(d.record().channel, Some(15));
+
+        let frames = gpdfs(&d.phy);
+        // Two Commissioning GPDFs, then Success repeated tx_repeats times.
+        assert_eq!(frames.len(), 2 + 2);
+        let c0 = advertised_counter(&frames[0]);
+        let c1 = advertised_counter(&frames[1]);
+        assert!(c1 > c0);
+        for f in &frames[2..] {
+            let (fc, clear) = sink_open(f, src_id, &KEY);
+            // zigpy drops a Success whose counter is not above the last
+            // commissioning counter.
+            assert_eq!(fc, c1 + 1);
+            assert_eq!(clear, [cmd::SUCCESS]);
+        }
+        assert_eq!(d.next_frame_counter(), c1 + 2);
+
+        // Every window covers the TempMaster's start time; the second
+        // window was entered only after the noise frames.
+        let ends = d.phy.rx_after_tx_ends.clone();
+        assert_eq!(ends.len(), 2);
+        let first = d.phy.rx_windows[0];
+        assert_eq!(first.0, ends[0] + POLICY.rx_open_us);
+        assert!(first.0 < ends[0] + 20_000 && ends[0] + 20_000 < first.1);
+        assert!(
+            d.phy
+                .rx_windows
+                .iter()
+                .all(|w| w.1 <= ends[0] + POLICY.rx_open_us + POLICY.rx_window_us
+                    || w.0 >= ends[1])
+        );
+    }
+
+    #[test]
+    fn no_reply_leaves_the_gpd_uncommissioned_without_counter_reuse() {
+        let (d, _) = open(MockPhy::default(), MockFlash::new(), sensor_profile());
+        let src_id = d.record().src_id;
+        let (mut phy, flash) = into_parts(d);
+        // A reply after the window closed is not seen.
+        phy.replies = std::vec![
+            None,
+            Some((
+                POLICY.rx_open_us + POLICY.rx_window_us,
+                reply_frame(src_id, &zigpy_reply())
+            )),
+        ];
+        let (mut d, _) = open(phy, flash, sensor_profile());
+        assert_eq!(
+            block_on(d.commission_bidirectional_on(15, POLICY)),
+            Err(GpdError::NoCommissioningReply)
+        );
+        assert_eq!(d.record().channel, None);
+        let frames = gpdfs(&d.phy);
+        assert_eq!(frames.len(), POLICY.attempts as usize);
+        let counters: Vec<u32> = frames.iter().map(|f| advertised_counter(f)).collect();
+        assert!(counters.windows(2).all(|w| w[1] > w[0]));
+        // Attempts are spaced by the policy gap.
+        let ends = &d.phy.rx_after_tx_ends;
+        assert!(
+            ends.windows(2)
+                .all(|w| w[1] - w[0] >= POLICY.attempt_gap_ms * 1000)
+        );
+
+        // A reboot never reuses an advertised counter.
+        let last = *counters.last().unwrap();
+        let (_, flash) = into_parts(d);
+        let (d, provisioning) = open(MockPhy::default(), flash, sensor_profile());
+        assert_eq!(provisioning, Provisioning::Resumed);
+        assert!(d.next_frame_counter() > last);
+    }
+
+    #[test]
+    fn reply_with_another_security_level_is_rejected() {
+        let (d, _) = open(MockPhy::default(), MockFlash::new(), sensor_profile());
+        let src_id = d.record().src_id;
+        let (mut phy, flash) = into_parts(d);
+        let reply = CommissioningReply {
+            security_level: SecurityLevel::FullCounterMic,
+            ..zigpy_reply()
+        };
+        phy.replies = std::vec![Some((20_000, reply_frame(src_id, &reply)))];
+        let (mut d, _) = open(phy, flash, sensor_profile());
+        assert_eq!(
+            block_on(d.commission_bidirectional_on(15, POLICY)),
+            Err(GpdError::CommissioningRejected)
+        );
+        assert_eq!(d.record().channel, None);
+        // No Success was sent.
+        assert_eq!(gpdfs(&d.phy).len(), 1);
+    }
+
+    #[test]
+    fn delivered_key_replaces_the_gpd_key() {
+        const NEW_KEY: AesKey = [0xA5; 16];
+        let (d, _) = open(MockPhy::default(), MockFlash::new(), sensor_profile());
+        let src_id = d.record().src_id;
+        let (mut phy, flash) = into_parts(d);
+        let fc = 0x0102_0304;
+        let w = security::wrap_key(
+            &mut SoftwareAesProvider,
+            &DEFAULT_TC_LINK_KEY,
+            &GpdId::SrcId(src_id),
+            Direction::ToGpd,
+            fc,
+            &NEW_KEY,
+        )
+        .unwrap();
+        let reply = CommissioningReply {
+            key: Some((w.key, Some((u32::from_le_bytes(w.mic), fc)))),
+            ..zigpy_reply()
+        };
+        phy.replies = std::vec![Some((20_000, reply_frame(src_id, &reply)))];
+        let (mut d, _) = open(phy, flash, sensor_profile());
+        block_on(d.commission_bidirectional_on(15, POLICY)).unwrap();
+        assert_eq!(d.record().key, NEW_KEY);
+        let frames = gpdfs(&d.phy);
+        let (_, clear) = sink_open(&frames[1], src_id, &NEW_KEY);
+        assert_eq!(clear, [cmd::SUCCESS]);
+
+        // The key survives a reboot and protects later reports.
+        let (_, flash) = into_parts(d);
+        let (mut d, provisioning) = open(MockPhy::default(), flash, sensor_profile());
+        assert_eq!(provisioning, Provisioning::Resumed);
+        assert_eq!(d.record().key, NEW_KEY);
+        block_on(d.report_environment(EnvironmentReport {
+            temperature_centi_celsius: 2_150,
+            humidity_centi_percent: None,
+            battery_voltage_100mv: None,
+            battery_half_percent: None,
+        }))
+        .unwrap();
+        let frames = gpdfs(&d.phy);
+        sink_open(&frames[0], src_id, &NEW_KEY);
+    }
+
+    #[test]
+    fn invalid_policy_is_rejected() {
+        let (mut d, _) = open(MockPhy::default(), MockFlash::new(), sensor_profile());
+        for policy in [
+            BidirectionalPolicy {
+                attempts: 0,
+                ..POLICY
+            },
+            BidirectionalPolicy {
+                rx_open_us: 20_001,
+                ..POLICY
+            },
+            BidirectionalPolicy {
+                rx_open_us: 15_000,
+                rx_window_us: 5_000,
+                ..POLICY
+            },
+        ] {
+            assert_eq!(
+                block_on(d.commission_bidirectional_on(15, policy)),
+                Err(GpdError::InvalidProfile)
+            );
+        }
+        assert!(d.phy.sent.is_empty());
+    }
 }
