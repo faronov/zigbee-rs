@@ -264,6 +264,7 @@ ieee802154 = [
 ]
 ieee802154-ack-pending = ["ieee802154"]
 ieee802154-tx-when-rx-full = ["ieee802154"]
+ieee802154-rx-timestamp = ["ieee802154"]
 log-04 = [
     "dep:log-04",
     "esp-hal/log-04",

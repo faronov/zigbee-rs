@@ -112,6 +112,19 @@ pub struct RawReceived {
     pub data: [u8; FRAME_SIZE],
     /// Receiver channel
     pub channel: u8,
+    /// `esp_hal::time::Instant` microseconds when RX_DONE was handled
+    /// (`ieee802154-rx-timestamp`): the end of the frame plus the interrupt
+    /// latency.
+    #[cfg(feature = "ieee802154-rx-timestamp")]
+    pub timestamp_us: u64,
+}
+
+#[cfg(feature = "ieee802154-rx-timestamp")]
+#[inline(always)]
+fn rx_timestamp_us() -> u64 {
+    esp_hal::time::Instant::now()
+        .duration_since_epoch()
+        .as_micros()
 }
 
 pub(crate) fn esp_ieee802154_enable<'d>(
@@ -398,6 +411,8 @@ impl super::suspend::Boundary for SleepBoundary<'_> {
             self.0.rx_queue.push_back(RawReceived {
                 data: unsafe { RX_BUFFER },
                 channel: freq_to_channel(freq()),
+                #[cfg(feature = "ieee802154-rx-timestamp")]
+                timestamp_us: rx_timestamp_us(),
             });
             warn!("Radio quiesce veto: RX completed during STOP; automatic ACK may need retry");
         }
@@ -659,6 +674,8 @@ fn zb_mac_handler() {
 
     if events & Event::RxDone != 0 {
         trace!("rx done");
+        #[cfg(feature = "ieee802154-rx-timestamp")]
+        let timestamp_us = rx_timestamp_us();
         // First, before the queue push: the ACK leaves 192 µs after RX_DONE.
         #[cfg(feature = "ieee802154-ack-pending")]
         config_ack_pending_bit();
@@ -673,6 +690,8 @@ fn zb_mac_handler() {
                     let item = RawReceived {
                         data: RX_BUFFER,
                         channel: freq_to_channel(freq()),
+                        #[cfg(feature = "ieee802154-rx-timestamp")]
+                        timestamp_us,
                     };
                     state.rx_queue.push_back(item);
                 } else {

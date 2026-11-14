@@ -40,6 +40,16 @@ em2-debug = []
 # LAB ONLY: the switch sends Off, On, Toggle in turn every 30 s without a
 # button press (unattended sink/event tests). Never a product image.
 lab-switch-cycle = []
+# Bidirectional commissioning: the GPD asks for a Commissioning Reply
+# (rxAfterTx) and confirms it with Success (products/efr32mg22-gpd
+# `BIDIRECTIONAL`). Needs a TempMaster proxy that can send in the rxAfterTx
+# window (an ESP32-H2 router built with `green-power-bidirectional`).
+bidirectional = ["efr32mg22-gpd-product/bidirectional"]
+# LAB ONLY: transmit at the lowest calibrated power (products/efr32mg22-gpd
+# `LAB_TX_POWER_DBM`), so a coordinator on the same bench does not hear the
+# GPD and the sink learns about it only through a proxy. Never a product
+# image.
+lab-tx-power = ["efr32mg22-gpd-product/lab-tx-power"]
 
 [profile.dev]
 opt-level = "s"

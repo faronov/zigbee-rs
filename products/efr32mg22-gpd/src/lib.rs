@@ -117,6 +117,41 @@ pub const SENSOR: GpdProfile = profile(GpdKind::Sensor, 0x33, SENSOR_MODEL_ID, S
 /// On/Off switch (GP DeviceID 0x02 "On/Off Switch").
 pub const SWITCH: GpdProfile = profile(GpdKind::Switch, 0x02, SWITCH_MODEL_ID, SWITCH_COMMANDS);
 
+/// Bidirectional commissioning policy (`bidirectional` feature).
+///
+/// A proxy answers an rxAfterTx Commissioning GPDF only once the sink's
+/// GP Response has come back through the network, so the reply normally
+/// arrives on the second or a later attempt: six attempts 500 ms apart
+/// cover a sink round trip of up to about 2.5 s. The receiver opens 1 ms
+/// before gpdRxOffset (20 ms after the start of the GPDF, GP 1.1.1
+/// A.1.6.3.1) and closes 29 ms after the end of the GPDF: gpMaxTxOffset-
+/// Variation (5 ms) and the GPDF duration as gpdMinRxWindow requires, plus
+/// 4 ms for late TempMasters and the reply itself: in M4 gate 2 an IKEA
+/// router started its reply 27.9 ms after the start (26.1 ms after the
+/// end) of the 1.8 ms Commissioning GPDF and finished it 26.9 ms after the
+/// end. About 12 ms of receive time per attempt, during commissioning only.
+#[cfg(feature = "bidirectional")]
+pub const BIDIRECTIONAL: gpd_app::BidirectionalPolicy = gpd_app::BidirectionalPolicy {
+    attempts: 6,
+    attempt_gap_ms: 500,
+    rx_open_us: 19_000,
+    rx_window_us: 10_000,
+};
+#[cfg(feature = "bidirectional")]
+const _: () = assert!(BIDIRECTIONAL.is_valid());
+
+/// LAB ONLY (`lab-tx-power`): transmit power for proxy tests on a bench
+/// next to the coordinator, in dBm.
+///
+/// The lowest calibrated BRD4183A level (-25 dBm). On the M4 bench the
+/// coordinator heard this GPD at about -89 dBm with the default 0 dBm,
+/// so at -25 dBm it falls well below the coordinator's sensitivity while a
+/// proxy within a few metres still gets a usable link. The sink then only
+/// learns about the GPD through a proxy, which is what proxy and TempMaster
+/// tests need. Never a product image: the range is a few metres.
+#[cfg(feature = "lab-tx-power")]
+pub const LAB_TX_POWER_DBM: i8 = efr32s2_hal::radio::TX_POWER_RANGE_DBM.0;
+
 /// Sensor reporting interval.
 pub const SENSOR_REPORT_INTERVAL_S: u64 = 60;
 /// Button press longer than this recommissions.

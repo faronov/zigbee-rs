@@ -445,7 +445,7 @@ mod proxy {
     use super::*;
     use zigbee_gp::cluster::{client_cmd, server_cmd};
     use zigbee_gp::proxy::{
-        BROADCAST_RX_ON_WHEN_IDLE, D_MIN_MS, DestAddr, GpdfOutcome, Proxy, ProxyConfig, TxFrame,
+        BROADCAST_RX_ON_WHEN_IDLE, D_MIN_U_MS, DestAddr, GpdfOutcome, Proxy, ProxyConfig, TxFrame,
     };
 
     fn gp_command(tx: &zigbee_gp::proxy::GpTx) -> (u8, &[u8]) {
@@ -480,7 +480,7 @@ mod proxy {
             p.on_gpdf(&mut aes, &f, LINK, 1000),
             GpdfOutcome::Notification
         );
-        let tx = p.poll(1000 + D_MIN_MS).unwrap();
+        let tx = p.poll(1000 + D_MIN_U_MS).unwrap();
         assert_eq!(tx.dest, DestAddr::Group(0x0B84));
         // Commissioned-groupcast alias: derived alias, MAC seq − 9
         // (GP 1.1.2 A.3.6.3.3.2).

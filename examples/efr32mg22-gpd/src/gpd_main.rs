@@ -150,6 +150,17 @@ pub async fn run(profile: GpdProfile) -> ! {
         log::error!("[GPD] identity: {error:?}");
         halt()
     });
+    #[cfg(feature = "lab-tx-power")]
+    match device.phy_mut().set_tx_power(product::LAB_TX_POWER_DBM) {
+        Ok(()) => log::warn!(
+            "[GPD] LAB build: TX power {} dBm",
+            product::LAB_TX_POWER_DBM
+        ),
+        Err(error) => {
+            log::error!("[GPD] lab TX power: {error:?}");
+            halt()
+        }
+    }
     let record = *device.record();
     log::info!(
         "[GPD] {provisioning:?} SrcID 0x{:08X} counter {} channel {:?}",
@@ -262,7 +273,12 @@ async fn classify(button: &mut Button0) -> Press {
 async fn commission(device: &mut Device, led: &mut Led0) {
     log::info!("[GPD] commissioning: scanning for a network that permits joining");
     led.on();
+    #[cfg(not(feature = "bidirectional"))]
     let result = device.commission().await;
+    #[cfg(feature = "bidirectional")]
+    let result = device
+        .commission_bidirectional(product::BIDIRECTIONAL)
+        .await;
     led.off();
     match result {
         Ok(network) => log::info!(

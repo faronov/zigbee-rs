@@ -58,6 +58,13 @@ mock = []
 # (unsecured GPDF replay/duplicate counter). Off by default; shipped images
 # are byte-identical without it.
 green-power = []
+# Timed transmission: `RadioPhy::transmit_at` / `MacDriver::transmit_raw_at`
+# and the end-of-frame receive time in `PhyRxFrame`/`MacFrame`. Used by the
+# Green Power TempMaster (gpTxQueue) to answer inside a GPD's rxAfterTx
+# window. Off by default; images without it are unchanged. On ESP32-C6/H2 it
+# time-stamps every received frame in the RX_DONE interrupt
+# (vendor/esp-radio/LOCAL-PATCHES.md).
+timed-tx = ["esp-radio?/ieee802154-rx-timestamp"]
 
 # Platform backends
 esp32c6 = [

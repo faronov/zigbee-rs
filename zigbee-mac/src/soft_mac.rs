@@ -227,7 +227,19 @@ fn phy_error(error: PhyError) -> MacError {
         PhyError::FrameTooLong => MacError::FrameTooLong,
         PhyError::CrcFailed | PhyError::Hardware => MacError::RadioError,
         PhyError::Unsupported => MacError::Unsupported,
+        #[cfg(feature = "timed-tx")]
+        PhyError::Missed => MacError::TransactionExpired,
     }
+}
+
+/// Indication payload carrying the PHY's end-of-frame time (`timed-tx`)
+/// and, with `green-power`, the MAC sequence number.
+#[cfg(feature = "timed-tx")]
+fn timed_payload(payload: &[u8], _sequence: u8, rx_end_us: u32) -> Option<MacFrame> {
+    let frame = MacFrame::from_slice(payload)?.with_rx_end_us(rx_end_us);
+    #[cfg(feature = "green-power")]
+    let frame = frame.with_mac_sequence(_sequence);
+    Some(frame)
 }
 
 fn pib_error(error: PibError) -> MacError {
@@ -1370,10 +1382,12 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             src_address: source,
             dst_address: destination,
             lqi: frame.lqi,
-            #[cfg(not(feature = "green-power"))]
+            #[cfg(not(any(feature = "green-power", feature = "timed-tx")))]
             payload: MacFrame::from_slice(&data[payload_offset..])?,
-            #[cfg(feature = "green-power")]
+            #[cfg(all(feature = "green-power", not(feature = "timed-tx")))]
             payload: MacFrame::from_slice(&data[payload_offset..])?.with_mac_sequence(data[2]),
+            #[cfg(feature = "timed-tx")]
+            payload: timed_payload(&data[payload_offset..], data[2], frame.rx_end_us)?,
             security_use,
         })
     }
@@ -1552,6 +1566,19 @@ macro_rules! soft_mac_driver_common {
             timeout_us: u32,
         ) -> impl Future<Output = Result<McpsDataIndication, MacError>> {
             self.receive_data(timeout_us)
+        }
+
+        #[cfg(feature = "timed-tx")]
+        fn timed_tx_supported(&self) -> bool {
+            P::TIMED_TX
+        }
+
+        #[cfg(feature = "timed-tx")]
+        async fn transmit_raw_at(&mut self, frame: &[u8], at_us: u32) -> Result<(), MacError> {
+            if !P::TIMED_TX {
+                return Err(MacError::Unsupported);
+            }
+            self.phy.transmit_at(frame, at_us).await.map_err(phy_error)
         }
 
         fn capabilities(&self) -> MacCapabilities {
@@ -2224,6 +2251,48 @@ mod tests {
         assert_eq!(indication.payload.as_slice(), [0xCC]);
         assert_eq!(indication.lqi, 180);
         assert_eq!(core.phy().sent_acks.as_slice(), [(0x2A, false)]);
+    }
+
+    /// `timed-tx`: the PHY's end-of-frame time reaches the data indication,
+    /// and [`PhyRxFrame::set`] clears a stale one.
+    #[test]
+    #[cfg(feature = "timed-tx")]
+    fn received_frame_end_time_reaches_the_indication() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        let gpdf = [
+            0x01, 0x08, 0xA7, 0xFF, 0xFF, 0xFF, 0xFF, // MAC header, seq 0xA7
+            0x8C, 0x10, 0x32, 0x54, 0x76, 0x98, 0x20, // NWK FC v3, SrcID, Off
+        ];
+        let mut frame = PhyRxFrame::from_slice(&gpdf, 150).unwrap();
+        assert_eq!(frame.rx_end_us, 0);
+        frame.rx_end_us = 0xDEAD_BEEF;
+        core.phy_mut().rx_frames.push_back(Ok(Some(frame))).unwrap();
+
+        let indication = block_on(core.receive_data(5_000)).unwrap();
+        assert_eq!(indication.payload.rx_end_us(), 0xDEAD_BEEF);
+        #[cfg(feature = "green-power")]
+        assert_eq!(indication.payload.mac_sequence(), 0xA7);
+
+        frame.set(&gpdf, 150).unwrap();
+        assert_eq!(frame.rx_end_us, 0);
+    }
+
+    /// `timed-tx` on a PHY without it: not advertised, and a timed
+    /// transmission is refused without touching the radio. A missed instant
+    /// maps to `TransactionExpired`.
+    #[test]
+    #[cfg(feature = "timed-tx")]
+    fn timed_tx_is_refused_by_a_phy_without_it() {
+        let mut core = core();
+        assert!(!core.timed_tx_supported());
+        assert_eq!(
+            block_on(core.transmit_raw_at(&[0x01, 0x08, 0x00], 1_000)),
+            Err(MacError::Unsupported)
+        );
+        assert_eq!(core.phy().tx_attempts, 0);
+        assert_eq!(phy_error(PhyError::Missed), MacError::TransactionExpired);
     }
 
     /// A Green Power data frame (GP 1.1 A.1.4.1: MAC FC 0x0801 — data,

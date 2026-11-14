@@ -500,6 +500,10 @@ pub struct MacFrame {
     /// as the replay/duplicate counter of unsecured GPDFs (GP 1.1 A.3.6.1.3).
     #[cfg(feature = "green-power")]
     mac_sequence: u8,
+    /// End-of-frame receive time of a PHY with timed transmission
+    /// (`timed-tx`), see [`crate::PhyRxFrame::rx_end_us`].
+    #[cfg(feature = "timed-tx")]
+    rx_end_us: u32,
 }
 
 impl MacFrame {
@@ -509,7 +513,24 @@ impl MacFrame {
             len: 0,
             #[cfg(feature = "green-power")]
             mac_sequence: 0,
+            #[cfg(feature = "timed-tx")]
+            rx_end_us: 0,
         }
+    }
+
+    /// [`crate::PlatformServices::monotonic_micros`] at the end of the
+    /// received frame; 0 when the PHY does not time-stamp frames
+    /// (`timed-tx`).
+    #[cfg(feature = "timed-tx")]
+    pub fn rx_end_us(&self) -> u32 {
+        self.rx_end_us
+    }
+
+    /// Record the end-of-frame receive time (`timed-tx`).
+    #[cfg(feature = "timed-tx")]
+    pub fn with_rx_end_us(mut self, rx_end_us: u32) -> Self {
+        self.rx_end_us = rx_end_us;
+        self
     }
 
     /// MAC sequence number of the received frame (0 when the producer did

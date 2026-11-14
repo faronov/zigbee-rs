@@ -14706,9 +14706,19 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
 
         // Green Power data frames (NWK protocol version 3) bypass the Zigbee
         // NWK layer, which only speaks protocol version 2.
-        #[cfg(feature = "green-power")]
+        #[cfg(all(feature = "green-power", not(feature = "green-power-bidirectional")))]
         if zigbee_gp::frame::is_gpdf(mac_payload) {
             self.gp_receive_gpdf(indication);
+            return None;
+        }
+        // A bidirectional GPD listens gpTxOffset after this GPDF; the
+        // TempMaster reply goes out from here, before any other work of the
+        // event loop (persistence, reporting) can delay it.
+        #[cfg(feature = "green-power-bidirectional")]
+        if zigbee_gp::frame::is_gpdf(mac_payload) {
+            if let Some(downlink) = self.gp_receive_gpdf_bidirectional(indication) {
+                self.gp_send_downlink(downlink).await;
+            }
             return None;
         }
 
@@ -16469,6 +16479,143 @@ mod parent_router_tests {
             .unwrap(),
             security_use: false,
         }
+    }
+
+    /// GP TempMaster end to end (`green-power-bidirectional`): the sink's GP
+    /// Response appoints this router TempMaster for a bidirectional GPD
+    /// (zigpy sends a Commissioning Reply this way); the GPD's next rxAfterTx
+    /// Commissioning GPDF triggers the queued GPDF, transmitted with timed
+    /// TX gpTxOffset (20 ms) after the end of the received frame, once.
+    #[cfg(feature = "green-power-bidirectional")]
+    #[test]
+    fn gp_tempmaster_answers_rx_after_tx_at_the_tx_offset() {
+        use zigbee_aps::ApsTxOptions;
+        use zigbee_aps::apsde::ApsdeDataRequest;
+        use zigbee_aps::{ApsAddress, ApsAddressMode};
+        use zigbee_gp::cluster::{Response, client_cmd};
+        use zigbee_gp::types::GpdId;
+
+        const SRC: u32 = 0x1234_5678;
+        // Commissioning Reply options: none of PAN ID / key / ... present.
+        const REPLY: [u8; 1] = [0x00];
+        // Unprotected Data GPDF, NWK FC extension, rxAfterTx, SrcID,
+        // Commissioning (0xE0): device 0x02, options RxOnCapability.
+        const COMMISSIONING: [u8; 9] = [0x8C, 0x40, 0x78, 0x56, 0x34, 0x12, 0xE0, 0x02, 0x02];
+        const RX_END_US: u32 = 4_000_000;
+
+        // One sink for the whole test: its NWK frame counter must advance.
+        let mut sink = centralized_coordinator();
+        let mut gp_response = |temp_master: u16| {
+            let channel = 15;
+            let response = Response {
+                gpd_id: GpdId::SrcId(SRC),
+                transmit_on_endpoint_match: false,
+                temp_master_short: temp_master,
+                temp_master_tx_channel: channel - 11,
+                command_id: 0xF0,
+                payload: &REPLY,
+            };
+            let mut zcl = [0u8; 64];
+            zcl[..3].copy_from_slice(&[0x19, 0x43, client_cmd::RESPONSE]);
+            let len = 3 + response.encode(&mut zcl[3..]).unwrap();
+            block_on(
+                sink.bdb
+                    .zdo_mut()
+                    .aps_mut()
+                    .apsde_data_request(&ApsdeDataRequest {
+                        dst_addr_mode: ApsAddressMode::Short,
+                        dst_address: ApsAddress::Short(ShortAddress(0xFFFD)),
+                        dst_endpoint: 242,
+                        profile_id: 0xA1E0,
+                        cluster_id: 0x0021,
+                        src_endpoint: 242,
+                        payload: &zcl[..len],
+                        tx_options: ApsTxOptions {
+                            use_nwk_key: true,
+                            ..ApsTxOptions::default()
+                        },
+                        radius: 0,
+                        alias_src_addr: None,
+                        alias_seq: None,
+                    }),
+            )
+            .unwrap();
+            McpsDataIndication {
+                src_address: MacAddress::Short(PAN, ShortAddress::COORDINATOR),
+                dst_address: MacAddress::Short(PAN, ShortAddress(0xFFFF)),
+                lqi: 200,
+                payload: MacFrame::from_slice(
+                    sink.mac().tx_history().last().unwrap().payload.as_slice(),
+                )
+                .unwrap(),
+                security_use: false,
+            }
+        };
+        // A joined router's NIB carries the channel of its PIB.
+        let joined_router = || {
+            let mut router = centralized_router();
+            router.bdb.zdo_mut().nwk_mut().nib_mut().logical_channel = 15;
+            router
+        };
+        let gpdf = |mac_seq: u8| McpsDataIndication {
+            src_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+            dst_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+            lqi: 180,
+            payload: MacFrame::from_slice(&COMMISSIONING)
+                .unwrap()
+                .with_mac_sequence(mac_seq)
+                .with_rx_end_us(RX_END_US),
+            security_use: false,
+        };
+
+        // Without timed TX the proxy is unidirectional: the Response is
+        // refused and nothing is sent into the window.
+        let mut router = joined_router();
+        router.mac_mut().set_time_micros(RX_END_US + 900);
+        let response = gp_response(ROUTER.0);
+        assert!(block_on(router.process_incoming(&response, &mut [])).is_none());
+        assert!(block_on(router.process_incoming(&gpdf(1), &mut [])).is_none());
+        assert!(!router.gp_proxy().bidirectional());
+
+        let mut router = joined_router();
+        router.mac_mut().set_timed_tx(true);
+        router.mac_mut().set_time_micros(RX_END_US + 900);
+        // A Response appointing another proxy queues nothing.
+        let other = gp_response(0x4A76);
+        assert!(block_on(router.process_incoming(&other, &mut [])).is_none());
+        assert!(block_on(router.process_incoming(&gpdf(1), &mut [])).is_none());
+        assert!(router.mac().timed_tx_history().is_empty());
+
+        let response = gp_response(ROUTER.0);
+        assert!(block_on(router.process_incoming(&response, &mut [])).is_none());
+        assert!(router.gp_proxy().bidirectional());
+        router.mac_mut().set_time_micros(RX_END_US + 900);
+        assert!(block_on(router.process_incoming(&gpdf(2), &mut [])).is_none());
+        let sent = router.mac().timed_tx_history();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].at_us, RX_END_US + 20_000);
+        // MAC: data, short broadcast destination, no source, no ACK request.
+        assert_eq!(&sent[0].frame[..2], &[0x01, 0x08]);
+        assert_eq!(&sent[0].frame[3..7], &[0xFF; 4]);
+        let reply = zigbee_gp::frame::parse(&sent[0].frame[7..], sent[0].frame[2], None).unwrap();
+        assert!(reply.header.to_gpd);
+        assert!(!reply.header.rx_after_tx);
+        assert_eq!(reply.header.gpd_id, Some(GpdId::SrcId(SRC)));
+        assert_eq!(reply.clear_command_id(), Some(0xF0));
+        assert_eq!(&sent[0].frame[sent[0].frame.len() - REPLY.len()..], &REPLY);
+
+        // The queued GPDF is sent once; the next window gets nothing.
+        router.mac_mut().set_time_micros(RX_END_US + 900);
+        assert!(block_on(router.process_incoming(&gpdf(3), &mut [])).is_none());
+        assert_eq!(router.mac().timed_tx_history().len(), 1);
+
+        // A missed instant is reported by the MAC and not retried.
+        let response = gp_response(ROUTER.0);
+        assert!(block_on(router.process_incoming(&response, &mut [])).is_none());
+        router.mac_mut().set_timed_tx(false);
+        router.mac_mut().set_time_micros(RX_END_US + 900);
+        assert!(block_on(router.process_incoming(&gpdf(4), &mut [])).is_none());
+        assert_eq!(router.mac().timed_tx_history().len(), 1);
     }
 
     /// GP Proxy Basic end to end: a sink's GP Pairing arrives over the

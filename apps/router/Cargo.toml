@@ -22,6 +22,8 @@ rejoin-request = []
 # persists its Proxy Table through the store given to
 # `set_green_power_store`. Off by default: images without it are unchanged.
 green-power = ["router", "zigbee-runtime/green-power"]
+# GP TempMaster (bidirectional proxy). Needs a MAC with `timed-tx`.
+green-power-bidirectional = ["green-power", "zigbee-runtime/green-power-bidirectional"]
 
 [dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }

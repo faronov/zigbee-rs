@@ -61,8 +61,15 @@ pub const MAX_ENTRY_ENCODED_LEN: usize = 2
     + 1
     + 1
     + MAX_UNICAST_SINKS * 10;
-/// Dmin of the tunnelling delay (A.3.6.3.1), ms.
-pub const D_MIN_MS: u32 = 15;
+/// Dmin_u of the tunnelling delay for a GPDF with `RxAfterTx` cleared
+/// (GP 1.1.1 A.3.6.3.1), ms.
+pub const D_MIN_U_MS: u32 = 5;
+/// Dmin_b of the tunnelling delay for a GPDF with `RxAfterTx` set (GP 1.1.1
+/// A.3.6.3.1), ms. It keeps every proxy's forward out of the GPD's receive
+/// window, which opens `gpTxOffset` (20 ms) after the GPDF.
+pub const D_MIN_B_MS: u32 = 32;
+/// QualityBasedDelay per Link quality step below Excellent (A.3.6.3.1), ms.
+pub const QUALITY_STEP_MS: u32 = 32;
 /// Dmax of the tunnelling delay (A.3.6.3.1), ms.
 pub const D_MAX_MS: u32 = 100;
 /// Default commissioning window, s (gpsCommissioningWindow default).
@@ -79,9 +86,17 @@ pub const GP_TX_QUEUE_LEN: usize = 5;
 pub const MAX_DOWNLINK_PAYLOAD: usize = 32;
 /// Default gpTxQueueEntryLifetime, ms.
 pub const DEFAULT_TX_QUEUE_LIFETIME_MS: u32 = 10_000;
-/// gpTxOffset (A.1.5.2.1.2): a queued GPDF is sent this long after the
-/// start of the triggering GPDF, in µs.
-pub const GP_TX_OFFSET_US: u32 = 5_000;
+/// gpTxOffset: a queued GPDF starts (first preamble symbol) this long after
+/// the *end* of the triggering GPDF, in µs. GP 1.1.1 measures gpTxOffset
+/// (20 ms) from the *start* of the triggering GPDF and allows
+/// gpMaxTxOffsetVariation (5 ms) on top (A.1.5.2.1.2/3); counting from the
+/// end adds the GPDF duration (at most 4.3 ms for a 127-byte PSDU), so the
+/// reply starts 20.2 to 24.3 ms after the start, inside that window, and a
+/// GPD that listens for gpdMinRxWindow (5 ms + the GPDF duration,
+/// A.1.6.3.2) from 20 ms after the start receives it. Reference stacks
+/// agree: ZBOSS `ZB_GPD_RX_OFFSET_MS` 20, EmberZNet `GP_RX_OFFSET_USEC`
+/// 20500 from the RX time stamp. Default of [`ProxyConfig::tx_offset_us`].
+pub const GP_TX_OFFSET_US: u32 = 20_000;
 
 /// Default [`ProxyConfig::counter_persist_stride`].
 pub const DEFAULT_COUNTER_PERSIST_STRIDE: u32 = 64;
@@ -107,6 +122,10 @@ pub struct ProxyConfig {
     /// gpTxQueueEntryLifetime of a GPDF queued by a GP Response, ms
     /// (bidirectional proxies only).
     pub tx_queue_lifetime_ms: u32,
+    /// Start of a GPDF sent from the gpTxQueue, in µs after the end of the
+    /// GPDF that opened the GPD's receive window ([`GP_TX_OFFSET_US`]).
+    #[cfg(feature = "proxy-bidirectional")]
+    pub tx_offset_us: u32,
 }
 
 impl Default for ProxyConfig {
@@ -115,6 +134,8 @@ impl Default for ProxyConfig {
             default_commissioning_window_s: DEFAULT_COMMISSIONING_WINDOW_S,
             counter_persist_stride: DEFAULT_COUNTER_PERSIST_STRIDE,
             tx_queue_lifetime_ms: DEFAULT_TX_QUEUE_LIFETIME_MS,
+            #[cfg(feature = "proxy-bidirectional")]
+            tx_offset_us: GP_TX_OFFSET_US,
         }
     }
 }
@@ -634,23 +655,27 @@ fn due(now: u32, deadline: u32) -> bool {
     now.wrapping_sub(deadline) < 0x8000_0000
 }
 
-/// gppTunnelingDelay (A.3.6.3.1) for a GPDF received with `link`.
+/// gppTunnelingDelay (GP 1.1.1 A.3.6.3.1) for a GPDF received with `link`.
 ///
-/// The distance `d` (0 = adjacent .. Dmax = edge of range) is
-/// approximated from the RSSI part of the GPP-GPD link byte.
-pub fn tunneling_delay_ms(first_to_forward: bool, no_route: bool, link: GppGpdLink) -> u32 {
+/// `Dmin` is [`D_MIN_B_MS`] when the GPDF had `RxAfterTx` set, otherwise
+/// [`D_MIN_U_MS`]. `shortest` (FirstToForward of a full unicast entry, or
+/// the TempMaster) gives `Dmin`; `no_route` gives `Dmin + Dmax`; otherwise
+/// `Dmin` plus [`QUALITY_STEP_MS`] per Link quality step below Excellent
+/// (0, 32, 64 or 96 ms).
+pub fn tunneling_delay_ms(
+    rx_after_tx: bool,
+    shortest: bool,
+    no_route: bool,
+    link: GppGpdLink,
+) -> u32 {
+    let d_min = if rx_after_tx { D_MIN_B_MS } else { D_MIN_U_MS };
     if no_route {
-        return D_MIN_MS + D_MAX_MS;
+        return d_min + D_MAX_MS;
     }
-    if first_to_forward {
-        return D_MIN_MS;
+    if shortest {
+        return d_min;
     }
-    let rssi = (link.0 & 0x3F) as u64; // 0 (-110 dBm) .. 59 (+8 dBm)
-    let d = D_MAX_MS as u64 - (rssi.min(59) * D_MAX_MS as u64) / 59;
-    let x = D_MAX_MS as u64 - d;
-    let x6 = x.pow(6);
-    let full = (D_MAX_MS as u64).pow(6);
-    (85 * (full - x6) / full) as u32 + D_MIN_MS
+    d_min + (3 - u32::from(link.link_quality())) * QUALITY_STEP_MS
 }
 
 impl<const N: usize, const Q: usize> Proxy<N, Q> {
@@ -722,8 +747,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     }
 
     /// Declare whether the platform can transmit a queued GPDF at
-    /// [`GP_TX_OFFSET_US`] after the start of a received GPDF, without
-    /// CSMA/CA. Without it the proxy stays unidirectional: it does not
+    /// [`ProxyConfig::tx_offset_us`] after the end of a received GPDF,
+    /// without CSMA/CA. Without it the proxy stays unidirectional: it does not
     /// advertise bidirectional operation and rejects GP Responses that
     /// appoint it TempMaster.
     #[cfg(feature = "proxy-bidirectional")]
@@ -1184,10 +1209,14 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         if dests.is_empty() {
             return Ok(());
         }
+        // FirstToForward only counts for full unicast (A.3.6.3.1); a
+        // TempMaster always uses the shortest delay (A.3.9.1 step 12).
         let delay = if full_unicast || h.rx_after_tx {
-            tunneling_delay_ms(e.first_to_forward, false, link)
+            let shortest =
+                (full_unicast && e.first_to_forward) || self.is_temp_master_for(&e.gpd_id);
+            tunneling_delay_ms(h.rx_after_tx, shortest, false, link)
         } else {
-            D_MIN_MS
+            D_MIN_U_MS
         };
         let origin = Some((e.gpd_id, n.frame_counter));
         self.schedule(Pending {
@@ -1292,9 +1321,9 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             radius: 0,
         });
         let delay = if h.rx_after_tx {
-            tunneling_delay_ms(self.is_temp_master_for(gpd), false, link)
+            tunneling_delay_ms(true, self.is_temp_master_for(gpd), false, link)
         } else {
-            D_MIN_MS
+            D_MIN_U_MS
         };
         match self.schedule(Pending {
             due_ms: now_ms.wrapping_add(delay),
@@ -1620,8 +1649,9 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     /// When the GPDF opens a receive window (`rxAfterTx`, or a Channel
     /// Request) and the gpTxQueue holds a GPDF for its GPD, the queued GPDF
     /// is built into `out` (MAC frame without FCS) and removed from the
-    /// queue; the caller transmits it [`GP_TX_OFFSET_US`] after the start of
-    /// the received GPDF, without CSMA/CA and without a MAC ACK request.
+    /// queue; the caller starts it [`ProxyConfig::tx_offset_us`] after the
+    /// end of the received GPDF, without CSMA/CA and without a MAC ACK
+    /// request.
     ///
     /// The reply uses the security parameters of the triggering GPDF: a
     /// protected trigger must pass the Proxy Table entry's MIC and
@@ -1787,14 +1817,26 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         if src_nwk == self.own_nwk {
             return None;
         }
-        let (gpd, counter, rx_after_tx, other) = match command_id {
+        let (gpd, counter, rx_after_tx, other_usable, other) = match command_id {
             server_cmd::NOTIFICATION => match Notification::decode(payload) {
-                Ok(n) => (n.gpd_id, n.frame_counter, n.rx_after_tx, n.proxy_info),
+                Ok(n) => (
+                    n.gpd_id,
+                    n.frame_counter,
+                    n.rx_after_tx,
+                    n.bidirectional_cap & !n.tx_queue_full,
+                    n.proxy_info,
+                ),
                 Err(_) => return None,
             },
             server_cmd::COMMISSIONING_NOTIFICATION => {
                 match CommissioningNotification::decode(payload) {
-                    Ok(n) => (n.gpd_id, n.frame_counter, n.rx_after_tx, n.proxy_info),
+                    Ok(n) => (
+                        n.gpd_id,
+                        n.frame_counter,
+                        n.rx_after_tx,
+                        n.bidirectional_cap,
+                        n.proxy_info,
+                    ),
                     Err(_) => return None,
                 }
             }
@@ -1808,6 +1850,10 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             if !p.rx_after_tx {
                 return true;
             }
+            // A forwarder unable to queue the reply must not pre-empt us.
+            if !other_usable {
+                return false;
+            }
             let (other_short, other_link) = match other {
                 ProxyInfo::Link { gpp_short, link } => (gpp_short, link),
                 ProxyInfo::Distance {
@@ -1818,9 +1864,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             };
             let ours = (p.link.link_quality(), p.link.0 & 0x3F);
             let theirs = (other_link.link_quality(), other_link.0 & 0x3F);
-            // Keep ours only if we are strictly better, or equal with the
-            // lower short address.
-            !(ours > theirs || (ours == theirs && own < other_short))
+            theirs > ours || (theirs == ours && other_short <= own)
         })
     }
 
@@ -1861,7 +1905,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 alias: Some((nwk, 0)),
                 radius: 0,
             });
-            let delay = D_MIN_MS + random % (D_MAX_MS - D_MIN_MS + 1);
+            let delay = D_MIN_U_MS + random % (D_MAX_MS - D_MIN_U_MS + 1);
             let _ = self.schedule(Pending {
                 due_ms: now_ms.wrapping_add(delay),
                 origin: None,
@@ -2026,8 +2070,8 @@ mod tests {
         let f = parse(&L3_SHARED, 0x20, None).unwrap();
         let out = p.on_gpdf(&mut aes, &f, GppGpdLink(0xC0 | 40), 1000);
         assert_eq!(out, GpdfOutcome::Notification);
-        assert!(p.poll(1000 + D_MIN_MS - 1).is_none());
-        let tx = p.poll(1000 + D_MIN_MS).unwrap();
+        assert!(p.poll(1000 + D_MIN_U_MS - 1).is_none());
+        let tx = p.poll(1000 + D_MIN_U_MS).unwrap();
         assert_eq!(tx.dest, DestAddr::Group(0x0B84));
         assert_eq!(tx.alias, Some((0x4321, 0x20u8.wrapping_sub(9))));
         let TxFrame::GpCommand {
@@ -2120,7 +2164,7 @@ mod tests {
             p.on_gpdf(&mut aes, &f, GppGpdLink(0xC0 | 30), 10),
             GpdfOutcome::CommissioningNotification
         );
-        let tx = p.poll(10 + D_MIN_MS).unwrap();
+        let tx = p.poll(10 + D_MIN_U_MS).unwrap();
         assert_eq!(tx.dest, DestAddr::Broadcast(0xFFFD));
         assert_eq!(tx.alias, Some((0x5678, 7u8.wrapping_sub(12))));
         let TxFrame::GpCommand { payload, .. } = tx.frame else {
@@ -2342,6 +2386,16 @@ mod tests {
 
     /// Another proxy's GP Notification of SRC's frame `fc`.
     fn others_notification(fc: u32, rx_after_tx: bool, info: ProxyInfo) -> heapless::Vec<u8, 48> {
+        others_notification_bidi(fc, rx_after_tx, rx_after_tx, false, info)
+    }
+
+    fn others_notification_bidi(
+        fc: u32,
+        rx_after_tx: bool,
+        bidi: bool,
+        queue_full: bool,
+        info: ProxyInfo,
+    ) -> heapless::Vec<u8, 48> {
         let n = Notification {
             gpd_id: GpdId::SrcId(SRC),
             also_unicast: false,
@@ -2350,8 +2404,8 @@ mod tests {
             security_level: SecurityLevel::Encrypted,
             key_type: KeyType::GpdGroupKey,
             rx_after_tx,
-            tx_queue_full: false,
-            bidirectional_cap: false,
+            tx_queue_full: queue_full,
+            bidirectional_cap: bidi,
             frame_counter: fc,
             command_id: cmd::OFF,
             payload: Some(&[]),
@@ -2427,7 +2481,30 @@ mod tests {
             p.on_server_command(0x0001, notify, &others_notification(2, true, worse)),
             None
         );
-        // A better one does.
+        // Nor does a better one that cannot act as TempMaster (GP 1.1.1
+        // A.3.5.2.1).
+        let better = ProxyInfo::Link {
+            gpp_short: 0x4321,
+            link: GppGpdLink(0xC0 | 40),
+        };
+        assert_eq!(
+            p.on_server_command(
+                0x4321,
+                notify,
+                &others_notification_bidi(2, true, false, false, better)
+            ),
+            None
+        );
+        // A proxy with a full queue cannot accept the sink's response.
+        assert_eq!(
+            p.on_server_command(
+                0x4321,
+                notify,
+                &others_notification_bidi(2, true, true, true, better)
+            ),
+            None
+        );
+        // A better bidirectional one does.
         let better = ProxyInfo::Link {
             gpp_short: 0x4321,
             link: GppGpdLink(0xC0 | 40),
@@ -2444,6 +2521,30 @@ mod tests {
                 cancelled: 1
             }
         );
+    }
+
+    #[test]
+    fn rx_after_tx_equal_link_prefers_lower_short_address() {
+        for (other_short, cancelled) in [(0x0001, true), (0x4321, false)] {
+            let mut p = paired_proxy(1);
+            let raw = secure_off(2, true);
+            let frame = parse(&raw, 2, None).unwrap();
+            let link = GppGpdLink(0x80 | 30);
+            p.on_gpdf(&mut SoftwareAesProvider, &frame, link, 0);
+            let info = ProxyInfo::Link {
+                gpp_short: other_short,
+                link,
+            };
+            assert_eq!(
+                p.on_server_command(
+                    other_short,
+                    server_cmd::NOTIFICATION,
+                    &others_notification(2, true, info)
+                )
+                .is_some(),
+                cancelled
+            );
+        }
     }
 
     fn pair(p: &mut P, pairing: &[u8]) -> CommandEffects {
@@ -2746,7 +2847,7 @@ mod tests {
         let mut p = paired_proxy(0);
         p.on_device_annce(0x4321, [1, 2, 3, 4, 5, 6, 7, 8], 0, 1000);
         let deadline = p.next_deadline().unwrap();
-        assert!((D_MIN_MS..=D_MAX_MS).contains(&deadline));
+        assert!((D_MIN_U_MS..=D_MAX_MS).contains(&deadline));
         let tx = p.poll(deadline).unwrap();
         assert_eq!(tx.frame, TxFrame::DeviceAnnce { alias: 0x4321 });
         assert_eq!(tx.alias, Some((0x4321, 0)));
@@ -2779,17 +2880,50 @@ mod tests {
     }
 
     #[test]
-    fn tunneling_delay_bounds() {
-        assert_eq!(tunneling_delay_ms(true, false, GppGpdLink(0)), D_MIN_MS);
+    fn tunneling_delay_follows_gp_1_1_1() {
+        // A.3.6.3.1: Dmin_u / Dmin_b by RxAfterTx, 32 ms per Link quality
+        // step below Excellent; RSSI does not enter the delay.
+        for rssi in [0u8, 40, 59] {
+            assert_eq!(
+                tunneling_delay_ms(false, false, false, GppGpdLink(0xC0 | rssi)),
+                5
+            );
+            assert_eq!(
+                tunneling_delay_ms(false, false, false, GppGpdLink(0x80 | rssi)),
+                37
+            );
+            assert_eq!(
+                tunneling_delay_ms(false, false, false, GppGpdLink(0x40 | rssi)),
+                69
+            );
+            assert_eq!(
+                tunneling_delay_ms(false, false, false, GppGpdLink(rssi)),
+                101
+            );
+            assert_eq!(
+                tunneling_delay_ms(true, false, false, GppGpdLink(0xC0 | rssi)),
+                32
+            );
+            assert_eq!(
+                tunneling_delay_ms(true, false, false, GppGpdLink(rssi)),
+                128
+            );
+        }
         assert_eq!(
-            tunneling_delay_ms(false, true, GppGpdLink(0)),
-            D_MIN_MS + D_MAX_MS
+            tunneling_delay_ms(false, true, false, GppGpdLink(0)),
+            D_MIN_U_MS
         );
-        assert_eq!(tunneling_delay_ms(false, false, GppGpdLink(59)), D_MIN_MS);
         assert_eq!(
-            tunneling_delay_ms(false, false, GppGpdLink(0)),
-            D_MIN_MS + 85
+            tunneling_delay_ms(true, true, false, GppGpdLink(0)),
+            D_MIN_B_MS
         );
+        assert_eq!(
+            tunneling_delay_ms(true, false, true, GppGpdLink(0xC0)),
+            D_MIN_B_MS + D_MAX_MS
+        );
+        // Every rxAfterTx forward starts after the GPD's receive window
+        // opens at gpTxOffset.
+        const { assert!(D_MIN_B_MS > GP_TX_OFFSET_US / 1000) };
     }
 
     #[cfg(feature = "proxy-bidirectional")]

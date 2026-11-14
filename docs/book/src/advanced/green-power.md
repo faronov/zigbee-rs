@@ -6,8 +6,13 @@
 > Proxy Basic is lab-tested on the ESP32-H2-Zero router against ZHA
 > (2026-11-12, see §6.1). Since 2026-11-13 the Proxy Basic is on by
 > default in every router build (§2, §4.1); only the ESP32-H2-Zero router
-> is hardware-tested.** Bidirectional operation, the full
-> proxy and Combo/Sink are still design only. Spec
+> is hardware-tested.** Bidirectional commissioning (M4: ESP32-H2
+> TempMaster with timed TX, MG22 GPD with `rxAfterTx`) is implemented
+> opt-in. The H2's reply timing and the MG22's bidirectional commissioning
+> into ZHA are lab-tested on hardware, but through a third-party
+> TempMaster (IKEA), not through our proxy. M4 hardware gate 2 was
+> accepted as partial on 2026-11-14 (gate 1 + gate 2b, §6.7, §6.9). The full proxy and Combo/Sink
+> are still design only. Spec
 > references are to GP 1.0a (docs-09-5499-26) and GP 1.1 where noted.
 
 ## 0. Implementation status
@@ -27,7 +32,10 @@
 | `products/efr32mg22-gpd` + `examples/efr32mg22-gpd` (bins `efr32mg22-gpd-sensor`, `efr32mg22-gpd-switch`) | sensor lab-tested on hardware (2026-11-11) | BRD4183A, direct to the ZHA sink (no proxy): TRNG key, L3 commissioning on channel 15, reports every 60.09 s decrypted by ZHA, counter resumed at 16 after reset (was 9) and accepted, EM2 floor ~8 µA, ~11 µA mean between reports, ~0.21 mC per report incl. LED/VCOM. Switch lab-tested the same day with a separate SrcID (0x7A6B9879) and journal: commissioned, Off/On/Toggle events in HA every 30 s (`lab-switch-cycle` build), counter resumed at 16 after reset and accepted. Re-flashing the sensor resumed its own SrcID (counter 80) and ZHA accepted it. Battery reporting (IADC0 AVDD, 331f8ea) lab-tested on hardware 2026-11-13: 3355 mV → 34 × 100 mV, 200 half-% (WSTK 3.3 V); HA shows 3.4 V / 100 % (§6.4) |
 | ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity entities; battery voltage/percentage entities (331f8ea) deployed 2026-11-13 and showing 3.4 V / 100 %; switch event entity with `off`/`on`/`toggle` |
 | Default-on in every router (`router` = `router-core` + `green-power`) with a product-owned Proxy Table partition: ESP32-C6/H2 (`zbnv` 0x3F8000), nRF52840 (0xF8000), nRF52833 (0x78000), EFR32MG21 (0x70000), ZBT-1 (0xF0000), STM32WB5MM-DK (0x080CF000), BL702 (0xF7000), TLSR8258 (0x6E000), mock-light (RAM store) | implemented | every image builds and passes its layout and stack gates; product host tests with and without `green-power`; hardware: ESP32-H2-Zero forwarding (§6); ZBT-1 `zrs-boot` boots with the proxy running, empty table, no forwarding observed (§4.1). The other targets compile only |
-| Bidirectional GPD, full proxy, Combo/Sink | not started | — |
+| Timed-TX capability (`zigbee-mac/timed-tx`): `RadioPhy::TIMED_TX` / `transmit_at`, `PhyRxFrame::rx_end_us`, `PhyError::Missed`, `MacDriver::timed_tx_supported` / `transmit_raw_at`; ESP backend with an RX_DONE timestamp (vendored esp-radio `ieee802154-rx-timestamp`) | implemented, opt-in | host tests (SoftMac timed payload, mock timed TX); ESP32-H2 lab-tested on air 2026-11-14: reply preamble 19,998–20,007 µs after the end of the GPDF in 4 of 5, 20,222 µs in 1, after calibrating `TIMED_TX_START_LEAD_US` to 425 µs (§6.8). ESP32-C6 not measured |
+| TempMaster (`zigbee-runtime/green-power-bidirectional`, router `green-power-bidirectional`): proxy advertises bidirectional only when the MAC has timed TX, sends a queued GP Response GPDF `tx_offset_us` (20 ms) after the end of the triggering GPDF, no CSMA, no ACK | implemented, opt-in (not in any default image) | end-to-end host test: GP Response from the sink → rxAfterTx GPDF → Commissioning Reply scheduled at RX end + 20 ms. Lab-tested on the H2-Zero 2026-11-14 with an injected GPD (radio-lab): forwarded first (+41 ms), appointed TempMaster by zigpy, 10 of 11 Commissioning Replies sent on time, 1 reported `Missed` (§6.8). **Not yet with a real bidirectional GPD** |
+| GPD bidirectional mode (`gpd-app/bidirectional`, MG22 example feature `bidirectional`, product `BIDIRECTIONAL` policy) | implemented, opt-in | host tests: reply in the window → Success and channel persisted; replies at both edges of the spec window (20 ms and 25 ms + GPDF airtime after the GPDF start) and at the measured IKEA offset received; no reply → stays uncommissioned without counter reuse; wrong security level rejected; delivered key replaces the GPD key; invalid policy rejected. Lab-tested on hardware 2026-11-14 (182b358, `lab-tx-power` build): commissioned into ZHA through IKEA 0x43FD as TempMaster, Success accepted, reports in HA, Resumed after reset with channel and counter (§6.9). **Not yet through our proxy** |
+| Full proxy, Combo/Sink | not started | — |
 
 Implementation notes that differ from the design below:
 
@@ -202,7 +210,7 @@ panic `Location` line/column fields); §4.1 records the proof.
 
 | Layer | Feature (`zigbee-gp` / `zigbee-runtime` / `router-app`) | Contents |
 |---|---|---|
-| (a) Proxy Basic | `proxy-basic` / `green-power-proxy` / `green-power` | dGP stub (version-3 demux, GPDF codec, security processing for proxy-table entries), proxy table plus journal, duplicate filter, commissioning mode, Commissioning Notification, Notification in derived/pre-commissioned groupcast and lightweight unicast, Pairing, Proxy Commissioning Mode, Proxy Table Request/Response, gppFunctionality attributes, LQI-based tunnelling delay. Unidirectional only. |
+| (a) Proxy Basic | `proxy-basic` / `green-power-proxy` / `green-power` | dGP stub (version-3 demux, GPDF codec, security processing for proxy-table entries), proxy table plus journal, duplicate filter, commissioning mode, Commissioning Notification, Notification in derived/pre-commissioned groupcast and lightweight unicast, Pairing, Proxy Commissioning Mode, Proxy Table Request/Response, gppFunctionality attributes, GP 1.1.1 tunnelling delay (A.3.6.3.1). Unidirectional only. |
 | (a+) Basic with bidirectional commissioning | `proxy-bidir-commissioning` | gpTxQueue (≥ 5 entries, one per GPD), GP Response handling in the TempMaster role, timed transmission on the operational channel, Commissioning Reply. *(verify 1.1: possibly mandatory for Basic)* |
 | (b) Full proxy | `proxy-full` (implies the above) | Bidirectional operation (any GPDF from the queue, including in operational mode), Channel Request/Configuration with a temporary channel switch, full unicast, every key type (incl. NWK-key-derived and group key) and security levels 1/2/3, IEEE ApplicationID 2 with endpoint, all Notification options |
 | (c) Combo / Sink | `sink` (implies `proxy-full`) | GP server on GPEP: sink table plus journal, sink commissioning mode (local button or Sink Commissioning Mode command), direct GPDF reception, Notification handling, Pairing generation, translation table (GPD command → local ZCL command on an application endpoint), Sink Table Request/Response, Translation Table commands |
@@ -258,23 +266,31 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
     source/sequence, so several proxies' copies collapse.
   - Address-conflict detection must not treat frames sourced from an alias
     as a conflict *(test item)*.
-- **Timed TX (bidirectional only):** GP needs the queued GPDF to go out
-  without CSMA, gpTxOffset = 5 ms after the *start* of the GPD's frame. The
-  GPD listens for at least gpdMinRxWindow = 0.576 ms. The current `RadioPhy`
-  has no RX timestamp and no scheduled TX, so add an optional capability:
-  - `PhyCapabilities::timed_tx`;
-  - an `rx_sfd_timestamp` in `PhyRxFrame`;
-  - `transmit_at(frame, t)`.
+- **Timed TX (bidirectional only):** the TempMaster sends the queued GPDF
+  without CSMA/CA and without an ACK request, starting gpTxOffset after
+  the *end* of the GPDF that carried `rxAfterTx`. GP 1.1 sets this to
+  20 ms (GP 1.0 had 5 ms); ZBOSS (`ZB_GPD_RX_OFFSET_MS` 20) and EmberZNet
+  (`GP_RX_OFFSET_USEC` 20500 from the RX time stamp) agree. The GPD
+  listens for at least gpdMinRxWindow = 0.576 ms. Implemented in M4 as an
+  optional capability behind `zigbee-mac/timed-tx`:
+  - `RadioPhy::TIMED_TX` (associated const, default `false`) and
+    `RadioPhy::transmit_at(frame, start_us)`;
+  - `PhyRxFrame::rx_end_us` / `MacFrame::rx_end_us()`: end of the
+    received frame on the `PlatformServices::monotonic_micros` clock;
+  - `MacDriver::timed_tx_supported()` and `transmit_raw_at()`;
+  - `PhyError::Missed` when the instant has passed or is too far ahead.
 
-  A backend without it must return `Unsupported`. The proxy then clears the
-  bidirectional bits in gppFunctionality and Commissioning Notification and
-  never claims support it lacks. Expected mechanisms (all unverified):
+  A backend without it returns `Unsupported`. The runtime asks
+  `timed_tx_supported()` before every GPDF; without it the proxy clears
+  the bidirectional bits in gppFunctionality and Commissioning
+  Notification and rejects a GP Response that appoints it TempMaster, so
+  it never claims support it lacks. Mechanisms:
 
   | Platform | Expected mechanism |
   |---|---|
   | nRF52840 | RADIO + TIMER/PPI |
   | EFR32 | RAIL scheduled TX |
-  | ESP32-C6/H2 | `ieee802154` transmit_at |
+  | ESP32-C6/H2 | **implemented (M4), built for ESP32-H2 only:** RX_DONE timestamp in the vendored esp-radio, then a timer wait plus a short spin before `transmit_raw`; start lead `TIMED_TX_START_LEAD_US` (150 µs, to be calibrated on air) |
   | TLSR8258 | system-tick stamp plus busy-wait |
   | BL702, PHY62x2 | unknown |
 
@@ -302,10 +318,19 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
    - *Response:* if TempMaster is this node, queue the frame in gpTxQueue on
      the given channel;
    - *Proxy Table Request:* answer from the table.
-4. On the first transmission the proxy may defer, using the LQI-based
-   tunnelling delay (Dmin 15 ms … Dmax 100 ms). Its own pending Notification
-   is cancelled if an identical one from another proxy is heard first
-   (A.3.5.2.1). `Proxy::forward_stats()` counts forwards sent and cancelled,
+4. On the first transmission the proxy defers by the GP 1.1.1 tunnelling
+   delay (A.3.6.3.1): Dmin_u = 5 ms (rxAfterTx = 0) or Dmin_b = 32 ms
+   (rxAfterTx = 1), plus (3 − Link quality) × 32 ms. The TempMaster for the
+   GPD and, in full unicast, a FirstToForward entry use the shortest delay;
+   the v1.0a distance formula (Dmin 15 ms, up to ~100 ms for most links) is
+   no longer used. Link quality is banded from RSSI (≥ −70 dBm Excellent,
+   ≥ −85 High, ≥ −95 Moderate, else Poor), which matches what commercial
+   proxies report on air (§6.8). A pending Notification is cancelled if an
+   identical one from another proxy is heard first (A.3.5.2.1); for
+   rxAfterTx frames only if that proxy is bidirectional-capable, its TX queue
+   is not full when reported, and it has a better link (or an equal link and
+   a lower address). Commissioning Notifications do not report the TX-queue
+   state. `Proxy::forward_stats()` counts forwards sent and cancelled,
    and the runtime logs each cancellation at debug level.
 5. Commissioning mode transitions are reported as `CommissioningEvent`
    (entered with its window, replaced by a new enter from the same sink, or
@@ -729,9 +754,70 @@ SEDs, every `router-core`) are byte-identical. The GP routers grow:
 The `.bss` growth is the cached base (per-entry counters and the append
 offset).
 
+### 4.3 Measured: bidirectional commissioning, opt-in (2026-11-14)
+
+Not enabled in any default image. Release builds of the M4 branch:
+
+| Image | `.text` | `.rodata` | `.data` | `.bss` | Flash | RAM |
+|---|---:|---:|---:|---:|---:|---:|
+| ESP32-H2-Zero router: `router,waveshare-h2-zero,green-power-bidirectional` vs `router,waveshare-h2-zero` | +6,278 B | +292 B | −24 B | +432 B | +6,546 B | +408 B |
+| MG22 GPD (sensor and switch): `bidirectional` vs default | +3,900 B | +464 B | 0 | 0 | +4,364 B | 0 |
+| MG22 GPD sensor, start-referenced receive window (182b358) vs 07db74a: `bidirectional` / `bidirectional,lab-tx-power` | | | | | +24 B (46,676 / 46,996 B file) | 0 |
+
+The default MG22 sensor and switch (42,288 B) are unchanged by 182b358
+except for 28 `core::panic::Location` line fields in `apps/gpd`.
+`lab-tx-power` (07db74a, never in a default image) sets the radio to
+−25 dBm (+320 B over `bidirectional`).
+
+The router's stack use with the feature was not measured; the queued
+GPDF (`GpDownlink`, about 60 B) is held on the receive path until it is
+sent.
+
+Feature-off identity (master e8c8060 against the M4 diff, both built in
+the same checkout path): ESP32-H2 router and `router-core`, ESP32-H2-Zero
+router, MG22 GPD sensor and switch and ZBT-1 `zrs-boot` router differ
+only in `core::panic::Location` line fields of edited files; every other
+section is byte-identical.
+
+### 4.4 Measured: GP 1.1.1 tunnelling delay and Link-quality bands (2026-11-14)
+
+This change is in the default-on proxy. Release builds, before against
+after, in the same checkout path (flash = code + rodata + data):
+
+| Image | Flash | RAM |
+|---|---:|---:|
+| ESP32-H2-Zero router `router,waveshare-h2-zero` | −78 B | 0 |
+| ESP32-H2-Zero router `+green-power-bidirectional` | +12 B | 0 |
+| ZBT-1 `router,zrs-boot` | −52 B | 0 |
+| Nucleo-WB55 router (default) | −64 B | 0 |
+| MG22 GPD sensor (default) | byte-identical | 0 |
+
+The follow-up TX-queue suppression and timed-TX deadline checks were also
+measured in the same checkout path against the preceding M4 build.
+`llvm-size` reports:
+
+| Image | `text` delta | `data` / `bss` delta |
+|---|---:|---:|
+| ESP32-C6 router | −4 B | 0 / 0 |
+| ESP32-H2-Zero router | −4 B | 0 / 0 |
+| ESP32-H2-Zero router `+green-power-bidirectional` | 0 | 0 / 0 |
+| nRF52833 / nRF52840 router | −4 / −4 B | 0 / 0 |
+| EFR32MG21 router | −4 B | 0 / 0 |
+| ZBT-1 `router,zrs-boot` | −4 B | 0 / 0 |
+| Nucleo-WB55 router (default) | −4 B | 0 / 0 |
+| WB55 USB dongle router | −4 B | 0 / 0 |
+| STM32WB5MM-DK router (default) | 0 | 0 / 0 |
+| BL702 router | 0 | 0 / 0 |
+| TLSR8258 router | −24 B | 0 / 0 |
+
+The GP-off H2 `router-core` image has the same section sizes as the
+previously saved build; its only byte differences are 11
+`core::panic::Location` line numbers in `radio_phy.rs`.
+
 ## 5. Risks
 
-1. **The 5 ms timed TX** on soft-MAC PHYs. Without it, bidirectional must be
+1. **The timed TX** (20 ms after the end of the GPDF, GP 1.1) on
+   soft-MAC PHYs; implemented for the ESP radio only (§3.1). Without it, bidirectional must be
    reported as unsupported. If GP 1.1 makes bidirectional commissioning
    mandatory for Basic, a PHY without timed TX is not compliant.
 2. **Channel switching** for Channel Configuration (full proxy). The router
@@ -749,7 +835,8 @@ offset).
    host tests.
 6. **No real 802.15.4 sniffer** (hwlab only has `fake/radio0`). Timing
    claims for gpTxOffset and RX windows cannot be verified independently
-   until a sniffer exists. The GPD↔proxy path can only be inferred from
+   until a sniffer exists. *(Resolved 2026-11-14: the nRF52840 radio lab
+   captures and injects on air, §6.6.)* The GPD↔proxy path can only be inferred from
    counters.
 7. **The GP 1.1 Basic spec text is missing.** The mandatory feature set and
    gppFunctionality are partly from memory or other stacks.
@@ -1178,6 +1265,225 @@ Results:
   frames. The FCS the radio appended matched the original capture
   (`6a7c`).
 
+### 6.7 M4 bidirectional commissioning (2026-11-14, host only)
+
+Design:
+
+- **Proxy (TempMaster).** The sink's GP Response (Commissioning Reply,
+  from zigpy after an rxAfterTx Commissioning Notification) is queued in
+  the gpTxQueue as before. When the GPD's next GPDF with `rxAfterTx`
+  arrives, `gp_receive_gpdf_bidirectional` builds the queued GPDF
+  before the proxy advances the GPD's counter and returns it with the
+  start instant `rx_end_us + tx_offset_us`; the runtime sends it with
+  `transmit_raw_at` (next macDSN, no CSMA, no ACK) and logs
+  `[GP] TempMaster GPDF sent` or the error (`Missed`).
+- **GPD.** `commission_bidirectional[_on]` sends Commissioning with
+  `rxAfterTx` and RxOnCapability, opens the receiver `rx_open_us` after
+  the *start* of the frame (gpdRxOffset, A.1.6.3.1) and closes it
+  `rx_window_us` after `rx_open_us` measured from the *end* of the frame
+  (gpdMinRxWindow includes the GPDF duration, A.1.6.3.2); the policy must
+  open by gpTxOffset (20 ms) and stay open past gpTxOffset +
+  gpMaxTxOffsetVariation (25 ms). It repeats up to `attempts`
+  times `attempt_gap_ms` apart. zigpy answers the *first* rxAfterTx
+  Commissioning through the network, so the proxy can deliver the reply
+  only on a later one. A reply must match the profile's security level
+  and key type; a delivered key is unwrapped, persisted and replaces the
+  GPD key. Success is then sent protected and the channel persisted.
+  Without a reply the GPD stays uncommissioned; its counter keeps
+  advancing through the journal as for any other frame.
+- **MG22 policy** (`products/efr32mg22-gpd::BIDIRECTIONAL`): 6 attempts,
+  500 ms apart, receiver from 19 ms after the start to 29 ms after the
+  end of the GPDF (until 182b358: 19–23 ms after the end, which missed
+  replies at the start of the spec window and the IKEA TempMaster, §6.9);
+  checked at compile time.
+- **zigpy 2.4.1:** the Commissioning Reply echoes the security level and
+  key type and carries no key and no PAN ID; Success through a proxy
+  arrives as a Commissioning Notification with `security_failed` and the
+  MIC, which zigpy decrypts with the pending device's key; its counter
+  must exceed the commissioning counter.
+
+Validation reached: host tests (`zigbee-mac` timed TX, `zigbee-runtime`
+`gp_tempmaster_answers_rx_after_tx_at_the_tx_offset`, `gpd-app`
+`bidirectional`), clippy on the ESP32-H2 and MG22 images, feature-off
+identity (§4.3).
+
+Open hardware gates:
+
+1. ~~On-air offset of the H2-Zero's Commissioning Reply after an injected
+   rxAfterTx GPDF (radio-lab capture timestamps), and calibration of
+   `TIMED_TX_START_LEAD_US`.~~ Done 2026-11-14 (§6.8).
+2. Full bidirectional commissioning of the MG22 GPD into ZHA through the
+   H2-Zero, with the coordinator and other proxies unable to answer.
+   *Partial, accepted 2026-11-14 (§6.9): the H2's reply timing on air
+   (gate 1) plus the MG22 commissioned into ZHA through IKEA 0x43FD as
+   TempMaster (gate 2b). Commissioning through our H2 as TempMaster is
+   not hardware-proven; no relocation retest is planned.*
+3. ~~Reports after commissioning and a GPD reset (counter and key
+   retained).~~ Done 2026-11-14 (§6.9).
+
+### 6.8 M4 on air: the TempMaster race (2026-11-14)
+
+Setup: H2-Zero (0x07A3) app-only flashed with the
+`green-power-bidirectional` image of 30d8f74 (joined state and proxy table
+kept); the nRF52840 radio-lab dongle injects an rxAfterTx Commissioning
+GPDF (test SrcID 0x7E57B1D1, RxOnCapability) on channel 15 during
+a ZHA permit-join and captures the air. Decoded with the network key.
+
+Findings with the 30d8f74 proxy:
+
+- **−40 dBm injection.** The H2 entered proxy commissioning mode and
+  tunnelled a Commissioning Notification with the bidirectional bit and
+  its own NWK address, but at +109 ms. IKEA VINDSTYRKA 0xD586 (not
+  bidirectional) forwarded at +70 ms. zigpy appointed 0xD586 as
+  TempMaster, so the H2 (correctly) dropped its queued reply.
+- **0 dBm injection.** The coordinator heard the GPDF directly; zigpy sent
+  one GP Response with TempMaster 0x0000 at +43 ms and another naming
+  ZBT-1 0x4A76; the H2 forwarded at +106 ms.
+
+Causes:
+
+1. Our delay used the GP 1.0a distance formula (Dmin 15 ms) with an LQI
+   from a linear RSSI curve, which gave ~95–100 ms for almost any link.
+   GP 1.1.1 A.3.6.3.1 uses Dmin_b = 32 ms for rxAfterTx plus 32 ms per
+   Link-quality step. Fixed (§3.2 step 4, §4.4).
+2. Link quality was the LQI quartile (Excellent only at ≥ −40 dBm).
+   Commercial proxies on this network report: IKEA −60/−50 dBm → 3,
+   −82 → 2, −86 → 1; Tuya −96…−88 → 2. Now banded from RSSI.
+3. A cancellation by an rxAfterTx duplicate now requires that the other
+   forwarder be bidirectional-capable with a better link (A.3.5.2.1).
+4. **zigpy 2.4.1 does not elect a TempMaster** (A.3.6.2.3: within Dmax,
+   among bidirectional-capable candidates, by best link). It takes the
+   `gpp_short_addr` of the first Commissioning Notification, or itself if
+   the coordinator heard the GPDF directly (`zgp/manager.py`). A
+   unidirectional proxy that forwards first therefore wins, and the
+   coordinator always wins when the GPD is in its range. Bidirectional
+   commissioning through our proxy needs the GPD out of the coordinator's
+   range and our proxy to forward first. Fixed upstream in zigpy PR
+   #1970 (open, not deployed in HA; §6.9).
+5. VINDSTYRKA forwarded at ~70 ms even at −86 dBm / LQ 1, i.e. not by the
+   1.1.1 formula; the H2 adds ~10 ms of processing to its computed delay.
+
+**After the fix (86d2c24, same setup, −20 dBm injection; the H2 reports
+RSSI −56 dBm, Link quality 3).** The H2 forwards first in every cycle,
+41–42 ms after the GPDF (32 ms Dmin_b + ~10 ms processing); zigpy
+appoints 0x07A3 as TempMaster; the H2 queues the GP Response and answers
+the next rxAfterTx GPDF with a Commissioning Reply GPDF (15 B, NWK FC
+0x8C, ext FC 0x80, command 0xF0, options 0x00 as zigpy echoes level 0).
+
+Offset of the reply (radio-lab stamps the end of the SFD, so TX start
+after the end of the trigger = ΔSFD − 19 × 32 µs − 160 µs; target
+gpTxOffset 20,000 µs):
+
+| `TIMED_TX_START_LEAD_US` | Samples | TX start after GPDF end |
+|---|---:|---|
+| 150 (initial estimate) | 5 | 20,273–20,280 µs (mean 20,275) |
+| 425 (calibrated) | 5 | 19,998, 20,004, 19,999, 20,007, 20,222 µs |
+
+One further cycle with the 150 µs build logged
+`TempMaster GPDF not sent: TransactionExpired` (`PhyError::Missed`): the
+GPDF arrived while the H2 was relaying a broadcast NWK_addr_req and was
+handled more than 20.3 ms after its end, so the frame was not sent late.
+The stall source is not yet identified. Each of the 11 triggered cycles
+otherwise logged `TempMaster GPDF sent (15 B)`.
+
+The follow-up deadline check runs before the first radio attempt and every
+retry after `Busy`; host regressions cover a late first attempt, an expired
+retry, the inclusive boundary, clock wrap and other radio errors. With that
+change on the H2 (app SHA-256 `4db51a0c…6771d72`, app-only flash after a
+verified full backup), the same nRF injection produced four replies at
+19,984–20,015 µs after the GPDF end (hwlab session
+`2026-11-14T212013Z-m4-deadline-regression`). This is still a software
+deadline: an interrupt or driver delay between the final check and radio
+start can make a frame late; the test does not prove a hard bound.
+
+Not yet changed (minor deviations): a proxy without bidirectional
+capability should send rxAfterTx Commissioning Notifications with the
+derived alias, but ours uses its own address; and a unidirectional
+groupcast proxy "SHALL NOT drop" its own forward, but ours cancels on a
+duplicate when rxAfterTx = 0 (M1 behaviour).
+
+### 6.9 M4 gates 2 and 3: MG22 bidirectional GPD into ZHA (2026-11-14)
+
+Setup: MG22 BRD4183A flashed with the `bidirectional,lab-tx-power`
+sensor (SrcID 0x293C9879, L3, key type 4). The MG22 cannot be moved away
+from the coordinator, so the lab build transmits at −25 dBm (07db74a,
+never in a default image). At that power the coordinator no longer hears
+the MG22 directly; IKEA 0x43FD hears it at about −86 dBm (Link quality 1),
+ZBT-1 0x4A76 earlier, and the H2-Zero only at about −90 dBm (Link
+quality 0). The H2 runs the `green-power-bidirectional` image; nRF52840
+radio-lab captures channel 15.
+
+**Attempt 1 (PB0, receive window 19–23 ms after the GPDF end).** zigpy
+appointed the first notifier, IKEA 0x43FD, as TempMaster (the H2
+forwarded at ~111 ms, last). IKEA's Commissioning Reply started 27.93 ms
+after the start of the GPDF, outside the GPD's window, so the GPD ended
+with `NoCommissioningReply`. The failed long-press recommissioning also
+left the GPD with no channel, so it stopped reporting until the next
+successful commissioning.
+
+**Window fix (182b358).** GP 1.1.1 measures gpdRxOffset and gpTxOffset
+from the *start* of the GPDF (A.1.5.2.1.2, A.1.6.3.1), and a TempMaster
+may start up to gpMaxTxOffsetVariation = 5 ms late. gpdMinRxWindow
+therefore includes that 5 ms plus the GPDF duration (A.1.6.3.2). The GPD
+measured from the end and closed after 4 ms, which missed spec-conformant
+replies at 20–21.8 ms after the start and IKEA's late replies. The
+receiver now opens 19 ms after the start and closes 29 ms after the end
+(≈ 30.8 ms after the start for the 48 B Commissioning GPDF). IKEA's late
+replies are outside the spec; the GPD accepts them only because the window
+was widened. Our proxy's reply (20 ms after the end ≈ 21.8 ms after the
+start) is inside the spec window and unchanged.
+
+**Attempt 2 (jlink reset with permit join open; an uncommissioned GPD
+commissions at boot).** zigpy again chose IKEA 0x43FD. IKEA sent the
+Commissioning Reply (MPDU 15 B, options 0x98: level 3, key type 4, no
+key) 25.25 ms after the start of the second Commissioning GPDF. The GPD
+accepted it and sent Success (fc 4434) 27.3 ms after that GPDF and logged
+`commissioned on channel 15` 3.3 s after boot. zigpy logged `Sent GP
+Pairing` and `GP device commissioned`.
+
+**Lost reports after commissioning: a zigpy bug.** The proxies forwarded
+the second Commissioning GPDF 70–130 ms late (0x4A76, 0x07A3), after the
+Success. zigpy's `_process_commissioning` created a new pending device
+from it and sent another Response. While permit join stays open,
+`gp_packet_received` sends GPDFs to the pending device, so reports fc
+4435–4439 never reached the ZHA entities. From fc 4440, after permit join
+closed, the entities updated (25.85 °C, 50.5 %). zigpy should ignore a
+Commissioning GPDF from a GPD it just paired with the same key and an
+outgoing counter below the registered one. This is to be fixed upstream
+together with the TempMaster election. BGT1 0x0CC35D9F's repeated
+commissioning (M6) may be related.
+
+**Gate 3 (jlink reset of the commissioned GPD, no permit join).** The GPD
+logged `Resumed SrcID 0x293C9879 counter 4448 channel Some(15)`; the last
+pre-reset report was fc ≤ 4442, so the journal skipped ahead. It reported
+at once and every 60 s. ZHA accepted fc 4448 and fc 4449 (humidity
+entity updated at 19:53:40 and 19:54:40 UTC; device `last_seen` current).
+The proxies, including the H2, kept forwarding.
+
+**Our proxy as TempMaster: not proven, gate 2 accepted as partial.** zigpy appoints the first
+notifier. A spec-conformant election (A.3.6.2.3: the bidirectional-capable
+candidate with the best link) would also choose IKEA (−86 dBm) over the H2
+(−90 dBm) at this placement. The H2's ZHA signature lacks endpoint 242,
+so a manual GP Response through ZHA's cluster-command service is not
+possible either. Gate 2 through our proxy needs the H2-Zero closer to
+the MG22 (Link quality ≥ 2, forwarded within ~64 ms). On 2026-11-14
+the user accepted gate 1 + gate 2b as the M4 gate-2 evidence, with no
+relocation retest.
+
+**zigpy fix upstream.** [zigpy PR #1970](https://github.com/zigpy/zigpy/pull/1970)
+(branch `faronov:gp-tempmaster-election`) addresses both findings:
+- it elects the TempMaster per A.3.6.2.3 within Dmax (100 ms): bidirectional
+  proxies with room in gpTxQueue first, then the best link, then the lowest
+  address;
+- it ignores a Commissioning GPDF whose outgoing counter is below the last
+  accepted frame counter for the same key.
+
+The PR adds zigpy unit tests. It is open and not deployed in the user's HA.
+
+**M5 note.** After an H2 reboot, the proxy drops up to 63 frames per GPD
+(`counter_persist_stride` 64, skip-ahead on restore). Consider persisting
+more often or using a smaller window in M5.
+
 ## 7. Open questions for the user
 
 1. GPD identity: reuse manufacturer 0x6D6B (as on FlowerX GP and BGT1 GP)
@@ -1210,6 +1516,11 @@ Results:
    unidirectional with `GpTableJournal`, on the TLSR8258 router.
 4. Timed-TX PHY capability: gpTxQueue and bidirectional commissioning,
    first on the platform where it can be proven. GPD bidirectional mode.
+   *(M4: implemented opt-in on ESP32-H2 and MG22, host-tested; H2 reply
+   timing and MG22 commissioning into ZHA (third-party TempMaster),
+   reset and reports lab-tested; gate 2 accepted as partial (gate 1 +
+   gate 2b), our proxy as TempMaster for a real GPD not proven; zigpy
+   PR #1970 open, §6.9.)*
 5. Full proxy (channel switch, unicast modes, key types, IEEE ApplicationID).
 6. Combo/Sink with translation table.
 
