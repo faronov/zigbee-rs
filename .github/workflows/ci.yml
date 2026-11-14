@@ -92,6 +92,9 @@ jobs:
       - run: cargo test -p zigbee-gp --all-features --locked
       - run: cargo test -p zigbee-gp --no-default-features --locked
       - run: cargo test -p gpd-app --locked
+      - run: cargo test -p gpd-app --features bidirectional --locked
+      # Timed TX (GP rxAfterTx replies) through SoftMac and the mock MAC.
+      - run: cargo test -p zigbee-mac --features timed-tx,green-power,mock --lib --locked
       # Do not combine these with --workspace/--all-features: unification hid
       # missing mandatory TCLK features in both production frontends.
       - run: cargo test -p router-app --no-default-features --test production_graph --locked
@@ -254,6 +257,10 @@ jobs:
             manifest: products/efr32mg22-gpd/Cargo.toml
             workspace: products/efr32mg22-gpd
             features: ""
+          - name: EFR32MG22 Green Power Device product (bidirectional)
+            manifest: products/efr32mg22-gpd/Cargo.toml
+            workspace: products/efr32mg22-gpd
+            features: bidirectional
           - name: Home Assistant Connect ZBT-1 product
             manifest: products/ha-connect-zbt1/Cargo.toml
             workspace: products/ha-connect-zbt1
@@ -430,6 +437,8 @@ jobs:
       - run: cargo clippy -p zigbee-gp --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-gp --all-targets --no-default-features --locked -- -D warnings
       - run: cargo clippy -p gpd-app --all-targets --locked -- -D warnings
+      - run: cargo clippy -p gpd-app --all-targets --features bidirectional --locked -- -D warnings
+      - run: cargo clippy -p zigbee-mac --all-targets --features timed-tx,green-power,mock --locked -- -D warnings
       - run: cargo clippy -p zigbee-runtime --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zdo --features router --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --features stm32wb --all-targets --locked -- -D warnings
@@ -1387,6 +1396,12 @@ jobs:
             --no-default-features --features router,waveshare-h2-zero
           cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/h2-zero \
             --no-default-features --features router,waveshare-h2-zero,status-led-selftest -- -D warnings
+          # Opt-in bidirectional GP proxy (timed TX into the GPD's rxAfterTx
+          # window); not part of the default router.
+          cargo build --release --locked -Z build-std=core,alloc --target-dir target/h2-bidi \
+            --no-default-features --features router,waveshare-h2-zero,green-power-bidirectional
+          cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/h2-bidi \
+            --no-default-features --features router,waveshare-h2-zero,green-power-bidirectional -- -D warnings
           DIR=target/riscv32imac-unknown-none-elf/release
           LED_DIR=target/status-led/riscv32imac-unknown-none-elf/release
           CSV=../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv
@@ -2468,6 +2483,14 @@ jobs:
           for image in efr32mg22-gpd-sensor efr32mg22-gpd-switch; do
             python3 ../efr32mg22-sensor/tools/verify-layout.py --flash-end 0x70000 \
               "target/thumbv8m.main-none-eabihf/release/$image"
+          done
+          # Opt-in bidirectional commissioning (rxAfterTx, Commissioning Reply).
+          cargo build --release --locked --bins --features bidirectional --target-dir target/bidi
+          cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+            --features bidirectional --target-dir target/bidi -- -D warnings
+          for image in efr32mg22-gpd-sensor efr32mg22-gpd-switch; do
+            python3 ../efr32mg22-sensor/tools/verify-layout.py --flash-end 0x70000 \
+              "target/bidi/thumbv8m.main-none-eabihf/release/$image"
           done
       - name: Create firmware artifacts
         run: |
