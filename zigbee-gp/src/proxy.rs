@@ -387,6 +387,27 @@ impl ProxyEntry {
         }
         Ok((e, buf.len() - r.remaining()))
     }
+
+    /// Locate the GPD ID bytes and the 4-byte frame counter (when present)
+    /// in an entry produced by [`encode`](Self::encode), without decoding
+    /// the rest, so storage can update a counter in place.
+    pub fn encoded_layout(buf: &[u8]) -> Result<(core::ops::Range<usize>, Option<usize>)> {
+        let mut r = Reader::new(buf);
+        let o = r.u16()?;
+        let id_len = match ApplicationId::from_bits(o as u8)? {
+            ApplicationId::SrcId => 4,
+            ApplicationId::Ieee => 9,
+            ApplicationId::Lped => return Err(Error::Unsupported),
+        };
+        let id = 2..2 + id_len;
+        let sec_use = o & (1 << 14) != 0;
+        let at = id.end + if o & (1 << 13) != 0 { 2 } else { 0 } + if sec_use { 17 } else { 0 };
+        let counter = (sec_use || o & (1 << 5) != 0).then_some(at);
+        if buf.len() < counter.map_or(at, |c| c + 4) {
+            return Err(Error::Truncated);
+        }
+        Ok((id, counter))
+    }
 }
 
 /// Destination address of a proxy transmission.
@@ -2644,6 +2665,45 @@ mod tests {
         pair(&mut p, &b[..n]);
         assert!(p.take_dirty(), "removal");
         assert!(p.entries().is_empty());
+    }
+
+    #[test]
+    fn encoded_layout_locates_id_and_counter() {
+        let mut buf = [0u8; MAX_ENTRY_ENCODED_LEN];
+        let mut e = ProxyEntry::new(GpdId::Ieee {
+            ieee: [1, 2, 3, 4, 5, 6, 7, 8],
+            endpoint: 9,
+        });
+        e.assigned_alias = Some(0x1234);
+        e.security_level = SecurityLevel::Encrypted;
+        e.key_type = KeyType::IndividualKey;
+        e.key = Some([0xA5; 16]);
+        e.frame_counter = 0xDEAD_BEEF;
+        e.derived_group = true;
+        let n = e.encode(&mut buf).unwrap();
+        let (id, counter) = ProxyEntry::encoded_layout(&buf[..n]).unwrap();
+        assert_eq!(&buf[id], &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let c = counter.unwrap();
+        assert_eq!(buf[c..c + 4], 0xDEAD_BEEFu32.to_le_bytes());
+        assert_eq!(
+            ProxyEntry::encoded_layout(&buf[..c + 3]),
+            Err(Error::Truncated)
+        );
+
+        // Unsecured, no MAC sequence capability: no counter.
+        let mut plain = ProxyEntry::new(GpdId::SrcId(0x0102_0304));
+        plain.derived_group = true;
+        let n = plain.encode(&mut buf).unwrap();
+        let (id, counter) = ProxyEntry::encoded_layout(&buf[..n]).unwrap();
+        assert_eq!(buf[id], 0x0102_0304u32.to_le_bytes());
+        assert_eq!(counter, None);
+
+        // Unsecured with incremental MAC sequence: counter present.
+        plain.mac_seq_cap = true;
+        plain.frame_counter = 77;
+        let n = plain.encode(&mut buf).unwrap();
+        let c = ProxyEntry::encoded_layout(&buf[..n]).unwrap().1.unwrap();
+        assert_eq!(buf[c..c + 4], 77u32.to_le_bytes());
     }
 
     #[test]
