@@ -5,10 +5,11 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
 
-# SRAM-resident CPU1 helper that drives the STM32WB coprocessor FUS for a
-# board without a debug probe (P-NUCLEO-WB55 USB dongle, MB1293C). It is
-# loaded and started by the ROM USB DFU bootloader (hwlab stm32dfu plugin:
-# memory-write + leave); see README.md. Not firmware: it never touches flash.
+# Flash-resident CPU1 sequencer that drives the STM32WB coprocessor FUS
+# (FUS upgrade, stack delete, MAC install) on a board without a debug probe
+# (P-NUCLEO-WB55 USB dongle, MB1293C), one step per boot. Programmed at
+# 0x08000000 over the ROM USB DFU bootloader (hwlab stm32dfu plugin); it only
+# writes its own log page. See README.md.
 [workspace]
 
 [dependencies]

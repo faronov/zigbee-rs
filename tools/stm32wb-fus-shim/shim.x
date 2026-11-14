@@ -1,37 +1,34 @@
-/* The whole helper runs from SRAM1. The ROM DFU bootloader keeps its own
- * data below 0x20004000 and hwlab only writes [0x20004000, 0x20030000).
- * SRAM2a (0x20030000) holds the coprocessor mailbox and is never part of
- * the image. There is no .data/.bss: all state is on the stack or in the
- * fixed parameter/result block, so no startup copy runs before interrupts
- * are masked. */
+/* Flash-resident sequencer: the vector table and code at the start of the
+ * user flash (the ROM DFU bootloader programs it there), the stack at the
+ * top of SRAM1. SRAM2a (0x20030000) holds the coprocessor mailbox and is
+ * never part of the image. There is no .data/.bss: all state is on the
+ * stack or in the flash log page, so no startup copy runs. */
 MEMORY
 {
-  IMAGE  : ORIGIN = 0x20008000, LENGTH = 0x8000
-  STACK  : ORIGIN = 0x20010000, LENGTH = 0x1F000
-  /* 0x2002F000: parameter block (host -> shim), 0x2002F100: results. */
+  FLASH : ORIGIN = 0x08000000, LENGTH = 0x2000
+  RAM   : ORIGIN = 0x20004000, LENGTH = 0x2C000
 }
 
-ENTRY(shim_reset);
+ENTRY(seq_reset);
 
 SECTIONS
 {
-  .vector_table ORIGIN(IMAGE) :
+  .vector_table ORIGIN(FLASH) :
   {
     KEEP(*(.vector_table));
-  } > IMAGE
+  } > FLASH
 
   .text :
   {
     *(.text .text.*);
     *(.rodata .rodata.*);
-  } > IMAGE
+  } > FLASH
 
-  .data : { *(.data .data.*); } > IMAGE
-  .bss (NOLOAD) : { *(.bss .bss.* COMMON); } > IMAGE
+  .data : { *(.data .data.*); } > RAM AT > FLASH
+  .bss (NOLOAD) : { *(.bss .bss.* COMMON); } > RAM
 
   /DISCARD/ : { *(.ARM.exidx .ARM.exidx.* .ARM.extab.*); }
 }
 
-ASSERT(SIZEOF(.data) == 0, "the shim must not have .data");
-ASSERT(SIZEOF(.bss) == 0, "the shim must not have .bss");
-ASSERT(ORIGIN(IMAGE) % 0x200 == 0, "DFU leave needs a 0x200-aligned vector table");
+ASSERT(SIZEOF(.data) == 0, "the sequencer must not have .data");
+ASSERT(SIZEOF(.bss) == 0, "the sequencer must not have .bss");
