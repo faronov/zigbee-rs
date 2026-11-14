@@ -863,7 +863,7 @@ All times are EET.
 - **Not covered:**
   - a GPD out of the coordinator's range;
   - an over-the-air capture of tunnelling timing;
-  - replay and bad-MIC tests on air;
+  - replay and bad-MIC tests on air (done later, §6.6);
   - the soak test;
   - bidirectional and Combo operation.
 - **Fixed after this run (host-tested, hardware re-checked in 6.2):**
@@ -1140,6 +1140,43 @@ running the nRF 802.15.4 sniffer on channel 15.
 - The proxy also relays Commissioning Notifications about every minute
   for SrcID 0x0CC35D9F, an already paired EfektaLab BGT1 that keeps
   sending commissioning frames (to investigate in M6).
+
+### 6.6 On-air replay and bad-MIC injection (2026-11-14)
+
+The nRF52840 dongle running zigbee-rs-radio-lab 0.1.0 transmitted two
+frames on channel 15 (hwlab `PacketInjection.transmit`, no CCA or ACK,
+0 dBm). The sniffer, H2-Zero console, GPD console and zigpy debug log
+were recorded together in hwlab session
+`2026-11-14T103808Z-m3-replay-badmic`. Proxies under test: the H2-Zero
+(0x07A3) and the ZBT-1 (0x4A76). Both had 0x293C9879 in their Proxy
+Table and both forwarded every genuine report as originators
+(radius 30). The live GPD counter was 3852…3857.
+
+| EET | Frame | Expected drop |
+|---|---|---|
+| 12:40:34.606 | Captured GPDF replayed byte for byte: counter 2197, MAC seq 149, valid MIC | `Stale` |
+| 12:42:34.102 | Same frame with counter 3932 (live + 77), MAC seq 92 and the last MIC byte flipped | `AuthFailed` |
+
+Results:
+
+- **Proxies.** Within 3 s of either injected frame, nothing on air
+  carried NWK source alias 0x9879: no Notification from the H2-Zero, the
+  ZBT-1, the IKEA proxies or any relay. Every genuine report in the same
+  run (12:39:03 to 12:44:04, one a minute) was followed by forwards from
+  0x4A76 and 0x07A3 within about 30 ms. The H2-Zero logged
+  `[GP] GPDF … Notification` only for the six genuine frames, and its
+  `forwards sent` count rose by exactly one a minute (501 → 506). Drop
+  reasons are logged at `debug` and are not in this `info` build.
+- **Coordinator and zigpy.** Neither injected frame produced a
+  `gpepIncomingMessageHandler` or a `Received a GP packet` line. The EZSP
+  NCP filtered them before the host. HA sensor states changed only at
+  the genuine report times (`:03` to `:04` past each minute).
+- **No counter poisoning.** Counter 3932 was not taken from the bad-MIC
+  frame. The next genuine reports (3856, 3857) were forwarded by both
+  proxies and accepted by zigpy, and HA kept updating.
+- The radio-lab TX audit log has a request and a result record for both
+  frames. The FCS the radio appended matched the original capture
+  (`6a7c`).
 
 ## 7. Open questions for the user
 
