@@ -64,15 +64,15 @@ struct MockPhy {
     busy: u32,
     delays: Vec<u32>,
     /// Answer to each transmitted GPDF with `rxAfterTx`, in order:
-    /// `(start after the end of the GPDF in µs, frame)`; `None` or an
+    /// `(start after the start of the GPDF in µs, frame)`; `None` or an
     /// exhausted list leaves the window empty.
     replies: Vec<Option<(u32, Vec<u8>)>>,
     /// Unrelated frames heard first in every rxAfterTx window.
     rx_noise: Vec<Vec<u8>>,
     /// The scheduled reply: `(start time, frame)`.
     timed_rx: Option<(u32, Vec<u8>)>,
-    /// End time of every transmitted GPDF with `rxAfterTx`.
-    rx_after_tx_ends: Vec<u32>,
+    /// `(start, end)` time of every transmitted GPDF with `rxAfterTx`.
+    rx_after_tx: Vec<(u32, u32)>,
     /// Every receive window: `(open, close)`.
     rx_windows: Vec<(u32, u32)>,
 }
@@ -97,17 +97,19 @@ impl RadioPhy for MockPhy {
             self.busy -= 1;
             return Err(PhyError::ChannelBusy);
         }
-        self.now_us += 1_000;
+        let start = self.now_us;
+        // SHR + PHR + MPDU + FCS at 32 µs per byte.
+        self.now_us += (6 + frame.len() as u32 + 2) * 32;
         self.sent.push((self.channel, frame.to_vec()));
         if requests_rx_after_tx(frame) {
-            self.rx_after_tx_ends.push(self.now_us);
+            self.rx_after_tx.push((start, self.now_us));
             self.pending_rx = self.rx_noise.iter().map(|f| (0xC0, f.clone())).collect();
             self.timed_rx = if self.replies.is_empty() {
                 None
             } else {
                 self.replies
                     .remove(0)
-                    .map(|(offset, f)| (self.now_us + offset, f))
+                    .map(|(offset, f)| (start + offset, f))
             };
         }
         if frame.last() == Some(&0x07) && frame.len() == 8 {
@@ -591,13 +593,36 @@ mod bidirectional {
 
     use super::*;
 
-    /// Product-like policy: listen 1 ms early, 4 ms long.
+    /// Product-like policy: listen from 1 ms before gpdRxOffset until
+    /// 29 ms after the end of the GPDF.
     const POLICY: BidirectionalPolicy = BidirectionalPolicy {
         attempts: 3,
         attempt_gap_ms: 400,
         rx_open_us: 19_000,
-        rx_window_us: 4_000,
+        rx_window_us: 10_000,
     };
+
+    /// Start of the IKEA TempMaster's Commissioning Reply measured on air
+    /// (M4 gate 2): 27.93 ms after the start of the GPDF.
+    const LATE_TEMPMASTER_OFFSET_US: u32 = 27_930;
+
+    /// Length of the Commissioning GPDF the sensor profile sends.
+    fn commissioning_gpdf_len() -> usize {
+        let (mut d, _) = open(MockPhy::default(), MockFlash::new(), sensor_profile());
+        let policy = BidirectionalPolicy {
+            attempts: 1,
+            ..POLICY
+        };
+        assert_eq!(
+            block_on(d.commission_bidirectional_on(15, policy)),
+            Err(GpdError::NoCommissioningReply)
+        );
+        gpdfs(&d.phy)[0].len()
+    }
+
+    fn airtime(len: usize) -> u32 {
+        (6 + len as u32 + 2) * 32
+    }
 
     /// zigpy's reply: echoes the commissioned level and key type, no key.
     fn zigpy_reply() -> CommissioningReply {
@@ -687,20 +712,50 @@ mod bidirectional {
         }
         assert_eq!(d.next_frame_counter(), c1 + 2);
 
-        // Every window covers the TempMaster's start time; the second
-        // window was entered only after the noise frames.
-        let ends = d.phy.rx_after_tx_ends.clone();
-        assert_eq!(ends.len(), 2);
+        // The window opens 1 ms before gpdRxOffset, counted from the start
+        // of the GPDF, and closes rx_open + rx_window after its end; the
+        // second window was entered only after the noise frames.
+        let tx = d.phy.rx_after_tx.clone();
+        assert_eq!(tx.len(), 2);
         let first = d.phy.rx_windows[0];
-        assert_eq!(first.0, ends[0] + POLICY.rx_open_us);
-        assert!(first.0 < ends[0] + 20_000 && ends[0] + 20_000 < first.1);
+        assert_eq!(first.0, tx[0].0 + POLICY.rx_open_us);
+        assert_eq!(first.1, tx[0].1 + POLICY.rx_open_us + POLICY.rx_window_us);
+        assert!(first.0 < tx[0].0 + 20_000);
         assert!(
             d.phy
                 .rx_windows
                 .iter()
-                .all(|w| w.1 <= ends[0] + POLICY.rx_open_us + POLICY.rx_window_us
-                    || w.0 >= ends[1])
+                .all(|w| w.1 <= tx[0].1 + POLICY.rx_open_us + POLICY.rx_window_us
+                    || w.0 >= tx[1].1)
         );
+    }
+
+    /// GP 1.1.1 A.1.5.2.1: a TempMaster may start anywhere from 20 to
+    /// 25 ms after the start of the GPDF, and gpdMinRxWindow adds the
+    /// GPDF duration; a reply at either edge, and the late reply measured
+    /// from a real TempMaster, is received.
+    #[test]
+    fn replies_across_the_spec_window_are_received() {
+        let len = commissioning_gpdf_len();
+        for offset in [
+            BidirectionalPolicy::GPD_RX_OFFSET_US,
+            BidirectionalPolicy::GPD_RX_OFFSET_US
+                + BidirectionalPolicy::GP_MAX_TX_OFFSET_VARIATION_US
+                + airtime(len),
+            LATE_TEMPMASTER_OFFSET_US,
+        ] {
+            let (d, _) = open(MockPhy::default(), MockFlash::new(), sensor_profile());
+            let src_id = d.record().src_id;
+            let (mut phy, flash) = into_parts(d);
+            phy.replies = std::vec![Some((offset, reply_frame(src_id, &zigpy_reply())))];
+            let (mut d, _) = open(phy, flash, sensor_profile());
+            assert_eq!(
+                block_on(d.commission_bidirectional_on(15, POLICY)),
+                Ok(()),
+                "reply {offset} µs after the start of the GPDF"
+            );
+            assert_eq!(d.record().channel, Some(15));
+        }
     }
 
     #[test]
@@ -708,13 +763,16 @@ mod bidirectional {
         let (d, _) = open(MockPhy::default(), MockFlash::new(), sensor_profile());
         let src_id = d.record().src_id;
         let (mut phy, flash) = into_parts(d);
-        // A reply after the window closed is not seen.
+        // A reply after the window closed is not seen, nor one before it
+        // opened.
+        let len = commissioning_gpdf_len();
         phy.replies = std::vec![
             None,
             Some((
-                POLICY.rx_open_us + POLICY.rx_window_us,
+                airtime(len) + POLICY.rx_open_us + POLICY.rx_window_us,
                 reply_frame(src_id, &zigpy_reply())
             )),
+            Some((POLICY.rx_open_us - 1, reply_frame(src_id, &zigpy_reply()))),
         ];
         let (mut d, _) = open(phy, flash, sensor_profile());
         assert_eq!(
@@ -727,10 +785,10 @@ mod bidirectional {
         let counters: Vec<u32> = frames.iter().map(|f| advertised_counter(f)).collect();
         assert!(counters.windows(2).all(|w| w[1] > w[0]));
         // Attempts are spaced by the policy gap.
-        let ends = &d.phy.rx_after_tx_ends;
+        let tx = &d.phy.rx_after_tx;
         assert!(
-            ends.windows(2)
-                .all(|w| w[1] - w[0] >= POLICY.attempt_gap_ms * 1000)
+            tx.windows(2)
+                .all(|w| w[1].0 - w[0].1 >= POLICY.attempt_gap_ms * 1000)
         );
 
         // A reboot never reuses an advertised counter.
@@ -820,6 +878,12 @@ mod bidirectional {
             BidirectionalPolicy {
                 rx_open_us: 15_000,
                 rx_window_us: 5_000,
+                ..POLICY
+            },
+            // Closes before gpTxOffset + gpMaxTxOffsetVariation.
+            BidirectionalPolicy {
+                rx_open_us: 19_000,
+                rx_window_us: 5_999,
                 ..POLICY
             },
         ] {

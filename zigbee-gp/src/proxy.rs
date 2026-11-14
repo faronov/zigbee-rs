@@ -87,11 +87,15 @@ pub const MAX_DOWNLINK_PAYLOAD: usize = 32;
 /// Default gpTxQueueEntryLifetime, ms.
 pub const DEFAULT_TX_QUEUE_LIFETIME_MS: u32 = 10_000;
 /// gpTxOffset: a queued GPDF starts (first preamble symbol) this long after
-/// the *end* of the triggering GPDF, in µs. GP 1.1 sets gpdRxOffset to
-/// 20 ms (GP 1.0: 5 ms); a GPD opens its receive window at that offset for
-/// at least gpdMinRxWindow (0.576 ms). Reference stacks agree: ZBOSS
-/// `ZB_GPD_RX_OFFSET_MS` 20, EmberZNet `GP_RX_OFFSET_USEC` 20500 from the RX
-/// time stamp. Default of [`ProxyConfig::tx_offset_us`].
+/// the *end* of the triggering GPDF, in µs. GP 1.1.1 measures gpTxOffset
+/// (20 ms) from the *start* of the triggering GPDF and allows
+/// gpMaxTxOffsetVariation (5 ms) on top (A.1.5.2.1.2/3); counting from the
+/// end adds the GPDF duration (at most 4.3 ms for a 127-byte PSDU), so the
+/// reply starts 20.2 to 24.3 ms after the start, inside that window, and a
+/// GPD that listens for gpdMinRxWindow (5 ms + the GPDF duration,
+/// A.1.6.3.2) from 20 ms after the start receives it. Reference stacks
+/// agree: ZBOSS `ZB_GPD_RX_OFFSET_MS` 20, EmberZNet `GP_RX_OFFSET_USEC`
+/// 20500 from the RX time stamp. Default of [`ProxyConfig::tx_offset_us`].
 pub const GP_TX_OFFSET_US: u32 = 20_000;
 
 /// Default [`ProxyConfig::counter_persist_stride`].

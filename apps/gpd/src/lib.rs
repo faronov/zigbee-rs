@@ -156,29 +156,47 @@ pub struct BidirectionalPolicy {
     /// Gap between attempts, in milliseconds (covers the sink's round
     /// trip through the network).
     pub attempt_gap_ms: u32,
-    /// Receiver start after the end of the Commissioning GPDF, in
-    /// microseconds; at most gpdRxOffset (20 ms) minus the expected proxy
+    /// Receiver start, in microseconds after the *start* of the
+    /// Commissioning GPDF (the reference of gpdRxOffset, GP 1.1.1
+    /// A.1.6.3.1); at most gpdRxOffset (20 ms) minus the expected proxy
     /// timing error.
     pub rx_open_us: u32,
-    /// Receive window length, in microseconds; at least gpdMinRxWindow
-    /// (0.576 ms) plus the timing error on both sides.
+    /// Receive window length, in microseconds, not counting the duration
+    /// of the triggering GPDF: the GPD adds that duration as gpdMinRxWindow
+    /// requires (A.1.6.3.2), so the window closes `rx_open_us +
+    /// rx_window_us` after the *end* of the GPDF. `rx_open_us +
+    /// rx_window_us` must reach gpTxOffset + gpMaxTxOffsetVariation
+    /// (25 ms); a longer window also catches TempMasters that measure the
+    /// offset from the end of the GPDF.
     pub rx_window_us: u32,
 }
 
 #[cfg(feature = "bidirectional")]
 impl BidirectionalPolicy {
-    /// GP 1.1 gpdRxOffset: a TempMaster starts the reply 20 ms after the
-    /// end of the GPDF that carried `rxAfterTx`.
+    /// GP 1.1.1 gpdRxOffset (A.1.6.3.1): the GPD enables its receiver
+    /// 20 ms after the start of the GPDF that carried `rxAfterTx`; a
+    /// TempMaster starts its reply 20 to 25 ms after that start (gpTxOffset
+    /// plus gpMaxTxOffsetVariation, A.1.5.2.1.2/3).
     pub const GPD_RX_OFFSET_US: u32 = 20_000;
+    /// GP 1.1.1 gpMaxTxOffsetVariation (A.1.5.2.1.3).
+    pub const GP_MAX_TX_OFFSET_VARIATION_US: u32 = 5_000;
 
-    /// At least one attempt, a non-empty window, and a window that opens
-    /// no later than gpdRxOffset and is still open after it.
+    /// At least one attempt, a window that opens no later than gpdRxOffset
+    /// and stays open until the latest start gpTxOffset +
+    /// gpMaxTxOffsetVariation.
     pub const fn is_valid(&self) -> bool {
         self.attempts > 0
-            && self.rx_window_us > 0
             && self.rx_open_us <= Self::GPD_RX_OFFSET_US
-            && self.rx_open_us.saturating_add(self.rx_window_us) > Self::GPD_RX_OFFSET_US
+            && self.rx_open_us.saturating_add(self.rx_window_us)
+                >= Self::GPD_RX_OFFSET_US + Self::GP_MAX_TX_OFFSET_VARIATION_US
     }
+}
+
+/// On-air duration of a MAC frame of `len` bytes without FCS: SHR (5) +
+/// PHR (1) + MPDU + FCS (2) at 32 µs per byte (2.4 GHz O-QPSK).
+#[cfg(feature = "bidirectional")]
+const fn airtime_us(len: usize) -> u32 {
+    (len as u32 + 8) * 32
 }
 
 impl From<PhyError> for GpdError {
@@ -664,7 +682,7 @@ impl<P: RadioPhy + PlatformServices, S: GpdStore> GpdDevice<P, S> {
                 Err(GpdError::ChannelBusy) => continue,
                 Err(e) => return Err(e),
             }
-            reply = self.receive_commissioning_reply(policy).await?;
+            reply = self.receive_commissioning_reply(policy, len).await?;
             if reply.is_some() {
                 break;
             }
@@ -691,21 +709,22 @@ impl<P: RadioPhy + PlatformServices, S: GpdStore> GpdDevice<P, S> {
     async fn receive_commissioning_reply(
         &mut self,
         policy: BidirectionalPolicy,
+        gpdf_len: usize,
     ) -> Result<Option<zigbee_gp::commissioning::CommissioningReply>, GpdError> {
-        // `try_transmit` returns at the end of the frame.
-        self.phy.delay_micros(policy.rx_open_us).await;
+        // `try_transmit` returns at the end of the frame; gpdRxOffset counts
+        // from its start, and the window closes `rx_open_us + rx_window_us`
+        // after its end (the GPDF duration is part of gpdMinRxWindow).
+        let airtime = airtime_us(gpdf_len).min(policy.rx_open_us);
+        let window_us = policy.rx_window_us + airtime;
+        self.phy.delay_micros(policy.rx_open_us - airtime).await;
         let start = self.phy.monotonic_micros();
         let mut rx = PhyRxFrame::EMPTY;
         loop {
             let elapsed = self.phy.monotonic_micros().wrapping_sub(start);
-            if elapsed >= policy.rx_window_us {
+            if elapsed >= window_us {
                 return Ok(None);
             }
-            if !self
-                .phy
-                .receive(policy.rx_window_us - elapsed, &mut rx)
-                .await?
-            {
+            if !self.phy.receive(window_us - elapsed, &mut rx).await? {
                 return Ok(None);
             }
             let Ok(downlink) =
