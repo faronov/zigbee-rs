@@ -710,6 +710,25 @@ compared, with each master `router` image paired with the branch's
 
   `.bss` is unchanged.
 
+### 4.2 Measured: compact counter records (2026-11-14)
+
+Master 42f37b5 against the branch, both built from the same checkout
+path, 62 images. All 49 images without `green-power` (sensors, EDs,
+SEDs, every `router-core`) are byte-identical. The GP routers grow:
+
+| Router | `.text` | `.rodata` | `.bss` |
+|---|---:|---:|---:|
+| ESP32-C6, ESP32-H2 | +2,858 / +2,860 B | +272 B | +32 B (stack −32 B) |
+| ESP32-H2-Zero | +2,674 B | +268 B | +32 B (stack −32 B) |
+| nRF52833, nRF52840 | +2,328 / +2,332 B | +272 B | +32 B |
+| EFR32MG21, ZBT-1 | +2,332 B | +272 B | 0 |
+| STM32WB5MM-DK | +2,252 B | +272 B | +32 B |
+| BL702 | +2,488 B | +8 B | +36 B |
+| TLSR8258 | +2,464 B | 0 | +40 B |
+
+The `.bss` growth is the cached base (per-entry counters and the append
+offset).
+
 ## 5. Risks
 
 1. **The 5 ms timed TX** on soft-MAC PHYs. Without it, bidirectional must be
@@ -1100,6 +1119,27 @@ running the nRF 802.15.4 sniffer on channel 15.
       2.4 copies.
     - HA temperature changed every 60 s from 09:04:04 to 09:18:06 with no
       gap.
+
+### 6.5 H2-Zero re-identity and GP re-pairing (2026-11-13/14)
+
+- Master 42f37b5 derives the ESP32-H2 EUI-64 like ESP-IDF. The H2-Zero
+  router (app `203f6d2f…3d84`, app only at 0x10000, otadata erased, full
+  backup first) booted with EUI-64 `10:51:db:ff:fe:63:b8:cd`. The
+  identity guard discarded the old network state, and the router joined
+  as NWK 0x07A3 at 00:06:24 EET with an empty Proxy Table.
+- 00:07:34 EET: ZHA permit-join put the proxy into commissioning mode
+  (254 s window, later "replaced" by each renewal).
+- 00:13:49 EET: after a PB0 press the GPD (same SrcID, counter 3105 →
+  3109) sent its Commissioning Request; zigpy sent three GP Pairings and
+  reported the device commissioned.
+- 00:15:00 EET: `GP proxy entries 1`. The GPD's reports then arrived as
+  paired-mode Notifications (00:15:39, 00:16:39), and each one was
+  cancelled because another proxy forwarded first (cancelled 8 → 10 → 12,
+  sent stayed at 7). HA kept updating temperature, humidity, battery
+  (100 %) and voltage (3.4 V).
+- The proxy also relays Commissioning Notifications about every minute
+  for SrcID 0x0CC35D9F, an already paired EfektaLab BGT1 that keeps
+  sending commissioning frames (to investigate in M6).
 
 ## 7. Open questions for the user
 
