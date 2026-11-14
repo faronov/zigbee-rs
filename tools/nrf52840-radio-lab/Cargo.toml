@@ -1,0 +1,39 @@
+[package]
+name = "nrf52840-radio-lab"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/faronov/zigbee-rs"
+description = "PCA10059 IEEE 802.15.4 sniffer and raw transmitter (lab tool, not a shipped image)"
+publish = false
+
+[[bin]]
+name = "nrf52840-radio-lab"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+radio-lab-protocol = { path = "../radio-lab-protocol" }
+nrf52840-pca10059 = { path = "../../boards/nrf52840-pca10059" }
+
+embassy-nrf = { version = "0.3", features = ["nrf52840", "time-driver-rtc1", "rt"] }
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "task-arena-size-32768"] }
+embassy-time = "0.4"
+embassy-sync = "0.6"
+embassy-futures = "0.1"
+embassy-usb = { version = "0.4", default-features = false }
+static_cell = "2"
+critical-section = "1"
+
+cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+# The Open DFU bootloader starts the application through the MBR; set VTOR so
+# the RADIO interrupt is not forwarded through the MBR vector table.
+cortex-m-rt = { version = "0.7", features = ["set-vtor"] }
+panic-reset = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+debug = 2
+codegen-units = 1

@@ -1,0 +1,13 @@
+[package]
+name = "radio-lab-protocol"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/faronov/zigbee-rs"
+description = "Text command protocol of the nRF52840 802.15.4 radio lab (Nordic sniffer compatible, plus transmit)"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+zigbee-mac = { path = "../../zigbee-mac" }

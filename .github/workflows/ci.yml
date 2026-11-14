@@ -483,6 +483,7 @@ jobs:
           cargo fmt --manifest-path products/stm32wb5mm-dk-router/Cargo.toml -- --check
           cargo fmt --manifest-path examples/stm32wb5mm-dk-router/Cargo.toml -- --check
           cargo fmt --manifest-path tools/efr32s2-lab/Cargo.toml -- --check
+          cargo fmt --manifest-path tools/nrf52840-radio-lab/Cargo.toml -- --check
           cargo fmt --manifest-path phy6222-hal/Cargo.toml -- --check
           cargo fmt --manifest-path boards/efr32mg1-tradfri/Cargo.toml -- --check
           cargo fmt --manifest-path products/efr32mg1-tradfri/Cargo.toml -- --check
@@ -919,6 +920,58 @@ jobs:
             examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.bin
             examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.hex
             examples/nrf52840-router/target/thumbv7em-none-eabihf/release/nrf52840-router.size.json
+          if-no-files-found: error
+
+  # Lab tool, not a shipped image: PCA10059 802.15.4 sniffer + raw TX for
+  # hwlab's nrf802154 plugin. Build-only; the command protocol is
+  # host-tested in the workspace (tools/radio-lab-protocol).
+  build-nrf52840-radio-lab:
+    name: Build nRF52840 dongle radio lab (sniffer + TX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv7em-none-eabihf
+          components: llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: tools/nrf52840-radio-lab
+          key: thumbv7em-nrf52840-radio-lab-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('tools/nrf52840-radio-lab/Cargo.lock', 'tools/nrf52840-radio-lab/memory.x') }}
+      - name: Build and lint (release)
+        working-directory: tools/nrf52840-radio-lab
+        run: |
+          cargo build --release --locked
+          cargo clippy --release --locked -- -D warnings
+      - name: Check Open DFU layout and create hex
+        working-directory: tools/nrf52840-radio-lab
+        run: |
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          OBJDUMP=$(find "$(rustc --print sysroot)" -name llvm-objdump -print -quit)
+          ELF=target/thumbv7em-none-eabihf/release/nrf52840-radio-lab
+          # memory.x asserts the window; check the vector table landed at
+          # the MBR's application start.
+          VT=$("$OBJDUMP" -h "$ELF" | awk '$2==".vector_table"{print $4}')
+          if [ "$VT" != "00001000" ]; then
+            echo "vector table at 0x$VT, expected 0x00001000" >&2
+            exit 1
+          fi
+          "$OBJCOPY" -O ihex "$ELF" "${ELF}.hex"
+          "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+          IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
+          # 0x1000..0xE0000 is the application window below the bootloader.
+          if [ "$IMAGE_BYTES" -gt 913408 ]; then
+            echo "radio lab ($IMAGE_BYTES B) overruns the Open DFU window" >&2
+            exit 1
+          fi
+      - name: Upload radio lab firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nrf52840-radio-lab
+          path: |
+            tools/nrf52840-radio-lab/target/thumbv7em-none-eabihf/release/nrf52840-radio-lab.hex
+            tools/nrf52840-radio-lab/target/thumbv7em-none-eabihf/release/nrf52840-radio-lab.bin
           if-no-files-found: error
 
   build-nrf52840-uf2:
