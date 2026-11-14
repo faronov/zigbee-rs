@@ -49,6 +49,21 @@ pub const GP_TX_QUEUE_DEPTH: usize = 4;
 /// The router's Green Power proxy.
 pub type GpProxy = Proxy<GP_PROXY_TABLE_ENTRIES, GP_TX_QUEUE_DEPTH>;
 
+/// Largest GPDF the TempMaster sends to a GPD: 7-octet MAC header, NWK
+/// header with SrcID and frame counter (10), command ID plus
+/// [`zigbee_gp::proxy::MAX_DOWNLINK_PAYLOAD`], MIC (4).
+#[cfg(feature = "green-power-bidirectional")]
+const GP_DOWNLINK_FRAME_LEN: usize = 7 + 10 + 1 + zigbee_gp::proxy::MAX_DOWNLINK_PAYLOAD + 4;
+
+/// A GPDF from the gpTxQueue, due in a GPD's receive window.
+#[cfg(feature = "green-power-bidirectional")]
+pub(crate) struct GpDownlink {
+    frame: [u8; GP_DOWNLINK_FRAME_LEN],
+    len: u8,
+    /// Start instant ([`zigbee_mac::PlatformServices::monotonic_micros`]).
+    at_us: u32,
+}
+
 /// Bound on transmissions per [`ZigbeeDevice::gp_poll`] call, so one call
 /// cannot monopolise the event loop.
 const MAX_TX_PER_POLL: usize = 4;
@@ -223,6 +238,96 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         self.green_power.clock.advance(now_us)
     }
 
+    /// Tell the proxy whether it can act as TempMaster (the MAC transmits
+    /// at an instant) and on which channel it operates.
+    #[cfg(feature = "green-power-bidirectional")]
+    fn gp_sync_bidirectional(&mut self) {
+        let capable = self.bdb.zdo().nwk().mac().timed_tx_supported();
+        let channel = self.bdb.zdo().nwk().nib().logical_channel;
+        let proxy = &mut self.green_power.proxy;
+        if proxy.bidirectional() != capable {
+            proxy.set_bidirectional_capable(capable);
+        }
+        proxy.set_operational_channel(channel);
+    }
+
+    /// Handle a received GPDF (NWK protocol version 3) as TempMaster: the
+    /// proxy processes it as [`Self::gp_receive_gpdf`] does, and the gpTxQueue
+    /// GPDF it triggers (GP 1.1 A.3.9.1) is returned, already built and
+    /// scheduled [`ProxyConfig::tx_offset_us`] after the end of
+    /// `indication`, for [`Self::gp_send_downlink`].
+    #[cfg(feature = "green-power-bidirectional")]
+    #[inline(never)]
+    pub(crate) fn gp_receive_gpdf_bidirectional(
+        &mut self,
+        indication: &McpsDataIndication,
+    ) -> Option<GpDownlink> {
+        if !self.gp_active() {
+            return None;
+        }
+        self.gp_sync_bidirectional();
+        let downlink = self.gp_take_downlink(indication);
+        self.gp_receive_gpdf(indication);
+        downlink
+    }
+
+    /// Build the queued GPDF a received GPDF triggers, before
+    /// [`Proxy::on_gpdf`] advances the GPD's frame counter: a protected
+    /// trigger is verified against, and the reply protected with, the
+    /// Proxy Table entry.
+    #[cfg(feature = "green-power-bidirectional")]
+    fn gp_take_downlink(&mut self, indication: &McpsDataIndication) -> Option<GpDownlink> {
+        if !self.green_power.proxy.bidirectional() {
+            return None;
+        }
+        let rx_end_us = indication.payload.rx_end_us();
+        let now_ms = self.gp_now_ms();
+        let mac_src_ieee = match indication.src_address {
+            MacAddress::Extended(_, ieee) => Some(ieee),
+            _ => None,
+        };
+        let frame = zigbee_gp::frame::parse(
+            indication.payload.as_slice(),
+            indication.payload.mac_sequence(),
+            mac_src_ieee,
+        )
+        .ok()?;
+        let mut downlink = GpDownlink {
+            frame: [0; GP_DOWNLINK_FRAME_LEN],
+            len: 0,
+            at_us: rx_end_us.wrapping_add(self.green_power.proxy.config().tx_offset_us),
+        };
+        let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+        // The MAC sequence number is set from macDSN when sending.
+        let len =
+            self.green_power
+                .proxy
+                .take_downlink(mac, &frame, now_ms, 0, &mut downlink.frame)?;
+        downlink.len = len as u8;
+        Some(downlink)
+    }
+
+    /// Send a TempMaster GPDF at its instant, with the next macDSN, no
+    /// CSMA/CA and no ACK request (GP 1.1 A.1.5.2.2).
+    #[cfg(feature = "green-power-bidirectional")]
+    #[inline(never)]
+    pub(crate) async fn gp_send_downlink(&mut self, mut downlink: GpDownlink) {
+        use zigbee_mac::pib::{PibAttribute, PibValue};
+        let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+        if let Ok(PibValue::U8(dsn)) = mac.mlme_get(PibAttribute::MacDsn).await {
+            downlink.frame[2] = dsn;
+            let _ = mac
+                .mlme_set(PibAttribute::MacDsn, PibValue::U8(dsn.wrapping_add(1)))
+                .await;
+        }
+        let frame = &downlink.frame[..usize::from(downlink.len)];
+        let result = mac.transmit_raw_at(frame, downlink.at_us).await;
+        match result {
+            Ok(()) => log::info!("[GP] TempMaster GPDF sent ({} B)", downlink.len),
+            Err(error) => log::warn!("[GP] TempMaster GPDF not sent: {:?}", error),
+        }
+    }
+
     /// Handle a received GPDF (NWK protocol version 3). Never reaches the
     /// Zigbee NWK layer.
     #[inline(never)]
@@ -301,6 +406,8 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         let now_ms = self.gp_now_ms();
         let own_nwk = self.bdb.zdo().nwk().nib().network_address.0;
         self.green_power.proxy.set_own_nwk(own_nwk);
+        #[cfg(feature = "green-power-bidirectional")]
+        self.gp_sync_bidirectional();
         let to_client = fc & ZCL_SERVER_TO_CLIENT != 0;
         if fc & 0x03 == ZCL_CLUSTER_SPECIFIC {
             if to_client {

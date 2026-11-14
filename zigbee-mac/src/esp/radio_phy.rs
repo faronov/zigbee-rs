@@ -103,6 +103,32 @@ pub const ESP_PENDING_RX: usize = crate::soft_mac::DEFAULT_PENDING_RX;
 /// shared core restore it on MLME-RESET instead of the IEEE 0 dBm.
 pub const DEFAULT_TX_POWER_DBM: i8 = 10;
 
+/// Time from handing a frame to the radio (`transmit_raw_discarding`) until
+/// its first preamble symbol is on air, in µs (`timed-tx`). The radio
+/// leaves receive, ramps up the transmitter and starts the SHR;
+/// [`RadioPhy::transmit_at`] issues the command this much early.
+#[cfg(feature = "timed-tx")]
+pub const TIMED_TX_START_LEAD_US: u32 = 150;
+
+/// How far behind its instant a timed transmission may still start, in µs
+/// (`timed-tx`). Later than that it is [`PhyError::Missed`]; a GPD's
+/// receive window is open for at least gpdMinRxWindow (0.576 ms,
+/// GP 1.1 A.1.5.2.1), so a frame this late still lands in it.
+#[cfg(feature = "timed-tx")]
+pub const TIMED_TX_LATE_US: u32 = 300;
+
+/// Furthest ahead a timed transmission may be scheduled, in µs
+/// (`timed-tx`): gpTxOffset (20 ms) plus margin. The PHY waits for it, so
+/// the bound keeps that wait short.
+#[cfg(feature = "timed-tx")]
+pub const TIMED_TX_MAX_AHEAD_US: u32 = 50_000;
+
+/// The timed transmission sleeps on the executor until this long before
+/// its instant, then busy-waits the rest (`timed-tx`), so executor wake-up
+/// jitter does not move the start.
+#[cfg(feature = "timed-tx")]
+const TIMED_TX_SPIN_US: u32 = 1_000;
+
 /// Shared software MAC (end-device role) on the ESP 802.15.4 radio.
 pub type EspSoftMac<'a> = SoftMacCore<EspRadioPhy<'a>, EndDevice, ESP_PENDING_RX>;
 
@@ -515,6 +541,47 @@ impl<'a> EspRadioPhy<'a> {
         Ok(())
     }
 
+    /// Hand `frame` to the radio now, without CCA, retrying a `Busy`
+    /// radio until `late_by_us` would exceed [`TIMED_TX_LATE_US`]
+    /// (`timed-tx`), then wait for TX-done. Unlike [`Self::transmit`] there
+    /// is no backoff after a busy radio: a late frame misses the peer's
+    /// receive window.
+    #[cfg(feature = "timed-tx")]
+    #[inline(never)]
+    fn transmit_timed(&mut self, frame: &[u8], start_at_us: u32) -> Result<(), PhyError> {
+        if frame.len() > MAX_PHY_FRAME_LEN {
+            return Err(PhyError::FrameTooLong);
+        }
+        let mut padded = [0u8; MAX_PHY_FRAME_LEN + 2];
+        padded[..frame.len()].copy_from_slice(frame);
+
+        TX_COMPLETE.store(false, Ordering::Release);
+        while let Err(error) = self
+            .driver
+            .transmit_raw_discarding(&padded[..frame.len() + 2], false)
+        {
+            if error != esp_radio::ieee802154::Error::Busy {
+                return Err(map_radio_error(error));
+            }
+            if self.monotonic_micros().wrapping_sub(start_at_us) as i32 > TIMED_TX_LATE_US as i32 {
+                return Err(PhyError::Missed);
+            }
+            core::hint::spin_loop();
+        }
+
+        let deadline = esp_hal::time::Instant::now()
+            + esp_hal::time::Duration::from_micros(TX_DONE_TIMEOUT_US);
+        while !TX_COMPLETE.load(Ordering::Acquire) {
+            if esp_hal::time::Instant::now() > deadline {
+                log::warn!("[ESP TX] timed TX: no TX-done within 10ms, cancelling");
+                self.driver.cancel_transmit();
+                return Err(PhyError::Hardware);
+            }
+            core::hint::spin_loop();
+        }
+        Ok(())
+    }
+
     /// esp-radio refused a transmission with `Busy` because the radio is
     /// receiving, sending an automatic ACK, or has interrupt work pending.
     /// Wait for that frame to end instead of reporting a busy channel, so
@@ -655,7 +722,31 @@ fn take_from_radio(driver: &mut Ieee802154<'_>, frame: &mut PhyRxFrame) -> bool 
     // gates on link cost, and the raw byte maps every router to cost 7. So
     // all images apply the stack-wide RSSI policy.
     let lqi = crate::lqi::from_rssi_dbm(raw.data[phr - 1] as i8);
-    frame.set(&raw.data[1..phr - 1], lqi).is_ok()
+    #[cfg(not(feature = "timed-tx"))]
+    {
+        frame.set(&raw.data[1..phr - 1], lqi).is_ok()
+    }
+    #[cfg(feature = "timed-tx")]
+    {
+        if frame.set(&raw.data[1..phr - 1], lqi).is_err() {
+            return false;
+        }
+        frame.rx_end_us = rx_end_us(raw.timestamp_us);
+        true
+    }
+}
+
+/// Convert the RX_DONE time stamp (`esp_hal::time::Instant` µs) into
+/// [`PlatformServices::monotonic_micros`] time (`timed-tx`). Only the age
+/// of the stamp crosses over, so the two clocks need the same rate but not
+/// the same epoch.
+#[cfg(feature = "timed-tx")]
+fn rx_end_us(timestamp_us: u64) -> u32 {
+    let age_us = esp_hal::time::Instant::now()
+        .duration_since_epoch()
+        .as_micros()
+        .saturating_sub(timestamp_us);
+    (Instant::now().as_micros() as u32).wrapping_sub(age_us as u32)
 }
 
 impl RadioPhy for EspRadioPhy<'_> {
@@ -688,6 +779,37 @@ impl RadioPhy for EspRadioPhy<'_> {
     /// One raw transmission without CCA (see the module documentation).
     async fn try_transmit(&mut self, frame: &[u8]) -> Result<(), PhyError> {
         self.transmit(frame, false)
+    }
+
+    /// Received frames carry the RX_DONE time (esp-radio
+    /// `ieee802154-rx-timestamp`), and [`Self::transmit_at`] is software
+    /// scheduled: an executor sleep to [`TIMED_TX_SPIN_US`] before the
+    /// instant, a busy-wait, then the TX command [`TIMED_TX_START_LEAD_US`]
+    /// early. (ESP-IDF's `esp_ieee802154_transmit_at` likewise starts the
+    /// transmission from a timer interrupt.)
+    #[cfg(feature = "timed-tx")]
+    const TIMED_TX: bool = true;
+
+    /// See [`Self::TIMED_TX`]. Instants more than [`TIMED_TX_MAX_AHEAD_US`]
+    /// ahead or [`TIMED_TX_LATE_US`] behind are [`PhyError::Missed`].
+    #[cfg(feature = "timed-tx")]
+    async fn transmit_at(&mut self, frame: &[u8], at_us: u32) -> Result<(), PhyError> {
+        let start_at_us = at_us.wrapping_sub(TIMED_TX_START_LEAD_US);
+        let ahead = start_at_us.wrapping_sub(self.monotonic_micros()) as i32;
+        if ahead > TIMED_TX_MAX_AHEAD_US as i32 || ahead < -(TIMED_TX_LATE_US as i32) {
+            return Err(PhyError::Missed);
+        }
+        if ahead > TIMED_TX_SPIN_US as i32 {
+            Timer::after_micros(u64::from(ahead as u32 - TIMED_TX_SPIN_US)).await;
+        }
+        let ahead = start_at_us.wrapping_sub(self.monotonic_micros()) as i32;
+        if ahead < -(TIMED_TX_LATE_US as i32) {
+            return Err(PhyError::Missed);
+        }
+        if ahead > 0 {
+            spin_micros(ahead as u64);
+        }
+        self.transmit_timed(frame, start_at_us)
     }
 
     /// ACKs are generated by the radio (`auto_ack_tx`).

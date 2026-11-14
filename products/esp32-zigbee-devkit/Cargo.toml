@@ -69,6 +69,12 @@ light-sleep = []
 # Green Power Proxy Basic on the router image: the router app's GP proxy and
 # its Proxy Table journal in `zbnv`.
 green-power = ["roles", "router-app/green-power", "zigbee-runtime/green-power"]
+# GP TempMaster: timed TX into a bidirectional GPD's rxAfterTx window.
+green-power-bidirectional = [
+    "green-power",
+    "router-app/green-power-bidirectional",
+    "zigbee-runtime/green-power-bidirectional",
+]
 # Persist ZCL Configure Reporting state in `zbnv` (sleepy sensor images).
 reporting-persist = []
 # Persist the sleepy sensor's anomaly record (fired keep-awake limits) in

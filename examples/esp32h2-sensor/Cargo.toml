@@ -113,6 +113,13 @@ green-power = [
     "router-app/green-power",
     "esp32-zigbee-devkit-product/green-power",
 ]
+# Green Power TempMaster (bidirectional proxy, GP 1.1 A.3.9.1): answers a
+# bidirectional GPD's rxAfterTx GPDF 20 ms after its end (timed TX,
+# `zigbee-mac/timed-tx`). Opt-in, not part of `router`.
+green-power-bidirectional = [
+    "green-power",
+    "esp32-zigbee-devkit-product/green-power-bidirectional",
+]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
 # Accept only signed MCUboot envelopes over OTA (see the product's

@@ -79,9 +79,13 @@ pub const GP_TX_QUEUE_LEN: usize = 5;
 pub const MAX_DOWNLINK_PAYLOAD: usize = 32;
 /// Default gpTxQueueEntryLifetime, ms.
 pub const DEFAULT_TX_QUEUE_LIFETIME_MS: u32 = 10_000;
-/// gpTxOffset (A.1.5.2.1.2): a queued GPDF is sent this long after the
-/// start of the triggering GPDF, in µs.
-pub const GP_TX_OFFSET_US: u32 = 5_000;
+/// gpTxOffset: a queued GPDF starts (first preamble symbol) this long after
+/// the *end* of the triggering GPDF, in µs. GP 1.1 sets gpdRxOffset to
+/// 20 ms (GP 1.0: 5 ms); a GPD opens its receive window at that offset for
+/// at least gpdMinRxWindow (0.576 ms). Reference stacks agree: ZBOSS
+/// `ZB_GPD_RX_OFFSET_MS` 20, EmberZNet `GP_RX_OFFSET_USEC` 20500 from the RX
+/// time stamp. Default of [`ProxyConfig::tx_offset_us`].
+pub const GP_TX_OFFSET_US: u32 = 20_000;
 
 /// Default [`ProxyConfig::counter_persist_stride`].
 pub const DEFAULT_COUNTER_PERSIST_STRIDE: u32 = 64;
@@ -107,6 +111,10 @@ pub struct ProxyConfig {
     /// gpTxQueueEntryLifetime of a GPDF queued by a GP Response, ms
     /// (bidirectional proxies only).
     pub tx_queue_lifetime_ms: u32,
+    /// Start of a GPDF sent from the gpTxQueue, in µs after the end of the
+    /// GPDF that opened the GPD's receive window ([`GP_TX_OFFSET_US`]).
+    #[cfg(feature = "proxy-bidirectional")]
+    pub tx_offset_us: u32,
 }
 
 impl Default for ProxyConfig {
@@ -115,6 +123,8 @@ impl Default for ProxyConfig {
             default_commissioning_window_s: DEFAULT_COMMISSIONING_WINDOW_S,
             counter_persist_stride: DEFAULT_COUNTER_PERSIST_STRIDE,
             tx_queue_lifetime_ms: DEFAULT_TX_QUEUE_LIFETIME_MS,
+            #[cfg(feature = "proxy-bidirectional")]
+            tx_offset_us: GP_TX_OFFSET_US,
         }
     }
 }
@@ -722,8 +732,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     }
 
     /// Declare whether the platform can transmit a queued GPDF at
-    /// [`GP_TX_OFFSET_US`] after the start of a received GPDF, without
-    /// CSMA/CA. Without it the proxy stays unidirectional: it does not
+    /// [`ProxyConfig::tx_offset_us`] after the end of a received GPDF,
+    /// without CSMA/CA. Without it the proxy stays unidirectional: it does not
     /// advertise bidirectional operation and rejects GP Responses that
     /// appoint it TempMaster.
     #[cfg(feature = "proxy-bidirectional")]
@@ -1620,8 +1630,9 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     /// When the GPDF opens a receive window (`rxAfterTx`, or a Channel
     /// Request) and the gpTxQueue holds a GPDF for its GPD, the queued GPDF
     /// is built into `out` (MAC frame without FCS) and removed from the
-    /// queue; the caller transmits it [`GP_TX_OFFSET_US`] after the start of
-    /// the received GPDF, without CSMA/CA and without a MAC ACK request.
+    /// queue; the caller starts it [`ProxyConfig::tx_offset_us`] after the
+    /// end of the received GPDF, without CSMA/CA and without a MAC ACK
+    /// request.
     ///
     /// The reply uses the security parameters of the triggering GPDF: a
     /// protected trigger must pass the Proxy Table entry's MIC and

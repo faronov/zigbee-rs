@@ -20,6 +20,11 @@ pub enum PhyError {
     Hardware,
     /// The operation is not implemented by this PHY.
     Unsupported,
+    /// A timed transmission ([`RadioPhy::transmit_at`]) could not start at
+    /// its instant: the instant had passed, or lay further ahead than the
+    /// PHY waits. Nothing was sent.
+    #[cfg(feature = "timed-tx")]
+    Missed,
 }
 
 /// Address filter programmed into PHYs with hardware filtering or auto-ACK.
@@ -73,6 +78,12 @@ pub struct PhyRxFrame {
     /// Backends whose hardware reports a different scale must convert before
     /// constructing this frame; see [`crate::lqi`].
     pub lqi: u8,
+    /// [`crate::PlatformServices::monotonic_micros`] when the last octet of
+    /// the frame was received (`timed-tx`). Set by PHYs whose
+    /// [`RadioPhy::TIMED_TX`] is `true`; 0 otherwise. [`Self::set`] and
+    /// [`Self::set_len`] clear it, so the PHY records it after them.
+    #[cfg(feature = "timed-tx")]
+    pub rx_end_us: u32,
 }
 
 impl PhyRxFrame {
@@ -82,6 +93,8 @@ impl PhyRxFrame {
         data: [0; MAX_PHY_FRAME_LEN],
         len: 0,
         lqi: 0,
+        #[cfg(feature = "timed-tx")]
+        rx_end_us: 0,
     };
 
     pub fn from_slice(data: &[u8], lqi: u8) -> Result<Self, PhyError> {
@@ -93,6 +106,8 @@ impl PhyRxFrame {
             data: [0; MAX_PHY_FRAME_LEN],
             len: data.len() as u8,
             lqi,
+            #[cfg(feature = "timed-tx")]
+            rx_end_us: 0,
         };
         frame.data[..data.len()].copy_from_slice(data);
         Ok(frame)
@@ -110,6 +125,10 @@ impl PhyRxFrame {
         self.data[..data.len()].copy_from_slice(data);
         self.len = data.len() as u8;
         self.lqi = lqi;
+        #[cfg(feature = "timed-tx")]
+        {
+            self.rx_end_us = 0;
+        }
         Ok(())
     }
 
@@ -127,6 +146,10 @@ impl PhyRxFrame {
         }
         self.len = len as u8;
         self.lqi = lqi;
+        #[cfg(feature = "timed-tx")]
+        {
+            self.rx_end_us = 0;
+        }
         Ok(())
     }
 
@@ -296,6 +319,27 @@ pub trait RadioPhy {
 
     /// Forget every armed Frame Pending source (MLME-RESET).
     fn clear_ack_frame_pending(&mut self) {}
+
+    /// Whether [`Self::transmit_at`] is implemented and every received
+    /// frame carries [`PhyRxFrame::rx_end_us`] (`timed-tx`).
+    #[cfg(feature = "timed-tx")]
+    const TIMED_TX: bool = false;
+
+    /// Transmit one MAC frame (without FCS) so that its first preamble
+    /// symbol goes on air at `at_us`
+    /// ([`crate::PlatformServices::monotonic_micros`] time), without CCA and
+    /// without waiting for an ACK (`timed-tx`).
+    ///
+    /// Used for transmissions into a receive window the peer opens at a
+    /// fixed offset after its own frame, e.g. a Green Power proxy answering
+    /// a GPD's `rxAfterTx` GPDF (GP 1.1 A.1.5.2.1, gpTxOffset). Returns
+    /// [`PhyError::Missed`] without transmitting when `at_us` has already
+    /// passed by more than the PHY's start tolerance or lies further ahead
+    /// than it is prepared to wait; the PHY documents both bounds.
+    #[cfg(feature = "timed-tx")]
+    async fn transmit_at(&mut self, _frame: &[u8], _at_us: u32) -> Result<(), PhyError> {
+        Err(PhyError::Unsupported)
+    }
 
     /// Follow `macRxOnWhenIdle`: keep the receiver (and its ISR receive /
     /// auto-ACK path) armed between MAC operations when `enabled`.

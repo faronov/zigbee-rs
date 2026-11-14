@@ -221,3 +221,30 @@ commit `10e48dd74837bae4be663a7d1825d12875363727`). The readers moved to
   `2026-11-03T063725Z-h2assoc-fix-verify1`, `...064553Z-...-verify2`,
   `...065319Z-...-verify3`). No sniffer was used, so the exact
   per-frame ACK timing is inferred.
+
+## Receive timestamp (`ieee802154-rx-timestamp`)
+
+Opt-in cargo feature. `zigbee-mac` enables it only with its `timed-tx`
+feature (the Green Power bidirectional proxy,
+`zigbee-runtime/green-power-bidirectional`); without it the crate
+compiles to the same code as before.
+
+- **Why:** a Green Power TempMaster must start the GPP → GPD frame
+  gpTxOffset (20 ms) after the end of the GPDF that carried `rxAfterTx`,
+  and the GPD listens for only gpdMinRxWindow (0.576 ms) plus its own
+  margin. The time at which the frame left the receive queue (a task, after
+  any flash or crypto work) is not precise enough.
+- **Patch:** `RawReceived::timestamp_us` holds `esp_hal::time::Instant`
+  microseconds read at the start of the RX_DONE branch of `zb_mac_handler`,
+  before the Frame Pending hook and the queue push, and at the RX-during-STOP
+  push in the sleep boundary. It is the end of the frame plus the interrupt
+  latency; nothing else in the handler changes.
+- `zigbee-mac` (`esp/radio_phy.rs`) converts it to its embassy-time
+  microsecond clock by age (`now - timestamp`), so the two clocks only need
+  the same rate, not the same epoch.
+- **Accuracy:** interrupt latency, and any longer interrupt-disabled
+  section (flash writes), delays the stamp and therefore the reply. The
+  on-air offset is measured with the nRF52840 radio lab; see the Green Power
+  chapter, M4 results.
+
+Not checked against ESP-IDF; the on-air measurement is the reference.

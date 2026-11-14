@@ -68,6 +68,16 @@ green-power = [
     "zigbee-nwk/green-power",
     "zigbee-zcl/green-power",
 ]
+# Green Power TempMaster (bidirectional proxy, GP 1.1 A.3.9.1): queue a GP
+# Response's GPDF in the gpTxQueue and send it into a bidirectional GPD's
+# rxAfterTx window, gpTxOffset (20 ms) after the end of its GPDF. Needs a MAC
+# with timed transmission (`zigbee-mac/timed-tx`); on a MAC without it the
+# proxy stays unidirectional and rejects such Responses. Off by default.
+green-power-bidirectional = [
+    "green-power",
+    "zigbee-gp/proxy-bidirectional",
+    "zigbee-mac/timed-tx",
+]
 # Deprecated item-by-item `save_state`/`restore_state` persistence. It does not
 # persist the Trust Center link key, APS keys, bindings or groups; production
 # devices use `SecurityStateStore`. Kept only for tests and mock examples.

@@ -66,6 +66,22 @@ pub struct MockMac {
     random_state: u32,
     tx_failures: u32,
     poll_failures: u32,
+    #[cfg(feature = "timed-tx")]
+    timed_tx: Option<bool>,
+    #[cfg(feature = "timed-tx")]
+    timed_tx_history: Vec<TimedTxRecord, 8>,
+}
+
+/// A frame sent with [`MacDriver::transmit_raw_at`] (`timed-tx`).
+#[cfg(feature = "timed-tx")]
+#[derive(Debug, Clone)]
+pub struct TimedTxRecord {
+    /// Complete MAC frame without FCS.
+    pub frame: Vec<u8, 127>,
+    /// Requested start instant.
+    pub at_us: u32,
+    /// Mock clock when the call was made.
+    pub called_us: u32,
 }
 
 /// Record of a transmitted frame (for test assertions)
@@ -126,7 +142,30 @@ impl MockMac {
             random_state: random_state.max(1),
             tx_failures: 0,
             poll_failures: 0,
+            #[cfg(feature = "timed-tx")]
+            timed_tx: None,
+            #[cfg(feature = "timed-tx")]
+            timed_tx_history: Vec::new(),
         }
+    }
+
+    /// Enable timed transmission (`timed-tx`). `meets_instants` is `true`
+    /// for a radio that meets every instant; `false` makes every
+    /// [`MacDriver::transmit_raw_at`] report a missed instant.
+    #[cfg(feature = "timed-tx")]
+    pub fn set_timed_tx(&mut self, meets_instants: bool) {
+        self.timed_tx = Some(meets_instants);
+    }
+
+    /// Frames sent with [`MacDriver::transmit_raw_at`] (`timed-tx`).
+    #[cfg(feature = "timed-tx")]
+    pub fn timed_tx_history(&self) -> &[TimedTxRecord] {
+        &self.timed_tx_history
+    }
+
+    /// Set the mock clock.
+    pub fn set_time_micros(&mut self, now_us: u32) {
+        self.time_micros = now_us;
     }
 
     // ── Test setup methods ──────────────────────────────────
@@ -581,6 +620,33 @@ impl MacDriver for MockMac {
             return Err(MacError::InvalidParameter);
         }
         self.mcps_data(req).await
+    }
+
+    #[cfg(feature = "timed-tx")]
+    fn timed_tx_supported(&self) -> bool {
+        self.timed_tx.is_some()
+    }
+
+    #[cfg(feature = "timed-tx")]
+    async fn transmit_raw_at(&mut self, frame: &[u8], at_us: u32) -> Result<(), MacError> {
+        let Some(meets_instants) = self.timed_tx else {
+            return Err(MacError::Unsupported);
+        };
+        if !meets_instants {
+            return Err(MacError::TransactionExpired);
+        }
+        let record = TimedTxRecord {
+            frame: Vec::from_slice(frame).map_err(|_| MacError::FrameTooLong)?,
+            at_us,
+            called_us: self.time_micros,
+        };
+        self.timed_tx_history
+            .push(record)
+            .map_err(|_| MacError::TransactionOverflow)?;
+        if (at_us.wrapping_sub(self.time_micros) as i32) > 0 {
+            self.time_micros = at_us;
+        }
+        Ok(())
     }
 
     fn capabilities(&self) -> MacCapabilities {

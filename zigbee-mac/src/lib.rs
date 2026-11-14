@@ -314,6 +314,24 @@ pub trait MacDriver: PlatformServices {
         self.mac_command_event().await
     }
 
+    // ── Timed transmission (`timed-tx`) ─────────────────────
+
+    /// Whether [`Self::transmit_raw_at`] works and received payloads carry
+    /// [`MacFrame::rx_end_us`].
+    #[cfg(feature = "timed-tx")]
+    fn timed_tx_supported(&self) -> bool {
+        false
+    }
+
+    /// Transmit a complete MAC frame (without FCS) starting at `at_us`
+    /// ([`PlatformServices::monotonic_micros`] time), without CSMA-CA and
+    /// without an ACK request; see [`RadioPhy::transmit_at`]. A missed
+    /// instant is [`MacError::TransactionExpired`]; nothing was sent.
+    #[cfg(feature = "timed-tx")]
+    async fn transmit_raw_at(&mut self, _frame: &[u8], _at_us: u32) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
+    }
+
     // ── Capability queries ──────────────────────────────────
 
     /// Returns the hardware capabilities of this MAC backend.
