@@ -2492,6 +2492,9 @@ jobs:
             python3 ../efr32mg22-sensor/tools/verify-layout.py --flash-end 0x70000 \
               "target/bidi/thumbv8m.main-none-eabihf/release/$image"
           done
+          # LAB ONLY: lowest calibrated TX power for proxy tests (lint only).
+          cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+            --features bidirectional,lab-tx-power --target-dir target/bidi -- -D warnings
       - name: Create firmware artifacts
         run: |
           DIR=examples/efr32mg22-sensor/target/thumbv8m.main-none-eabihf/release

@@ -150,6 +150,17 @@ pub async fn run(profile: GpdProfile) -> ! {
         log::error!("[GPD] identity: {error:?}");
         halt()
     });
+    #[cfg(feature = "lab-tx-power")]
+    match device.phy_mut().set_tx_power(product::LAB_TX_POWER_DBM) {
+        Ok(()) => log::warn!(
+            "[GPD] LAB build: TX power {} dBm",
+            product::LAB_TX_POWER_DBM
+        ),
+        Err(error) => {
+            log::error!("[GPD] lab TX power: {error:?}");
+            halt()
+        }
+    }
     let record = *device.record();
     log::info!(
         "[GPD] {provisioning:?} SrcID 0x{:08X} counter {} channel {:?}",

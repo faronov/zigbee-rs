@@ -135,6 +135,18 @@ pub const BIDIRECTIONAL: gpd_app::BidirectionalPolicy = gpd_app::BidirectionalPo
 #[cfg(feature = "bidirectional")]
 const _: () = assert!(BIDIRECTIONAL.is_valid());
 
+/// LAB ONLY (`lab-tx-power`): transmit power for proxy tests on a bench
+/// next to the coordinator, in dBm.
+///
+/// The lowest calibrated BRD4183A level (-25 dBm). On the M4 bench the
+/// coordinator heard this GPD at about -89 dBm with the default 0 dBm,
+/// so at -25 dBm it falls well below the coordinator's sensitivity while a
+/// proxy within a few metres still gets a usable link. The sink then only
+/// learns about the GPD through a proxy, which is what proxy and TempMaster
+/// tests need. Never a product image: the range is a few metres.
+#[cfg(feature = "lab-tx-power")]
+pub const LAB_TX_POWER_DBM: i8 = efr32s2_hal::radio::TX_POWER_RANGE_DBM.0;
+
 /// Sensor reporting interval.
 pub const SENSOR_REPORT_INTERVAL_S: u64 = 60;
 /// Button press longer than this recommissions.

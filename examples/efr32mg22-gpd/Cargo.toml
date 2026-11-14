@@ -45,6 +45,11 @@ lab-switch-cycle = []
 # `BIDIRECTIONAL`). Needs a TempMaster proxy that can send in the rxAfterTx
 # window (an ESP32-H2 router built with `green-power-bidirectional`).
 bidirectional = ["efr32mg22-gpd-product/bidirectional"]
+# LAB ONLY: transmit at the lowest calibrated power (products/efr32mg22-gpd
+# `LAB_TX_POWER_DBM`), so a coordinator on the same bench does not hear the
+# GPD and the sink learns about it only through a proxy. Never a product
+# image.
+lab-tx-power = ["efr32mg22-gpd-product/lab-tx-power"]
 
 [profile.dev]
 opt-level = "s"

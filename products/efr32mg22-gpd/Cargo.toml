@@ -20,3 +20,6 @@ zigbee-gp = { path = "../../zigbee-gp", features = ["gpd"] }
 # Bidirectional commissioning (rxAfterTx, Commissioning Reply): exposes
 # `BIDIRECTIONAL`. Off by default; the default images do not change.
 bidirectional = ["gpd-app/bidirectional"]
+# LAB ONLY: exposes `LAB_TX_POWER_DBM`, a reduced transmit power for proxy
+# tests next to the coordinator. Never a product image.
+lab-tx-power = []
