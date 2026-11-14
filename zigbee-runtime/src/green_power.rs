@@ -166,12 +166,12 @@ impl GreenPowerState {
 }
 
 /// Approximate the received RSSI from the 802.15.4 LQI for the GPP-GPD link
-/// byte (the MAC indication carries no RSSI). Linear over the usual
-/// −100..−20 dBm LQI range; it only orders proxies for the tunnelling delay
-/// and is reported to the sink as an estimate.
+/// byte (the MAC indication carries no RSSI). It inverts the stack-wide
+/// RSSI-derived LQI policy (`zigbee_mac::lqi::from_rssi_dbm`, linear over
+/// −100..−20 dBm), and the Link quality follows the RSSI bands of
+/// [`GppGpdLink::from_rssi`].
 fn link_from_lqi(lqi: u8) -> GppGpdLink {
-    let rssi = -100 + (i16::from(lqi) * 80 / 255);
-    GppGpdLink::from_rssi_lqi(rssi as i8, lqi)
+    GppGpdLink::from_rssi(-100 + (i16::from(lqi) * 80 / 255))
 }
 
 /// Split a ZCL frame into (frame control, TSN, command, payload).
@@ -730,7 +730,15 @@ mod tests {
         let low = link_from_lqi(0);
         let high = link_from_lqi(255);
         assert_eq!(low.rssi_dbm(), -100);
+        assert_eq!(low.link_quality(), 0);
         assert_eq!(high.rssi_dbm(), -20);
         assert_eq!(high.link_quality(), 3);
+        let mut last = low;
+        for lqi in 1..=255 {
+            let l = link_from_lqi(lqi);
+            assert!(l.link_quality() >= last.link_quality());
+            assert!(l.rssi_dbm() >= last.rssi_dbm());
+            last = l;
+        }
     }
 }

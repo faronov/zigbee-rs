@@ -199,6 +199,13 @@ fn write_payload(w: &mut Writer<'_>, payload: Option<&[u8]>) -> Result<()> {
     }
 }
 
+/// Lowest RSSI, dBm, reported as Excellent by [`GppGpdLink::from_rssi`].
+pub const LQ_EXCELLENT_DBM: i16 = -70;
+/// Lowest RSSI, dBm, reported as High by [`GppGpdLink::from_rssi`].
+pub const LQ_HIGH_DBM: i16 = -85;
+/// Lowest RSSI, dBm, reported as Moderate by [`GppGpdLink::from_rssi`].
+pub const LQ_MODERATE_DBM: i16 = -95;
+
 /// GPP → GPD link field (RSSI and link quality, GP spec Figure 27).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GppGpdLink(pub u8);
@@ -212,6 +219,32 @@ impl GppGpdLink {
         let capped = rssi_dbm.clamp(-109, 8) as i16;
         let rssi = (((capped + 110) / 2) as u8) & 0x3F;
         Self(rssi | ((lqi >> 6) << 6))
+    }
+
+    /// Build the link byte from an RSSI in dBm alone, for radios whose LQI is
+    /// itself derived from RSSI.
+    ///
+    /// The Link quality sub-field is vendor-specific (Table 32). Under GP
+    /// 1.1.1 A.3.6.3.1 every step below Excellent adds 32 ms to the
+    /// tunnelling delay, and sinks elect the TempMaster by Link quality
+    /// first, so it must be on the scale other stacks use. Measured on air
+    /// (channel 15, 2026-11-14): IKEA proxies reported -60 and -50 dBm as
+    /// Excellent, -82 dBm as High and -86 dBm as Moderate; a Tuya plug
+    /// reported -96..-88 dBm as High. The bands are therefore Excellent at
+    /// [`LQ_EXCELLENT_DBM`] and above, High at [`LQ_HIGH_DBM`], Moderate at
+    /// [`LQ_MODERATE_DBM`], Poor below.
+    pub fn from_rssi(rssi_dbm: i16) -> Self {
+        let quality = if rssi_dbm >= LQ_EXCELLENT_DBM {
+            3
+        } else if rssi_dbm >= LQ_HIGH_DBM {
+            2
+        } else if rssi_dbm >= LQ_MODERATE_DBM {
+            1
+        } else {
+            0
+        };
+        let capped = rssi_dbm.clamp(-109, 8);
+        Self((((capped + 110) / 2) as u8 & 0x3F) | quality << 6)
     }
 
     /// Encoded RSSI part converted back to dBm.
@@ -921,6 +954,26 @@ mod tests {
         let l = GppGpdLink::from_rssi_lqi(-120, 10);
         assert_eq!(l.rssi_dbm(), -110);
         assert_eq!(l.link_quality(), 0);
+    }
+
+    #[test]
+    fn rssi_link_quality_bands() {
+        for (rssi, lq, byte) in [
+            (20, 3, 0xC0 | 59),
+            (-50, 3, 0xC0 | 30),
+            (-70, 3, 0xC0 | 20),
+            (-71, 2, 0x80 | 19),
+            (-82, 2, 0x80 | 14),
+            (-85, 2, 0x80 | 12),
+            (-86, 1, 0x40 | 12),
+            (-95, 1, 0x40 | 7),
+            (-96, 0, 7),
+            (-120, 0, 0),
+        ] {
+            let l = GppGpdLink::from_rssi(rssi);
+            assert_eq!(l.link_quality(), lq, "{rssi} dBm");
+            assert_eq!(l.0, byte, "{rssi} dBm");
+        }
     }
 
     #[test]

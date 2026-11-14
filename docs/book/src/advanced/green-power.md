@@ -207,7 +207,7 @@ panic `Location` line/column fields); §4.1 records the proof.
 
 | Layer | Feature (`zigbee-gp` / `zigbee-runtime` / `router-app`) | Contents |
 |---|---|---|
-| (a) Proxy Basic | `proxy-basic` / `green-power-proxy` / `green-power` | dGP stub (version-3 demux, GPDF codec, security processing for proxy-table entries), proxy table plus journal, duplicate filter, commissioning mode, Commissioning Notification, Notification in derived/pre-commissioned groupcast and lightweight unicast, Pairing, Proxy Commissioning Mode, Proxy Table Request/Response, gppFunctionality attributes, LQI-based tunnelling delay. Unidirectional only. |
+| (a) Proxy Basic | `proxy-basic` / `green-power-proxy` / `green-power` | dGP stub (version-3 demux, GPDF codec, security processing for proxy-table entries), proxy table plus journal, duplicate filter, commissioning mode, Commissioning Notification, Notification in derived/pre-commissioned groupcast and lightweight unicast, Pairing, Proxy Commissioning Mode, Proxy Table Request/Response, gppFunctionality attributes, GP 1.1.1 tunnelling delay (A.3.6.3.1). Unidirectional only. |
 | (a+) Basic with bidirectional commissioning | `proxy-bidir-commissioning` | gpTxQueue (≥ 5 entries, one per GPD), GP Response handling in the TempMaster role, timed transmission on the operational channel, Commissioning Reply. *(verify 1.1: possibly mandatory for Basic)* |
 | (b) Full proxy | `proxy-full` (implies the above) | Bidirectional operation (any GPDF from the queue, including in operational mode), Channel Request/Configuration with a temporary channel switch, full unicast, every key type (incl. NWK-key-derived and group key) and security levels 1/2/3, IEEE ApplicationID 2 with endpoint, all Notification options |
 | (c) Combo / Sink | `sink` (implies `proxy-full`) | GP server on GPEP: sink table plus journal, sink commissioning mode (local button or Sink Commissioning Mode command), direct GPDF reception, Notification handling, Pairing generation, translation table (GPD command → local ZCL command on an application endpoint), Sink Table Request/Response, Translation Table commands |
@@ -315,10 +315,17 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
    - *Response:* if TempMaster is this node, queue the frame in gpTxQueue on
      the given channel;
    - *Proxy Table Request:* answer from the table.
-4. On the first transmission the proxy may defer, using the LQI-based
-   tunnelling delay (Dmin 15 ms … Dmax 100 ms). Its own pending Notification
-   is cancelled if an identical one from another proxy is heard first
-   (A.3.5.2.1). `Proxy::forward_stats()` counts forwards sent and cancelled,
+4. On the first transmission the proxy defers by the GP 1.1.1 tunnelling
+   delay (A.3.6.3.1): Dmin_u = 5 ms (rxAfterTx = 0) or Dmin_b = 32 ms
+   (rxAfterTx = 1), plus (3 − Link quality) × 32 ms. The TempMaster for the
+   GPD and, in full unicast, a FirstToForward entry use the shortest delay;
+   the v1.0a distance formula (Dmin 15 ms, up to ~100 ms for most links) is
+   no longer used. Link quality is banded from RSSI (≥ −70 dBm Excellent,
+   ≥ −85 High, ≥ −95 Moderate, else Poor), which matches what commercial
+   proxies report on air (§6.8). A pending Notification is cancelled if an
+   identical one from another proxy is heard first (A.3.5.2.1); for
+   rxAfterTx frames only if that proxy is bidirectional-capable and has a
+   better link (or an equal link and a lower address). `Proxy::forward_stats()` counts forwards sent and cancelled,
    and the runtime logs each cancellation at debug level.
 5. Commissioning mode transitions are reported as `CommissioningEvent`
    (entered with its window, replaced by a new enter from the same sink, or
@@ -760,6 +767,19 @@ the same checkout path): ESP32-H2 router and `router-core`, ESP32-H2-Zero
 router, MG22 GPD sensor and switch and ZBT-1 `zrs-boot` router differ
 only in `core::panic::Location` line fields of edited files; every other
 section is byte-identical.
+
+### 4.4 Measured: GP 1.1.1 tunnelling delay and Link-quality bands (2026-11-14)
+
+This change is in the default-on proxy. Release builds, before against
+after, in the same checkout path (flash = code + rodata + data):
+
+| Image | Flash | RAM |
+|---|---:|---:|
+| ESP32-H2-Zero router `router,waveshare-h2-zero` | −78 B | 0 |
+| ESP32-H2-Zero router `+green-power-bidirectional` | +12 B | 0 |
+| ZBT-1 `router,zrs-boot` | −52 B | 0 |
+| Nucleo-WB55 router (default) | −64 B | 0 |
+| MG22 GPD sensor (default) | byte-identical | 0 |
 
 ## 5. Risks
 
@@ -1256,6 +1276,53 @@ Open hardware gates:
 2. Full bidirectional commissioning of the MG22 GPD into ZHA through the
    H2-Zero, with the coordinator and other proxies unable to answer.
 3. Reports after commissioning and a GPD reset (counter and key retained).
+
+### 6.8 M4 on air: the TempMaster race (2026-11-14)
+
+Setup: H2-Zero (0x07A3) app-only flashed with the
+`green-power-bidirectional` image of 30d8f74 (joined state and proxy table
+kept); the nRF52840 radio-lab dongle injects an rxAfterTx Commissioning
+GPDF (test SrcID 0x7E57B1D1, RxOnCapability) on channel 15 during
+a ZHA permit-join and captures the air. Decoded with the network key.
+
+Findings with the 30d8f74 proxy:
+
+- **−40 dBm injection.** The H2 entered proxy commissioning mode and
+  tunnelled a Commissioning Notification with the bidirectional bit and
+  its own NWK address, but at +109 ms. IKEA VINDSTYRKA 0xD586 (not
+  bidirectional) forwarded at +70 ms. zigpy appointed 0xD586 as
+  TempMaster, so the H2 (correctly) dropped its queued reply.
+- **0 dBm injection.** The coordinator heard the GPDF directly; zigpy sent
+  one GP Response with TempMaster 0x0000 at +43 ms and another naming
+  ZBT-1 0x4A76; the H2 forwarded at +106 ms.
+
+Causes:
+
+1. Our delay used the GP 1.0a distance formula (Dmin 15 ms) with an LQI
+   from a linear RSSI curve, which gave ~95–100 ms for almost any link.
+   GP 1.1.1 A.3.6.3.1 uses Dmin_b = 32 ms for rxAfterTx plus 32 ms per
+   Link-quality step. Fixed (§3.2 step 4, §4.4).
+2. Link quality was the LQI quartile (Excellent only at ≥ −40 dBm).
+   Commercial proxies on this network report: IKEA −60/−50 dBm → 3,
+   −82 → 2, −86 → 1; Tuya −96…−88 → 2. Now banded from RSSI.
+3. A cancellation by an rxAfterTx duplicate now requires that the other
+   forwarder be bidirectional-capable with a better link (A.3.5.2.1).
+4. **zigpy 2.4.1 does not elect a TempMaster** (A.3.6.2.3: within Dmax,
+   among bidirectional-capable candidates, by best link). It takes the
+   `gpp_short_addr` of the first Commissioning Notification, or itself if
+   the coordinator heard the GPDF directly (`zgp/manager.py`). A
+   unidirectional proxy that forwards first therefore wins, and the
+   coordinator always wins when the GPD is in its range. Bidirectional
+   commissioning through our proxy needs the GPD out of the coordinator's
+   range and our proxy to forward first. Not fixed here (zigpy).
+5. VINDSTYRKA forwarded at ~70 ms even at −86 dBm / LQ 1, i.e. not by the
+   1.1.1 formula; the H2 adds ~10 ms of processing to its computed delay.
+
+Not yet changed (minor deviations): a proxy without bidirectional
+capability should send rxAfterTx Commissioning Notifications with the
+derived alias, but ours uses its own address; and a unidirectional
+groupcast proxy "SHALL NOT drop" its own forward, but ours cancels on a
+duplicate when rxAfterTx = 0 (M1 behaviour).
 
 ## 7. Open questions for the user
 
