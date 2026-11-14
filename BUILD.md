@@ -439,6 +439,25 @@ Beacon response, child association and indirect delivery have not been
 observed yet (see the
 [STM32WB guide](docs/book/src/platform-guides/stm32wb.md)).
 
+## P-NUCLEO-WB55 (Nucleo-WB55 and USB dongle)
+
+Both kit boards share the DK's coprocessor requirement (FUS 1.2.0, MAC
+1.24.0, SFSA `0xE1`). They also share its linker layout and journals
+through `products/stm32wb-router` and `apps/stm32wb-router`.
+
+```bash
+cd examples/nucleo-wb55-router      # ST-LINK VCP log
+cargo +nightly-2026-03-23 build --release --locked
+cd ../wb55-dongle-router            # USB CDC log (feature usb-log)
+cargo +nightly-2026-03-23 build --release --locked
+```
+
+The dongle has no SWD connector. It is programmed through its ROM USB
+DFU bootloader (SW2 on BOOT0, then replug). Its coprocessor is serviced
+by `tools/stm32wb-fus-shim`, a CPU1 SRAM helper that runs the FUS
+commands. See its README and the
+[STM32WB guide](docs/book/src/platform-guides/stm32wb.md).
+
 ## Telink TLSR8258
 
 Install the [pinned TC32 release](https://github.com/modern-tc32/rust/releases/tag/tc32-1.98.1-20261003-31a272)

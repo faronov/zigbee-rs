@@ -87,6 +87,15 @@ exclude = [
     "boards/stm32wb5mm-dk",
     "products/stm32wb5mm-dk-router",
     "examples/stm32wb5mm-dk-router",
+    "products/stm32wb-router",
+    "apps/stm32wb-router",
+    "boards/nucleo-wb55",
+    "products/nucleo-wb55-router",
+    "examples/nucleo-wb55-router",
+    "boards/wb55-usb-dongle",
+    "products/wb55-dongle-router",
+    "examples/wb55-dongle-router",
+    "tools/stm32wb-fus-shim",
 ]
 
 [workspace.package]

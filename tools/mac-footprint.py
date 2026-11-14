@@ -246,6 +246,19 @@ IMAGES: list[Image] = [
     Image("stm32wb5mm-dk-router-core", "examples/stm32wb5mm-dk-router",
           "target/thumbv7em-none-eabihf/release/stm32wb5mm-dk-router",
           ["--no-default-features"]),
+    # P-NUCLEO-WB55 routers on the shared STM32WB router kit: the stock
+    # images (Green Power on; the dongle also logs over USB CDC) and the
+    # same without Green Power.
+    Image("nucleo-wb55-router", "examples/nucleo-wb55-router",
+          "target/thumbv7em-none-eabihf/release/nucleo-wb55-router"),
+    Image("nucleo-wb55-router-core", "examples/nucleo-wb55-router",
+          "target/thumbv7em-none-eabihf/release/nucleo-wb55-router",
+          ["--no-default-features"]),
+    Image("wb55-dongle-router", "examples/wb55-dongle-router",
+          "target/thumbv7em-none-eabihf/release/wb55-dongle-router"),
+    Image("wb55-dongle-router-core", "examples/wb55-dongle-router",
+          "target/thumbv7em-none-eabihf/release/wb55-dongle-router",
+          ["--no-default-features", "--features", "usb-log"]),
     _phy_ed("phy6222-ed", "examples/phy6222-sensor", "phy6222-ed",
             "production,phy6222,ed"),
     _phy_ed("phy6252-ed", "examples/phy6222-sensor", "phy6222-ed",

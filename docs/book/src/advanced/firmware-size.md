@@ -112,6 +112,8 @@ former-budget rows.
 | TLSR8258 default / LOW32K 250 ms / LOW32K 10 s | 290,616 / 295,548 / 295,552 | 294,912 / 299,008 / 299,008 | 4,296 / 3,460 / 3,456 | raw binaries |
 | TLSR8258 parent router | 436,072 | 430,080 | -5,992 | raw binary; above former budget |
 | STM32WB5MM-DK router plain / all peripherals (default) | 388,482 / 449,602 | 864,256 each | 475,774 / 414,654 | raw binaries from `0x08000000`; the application slot ends at the settings journal (`0x080D3000`) |
+| Nucleo-WB55 router GP-off / default (GP) | 391,682 / 419,394 | 847,872 each | 456,190 / 428,478 | raw binaries from `0x08000000`; the slot ends at the GP Proxy Table journal (`0x080CF000`) |
+| WB55 USB dongle router GP-off / default (GP, USB CDC log) | 414,050 / 441,794 | 847,872 each | 433,822 / 406,078 | as above; without `usb-log` the GP image is 315,214 B of text+data, because no log formatting is linked |
 
 The measurements use:
 
@@ -220,6 +222,14 @@ are in [Green Power §4.1](./green-power.md). The `-router` rows of
 `tools/mac-footprint-baseline.json` were refreshed with GP on, and
 `-router-core` and STM32WB5MM-DK rows were added; the other rows are
 unchanged.
+
+The P-NUCLEO-WB55 rows (`nucleo-wb55-router`, `wb55-dongle-router` and
+their `-core` variants) were added with the shared STM32WB router kit.
+The DK rows were refreshed in the same change. Moving the DK's
+composition into `apps/stm32wb-router` costs it about 2.1 KB of flash
+and 32 B of `.bss`. That cost comes from code generation across the new
+crate boundary (the outlined composition and memory-manager task); the
+DK's behaviour is unchanged.
 
 ## Why the application model remains small
 

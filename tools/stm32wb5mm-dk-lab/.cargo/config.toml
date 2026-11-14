@@ -4,7 +4,7 @@ target = "thumbv7em-none-eabihf"
 [target.thumbv7em-none-eabihf]
 # Flash through HWLab (stlink plugin, `target flash program`).
 rustflags = [
-    "-L", "../../products/stm32wb5mm-dk-router/link",
+    "-L", "../../products/stm32wb-router/link",
     "-C", "link-arg=--nmagic",
     "-C", "link-arg=-Tlink.x",
     "-C", "link-arg=-Ttl_mbox.x",

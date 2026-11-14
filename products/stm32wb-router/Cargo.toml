@@ -1,0 +1,40 @@
+[package]
+name = "stm32wb-router-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Flash layout, persistence, router policy and UX shared by the 1 MiB STM32WB55 Zigbee router products"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone: the Embassy git dependencies of the target build must not enter
+# the root lockfile.
+[workspace]
+
+[features]
+default = []
+# Green Power Proxy Basic: the GP Proxy Table journal (`storage::open`). The
+# window is reserved in every image.
+green-power = ["router-app/green-power", "zigbee-runtime/green-power"]
+
+[dependencies]
+router-app = { path = "../../apps/router" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-mac = { path = "../../zigbee-mac", default-features = false }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[dev-dependencies]
+zigbee-mac = { path = "../../zigbee-mac", default-features = false, features = ["mock"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["router"] }
+
+# No chip feature here: the firmware composition root (one per board)
+# selects the STM32WB55 package, and Cargo's feature unification hands it to
+# this crate. The journals are only built for the target.
+[target.'cfg(target_os = "none")'.dependencies]
+stm32wb-hal = { path = "../../stm32wb-hal" }
+
+# Local ST MAC layout and mailbox-acknowledgement fixes: see
+# vendor/embassy-stm32-wpan/LOCAL-PATCHES.md.
+[patch."https://github.com/embassy-rs/embassy"]
+embassy-stm32-wpan = { path = "../../vendor/embassy-stm32-wpan" }

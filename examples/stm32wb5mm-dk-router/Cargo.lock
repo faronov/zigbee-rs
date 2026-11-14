@@ -930,6 +930,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "stm32wb-router-app"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "embassy-executor",
+ "embassy-sync",
+ "embassy-time",
+ "log",
+ "router-app",
+ "static_cell",
+ "stm32wb-hal",
+ "stm32wb-router-product",
+ "zigbee-mac",
+ "zigbee-runtime",
+ "zigbee-types",
+ "zigbee-zcl",
+]
+
+[[package]]
+name = "stm32wb-router-product"
+version = "0.1.0"
+dependencies = [
+ "router-app",
+ "stm32wb-hal",
+ "zigbee-aps",
+ "zigbee-mac",
+ "zigbee-runtime",
+ "zigbee-zcl",
+]
+
+[[package]]
 name = "stm32wb5mm-dk"
 version = "0.1.0"
 dependencies = [
@@ -958,6 +990,7 @@ dependencies = [
  "router-app",
  "static_cell",
  "stm32wb-hal",
+ "stm32wb-router-app",
  "stm32wb5mm-dk",
  "stm32wb5mm-dk-router-product",
  "zigbee-display",
@@ -980,6 +1013,7 @@ dependencies = [
  "libm",
  "router-app",
  "stm32wb-hal",
+ "stm32wb-router-product",
  "zigbee-aps",
  "zigbee-mac",
  "zigbee-runtime",

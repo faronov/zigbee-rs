@@ -34,7 +34,8 @@ pub const SECURITY_START: u32 = APS_TABLE_START + JOURNAL_PHYSICAL_SIZE as u32;
 pub const NV_END: u32 = SECURITY_START + JOURNAL_PHYSICAL_SIZE as u32;
 
 /// Secure-area start with FUS 1.2.0 and the 802.15.4 MAC 1.24.0 stack on a
-/// 1 MiB part (SFSA = 0xE1), measured on the DK.
+/// 1 MiB part (SFSA = 0xE1), measured on the STM32WB5MM-DK and the
+/// Nucleo-WB55.
 pub const EXPECTED_SECURE_START: u32 = 0x080E_1000;
 
 const _: () = assert!(APPLICATION_END.is_multiple_of(PAGE_SIZE as u32));

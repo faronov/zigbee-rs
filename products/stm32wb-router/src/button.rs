@@ -1,9 +1,10 @@
-//! Product-owned button gestures for the router.
+//! Button gestures shared by the STM32WB router products.
 //!
-//! The composition root samples the active-low DK buttons B1 (PC12) and B2
-//! (PC13) between bounded application steps and feeds each level and a
-//! monotonic millisecond clock into its own [`ButtonGestures`]. The product
-//! decides what each gesture means ([`crate::actions`]):
+//! The composition root samples each board button between bounded
+//! application steps and feeds its logical level and a monotonic
+//! millisecond clock into its own [`ButtonGestures`]. Each product decides
+//! what a gesture means (its `actions` table, expressed in
+//! [`crate::actions::Action`]):
 //!
 //! - **short press** (released after at least [`SHORT_PRESS_MIN_MS`] and
 //!   before [`LONG_HOLD_MS`]), reported on release;

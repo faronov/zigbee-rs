@@ -1,9 +1,12 @@
-//! Status palette of the DK's TLC59731 RGB LED.
+//! Status palette shared by the STM32WB router products.
 //!
 //! The shared [`router_app::StatusIndicator`] selects the indication from
 //! the router lifecycle, the NWK permit-join state and identify; the product
-//! owns colours, brightness and patterns. The board's LED driver
-//! (`boards/stm32wb5mm-dk`, feature `rgb-led`) only writes the colour.
+//! owns colours, brightness and patterns. A board with an RGB LED (the
+//! STM32WB5MM-DK's TLC59731) writes the colour; a board with three discrete
+//! red/green/blue LEDs (Nucleo-WB55, USB dongle) lights each LED whose
+//! channel is non-zero ([`DiscreteLeds::from_rgb`]), so every state keeps a
+//! distinct LED combination.
 
 use router_app::{IndicationStyle, Rgb, StatusPalette};
 
@@ -33,6 +36,31 @@ pub static STATUS_PALETTE: StatusPalette = StatusPalette {
 
 const _: () = assert!(STATUS_PALETTE.is_valid());
 
+/// The palette colour on three discrete on/off LEDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiscreteLeds {
+    pub red: bool,
+    pub green: bool,
+    pub blue: bool,
+}
+
+impl DiscreteLeds {
+    pub const OFF: Self = Self {
+        red: false,
+        green: false,
+        blue: false,
+    };
+
+    /// Light each LED whose channel is non-zero.
+    pub const fn from_rgb(colour: Rgb) -> Self {
+        Self {
+            red: colour.r > 0,
+            green: colour.g > 0,
+            blue: colour.b > 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +84,18 @@ mod tests {
             assert!(c.r <= MAX_CHANNEL && c.g <= MAX_CHANNEL && c.b <= MAX_CHANNEL);
             for b in &ALL[i + 1..] {
                 assert_ne!(c, STATUS_PALETTE.style(*b).unwrap().color, "{a:?}/{b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_state_is_distinct_on_discrete_leds() {
+        for (i, a) in ALL.iter().enumerate() {
+            let leds = DiscreteLeds::from_rgb(STATUS_PALETTE.style(*a).unwrap().color);
+            assert_ne!(leds, DiscreteLeds::OFF, "{a:?} must light an LED");
+            for b in &ALL[i + 1..] {
+                let other = DiscreteLeds::from_rgb(STATUS_PALETTE.style(*b).unwrap().color);
+                assert_ne!(leds, other, "{a:?}/{b:?}");
             }
         }
     }

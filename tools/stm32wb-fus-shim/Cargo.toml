@@ -1,0 +1,25 @@
+[package]
+name = "stm32wb-fus-shim"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Flash-resident CPU1 sequencer that drives the STM32WB coprocessor FUS
+# (FUS upgrade, stack delete, MAC install) on a board without a debug probe
+# (P-NUCLEO-WB55 USB dongle, MB1293C), one step per boot. Programmed at
+# 0x08000000 over the ROM USB DFU bootloader (hwlab stm32dfu plugin); it only
+# writes its own log page. See README.md.
+[workspace]
+
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+debug = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

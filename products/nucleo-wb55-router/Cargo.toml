@@ -1,0 +1,19 @@
+[package]
+name = "nucleo-wb55-router-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product configuration for the Nucleo-WB55 Zigbee Router"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone, like the shared STM32WB router kit it builds on.
+[workspace]
+
+[dependencies]
+stm32wb-router-product = { path = "../stm32wb-router" }
+
+# Local ST MAC layout and mailbox-acknowledgement fixes: see
+# vendor/embassy-stm32-wpan/LOCAL-PATCHES.md.
+[patch."https://github.com/embassy-rs/embassy"]
+embassy-stm32-wpan = { path = "../../vendor/embassy-stm32-wpan" }

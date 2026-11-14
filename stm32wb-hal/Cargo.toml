@@ -13,10 +13,12 @@ publish = false
 [features]
 default = []
 # One feature per STM32WB55 package; the STM32WB5MMG module carries a
-# 1 MiB / 256 KiB STM32WB55VG die. Without a chip feature only the
+# 1 MiB / 256 KiB STM32WB55VG die, the Nucleo-WB55 an STM32WB55RG and the
+# USB dongle an STM32WB55CG. Without a chip feature only the
 # hardware-independent logic is built, which is what the host tests use.
 stm32wb55vg = ["_chip", "embassy-stm32/stm32wb55vg", "embassy-stm32-wpan/stm32wb55vg"]
 stm32wb55rg = ["_chip", "embassy-stm32/stm32wb55rg", "embassy-stm32-wpan/stm32wb55rg"]
+stm32wb55cg = ["_chip", "embassy-stm32/stm32wb55cg", "embassy-stm32-wpan/stm32wb55cg"]
 _chip = [
     "dep:embassy-stm32",
     "dep:embassy-stm32-wpan",

@@ -249,6 +249,8 @@ path-level evidence unless the row names the current MAC or image.
 | TLSR8258 TB-04 | environmental sleepy End Device | yes | prior evidence (hand-written MAC) covers the SUSPEND primitive; the current `SoftMacCore` image and repeated application/network acceptance remain open |
 | TLSR8258 TB-04 | child-capable router | yes | prior evidence covers join/restart/Link Status/relay; corrected-image child acceptance remains open |
 | STM32WB5MM-DK (STM32WB55, ST 802.15.4 MAC on CPU2) | router | yes | on `Stm32wbMac` over IPCC: ZHA join/interview as Router, Link Status, broadcast relay, RREP and journal reset/resume on one board with a sniffer; default image adds RGB LED, OLED, touch key, STTS22H/ISM330DHCX/VL53L0X and PDM mic as ZCL endpoints 1–4 (ZHA interview verified; Analog Input needs the bundled quirk); beacon response, child association/indirect delivery, OTA and long-duration runs remain open |
+| Nucleo-WB55 (STM32WB55RG, P-NUCLEO-WB55) | router (Basic + Identify, GP proxy) | yes | shared STM32WB router kit with the DK; after FUS 0.5.3→1.2.0 and MAC 1.24.0 through HWLab, one board joined ZHA as a Router (NWK 0xFEF4) and passed the interview; LED/button UX by eye, beacon response, child association, OTA and long-duration runs remain open |
+| P-NUCLEO-WB55 USB dongle (STM32WB55CG) | router (Basic + Identify, GP proxy), USB CDC log | yes | same kit; programmed through ROM USB DFU, with the coprocessor serviced by an SRAM FUS helper (`tools/stm32wb-fus-shim`); hardware bring-up pending |
 
 See [BUILD.md](BUILD.md) for pinned commands, partition boundaries, and exact
 remaining gates, and

@@ -125,8 +125,8 @@ pub async fn run(mut ui: Ui) -> ! {
             let touched = detector.update(count, now);
             if let Some(gesture) = gestures.sample(touched, now) {
                 match actions::action(Input::Touch(gesture)) {
-                    Action::NextPage => page = page.next(),
-                    Action::FirstPage => page = Page::Network,
+                    Some(Action::NextPage) => page = page.next(),
+                    Some(Action::FirstPage) => page = Page::Network,
                     _ => {}
                 }
                 next_draw = Instant::now();

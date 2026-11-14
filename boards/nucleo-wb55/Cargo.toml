@@ -1,0 +1,19 @@
+[package]
+name = "nucleo-wb55"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for the ST Nucleo-WB55 (MB1355C) of the P-NUCLEO-WB55 kit"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Standalone: Embassy is pinned by git in stm32wb-hal.
+[workspace]
+
+[dependencies]
+stm32wb-hal = { path = "../../stm32wb-hal", features = ["stm32wb55rg"] }
+
+# Local ST MAC layout and mailbox-acknowledgement fixes: see
+# vendor/embassy-stm32-wpan/LOCAL-PATCHES.md.
+[patch."https://github.com/embassy-rs/embassy"]
+embassy-stm32-wpan = { path = "../../vendor/embassy-stm32-wpan" }

@@ -18,7 +18,11 @@ publish = false
 default = ["green-power", "rgb-led", "lcd", "touch", "sensors", "mic"]
 # Green Power Proxy Basic: tunnels GPDFs to the sink and journals the Proxy
 # Table at 0x080CF000.
-green-power = ["router-app/green-power", "stm32wb5mm-dk-router-product/green-power"]
+green-power = [
+    "router-app/green-power",
+    "stm32wb5mm-dk-router-product/green-power",
+    "stm32wb-router-app/green-power",
+]
 # Lifecycle colours on the TLC59731 RGB LED.
 rgb-led = ["stm32wb5mm-dk/rgb-led"]
 # Network/traffic/sensor pages on the 128x64 SSD1315 OLED.
@@ -47,6 +51,7 @@ router-app = { path = "../../apps/router", features = ["router"] }
 stm32wb-hal = { path = "../../stm32wb-hal", features = ["stm32wb55vg"] }
 stm32wb5mm-dk = { path = "../../boards/stm32wb5mm-dk" }
 stm32wb5mm-dk-router-product = { path = "../../products/stm32wb5mm-dk-router" }
+stm32wb-router-app = { path = "../../apps/stm32wb-router" }
 
 # Same Embassy commit as stm32wb-hal.
 embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", features = ["platform-cortex-m", "executor-thread"] }
