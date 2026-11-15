@@ -25,6 +25,12 @@ proxy-bidirectional = ["proxy"]
 # Notification retries / acknowledgements, and protected IEEE-addressed
 # GPDF authentication / forwarding.
 proxy-full = ["proxy-bidirectional"]
+# GP Combo / Sink (GP server): Sink Table, sink commissioning mode, GPD
+# commissioning (direct and through Commissioning Notifications, including
+# bidirectional commissioning through a TempMaster), operational processing
+# of direct GPDFs and GP Notifications, Sink Table Request, and built-in
+# GPD → ZCL translation. A combo device also runs the full proxy.
+sink = ["proxy-full"]
 # Green Power Device side: GPDF builder, commissioning payload builder, key
 # wrapping and outgoing frame-counter handling.
 gpd = []

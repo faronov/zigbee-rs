@@ -14,6 +14,7 @@
 //! * [`dup`] – the GP duplicate filter;
 //! * [`proxy`] (feature `proxy`) – the Proxy Basic state machine and proxy
 //!   table;
+//! * [`translation`] (feature `sink`) – GPD → ZCL command translation;
 //! * [`gpd`] (feature `gpd`) – Green Power Device-side transmission helpers.
 //!
 //! The crate never touches a radio, a clock or flash directly. Callers feed
@@ -40,6 +41,8 @@ pub mod types;
 pub mod gpd;
 #[cfg(feature = "proxy")]
 pub mod proxy;
+#[cfg(feature = "sink")]
+pub mod translation;
 
 /// The Green Power endpoint (GPEP).
 pub const GP_ENDPOINT: u8 = 242;
