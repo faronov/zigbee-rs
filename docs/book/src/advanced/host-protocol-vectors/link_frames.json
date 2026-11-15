@@ -1,0 +1,175 @@
+{
+  "session": {
+    "host_cookie": "1a2b3c4d",
+    "ncp_cookie": "c0ffee01",
+    "epoch": 33,
+    "epoch_rule": "1 + crc32c(host_cookie_le32 || ncp_cookie_le32) % 255"
+  },
+  "max_wire_len_in_set": 656,
+  "vectors": [
+    {
+      "name": "reset_req_host",
+      "note": "host opens the port; epoch 0; reason 4 = host open",
+      "type": 3,
+      "fields": {},
+      "payload_hex": "4d3c2b1a00000000000120048002e803f401b80b0501040208030404040502",
+      "decoded_hex": "4300000000001f004d3c2b1a00000000000120048002e803f401b80b05010402080304040405025c29e1a3",
+      "crc32c": "a3e1295c",
+      "wire_hex": "024301010101021f054d3c2b1a010101011b0120048002e803f401b80b05010402080304040405025c29e1a300"
+    },
+    {
+      "name": "reset_ack_ncp",
+      "note": "NCP accepts; window 16 toward the NCP; LOG credit 0",
+      "type": 4,
+      "fields": {},
+      "payload_hex": "01eeffc04d3c2b1a010110008002e803f401b80b0501040208030404020500",
+      "decoded_hex": "4400000000001f0001eeffc04d3c2b1a010110008002e803f401b80b0501040208030404020500585404f7",
+      "crc32c": "f7045458",
+      "wire_hex": "024401010101021f0c01eeffc04d3c2b1a010110138002e803f401b80b0501040208030404020505585404f700"
+    },
+    {
+      "name": "data_negotiate",
+      "note": "first DATA on SYSTEM: seq 0, ep_seq 0",
+      "type": 0,
+      "fields": {
+        "epoch": 33,
+        "endpoint": 1,
+        "seq": 0,
+        "ack": 0,
+        "ep_seq": 0
+      },
+      "payload_hex": "00010001001800010100000000000000000d7a696770792d7a72732f302e31",
+      "decoded_hex": "4021010000001f0000010001001800010100000000000000000d7a696770792d7a72732f302e312c806407",
+      "crc32c": "0764802c",
+      "wire_hex": "044021010101021f0102010201021803010101010101010101130d7a696770792d7a72732f302e312c80640700"
+    },
+    {
+      "name": "data_batch_two_messages",
+      "note": "SYS_ECHO and SYS_GET_STATUS batched in one frame",
+      "type": 0,
+      "fields": {
+        "epoch": 33,
+        "endpoint": 1,
+        "seq": 1,
+        "ack": 0,
+        "ep_seq": 1
+      },
+      "payload_hex": "0007000200040070696e6700040003000000",
+      "decoded_hex": "40210101000112000007000200040070696e6700040003000000d481e096",
+      "crc32c": "96e081d4",
+      "wire_hex": "0540210101030112010207020202040570696e6702040203010105d481e09600"
+    },
+    {
+      "name": "data_retransmit_poll",
+      "note": "retransmission of seq 1 after RTO, RETX|POLL",
+      "type": 0,
+      "fields": {
+        "epoch": 33,
+        "endpoint": 1,
+        "seq": 1,
+        "ack": 0,
+        "ep_seq": 1,
+        "flags": 48
+      },
+      "payload_hex": "0007000200040070696e6700040003000000",
+      "decoded_hex": "70210101000112000007000200040070696e670004000300000013005de0",
+      "crc32c": "e05d0013",
+      "wire_hex": "0570210101030112010207020202040570696e670204020301010213035de000"
+    },
+    {
+      "name": "ack_plain",
+      "note": "cumulative ack 5, nothing beyond",
+      "type": 1,
+      "fields": {
+        "epoch": 33,
+        "ack": 5
+      },
+      "payload_hex": "000000000000",
+      "decoded_hex": "4121000005000600000000000000f0858102",
+      "crc32c": "028185f0",
+      "wire_hex": "034121010205020601010101010105f085810200"
+    },
+    {
+      "name": "nak_gap",
+      "note": "seq 2 missing; 3 and 4 received (sack bits 0,1)",
+      "type": 2,
+      "fields": {
+        "epoch": 33,
+        "ack": 2
+      },
+      "payload_hex": "030000000000",
+      "decoded_hex": "4221000002000600030000000000793e4fb1",
+      "crc32c": "b14f3e79",
+      "wire_hex": "034221010202020602030101010105793e4fb100"
+    },
+    {
+      "name": "nak_crc_error",
+      "note": "one CRC-failed frame since seq 0 was received",
+      "type": 2,
+      "fields": {
+        "epoch": 33,
+        "ack": 1
+      },
+      "payload_hex": "000000000100",
+      "decoded_hex": "4221000001000600000000000100ca9747ce",
+      "crc32c": "ce4797ca",
+      "wire_hex": "034221010201020601010101020105ca9747ce00"
+    },
+    {
+      "name": "ack_with_credits",
+      "note": "ack 9 and credit edges ZIGBEE=17, BULK=6",
+      "type": 1,
+      "fields": {
+        "epoch": 33,
+        "ack": 9
+      },
+      "payload_hex": "00000000000202110406",
+      "decoded_hex": "4121000009000a0000000000000202110406645df9f1",
+      "crc32c": "f1f95d64",
+      "wire_hex": "034121010209020a01010101010a0202110406645df9f100"
+    },
+    {
+      "name": "keepalive_poll",
+      "note": "idle keepalive: ACK with POLL",
+      "type": 1,
+      "fields": {
+        "epoch": 33,
+        "ack": 9,
+        "flags": 32
+      },
+      "payload_hex": "000000000000",
+      "decoded_hex": "6121000009000600000000000000d3e967c3",
+      "crc32c": "c367e9d3",
+      "wire_hex": "036121010209020601010101010105d3e967c300"
+    },
+    {
+      "name": "reject_no_credit",
+      "note": "DATA seq 7 on BULK ep_seq 6 rejected: NO_CREDIT",
+      "type": 5,
+      "fields": {
+        "epoch": 33,
+        "ack": 8
+      },
+      "payload_hex": "07040601",
+      "decoded_hex": "452100000800040007040601be21957b",
+      "crc32c": "7b9521be",
+      "wire_hex": "03452101020802040907040601be21957b00"
+    },
+    {
+      "name": "data_max_payload",
+      "note": "640-byte payload; worst-case size check",
+      "type": 0,
+      "fields": {
+        "epoch": 33,
+        "endpoint": 4,
+        "seq": 200,
+        "ack": 17,
+        "ep_seq": 99
+      },
+      "payload_hex": "01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a",
+      "decoded_hex": "402104c81163800201080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737af4987fd8",
+      "crc32c": "d87f98f4",
+      "wire_hex": "52402104c81163800201080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f9ff070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf202f9ff070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf202f93b070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737af4987fd800"
+    }
+  ]
+}
