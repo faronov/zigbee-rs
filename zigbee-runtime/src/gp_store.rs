@@ -1265,8 +1265,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
     ) -> Result<(Option<SinkBase>, EntryLayout), GpStoreError> {
         let empty = EntryLayout {
             entries: 0,
-            tags: [0; GP_SINK_TABLE_ENTRIES],
-            counter_at: [0; GP_SINK_TABLE_ENTRIES],
+            tags: [0; LAYOUT_ENTRIES],
+            counter_at: [0; LAYOUT_ENTRIES],
         };
         if let Some(snapshot) = snapshot.as_deref_mut() {
             snapshot.set_sink_validated(&[0]);
@@ -2239,11 +2239,14 @@ pub(crate) mod tests {
             assert_eq!(snapshot.sink_len(), 2);
             assert_eq!(sink_counters(&snapshot).as_slice(), &[7, 9]);
             assert!(PersistentGpProxyTable::default().is_empty());
-            let full: heapless::Vec<SinkEntry, 8> = (0..8).map(|i| sink_entry(i, i)).collect();
+            let full: heapless::Vec<SinkEntry, GP_SINK_TABLE_ENTRIES> = (0..GP_SINK_TABLE_ENTRIES
+                as u32)
+                .map(|i| sink_entry(i + 1, i))
+                .collect();
+            let over: heapless::Vec<SinkEntry, { GP_SINK_TABLE_ENTRIES + 1 }> =
+                full.iter().cloned().chain([sink_entry(0x99, 9)]).collect();
             assert_eq!(
-                capture(&[])
-                    .with_sink(&[full.as_slice(), &[sink_entry(9, 9)]].concat())
-                    .err(),
+                capture(&[]).with_sink(&over).err(),
                 Some(GpStoreError::Full)
             );
             let _ = capture(&[]).with_sink(&full).unwrap();
