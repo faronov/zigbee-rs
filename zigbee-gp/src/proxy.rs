@@ -1035,7 +1035,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                     0
                 };
                 let full_proxy = if cfg!(feature = "proxy-full") {
-                    functionality::IEEE_ADDRESS
+                    functionality::FULL_UNICAST | functionality::IEEE_ADDRESS
                 } else {
                     0
                 };
@@ -2326,7 +2326,7 @@ mod tests {
             u32::from_le_bytes([out[0], out[1], out[2], 0]),
             functionality::BASIC_PROXY
                 | if cfg!(feature = "proxy-full") {
-                    functionality::IEEE_ADDRESS
+                    functionality::FULL_UNICAST | functionality::IEEE_ADDRESS
                 } else {
                     0
                 }
