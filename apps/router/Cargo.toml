@@ -24,6 +24,8 @@ rejoin-request = []
 green-power = ["router", "zigbee-runtime/green-power"]
 # GP TempMaster (bidirectional proxy). Needs a MAC with `timed-tx`.
 green-power-bidirectional = ["green-power", "zigbee-runtime/green-power-bidirectional"]
+# Experimental Full Proxy capabilities; product images must opt in explicitly.
+green-power-full-proxy = ["green-power-bidirectional", "zigbee-runtime/green-power-full-proxy"]
 
 [dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }

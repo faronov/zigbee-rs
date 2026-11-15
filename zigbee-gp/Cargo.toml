@@ -21,8 +21,9 @@ proxy = []
 # Bidirectional proxy operation: gpTxQueue, GP Response handling, TempMaster
 # role (Commissioning Reply / Channel Configuration delivery).
 proxy-bidirectional = ["proxy"]
-# Full proxy: full unicast with GP Notification Response / retries, Tunneling
-# Stop, Pairing Search and proxy-table maintenance.
+# Full proxy capability gate. Currently enables full-unicast Pairing,
+# Notification retries / acknowledgements, and protected IEEE-addressed
+# GPDF authentication / forwarding.
 proxy-full = ["proxy-bidirectional"]
 # Green Power Device side: GPDF builder, commissioning payload builder, key
 # wrapping and outgoing frame-counter handling.

@@ -94,8 +94,8 @@ impl Gpdf<'_> {
 /// Parse the NWK part of a GPDF.
 ///
 /// `mac_src_ieee` must carry the MAC source extended address for
-/// ApplicationID 0b010 frames. Security level 0b01 (deprecated) and
-/// protected ApplicationID 0b010 frames return [`Error::Unsupported`].
+/// ApplicationID 0b010 frames. Security level 0b01 (deprecated) returns
+/// [`Error::Unsupported`].
 pub fn parse(msdu: &[u8], mac_seq: u8, mac_src_ieee: Option<IeeeAddress>) -> Result<Gpdf<'_>> {
     let mut r = Reader::new(msdu);
     let fc = r.u8()?;
@@ -147,9 +147,6 @@ pub fn parse(msdu: &[u8], mac_seq: u8, mac_src_ieee: Option<IeeeAddress>) -> Res
             }
         }
         ApplicationId::Ieee => {
-            if header.security_level != SecurityLevel::None {
-                return Err(Error::Unsupported);
-            }
             let endpoint = r.u8()?;
             let ieee = mac_src_ieee.ok_or(Error::Unsupported)?;
             header.gpd_id = Some(GpdId::Ieee { ieee, endpoint });
@@ -375,6 +372,31 @@ mod tests {
         assert_eq!(f.header.frame_type, FrameType::Maintenance);
         assert_eq!(f.header.gpd_id, None);
         assert_eq!(f.payload, &[0xE3, 0x45]);
+    }
+
+    #[test]
+    fn parses_protected_ieee_application_id() {
+        let ieee = [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE];
+        let msdu = [
+            0x8C, // data, protocol 3, extended NWK frame control
+            0x1A, // IEEE ApplicationID, encrypted security level
+            0x0B, // GPD endpoint
+            0x02, 0x00, 0x00, 0x00, // frame counter
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, // ciphertext and MIC
+        ];
+        let f = parse(&msdu, 7, Some(ieee)).unwrap();
+        assert_eq!(f.header.app_id, ApplicationId::Ieee);
+        assert_eq!(
+            f.header.gpd_id,
+            Some(GpdId::Ieee {
+                ieee,
+                endpoint: 0x0B
+            })
+        );
+        assert_eq!(f.header.frame_counter, 2);
+        assert_eq!(f.raw_header, &msdu[..7]);
+        assert_eq!(f.payload, &[0xAA]);
+        assert_eq!(f.mic, Some([0xBB, 0xCC, 0xDD, 0xEE]));
     }
 
     #[test]

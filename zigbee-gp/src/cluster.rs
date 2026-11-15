@@ -145,8 +145,7 @@ pub mod functionality {
         | CT_BASED_COMMISSIONING
         | SECURITY_LEVEL_0
         | SECURITY_LEVEL_2
-        | SECURITY_LEVEL_3
-        | IEEE_ADDRESS;
+        | SECURITY_LEVEL_3;
 }
 
 fn read_gpd_id(r: &mut Reader<'_>, app: ApplicationId) -> Result<GpdId> {
@@ -844,6 +843,55 @@ impl NotificationResponse {
     }
 }
 
+/// GP Tunneling Stop (client → server 0x03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunnelingStop {
+    /// Options byte; the low three bits select the GPD ApplicationID.
+    pub options: u8,
+    /// GPD identity.
+    pub gpd_id: GpdId,
+    /// Last GPD security frame counter.
+    pub frame_counter: u32,
+    /// Proxy IEEE short address.
+    pub gpp_short_address: u16,
+    /// Proxy distance.
+    pub gpp_distance: i8,
+}
+
+impl TunnelingStop {
+    /// Encode into `out`, returning the length.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize> {
+        if self.options & 0x07 != self.gpd_id.application_id() as u8 {
+            return Err(Error::Unsupported);
+        }
+        let mut w = Writer::new(out);
+        w.u8(self.options)?;
+        write_gpd_id(&mut w, &self.gpd_id)?;
+        w.u32(self.frame_counter)?;
+        w.u16(self.gpp_short_address)?;
+        w.u8(self.gpp_distance as u8)?;
+        Ok(w.len())
+    }
+
+    /// Strictly decode.
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        let options = r.u8()?;
+        let gpd_id = read_gpd_id(&mut r, ApplicationId::from_bits(options)?)?;
+        let frame_counter = r.u32()?;
+        let gpp_short_address = r.u16()?;
+        let gpp_distance = r.u8()? as i8;
+        r.finish()?;
+        Ok(Self {
+            options,
+            gpd_id,
+            frame_counter,
+            gpp_short_address,
+            gpp_distance,
+        })
+    }
+}
+
 /// GP Pairing Search (client → server 0x01).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairingSearch {
@@ -1003,5 +1051,44 @@ mod tests {
             Notification::decode(&buf[..len + 1]),
             Err(Error::TrailingBytes)
         );
+    }
+
+    #[test]
+    fn tunneling_stop_round_trips_srcid_and_ieee_payloads() {
+        for stop in [
+            TunnelingStop {
+                options: 0,
+                gpd_id: GpdId::SrcId(0x0102_0304),
+                frame_counter: 0x1122_3344,
+                gpp_short_address: 0x5566,
+                gpp_distance: -7,
+            },
+            TunnelingStop {
+                options: 2,
+                gpd_id: GpdId::Ieee {
+                    ieee: [1, 2, 3, 4, 5, 6, 7, 8],
+                    endpoint: 9,
+                },
+                frame_counter: 0x1122_3344,
+                gpp_short_address: 0x5566,
+                gpp_distance: -7,
+            },
+        ] {
+            let mut buf = [0u8; 32];
+            let len = stop.encode(&mut buf).unwrap();
+            if matches!(stop.gpd_id, GpdId::SrcId(_)) {
+                assert_eq!(
+                    &buf[..len],
+                    &[
+                        0x00, 0x04, 0x03, 0x02, 0x01, 0x44, 0x33, 0x22, 0x11, 0x66, 0x55, 0xF9,
+                    ]
+                );
+            }
+            assert_eq!(TunnelingStop::decode(&buf[..len]).unwrap(), stop);
+            assert_eq!(
+                TunnelingStop::decode(&buf[..len + 1]),
+                Err(Error::TrailingBytes)
+            );
+        }
     }
 }

@@ -75,6 +75,9 @@ const ZCL_SERVER_TO_CLIENT: u8 = 0x08;
 const ZCL_DISABLE_DEFAULT_RESPONSE: u8 = 0x10;
 const ZCL_READ_ATTRIBUTES: u8 = 0x00;
 const ZCL_READ_ATTRIBUTES_RESPONSE: u8 = 0x01;
+const ZCL_WRITE_ATTRIBUTES: u8 = 0x02;
+const ZCL_WRITE_ATTRIBUTES_RESPONSE: u8 = 0x04;
+const ZCL_DEFAULT_RESPONSE: u8 = 0x0B;
 const ZCL_UNSUPPORTED_ATTRIBUTE: u8 = 0x86;
 const ZCL_INSUFFICIENT_SPACE: u8 = 0x89;
 
@@ -446,8 +449,12 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                     );
                 }
             }
-        } else if fc & 0x03 == 0 && to_client && command == ZCL_READ_ATTRIBUTES {
-            self.gp_read_attributes(src_addr, tsn, payload);
+        } else if fc & 0x03 == 0 && to_client {
+            match command {
+                ZCL_READ_ATTRIBUTES => self.gp_read_attributes(src_addr, tsn, payload),
+                ZCL_WRITE_ATTRIBUTES => self.gp_write_attributes(src_addr, tsn, payload),
+                _ => {}
+            }
         }
         true
     }
@@ -545,7 +552,30 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                     payload,
                 },
             },
-            zcl_frame_control: ZCL_DISABLE_DEFAULT_RESPONSE,
+            zcl_frame_control: ZCL_SERVER_TO_CLIENT | ZCL_DISABLE_DEFAULT_RESPONSE,
+            tsn: Some(tsn),
+        });
+    }
+
+    /// Apply Write Attributes to the Full Proxy retry controls and answer
+    /// unsupported/read-only attributes with their ZCL status.
+    fn gp_write_attributes(&mut self, src_addr: u16, tsn: u8, request: &[u8]) {
+        let (command_id, payload) =
+            gp_write_attributes_response(&mut self.green_power.proxy, request);
+        self.green_power.reply = Some(OutFrame {
+            tx: GpTx {
+                dest: DestAddr::Unicast {
+                    nwk: src_addr,
+                    ieee: None,
+                },
+                alias: None,
+                radius: 0,
+                frame: TxFrame::GpCommand {
+                    command_id,
+                    payload,
+                },
+            },
+            zcl_frame_control: ZCL_SERVER_TO_CLIENT | ZCL_DISABLE_DEFAULT_RESPONSE,
             tsn: Some(tsn),
         });
     }
@@ -695,6 +725,107 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
     }
 }
 
+/// Build the response to a GP client-attribute Write Attributes request.
+/// Malformed records are rejected as a whole before the proxy configuration
+/// is changed.
+fn gp_write_attributes_response(
+    proxy: &mut GpProxy,
+    request: &[u8],
+) -> (
+    u8,
+    heapless::Vec<u8, { zigbee_gp::proxy::MAX_GP_COMMAND_LEN }>,
+) {
+    use zigbee_zcl::ZclStatus;
+    #[cfg(feature = "green-power-full-proxy")]
+    use zigbee_zcl::data_types::ZclValue;
+    use zigbee_zcl::foundation::write_attributes::{
+        WriteAttributeStatusRecord, WriteAttributesRequest, WriteAttributesResponse,
+    };
+
+    let Ok(parsed) = WriteAttributesRequest::parse_checked(request) else {
+        let mut payload = heapless::Vec::new();
+        let _ =
+            payload.extend_from_slice(&[ZCL_WRITE_ATTRIBUTES, ZclStatus::MalformedCommand as u8]);
+        return (ZCL_DEFAULT_RESPONSE, payload);
+    };
+
+    #[cfg(feature = "green-power-full-proxy")]
+    let mut config = *proxy.config();
+    #[cfg(feature = "green-power-full-proxy")]
+    let mut config_changed = false;
+    let mut response = WriteAttributesResponse {
+        records: heapless::Vec::new(),
+    };
+    let mut valid_records = parsed.request.records.iter();
+    let mut invalid_records = parsed.invalid_data_types.iter().peekable();
+    let record_count = parsed.request.records.len() + parsed.invalid_data_types.len();
+
+    for ordinal in 0..record_count {
+        let record_status = if invalid_records
+            .peek()
+            .is_some_and(|failure| usize::from(failure.ordinal) == ordinal)
+        {
+            invalid_records.next().map(|failure| failure.record)
+        } else {
+            valid_records.next().map(|record| {
+                let id = record.id.0;
+                let status = match id {
+                    #[cfg(feature = "green-power-full-proxy")]
+                    zigbee_gp::cluster::attr::GPP_NOTIFICATION_RETRY_NUMBER => {
+                        match (record.data_type, &record.value) {
+                            (zigbee_zcl::data_types::ZclDataType::U8, ZclValue::U8(value)) => {
+                                config.notification_retry_number = *value;
+                                config_changed = true;
+                                ZclStatus::Success
+                            }
+                            _ => ZclStatus::InvalidDataType,
+                        }
+                    }
+                    #[cfg(feature = "green-power-full-proxy")]
+                    zigbee_gp::cluster::attr::GPP_NOTIFICATION_RETRY_TIMER => {
+                        match (record.data_type, &record.value) {
+                            (zigbee_zcl::data_types::ZclDataType::U8, ZclValue::U8(value)) => {
+                                config.notification_retry_timer_ms = *value;
+                                config_changed = true;
+                                ZclStatus::Success
+                            }
+                            _ => ZclStatus::InvalidDataType,
+                        }
+                    }
+                    _ => {
+                        let mut value = [0u8; zigbee_gp::proxy::MAX_GP_COMMAND_LEN];
+                        match proxy.read_attribute(id, &mut value) {
+                            Ok(Some(_)) | Err(zigbee_gp::Error::BufferFull) => ZclStatus::ReadOnly,
+                            Ok(None) => ZclStatus::UnsupportedAttribute,
+                            Err(error) => {
+                                log::warn!("[GP] attribute 0x{:04X} read failed: {:?}", id, error);
+                                ZclStatus::Failure
+                            }
+                        }
+                    }
+                };
+                WriteAttributeStatusRecord {
+                    status,
+                    id: record.id,
+                }
+            })
+        };
+        if let Some(status) = record_status {
+            let _ = response.records.push(status);
+        }
+    }
+
+    #[cfg(feature = "green-power-full-proxy")]
+    if config_changed {
+        proxy.set_config(config);
+    }
+    let mut payload = heapless::Vec::new();
+    let mut encoded = [0u8; zigbee_gp::proxy::MAX_GP_COMMAND_LEN];
+    let len = response.serialize(&mut encoded);
+    let _ = payload.extend_from_slice(&encoded[..len]);
+    (ZCL_WRITE_ATTRIBUTES_RESPONSE, payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,6 +854,75 @@ mod tests {
             Some((0x1D, 0x07, 0x02, &[][..]))
         );
         assert_eq!(parse_zcl(&[0x19, 0x07]), None);
+    }
+
+    #[cfg(feature = "green-power-full-proxy")]
+    #[test]
+    fn write_attributes_updates_full_proxy_retry_controls() {
+        let mut proxy = GpProxy::new(ProxyConfig::default());
+        let (command, response) = gp_write_attributes_response(
+            &mut proxy,
+            &[
+                0x12, 0x00, 0x20, 0x03, // retry count
+                0x13, 0x00, 0x20, 0x32, // retry timer, 50 ms
+            ],
+        );
+        assert_eq!(command, ZCL_WRITE_ATTRIBUTES_RESPONSE);
+        assert_eq!(response.as_slice(), &[0]);
+        assert_eq!(proxy.config().notification_retry_number, 3);
+        assert_eq!(proxy.config().notification_retry_timer_ms, 50);
+    }
+
+    #[cfg(feature = "green-power-full-proxy")]
+    #[test]
+    fn malformed_write_attributes_does_not_change_proxy_config() {
+        let mut proxy = GpProxy::new(ProxyConfig::default());
+        let (command, response) = gp_write_attributes_response(&mut proxy, &[0x12, 0x00, 0x20]);
+        assert_eq!(command, ZCL_DEFAULT_RESPONSE);
+        assert_eq!(
+            response.as_slice(),
+            &[
+                ZCL_WRITE_ATTRIBUTES,
+                zigbee_zcl::ZclStatus::MalformedCommand as u8
+            ]
+        );
+        assert_eq!(
+            proxy.config().notification_retry_number,
+            zigbee_gp::proxy::DEFAULT_NOTIFICATION_RETRY_NUMBER
+        );
+    }
+
+    #[cfg(feature = "green-power-full-proxy")]
+    #[test]
+    fn write_attributes_reports_type_read_only_and_unknown_errors() {
+        let mut proxy = GpProxy::new(ProxyConfig::default());
+        let (command, response) = gp_write_attributes_response(
+            &mut proxy,
+            &[
+                0x12, 0x00, 0x21, 0x03, 0x00, // retry count with wrong type
+                0x10, 0x00, 0x20, 0x03, // read-only max proxy table entries
+                0x34, 0x12, 0x20, 0x03, // unknown attribute
+            ],
+        );
+        assert_eq!(command, ZCL_WRITE_ATTRIBUTES_RESPONSE);
+        assert_eq!(
+            response.as_slice(),
+            &[
+                zigbee_zcl::ZclStatus::InvalidDataType as u8,
+                0x12,
+                0x00,
+                zigbee_zcl::ZclStatus::ReadOnly as u8,
+                0x10,
+                0x00,
+                ZCL_UNSUPPORTED_ATTRIBUTE,
+                0x34,
+                0x12,
+            ]
+        );
+        assert_eq!(
+            proxy.config().notification_retry_number,
+            zigbee_gp::proxy::DEFAULT_NOTIFICATION_RETRY_NUMBER
+        );
     }
 
     #[test]
