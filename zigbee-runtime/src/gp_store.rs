@@ -17,6 +17,10 @@
 //!   [`ZigbeeDevice::save_gp_proxy_table_if_dirty`] and
 //!   [`ZigbeeDevice::clear_persisted_gp_proxy_table`] are the lifecycle.
 //!
+//! With `green-power-sink` the same snapshot and journal also carry the
+//! combo's Sink Table (see [`GpProxyJournal`]); journals written without it
+//! load unchanged.
+//!
 //! The proxy marks its table dirty when an entry changes and, for incoming
 //! GPD frame counters, only every
 //! [`ProxyConfig::counter_persist_stride`](zigbee_gp::proxy::ProxyConfig)
@@ -35,13 +39,23 @@ use zigbee_types::IeeeAddress;
 
 use crate::ZigbeeDevice;
 use crate::green_power::GP_PROXY_TABLE_ENTRIES;
+#[cfg(feature = "green-power-sink")]
+use crate::green_power::GP_SINK_TABLE_ENTRIES;
 use crate::role::DeviceRole;
 use crate::security_journal::crc32;
+#[cfg(feature = "green-power-sink")]
+use zigbee_gp::sink::{MAX_SINK_ENTRY_ENCODED_LEN, SinkEntry};
 
 /// Largest encoded snapshot payload: an entry count, then every entry as a
 /// length byte followed by its Proxy Table attribute encoding.
 pub const MAX_ENCODED_GP_PROXY_TABLE_LEN: usize =
     1 + GP_PROXY_TABLE_ENTRIES * (1 + MAX_ENTRY_ENCODED_LEN);
+
+/// Largest encoded Sink Table payload: an entry count, then every entry as a
+/// length byte followed by its Sink Table attribute encoding.
+#[cfg(feature = "green-power-sink")]
+pub const MAX_ENCODED_GP_SINK_TABLE_LEN: usize =
+    1 + GP_SINK_TABLE_ENTRIES * (1 + MAX_SINK_ENTRY_ENCODED_LEN);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpStoreError {
@@ -63,15 +77,23 @@ pub struct PersistentGpProxyTable {
     extended_pan_id: IeeeAddress,
     len: usize,
     payload: [u8; MAX_ENCODED_GP_PROXY_TABLE_LEN],
+    /// The combo's Sink Table, same layout (count, then length-prefixed
+    /// Sink Table attribute entries).
+    #[cfg(feature = "green-power-sink")]
+    sink_len: usize,
+    #[cfg(feature = "green-power-sink")]
+    sink_payload: [u8; MAX_ENCODED_GP_SINK_TABLE_LEN],
 }
 
 impl core::fmt::Debug for PersistentGpProxyTable {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // The payload carries GPD keys: never print it.
-        f.debug_struct("PersistentGpProxyTable")
-            .field("extended_pan_id", &self.extended_pan_id)
-            .field("entries", &self.payload[0])
-            .finish_non_exhaustive()
+        let mut f = f.debug_struct("PersistentGpProxyTable");
+        f.field("extended_pan_id", &self.extended_pan_id)
+            .field("entries", &self.payload[0]);
+        #[cfg(feature = "green-power-sink")]
+        f.field("sink_entries", &self.sink_payload[0]);
+        f.finish_non_exhaustive()
     }
 }
 
@@ -88,6 +110,10 @@ impl PersistentGpProxyTable {
             extended_pan_id,
             len: 1,
             payload: [0; MAX_ENCODED_GP_PROXY_TABLE_LEN],
+            #[cfg(feature = "green-power-sink")]
+            sink_len: 1,
+            #[cfg(feature = "green-power-sink")]
+            sink_payload: [0; MAX_ENCODED_GP_SINK_TABLE_LEN],
         }
     }
 
@@ -153,7 +179,13 @@ impl PersistentGpProxyTable {
         self.payload[0] as usize
     }
 
+    /// Whether the snapshot holds no Proxy Table (and, with
+    /// `green-power-sink`, no Sink Table) entry.
     pub fn is_empty(&self) -> bool {
+        #[cfg(feature = "green-power-sink")]
+        if self.sink_len() != 0 {
+            return false;
+        }
         self.len() == 0
     }
 
@@ -199,6 +231,94 @@ impl PersistentGpProxyTable {
             failed = decoded.is_err();
             Some(decoded)
         })
+    }
+}
+
+#[cfg(feature = "green-power-sink")]
+impl PersistentGpProxyTable {
+    /// Add the Sink Table `entries` to a snapshot.
+    pub fn with_sink(mut self, entries: &[SinkEntry]) -> Result<Self, GpStoreError> {
+        if entries.len() > GP_SINK_TABLE_ENTRIES {
+            return Err(GpStoreError::Full);
+        }
+        self.sink_payload[0] = entries.len() as u8;
+        let mut at = 1;
+        for entry in entries {
+            let out = &mut self.sink_payload[at + 1..at + 1 + MAX_SINK_ENTRY_ENCODED_LEN];
+            let n = entry.encode(out).map_err(|_| GpStoreError::Corrupt)?;
+            self.sink_payload[at] = n as u8;
+            at += 1 + n;
+        }
+        self.sink_len = at;
+        Ok(self)
+    }
+
+    /// Number of stored Sink Table entries.
+    pub fn sink_len(&self) -> usize {
+        self.sink_payload[0] as usize
+    }
+
+    pub fn sink_payload(&self) -> &[u8] {
+        &self.sink_payload[..self.sink_len]
+    }
+
+    /// Decode the stored Sink Table entries.
+    pub fn sink_entries(&self) -> impl Iterator<Item = Result<SinkEntry, GpStoreError>> + '_ {
+        let payload = self.sink_payload();
+        let mut at = 1usize;
+        let mut left = payload[0] as usize;
+        let mut failed = false;
+        core::iter::from_fn(move || {
+            if failed {
+                return None;
+            }
+            if left == 0 {
+                if at != payload.len() {
+                    failed = true;
+                    return Some(Err(GpStoreError::Corrupt));
+                }
+                return None;
+            }
+            left -= 1;
+            let decoded = (|| {
+                let n = *payload.get(at).ok_or(GpStoreError::Corrupt)? as usize;
+                let bytes = payload
+                    .get(at + 1..at + 1 + n)
+                    .ok_or(GpStoreError::Corrupt)?;
+                let (entry, used) = SinkEntry::decode(bytes).map_err(|_| GpStoreError::Corrupt)?;
+                if used != n {
+                    return Err(GpStoreError::Corrupt);
+                }
+                at += 1 + n;
+                Ok(entry)
+            })();
+            failed = decoded.is_err();
+            Some(decoded)
+        })
+    }
+
+    /// Validate a stored Sink Table payload in place.
+    fn validate_sink_payload(payload: &[u8]) -> Result<(), GpStoreError> {
+        if payload.is_empty() || payload.len() > MAX_ENCODED_GP_SINK_TABLE_LEN {
+            return Err(GpStoreError::Corrupt);
+        }
+        let layout = SinkPayloadLayout::of(payload)?;
+        let mut snapshot = Self::empty([0; 8]);
+        snapshot.set_sink_validated(payload);
+        let mut count = 0usize;
+        for entry in snapshot.sink_entries() {
+            entry?;
+            count += 1;
+        }
+        if count != layout.entries {
+            return Err(GpStoreError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn set_sink_validated(&mut self, payload: &[u8]) {
+        self.sink_payload[..payload.len()].copy_from_slice(payload);
+        self.sink_len = payload.len();
     }
 }
 
@@ -263,6 +383,21 @@ const RECORD_COMMIT: [u8; 4] = *b"CMIT";
 // base generation, GPD ID tag, frame counter, CRC32 of bytes 0..20, then
 // the commit marker at 24..28; 28..32 stay erased.
 const COUNTER_MAGIC: [u8; 4] = *b"ZBGC";
+/// Sink Table record magic (`green-power-sink`). A sink record has the
+/// full-record layout and immediately precedes, in the same sector, the
+/// Proxy Table record of the same generation.
+#[cfg(feature = "green-power-sink")]
+const SINK_RECORD_MAGIC: [u8; 4] = *b"ZBGS";
+/// Byte 7 of a Proxy Table record (zero, and not checked, in the original
+/// format): set when a sink record of the same generation precedes it. A
+/// lone sink record left by an interrupted pair write is never paired with a
+/// later Proxy Table record that reuses its generation.
+#[cfg(feature = "green-power-sink")]
+const RECORD_PAIRED_WITH_SINK: u8 = 0x01;
+/// Counter records of Sink Table entries carry this bit in the entry index;
+/// firmware without the sink ignores them (index beyond its table).
+#[cfg(feature = "green-power-sink")]
+const SINK_COUNTER_INDEX: u8 = 0x80;
 const COUNTER_VERSION: u8 = 1;
 const COUNTER_CRC_OFFSET: usize = 20;
 const COUNTER_COMMIT_OFFSET: usize = 24;
@@ -270,6 +405,12 @@ const COUNTER_COMMIT_OFFSET: usize = 24;
 const _: () = assert!(RECORD_PAYLOAD_OFFSET + MAX_ENCODED_GP_PROXY_TABLE_LEN <= RECORD_CRC_OFFSET);
 const _: () = assert!(GP_PROXY_JOURNAL_SLOT_SIZE.is_multiple_of(GP_COUNTER_RECORD_SIZE));
 const _: () = assert!(GP_PROXY_TABLE_ENTRIES <= u8::MAX as usize);
+#[cfg(feature = "green-power-sink")]
+const _: () = assert!(RECORD_PAYLOAD_OFFSET + MAX_ENCODED_GP_SINK_TABLE_LEN <= RECORD_CRC_OFFSET);
+#[cfg(feature = "green-power-sink")]
+const _: () = assert!(GP_SINK_TABLE_ENTRIES < SINK_COUNTER_INDEX as usize);
+#[cfg(feature = "green-power-sink")]
+const _: () = assert!(GP_PROXY_TABLE_ENTRIES < SINK_COUNTER_INDEX as usize);
 
 /// Where each entry's GPD ID tag and frame counter sit in a snapshot
 /// payload. A zero counter offset means the entry carries no counter.
@@ -328,6 +469,73 @@ impl PayloadLayout {
     }
 }
 
+/// [`PayloadLayout`] of a Sink Table payload.
+#[cfg(feature = "green-power-sink")]
+struct SinkPayloadLayout {
+    entries: usize,
+    tags: [u32; GP_SINK_TABLE_ENTRIES],
+    counter_at: [u16; GP_SINK_TABLE_ENTRIES],
+}
+
+#[cfg(feature = "green-power-sink")]
+impl SinkPayloadLayout {
+    fn of(payload: &[u8]) -> Result<Self, GpStoreError> {
+        let mut layout = Self {
+            entries: *payload.first().ok_or(GpStoreError::Corrupt)? as usize,
+            tags: [0; GP_SINK_TABLE_ENTRIES],
+            counter_at: [0; GP_SINK_TABLE_ENTRIES],
+        };
+        if layout.entries > GP_SINK_TABLE_ENTRIES {
+            return Err(GpStoreError::Corrupt);
+        }
+        let mut at = 1usize;
+        for index in 0..layout.entries {
+            let n = *payload.get(at).ok_or(GpStoreError::Corrupt)? as usize;
+            let entry = payload
+                .get(at + 1..at + 1 + n)
+                .ok_or(GpStoreError::Corrupt)?;
+            let (id, counter) =
+                SinkEntry::encoded_layout(entry).map_err(|_| GpStoreError::Corrupt)?;
+            layout.tags[index] = crc32(&entry[id]);
+            if let Some(counter) = counter {
+                layout.counter_at[index] = (at + 1 + counter) as u16;
+            }
+            at += 1 + n;
+        }
+        Ok(layout)
+    }
+
+    fn counter(&self, payload: &[u8], index: usize) -> Option<u32> {
+        let at = self.counter_at[index] as usize;
+        (at != 0).then(|| {
+            u32::from_le_bytes([
+                payload[at],
+                payload[at + 1],
+                payload[at + 2],
+                payload[at + 3],
+            ])
+        })
+    }
+
+    fn in_counter(&self, at: usize) -> bool {
+        self.counter_at[..self.entries]
+            .iter()
+            .any(|&c| c != 0 && (c as usize..c as usize + 4).contains(&at))
+    }
+}
+
+/// The Sink Table record of the newest full record.
+#[cfg(feature = "green-power-sink")]
+#[derive(Clone, Copy)]
+struct SinkBase {
+    /// Slot of the sink record (the Proxy Table record's slot - 1).
+    slot: u8,
+    /// Encoded Sink Table payload length.
+    len: u16,
+    /// Effective frame counter of each Sink Table entry.
+    counters: [u32; GP_SINK_TABLE_ENTRIES],
+}
+
 /// The newest full record and the counter records appended after it.
 #[derive(Clone, Copy)]
 struct Base {
@@ -341,6 +549,9 @@ struct Base {
     /// Effective frame counter of each entry: the full record's value
     /// overlaid by the newest counter record for that entry.
     counters: [u32; GP_PROXY_TABLE_ENTRIES],
+    /// The Sink Table record paired with this full record, if any.
+    #[cfg(feature = "green-power-sink")]
+    sink: Option<SinkBase>,
 }
 
 /// Atomic two-sector journal of GP Proxy Table snapshots.
@@ -359,6 +570,19 @@ struct Base {
 /// unchanged snapshot is not written at all. Journals holding only full
 /// records (the original format) load unchanged; firmware without counter
 /// record support ignores them and restores the full record's counters.
+///
+/// `green-power-sink`: a snapshot with Sink Table entries is written as two
+/// consecutive slots of one sector, a `ZBGS` sink record (same layout as the
+/// full record) and then the `ZBGP` Proxy Table record of the same
+/// generation, flagged as paired in its (formerly zero, unchecked) byte 7;
+/// its commit marker commits both. Load pairs a flagged newest `ZBGP` record
+/// with the `ZBGS` record of the same generation in the slot before it;
+/// anything else (no flag, a torn pair, a journal written without the sink)
+/// means an empty Sink Table. Sink entry frame counters use counter
+/// records with bit 7 set in the entry index. A snapshot without sink
+/// entries is written exactly as without the feature. Firmware without the
+/// sink ignores `ZBGS` slots and sink counter records, so its Proxy Table
+/// still loads.
 pub struct GpProxyJournal<S, const SECTOR_SIZE: usize = GP_PROXY_JOURNAL_SECTOR_SIZE> {
     storage: S,
     sectors: [u32; 2],
@@ -498,6 +722,10 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             return Ok(false);
         };
 
+        // The sink record of this generation sits in the slot before it.
+        #[cfg(feature = "green-power-sink")]
+        let (mut sink, sink_layout) =
+            self.scan_sink(sector, slot, generation, &mut record, &mut snapshot)?;
         self.read_slot(sector, slot, &mut record)?;
         let payload = &record[RECORD_PAYLOAD_OFFSET..RECORD_PAYLOAD_OFFSET + len];
         let layout = PayloadLayout::of(payload)?;
@@ -508,6 +736,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             len: len as u16,
             append: SECTOR_SIZE as u16,
             counters: [0; GP_PROXY_TABLE_ENTRIES],
+            #[cfg(feature = "green-power-sink")]
+            sink: None,
         };
         for index in 0..layout.entries {
             base.counters[index] = layout.counter(payload, index).unwrap_or(0);
@@ -536,6 +766,19 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
                     {
                         base.counters[index] = counter;
                     }
+                    #[cfg(feature = "green-power-sink")]
+                    if let (Some(sink), Some((index, tag, counter))) =
+                        (sink.as_mut(), Self::counter_record(unit, generation))
+                        && index & SINK_COUNTER_INDEX as usize != 0
+                    {
+                        let index = index & !(SINK_COUNTER_INDEX as usize);
+                        if index < sink_layout.entries
+                            && sink_layout.counter_at[index] != 0
+                            && sink_layout.tags[index] == tag
+                        {
+                            sink.counters[index] = counter;
+                        }
+                    }
                 }
             }
             if let Some(snapshot) = snapshot {
@@ -546,7 +789,21 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
                             .copy_from_slice(&base.counters[index].to_le_bytes());
                     }
                 }
+                #[cfg(feature = "green-power-sink")]
+                if let Some(sink) = &sink {
+                    for index in 0..sink_layout.entries {
+                        let at = sink_layout.counter_at[index] as usize;
+                        if at != 0 {
+                            snapshot.sink_payload[at..at + 4]
+                                .copy_from_slice(&sink.counters[index].to_le_bytes());
+                        }
+                    }
+                }
             }
+        }
+        #[cfg(feature = "green-power-sink")]
+        {
+            base.sink = sink;
         }
         self.current = Some(base);
         self.scanned = true;
@@ -716,6 +973,12 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         if !self.same_structure(&base, snapshot, &layout)? {
             return Ok(false);
         }
+        #[cfg(feature = "green-power-sink")]
+        let sink_layout = SinkPayloadLayout::of(snapshot.sink_payload())?;
+        #[cfg(feature = "green-power-sink")]
+        if !self.same_sink_structure(&base, snapshot, &sink_layout)? {
+            return Ok(false);
+        }
         let changed = (0..layout.entries)
             .filter(|&index| {
                 layout
@@ -723,6 +986,17 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
                     .is_some_and(|counter| counter != base.counters[index])
             })
             .count();
+        #[cfg(feature = "green-power-sink")]
+        let changed = changed
+            + base.sink.map_or(0, |sink| {
+                (0..sink_layout.entries)
+                    .filter(|&index| {
+                        sink_layout
+                            .counter(snapshot.sink_payload(), index)
+                            .is_some_and(|counter| counter != sink.counters[index])
+                    })
+                    .count()
+            });
         if base.append as usize + changed * GP_COUNTER_RECORD_SIZE > SECTOR_SIZE {
             return Ok(false);
         }
@@ -740,6 +1014,31 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             base.append += GP_COUNTER_RECORD_SIZE as u16;
             self.current = Some(base);
         }
+        #[cfg(feature = "green-power-sink")]
+        if let Some(mut sink) = base.sink {
+            let sink_payload = snapshot.sink_payload();
+            for index in 0..sink_layout.entries {
+                let Some(counter) = sink_layout.counter(sink_payload, index) else {
+                    continue;
+                };
+                if counter == sink.counters[index] {
+                    continue;
+                }
+                let unit_index = SINK_COUNTER_INDEX as usize | index;
+                if !self.write_counter_record(
+                    &base,
+                    unit_index,
+                    sink_layout.tags[index],
+                    counter,
+                )? {
+                    return Ok(false);
+                }
+                sink.counters[index] = counter;
+                base.append += GP_COUNTER_RECORD_SIZE as u16;
+                base.sink = Some(sink);
+                self.current = Some(base);
+            }
+        }
         Ok(true)
     }
 
@@ -756,6 +1055,10 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         }
         if self.commit_counters(snapshot)? {
             return Ok(());
+        }
+        #[cfg(feature = "green-power-sink")]
+        if snapshot.sink_len() != 0 {
+            return self.commit_with_sink(snapshot);
         }
         let (generation, sector, slot) = match self.current {
             Some(base) => {
@@ -788,9 +1091,268 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             len: payload.len() as u16,
             append: ((slot + 1) * GP_PROXY_JOURNAL_SLOT_SIZE) as u16,
             counters: [0; GP_PROXY_TABLE_ENTRIES],
+            #[cfg(feature = "green-power-sink")]
+            sink: None,
         };
         for index in 0..layout.entries {
             base.counters[index] = layout.counter(payload, index).unwrap_or(0);
+        }
+        self.current = Some(base);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "green-power-sink")]
+impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
+    /// Generation and payload length of a committed, CRC-valid sink record.
+    fn sink_header(record: &[u8; GP_PROXY_JOURNAL_SLOT_SIZE]) -> Option<(u32, usize)> {
+        if record[0..4] != SINK_RECORD_MAGIC
+            || record[4] != RECORD_VERSION
+            || record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4] != RECORD_COMMIT
+        {
+            return None;
+        }
+        let len = u16::from_le_bytes([record[5], record[6]]) as usize;
+        if len == 0 || len > MAX_ENCODED_GP_SINK_TABLE_LEN {
+            return None;
+        }
+        let crc = u32::from_le_bytes([
+            record[RECORD_CRC_OFFSET],
+            record[RECORD_CRC_OFFSET + 1],
+            record[RECORD_CRC_OFFSET + 2],
+            record[RECORD_CRC_OFFSET + 3],
+        ]);
+        if crc32(&record[..RECORD_CRC_OFFSET]) != crc {
+            return None;
+        }
+        Some((
+            u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
+            len,
+        ))
+    }
+
+    /// Load the sink record paired with the Proxy Table record at
+    /// (`sector`, `slot`) of `generation`, into `snapshot` when given.
+    fn scan_sink(
+        &mut self,
+        sector: usize,
+        slot: usize,
+        generation: u32,
+        record: &mut [u8; GP_PROXY_JOURNAL_SLOT_SIZE],
+        snapshot: &mut Option<&mut PersistentGpProxyTable>,
+    ) -> Result<(Option<SinkBase>, SinkPayloadLayout), GpStoreError> {
+        let empty = SinkPayloadLayout {
+            entries: 0,
+            tags: [0; GP_SINK_TABLE_ENTRIES],
+            counter_at: [0; GP_SINK_TABLE_ENTRIES],
+        };
+        if let Some(snapshot) = snapshot.as_deref_mut() {
+            snapshot.set_sink_validated(&[0]);
+        }
+        if slot == 0 {
+            return Ok((None, empty));
+        }
+        self.read_slot(sector, slot, record)?;
+        if record[7] != RECORD_PAIRED_WITH_SINK {
+            return Ok((None, empty));
+        }
+        self.read_slot(sector, slot - 1, record)?;
+        let Some((sink_generation, len)) = Self::sink_header(record) else {
+            return Ok((None, empty));
+        };
+        let payload = &record[RECORD_PAYLOAD_OFFSET..RECORD_PAYLOAD_OFFSET + len];
+        if sink_generation != generation
+            || PersistentGpProxyTable::validate_sink_payload(payload).is_err()
+        {
+            return Ok((None, empty));
+        }
+        let layout = SinkPayloadLayout::of(payload)?;
+        let mut sink = SinkBase {
+            slot: (slot - 1) as u8,
+            len: len as u16,
+            counters: [0; GP_SINK_TABLE_ENTRIES],
+        };
+        for index in 0..layout.entries {
+            sink.counters[index] = layout.counter(payload, index).unwrap_or(0);
+        }
+        if let Some(snapshot) = snapshot.as_deref_mut() {
+            snapshot.set_sink_validated(payload);
+        }
+        Ok((Some(sink), layout))
+    }
+
+    /// Whether the stored sink record equals the snapshot's Sink Table in
+    /// everything but the frame counters (no sink record: an empty table).
+    fn same_sink_structure(
+        &mut self,
+        base: &Base,
+        snapshot: &PersistentGpProxyTable,
+        layout: &SinkPayloadLayout,
+    ) -> Result<bool, GpStoreError> {
+        let payload = snapshot.sink_payload();
+        let Some(sink) = base.sink else {
+            return Ok(snapshot.sink_len() == 0);
+        };
+        if sink.len as usize != payload.len() {
+            return Ok(false);
+        }
+        let address = self.slot_address(base.sector as usize, sink.slot as usize);
+        let mut chunk = [0u8; 64];
+        for (index, expected) in payload.chunks(chunk.len()).enumerate() {
+            let start = index * chunk.len();
+            let window = &mut chunk[..expected.len()];
+            self.storage
+                .read(address + (RECORD_PAYLOAD_OFFSET + start) as u32, window)
+                .map_err(|_| GpStoreError::Hardware)?;
+            let differs = window
+                .iter()
+                .zip(expected)
+                .enumerate()
+                .any(|(i, (stored, new))| stored != new && !layout.in_counter(start + i));
+            if differs {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Write one record of a pair (full-record layout; `kind` is the magic
+    /// and byte 7), commit marker last, verified by read-back.
+    fn write_pair_record(
+        &mut self,
+        sector: usize,
+        slot: usize,
+        (magic, flags): ([u8; 4], u8),
+        generation: u32,
+        extended_pan_id: &IeeeAddress,
+        payload: &[u8],
+    ) -> Result<(), GpStoreError> {
+        let mut record = [0xFFu8; GP_PROXY_JOURNAL_SLOT_SIZE];
+        record[0..4].copy_from_slice(&magic);
+        record[4] = RECORD_VERSION;
+        record[5..7].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+        record[7] = flags;
+        record[8..12].copy_from_slice(&generation.to_le_bytes());
+        record[RECORD_EPID_OFFSET..RECORD_EPID_OFFSET + 8].copy_from_slice(extended_pan_id);
+        record[RECORD_PAYLOAD_OFFSET..RECORD_PAYLOAD_OFFSET + payload.len()]
+            .copy_from_slice(payload);
+        let crc = crc32(&record[..RECORD_CRC_OFFSET]);
+        record[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        let address = self.slot_address(sector, slot);
+        self.storage
+            .write(address, &record[..RECORD_COMMIT_OFFSET])
+            .map_err(|_| GpStoreError::Hardware)?;
+        record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4].copy_from_slice(&RECORD_COMMIT);
+        self.storage
+            .write(
+                address + RECORD_COMMIT_OFFSET as u32,
+                &record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4],
+            )
+            .map_err(|_| GpStoreError::Hardware)?;
+        let mut chunk = [0u8; 64];
+        for (index, expected) in record.chunks(chunk.len()).enumerate() {
+            let at = address + (index * chunk.len()) as u32;
+            let window = &mut chunk[..expected.len()];
+            self.storage
+                .read(at, window)
+                .map_err(|_| GpStoreError::Hardware)?;
+            if window != expected {
+                return Err(GpStoreError::Hardware);
+            }
+        }
+        Ok(())
+    }
+
+    /// First slot `s >= from` of `sector` with slots `s` and `s + 1` erased.
+    fn erased_slot_pair(
+        &mut self,
+        sector: usize,
+        from: usize,
+    ) -> Result<Option<usize>, GpStoreError> {
+        let mut slot = from;
+        while slot + 1 < Self::SLOTS_PER_SECTOR {
+            let Some(first) = self.first_erased_slot(sector, slot)? else {
+                return Ok(None);
+            };
+            if first + 1 >= Self::SLOTS_PER_SECTOR {
+                return Ok(None);
+            }
+            if self.first_erased_slot(sector, first + 1)? == Some(first + 1) {
+                return Ok(Some(first));
+            }
+            slot = first + 1;
+        }
+        Ok(None)
+    }
+
+    /// Full commit of a snapshot with Sink Table entries: sink record, then
+    /// the Proxy Table record of the same generation in the next slot.
+    fn commit_with_sink(&mut self, snapshot: &PersistentGpProxyTable) -> Result<(), GpStoreError> {
+        if Self::SLOTS_PER_SECTOR < 2 {
+            return Err(GpStoreError::Hardware);
+        }
+        let (generation, sector, slot) = match self.current {
+            Some(base) => {
+                let generation = base
+                    .generation
+                    .checked_add(1)
+                    .ok_or(GpStoreError::GenerationExhausted)?;
+                let sector = base.sector as usize;
+                match self.erased_slot_pair(sector, base.slot as usize + 1)? {
+                    Some(slot) => (generation, sector, slot),
+                    None => {
+                        let target = 1 - sector;
+                        self.erase_sector(target)?;
+                        (generation, target, 0)
+                    }
+                }
+            }
+            None => {
+                self.erase_sector(0)?;
+                (0, 0, 0)
+            }
+        };
+        let epid = snapshot.extended_pan_id;
+        self.write_pair_record(
+            sector,
+            slot,
+            (SINK_RECORD_MAGIC, 0),
+            generation,
+            &epid,
+            snapshot.sink_payload(),
+        )?;
+        self.write_pair_record(
+            sector,
+            slot + 1,
+            (RECORD_MAGIC, RECORD_PAIRED_WITH_SINK),
+            generation,
+            &epid,
+            snapshot.payload(),
+        )?;
+        let payload = snapshot.payload();
+        let layout = PayloadLayout::of(payload)?;
+        let sink_payload = snapshot.sink_payload();
+        let sink_layout = SinkPayloadLayout::of(sink_payload)?;
+        let mut base = Base {
+            generation,
+            sector: sector as u8,
+            slot: (slot + 1) as u8,
+            len: payload.len() as u16,
+            append: ((slot + 2) * GP_PROXY_JOURNAL_SLOT_SIZE) as u16,
+            counters: [0; GP_PROXY_TABLE_ENTRIES],
+            sink: Some(SinkBase {
+                slot: slot as u8,
+                len: sink_payload.len() as u16,
+                counters: [0; GP_SINK_TABLE_ENTRIES],
+            }),
+        };
+        for index in 0..layout.entries {
+            base.counters[index] = layout.counter(payload, index).unwrap_or(0);
+        }
+        if let Some(sink) = base.sink.as_mut() {
+            for index in 0..sink_layout.entries {
+                sink.counters[index] = sink_layout.counter(sink_payload, index).unwrap_or(0);
+            }
         }
         self.current = Some(base);
         Ok(())
@@ -814,8 +1376,9 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyStore for GpProxyJournal<S, S
 }
 
 impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
-    /// Restore the Proxy Table for the joined network and re-establish the
-    /// GPEP group membership it requires.
+    /// Restore the Proxy Table (and, with `green-power-sink`, the Sink Table)
+    /// for the joined network and re-establish the GPEP group membership they
+    /// require. Returns the number of restored entries of both tables.
     ///
     /// Call once after the device restored its network state. An empty or
     /// missing snapshot leaves an empty table. A non-empty snapshot from
@@ -845,6 +1408,14 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                 .map_err(|_| GpStoreError::Full)?;
             restored += 1;
         }
+        #[cfg(feature = "green-power-sink")]
+        for entry in snapshot.sink_entries() {
+            let entry = entry?;
+            self.gp_sink_mut()
+                .restore(entry)
+                .map_err(|_| GpStoreError::Full)?;
+            restored += 1;
+        }
         self.gp_restore_groups();
         self.gp_take_dirty();
         Ok(restored)
@@ -862,7 +1433,12 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             return Ok(false);
         }
         let extended_pan_id = self.bdb.zdo().nwk().nib().extended_pan_id;
+        #[cfg(not(feature = "green-power-sink"))]
         let result = PersistentGpProxyTable::capture(extended_pan_id, self.gp_proxy().entries())
+            .and_then(|snapshot| store.store(&snapshot));
+        #[cfg(feature = "green-power-sink")]
+        let result = PersistentGpProxyTable::capture(extended_pan_id, self.gp_proxy().entries())
+            .and_then(|snapshot| snapshot.with_sink(self.gp_sink().entries()))
             .and_then(|snapshot| store.store(&snapshot));
         if result.is_err() {
             self.gp_mark_dirty();
@@ -883,7 +1459,7 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use embedded_storage::nor_flash::{ErrorType, NorFlashErrorKind, ReadNorFlash};
     use zigbee_gp::types::{GpdId, KeyType, SecurityLevel};
@@ -914,7 +1490,7 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct FlashError;
+    pub(crate) struct FlashError;
 
     impl embedded_storage::nor_flash::NorFlashError for FlashError {
         fn kind(&self) -> NorFlashErrorKind {
@@ -922,7 +1498,7 @@ mod tests {
         }
     }
 
-    struct MockFlash {
+    pub(crate) struct MockFlash {
         data: [u8; 2 * SECTOR],
         /// Successful program operations left before every write fails.
         programs_left: Option<usize>,
@@ -930,7 +1506,7 @@ mod tests {
     }
 
     impl MockFlash {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 data: [0xFF; 2 * SECTOR],
                 programs_left: None,
@@ -1501,5 +2077,197 @@ mod tests {
             journal.load_into(&mut snapshot),
             Err(GpStoreError::Hardware)
         );
+    }
+
+    /// A sink-less build ignores sink (`ZBGS`) records: the Proxy Table
+    /// record after one loads, takes counter records and new records.
+    #[test]
+    fn records_of_another_kind_are_skipped() {
+        let proxy = capture(&[entry(1, 10)]);
+        let mut sink_like = legacy_record(7, &proxy);
+        sink_like[0..4].copy_from_slice(b"ZBGS");
+        let crc = crc32(&sink_like[..1012]);
+        sink_like[1012..1016].copy_from_slice(&crc.to_le_bytes());
+        let mut flash = MockFlash::new();
+        flash.data[..1024].copy_from_slice(&sink_like);
+        flash.data[1024..2048].copy_from_slice(&legacy_record(7, &proxy));
+        let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+        assert_eq!(load(&mut journal).unwrap().payload(), proxy.payload());
+        journal.store(&capture(&[entry(1, 74)])).unwrap();
+        journal.store(&capture(&[entry_radius(1, 74, 3)])).unwrap();
+        let flash = journal.into_storage();
+        assert_eq!(flash.data[..1024], sink_like);
+        let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+        assert_eq!(
+            load(&mut journal).unwrap().payload(),
+            capture(&[entry_radius(1, 74, 3)]).payload()
+        );
+    }
+
+    #[cfg(feature = "green-power-sink")]
+    mod sink {
+        use super::*;
+
+        fn sink_entry(src_id: u32, counter: u32) -> SinkEntry {
+            let mut entry = SinkEntry::new(GpdId::SrcId(src_id));
+            entry.security_level = SecurityLevel::Encrypted;
+            entry.key_type = KeyType::IndividualKey;
+            entry.key = Some([0x5A; 16]);
+            entry.frame_counter = counter;
+            entry.device_id = 0x02;
+            entry
+        }
+
+        fn combo(proxy: &[ProxyEntry], sink: &[SinkEntry]) -> PersistentGpProxyTable {
+            capture(proxy).with_sink(sink).unwrap()
+        }
+
+        fn sink_counters(snapshot: &PersistentGpProxyTable) -> heapless::Vec<u32, 8> {
+            snapshot
+                .sink_entries()
+                .map(|entry| entry.unwrap().frame_counter)
+                .collect()
+        }
+
+        #[test]
+        fn sink_snapshot_round_trips_and_counts_as_content() {
+            let snapshot = combo(&[], &[sink_entry(1, 7), sink_entry(2, 9)]);
+            assert!(!snapshot.is_empty());
+            assert_eq!(snapshot.len(), 0);
+            assert_eq!(snapshot.sink_len(), 2);
+            assert_eq!(sink_counters(&snapshot).as_slice(), &[7, 9]);
+            assert!(PersistentGpProxyTable::default().is_empty());
+            let full: heapless::Vec<SinkEntry, 8> = (0..8).map(|i| sink_entry(i, i)).collect();
+            assert_eq!(
+                capture(&[])
+                    .with_sink(&[full.as_slice(), &[sink_entry(9, 9)]].concat())
+                    .err(),
+                Some(GpStoreError::Full)
+            );
+            let _ = capture(&[]).with_sink(&full).unwrap();
+        }
+
+        /// Pair layout: sink record then the Proxy Table record of the same
+        /// generation; load restores both; a legacy journal loads with an
+        /// empty Sink Table and the next sink commit writes the pair.
+        #[test]
+        fn journal_keeps_proxy_and_sink_tables() {
+            let legacy = capture(&[entry(1, 10)]);
+            let mut flash = MockFlash::new();
+            flash.data[..1024].copy_from_slice(&legacy_record(4, &legacy));
+            let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+            let loaded = load(&mut journal).unwrap();
+            assert_eq!(loaded.payload(), legacy.payload());
+            assert_eq!(loaded.sink_len(), 0);
+
+            let both = combo(&[entry(1, 10)], &[sink_entry(2, 20)]);
+            journal.store(&both).unwrap();
+            let data = &journal.storage.data;
+            assert_eq!(data[1024..1028], *b"ZBGS");
+            assert_eq!(data[2048..2052], *b"ZBGP");
+            assert_eq!(data[1024 + 8..1024 + 12], 5u32.to_le_bytes());
+            assert_eq!(data[2048 + 8..2048 + 12], 5u32.to_le_bytes());
+            let flash = journal.into_storage();
+            let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+            assert_eq!(load(&mut journal).unwrap(), both);
+
+            // A sink counter change is a compact record with the sink bit.
+            let moved = combo(&[entry(1, 10)], &[sink_entry(2, 84)]);
+            journal.store(&moved).unwrap();
+            let at = 3 * GP_PROXY_JOURNAL_SLOT_SIZE;
+            assert_eq!(journal.storage.data[at..at + 4], *b"ZBGC");
+            assert_eq!(journal.storage.data[at + 5], 0x80);
+            assert_eq!(journal.storage.erases, 0);
+            let flash = journal.into_storage();
+            let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+            let loaded = load(&mut journal).unwrap();
+            assert_eq!(sink_counters(&loaded).as_slice(), &[84]);
+            assert_eq!(counters(&loaded).as_slice(), &[10]);
+            // Unchanged: nothing written.
+            let before = journal.storage.data;
+            journal.store(&moved).unwrap();
+            assert_eq!(journal.storage.data, before);
+        }
+
+        #[test]
+        fn torn_pair_keeps_the_previous_tables() {
+            let first = combo(&[entry(1, 10)], &[sink_entry(2, 20)]);
+            let mut journal = journal(MockFlash::new());
+            journal.store(&first).unwrap();
+            // Power fails after the sink record, before the proxy record.
+            let next = combo(&[entry(1, 10)], &[sink_entry(2, 20), sink_entry(3, 1)]);
+            journal.storage.programs_left = Some(2);
+            assert_eq!(journal.store(&next), Err(GpStoreError::Hardware));
+            let mut flash = journal.into_storage();
+            flash.programs_left = None;
+            let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+            assert_eq!(load(&mut journal).unwrap(), first);
+            // The retry pairs records of the same (reused) generation.
+            journal.store(&next).unwrap();
+            let flash = journal.into_storage();
+            let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+            assert_eq!(load(&mut journal).unwrap(), next);
+        }
+
+        #[test]
+        fn pairs_roll_over_and_an_emptied_sink_table_drops_its_record() {
+            let mut journal = journal(MockFlash::new());
+            let mut last = PersistentGpProxyTable::default();
+            for radius in 0..6u8 {
+                last = combo(&[entry_radius(1, 10, radius)], &[sink_entry(2, 20)]);
+                journal.store(&last).unwrap();
+            }
+            assert!(journal.storage.erases >= 2);
+            let flash = journal.into_storage();
+            let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+            assert_eq!(load(&mut journal).unwrap(), last);
+            // Removing every sink entry writes a lone Proxy Table record;
+            // the older sink record before it is not paired.
+            let proxy_only = capture(&[entry_radius(1, 10, 9)]);
+            journal.store(&proxy_only).unwrap();
+            let flash = journal.into_storage();
+            let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+            let loaded = load(&mut journal).unwrap();
+            assert_eq!(loaded.payload(), proxy_only.payload());
+            assert_eq!(loaded.sink_len(), 0);
+        }
+
+        /// A sink record left by an interrupted pair is not paired with the
+        /// next (proxy-only) record, which reuses its generation.
+        #[test]
+        fn orphan_sink_record_is_not_resurrected() {
+            let first = combo(&[entry(1, 10)], &[sink_entry(2, 20)]);
+            let mut journal = journal(MockFlash::new());
+            journal.store(&first).unwrap();
+            journal.storage.programs_left = Some(2);
+            let attempted = combo(&[entry(1, 10)], &[sink_entry(2, 20), sink_entry(3, 1)]);
+            assert_eq!(journal.store(&attempted), Err(GpStoreError::Hardware));
+            journal.storage.programs_left = None;
+            let proxy_only = capture(&[entry(1, 10)]);
+            journal.store(&proxy_only).unwrap();
+            // The orphan (generation 1) sits right before the new record
+            // (generation 1).
+            assert_eq!(journal.storage.data[2048..2052], *b"ZBGS");
+            assert_eq!(journal.storage.data[3072..3076], *b"ZBGP");
+            let flash = journal.into_storage();
+            let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+            let loaded = load(&mut journal).unwrap();
+            assert_eq!(loaded.payload(), proxy_only.payload());
+            assert_eq!(loaded.sink_len(), 0);
+        }
+
+        #[test]
+        fn sink_record_of_another_generation_is_not_paired() {
+            let both = combo(&[entry(1, 10)], &[sink_entry(2, 20)]);
+            let mut journal = journal(MockFlash::new());
+            journal.store(&both).unwrap();
+            // Corrupt the sink record's CRC: the proxy record still loads.
+            journal.storage.data[100] ^= 1;
+            let flash = journal.into_storage();
+            let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+            let loaded = load(&mut journal).unwrap();
+            assert_eq!(loaded.payload(), both.payload());
+            assert_eq!(loaded.sink_len(), 0);
+        }
     }
 }

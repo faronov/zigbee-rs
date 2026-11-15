@@ -16971,7 +16971,8 @@ mod parent_router_tests {
     /// a GPD Commissioning GPDF heard directly, the Sink Table entry and GP
     /// Pairing, a secured Toggle GPDF that toggles the local On/Off cluster,
     /// a replay rejected, a GP Notification from another proxy toggling it
-    /// back, and that proxy's duplicate dropped.
+    /// back, that proxy's duplicate dropped, and a reboot through the GP
+    /// journal that keeps the entry and its counter floor.
     #[cfg(feature = "green-power-sink")]
     #[test]
     fn gp_combo_commissions_a_switch_and_toggles_the_local_light() {
@@ -17222,6 +17223,44 @@ mod parent_router_tests {
         process(&mut router, &mut on_off, &second);
         assert!(!on_off.is_on());
         assert_eq!(router.gp_sink().entries()[0].frame_counter, 12);
+
+        // The Sink Table survives a reboot through the GP journal, its
+        // counter skipped ahead by the persistence stride.
+        const STRIDE: u32 = zigbee_gp::sink::DEFAULT_SINK_COUNTER_PERSIST_STRIDE;
+        let mut journal = crate::gp_store::GpProxyJournal::<_, 4096>::new(
+            crate::gp_store::tests::MockFlash::new(),
+            0,
+            4096,
+        );
+        assert!(router.save_gp_proxy_table_if_dirty(&mut journal).unwrap());
+        let mut rebooted = gp_combo_router();
+        assert_eq!(rebooted.restore_gp_proxy_table(&mut journal).unwrap(), 1);
+        let restored = &rebooted.gp_sink().entries()[0];
+        assert_eq!(restored.key, Some(KEY));
+        assert_eq!(restored.frame_counter, 12 + STRIDE - 1);
+        assert!(
+            rebooted
+                .bdb
+                .zdo()
+                .aps()
+                .group_member_endpoints(alias)
+                .contains(&242)
+        );
+        let mut light = OnOffCluster::new();
+        assert!(process(&mut rebooted, &mut light, &toggle).is_none());
+        assert!(!light.is_on());
+        // The first frame above the floor is accepted and journalled (a
+        // compact counter record); a second reboot keeps it.
+        let fresh = gpdf(SecurityLevel::Encrypted, 12 + STRIDE, 0x22, &[]);
+        assert!(process(&mut rebooted, &mut light, &fresh).is_some());
+        assert!(light.is_on());
+        assert!(rebooted.save_gp_proxy_table_if_dirty(&mut journal).unwrap());
+        let mut again = gp_combo_router();
+        assert_eq!(again.restore_gp_proxy_table(&mut journal).unwrap(), 1);
+        assert_eq!(
+            again.gp_sink().entries()[0].frame_counter,
+            12 + STRIDE + STRIDE - 1
+        );
     }
 
     #[test]
