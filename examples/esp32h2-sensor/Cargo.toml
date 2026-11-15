@@ -120,6 +120,17 @@ green-power-bidirectional = [
     "green-power",
     "esp32-zigbee-devkit-product/green-power-bidirectional",
 ]
+# GP Combo light (lab target: Waveshare ESP32-H2-Zero, with
+# `router,waveshare-h2-zero`): the router endpoint is an HA On/Off Light shown
+# on the WS2812 (dim warm white while no status indication is lit), a GP
+# Combo sink delivers paired GPD switch commands to it, and BOOT pressed while
+# joined opens sink commissioning mode (proxies included). Opt-in, not part
+# of `router`.
+combo-light = [
+    "green-power",
+    "router-app/green-power-sink",
+    "esp32-zigbee-devkit-product/combo-light",
+]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
 # Accept only signed MCUboot envelopes over OTA (see the product's

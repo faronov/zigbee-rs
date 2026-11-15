@@ -38,7 +38,7 @@
 | TempMaster (`zigbee-runtime/green-power-bidirectional`, router `green-power-bidirectional`): proxy advertises bidirectional only when the MAC has timed TX, sends a queued GP Response GPDF `tx_offset_us` (20 ms) after the end of the triggering GPDF, no CSMA, no ACK | implemented, opt-in (not in any default image) | end-to-end host test: GP Response from the sink → rxAfterTx GPDF → Commissioning Reply scheduled at RX end + 20 ms. Lab-tested on the H2-Zero 2026-11-14 with an injected GPD (radio-lab): forwarded first (+41 ms), appointed TempMaster by zigpy, 10 of 11 Commissioning Replies sent on time, 1 reported `Missed` (§6.8). **Not yet with a real bidirectional GPD** |
 | GPD bidirectional mode (`gpd-app/bidirectional`, MG22 example feature `bidirectional`, product `BIDIRECTIONAL` policy) | implemented, opt-in | host tests: reply in the window → Success and channel persisted; replies at both edges of the spec window (20 ms and 25 ms + GPDF airtime after the GPDF start) and at the measured IKEA offset received; no reply → stays uncommissioned without counter reuse; wrong security level rejected; delivered key replaces the GPD key; invalid policy rejected. Lab-tested on hardware 2026-11-14 (182b358, `lab-tx-power` build): commissioned into ZHA through IKEA 0x43FD as TempMaster, Success accepted, reports in HA, Resumed after reset with channel and counter (§6.9). **Not yet through our proxy** |
 | Full proxy (`zigbee-gp/proxy-full`, `zigbee-runtime/green-power-full-proxy`) | in progress, opt-in (§2 row (b)) | host tests |
-| Combo / Sink (`zigbee-gp/sink`, `zigbee-runtime/green-power-sink`, router-app `green-power-sink`): Sink Table, sink commissioning mode, GPD commissioning (direct and Commissioning Notification, bidirectional through a TempMaster), Notification processing, Notification Response, Sink Table Request, sink attributes, built-in GPD → ZCL translation to one local endpoint, Sink Table in the GP journal | implemented, opt-in (not in any image) | host tests (`zigbee-gp` sink unit tests, zigpy golden vectors, `gp_store` sink journal tests, runtime end-to-end `gp_combo_commissions_a_switch_and_toggles_the_local_light`); ESP32-H2 and nRF52840 router builds (§4.5). **Not hardware-tested**; no router product has an On/Off endpoint yet (proposal for the Waveshare ESP32-H2-Zero in §3.7) |
+| Combo / Sink (`zigbee-gp/sink`, `zigbee-runtime/green-power-sink`, router-app `green-power-sink`): Sink Table, sink commissioning mode, GPD commissioning (direct and Commissioning Notification, bidirectional through a TempMaster), Notification processing, Notification Response, Sink Table Request, sink attributes, built-in GPD → ZCL translation to one local endpoint, Sink Table in the GP journal | implemented, opt-in (not in any image) | host tests (`zigbee-gp` sink unit tests, zigpy golden vectors, `gp_store` sink journal tests, runtime end-to-end `gp_combo_commissions_a_switch_and_toggles_the_local_light`); ESP32-H2 and nRF52840 router builds (§4.5); first product: Waveshare ESP32-H2-Zero combo light (`combo-light`, On/Off Light endpoint on the WS2812, BOOT opens sink commissioning; host tests, builds, §3.7). **Not hardware-tested** |
 
 Implementation notes that differ from the design below:
 
@@ -742,47 +742,69 @@ a local On/Off cluster → replay rejected → a GP Notification from another
 proxy toggles it back and its duplicate is dropped → two reboots through
 the journal keep the entry and its counter floor).
 
-**Open.** No hardware run. No router product has an On/Off (or Level)
-endpoint yet, so no product wires the button API or selects an endpoint.
+**Open.** No hardware run yet (the H2-Zero combo below is the first
+target).
 
-**Proposed first product (not implemented): Waveshare ESP32-H2-Zero
-combo.** The user chose the H2-Zero router with an On/Off endpoint driven
-by its WS2812. Today the router image (`examples/esp32h2-sensor`, bin
-`esp32h2-router`, `router,waveshare-h2-zero`) has one HA Range Extender
-endpoint (Basic, Identify; `products/esp32-zigbee-devkit/src/router.rs`)
-and `status-led` is always on in `router-core`: the product's
-`RgbStatusLed` drives the board's RMT WS2812 on GPIO8 from the
-`router_app::StatusIndicator` (booting, searching, joined for 30 s then
-dark, permit join, identify, OTA, error). The BOOT button only requests
-(re)commissioning while the router waits for it. Minimal change:
+**First product: Waveshare ESP32-H2-Zero combo light (`combo-light`,
+implemented, host-tested, not yet hardware-tested).** Build:
+`examples/esp32h2-sensor`, bin `esp32h2-router`,
+`--no-default-features --features router,waveshare-h2-zero,combo-light`.
 
-- Example feature `combo-light = ["green-power", "router-app/green-power-sink",
-  "esp32-zigbee-devkit-product/combo-light"]`; product feature
-  `combo-light = ["status-led", "green-power"]`. Off by default; `router`
-  and every shipped image unchanged. `green-power-bidirectional` stays a
-  separate opt-in (only needed for bidirectional GPDs heard directly).
-- Product: a router profile with On/Off (0x0006) on the existing endpoint
-  (device ID On/Off Light 0x0100, servers Basic, Identify, On/Off; the
-  runtime's `OnOffCluster`, no Level), and a `SinkConfig` with
-  `endpoint: Some(ENDPOINT)` and the Silicon Labs defaults above.
-- LED ownership stays with the product's `RgbStatusLed`: status
-  indications keep priority, and the On/Off state is shown only where the
-  status palette is dark today (after the 30 s joined hold): a dim warm
-  white while On, dark while Off. While a status (permit join, identify,
-  OTA, error) is active the light state is not visible, and it returns
-  when the status ends. No second owner of the RMT channel.
-- Composition root: pass the On/Off cluster to the router app's receive
-  path (as the cluster set of the profile), and use a BOOT press while
-  joined to call `gp_sink_enter_commissioning(true)` (also opening the
-  proxies); the existing press-to-recommission while waiting is unchanged.
-- Persistence: none new; the Sink Table already shares the `zbnv` GP
-  journal at 0x3F8000. The On/Off state is volatile (StartUpOnOff
-  default off) unless the product later journals it.
-- Estimated size: the sink costs +26,162 B flash / +1,628 B `.bss` over
-  the plain H2 router (§4.5); On/Off cluster, profile and LED mapping add
-  roughly 2–5 KB flash and under 0.1 KB RAM (estimate, not measured), so
-  about +28–31 KB flash over `router,waveshare-h2-zero`, well inside the
-  2,031,616 B `ota_0`.
+- Features: example `combo-light = ["green-power",
+  "router-app/green-power-sink", "esp32-zigbee-devkit-product/combo-light"]`;
+  product `combo-light = ["status-led", "green-power",
+  "router-app/green-power-sink", "zigbee-runtime/green-power-sink"]`. Off
+  by default; `router` and every shipped image are unchanged (identity
+  below). `green-power-bidirectional` stays a separate opt-in (only for
+  bidirectional GPDs heard directly).
+- Profile: the reusable `zigbee_runtime::profile::OnOffLight` (Basic,
+  Identify, On/Off server; the runtime's `OnOffCluster`, no Level, no
+  Groups/Scenes; OnOff reported on change with a 1 h heartbeat). The
+  product's router profile is `DeviceProfile<OnOffLight>` on the existing
+  endpoint 1 with device ID On/Off Light (0x0100) instead of Range
+  Extender (0x0008); `COMBO_SINK_ENDPOINT` = 1 is set as the sink's
+  translation target in the composition root. The profile's non-generic
+  methods are `#[inline]`: a plain (non-inline) module in
+  `zigbee-runtime` changed the code generation of the default router
+  image by −18 B `.text` although nothing used it.
+- LED: the product's `RgbStatusLed` remains the only owner of the RMT
+  WS2812. `combo_color(status, light_on)`: a lit status indication always
+  wins; otherwise the light shows dim warm white `(24, 14, 4)` while On and
+  is dark while Off. After joining, the green joined hold (30 s) comes
+  first. An open GP sink commissioning window blinks like permit join
+  (blue, 1 s on / 1 s off).
+- BOOT (GPIO9): pressed while joined it calls
+  `gp_sink_enter_commissioning(true)` (proxies included, window 180 s,
+  exit on first pairing); ignored while a window is open; the existing
+  press-to-recommission after Leave is unchanged. Sink events
+  (commissioning entered/left, commissioned, untranslated GPD commands
+  such as attribute reports) are logged on the console; the 60 s summary
+  adds the Sink Table size and the light state.
+- OnTime/OffWaitTime advance in 100 ms ticks from the run loop. The OnOff
+  state is volatile: the light starts Off after every reset.
+- Persistence: none new; the Sink Table shares the `zbnv` GP journal at
+  0x3F8000 with the Proxy Table.
+- Measured size (2026-11-15, `tools/mac-footprint.py`):
+
+  | image | flash | `.bss` |
+  |---|---:|---:|
+  | `router,waveshare-h2-zero` | 521,330 | 68,116 |
+  | `router,router-app/green-power-sink` | 547,500 | 69,744 |
+  | `router,waveshare-h2-zero,combo-light` | 553,370 | 70,220 |
+
+  Combo light over the H2-Zero router: +32,040 B flash, +2,104 B `.bss`
+  (the estimate was +28–31 KB). Over the sink alone: +5,870 B flash,
+  +476 B `.bss`, mostly the router app and node instantiated for the new
+  profile type, the On/Off command handler (678 B), `Combo::service`
+  (1,294 B) and the `SinkEvent` log formatter (486 B). App image
+  553,472 B of the 2,031,616 B `ota_0`.
+- Feature-off identity (same checkout path, against e8a6fa3/f5fa17c):
+  ESP32-H2 router, ESP32-H2-Zero router, `router-core`, bidirectional and
+  sink-only H2 routers differ only in 28–33 panic Location words; the
+  nRF52840 router is identical.
+- Not covered: GP endpoint 242 is not in the node's Active Endpoint list or
+  simple descriptors (as for the proxy); ZHA does not need it for a proxy
+  or for this sink, but a GP 1.1 combo should advertise it.
 
 ## 4. Size estimates
 

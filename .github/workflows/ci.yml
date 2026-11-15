@@ -207,6 +207,11 @@ jobs:
             manifest: products/esp32-zigbee-devkit/Cargo.toml
             workspace: products/esp32-zigbee-devkit
             features: esp32h2,roles,status-led
+          # GP Combo light: On/Off Light profile, LED composition, sink.
+          - name: ESP32-H2 router product (GP Combo light)
+            manifest: products/esp32-zigbee-devkit/Cargo.toml
+            workspace: products/esp32-zigbee-devkit
+            features: esp32h2,roles,combo-light
           - name: ESP32 devkit board (status LED RMT timing)
             manifest: boards/esp32-zigbee-devkit/Cargo.toml
             workspace: boards/esp32-zigbee-devkit
@@ -1410,10 +1415,24 @@ jobs:
             --no-default-features --features router,waveshare-h2-zero,green-power-bidirectional
           cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/h2-bidi \
             --no-default-features --features router,waveshare-h2-zero,green-power-bidirectional -- -D warnings
-          # Opt-in GP Combo / Sink (router-app/green-power-sink, no timed TX
-          # needed); a no_std build check only, not part of any image.
+          # Opt-in GP Combo light on the H2-Zero (`combo-light`: On/Off
+          # Light endpoint on the WS2812, GP sink, BOOT opens sink
+          # commissioning); not part of the default router. It must fit
+          # ota_0.
           cargo build --release --locked -Z build-std=core,alloc --target-dir target/h2-sink \
-            --no-default-features --features router,waveshare-h2-zero,router-app/green-power-sink
+            --no-default-features --features router,waveshare-h2-zero,combo-light
+          cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/h2-sink \
+            --no-default-features --features router,waveshare-h2-zero,combo-light -- -D warnings
+          COMBO=target/h2-sink/riscv32imac-unknown-none-elf/release/esp32h2-router
+          espflash save-image --skip-update-check --chip esp32h2 \
+            --partition-table ../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
+            --target-app-partition ota_0 "$COMBO" "$COMBO.app.bin"
+          espflash save-image --skip-update-check --chip esp32h2 \
+            --merge --skip-padding --flash-size 4mb \
+            --partition-table ../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv \
+            --target-app-partition ota_0 "$COMBO" "$COMBO.bin"
+          python3 ../../products/esp32-zigbee-devkit/partitions/check-app-image-size.py \
+            --chip esp32h2 --slot ota_0 --merged "$COMBO.bin" "$COMBO.app.bin"
           DIR=target/riscv32imac-unknown-none-elf/release
           LED_DIR=target/status-led/riscv32imac-unknown-none-elf/release
           CSV=../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv

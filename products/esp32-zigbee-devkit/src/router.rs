@@ -8,7 +8,11 @@
 
 use router_app::RouterPolicy;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
-use zigbee_runtime::profile::{DeviceProfile, RangeExtender};
+use zigbee_runtime::profile::DeviceProfile;
+#[cfg(feature = "combo-light")]
+use zigbee_runtime::profile::OnOffLight;
+#[cfg(not(feature = "combo-light"))]
+use zigbee_runtime::profile::RangeExtender;
 use zigbee_zcl::DeviceId;
 
 use crate::ENDPOINT;
@@ -22,9 +26,11 @@ pub static ROUTER_POLICY: RouterPolicy = RouterPolicy {
     secure_rejoin_failure_limit: 0,
 };
 
+#[cfg(not(feature = "combo-light"))]
 pub type RouterProfile = DeviceProfile<RangeExtender>;
 
 /// HA Range Extender: Basic + Identify on a routing, child-capable node.
+#[cfg(not(feature = "combo-light"))]
 pub const fn router_profile() -> RouterProfile {
     DeviceProfile::new(
         ENDPOINT,
@@ -33,6 +39,28 @@ pub const fn router_profile() -> RouterProfile {
         RangeExtender,
     )
 }
+
+/// GP Combo light (`combo-light`): an HA On/Off Light endpoint.
+#[cfg(feature = "combo-light")]
+pub type RouterProfile = DeviceProfile<OnOffLight>;
+
+/// HA On/Off Light: Basic + Identify + On/Off on the routing, child-capable
+/// node. Its endpoint is also the GP sink's translation target
+/// ([`COMBO_SINK_ENDPOINT`]). The OnOff state is not persisted: the light
+/// starts off after every reset.
+#[cfg(feature = "combo-light")]
+pub fn router_profile() -> RouterProfile {
+    DeviceProfile::new(
+        ENDPOINT,
+        PROFILE_HOME_AUTOMATION,
+        DeviceId::ON_OFF_LIGHT,
+        OnOffLight::default(),
+    )
+}
+
+/// The local endpoint that receives the GP sink's translated GPD commands.
+#[cfg(feature = "combo-light")]
+pub const COMBO_SINK_ENDPOINT: u8 = ENDPOINT;
 
 #[cfg(target_os = "none")]
 pub use stores::{
@@ -101,10 +129,21 @@ mod tests {
         assert!(ROUTER_POLICY.max_receive_slice_us <= 20_000);
     }
 
+    #[cfg(not(feature = "combo-light"))]
     #[test]
     fn router_advertises_a_range_extender() {
         let profile = router_profile();
         assert_eq!(profile.device_id(), DeviceId::RANGE_EXTENDER);
         assert_eq!(profile.expected_report_clusters(), 0);
+    }
+
+    #[cfg(feature = "combo-light")]
+    #[test]
+    fn combo_router_advertises_an_on_off_light_that_receives_gp_commands() {
+        let profile = router_profile();
+        assert_eq!(profile.device_id(), DeviceId::ON_OFF_LIGHT);
+        assert_eq!(profile.endpoint(), COMBO_SINK_ENDPOINT);
+        assert_eq!(profile.expected_report_clusters(), 1);
+        assert!(!profile.component().is_on());
     }
 }
