@@ -127,6 +127,10 @@ pub struct GreenPowerState {
     /// the next [`ZigbeeDevice::gp_poll`].
     reply: Option<OutFrame>,
     tsn: u8,
+    /// Temporary channel the radio was tuned to for a Channel Configuration
+    /// delivery; `None` while on the operational channel.
+    #[cfg(feature = "green-power-full-proxy")]
+    off_channel: Option<u8>,
 }
 
 impl GreenPowerState {
@@ -136,6 +140,8 @@ impl GreenPowerState {
             clock: GpClock::new(),
             reply: None,
             tsn: 0,
+            #[cfg(feature = "green-power-full-proxy")]
+            off_channel: None,
         }
     }
 
@@ -160,6 +166,11 @@ impl GreenPowerState {
     pub(crate) fn clear(&mut self) {
         self.proxy.clear();
         self.reply = None;
+        // Leave and rejoin retune the radio themselves.
+        #[cfg(feature = "green-power-full-proxy")]
+        {
+            self.off_channel = None;
+        }
     }
 
     fn next_tsn(&mut self) -> u8 {
@@ -328,6 +339,42 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         match result {
             Ok(()) => log::info!("[GP] TempMaster GPDF sent ({} B)", downlink.len),
             Err(error) => log::warn!("[GP] TempMaster GPDF not sent: {:?}", error),
+        }
+        // A delivered Channel Configuration ends a temporary channel.
+        #[cfg(feature = "green-power-full-proxy")]
+        self.gp_sync_radio_channel().await;
+    }
+
+    /// Tune the radio to the channel the proxy needs: a GPD's transmit
+    /// channel while a Channel Configuration waits for delivery (GP 1.1
+    /// A.3.9.1 step 8), otherwise back to the operational channel.
+    #[cfg(feature = "green-power-full-proxy")]
+    async fn gp_sync_radio_channel(&mut self) {
+        let now_ms = self.gp_now_ms();
+        let wanted = self.green_power.proxy.transmit_channel(now_ms);
+        if wanted == self.green_power.off_channel {
+            return;
+        }
+        let channel = wanted.unwrap_or(self.bdb.zdo().nwk().nib().logical_channel);
+        let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+        match mac
+            .mlme_set(
+                zigbee_mac::PibAttribute::PhyCurrentChannel,
+                zigbee_mac::PibValue::U8(channel),
+            )
+            .await
+        {
+            Ok(()) => {
+                log::info!("[GP] radio on channel {}", channel);
+                self.green_power.off_channel = wanted;
+            }
+            Err(error) => {
+                log::warn!("[GP] channel {} switch failed: {:?}", channel, error);
+                if wanted.is_some() {
+                    // Give up the delivery rather than retrying every pass.
+                    self.green_power.proxy.abandon_transmit_channel();
+                }
+            }
         }
     }
 
@@ -616,6 +663,13 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         if self.green_power.reply.is_some() {
             return Some(0);
         }
+        #[cfg(feature = "green-power-full-proxy")]
+        {
+            let now_ms = self.gp_now_ms();
+            if self.green_power.proxy.transmit_channel(now_ms) != self.green_power.off_channel {
+                return Some(0);
+            }
+        }
         let deadline = self.green_power.proxy.next_deadline()?;
         let now_ms = self.gp_now_ms();
         let remaining_ms = deadline.wrapping_sub(now_ms);
@@ -634,6 +688,10 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             self.green_power.reply = None;
             return;
         }
+        // Retune first: due network frames are sent only on the operational
+        // channel, a Channel Configuration only on the GPD's.
+        #[cfg(feature = "green-power-full-proxy")]
+        self.gp_sync_radio_channel().await;
         let own_nwk = self.bdb.zdo().nwk().nib().network_address.0;
         self.green_power.proxy.set_own_nwk(own_nwk);
         for _ in 0..MAX_TX_PER_POLL {

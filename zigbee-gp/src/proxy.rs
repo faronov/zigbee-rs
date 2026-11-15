@@ -86,6 +86,11 @@ pub const GP_TX_QUEUE_LEN: usize = 5;
 pub const MAX_DOWNLINK_PAYLOAD: usize = 32;
 /// Default gpTxQueueEntryLifetime, ms.
 pub const DEFAULT_TX_QUEUE_LIFETIME_MS: u32 = 10_000;
+/// How long a TempMaster stays on a GPD's transmit channel waiting for the
+/// Channel Request that releases a queued Channel Configuration, ms. Matches
+/// the Silicon Labs GP client's channel-delivery timeout.
+#[cfg(feature = "proxy-full")]
+pub const CHANNEL_DELIVERY_TIMEOUT_MS: u32 = 5_000;
 /// gpTxOffset: a queued GPDF starts (first preamble symbol) this long after
 /// the *end* of the triggering GPDF, in µs. GP 1.1.1 measures gpTxOffset
 /// (20 ms) from the *start* of the triggering GPDF and allows
@@ -576,6 +581,9 @@ pub enum DropReason {
     Invalid,
     /// IEEE-addressed GPDs require the Full Proxy feature.
     UnsupportedApplicationId,
+    /// The proxy is temporarily on a GPD's transmit channel to deliver a
+    /// Channel Configuration; only that GPD's Channel Request is served.
+    OffChannel,
     /// Transmission queue full.
     QueueFull,
 }
@@ -691,6 +699,17 @@ struct Bidirectional {
     /// GPD this proxy was last appointed TempMaster for; it uses the
     /// shortest tunnelling delay for that GPD (A.3.9.1 step 12).
     temp_master_for: Option<GpdId>,
+    /// Temporary transmit channel for a Channel Configuration delivery
+    /// (A.3.9.1 step 8), and when the proxy gives up waiting there.
+    #[cfg(feature = "proxy-full")]
+    transmit_channel: Option<TransmitChannel>,
+}
+
+#[cfg(feature = "proxy-full")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransmitChannel {
+    channel: u8,
+    until_ms: u32,
 }
 
 fn due(now: u32, deadline: u32) -> bool {
@@ -746,6 +765,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 operational_channel: 0,
                 tx_queue: heapless::Vec::new(),
                 temp_master_for: None,
+                #[cfg(feature = "proxy-full")]
+                transmit_channel: None,
             },
         }
     }
@@ -776,6 +797,10 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         {
             self.bidi.tx_queue.clear();
             self.bidi.temp_master_for = None;
+            #[cfg(feature = "proxy-full")]
+            {
+                self.bidi.transmit_channel = None;
+            }
         }
     }
 
@@ -804,6 +829,10 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         self.bidi.capable = capable;
         if !capable {
             self.bidi.tx_queue.clear();
+            #[cfg(feature = "proxy-full")]
+            {
+                self.bidi.transmit_channel = None;
+            }
         }
     }
 
@@ -813,7 +842,56 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         if self.bidi.operational_channel != channel {
             self.bidi.operational_channel = channel;
             self.bidi.tx_queue.clear();
+            #[cfg(feature = "proxy-full")]
+            {
+                self.bidi.transmit_channel = None;
+            }
         }
+    }
+
+    /// The channel the radio must be on for a Channel Configuration
+    /// delivery (A.3.9.1 step 8), or `None` when the proxy needs the
+    /// operational channel. The owner tunes the radio to it and back; while
+    /// it is set the proxy serves only Channel Requests and defers its
+    /// network transmissions.
+    #[cfg(feature = "proxy-full")]
+    pub fn transmit_channel(&self, now_ms: u32) -> Option<u8> {
+        self.bidi
+            .transmit_channel
+            .filter(|t| !due(now_ms, t.until_ms))
+            .map(|t| t.channel)
+    }
+
+    /// Leave the transmit channel once its delivery is done or timed out,
+    /// dropping an undelivered Channel Configuration.
+    #[cfg(feature = "proxy-full")]
+    fn expire_transmit_channel(&mut self, now_ms: u32) {
+        if self
+            .bidi
+            .transmit_channel
+            .is_some_and(|t| due(now_ms, t.until_ms))
+        {
+            self.end_transmit_channel();
+        }
+    }
+
+    #[cfg(feature = "proxy-full")]
+    fn end_transmit_channel(&mut self) {
+        if self.bidi.transmit_channel.take().is_some() {
+            self.bidi.tx_queue.retain(|e| e.gpd_id != GpdId::SrcId(0));
+        }
+    }
+
+    /// Drop a pending Channel Configuration delivery, e.g. when the radio
+    /// cannot tune to its transmit channel.
+    #[cfg(feature = "proxy-full")]
+    pub fn abandon_transmit_channel(&mut self) {
+        self.end_transmit_channel();
+    }
+
+    #[cfg(feature = "proxy-full")]
+    fn on_transmit_channel(&self, now_ms: u32) -> bool {
+        self.transmit_channel(now_ms).is_some()
     }
 
     /// Whether this proxy has no gpTxQueue room for `gpd` (Notification
@@ -995,6 +1073,12 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
 
     /// Next time `poll` has work, if any.
     pub fn next_deadline(&self) -> Option<u32> {
+        // Network transmissions wait until the radio is back on the
+        // operational channel.
+        #[cfg(feature = "proxy-full")]
+        if let Some(t) = self.bidi.transmit_channel {
+            return Some(t.until_ms);
+        }
         let mut best: Option<u32> = self.commissioning.and_then(|c| c.deadline_ms);
         for p in &self.pending {
             best = Some(match best {
@@ -1016,6 +1100,13 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     /// repeatedly until it returns `None`.
     pub fn poll(&mut self, now_ms: u32) -> Option<GpTx> {
         self.expire_commissioning(now_ms);
+        #[cfg(feature = "proxy-full")]
+        {
+            self.expire_transmit_channel(now_ms);
+            if self.on_transmit_channel(now_ms) {
+                return None;
+            }
+        }
         #[cfg(feature = "proxy-full")]
         if let Some(i) = self
             .notification_retries
@@ -1151,6 +1242,15 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         }
         if h.app_id == ApplicationId::Ieee && !cfg!(feature = "proxy-full") {
             return GpdfOutcome::Dropped(UnsupportedApplicationId);
+        }
+        // The Channel Request that releases the Channel Configuration was
+        // already served by `take_downlink`; nothing is tunnelled from here.
+        #[cfg(feature = "proxy-full")]
+        {
+            self.expire_transmit_channel(now_ms);
+            if self.on_transmit_channel(now_ms) {
+                return GpdfOutcome::Dropped(OffChannel);
+            }
         }
         let gpd = h.gpd_id.unwrap_or(GpdId::SrcId(0));
         let entry_idx = self.find(&gpd);
@@ -1752,8 +1852,9 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     /// GPD's next `rxAfterTx` window and sets FirstToForward. It fails with
     /// [`Error::Unsupported`] when this proxy cannot act as TempMaster
     /// (unidirectional build or platform), or when the TempMaster would have
-    /// to switch to another channel (Channel Configuration delivery on a
-    /// non-operational channel). A full gpTxQueue returns
+    /// to switch to another channel: only a `proxy-full` build switches, and
+    /// only for a Maintenance Channel Configuration (see
+    /// [`transmit_channel`](Self::transmit_channel)). A full gpTxQueue returns
     /// [`Error::BufferFull`]. A Response appointing another proxy drops our
     /// queued GPDF for that GPD and clears FirstToForward.
     fn on_response(&mut self, r: &Response<'_>, _now_ms: u32) -> Result<()> {
@@ -1769,6 +1870,11 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             if self.is_temp_master_for(&r.gpd_id) {
                 self.bidi.temp_master_for = None;
             }
+            // Another proxy delivers the Channel Configuration.
+            #[cfg(feature = "proxy-full")]
+            if r.gpd_id == GpdId::SrcId(0) {
+                self.end_transmit_channel();
+            }
         }
         if let Some(i) = self.find(&r.gpd_id) {
             self.table[i].first_to_forward = false;
@@ -1781,9 +1887,30 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         if !self.bidi.capable || r.transmit_on_endpoint_match {
             return Err(Error::Unsupported);
         }
-        // Delivery on another channel needs the TempMaster channel switch
-        // of A.3.9.1 step 8 (proxy-full).
-        if self.bidi.operational_channel == 0 || r.tx_channel() != self.bidi.operational_channel {
+        if self.bidi.operational_channel == 0 {
+            return Err(Error::Unsupported);
+        }
+        let off_channel = r.tx_channel() != self.bidi.operational_channel;
+        #[cfg(feature = "proxy-full")]
+        {
+            self.expire_transmit_channel(now_ms);
+            let other_channel = self
+                .bidi
+                .transmit_channel
+                .is_some_and(|t| t.channel != r.tx_channel());
+            // A.3.9.1 step 8: only a Maintenance Channel Configuration is
+            // delivered off the operational channel, one channel at a time.
+            if off_channel
+                && (r.gpd_id != GpdId::SrcId(0)
+                    || r.command_id != cmd::CHANNEL_CONFIGURATION
+                    || other_channel)
+            {
+                return Err(Error::Unsupported);
+            }
+        }
+        // Without proxy-full there is no channel switch.
+        #[cfg(not(feature = "proxy-full"))]
+        if off_channel {
             return Err(Error::Unsupported);
         }
         let payload = heapless::Vec::from_slice(r.payload).map_err(|_| Error::BufferFull)?;
@@ -1803,6 +1930,13 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         self.bidi.temp_master_for = Some(r.gpd_id);
         if let Some(i) = self.find(&r.gpd_id) {
             self.table[i].first_to_forward = true;
+        }
+        #[cfg(feature = "proxy-full")]
+        if off_channel {
+            self.bidi.transmit_channel = Some(TransmitChannel {
+                channel: r.tx_channel(),
+                until_ms: now_ms.wrapping_add(CHANNEL_DELIVERY_TIMEOUT_MS),
+            });
         }
         Ok(())
     }
@@ -1840,6 +1974,15 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         }
         let channel_request = frame.clear_command_id() == Some(cmd::CHANNEL_REQUEST);
         if !h.rx_after_tx && !channel_request {
+            return None;
+        }
+        #[cfg(feature = "proxy-full")]
+        let on_transmit_channel = {
+            self.expire_transmit_channel(now_ms);
+            self.on_transmit_channel(now_ms)
+        };
+        #[cfg(feature = "proxy-full")]
+        if on_transmit_channel && !channel_request {
             return None;
         }
         self.bidi.tx_queue.retain(|e| !due(now_ms, e.expires_ms));
@@ -1913,6 +2056,15 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         )
         .ok()?;
         self.bidi.tx_queue.swap_remove(idx);
+        // A.3.9.1 step 8: back to the operational channel. The Channel
+        // Request is not tunnelled, or the sink would answer it with yet
+        // another off-channel GP Response.
+        #[cfg(feature = "proxy-full")]
+        if maintenance && on_transmit_channel {
+            self.end_transmit_channel();
+            let counter = u32::from(frame.mac_seq);
+            let _ = self.dup.check_and_record(&gpd, counter, now_ms);
+        }
         Some(n)
     }
 
@@ -3639,6 +3791,114 @@ mod tests {
                 late,
             )
             .unwrap();
+        }
+
+        #[cfg(feature = "proxy-full")]
+        fn commissioning(p: &mut P, now_ms: u32) {
+            let mut reply = None;
+            p.on_client_command(
+                0,
+                client_cmd::PROXY_COMMISSIONING_MODE,
+                &zha_pcm(true),
+                now_ms,
+                &mut reply,
+            )
+            .unwrap();
+        }
+
+        #[cfg(feature = "proxy-full")]
+        #[test]
+        fn channel_configuration_is_delivered_on_the_gpd_transmit_channel() {
+            const TX_CHANNEL: u8 = 15;
+            let mut p = bidi_proxy(1);
+            commissioning(&mut p, 0);
+            // Only a Maintenance Channel Configuration may move the radio.
+            assert_eq!(
+                response(
+                    &mut p,
+                    GpdId::SrcId(SRC),
+                    0x1234,
+                    TX_CHANNEL,
+                    0xF3,
+                    &[0x1E],
+                    0
+                ),
+                Err(Error::Unsupported)
+            );
+            assert_eq!(p.transmit_channel(0), None);
+            response(
+                &mut p,
+                GpdId::SrcId(0),
+                0x1234,
+                TX_CHANNEL,
+                0xF3,
+                &[0x1E],
+                0,
+            )
+            .unwrap();
+            assert_eq!(p.transmit_channel(0), Some(TX_CHANNEL));
+            // One channel at a time.
+            assert_eq!(
+                response(&mut p, GpdId::SrcId(0), 0x1234, 20, 0xF3, &[0x1E], 1),
+                Err(Error::Unsupported)
+            );
+            assert_eq!(p.next_deadline(), Some(CHANNEL_DELIVERY_TIMEOUT_MS));
+
+            // Off channel: other GPDFs are neither answered nor tunnelled,
+            // and network transmissions wait.
+            let data = uplink(Some(SRC), Some(&KEY_C0), 2, true, cmd::TOGGLE, &[]);
+            assert!(take(&mut p, &data, 10).is_none());
+            assert_eq!(
+                p.on_gpdf(&mut SoftwareAesProvider, &gpdf(&data), GppGpdLink(0), 10),
+                GpdfOutcome::Dropped(DropReason::OffChannel)
+            );
+            assert!(p.poll(10).is_none());
+
+            let req = uplink(None, None, 0, false, cmd::CHANNEL_REQUEST, &[0xEE]);
+            let down = take(&mut p, &req, 20).unwrap();
+            assert_eq!(&down[7..], &[0x0D, 0xF3, 0x1E]);
+            assert_eq!(p.transmit_channel(20), None);
+            // The releasing Channel Request is not tunnelled back to the sink.
+            assert_eq!(
+                p.on_gpdf(&mut SoftwareAesProvider, &gpdf(&req), GppGpdLink(0), 20),
+                GpdfOutcome::Dropped(DropReason::Duplicate)
+            );
+        }
+
+        #[cfg(feature = "proxy-full")]
+        #[test]
+        fn undelivered_channel_configuration_times_out_back_to_operation() {
+            let mut p = bidi_proxy(1);
+            response(&mut p, GpdId::SrcId(0), 0x1234, 15, 0xF3, &[0x1E], 0).unwrap();
+            let end = CHANNEL_DELIVERY_TIMEOUT_MS;
+            assert_eq!(p.transmit_channel(end - 1), Some(15));
+            assert_eq!(p.transmit_channel(end), None);
+            assert!(p.poll(end).is_none());
+            assert_eq!(p.next_deadline(), None);
+            // The undelivered frame is gone; a later Channel Request on the
+            // operational channel gets nothing.
+            let req = uplink(None, None, 0, false, cmd::CHANNEL_REQUEST, &[0xEE]);
+            assert!(take(&mut p, &req, end + 1).is_none());
+            // Normal tunnelling resumes.
+            let data = uplink(Some(SRC), Some(&KEY_C0), 2, false, cmd::TOGGLE, &[]);
+            assert_eq!(
+                p.on_gpdf(
+                    &mut SoftwareAesProvider,
+                    &gpdf(&data),
+                    GppGpdLink(0),
+                    end + 1
+                ),
+                GpdfOutcome::Notification
+            );
+        }
+
+        #[cfg(feature = "proxy-full")]
+        #[test]
+        fn other_temp_master_ends_our_channel_delivery() {
+            let mut p = bidi_proxy(1);
+            response(&mut p, GpdId::SrcId(0), 0x1234, 15, 0xF3, &[0x1E], 0).unwrap();
+            response(&mut p, GpdId::SrcId(0), 0x5678, 15, 0xF3, &[0x1E], 1).unwrap();
+            assert_eq!(p.transmit_channel(1), None);
         }
 
         #[test]

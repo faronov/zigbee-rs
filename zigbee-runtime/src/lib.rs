@@ -16618,6 +16618,113 @@ mod parent_router_tests {
         assert_eq!(router.mac().timed_tx_history().len(), 1);
     }
 
+    /// GP Channel Configuration delivery off the operational channel
+    /// (`green-power-full-proxy`, GP 1.1 A.3.9.1 step 8): the TempMaster
+    /// tunes the radio to the GPD's transmit channel, answers its Channel
+    /// Request there and returns to the operational channel.
+    #[cfg(feature = "green-power-full-proxy")]
+    #[test]
+    fn gp_tempmaster_delivers_channel_configuration_on_the_transmit_channel() {
+        use zigbee_aps::ApsTxOptions;
+        use zigbee_aps::apsde::ApsdeDataRequest;
+        use zigbee_aps::{ApsAddress, ApsAddressMode};
+        use zigbee_gp::cluster::{Response, client_cmd};
+        use zigbee_gp::types::GpdId;
+        use zigbee_mac::{PibAttribute, PibValue};
+
+        const OPERATIONAL: u8 = 15;
+        const TRANSMIT: u8 = 20;
+        // Basic Channel Configuration: operational channel 15.
+        const CONFIGURATION: [u8; 1] = [0x10 | (OPERATIONAL - 11)];
+        // Maintenance GPDF without extension: Channel Request (0xE3).
+        const CHANNEL_REQUEST: [u8; 3] = [0x0D, 0xE3, 0x99];
+        const RX_END_US: u32 = 4_000_000;
+
+        let mut sink = centralized_coordinator();
+        let response = Response {
+            gpd_id: GpdId::SrcId(0),
+            transmit_on_endpoint_match: false,
+            temp_master_short: ROUTER.0,
+            temp_master_tx_channel: TRANSMIT - 11,
+            command_id: 0xF3,
+            payload: &CONFIGURATION,
+        };
+        let mut zcl = [0u8; 64];
+        zcl[..3].copy_from_slice(&[0x19, 0x43, client_cmd::RESPONSE]);
+        let len = 3 + response.encode(&mut zcl[3..]).unwrap();
+        block_on(
+            sink.bdb
+                .zdo_mut()
+                .aps_mut()
+                .apsde_data_request(&ApsdeDataRequest {
+                    dst_addr_mode: ApsAddressMode::Short,
+                    dst_address: ApsAddress::Short(ShortAddress(0xFFFD)),
+                    dst_endpoint: 242,
+                    profile_id: 0xA1E0,
+                    cluster_id: 0x0021,
+                    src_endpoint: 242,
+                    payload: &zcl[..len],
+                    tx_options: ApsTxOptions {
+                        use_nwk_key: true,
+                        ..ApsTxOptions::default()
+                    },
+                    radius: 0,
+                    alias_src_addr: None,
+                    alias_seq: None,
+                }),
+        )
+        .unwrap();
+        let response = McpsDataIndication {
+            src_address: MacAddress::Short(PAN, ShortAddress::COORDINATOR),
+            dst_address: MacAddress::Short(PAN, ShortAddress(0xFFFF)),
+            lqi: 200,
+            payload: MacFrame::from_slice(
+                sink.mac().tx_history().last().unwrap().payload.as_slice(),
+            )
+            .unwrap(),
+            security_use: false,
+        };
+        let channel_request = McpsDataIndication {
+            src_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+            dst_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+            lqi: 180,
+            payload: MacFrame::from_slice(&CHANNEL_REQUEST)
+                .unwrap()
+                .with_mac_sequence(7)
+                .with_rx_end_us(RX_END_US),
+            security_use: false,
+        };
+
+        let mut router = centralized_router();
+        router.bdb.zdo_mut().nwk_mut().nib_mut().logical_channel = OPERATIONAL;
+        router.mac_mut().set_timed_tx(true);
+        let radio_channel = |router: &mut ZigbeeDevice<MockMac, _>| {
+            let mac: &mut MockMac = router.mac_mut();
+            match block_on(mac.mlme_get(PibAttribute::PhyCurrentChannel)) {
+                Ok(PibValue::U8(channel)) => channel,
+                other => panic!("{other:?}"),
+            }
+        };
+        block_on(
+            router
+                .mac_mut()
+                .mlme_set(PibAttribute::PhyCurrentChannel, PibValue::U8(OPERATIONAL)),
+        )
+        .unwrap();
+
+        assert!(block_on(router.process_incoming(&response, &mut [])).is_none());
+        assert_eq!(router.gp_next_wait_us(), Some(0));
+        block_on(router.gp_poll());
+        assert_eq!(radio_channel(&mut router), TRANSMIT);
+
+        router.mac_mut().set_time_micros(RX_END_US + 900);
+        assert!(block_on(router.process_incoming(&channel_request, &mut [])).is_none());
+        let sent = router.mac().timed_tx_history();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(&sent[0].frame[7..], &[0x0D, 0xF3, CONFIGURATION[0]]);
+        assert_eq!(radio_channel(&mut router), OPERATIONAL);
+    }
+
     /// GP Proxy Basic end to end: a sink's GP Pairing arrives over the
     /// secured NWK, a paired L3 GPDF is tunnelled as a groupcast GP
     /// Notification under the GPD alias, a replay is rejected, and the
