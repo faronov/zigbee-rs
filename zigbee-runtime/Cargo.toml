@@ -89,11 +89,11 @@ green-power-full-proxy = [
 # sink commissioning mode, GPD commissioning, GP Notification processing),
 # GPDFs heard directly processed locally, and translated GPD commands
 # delivered to one local application endpoint. Sink Table persistence shares
-# the GP journal. Off by default: images built without it are unchanged.
-green-power-sink = [
-    "green-power-full-proxy",
-    "zigbee-gp/sink",
-]
+# the GP journal. Needs no timed TX: bidirectional commissioning of a GPD the
+# combo hears directly also needs `green-power-bidirectional`; through other
+# TempMasters it always works. Off by default: images built without it are
+# unchanged.
+green-power-sink = ["green-power", "zigbee-gp/sink"]
 # Deprecated item-by-item `save_state`/`restore_state` persistence. It does not
 # persist the Trust Center link key, APS keys, bindings or groups; production
 # devices use `SecurityStateStore`. Kept only for tests and mock examples.

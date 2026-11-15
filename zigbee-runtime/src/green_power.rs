@@ -1277,6 +1277,7 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             let Some(out) = self.green_power.sink.poll(now_ms) else {
                 break;
             };
+            #[cfg(feature = "green-power-bidirectional")]
             if let TxFrame::GpCommand {
                 command_id: zigbee_gp::cluster::client_cmd::RESPONSE,
                 payload,

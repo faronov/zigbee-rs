@@ -14709,6 +14709,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         #[cfg(all(feature = "green-power", not(feature = "green-power-bidirectional")))]
         if zigbee_gp::frame::is_gpdf(mac_payload) {
             self.gp_receive_gpdf(indication);
+            // Combo: the sink's translation of a GPDF heard directly.
+            #[cfg(feature = "green-power-sink")]
+            return self.gp_sink_deliver(clusters);
+            #[cfg(not(feature = "green-power-sink"))]
             return None;
         }
         // A bidirectional GPD listens gpTxOffset after this GPDF; the

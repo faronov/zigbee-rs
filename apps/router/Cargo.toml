@@ -28,7 +28,7 @@ green-power-bidirectional = ["green-power", "zigbee-runtime/green-power-bidirect
 green-power-full-proxy = ["green-power-bidirectional", "zigbee-runtime/green-power-full-proxy"]
 # Experimental GP Combo / Sink (GP server); the Sink Table shares the store
 # given to `set_green_power_store`. Product images must opt in explicitly.
-green-power-sink = ["green-power-full-proxy", "zigbee-runtime/green-power-sink"]
+green-power-sink = ["green-power", "zigbee-runtime/green-power-sink"]
 
 [dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }
