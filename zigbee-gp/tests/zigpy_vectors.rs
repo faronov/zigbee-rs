@@ -600,7 +600,9 @@ mod sink {
     use super::*;
     use zigbee_gp::cluster::{client_cmd, server_cmd};
     use zigbee_gp::proxy::{GpTx, TxFrame};
-    use zigbee_gp::sink::{Sink, SinkConfig, SinkEvent, SinkOutcome, exit_mode_attr, zcl_status};
+    use zigbee_gp::sink::{
+        ServerCommand, Sink, SinkConfig, SinkEvent, SinkOutcome, exit_mode_attr, zcl_status,
+    };
 
     fn gp_command(tx: &GpTx) -> (u8, &[u8]) {
         match &tx.frame {
@@ -634,7 +636,7 @@ mod sink {
         let mut aes = SoftwareAesProvider;
         let mut s = zha_like_sink();
         s.enter_commissioning(0, true).unwrap();
-        let tx = s.poll(0).unwrap();
+        let tx = s.poll(0).unwrap().tx;
         assert_eq!(
             gp_command(&tx),
             (client_cmd::PROXY_COMMISSIONING_MODE, v::PCM_ENTER_180)
@@ -644,18 +646,21 @@ mod sink {
         assert_eq!(
             s.on_server_command(
                 &mut aes,
-                0x1234,
-                false,
-                server_cmd::COMMISSIONING_NOTIFICATION,
-                v::COMMISSIONING_NOTIFICATION_PROXY_INFO,
-                10,
+                &ServerCommand {
+                    src_nwk: 0x1234,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::COMMISSIONING_NOTIFICATION,
+                    payload: v::COMMISSIONING_NOTIFICATION_PROXY_INFO
+                },
+                10
             ),
             Ok((zcl_status::SUCCESS, Some(SinkOutcome::Commissioned)))
         );
-        let tx = s.poll(10).unwrap();
+        let tx = s.poll(10).unwrap().tx;
         assert_eq!(gp_command(&tx), (client_cmd::PAIRING, v::PAIRING_ADD_L3));
         assert!(matches!(
-            s.poll(10).unwrap().frame,
+            s.poll(10).unwrap().tx.frame,
             TxFrame::DeviceAnnce { .. }
         ));
 
@@ -664,11 +669,14 @@ mod sink {
         assert_eq!(
             s.on_server_command(
                 &mut aes,
-                0x1234,
-                false,
-                server_cmd::NOTIFICATION,
-                v::NOTIFICATION_COMM_GROUP_L3,
-                20,
+                &ServerCommand {
+                    src_nwk: 0x1234,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::NOTIFICATION,
+                    payload: v::NOTIFICATION_COMM_GROUP_L3
+                },
+                20
             ),
             Ok((zcl_status::SUCCESS, Some(SinkOutcome::PassedThrough)))
         );
@@ -682,11 +690,14 @@ mod sink {
         assert_eq!(
             s.on_server_command(
                 &mut aes,
-                0x1234,
-                false,
-                server_cmd::NOTIFICATION,
-                v::NOTIFICATION_RX_AFTER_TX_PROXY_INFO,
-                30,
+                &ServerCommand {
+                    src_nwk: 0x1234,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::NOTIFICATION,
+                    payload: v::NOTIFICATION_RX_AFTER_TX_PROXY_INFO
+                },
+                30
             ),
             Ok((zcl_status::SUCCESS, Some(SinkOutcome::Translated)))
         );
@@ -697,7 +708,7 @@ mod sink {
         assert_eq!(s.entries()[0].frame_counter, 0x13);
 
         s.exit_commissioning();
-        let tx = s.poll(50).unwrap();
+        let tx = s.poll(50).unwrap().tx;
         assert_eq!(
             gp_command(&tx),
             (client_cmd::PROXY_COMMISSIONING_MODE, v::PCM_EXIT)
@@ -728,18 +739,21 @@ mod sink {
         assert_eq!(
             s.on_server_command(
                 &mut aes,
-                0x1234,
-                false,
-                server_cmd::COMMISSIONING_NOTIFICATION,
-                &payload,
-                10,
+                &ServerCommand {
+                    src_nwk: 0x1234,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::COMMISSIONING_NOTIFICATION,
+                    payload: &payload
+                },
+                10
             ),
             Ok((
                 zcl_status::SUCCESS,
                 Some(SinkOutcome::CommissioningReplySent)
             ))
         );
-        let tx = s.poll(10).unwrap();
+        let tx = s.poll(10).unwrap().tx;
         assert_eq!(
             gp_command(&tx),
             (client_cmd::RESPONSE, v::RESPONSE_COMMISSIONING_REPLY)

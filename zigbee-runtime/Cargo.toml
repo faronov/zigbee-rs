@@ -85,6 +85,15 @@ green-power-full-proxy = [
     "green-power-bidirectional",
     "zigbee-gp/proxy-full",
 ]
+# Experimental GP Combo / Sink: the GP server on endpoint 242 (Sink Table,
+# sink commissioning mode, GPD commissioning, GP Notification processing),
+# GPDFs heard directly processed locally, and translated GPD commands
+# delivered to one local application endpoint. Sink Table persistence shares
+# the GP journal. Off by default: images built without it are unchanged.
+green-power-sink = [
+    "green-power-full-proxy",
+    "zigbee-gp/sink",
+]
 # Deprecated item-by-item `save_state`/`restore_state` persistence. It does not
 # persist the Trust Center link key, APS keys, bindings or groups; production
 # devices use `SecurityStateStore`. Kept only for tests and mock examples.

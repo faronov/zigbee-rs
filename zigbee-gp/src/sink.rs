@@ -535,6 +535,21 @@ impl SinkTableRequest {
     }
 }
 
+/// A Green Power cluster command received for the GP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerCommand<'a> {
+    /// NWK source.
+    pub src_nwk: u16,
+    /// APS unicast to this node (not group or broadcast).
+    pub unicast: bool,
+    /// ZCL transaction sequence number.
+    pub tsn: u8,
+    /// ZCL command identifier ([`server_cmd`]).
+    pub command_id: u8,
+    /// ZCL payload.
+    pub payload: &'a [u8],
+}
+
 /// Why a frame did not change the sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkDrop {
@@ -651,6 +666,17 @@ pub struct SinkCommand {
     pub translation: Translation,
 }
 
+/// A network frame of the sink. All GP cluster commands it sends are
+/// server → client; `tsn` is the ZCL transaction sequence number of the
+/// request a response answers (`None`: the caller picks one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkTx {
+    /// The frame.
+    pub tx: GpTx,
+    /// ZCL TSN to reuse.
+    pub tsn: Option<u8>,
+}
+
 /// Sink counters (wrapping), for diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SinkStats {
@@ -715,7 +741,7 @@ pub struct Sink<const N: usize, const Q: usize> {
     pending: heapless::Vec<Pending, MAX_PENDING_COMMISSIONING>,
     /// First GP Notification sender per (GPD, counter), for FirstToForward.
     first_forwarders: heapless::Deque<(GpdId, u32, u16), 4>,
-    tx: heapless::Deque<GpTx, Q>,
+    tx: heapless::Deque<SinkTx, Q>,
     commands: heapless::Deque<SinkCommand, SINK_COMMAND_QUEUE_LEN>,
     events: heapless::Deque<SinkEvent, SINK_EVENT_QUEUE_LEN>,
     group_changes: heapless::Deque<GroupChange, 4>,
@@ -871,7 +897,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
 
     /// Process timers and return the next network frame, if any. Call
     /// repeatedly until it returns `None`.
-    pub fn poll(&mut self, now_ms: u32) -> Option<GpTx> {
+    pub fn poll(&mut self, now_ms: u32) -> Option<SinkTx> {
         if let Some(c) = self.commissioning
             && c.deadline_ms.is_some_and(|d| due(now_ms, d))
         {
@@ -899,7 +925,11 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
     }
 
     fn send(&mut self, tx: GpTx) -> bool {
-        let ok = self.tx.push_back(tx).is_ok();
+        self.send_reply(tx, None)
+    }
+
+    fn send_reply(&mut self, tx: GpTx, tsn: Option<u8>) -> bool {
+        let ok = self.tx.push_back(SinkTx { tx, tsn }).is_ok();
         if !ok {
             self.stats.tx_dropped = self.stats.tx_dropped.wrapping_add(1);
         }
@@ -1214,8 +1244,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
     }
 
     /// Process a Green Power cluster command sent to the GP server
-    /// (client → server direction) by `src_nwk`; `unicast` tells whether it
-    /// was APS-unicast to this node (not group or broadcast).
+    /// (client → server direction).
     ///
     /// Returns the ZCL status of commands that report one (GP Sink
     /// Commissioning Mode), otherwise `SUCCESS`, together with what the
@@ -1224,18 +1253,22 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
     pub fn on_server_command<P: ForwardAesProvider>(
         &mut self,
         aes: &mut P,
-        src_nwk: u16,
-        unicast: bool,
-        command_id: u8,
-        payload: &[u8],
+        command: &ServerCommand<'_>,
         now_ms: u32,
     ) -> Result<(u8, Option<SinkOutcome>)> {
+        let ServerCommand {
+            src_nwk,
+            unicast,
+            tsn,
+            command_id,
+            payload,
+        } = *command;
         match command_id {
             server_cmd::NOTIFICATION => {
                 let n = Notification::decode(payload)?;
                 Ok((
                     zcl_status::SUCCESS,
-                    Some(self.on_notification(aes, src_nwk, unicast, &n, now_ms)),
+                    Some(self.on_notification(aes, src_nwk, unicast, tsn, &n, now_ms)),
                 ))
             }
             server_cmd::COMMISSIONING_NOTIFICATION => {
@@ -1254,7 +1287,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 // gecko_sdk answers unicast requests only.
                 if unicast {
                     let tx = self.sink_table_response(src_nwk, &req)?;
-                    self.send(tx);
+                    self.send_reply(tx, Some(tsn));
                 }
                 Ok((zcl_status::SUCCESS, None))
             }
@@ -1314,6 +1347,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         aes: &mut P,
         src_nwk: u16,
         unicast: bool,
+        tsn: u8,
         n: &Notification<'_>,
         now_ms: u32,
     ) -> SinkOutcome {
@@ -1344,7 +1378,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 client_cmd::NOTIFICATION_RESPONSE,
                 |b| r.encode(b),
             ) {
-                self.send(tx);
+                self.send_reply(tx, Some(tsn));
             }
         }
         let Some(payload) = n.payload else {
@@ -2053,7 +2087,7 @@ mod tests {
     fn drain(s: &mut S, now: u32) -> heapless::Vec<GpTx, 8> {
         let mut out = heapless::Vec::new();
         while let Some(tx) = s.poll(now) {
-            out.push(tx).unwrap();
+            out.push(tx.tx).unwrap();
         }
         out
     }
@@ -2364,13 +2398,33 @@ mod tests {
         let mut aes = SoftwareAesProvider;
         let on = notification(20, 0x21, ProxyInfo::None);
         assert_eq!(
-            s.on_server_command(&mut aes, 0x1111, false, server_cmd::NOTIFICATION, &on, 1000),
+            s.on_server_command(
+                &mut aes,
+                &ServerCommand {
+                    src_nwk: 0x1111,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::NOTIFICATION,
+                    payload: &on
+                },
+                1000
+            ),
             Ok((zcl_status::SUCCESS, Some(SinkOutcome::Translated)))
         );
         assert_eq!(s.take_command().unwrap().translation.command_id, 0x01);
         // A second proxy's copy, and the GPDF heard directly, are dropped.
         assert_eq!(
-            s.on_server_command(&mut aes, 0x2222, false, server_cmd::NOTIFICATION, &on, 1010),
+            s.on_server_command(
+                &mut aes,
+                &ServerCommand {
+                    src_nwk: 0x2222,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::NOTIFICATION,
+                    payload: &on
+                },
+                1010
+            ),
             Ok((
                 zcl_status::SUCCESS,
                 Some(SinkOutcome::Dropped(SinkDrop::Duplicate))
@@ -2382,7 +2436,17 @@ mod tests {
             SinkOutcome::Dropped(SinkDrop::Duplicate)
         );
         assert_eq!(
-            s.on_server_command(&mut aes, 0x2222, false, server_cmd::NOTIFICATION, &on, 9000),
+            s.on_server_command(
+                &mut aes,
+                &ServerCommand {
+                    src_nwk: 0x2222,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::NOTIFICATION,
+                    payload: &on
+                },
+                9000
+            ),
             Ok((
                 zcl_status::SUCCESS,
                 Some(SinkOutcome::Dropped(SinkDrop::Stale))
@@ -2394,7 +2458,17 @@ mod tests {
         // Commissioning tunnelled in a Notification is dropped.
         let c = notification(21, cmd::COMMISSIONING, ProxyInfo::None);
         assert_eq!(
-            s.on_server_command(&mut aes, 0x1111, false, server_cmd::NOTIFICATION, &c, 9100),
+            s.on_server_command(
+                &mut aes,
+                &ServerCommand {
+                    src_nwk: 0x1111,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::NOTIFICATION,
+                    payload: &c
+                },
+                9100
+            ),
             Ok((
                 zcl_status::SUCCESS,
                 Some(SinkOutcome::Dropped(SinkDrop::NotCommissioning))
@@ -2410,14 +2484,34 @@ mod tests {
         let mut aes = SoftwareAesProvider;
         // Not paired in full unicast: no response.
         let n = notification(30, 0x21, ProxyInfo::None);
-        s.on_server_command(&mut aes, 0x1111, true, server_cmd::NOTIFICATION, &n, 1000)
-            .unwrap();
+        s.on_server_command(
+            &mut aes,
+            &ServerCommand {
+                src_nwk: 0x1111,
+                unicast: true,
+                tsn: 0x42,
+                command_id: server_cmd::NOTIFICATION,
+                payload: &n,
+            },
+            1000,
+        )
+        .unwrap();
         assert!(drain(&mut s, 1000).is_empty());
         s.table[0].communication_mode = CommunicationMode::FullUnicast;
         let n = notification(31, 0x21, ProxyInfo::None);
         for (proxy, first) in [(0x1111, true), (0x2222, false), (0x1111, true)] {
-            s.on_server_command(&mut aes, proxy, true, server_cmd::NOTIFICATION, &n, 2000)
-                .unwrap();
+            s.on_server_command(
+                &mut aes,
+                &ServerCommand {
+                    src_nwk: proxy,
+                    unicast: true,
+                    tsn: 0x42,
+                    command_id: server_cmd::NOTIFICATION,
+                    payload: &n,
+                },
+                2000,
+            )
+            .unwrap();
             let tx = drain(&mut s, 2000);
             assert_eq!(
                 tx[0].dest,
@@ -2439,7 +2533,17 @@ mod tests {
         drain(&mut s, 3000);
         let n = notification(32, 0x21, ProxyInfo::None);
         assert_eq!(
-            s.on_server_command(&mut aes, 0x1111, true, server_cmd::NOTIFICATION, &n, 3000),
+            s.on_server_command(
+                &mut aes,
+                &ServerCommand {
+                    src_nwk: 0x1111,
+                    unicast: true,
+                    tsn: 0x42,
+                    command_id: server_cmd::NOTIFICATION,
+                    payload: &n
+                },
+                3000
+            ),
             Ok((
                 zcl_status::SUCCESS,
                 Some(SinkOutcome::Dropped(SinkDrop::NoEntry))
@@ -2500,10 +2604,13 @@ mod tests {
         assert_eq!(
             s.on_server_command(
                 &mut aes,
-                0x1111,
-                false,
-                server_cmd::COMMISSIONING_NOTIFICATION,
-                &cn,
+                &ServerCommand {
+                    src_nwk: 0x1111,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::COMMISSIONING_NOTIFICATION,
+                    payload: &cn
+                },
                 0
             ),
             Ok((
@@ -2515,10 +2622,13 @@ mod tests {
         assert_eq!(
             s.on_server_command(
                 &mut aes,
-                0x1111,
-                false,
-                server_cmd::COMMISSIONING_NOTIFICATION,
-                &cn,
+                &ServerCommand {
+                    src_nwk: 0x1111,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::COMMISSIONING_NOTIFICATION,
+                    payload: &cn
+                },
                 10
             ),
             Ok((zcl_status::SUCCESS, Some(SinkOutcome::Commissioned)))
@@ -2544,10 +2654,13 @@ mod tests {
         assert_eq!(
             s.on_server_command(
                 &mut aes,
-                0x1111,
-                false,
-                server_cmd::COMMISSIONING_NOTIFICATION,
-                &cn,
+                &ServerCommand {
+                    src_nwk: 0x1111,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::COMMISSIONING_NOTIFICATION,
+                    payload: &cn
+                },
                 10
             ),
             Ok((
@@ -2577,10 +2690,13 @@ mod tests {
         assert_eq!(
             s.on_server_command(
                 &mut aes,
-                0x1111,
-                false,
-                server_cmd::COMMISSIONING_NOTIFICATION,
-                &bad,
+                &ServerCommand {
+                    src_nwk: 0x1111,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::COMMISSIONING_NOTIFICATION,
+                    payload: &bad
+                },
                 20
             ),
             Ok((
@@ -2592,10 +2708,13 @@ mod tests {
         assert_eq!(
             s.on_server_command(
                 &mut aes,
-                0x1111,
-                false,
-                server_cmd::COMMISSIONING_NOTIFICATION,
-                &bad,
+                &ServerCommand {
+                    src_nwk: 0x1111,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::COMMISSIONING_NOTIFICATION,
+                    payload: &bad
+                },
                 30
             ),
             Ok((zcl_status::SUCCESS, Some(SinkOutcome::Commissioned)))
@@ -2772,15 +2891,20 @@ mod tests {
             assert_eq!(SinkTableRequest::decode(&b[..n]), Ok(req));
             s.on_server_command(
                 &mut aes,
-                0x0000,
-                unicast,
-                server_cmd::SINK_TABLE_REQUEST,
-                &b[..n],
+                &ServerCommand {
+                    src_nwk: 0x0000,
+                    unicast,
+                    tsn: 0x42,
+                    command_id: server_cmd::SINK_TABLE_REQUEST,
+                    payload: &b[..n],
+                },
                 0,
             )
             .unwrap();
-            let tx = drain(s, 0);
-            tx.first().map(|tx| {
+            s.poll(0).map(|reply| {
+                // The response reuses the request's ZCL TSN.
+                assert_eq!(reply.tsn, Some(0x42));
+                let tx = &reply.tx;
                 assert_eq!(tx.dest, DestAddr::Unicast { nwk: 0, ieee: None });
                 let (id, p) = command(tx);
                 assert_eq!(id, client_cmd::SINK_TABLE_RESPONSE);
@@ -2912,10 +3036,13 @@ mod tests {
             assert_eq!(SinkCommissioningMode::decode(&b[..n]), Ok(m));
             s.on_server_command(
                 &mut aes,
-                0,
-                true,
-                server_cmd::SINK_COMMISSIONING_MODE,
-                &b[..n],
+                &ServerCommand {
+                    src_nwk: 0,
+                    unicast: true,
+                    tsn: 0x42,
+                    command_id: server_cmd::SINK_COMMISSIONING_MODE,
+                    payload: &b[..n],
+                },
                 0,
             )
             .unwrap()
@@ -2946,10 +3073,13 @@ mod tests {
         assert_eq!(
             s.on_server_command(
                 &mut aes,
-                0,
-                true,
-                server_cmd::TRANSLATION_TABLE_REQUEST,
-                &[0],
+                &ServerCommand {
+                    src_nwk: 0,
+                    unicast: true,
+                    tsn: 0x42,
+                    command_id: server_cmd::TRANSLATION_TABLE_REQUEST,
+                    payload: &[0]
+                },
                 0
             ),
             Err(Error::Unsupported)
