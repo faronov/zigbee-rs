@@ -897,6 +897,26 @@ fn gp_log_sink_outcome(
     }
 }
 
+#[cfg(feature = "green-power-sink")]
+fn gp_log_sink_command(src: u16, command: u8, outcome: zigbee_gp::sink::SinkOutcome) {
+    match outcome {
+        zigbee_gp::sink::SinkOutcome::Dropped(reason) => {
+            log::debug!(
+                "[GP] sink cmd 0x{:02X} from 0x{:04X} dropped: {:?}",
+                command,
+                src,
+                reason
+            )
+        }
+        _ => log::info!(
+            "[GP] sink cmd 0x{:02X} from 0x{:04X}: {:?}",
+            command,
+            src,
+            outcome
+        ),
+    }
+}
+
 /// ZCL Read Attributes Response records for `request`, served by `read`;
 /// stops at the last record that fits one frame (ZCL 2.5.2.3).
 #[cfg(feature = "green-power-sink")]
@@ -1116,17 +1136,7 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         {
             Ok((status, outcome)) => {
                 if let Some(outcome) = outcome {
-                    let gpd = match command {
-                        zigbee_gp::cluster::server_cmd::NOTIFICATION => {
-                            zigbee_gp::cluster::Notification::decode(payload)
-                                .ok()
-                                .map(|n| n.gpd_id)
-                        }
-                        _ => zigbee_gp::cluster::CommissioningNotification::decode(payload)
-                            .ok()
-                            .map(|n| n.gpd_id),
-                    };
-                    gp_log_sink_outcome(gpd, outcome);
+                    gp_log_sink_command(src_addr, command, outcome);
                 }
                 status
             }
