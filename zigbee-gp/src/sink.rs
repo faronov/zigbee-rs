@@ -694,6 +694,45 @@ struct CommissioningState {
     proxies_have_window: bool,
 }
 
+/// A queued network frame; [`Sink::poll`] encodes it (a GP Pairing from
+/// the GPD's Sink Table entry at that time), which keeps the queue small.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Out {
+    ProxyCommissioningMode(ProxyCommissioningMode),
+    /// GP Pairing (AddSink) for the GPD's Sink Table entry.
+    PairingAdd(GpdId),
+    /// GP Pairing with RemoveGPD.
+    PairingRemove {
+        gpd_id: GpdId,
+        mode: CommunicationMode,
+        level: SecurityLevel,
+        key_type: KeyType,
+    },
+    /// `Device_annce` for an alias.
+    DeviceAnnce(u16),
+    /// GP Response carrying a Commissioning Reply.
+    Response {
+        gpd_id: GpdId,
+        temp_master: u16,
+        tx_channel: u8,
+        reply: [u8; MAX_REPLY_LEN],
+        reply_len: u8,
+    },
+    NotificationResponse {
+        dst: u16,
+        tsn: u8,
+        response: NotificationResponse,
+    },
+    SinkTableResponse {
+        dst: u16,
+        tsn: u8,
+        request: SinkTableRequest,
+    },
+}
+
+/// Commissioning Reply without a key: options and the optional PAN ID.
+const MAX_REPLY_LEN: usize = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
     entry: SinkEntry,
@@ -741,7 +780,7 @@ pub struct Sink<const N: usize, const Q: usize> {
     pending: heapless::Vec<Pending, MAX_PENDING_COMMISSIONING>,
     /// First GP Notification sender per (GPD, counter), for FirstToForward.
     first_forwarders: heapless::Deque<(GpdId, u32, u16), 4>,
-    tx: heapless::Deque<SinkTx, Q>,
+    tx: heapless::Deque<Out, Q>,
     commands: heapless::Deque<SinkCommand, SINK_COMMAND_QUEUE_LEN>,
     events: heapless::Deque<SinkEvent, SINK_EVENT_QUEUE_LEN>,
     group_changes: heapless::Deque<GroupChange, 4>,
@@ -903,7 +942,123 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         {
             self.leave_commissioning(SinkCommissioningExit::Timeout);
         }
-        self.tx.pop_front()
+        while let Some(out) = self.tx.pop_front() {
+            if let Some(tx) = self.encode(&out) {
+                return Some(tx);
+            }
+        }
+        None
+    }
+
+    /// Encode a queued frame; `None` when it no longer applies (the GPD of
+    /// a queued GP Pairing was removed) or does not encode.
+    #[inline(never)]
+    fn encode(&self, out: &Out) -> Option<SinkTx> {
+        let broadcast = DestAddr::Broadcast(BROADCAST_RX_ON_WHEN_IDLE);
+        let unicast = |nwk| DestAddr::Unicast { nwk, ieee: None };
+        let mut payload = heapless::Vec::<u8, MAX_GP_COMMAND_LEN>::new();
+        payload.resize_default(MAX_TX_PAYLOAD).ok()?;
+        let (dest, command_id, tsn, len) = match *out {
+            Out::ProxyCommissioningMode(m) => (
+                broadcast,
+                client_cmd::PROXY_COMMISSIONING_MODE,
+                None,
+                m.encode(&mut payload),
+            ),
+            Out::PairingAdd(gpd_id) => {
+                let e = &self.table[self.find(&gpd_id)?];
+                (
+                    broadcast,
+                    client_cmd::PAIRING,
+                    None,
+                    self.pairing(e).encode(&mut payload),
+                )
+            }
+            Out::PairingRemove {
+                gpd_id,
+                mode,
+                level,
+                key_type,
+            } => {
+                // gecko_sdk `decommissionGpd`: mode, level and key type in
+                // the options, no sink fields.
+                let p = Pairing {
+                    gpd_id,
+                    add_sink: false,
+                    remove_gpd: true,
+                    communication_mode: mode,
+                    gpd_fixed: false,
+                    mac_seq_cap: false,
+                    security_level: level,
+                    key_type,
+                    sink: PairingSink::None,
+                    device_id: None,
+                    frame_counter: None,
+                    key: None,
+                    assigned_alias: None,
+                    groupcast_radius: None,
+                };
+                (broadcast, client_cmd::PAIRING, None, p.encode(&mut payload))
+            }
+            Out::DeviceAnnce(alias) => {
+                return Some(SinkTx {
+                    tx: GpTx {
+                        dest: broadcast,
+                        alias: Some((alias, 0)),
+                        radius: 0,
+                        frame: TxFrame::DeviceAnnce { alias },
+                    },
+                    tsn: None,
+                });
+            }
+            Out::Response {
+                gpd_id,
+                temp_master,
+                tx_channel,
+                reply,
+                reply_len,
+            } => {
+                let r = Response {
+                    gpd_id,
+                    transmit_on_endpoint_match: false,
+                    temp_master_short: temp_master,
+                    temp_master_tx_channel: tx_channel,
+                    command_id: cmd::COMMISSIONING_REPLY,
+                    payload: &reply[..usize::from(reply_len)],
+                };
+                (
+                    broadcast,
+                    client_cmd::RESPONSE,
+                    None,
+                    r.encode(&mut payload),
+                )
+            }
+            Out::NotificationResponse { dst, tsn, response } => (
+                unicast(dst),
+                client_cmd::NOTIFICATION_RESPONSE,
+                Some(tsn),
+                response.encode(&mut payload),
+            ),
+            Out::SinkTableResponse { dst, tsn, request } => (
+                unicast(dst),
+                client_cmd::SINK_TABLE_RESPONSE,
+                Some(tsn),
+                self.sink_table_response(&request, &mut payload),
+            ),
+        };
+        payload.truncate(len.ok()?);
+        Some(SinkTx {
+            tx: GpTx {
+                dest,
+                alias: None,
+                radius: 0,
+                frame: TxFrame::GpCommand {
+                    command_id,
+                    payload,
+                },
+            },
+            tsn,
+        })
     }
 
     fn find(&self, gpd: &GpdId) -> Option<usize> {
@@ -924,53 +1079,12 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         let _ = self.events.push_back(event);
     }
 
-    fn send(&mut self, tx: GpTx) -> bool {
-        self.send_reply(tx, None)
-    }
-
-    fn send_reply(&mut self, tx: GpTx, tsn: Option<u8>) -> bool {
-        let ok = self.tx.push_back(SinkTx { tx, tsn }).is_ok();
+    fn queue(&mut self, out: Out) -> bool {
+        let ok = self.tx.push_back(out).is_ok();
         if !ok {
             self.stats.tx_dropped = self.stats.tx_dropped.wrapping_add(1);
         }
         ok
-    }
-
-    fn command_frame(
-        dest: DestAddr,
-        command_id: u8,
-        encode: impl FnOnce(&mut [u8]) -> Result<usize>,
-    ) -> Result<GpTx> {
-        let mut payload = heapless::Vec::<u8, MAX_GP_COMMAND_LEN>::new();
-        payload
-            .resize_default(MAX_GP_COMMAND_LEN)
-            .map_err(|_| Error::BufferFull)?;
-        let n = encode(&mut payload)?;
-        payload.truncate(n);
-        Ok(GpTx {
-            dest,
-            alias: None,
-            radius: 0,
-            frame: TxFrame::GpCommand {
-                command_id,
-                payload,
-            },
-        })
-    }
-
-    fn broadcast(
-        &mut self,
-        command_id: u8,
-        encode: impl FnOnce(&mut [u8]) -> Result<usize>,
-    ) -> bool {
-        match Self::command_frame(
-            DestAddr::Broadcast(BROADCAST_RX_ON_WHEN_IDLE),
-            command_id,
-            encode,
-        ) {
-            Ok(tx) => self.send(tx),
-            Err(_) => false,
-        }
     }
 
     fn proxy_commissioning_mode(&self, enter: bool) -> ProxyCommissioningMode {
@@ -1016,7 +1130,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             proxies_have_window: pcm.window_s.is_some(),
         });
         if involve_proxies {
-            self.broadcast(client_cmd::PROXY_COMMISSIONING_MODE, |b| pcm.encode(b));
+            self.queue(Out::ProxyCommissioningMode(pcm));
         }
         self.event(SinkEvent::CommissioningEntered {
             window_s: window,
@@ -1041,7 +1155,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         if c.involve_proxies && !(reason == SinkCommissioningExit::Timeout && c.proxies_have_window)
         {
             let pcm = self.proxy_commissioning_mode(false);
-            self.broadcast(client_cmd::PROXY_COMMISSIONING_MODE, |b| pcm.encode(b));
+            self.queue(Out::ProxyCommissioningMode(pcm));
         }
         self.event(SinkEvent::CommissioningLeft(reason));
     }
@@ -1286,8 +1400,11 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 let req = SinkTableRequest::decode(payload)?;
                 // gecko_sdk answers unicast requests only.
                 if unicast {
-                    let tx = self.sink_table_response(src_nwk, &req)?;
-                    self.send_reply(tx, Some(tsn));
+                    self.queue(Out::SinkTableResponse {
+                        dst: src_nwk,
+                        tsn,
+                        request: req,
+                    });
                 }
                 Ok((zcl_status::SUCCESS, None))
             }
@@ -1370,16 +1487,11 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 no_pairing: idx.is_none(),
                 frame_counter: n.frame_counter,
             };
-            if let Ok(tx) = Self::command_frame(
-                DestAddr::Unicast {
-                    nwk: src_nwk,
-                    ieee: None,
-                },
-                client_cmd::NOTIFICATION_RESPONSE,
-                |b| r.encode(b),
-            ) {
-                self.send_reply(tx, Some(tsn));
-            }
+            self.queue(Out::NotificationResponse {
+                dst: src_nwk,
+                tsn,
+                response: r,
+            });
         }
         let Some(payload) = n.payload else {
             return SinkOutcome::Dropped(Invalid);
@@ -1689,17 +1801,9 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             key_type,
             key: None,
         };
-        let mut reply_buf = [0u8; 8];
+        let mut reply_buf = [0u8; MAX_REPLY_LEN];
         let Ok(reply_len) = reply.encode(&mut reply_buf) else {
             return SinkOutcome::Dropped(Invalid);
-        };
-        let response = Response {
-            gpd_id: rx.gpd,
-            transmit_on_endpoint_match: false,
-            temp_master_short: temp_master,
-            temp_master_tx_channel: self.operational_channel - 11,
-            command_id: cmd::COMMISSIONING_REPLY,
-            payload: &reply_buf[..reply_len],
         };
         if let Some(i) = self.pending_index(&rx.gpd) {
             self.pending.swap_remove(i);
@@ -1707,53 +1811,51 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         if self.pending.is_full() {
             self.pending.remove(0);
         }
-        if !self.broadcast(client_cmd::RESPONSE, |b| response.encode(b)) {
+        if !self.queue(Out::Response {
+            gpd_id: rx.gpd,
+            temp_master,
+            tx_channel: self.operational_channel - 11,
+            reply: reply_buf,
+            reply_len: reply_len as u8,
+        }) {
             return SinkOutcome::Dropped(QueueFull);
         }
         let _ = self.pending.push(Pending { entry });
         SinkOutcome::CommissioningReplySent
     }
 
-    fn pairing(&self, e: &SinkEntry, remove: bool) -> Pairing {
+    /// GP Pairing (AddSink) for a Sink Table entry (gecko_sdk
+    /// `sendGpPairingFromSinkEntry`).
+    fn pairing(&self, e: &SinkEntry) -> Pairing {
         let protected = e.security_level.is_protected();
-        let groupcast = matches!(
-            e.communication_mode,
-            CommunicationMode::DerivedGroupcast | CommunicationMode::CommissionedGroupcast
-        );
-        let sink = if remove {
-            PairingSink::None
-        } else {
-            match e.communication_mode {
-                CommunicationMode::DerivedGroupcast => PairingSink::Group(derive_alias(&e.gpd_id)),
-                CommunicationMode::CommissionedGroupcast => {
-                    PairingSink::Group(e.groups.first().map_or(0xFFFF, |g| g.group))
-                }
-                _ => PairingSink::Unicast {
-                    ieee: self.own_ieee,
-                    nwk: self.own_nwk,
-                },
+        let sink = match e.communication_mode {
+            CommunicationMode::DerivedGroupcast => PairingSink::Group(derive_alias(&e.gpd_id)),
+            CommunicationMode::CommissionedGroupcast => {
+                PairingSink::Group(e.groups.first().map_or(0xFFFF, |g| g.group))
             }
+            _ => PairingSink::Unicast {
+                ieee: self.own_ieee,
+                nwk: self.own_nwk,
+            },
         };
-        let add = !remove;
-        // gecko_sdk `sendGpPairingFromSinkEntry` / `decommissionGpd`.
+        let groupcast = matches!(sink, PairingSink::Group(_));
         Pairing {
             gpd_id: e.gpd_id,
-            add_sink: add,
-            remove_gpd: remove,
+            add_sink: true,
+            remove_gpd: false,
             communication_mode: e.communication_mode,
-            gpd_fixed: add && e.fixed_location,
-            mac_seq_cap: add && e.mac_seq_cap,
+            gpd_fixed: e.fixed_location,
+            mac_seq_cap: e.mac_seq_cap,
             security_level: e.security_level,
             key_type: e.key_type,
             sink,
-            device_id: add.then_some(e.device_id),
-            frame_counter: (add && (e.mac_seq_cap || protected)).then_some(e.frame_counter),
-            key: (add && protected && e.key_type != KeyType::NoKey)
+            device_id: Some(e.device_id),
+            frame_counter: (e.mac_seq_cap || protected).then_some(e.frame_counter),
+            key: (protected && e.key_type != KeyType::NoKey)
                 .then_some(e.key)
                 .flatten(),
-            assigned_alias: if add { e.assigned_alias } else { None },
-            groupcast_radius: (add && groupcast && e.groupcast_radius != 0)
-                .then_some(e.groupcast_radius),
+            assigned_alias: e.assigned_alias,
+            groupcast_radius: (groupcast && e.groupcast_radius != 0).then_some(e.groupcast_radius),
         }
     }
 
@@ -1813,18 +1915,11 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             .filter(|g| !new_groups.contains(g))
             .collect();
         self.release_groups(&released);
-        let pairing = self.pairing(&entry, false);
-        self.broadcast(client_cmd::PAIRING, |b| pairing.encode(b));
+        self.queue(Out::PairingAdd(gpd_id));
         // A sink that added a pairing announces the alias (except in
         // lightweight unicast).
         if entry.communication_mode != CommunicationMode::LightweightUnicast {
-            let alias = entry.alias();
-            self.send(GpTx {
-                dest: DestAddr::Broadcast(BROADCAST_RX_ON_WHEN_IDLE),
-                alias: Some((alias, 0)),
-                radius: 0,
-                frame: TxFrame::DeviceAnnce { alias },
-            });
+            self.queue(Out::DeviceAnnce(entry.alias()));
         }
         self.event(SinkEvent::Commissioned { gpd_id, device_id });
         if self.config.exit_mode & exit_mode_attr::ON_FIRST_PAIRING != 0 {
@@ -1843,17 +1938,21 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         let e = self.table.swap_remove(i);
         self.dup.forget(&e.gpd_id);
         self.release_groups(&e.group_ids());
-        let pairing = self.pairing(&e, true);
-        self.broadcast(client_cmd::PAIRING, |b| pairing.encode(b));
+        self.queue(Out::PairingRemove {
+            gpd_id: e.gpd_id,
+            mode: e.communication_mode,
+            level: e.security_level,
+            key_type: e.key_type,
+        });
         self.dirty = true;
         self.event(SinkEvent::Decommissioned { gpd_id: e.gpd_id });
         true
     }
 
-    /// GP Sink Table Response (gecko_sdk
-    /// `emberAfGreenPowerClusterGpSinkTableRequestCallback`).
-    fn sink_table_response(&self, dst: u16, req: &SinkTableRequest) -> Result<GpTx> {
-        let total = self.table.len() as u8;
+    /// GP Sink Table Response payload (gecko_sdk
+    /// `emberAfGreenPowerClusterGpSinkTableRequestCallback`): status, total,
+    /// start index, count, then the entries that fit one frame.
+    fn sink_table_response(&self, req: &SinkTableRequest, out: &mut [u8]) -> Result<usize> {
         let (status, start, slice): (u8, u8, &[SinkEntry]) = match *req {
             SinkTableRequest::ByGpdId(id) => match self.find(&id) {
                 Some(i) if !id.is_reserved() => (status::SUCCESS, 0xFF, &self.table[i..=i]),
@@ -1864,38 +1963,21 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             }
             SinkTableRequest::ByIndex(i) => (status::NOT_FOUND, i, &[]),
         };
-        Self::command_frame(
-            DestAddr::Unicast {
-                nwk: dst,
-                ieee: None,
-            },
-            client_cmd::SINK_TABLE_RESPONSE,
-            |out| {
-                let mut w = Writer::new(out);
-                w.u8(status)?;
-                w.u8(total)?;
-                w.u8(start)?;
-                let mut entries = [0u8; MAX_TX_PAYLOAD];
-                let mut used = 0usize;
-                let mut count = 0u8;
-                // Status, total, start index and entry count precede the
-                // entries; stop at the last entry that fits one frame.
-                let budget = MAX_TX_PAYLOAD - 4;
-                for e in slice {
-                    let mut tmp = [0u8; MAX_SINK_ENTRY_ENCODED_LEN];
-                    let n = e.encode(&mut tmp)?;
-                    if used + n > budget {
-                        break;
-                    }
-                    entries[used..used + n].copy_from_slice(&tmp[..n]);
-                    used += n;
-                    count += 1;
-                }
-                w.u8(count)?;
-                w.bytes(&entries[..used])?;
-                Ok(w.len())
-            },
-        )
+        let mut w = Writer::new(out);
+        w.bytes(&[status, self.table.len() as u8, start, 0])?;
+        let mut count = 0u8;
+        for e in slice {
+            let mut tmp = [0u8; MAX_SINK_ENTRY_ENCODED_LEN];
+            let n = e.encode(&mut tmp)?;
+            if w.len() + n > MAX_TX_PAYLOAD {
+                break;
+            }
+            w.bytes(&tmp[..n])?;
+            count += 1;
+        }
+        let len = w.len();
+        out[3] = count;
+        Ok(len)
     }
 }
 
