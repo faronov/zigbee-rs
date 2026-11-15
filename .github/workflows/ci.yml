@@ -91,6 +91,8 @@ jobs:
       - run: cargo test -p zigbee-runtime --no-default-features --locked
       - run: cargo test -p zigbee-gp --all-features --locked
       - run: cargo test -p zigbee-gp --no-default-features --locked
+      # The sink without the bidirectional / full proxy (its own cfg graph).
+      - run: cargo test -p zigbee-gp --features sink --locked
       - run: cargo test -p gpd-app --locked
       - run: cargo test -p gpd-app --features bidirectional --locked
       # Timed TX (GP rxAfterTx replies) through SoftMac and the mock MAC.
@@ -436,6 +438,8 @@ jobs:
       - run: cargo clippy -p sensor-sed-app --all-targets --features ota --locked -- -D warnings
       - run: cargo clippy -p zigbee-gp --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-gp --all-targets --no-default-features --locked -- -D warnings
+      - run: cargo clippy -p zigbee-gp --all-targets --features sink --locked -- -D warnings
+      - run: cargo clippy -p zigbee-runtime --all-targets --features green-power-sink --locked -- -D warnings
       - run: cargo clippy -p gpd-app --all-targets --locked -- -D warnings
       - run: cargo clippy -p gpd-app --all-targets --features bidirectional --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --all-targets --features timed-tx,green-power,mock --locked -- -D warnings
@@ -894,6 +898,10 @@ jobs:
             cargo build --release --locked --no-default-features --features router-core &&
             cargo clippy --release --locked --target thumbv7em-none-eabihf \
               --no-default-features --features router-core -- -D warnings)
+          # Opt-in GP Combo / Sink on a MAC without timed TX; build check only.
+          (cd examples/nrf52840-router &&
+            cargo build --release --locked --no-default-features \
+              --features router,router-app/green-power-sink)
           # The shipped GP routers are built last, so the artifacts below are them.
           (cd examples/nrf52833-sensor &&
             cargo build --release --locked --no-default-features --features ed &&
@@ -1402,6 +1410,10 @@ jobs:
             --no-default-features --features router,waveshare-h2-zero,green-power-bidirectional
           cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/h2-bidi \
             --no-default-features --features router,waveshare-h2-zero,green-power-bidirectional -- -D warnings
+          # Opt-in GP Combo / Sink (router-app/green-power-sink, no timed TX
+          # needed); a no_std build check only, not part of any image.
+          cargo build --release --locked -Z build-std=core,alloc --target-dir target/h2-sink \
+            --no-default-features --features router,waveshare-h2-zero,router-app/green-power-sink
           DIR=target/riscv32imac-unknown-none-elf/release
           LED_DIR=target/status-led/riscv32imac-unknown-none-elf/release
           CSV=../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv

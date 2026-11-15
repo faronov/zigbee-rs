@@ -11,8 +11,10 @@
 > opt-in. The H2's reply timing and the MG22's bidirectional commissioning
 > into ZHA are lab-tested on hardware, but through a third-party
 > TempMaster (IKEA), not through our proxy. M4 hardware gate 2 was
-> accepted as partial on 2026-11-14 (gate 1 + gate 2b, §6.7, §6.9). The full proxy and Combo/Sink
-> are still design only. Spec
+> accepted as partial on 2026-11-14 (gate 1 + gate 2b, §6.7, §6.9). The full proxy
+> is in progress (M5, opt-in). Combo/Sink (layer (c)) is implemented opt-in
+> behind `green-power-sink` and host-tested only: it is in no image and has
+> not run on hardware (§3.7, §4.5). Spec
 > references are to GP 1.0a (docs-09-5499-26) and GP 1.1 where noted.
 
 ## 0. Implementation status
@@ -35,7 +37,8 @@
 | Timed-TX capability (`zigbee-mac/timed-tx`): `RadioPhy::TIMED_TX` / `transmit_at`, `PhyRxFrame::rx_end_us`, `PhyError::Missed`, `MacDriver::timed_tx_supported` / `transmit_raw_at`; ESP backend with an RX_DONE timestamp (vendored esp-radio `ieee802154-rx-timestamp`) | implemented, opt-in | host tests (SoftMac timed payload, mock timed TX); ESP32-H2 lab-tested on air 2026-11-14: reply preamble 19,998–20,007 µs after the end of the GPDF in 4 of 5, 20,222 µs in 1, after calibrating `TIMED_TX_START_LEAD_US` to 425 µs (§6.8). ESP32-C6 not measured |
 | TempMaster (`zigbee-runtime/green-power-bidirectional`, router `green-power-bidirectional`): proxy advertises bidirectional only when the MAC has timed TX, sends a queued GP Response GPDF `tx_offset_us` (20 ms) after the end of the triggering GPDF, no CSMA, no ACK | implemented, opt-in (not in any default image) | end-to-end host test: GP Response from the sink → rxAfterTx GPDF → Commissioning Reply scheduled at RX end + 20 ms. Lab-tested on the H2-Zero 2026-11-14 with an injected GPD (radio-lab): forwarded first (+41 ms), appointed TempMaster by zigpy, 10 of 11 Commissioning Replies sent on time, 1 reported `Missed` (§6.8). **Not yet with a real bidirectional GPD** |
 | GPD bidirectional mode (`gpd-app/bidirectional`, MG22 example feature `bidirectional`, product `BIDIRECTIONAL` policy) | implemented, opt-in | host tests: reply in the window → Success and channel persisted; replies at both edges of the spec window (20 ms and 25 ms + GPDF airtime after the GPDF start) and at the measured IKEA offset received; no reply → stays uncommissioned without counter reuse; wrong security level rejected; delivered key replaces the GPD key; invalid policy rejected. Lab-tested on hardware 2026-11-14 (182b358, `lab-tx-power` build): commissioned into ZHA through IKEA 0x43FD as TempMaster, Success accepted, reports in HA, Resumed after reset with channel and counter (§6.9). **Not yet through our proxy** |
-| Full proxy, Combo/Sink | not started | — |
+| Full proxy (`zigbee-gp/proxy-full`, `zigbee-runtime/green-power-full-proxy`) | in progress, opt-in (§2 row (b)) | host tests |
+| Combo / Sink (`zigbee-gp/sink`, `zigbee-runtime/green-power-sink`, router-app `green-power-sink`): Sink Table, sink commissioning mode, GPD commissioning (direct and Commissioning Notification, bidirectional through a TempMaster), Notification processing, Notification Response, Sink Table Request, sink attributes, built-in GPD → ZCL translation to one local endpoint, Sink Table in the GP journal | implemented, opt-in (not in any image) | host tests (`zigbee-gp` sink unit tests, zigpy golden vectors, `gp_store` sink journal tests, runtime end-to-end `gp_combo_commissions_a_switch_and_toggles_the_local_light`); ESP32-H2 and nRF52840 router builds (§4.5). **Not hardware-tested**; no router product has an On/Off endpoint yet (proposal for the Waveshare ESP32-H2-Zero in §3.7) |
 
 Implementation notes that differ from the design below:
 
@@ -213,7 +216,7 @@ panic `Location` line/column fields); §4.1 records the proof.
 | (a) Proxy Basic | `proxy-basic` / `green-power-proxy` / `green-power` | dGP stub (version-3 demux, GPDF codec, security processing for proxy-table entries), proxy table plus journal, duplicate filter, commissioning mode, Commissioning Notification, Notification in derived/pre-commissioned groupcast and lightweight unicast, Pairing, Proxy Commissioning Mode, Proxy Table Request/Response, gppFunctionality attributes, GP 1.1.1 tunnelling delay (A.3.6.3.1). Unidirectional only. |
 | (a+) Basic with bidirectional commissioning | `proxy-bidir-commissioning` | gpTxQueue (≥ 5 entries, one per GPD), GP Response handling in the TempMaster role, timed transmission on the operational channel, Commissioning Reply. *(verify 1.1: possibly mandatory for Basic)* |
 | (b) Full proxy | `proxy-full` (implies the above) | **In progress (M5):** protected IEEE ApplicationID 2 GPDF authentication/forwarding; full-unicast Pairing and Notification Response matching; bounded retries with readable/writable retry attributes; temporary channel switch for a Maintenance Channel Configuration (A.3.9.1 step 8: the radio moves to the GPD's transmit channel, serves only its Channel Request, defers network transmissions and returns after delivery or 5 s); strict GP Tunneling Stop payload codec. gppFunctionality adds full unicast and GPD IEEE address. Tunneling Stop is a GP 1.0 optional command that the Silicon Labs GP 1.1 client neither sends nor handles, so no behaviour is attached to it. Pairing Search and Proxy Table maintenance are deferred: neither zigpy nor the Silicon Labs client uses them. Remaining: Combo/Sink and counter-reservation optimization. |
-| (c) Combo / Sink | `sink` (implies `proxy-full`) | GP server on GPEP: sink table plus journal, sink commissioning mode (local button or Sink Commissioning Mode command), direct GPDF reception, Notification handling, Pairing generation, translation table (GPD command → local ZCL command on an application endpoint), Sink Table Request/Response, Translation Table commands |
+| (c) Combo / Sink | `sink` (implies `proxy`) / `green-power-sink` (implies `green-power`) / `green-power-sink` | **Implemented opt-in, host-tested, not hardware-tested (§3.7):** GP server on GPEP: Sink Table plus journal, sink commissioning mode (local API or GP Sink Commissioning Mode, window, exit on first pairing, GP Proxy Commissioning Mode to the proxies), direct GPDF reception, Notification and Commissioning Notification handling, bidirectional commissioning (GP Response with Commissioning Reply, Success), decommissioning, GP Pairing and alias Device_annce generation, GP Notification Response, Sink Table Request/Response, sink attributes 0x0000–0x0007, built-in translation (Off/On/Toggle → On/Off, Level Control Move/Step/Stop) to one local application endpoint. **Deferred:** Translation Table Update/Request and per-GPD translations, GP Pairing Configuration, Application Description, Channel Request handling, key provisioning to a GPD, GPM / involve-TC commissioning, GP Pairing Search |
 | (d) GPD app | `gpd` (frame builder and security only) + `apps/gpd` | No NWK/APS/ZDO/BDB. Commissioning (uni- and bidirectional), Channel Request, data and attribute reports, switch commands, secure frame-counter journal, sleep between reports |
 
 `security-level-1` is not a separate flag. Level 1 costs a few dozen bytes,
@@ -349,8 +352,8 @@ zigbee-mac  (+mac_seq in indication, cfg; optional timed-TX PHY capability)
 - A proxy entry is about 72 B: GPD ID, endpoint, options, security
   options, key, counter, alias, radius, search counter, up to 2 sink groups,
   up to 2 lightweight sinks.
-- Sink-table and translation records share the journal with distinct record
-  kinds.
+- Sink-table records share the journal as a distinct record kind (`ZBGS`,
+  implemented, §3.7); translation records are not implemented.
 - Leaving the network or a factory reset clears the journal.
 
 **Proxy-side GPD frame counter**
@@ -634,6 +637,153 @@ Design notes:
     profile.
   - Later candidates: PHY6222 / PB-03F, TLSR8258 sensor, ESP32-H2.
 
+### 3.7 Combo / Sink (as implemented, opt-in)
+
+No GP specification text is available. Wire formats and behaviour follow
+the certified Silicon Labs GP 1.1 sink (gecko_sdk `app/zcl/green-power.xml`;
+`protocol/zigbee/app/framework/plugin/green-power-server/`
+`green-power-server.c`, `green-power-security.c`,
+`green-power-server-gpd-cmd-maps.c`) and zigpy; the code names the gecko_sdk
+routine each path mirrors.
+
+**Layers.** `zigbee_gp::sink::Sink<N, Q>` is sans-IO like the proxy: it
+takes direct GPDFs (`on_gpdf`), GP server commands (`on_server_command`),
+attribute reads and writes, and the local commissioning API, and the caller
+drains network frames (`poll`), translated commands (`take_command`), GPEP
+group changes and application events. `zigbee_gp::translation` holds the
+built-in GPD → ZCL map. `zigbee-runtime` (`green-power-sink`) owns a
+`Sink<8, 4>` next to the proxy (`gp_sink*` API).
+
+**Decisions.**
+
+- A GPDF heard directly goes to the proxy *and* to the sink, each with its
+  own security check, counter and duplicate filter. The proxy still
+  tunnels it for other sinks (for example ZHA through the shared Proxy
+  Table); nothing is tunnelled to this node.
+- The sink's own GP Pairing is *not* looped back into the local Proxy
+  Table (gecko_sdk does that because its sink only sees GPDFs through its
+  proxy). Other sinks' Pairings still populate it, so multi-sink forwarding
+  is unchanged and a single-sink combo sends no useless groupcast per press.
+  The sink's GP Proxy Commissioning Mode is not looped back either.
+- The sink needs neither the bidirectional nor the full proxy, nor a
+  timed-TX MAC: `green-power-sink` implies only `green-power`, so it builds
+  on every router MAC (nRF52840 included). Bidirectional commissioning
+  through another proxy as TempMaster always works. For a GPD the combo
+  hears directly, `green-power-bidirectional` is needed as well: then a GP
+  Response from the sink that appoints this node TempMaster is handed to
+  the local proxy (its gpTxQueue sends the Commissioning Reply), because
+  the broadcast does not come back to the sender, and gpsFunctionality
+  bit 6 is advertised only while the MAC can transmit at an instant.
+  Without it such a GPD is refused (`NoTempMaster`).
+- Translated commands are dispatched through the runtime's local ZCL
+  dispatcher to the configured endpoint as locally originated, non-unicast
+  commands (source: own NWK address, endpoint 242; Disable Default
+  Response), so no ZCL response goes on air and the application sees the
+  usual `CommandReceived` event. Untranslated commands (attribute reports,
+  scenes, generic switch, …) are `SinkEvent::GpdCommand` events.
+- Group membership of GPEP is shared: neither table leaves a group the
+  other still needs.
+- Defaults are the gecko_sdk attribute defaults: derived groupcast, exit on
+  first pairing, 180 s window and **gpsSecurityLevel 0x01: only GPDs with
+  security level 2 or 3 are commissioned. A level-0 (unsecured) GPD is
+  refused (`SecurityPolicy`) unless the product opts in by setting
+  `SinkConfig::security_level` to 0** (or a sink writes attribute 0x0005).
+  This is a deliberate choice (user decision 2026-11-15): an unsecured
+  switch can be replayed or spoofed by anyone in radio range. Commissioned
+  groupcast requires a product-configured group. Written attributes are
+  volatile.
+- Protected GPDs must send their key (TC-LK wrapped or clear): this sink
+  provisions none. Security level, key type and frame counter are checked
+  for direct GPDFs and for Notifications (gecko_sdk
+  `emberAfGreenPowerClusterGpNotificationCallback`); unprotected entries
+  rely on the 2 s duplicate filter, as gecko_sdk and zigpy do.
+- GP Notification Response is sent to unicast GP Notifications: for full
+  unicast pairings with FirstToForward for the proxy whose copy arrived
+  first, and with NoPairing for a GPD without a pairing. gecko_sdk's sink
+  does not send it; the semantics are those our proxy (`proxy-full`)
+  expects.
+- A Commissioning Notification with "security processing failed" (for
+  example the Success of a bidirectional commissioning, which the proxy
+  cannot open yet) is verified and decrypted with the pending key after
+  rebuilding the GPDF header (gecko_sdk `prepareHeader`). SrcID GPDs only.
+- Protected Sink Table counters use the proxy's persistence stride (64)
+  and skip-ahead on restore; unprotected sequence numbers are not
+  persisted.
+
+**Persistence.** The GP snapshot carries the Sink Table after the Proxy
+Table and `GpProxyJournal` stores both:
+
+- a snapshot with sink entries is a pair of slots in one sector: a `ZBGS`
+  sink record (full-record layout), then the `ZBGP` Proxy Table record of
+  the same generation, flagged as paired in byte 7 (zero and unchecked in
+  the original format); the `ZBGP` commit marker commits both;
+- load pairs only a flagged newest `ZBGP` with the `ZBGS` of the same
+  generation in the slot before it, so a torn pair or an orphan sink
+  record left by an interrupted write is never applied;
+- sink counters use the 32-byte counter records with bit 7 set in the
+  entry index;
+- a snapshot without sink entries is written exactly as before, existing
+  proxy journals load unchanged, and firmware without the sink skips
+  `ZBGS` slots and sink counter records (host-tested in the sink-less
+  build). A 4 KiB sector holds two pairs instead of four full records.
+
+**Validation.** Host only: `zigbee-gp` sink unit tests (entry codec and the
+gecko_sdk layout, commissioning mode, direct and tunnelled commissioning,
+bidirectional commissioning with a tunnelled Success, security policy,
+translation, replay and duplicate handling across proxies, Notification
+Response, decommissioning, Sink Table Request, attributes, restore
+skip-ahead); zigpy golden vectors (the sink's GP Proxy Commissioning Mode
+enter/exit, GP Pairing and GP Response with Commissioning Reply are
+byte-identical to zigpy's, and zigpy-built Commissioning Notifications and
+Notifications are consumed); `gp_store` sink journal tests; and the runtime
+end-to-end test (sink commissioning mode → Commissioning GPDF heard
+directly → Sink Table entry and GP Pairing on air → secured Toggle switches
+a local On/Off cluster → replay rejected → a GP Notification from another
+proxy toggles it back and its duplicate is dropped → two reboots through
+the journal keep the entry and its counter floor).
+
+**Open.** No hardware run. No router product has an On/Off (or Level)
+endpoint yet, so no product wires the button API or selects an endpoint.
+
+**Proposed first product (not implemented): Waveshare ESP32-H2-Zero
+combo.** The user chose the H2-Zero router with an On/Off endpoint driven
+by its WS2812. Today the router image (`examples/esp32h2-sensor`, bin
+`esp32h2-router`, `router,waveshare-h2-zero`) has one HA Range Extender
+endpoint (Basic, Identify; `products/esp32-zigbee-devkit/src/router.rs`)
+and `status-led` is always on in `router-core`: the product's
+`RgbStatusLed` drives the board's RMT WS2812 on GPIO8 from the
+`router_app::StatusIndicator` (booting, searching, joined for 30 s then
+dark, permit join, identify, OTA, error). The BOOT button only requests
+(re)commissioning while the router waits for it. Minimal change:
+
+- Example feature `combo-light = ["green-power", "router-app/green-power-sink",
+  "esp32-zigbee-devkit-product/combo-light"]`; product feature
+  `combo-light = ["status-led", "green-power"]`. Off by default; `router`
+  and every shipped image unchanged. `green-power-bidirectional` stays a
+  separate opt-in (only needed for bidirectional GPDs heard directly).
+- Product: a router profile with On/Off (0x0006) on the existing endpoint
+  (device ID On/Off Light 0x0100, servers Basic, Identify, On/Off; the
+  runtime's `OnOffCluster`, no Level), and a `SinkConfig` with
+  `endpoint: Some(ENDPOINT)` and the Silicon Labs defaults above.
+- LED ownership stays with the product's `RgbStatusLed`: status
+  indications keep priority, and the On/Off state is shown only where the
+  status palette is dark today (after the 30 s joined hold): a dim warm
+  white while On, dark while Off. While a status (permit join, identify,
+  OTA, error) is active the light state is not visible, and it returns
+  when the status ends. No second owner of the RMT channel.
+- Composition root: pass the On/Off cluster to the router app's receive
+  path (as the cluster set of the profile), and use a BOOT press while
+  joined to call `gp_sink_enter_commissioning(true)` (also opening the
+  proxies); the existing press-to-recommission while waiting is unchanged.
+- Persistence: none new; the Sink Table already shares the `zbnv` GP
+  journal at 0x3F8000. The On/Off state is volatile (StartUpOnOff
+  default off) unless the product later journals it.
+- Estimated size: the sink costs +26,162 B flash / +1,628 B `.bss` over
+  the plain H2 router (§4.5); On/Off cluster, profile and LED mapping add
+  roughly 2–5 KB flash and under 0.1 KB RAM (estimate, not measured), so
+  about +28–31 KB flash over `router,waveshare-h2-zero`, well inside the
+  2,031,616 B `ota_0`.
+
 ## 4. Size estimates
 
 §4.1 has the measured Proxy Basic cost; the rest of this section is the
@@ -814,6 +964,67 @@ The GP-off H2 `router-core` image has the same section sizes as the
 previously saved build; its only byte differences are 11
 `core::panic::Location` line numbers in `radio_phy.rs`.
 
+### 4.5 Measured: Combo / Sink, opt-in (2026-11-15)
+
+Release builds of `gp-sink`, `tools/mac-footprint.py report` (flash =
+file-backed bytes; stack = static direct-call bound). ESP32-H2 router:
+`examples/esp32h2-sensor`, bin `esp32h2-router`, nightly-2026-08-01.
+nRF52840 router: `examples/nrf52840-router`, bin `nrf52840-router`.
+
+| Image (`--no-default-features --features …`) | Flash | `.text` | `.data` | `.bss` | Stack bound |
+|---|---:|---:|---:|---:|---:|
+| H2 `router` | 521,338 | 441,810 | 3,728 | 68,116 | 29,648 |
+| H2 `router,router-app/green-power-sink` | 547,500 | 466,544 | 3,936 | 69,744 | 29,648 |
+| H2 `router,green-power-bidirectional,router-app/green-power-full-proxy` | 531,948 | 451,892 | 3,728 | 70,076 | 29,680 |
+| H2 the same `+router-app/green-power-sink` | 558,802 | 477,170 | 3,936 | 71,704 | 29,664 |
+| nRF52840 `router` | 393,164 | 331,232 | 316 | 40,800 | 20,216 |
+| nRF52840 `router,router-app/green-power-sink` | 414,412 | 351,116 | 316 | 42,432 | 20,208 |
+
+So the sink costs **+26,162 B flash / +1,628 B `.bss` on the H2 router,
++21,248 B / +1,632 B on the nRF52840 router**, and +26,854 B / +1,628 B
+over the H2 full proxy. That is still above the §4 estimate (+8–12 KB,
++1.0–1.6 KB RAM). The nRF52840 router builds with the sink since the
+sink no longer needs timed TX.
+
+Trimming, measured on H2 full proxy + sink and nRF52840 + sink:
+
+| Step | H2 flash | H2 `.bss` | nRF flash | nRF `.bss` |
+|---|---:|---:|---:|---:|
+| First implementation (full proxy + sink; nRF did not build) | 561,146 | 72,248 | — | — |
+| Sink queues frame intents, encodes them in `poll` | −416 | −544 | −188 | −544 |
+| Sink frames share the GP reply slot (one transmit path) | −98 | 0 | −140 | 0 |
+| Journal: one entry-layout walker, header check, record writer and masked compare for both tables; no snapshot copy in validation | −1,232 | 0 | −1,172 | 0 |
+| `finalize` moves the entry instead of cloning it | −598 | 0 | −464 | 0 |
+| Result | 558,802 (−2,344) | 71,704 (−544) | 414,412 | 42,432 |
+
+Tried and not kept: a sink-only commissioning parser (−28 B H2, −116 B
+nRF, but a second copy of the codec) and a shared `dyn` attribute-read
+loop for proxy and sink (−38 B H2, +48 B nRF). The rest is the sink's own
+behaviour: GP server command handling (~2.7 KB), GPD processing and
+commissioning (~2.6 KB), frame encoding (~1.9 KB), Sink Table codec and
+journal (~3 KB), attribute read/write (~1.7 KB), local ZCL delivery
+(~0.7 KB) and codecs the proxy never encodes (Pairing, Proxy
+Commissioning Mode, Response, Notification Response).
+
+Sink Table capacity (not changed, 8 entries stays the default): with 5
+entries flash is unchanged (H2 full + sink +22 B, H2 sink +78 B, nRF −84 B)
+and `.bss` drops by 212–224 B. The capacity only sizes static tables.
+
+`.bss`: the `Sink<8, 4>` lives in the statically allocated device (Sink
+Table of 8, 4 queued frame intents, 3 events with up to 104-byte GPD
+payloads, 2 translated commands, 2 pending commissionings, its duplicate
+filter); a GP snapshot on the save/restore path is about 380 B larger.
+
+Feature-off identity against gp-m5 f169c61, both built in this worktree
+(same absolute path), at gp-sink e8a6fa3: `nrf52840-router`,
+`nrf52840-router-core`, `esp32h2-router`, `esp32h2-router-core` and the
+opt-in H2 `green-power-bidirectional` and `green-power-full-proxy`
+routers have equal section addresses and sizes and identical
+`.text`/`.data`; every differing word (21–69 per image, all in
+`.rodata`) is the line or column field of a `core::panic::Location` whose
+file pointer names a `.rs` path. `tools/mac-footprint.py compare`
+reports +0 for every metric of these six images.
+
 ## 5. Risks
 
 1. **The timed TX** (20 ms after the end of the GPDF, GP 1.1) on
@@ -883,7 +1094,8 @@ used by other work is not touched.
 6. **Bidirectional** (after a-plus): GPD with `rxAfterTx`; Commissioning
    Reply received through the proxy's gpTxQueue; Success. A timing check
    needs a sniffer.
-7. **Combo** (layer c, on nRF52840, ESP or BL702): pair a GP switch directly
+7. **Combo** (layer c, on nRF52840, ESP or BL702; host-tested only, §3.7,
+   and blocked on a router product with an On/Off endpoint): pair a GP switch directly
    to the router's on/off endpoint with ZHA offline. ZHA must still pair the
    same GPD through the shared proxy table.
 8. **Soak:** 24 h with periodic reports. Then re-check the feature-off images
@@ -1505,6 +1717,9 @@ more often or using a smaller window in M5.
    2026-11-13: default-on in every router build (§2, §4.1).
 8. Is Combo/Sink (layer c) wanted on a specific router product, such as a
    light or relay endpoint for direct switch pairing?
+   *(Still open. The sink is implemented opt-in (§3.7) but no router product
+   has an On/Off or Level endpoint to drive, and adding one is a product
+   decision.)*
 
 ## 8. Proposed implementation order
 
@@ -1522,7 +1737,8 @@ more often or using a smaller window in M5.
    gate 2b), our proxy as TempMaster for a real GPD not proven; zigpy
    PR #1970 open, §6.9.)*
 5. Full proxy (channel switch, unicast modes, key types, IEEE ApplicationID).
-6. Combo/Sink with translation table.
+6. Combo/Sink with translation table. *(Implemented opt-in, host-tested,
+   §3.7, §4.5; Translation Table commands deferred; hardware not started.)*
 
 Each step ends with host tests, the feature-off byte-identity check, and
 size and RAM deltas recorded here before the next step starts.
