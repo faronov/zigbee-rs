@@ -794,6 +794,11 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         let own_nwk = self.bdb.zdo().nwk().nib().network_address.0;
         self.green_power.proxy.set_own_nwk(own_nwk);
         for _ in 0..MAX_TX_PER_POLL {
+            // The sink's frames share the reply slot (one transmit path).
+            #[cfg(feature = "green-power-sink")]
+            if self.green_power.reply.is_none() {
+                self.green_power.reply = self.gp_sink_next_frame();
+            }
             let frame = match self.green_power.reply.take() {
                 Some(frame) => frame,
                 None => {
@@ -812,8 +817,6 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             };
             self.gp_transmit(frame).await;
         }
-        #[cfg(feature = "green-power-sink")]
-        self.gp_sink_poll().await;
     }
 
     async fn gp_transmit(&mut self, frame: OutFrame) {
@@ -1267,46 +1270,41 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         event
     }
 
-    /// Transmit the sink's queued frames. A GP Response that appoints this
-    /// node TempMaster is also handed to its own proxy: the broadcast does
-    /// not come back to the sender.
-    async fn gp_sink_poll(&mut self) {
+    /// The sink's next frame. A GP Response that appoints this node
+    /// TempMaster is also handed to its own proxy: the broadcast does not
+    /// come back to the sender.
+    fn gp_sink_next_frame(&mut self) -> Option<OutFrame> {
         self.gp_sink_sync();
-        for _ in 0..MAX_TX_PER_POLL {
-            let now_ms = self.gp_now_ms();
-            let Some(out) = self.green_power.sink.poll(now_ms) else {
-                break;
-            };
-            #[cfg(feature = "green-power-bidirectional")]
-            if let TxFrame::GpCommand {
-                command_id: zigbee_gp::cluster::client_cmd::RESPONSE,
+        let now_ms = self.gp_now_ms();
+        let out = self.green_power.sink.poll(now_ms)?;
+        #[cfg(feature = "green-power-bidirectional")]
+        if let TxFrame::GpCommand {
+            command_id: zigbee_gp::cluster::client_cmd::RESPONSE,
+            payload,
+        } = &out.tx.frame
+        {
+            self.gp_sync_bidirectional();
+            let own_nwk = self.bdb.zdo().nwk().nib().network_address.0;
+            let proxy = &mut self.green_power.proxy;
+            proxy.set_own_nwk(own_nwk);
+            let mut reply = None;
+            if let Err(error) = proxy.on_client_command(
+                own_nwk,
+                zigbee_gp::cluster::client_cmd::RESPONSE,
                 payload,
-            } = &out.tx.frame
-            {
-                self.gp_sync_bidirectional();
-                let own_nwk = self.bdb.zdo().nwk().nib().network_address.0;
-                let proxy = &mut self.green_power.proxy;
-                proxy.set_own_nwk(own_nwk);
-                let mut reply = None;
-                if let Err(error) = proxy.on_client_command(
-                    own_nwk,
-                    zigbee_gp::cluster::client_cmd::RESPONSE,
-                    payload,
-                    now_ms,
-                    &mut reply,
-                ) {
-                    log::warn!("[GP] own proxy refused the sink's GP Response: {:?}", error);
-                }
+                now_ms,
+                &mut reply,
+            ) {
+                log::warn!("[GP] own proxy refused the sink's GP Response: {:?}", error);
             }
-            self.gp_transmit(OutFrame {
-                tx: out.tx,
-                zcl_frame_control: ZCL_CLUSTER_SPECIFIC
-                    | ZCL_SERVER_TO_CLIENT
-                    | ZCL_DISABLE_DEFAULT_RESPONSE,
-                tsn: out.tsn,
-            })
-            .await;
         }
+        Some(OutFrame {
+            tx: out.tx,
+            zcl_frame_control: ZCL_CLUSTER_SPECIFIC
+                | ZCL_SERVER_TO_CLIENT
+                | ZCL_DISABLE_DEFAULT_RESPONSE,
+            tsn: out.tsn,
+        })
     }
 }
 
