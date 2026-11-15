@@ -1873,6 +1873,9 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
     fn finalize(&mut self, mut entry: SinkEntry) -> SinkOutcome {
         let gpd_id = entry.gpd_id;
         let device_id = entry.device_id;
+        let new_groups = entry.group_ids();
+        let announce = (entry.communication_mode != CommunicationMode::LightweightUnicast)
+            .then(|| entry.alias());
         entry.persisted_counter = entry.frame_counter;
         let old_groups = match self.find(&gpd_id) {
             Some(i) => {
@@ -1889,10 +1892,12 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 } else {
                     entry.persisted_counter = old.persisted_counter;
                 }
-                core::mem::replace(old, entry.clone()).group_ids()
+                let old_groups = old.group_ids();
+                *old = entry;
+                old_groups
             }
             None => {
-                if self.table.push(entry.clone()).is_err() {
+                if self.table.push(entry).is_err() {
                     self.event(SinkEvent::CommissioningFailed {
                         gpd_id,
                         reason: SinkDrop::TableFull,
@@ -1903,23 +1908,21 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 heapless::Vec::new()
             }
         };
-        let new_groups = entry.group_ids();
         for g in &new_groups {
             if !old_groups.contains(g) {
                 let _ = self.group_changes.push_back(GroupChange::Join(*g));
             }
         }
-        let released: heapless::Vec<u16, MAX_SINK_GROUPS> = old_groups
-            .iter()
-            .copied()
-            .filter(|g| !new_groups.contains(g))
-            .collect();
-        self.release_groups(&released);
+        for &g in &old_groups {
+            if !new_groups.contains(&g) {
+                self.release_groups(&[g]);
+            }
+        }
         self.queue(Out::PairingAdd(gpd_id));
         // A sink that added a pairing announces the alias (except in
         // lightweight unicast).
-        if entry.communication_mode != CommunicationMode::LightweightUnicast {
-            self.queue(Out::DeviceAnnce(entry.alias()));
+        if let Some(alias) = announce {
+            self.queue(Out::DeviceAnnce(alias));
         }
         self.event(SinkEvent::Commissioned { gpd_id, device_id });
         if self.config.exit_mode & exit_mode_attr::ON_FIRST_PAIRING != 0 {
