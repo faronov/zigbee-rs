@@ -14,7 +14,8 @@
 //! * [`dup`] – the GP duplicate filter;
 //! * [`proxy`] (feature `proxy`) – the Proxy Basic state machine and proxy
 //!   table;
-//! * [`translation`] (feature `sink`) – GPD → ZCL command translation;
+//! * [`sink`] and [`translation`] (feature `sink`) – the GP sink / combo
+//!   state machine, Sink Table and GPD → ZCL command translation;
 //! * [`gpd`] (feature `gpd`) – Green Power Device-side transmission helpers.
 //!
 //! The crate never touches a radio, a clock or flash directly. Callers feed
@@ -41,6 +42,8 @@ pub mod types;
 pub mod gpd;
 #[cfg(feature = "proxy")]
 pub mod proxy;
+#[cfg(feature = "sink")]
+pub mod sink;
 #[cfg(feature = "sink")]
 pub mod translation;
 
