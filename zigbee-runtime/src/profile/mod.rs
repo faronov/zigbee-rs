@@ -14,6 +14,7 @@
 //! - `AirQuality` — CO₂ + temperature + humidity, optional battery; requires
 //!   the `float32` feature.
 //! - [`dimmable_light::DimmableLight`] — commanded On/Off + Level Control.
+//! - [`on_off_light::OnOffLight`] — commanded On/Off only.
 //! - [`thermostat::Thermostat`] — local temperature + full thermostat controls,
 //!   optional humidity/battery.
 //! - [`occupancy_light::OccupancyLight`] — occupancy + illuminance sensing,
@@ -33,6 +34,7 @@
 pub mod air_quality;
 pub mod dimmable_light;
 pub mod occupancy_light;
+pub mod on_off_light;
 pub mod plant_sensor;
 pub mod range_extender;
 pub mod smart_plug;
@@ -42,6 +44,7 @@ pub mod thermostat;
 pub use air_quality::{AirQuality, AirQualityMeasurement, AirQualityReporting};
 pub use dimmable_light::{DimmableLight, DimmableLightReporting};
 pub use occupancy_light::{OccupancyLight, OccupancyLightMeasurement, OccupancyLightReporting};
+pub use on_off_light::OnOffLight;
 pub use plant_sensor::{PlantSensor, PlantSensorMeasurement, PlantSensorReporting};
 pub use range_extender::RangeExtender;
 pub use smart_plug::{ElectricalReading, SmartPlug, SmartPlugReporting};
