@@ -78,11 +78,12 @@ green-power-bidirectional = [
 # GP Combo light (lab target: Waveshare ESP32-H2-Zero router): the router
 # endpoint is an HA On/Off Light whose OnOff state the status LED shows
 # (dim warm white whenever no status indication is lit), and a Green Power
-# Combo sink delivers paired GPD switch commands to it. The Sink Table
+# Combo sink delivers paired GPD switch commands to it, with the TempMaster
+# so bidirectional GPDs heard directly can commission. The Sink Table
 # shares the GP journal in `zbnv`; no new flash region.
 combo-light = [
     "status-led",
-    "green-power",
+    "green-power-bidirectional",
     "router-app/green-power-sink",
     "zigbee-runtime/green-power-sink",
 ]

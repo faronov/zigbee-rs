@@ -124,10 +124,11 @@ green-power-bidirectional = [
 # `router,waveshare-h2-zero`): the router endpoint is an HA On/Off Light shown
 # on the WS2812 (dim warm white while no status indication is lit), a GP
 # Combo sink delivers paired GPD switch commands to it, and BOOT pressed while
-# joined opens sink commissioning mode (proxies included). Opt-in, not part
-# of `router`.
+# joined opens sink commissioning mode (proxies included, 180 s). Includes the
+# TempMaster (`green-power-bidirectional`) so bidirectional GPDs heard
+# directly can commission. Opt-in, not part of `router`.
 combo-light = [
-    "green-power",
+    "green-power-bidirectional",
     "router-app/green-power-sink",
     "esp32-zigbee-devkit-product/combo-light",
 ]
