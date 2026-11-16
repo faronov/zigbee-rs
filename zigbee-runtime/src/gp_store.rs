@@ -77,12 +77,18 @@ pub struct PersistentGpProxyTable {
     extended_pan_id: IeeeAddress,
     len: usize,
     payload: [u8; MAX_ENCODED_GP_PROXY_TABLE_LEN],
+    /// Bit `i`: entry `i`'s frame counter was written exactly
+    /// ([`zigbee_gp::counter`]); clear restores it batched.
+    exact: u32,
     /// The combo's Sink Table, same layout (count, then length-prefixed
     /// Sink Table attribute entries).
     #[cfg(feature = "green-power-sink")]
     sink_len: usize,
     #[cfg(feature = "green-power-sink")]
     sink_payload: [u8; MAX_ENCODED_GP_SINK_TABLE_LEN],
+    /// Exact-counter bits of the Sink Table entries.
+    #[cfg(feature = "green-power-sink")]
+    sink_exact: u32,
 }
 
 impl core::fmt::Debug for PersistentGpProxyTable {
@@ -110,10 +116,13 @@ impl PersistentGpProxyTable {
             extended_pan_id,
             len: 1,
             payload: [0; MAX_ENCODED_GP_PROXY_TABLE_LEN],
+            exact: 0,
             #[cfg(feature = "green-power-sink")]
             sink_len: 1,
             #[cfg(feature = "green-power-sink")]
             sink_payload: [0; MAX_ENCODED_GP_SINK_TABLE_LEN],
+            #[cfg(feature = "green-power-sink")]
+            sink_exact: 0,
         }
     }
 
@@ -128,10 +137,11 @@ impl PersistentGpProxyTable {
         }
         snapshot.payload[0] = entries.len() as u8;
         let mut at = 1;
-        for entry in entries {
+        for (index, entry) in entries.iter().enumerate() {
             let out = &mut snapshot.payload[at + 1..at + 1 + MAX_ENTRY_ENCODED_LEN];
             let n = entry.encode(out).map_err(|_| GpStoreError::Corrupt)?;
             snapshot.payload[at] = n as u8;
+            snapshot.exact |= u32::from(entry.counter_exact()) << index;
             at += 1 + n;
         }
         snapshot.len = at;
@@ -168,6 +178,21 @@ impl PersistentGpProxyTable {
         self.extended_pan_id = extended_pan_id;
         self.payload[..payload.len()].copy_from_slice(payload);
         self.len = payload.len();
+        self.exact = 0;
+    }
+
+    /// Exact-counter bits of the Proxy Table entries (bit `i`: entry `i`).
+    pub fn exact_counters(&self) -> u32 {
+        self.exact
+    }
+
+    /// Whether any Proxy Table (or Sink Table) entry has an exact counter.
+    pub fn has_exact_counters(&self) -> bool {
+        #[cfg(feature = "green-power-sink")]
+        if self.sink_exact != 0 {
+            return true;
+        }
+        self.exact != 0
     }
 
     pub fn extended_pan_id(&self) -> IeeeAddress {
@@ -197,6 +222,8 @@ impl PersistentGpProxyTable {
     /// [`GpStoreError::Corrupt`].
     pub fn entries(&self) -> impl Iterator<Item = Result<ProxyEntry, GpStoreError>> + '_ {
         Self::entries_in(self.payload())
+            .enumerate()
+            .map(|(index, entry)| entry.map(|e| e.with_counter_exact(self.exact >> index & 1 != 0)))
     }
 
     /// Decode the entries of a non-empty encoded payload.
@@ -242,11 +269,13 @@ impl PersistentGpProxyTable {
             return Err(GpStoreError::Full);
         }
         self.sink_payload[0] = entries.len() as u8;
+        self.sink_exact = 0;
         let mut at = 1;
-        for entry in entries {
+        for (index, entry) in entries.iter().enumerate() {
             let out = &mut self.sink_payload[at + 1..at + 1 + MAX_SINK_ENTRY_ENCODED_LEN];
             let n = entry.encode(out).map_err(|_| GpStoreError::Corrupt)?;
             self.sink_payload[at] = n as u8;
+            self.sink_exact |= u32::from(entry.counter_exact()) << index;
             at += 1 + n;
         }
         self.sink_len = at;
@@ -265,6 +294,15 @@ impl PersistentGpProxyTable {
     /// Decode the stored Sink Table entries.
     pub fn sink_entries(&self) -> impl Iterator<Item = Result<SinkEntry, GpStoreError>> + '_ {
         Self::sink_entries_in(self.sink_payload())
+            .enumerate()
+            .map(|(index, entry)| {
+                entry.map(|e| e.with_counter_exact(self.sink_exact >> index & 1 != 0))
+            })
+    }
+
+    /// Exact-counter bits of the Sink Table entries.
+    pub fn sink_exact_counters(&self) -> u32 {
+        self.sink_exact
     }
 
     /// Decode the entries of a non-empty encoded Sink Table payload.
@@ -322,6 +360,7 @@ impl PersistentGpProxyTable {
     fn set_sink_validated(&mut self, payload: &[u8]) {
         self.sink_payload[..payload.len()].copy_from_slice(payload);
         self.sink_len = payload.len();
+        self.sink_exact = 0;
     }
 }
 
@@ -402,16 +441,34 @@ const RECORD_PAIRED_WITH_SINK: u8 = 0x01;
 #[cfg(feature = "green-power-sink")]
 const SINK_COUNTER_INDEX: u8 = 0x80;
 const COUNTER_VERSION: u8 = 1;
+/// Counter record byte 6 (written zero, and never read, before adaptive
+/// persistence): flags of the stored counter.
+const COUNTER_FLAGS_OFFSET: usize = 6;
+/// The counter was written exactly: restore it as is, not skipped ahead.
+/// Firmware that ignores the byte restores it batched, which is safe.
+const COUNTER_FLAG_EXACT: u8 = 0x01;
 const COUNTER_CRC_OFFSET: usize = 20;
+
+/// `bits` with bit `index` set to `value`.
+const fn set_bit(bits: u32, index: usize, value: bool) -> u32 {
+    if value {
+        bits | 1 << index
+    } else {
+        bits & !(1 << index)
+    }
+}
 const COUNTER_COMMIT_OFFSET: usize = 24;
 
 const _: () = assert!(RECORD_PAYLOAD_OFFSET + MAX_ENCODED_GP_PROXY_TABLE_LEN <= RECORD_CRC_OFFSET);
 const _: () = assert!(GP_PROXY_JOURNAL_SLOT_SIZE.is_multiple_of(GP_COUNTER_RECORD_SIZE));
 const _: () = assert!(GP_PROXY_TABLE_ENTRIES <= u8::MAX as usize);
+const _: () = assert!(GP_PROXY_TABLE_ENTRIES <= u32::BITS as usize);
 #[cfg(feature = "green-power-sink")]
 const _: () = assert!(RECORD_PAYLOAD_OFFSET + MAX_ENCODED_GP_SINK_TABLE_LEN <= RECORD_CRC_OFFSET);
 #[cfg(feature = "green-power-sink")]
 const _: () = assert!(GP_SINK_TABLE_ENTRIES < SINK_COUNTER_INDEX as usize);
+#[cfg(feature = "green-power-sink")]
+const _: () = assert!(GP_SINK_TABLE_ENTRIES <= u32::BITS as usize);
 #[cfg(feature = "green-power-sink")]
 const _: () = assert!(GP_PROXY_TABLE_ENTRIES < SINK_COUNTER_INDEX as usize);
 
@@ -566,6 +623,8 @@ struct SinkBase {
     len: u16,
     /// Effective frame counter of each Sink Table entry.
     counters: [u32; GP_SINK_TABLE_ENTRIES],
+    /// Effective exact-counter bit of each Sink Table entry.
+    exact: u32,
 }
 
 /// The newest full record and the counter records appended after it.
@@ -581,6 +640,8 @@ struct Base {
     /// Effective frame counter of each entry: the full record's value
     /// overlaid by the newest counter record for that entry.
     counters: [u32; GP_PROXY_TABLE_ENTRIES],
+    /// Effective exact-counter bit of each entry (a full record: none).
+    exact: u32,
     /// The Sink Table record paired with this full record, if any.
     #[cfg(feature = "green-power-sink")]
     sink: Option<SinkBase>,
@@ -707,9 +768,9 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         ))
     }
 
-    /// Entry index, GPD ID tag and frame counter of a committed, CRC-valid
-    /// counter record bound to the full record `generation`.
-    fn counter_record(unit: &[u8], generation: u32) -> Option<(usize, u32, u32)> {
+    /// Entry index, GPD ID tag, frame counter and exact flag of a committed,
+    /// CRC-valid counter record bound to the full record `generation`.
+    fn counter_record(unit: &[u8], generation: u32) -> Option<(usize, u32, u32, bool)> {
         let word =
             |at: usize| u32::from_le_bytes([unit[at], unit[at + 1], unit[at + 2], unit[at + 3]]);
         (unit[0..4] == COUNTER_MAGIC
@@ -717,7 +778,14 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             && unit[COUNTER_COMMIT_OFFSET..COUNTER_COMMIT_OFFSET + 4] == RECORD_COMMIT
             && crc32(&unit[..COUNTER_CRC_OFFSET]) == word(COUNTER_CRC_OFFSET)
             && word(8) == generation)
-            .then(|| (unit[5] as usize, word(12), word(16)))
+            .then(|| {
+                (
+                    unit[5] as usize,
+                    word(12),
+                    word(16),
+                    unit[COUNTER_FLAGS_OFFSET] & COUNTER_FLAG_EXACT != 0,
+                )
+            })
     }
 
     /// Scan both sectors, copying the newest valid snapshot, with the
@@ -769,6 +837,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             len: len as u16,
             append: SECTOR_SIZE as u16,
             counters: [0; GP_PROXY_TABLE_ENTRIES],
+            exact: 0,
             #[cfg(feature = "green-power-sink")]
             sink: None,
         };
@@ -792,15 +861,17 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
                         break 'walk;
                     }
                     // Torn or foreign units are skipped.
-                    if let Some((index, tag, counter)) = Self::counter_record(unit, generation)
+                    if let Some((index, tag, counter, exact)) =
+                        Self::counter_record(unit, generation)
                         && index < layout.entries
                         && layout.counter_at[index] != 0
                         && layout.tags[index] == tag
                     {
                         base.counters[index] = counter;
+                        base.exact = set_bit(base.exact, index, exact);
                     }
                     #[cfg(feature = "green-power-sink")]
-                    if let (Some(sink), Some((index, tag, counter))) =
+                    if let (Some(sink), Some((index, tag, counter, exact))) =
                         (sink.as_mut(), Self::counter_record(unit, generation))
                         && index & SINK_COUNTER_INDEX as usize != 0
                     {
@@ -810,11 +881,13 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
                             && sink_layout.tags[index] == tag
                         {
                             sink.counters[index] = counter;
+                            sink.exact = set_bit(sink.exact, index, exact);
                         }
                     }
                 }
             }
             if let Some(snapshot) = snapshot {
+                snapshot.exact = base.exact;
                 for index in 0..layout.entries {
                     let at = layout.counter_at[index] as usize;
                     if at != 0 {
@@ -824,6 +897,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
                 }
                 #[cfg(feature = "green-power-sink")]
                 if let Some(sink) = &sink {
+                    snapshot.sink_exact = sink.exact;
                     for index in 0..sink_layout.entries {
                         let at = sink_layout.counter_at[index] as usize;
                         if at != 0 {
@@ -955,7 +1029,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         base: &Base,
         index: usize,
         tag: u32,
-        counter: u32,
+        (counter, exact): (u32, bool),
     ) -> Result<bool, GpStoreError> {
         let address = self.sectors[base.sector as usize] + base.append as u32;
         let mut unit = [0u8; GP_COUNTER_RECORD_SIZE];
@@ -968,7 +1042,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         unit[0..4].copy_from_slice(&COUNTER_MAGIC);
         unit[4] = COUNTER_VERSION;
         unit[5] = index as u8;
-        unit[6..8].fill(0);
+        unit[COUNTER_FLAGS_OFFSET] = if exact { COUNTER_FLAG_EXACT } else { 0 };
+        unit[7] = 0;
         unit[8..12].copy_from_slice(&base.generation.to_le_bytes());
         unit[12..16].copy_from_slice(&tag.to_le_bytes());
         unit[16..20].copy_from_slice(&counter.to_le_bytes());
@@ -994,8 +1069,9 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         Ok(true)
     }
 
-    /// Persist a counter-only change as counter records. `Ok(false)` when a
-    /// full record is needed (structural change or no room).
+    /// Persist a counter-only change (a counter or its exact flag) as
+    /// counter records. `Ok(false)` when a full record is needed
+    /// (structural change or no room).
     fn commit_counters(&mut self, snapshot: &PersistentGpProxyTable) -> Result<bool, GpStoreError> {
         let Some(mut base) = self.current else {
             return Ok(false);
@@ -1014,11 +1090,30 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         if !self.same_sink_structure(&base, snapshot, &sink_layout)? {
             return Ok(false);
         }
+        // (counter, exact) of entry `index` when it differs from `stored`.
+        let changed_at = |layout: &PayloadLayout,
+                          payload: &[u8],
+                          exact: u32,
+                          index: usize,
+                          counters: &[u32],
+                          stored_exact: u32|
+         -> Option<(u32, bool)> {
+            let counter = layout.counter(payload, index)?;
+            let flag = exact >> index & 1 != 0;
+            (counter != counters[index] || flag != (stored_exact >> index & 1 != 0))
+                .then_some((counter, flag))
+        };
         let changed = (0..layout.entries)
             .filter(|&index| {
-                layout
-                    .counter(payload, index)
-                    .is_some_and(|counter| counter != base.counters[index])
+                changed_at(
+                    &layout,
+                    payload,
+                    snapshot.exact,
+                    index,
+                    &base.counters,
+                    base.exact,
+                )
+                .is_some()
             })
             .count();
         #[cfg(feature = "green-power-sink")]
@@ -1026,9 +1121,15 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             + base.sink.map_or(0, |sink| {
                 (0..sink_layout.entries)
                     .filter(|&index| {
-                        sink_layout
-                            .counter(snapshot.sink_payload(), index)
-                            .is_some_and(|counter| counter != sink.counters[index])
+                        changed_at(
+                            &sink_layout,
+                            snapshot.sink_payload(),
+                            snapshot.sink_exact,
+                            index,
+                            &sink.counters,
+                            sink.exact,
+                        )
+                        .is_some()
                     })
                     .count()
             });
@@ -1036,16 +1137,21 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             return Ok(false);
         }
         for index in 0..layout.entries {
-            let Some(counter) = layout.counter(payload, index) else {
+            let Some(value) = changed_at(
+                &layout,
+                payload,
+                snapshot.exact,
+                index,
+                &base.counters,
+                base.exact,
+            ) else {
                 continue;
             };
-            if counter == base.counters[index] {
-                continue;
-            }
-            if !self.write_counter_record(&base, index, layout.tags[index], counter)? {
+            if !self.write_counter_record(&base, index, layout.tags[index], value)? {
                 return Ok(false);
             }
-            base.counters[index] = counter;
+            base.counters[index] = value.0;
+            base.exact = set_bit(base.exact, index, value.1);
             base.append += GP_COUNTER_RECORD_SIZE as u16;
             self.current = Some(base);
         }
@@ -1053,22 +1159,22 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         if let Some(mut sink) = base.sink {
             let sink_payload = snapshot.sink_payload();
             for index in 0..sink_layout.entries {
-                let Some(counter) = sink_layout.counter(sink_payload, index) else {
+                let Some(value) = changed_at(
+                    &sink_layout,
+                    sink_payload,
+                    snapshot.sink_exact,
+                    index,
+                    &sink.counters,
+                    sink.exact,
+                ) else {
                     continue;
                 };
-                if counter == sink.counters[index] {
-                    continue;
-                }
                 let unit_index = SINK_COUNTER_INDEX as usize | index;
-                if !self.write_counter_record(
-                    &base,
-                    unit_index,
-                    sink_layout.tags[index],
-                    counter,
-                )? {
+                if !self.write_counter_record(&base, unit_index, sink_layout.tags[index], value)? {
                     return Ok(false);
                 }
-                sink.counters[index] = counter;
+                sink.counters[index] = value.0;
+                sink.exact = set_bit(sink.exact, index, value.1);
                 base.append += GP_COUNTER_RECORD_SIZE as u16;
                 base.sink = Some(sink);
                 self.current = Some(base);
@@ -1091,9 +1197,26 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         if self.commit_counters(snapshot)? {
             return Ok(());
         }
+        // A full record restores every counter batched; exact ones are
+        // re-asserted by counter records right after it, so leave room for
+        // them in the same sector.
+        let reassert = snapshot.has_exact_counters() && Self::SLOTS_PER_SECTOR > 1;
+        self.commit_full(snapshot, reassert)?;
+        if reassert {
+            // No room (or a failure) leaves them batched, which is safe.
+            self.commit_counters(snapshot)?;
+        }
+        Ok(())
+    }
+
+    fn commit_full(
+        &mut self,
+        snapshot: &PersistentGpProxyTable,
+        reassert: bool,
+    ) -> Result<(), GpStoreError> {
         #[cfg(feature = "green-power-sink")]
         if snapshot.sink_len() != 0 {
-            return self.commit_with_sink(snapshot);
+            return self.commit_with_sink(snapshot, reassert);
         }
         let (generation, sector, slot) = match self.current {
             Some(base) => {
@@ -1103,8 +1226,10 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
                     .ok_or(GpStoreError::GenerationExhausted)?;
                 let sector = base.sector as usize;
                 match self.first_erased_slot(sector, base.slot as usize + 1)? {
-                    Some(slot) => (generation, sector, slot),
-                    None => {
+                    Some(slot) if !reassert || slot + 1 < Self::SLOTS_PER_SECTOR => {
+                        (generation, sector, slot)
+                    }
+                    _ => {
                         let target = 1 - sector;
                         self.erase_sector(target)?;
                         (generation, target, 0)
@@ -1126,6 +1251,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             len: payload.len() as u16,
             append: ((slot + 1) * GP_PROXY_JOURNAL_SLOT_SIZE) as u16,
             counters: [0; GP_PROXY_TABLE_ENTRIES],
+            exact: 0,
             #[cfg(feature = "green-power-sink")]
             sink: None,
         };
@@ -1293,6 +1419,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             slot: (slot - 1) as u8,
             len: len as u16,
             counters: [0; GP_SINK_TABLE_ENTRIES],
+            exact: 0,
         };
         for index in 0..layout.entries {
             sink.counters[index] = layout.counter(payload, index).unwrap_or(0);
@@ -1389,7 +1516,11 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
 
     /// Full commit of a snapshot with Sink Table entries: sink record, then
     /// the Proxy Table record of the same generation in the next slot.
-    fn commit_with_sink(&mut self, snapshot: &PersistentGpProxyTable) -> Result<(), GpStoreError> {
+    fn commit_with_sink(
+        &mut self,
+        snapshot: &PersistentGpProxyTable,
+        reassert: bool,
+    ) -> Result<(), GpStoreError> {
         if Self::SLOTS_PER_SECTOR < 2 {
             return Err(GpStoreError::Hardware);
         }
@@ -1401,8 +1532,10 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
                     .ok_or(GpStoreError::GenerationExhausted)?;
                 let sector = base.sector as usize;
                 match self.erased_slot_pair(sector, base.slot as usize + 1)? {
-                    Some(slot) => (generation, sector, slot),
-                    None => {
+                    Some(slot) if !reassert || slot + 2 < Self::SLOTS_PER_SECTOR => {
+                        (generation, sector, slot)
+                    }
+                    _ => {
                         let target = 1 - sector;
                         self.erase_sector(target)?;
                         (generation, target, 0)
@@ -1442,10 +1575,12 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             len: payload.len() as u16,
             append: ((slot + 2) * GP_PROXY_JOURNAL_SLOT_SIZE) as u16,
             counters: [0; GP_PROXY_TABLE_ENTRIES],
+            exact: 0,
             sink: Some(SinkBase {
                 slot: slot as u8,
                 len: sink_payload.len() as u16,
                 counters: [0; GP_SINK_TABLE_ENTRIES],
+                exact: 0,
             }),
         };
         for index in 0..layout.entries {
@@ -1689,6 +1824,131 @@ pub(crate) mod tests {
             .entries()
             .map(|entry| entry.unwrap().frame_counter)
             .collect()
+    }
+
+    fn exact_entry(src_id: u32, counter: u32) -> ProxyEntry {
+        entry(src_id, counter).with_counter_exact(true)
+    }
+
+    fn exact_bits(snapshot: &PersistentGpProxyTable) -> heapless::Vec<bool, 8> {
+        snapshot
+            .entries()
+            .map(|entry| entry.unwrap().counter_exact())
+            .collect()
+    }
+
+    /// The exact-counter flag survives a full record (re-asserted by a
+    /// counter record right after it), counter records and a reboot; a
+    /// flag-only change is a counter record, not a full record.
+    #[test]
+    fn exact_counter_flags_round_trip_through_the_journal() {
+        let mut journal = journal(MockFlash::new());
+        let first = capture(&[exact_entry(1, 10), entry(2, 20)]);
+        assert_eq!(first.exact_counters(), 0b01);
+        journal.store(&first).unwrap();
+        // Full record in slot 0, then one re-assert counter record.
+        let slot = GP_PROXY_JOURNAL_SLOT_SIZE;
+        assert_eq!(journal.storage.data[slot..slot + 4], *b"ZBGC");
+        assert_eq!(
+            journal.storage.data[slot + COUNTER_FLAGS_OFFSET],
+            COUNTER_FLAG_EXACT
+        );
+        assert!(
+            journal.storage.data[slot + GP_COUNTER_RECORD_SIZE..2 * slot]
+                .iter()
+                .all(|b| *b == 0xFF)
+        );
+        let mut rebooted =
+            GpProxyJournal::<_, SECTOR>::new(journal.into_storage(), 0, SECTOR as u32);
+        let loaded = load(&mut rebooted).unwrap();
+        assert_eq!(exact_bits(&loaded).as_slice(), &[true, false]);
+        assert_eq!(counters(&loaded).as_slice(), &[10, 20]);
+
+        // The switch is pressed (exact, counter record); the sensor leaves
+        // nothing to write; then the switch falls back to batched: a
+        // flag-only change is one more counter record.
+        rebooted
+            .store(&capture(&[exact_entry(1, 11), entry(2, 20)]))
+            .unwrap();
+        rebooted
+            .store(&capture(&[entry(1, 11), entry(2, 20)]))
+            .unwrap();
+        let data = &rebooted.storage.data;
+        assert_eq!(data[slot + 2 * GP_COUNTER_RECORD_SIZE..][..4], *b"ZBGC");
+        assert_eq!(
+            data[slot + 2 * GP_COUNTER_RECORD_SIZE + COUNTER_FLAGS_OFFSET],
+            0
+        );
+        assert_eq!(rebooted.storage.erases, 1);
+        let mut again = GpProxyJournal::<_, SECTOR>::new(rebooted.into_storage(), 0, SECTOR as u32);
+        let loaded = load(&mut again).unwrap();
+        assert_eq!(exact_bits(&loaded).as_slice(), &[false, false]);
+        assert_eq!(counters(&loaded).as_slice(), &[11, 20]);
+        // Unchanged: nothing written.
+        let before = again.storage.data;
+        again
+            .store(&capture(&[entry(1, 11), entry(2, 20)]))
+            .unwrap();
+        assert_eq!(again.storage.data, before);
+    }
+
+    /// A journal without exact flags (the original format), and a torn
+    /// re-assert record after a full record, both restore batched, which
+    /// is always safe.
+    #[test]
+    fn missing_or_torn_exact_flags_restore_batched() {
+        let legacy = capture(&[entry(1, 10)]);
+        let mut flash = MockFlash::new();
+        flash.data[..1024].copy_from_slice(&legacy_record(4, &legacy));
+        let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+        assert_eq!(
+            exact_bits(&load(&mut journal).unwrap()).as_slice(),
+            &[false]
+        );
+
+        // Power fails after the full record's commit, before the re-assert
+        // record's commit marker.
+        let mut flash = MockFlash::new();
+        // Erase, then: full record body + commit, re-assert body only.
+        flash.programs_left = Some(3);
+        let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+        let _ = journal.store(&capture(&[exact_entry(1, 10)]));
+        let mut flash = journal.into_storage();
+        flash.programs_left = None;
+        let mut rebooted = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+        let loaded = load(&mut rebooted).unwrap();
+        assert_eq!(counters(&loaded).as_slice(), &[10]);
+        assert_eq!(exact_bits(&loaded).as_slice(), &[false]);
+    }
+
+    /// A full record never lands in a sector's last slot while an exact
+    /// flag must follow it: the journal rolls over instead.
+    #[test]
+    fn full_record_leaves_room_for_the_exact_flags() {
+        let mut journal = journal(MockFlash::new());
+        // Fill slots 0..=2 with structural changes of a batched table.
+        for radius in 0..3 {
+            journal
+                .store(&capture(&[entry_radius(1, 10, radius)]))
+                .unwrap();
+        }
+        assert_eq!(journal.current.unwrap().slot, 2);
+        // Slot 3 is the last one: an exact entry rolls over to sector 1.
+        journal
+            .store(&capture(&[exact_entry(1, 10).clone()]).clone())
+            .unwrap();
+        let mut changed = exact_entry(1, 10);
+        changed.groupcast_radius = 9;
+        journal.store(&capture(&[changed])).unwrap();
+        let base = journal.current.unwrap();
+        assert_eq!(base.sector, 1);
+        assert_eq!(base.exact, 0b1);
+        let mut rebooted =
+            GpProxyJournal::<_, SECTOR>::new(journal.into_storage(), 0, SECTOR as u32);
+        assert_eq!(
+            exact_bits(&load(&mut rebooted).unwrap()).as_slice(),
+            &[true]
+        );
     }
 
     #[test]
@@ -1985,20 +2245,32 @@ pub(crate) mod tests {
         let tag = crc32(&1u32.to_le_bytes());
         assert!(
             journal
-                .write_counter_record(&base, 0, tag ^ 1, 999)
+                .write_counter_record(&base, 0, tag ^ 1, (999, false))
                 .unwrap()
         );
         base.append += GP_COUNTER_RECORD_SIZE as u16;
         // Entry index past the table.
-        assert!(journal.write_counter_record(&base, 2, tag, 999).unwrap());
+        assert!(
+            journal
+                .write_counter_record(&base, 2, tag, (999, false))
+                .unwrap()
+        );
         base.append += GP_COUNTER_RECORD_SIZE as u16;
         // Older generation.
         base.generation = base.generation.wrapping_sub(1);
-        assert!(journal.write_counter_record(&base, 0, tag, 999).unwrap());
+        assert!(
+            journal
+                .write_counter_record(&base, 0, tag, (999, false))
+                .unwrap()
+        );
         base.append += GP_COUNTER_RECORD_SIZE as u16;
         // The matching record still applies.
         base.generation = base.generation.wrapping_add(1);
-        assert!(journal.write_counter_record(&base, 0, tag, 333).unwrap());
+        assert!(
+            journal
+                .write_counter_record(&base, 0, tag, (333, false))
+                .unwrap()
+        );
         let flash = journal.into_storage();
         let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
         assert_eq!(
@@ -2062,6 +2334,11 @@ pub(crate) mod tests {
         const SRC: u32 = 0x293C_9879;
         const KEY: [u8; 16] = [0x5C; 16];
         const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
+        // Batched persistence only (exact writes are covered separately).
+        const BATCHED: ProxyConfig = ProxyConfig {
+            exact_counter_burst: 0,
+            ..ProxyConfig::DEFAULT
+        };
         let mut aes = zigbee_mac::mock::MockMac::new([0; 8]);
 
         let mut gpdf = |p: &mut P, fc: u32, now_ms: u32| {
@@ -2100,7 +2377,7 @@ pub(crate) mod tests {
             }
         };
 
-        let mut p = P::new(ProxyConfig::default());
+        let mut p = P::new(BATCHED);
         p.set_own_nwk(0x8C23);
         let pairing = Pairing {
             gpd_id: GpdId::SrcId(SRC),
@@ -2151,7 +2428,7 @@ pub(crate) mod tests {
         // Power loss and reboot.
         let mut journal = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
         let snapshot = load(&mut journal).unwrap();
-        let mut p = P::new(ProxyConfig::default());
+        let mut p = P::new(BATCHED);
         p.set_own_nwk(0x8C23);
         for entry in snapshot.entries() {
             p.restore(entry.unwrap()).unwrap();
@@ -2229,6 +2506,46 @@ pub(crate) mod tests {
                 .sink_entries()
                 .map(|entry| entry.unwrap().frame_counter)
                 .collect()
+        }
+
+        /// Sink entries carry their own exact flags (bit 7 index records).
+        #[test]
+        fn sink_exact_counter_flags_round_trip() {
+            let mut journal = journal(MockFlash::new());
+            let switch = sink_entry(2, 20).with_counter_exact(true);
+            journal
+                .store(&combo(
+                    &[entry(1, 10)],
+                    &[switch.clone(), sink_entry(3, 30)],
+                ))
+                .unwrap();
+            let mut rebooted =
+                GpProxyJournal::<_, SECTOR>::new(journal.into_storage(), 0, SECTOR as u32);
+            let loaded = load(&mut rebooted).unwrap();
+            let flags: heapless::Vec<bool, 8> = loaded
+                .sink_entries()
+                .map(|e| e.unwrap().counter_exact())
+                .collect();
+            assert_eq!(flags.as_slice(), &[true, false]);
+            assert_eq!(exact_bits(&loaded).as_slice(), &[false]);
+            // A press: one sink counter record, still exact.
+            let mut pressed = switch.clone();
+            pressed.frame_counter = 21;
+            rebooted
+                .store(&combo(&[entry(1, 10)], &[pressed, sink_entry(3, 30)]))
+                .unwrap();
+            let mut again =
+                GpProxyJournal::<_, SECTOR>::new(rebooted.into_storage(), 0, SECTOR as u32);
+            let loaded = load(&mut again).unwrap();
+            assert_eq!(sink_counters(&loaded).as_slice(), &[21, 30]);
+            assert!(
+                loaded
+                    .sink_entries()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .counter_exact()
+            );
         }
 
         #[test]

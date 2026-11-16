@@ -133,7 +133,16 @@ pub struct ProxyConfig {
     /// its counter passes the skipped-ahead floor. The default 64 keeps one
     /// GPD reporting every 60 s near ten years of a 10k-cycle, 4 KiB-sector
     /// two-sector journal (one write per ~64 min; see the GP design doc).
+    ///
+    /// This batched mode applies to reports; event commands (switches) are
+    /// written exactly while [`exact_counter_burst`](Self::exact_counter_burst)
+    /// allows it (see [`crate::counter`]).
     pub counter_persist_stride: u32,
+    /// Exact counter writes allowed in a burst ([`crate::counter`]); 0 keeps
+    /// every entry batched.
+    pub exact_counter_burst: u8,
+    /// One exact counter write is refilled per this many milliseconds.
+    pub exact_counter_refill_ms: u32,
     /// gpTxQueueEntryLifetime of a GPDF queued by a GP Response, ms
     /// (bidirectional proxies only).
     pub tx_queue_lifetime_ms: u32,
@@ -152,18 +161,25 @@ pub struct ProxyConfig {
 
 impl Default for ProxyConfig {
     fn default() -> Self {
-        Self {
-            default_commissioning_window_s: DEFAULT_COMMISSIONING_WINDOW_S,
-            counter_persist_stride: DEFAULT_COUNTER_PERSIST_STRIDE,
-            tx_queue_lifetime_ms: DEFAULT_TX_QUEUE_LIFETIME_MS,
-            #[cfg(feature = "proxy-full")]
-            notification_retry_number: DEFAULT_NOTIFICATION_RETRY_NUMBER,
-            #[cfg(feature = "proxy-full")]
-            notification_retry_timer_ms: DEFAULT_NOTIFICATION_RETRY_TIMER_MS,
-            #[cfg(feature = "proxy-bidirectional")]
-            tx_offset_us: GP_TX_OFFSET_US,
-        }
+        Self::DEFAULT
     }
+}
+
+impl ProxyConfig {
+    /// The defaults, usable in constants.
+    pub const DEFAULT: Self = Self {
+        default_commissioning_window_s: DEFAULT_COMMISSIONING_WINDOW_S,
+        counter_persist_stride: DEFAULT_COUNTER_PERSIST_STRIDE,
+        exact_counter_burst: crate::counter::DEFAULT_EXACT_COUNTER_BURST,
+        exact_counter_refill_ms: crate::counter::DEFAULT_EXACT_COUNTER_REFILL_MS,
+        tx_queue_lifetime_ms: DEFAULT_TX_QUEUE_LIFETIME_MS,
+        #[cfg(feature = "proxy-full")]
+        notification_retry_number: DEFAULT_NOTIFICATION_RETRY_NUMBER,
+        #[cfg(feature = "proxy-full")]
+        notification_retry_timer_ms: DEFAULT_NOTIFICATION_RETRY_TIMER_MS,
+        #[cfg(feature = "proxy-bidirectional")]
+        tx_offset_us: GP_TX_OFFSET_US,
+    };
 }
 
 /// A unicast sink of a Proxy Table entry.
@@ -226,6 +242,8 @@ pub struct ProxyEntry {
     /// Search counter (inactive / invalid entries).
     pub search_counter: u8,
     persisted_counter: u32,
+    /// The last write stored the counter exactly ([`crate::counter`]).
+    counter_exact: bool,
 }
 
 impl ProxyEntry {
@@ -251,16 +269,40 @@ impl ProxyEntry {
             groupcast_radius: 0,
             search_counter: 0,
             persisted_counter: 0,
+            counter_exact: false,
         }
+    }
+
+    /// Whether the frame counter is stored exactly (written on every
+    /// accepted frame) rather than batched; persistence stores this with
+    /// the counter ([`crate::counter`]).
+    pub fn counter_exact(&self) -> bool {
+        self.counter_exact
+    }
+
+    /// The entry as restored from storage that recorded the counter mode
+    /// `exact` (storage without the mode restores batched: `false`).
+    pub fn with_counter_exact(mut self, exact: bool) -> Self {
+        self.counter_exact = exact;
+        self
     }
 
     /// Whether `self` and `other` differ at most in the frame counter.
     fn same_except_counter(&mut self, other: &Self) -> bool {
-        let counters = (self.frame_counter, self.persisted_counter);
+        let counters = (
+            self.frame_counter,
+            self.persisted_counter,
+            self.counter_exact,
+        );
         self.frame_counter = other.frame_counter;
         self.persisted_counter = other.persisted_counter;
+        self.counter_exact = other.counter_exact;
         let same = *self == *other;
-        (self.frame_counter, self.persisted_counter) = counters;
+        (
+            self.frame_counter,
+            self.persisted_counter,
+            self.counter_exact,
+        ) = counters;
         same
     }
 
@@ -681,6 +723,8 @@ pub struct Proxy<const N: usize, const Q: usize> {
     #[cfg(feature = "proxy-full")]
     notification_retries: heapless::Vec<NotificationRetry, NOTIFICATION_RETRY_QUEUE_LEN>,
     dirty: bool,
+    /// Bounds exact frame-counter writes ([`crate::counter`]).
+    exact_budget: crate::counter::ExactBudget,
     /// The commissioning window elapsed and the owner was not told yet.
     commissioning_timed_out: bool,
     stats: ForwardStats,
@@ -752,6 +796,7 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             #[cfg(feature = "proxy-full")]
             notification_retries: heapless::Vec::new(),
             dirty: false,
+            exact_budget: crate::counter::ExactBudget::new(),
             commissioning_timed_out: false,
             stats: ForwardStats {
                 sent: 0,
@@ -768,6 +813,14 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 #[cfg(feature = "proxy-full")]
                 transmit_channel: None,
             },
+        }
+    }
+
+    fn counter_policy(&self) -> crate::counter::CounterPolicy {
+        crate::counter::CounterPolicy {
+            stride: self.config.counter_persist_stride.max(1),
+            exact_burst: self.config.exact_counter_burst,
+            exact_refill_ms: self.config.exact_counter_refill_ms,
         }
     }
 
@@ -961,15 +1014,16 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
 
     /// Restore an entry from persistent storage.
     ///
-    /// A protected entry's frame counter is skipped ahead to the highest
-    /// value the proxy may have accepted before the reboot (`stored +
-    /// counter_persist_stride - 1`), so no frame it saw is accepted again.
-    /// The persisted value stays the stored one: the first frame above the
-    /// floor is persisted.
+    /// A protected entry's frame counter is moved to the highest value the
+    /// proxy may have accepted before the reboot: the stored counter when it
+    /// was written exactly, otherwise `stored + counter_persist_stride - 1`
+    /// ([`crate::counter`]), so no frame it saw is accepted again. The
+    /// persisted value stays the stored one.
     pub fn restore(&mut self, mut entry: ProxyEntry) -> Result<()> {
         if entry.security_level.is_protected() {
-            let skip = self.config.counter_persist_stride.max(1) - 1;
-            entry.frame_counter = entry.persisted_counter.saturating_add(skip);
+            entry.frame_counter = self
+                .counter_policy()
+                .restore_floor(entry.persisted_counter, entry.counter_exact);
         }
         if let Some(i) = self.find(&entry.gpd_id) {
             self.table[i] = entry;
@@ -1342,11 +1396,25 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         if self.dup.check_and_record(&gpd, counter, now_ms) {
             return GpdfOutcome::Dropped(Duplicate);
         }
-        let stride = self.config.counter_persist_stride.max(1);
+        let policy = self.counter_policy();
         let e = &mut self.table[i];
-        if protected || e.mac_seq_cap {
+        if protected {
             e.frame_counter = counter;
-            if counter.wrapping_sub(e.persisted_counter) >= stride {
+            let event = command_id.is_some_and(crate::counter::is_event_command);
+            if crate::counter::on_accepted(
+                &mut e.persisted_counter,
+                &mut e.counter_exact,
+                counter,
+                event,
+                &mut self.exact_budget,
+                &policy,
+                now_ms,
+            ) {
+                self.dirty = true;
+            }
+        } else if e.mac_seq_cap {
+            e.frame_counter = counter;
+            if counter.wrapping_sub(e.persisted_counter) >= policy.stride {
                 e.persisted_counter = counter;
                 self.dirty = true;
             }
@@ -1837,10 +1905,16 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             }
             _ => return Err(Error::Unsupported),
         }
+        let new_entry = before.is_none();
         if before.is_none_or(|b| !e.same_except_counter(&b))
             || e.frame_counter.wrapping_sub(e.persisted_counter) >= stride
         {
             e.persisted_counter = e.frame_counter;
+            // A new entry has accepted nothing yet: its counter is exact.
+            // An existing one keeps its mode.
+            if new_entry && self.config.exact_counter_burst != 0 {
+                e.counter_exact = true;
+            }
             self.dirty = true;
         }
         Ok(())
@@ -2298,7 +2372,21 @@ mod tests {
     }
 
     fn paired_proxy(fc: u32) -> P {
-        let mut p = P::new(ProxyConfig::default());
+        paired_proxy_with(ProxyConfig::default(), fc)
+    }
+
+    /// Batched counter persistence only (the original behaviour).
+    const BATCHED: ProxyConfig = ProxyConfig {
+        exact_counter_burst: 0,
+        ..ProxyConfig::DEFAULT
+    };
+
+    fn batched_proxy(fc: u32) -> P {
+        paired_proxy_with(BATCHED, fc)
+    }
+
+    fn paired_proxy_with(config: ProxyConfig, fc: u32) -> P {
+        let mut p = P::new(config);
         p.set_own_nwk(0x1234);
         let mut reply = None;
         let fx = p
@@ -2695,6 +2783,15 @@ mod tests {
 
     /// Encrypted OFF GPDF of SRC with KEY_C0, NWK part (no MAC header).
     fn secure_off(fc: u32, rx_after_tx: bool) -> heapless::Vec<u8, 64> {
+        secure_command(fc, rx_after_tx, cmd::OFF, &[])
+    }
+
+    fn secure_command(
+        fc: u32,
+        rx_after_tx: bool,
+        command: u8,
+        payload: &[u8],
+    ) -> heapless::Vec<u8, 64> {
         let params = crate::frame::GpdfParams {
             frame_type: FrameType::Data,
             auto_commissioning: false,
@@ -2711,8 +2808,8 @@ mod tests {
             Some(&KEY_C0),
             &params,
             fc as u8,
-            cmd::OFF,
-            &[],
+            command,
+            payload,
             &mut out,
         )
         .unwrap();
@@ -2897,7 +2994,7 @@ mod tests {
     fn repeated_pairing_does_not_rewrite_the_table() {
         const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
         // ZHA sends the same GP Pairing for every commissioning GPDF.
-        let mut p = paired_proxy(1176);
+        let mut p = batched_proxy(1176);
         let fx = pair(&mut p, &zha_pairing(1176));
         assert!(fx.groups.is_empty());
         assert!(!p.take_dirty(), "identical pairing");
@@ -2924,7 +3021,8 @@ mod tests {
 
     /// The Proxy Table snapshot the runtime journals when the proxy
     /// reports it dirty.
-    type Flash = heapless::Vec<heapless::Vec<u8, MAX_ENTRY_ENCODED_LEN>, 4>;
+    /// Each entry's encoding and its stored counter mode.
+    type Flash = heapless::Vec<(heapless::Vec<u8, MAX_ENTRY_ENCODED_LEN>, bool), 4>;
 
     fn journal(p: &P) -> Flash {
         let mut out = [0u8; MAX_ENTRY_ENCODED_LEN];
@@ -2932,7 +3030,10 @@ mod tests {
             .iter()
             .map(|e| {
                 let n = e.encode(&mut out).unwrap();
-                heapless::Vec::from_slice(&out[..n]).unwrap()
+                (
+                    heapless::Vec::from_slice(&out[..n]).unwrap(),
+                    e.counter_exact(),
+                )
             })
             .collect()
     }
@@ -2941,10 +3042,10 @@ mod tests {
     fn reboot(config: ProxyConfig, flash: &Flash) -> P {
         let mut rebooted = P::new(config);
         rebooted.set_own_nwk(0x1234);
-        for bytes in flash {
+        for (bytes, exact) in flash {
             let (entry, used) = ProxyEntry::decode(bytes).unwrap();
             assert_eq!(used, bytes.len());
-            rebooted.restore(entry).unwrap();
+            rebooted.restore(entry.with_counter_exact(*exact)).unwrap();
         }
         rebooted
     }
@@ -2958,7 +3059,7 @@ mod tests {
     #[test]
     fn reboot_skips_the_counter_ahead_by_the_stride() {
         const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
-        let mut p = paired_proxy(1000);
+        let mut p = batched_proxy(1000);
         let flash = journal(&p);
         // Accept frames up to the last one before the next write.
         let mut now = 0;
@@ -2997,7 +3098,7 @@ mod tests {
     #[test]
     fn reboot_after_a_write_rejects_replays_below_the_new_floor() {
         const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
-        let mut p = paired_proxy(1000);
+        let mut p = batched_proxy(1000);
         assert_eq!(gpdf(&mut p, 1000 + S, 1_000), GpdfOutcome::Notification);
         assert!(p.take_dirty(), "written at 1000+stride");
         let flash = journal(&p);
@@ -3036,9 +3137,111 @@ mod tests {
         assert_eq!(gpdf(&mut p, 1002, 3_000), GpdfOutcome::Notification);
     }
 
+    /// Send every due notification (keeps the forward queue empty).
+    fn drain(p: &mut P, now_ms: u32) {
+        while p.poll(now_ms.wrapping_add(1_000)).is_some() {}
+    }
+
+    /// An attribute report (0xA0, batched persistence) with counter `fc`.
+    fn report(p: &mut P, fc: u32, now_ms: u32) -> GpdfOutcome {
+        let raw = secure_command(fc, false, 0xA0, &[0x02, 0x04, 0x00, 0x00, 0x29, 0x10, 0x09]);
+        let f = parse(&raw, fc as u8, None).unwrap();
+        p.on_gpdf(&mut SoftwareAesProvider, &f, GppGpdLink(0), now_ms)
+    }
+
+    /// Reboot after `n` frames of a switch (exact) or a sensor (batched):
+    /// nothing accepted before is accepted again, and a switch's next press
+    /// is accepted at once.
+    #[test]
+    fn reboot_after_1_2_64_65_frames_in_both_modes() {
+        const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
+        for n in [1u32, 2, 64, 65] {
+            for switch in [true, false] {
+                let mut p = paired_proxy(1000);
+                let mut flash = journal(&p);
+                let mut now = 0;
+                for fc in 1001..=1000 + n {
+                    // A press or report a minute apart (inside the budget).
+                    now += 60_000;
+                    let outcome = if switch {
+                        gpdf(&mut p, fc, now)
+                    } else {
+                        report(&mut p, fc, now)
+                    };
+                    assert_eq!(outcome, GpdfOutcome::Notification, "n {n} fc {fc}");
+                    drain(&mut p, now);
+                    if p.take_dirty() {
+                        flash = journal(&p);
+                    }
+                }
+                let mut r = reboot(p.config, &flash);
+                for fc in 1000..=1000 + n {
+                    now += 1_000;
+                    let outcome = if switch {
+                        gpdf(&mut r, fc, now)
+                    } else {
+                        report(&mut r, fc, now)
+                    };
+                    assert_eq!(
+                        outcome,
+                        GpdfOutcome::Dropped(DropReason::Stale),
+                        "n {n} switch {switch}: replayed {fc}"
+                    );
+                }
+                let next = 1000 + n + 1;
+                now += 60_000;
+                if switch {
+                    assert!(p.entries()[0].counter_exact());
+                    assert_eq!(
+                        gpdf(&mut r, next, now),
+                        GpdfOutcome::Notification,
+                        "n {n}: the first press after the reboot"
+                    );
+                } else {
+                    let floor = r.entries()[0].frame_counter;
+                    assert!(floor >= 1000 + n && floor < 1000 + n + S, "n {n}: {floor}");
+                    assert!(!p.entries()[0].counter_exact());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn presses_beyond_the_budget_fall_back_to_batched_safely() {
+        let mut p = paired_proxy(0);
+        let mut flash = journal(&p);
+        let mut writes = 0;
+        // 40 presses inside one second: the burst of 16 is written exactly,
+        // then one batched write, then nothing until the stride.
+        for fc in 1..=40 {
+            assert_eq!(gpdf(&mut p, fc, fc * 10), GpdfOutcome::Notification);
+            drain(&mut p, fc * 10);
+            if p.take_dirty() {
+                writes += 1;
+                flash = journal(&p);
+            }
+        }
+        assert_eq!(writes, 17);
+        assert!(!p.entries()[0].counter_exact());
+        let mut r = reboot(p.config, &flash);
+        for fc in 1..=40 {
+            assert_eq!(
+                gpdf(&mut r, fc, 1_000),
+                GpdfOutcome::Dropped(DropReason::Stale),
+                "replayed {fc}"
+            );
+        }
+        // A minute later the budget allows exact writes again.
+        assert_eq!(gpdf(&mut p, 41, 70_000), GpdfOutcome::Notification);
+        assert!(p.take_dirty());
+        assert!(p.entries()[0].counter_exact());
+        let mut r = reboot(p.config, &journal(&p));
+        assert_eq!(gpdf(&mut r, 42, 71_000), GpdfOutcome::Notification);
+    }
+
     #[test]
     fn skip_ahead_saturates_and_leaves_unprotected_entries_alone() {
-        let mut p = paired_proxy(u32::MAX - 3);
+        let mut p = batched_proxy(u32::MAX - 3);
         let p2 = reboot(p.config, &journal(&p));
         assert_eq!(p2.entries()[0].frame_counter, u32::MAX, "exhausted");
         // An unsecured MAC-sequence entry keeps its 8-bit window.
@@ -3154,7 +3357,9 @@ mod tests {
         let n = p.entries()[0].encode(&mut buf).unwrap();
         let (e, used) = ProxyEntry::decode(&buf[..n]).unwrap();
         assert_eq!(used, n);
-        assert_eq!(e, p.entries()[0]);
+        // The counter mode is stored next to the entry, not in it.
+        assert!(!e.counter_exact());
+        assert_eq!(e.with_counter_exact(true), p.entries()[0]);
 
         let rm = Pairing {
             gpd_id: GpdId::SrcId(SRC),

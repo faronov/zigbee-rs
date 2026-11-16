@@ -38,6 +38,8 @@ pub mod frame;
 pub mod security;
 pub mod types;
 
+#[cfg(feature = "proxy")]
+pub mod counter;
 #[cfg(feature = "gpd")]
 pub mod gpd;
 #[cfg(feature = "proxy")]

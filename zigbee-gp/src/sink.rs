@@ -187,8 +187,15 @@ pub struct SinkConfig {
     pub endpoint: Option<u8>,
     /// Persist a protected GPD's frame counter after it advanced by this
     /// many values; restore skips ahead by `stride - 1` (as the proxy, see
-    /// [`crate::proxy::ProxyConfig::counter_persist_stride`]).
+    /// [`crate::proxy::ProxyConfig::counter_persist_stride`]). Batched
+    /// persistence applies to reports; event commands are written exactly
+    /// within the budget below ([`crate::counter`]).
     pub counter_persist_stride: u32,
+    /// Exact counter writes allowed in a burst ([`crate::counter`]); 0 keeps
+    /// every entry batched.
+    pub exact_counter_burst: u8,
+    /// One exact counter write is refilled per this many milliseconds.
+    pub exact_counter_refill_ms: u32,
 }
 
 impl Default for SinkConfig {
@@ -205,6 +212,8 @@ impl Default for SinkConfig {
             groupcast_radius: None,
             endpoint: None,
             counter_persist_stride: DEFAULT_SINK_COUNTER_PERSIST_STRIDE,
+            exact_counter_burst: crate::counter::DEFAULT_EXACT_COUNTER_BURST,
+            exact_counter_refill_ms: crate::counter::DEFAULT_EXACT_COUNTER_REFILL_MS,
         }
     }
 }
@@ -239,6 +248,8 @@ pub struct SinkEntry {
     /// Groupcast radius (0 = stack default).
     pub groupcast_radius: u8,
     persisted_counter: u32,
+    /// The last write stored the counter exactly ([`crate::counter`]).
+    counter_exact: bool,
 }
 
 impl SinkEntry {
@@ -259,7 +270,21 @@ impl SinkEntry {
             groups: heapless::Vec::new(),
             groupcast_radius: 0,
             persisted_counter: 0,
+            counter_exact: false,
         }
+    }
+
+    /// Whether the frame counter is stored exactly (see
+    /// [`crate::proxy::ProxyEntry::counter_exact`]).
+    pub fn counter_exact(&self) -> bool {
+        self.counter_exact
+    }
+
+    /// The entry as restored from storage that recorded the counter mode
+    /// `exact` (storage without the mode restores batched: `false`).
+    pub fn with_counter_exact(mut self, exact: bool) -> Self {
+        self.counter_exact = exact;
+        self
     }
 
     /// NWK alias of the GPD.
@@ -431,11 +456,20 @@ impl SinkEntry {
     }
 
     fn same_except_counter(&mut self, other: &Self) -> bool {
-        let counters = (self.frame_counter, self.persisted_counter);
+        let counters = (
+            self.frame_counter,
+            self.persisted_counter,
+            self.counter_exact,
+        );
         self.frame_counter = other.frame_counter;
         self.persisted_counter = other.persisted_counter;
+        self.counter_exact = other.counter_exact;
         let same = *self == *other;
-        (self.frame_counter, self.persisted_counter) = counters;
+        (
+            self.frame_counter,
+            self.persisted_counter,
+            self.counter_exact,
+        ) = counters;
         same
     }
 }
@@ -759,6 +793,7 @@ struct Received<'a> {
     command_id: u8,
     payload: &'a [u8],
     source: Source,
+    now_ms: u32,
 }
 
 fn due(now: u32, deadline: u32) -> bool {
@@ -785,6 +820,8 @@ pub struct Sink<const N: usize, const Q: usize> {
     events: heapless::Deque<SinkEvent, SINK_EVENT_QUEUE_LEN>,
     group_changes: heapless::Deque<GroupChange, 4>,
     dirty: bool,
+    /// Bounds exact frame-counter writes ([`crate::counter`]).
+    exact_budget: crate::counter::ExactBudget,
     stats: SinkStats,
 }
 
@@ -808,6 +845,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             events: heapless::Deque::new(),
             group_changes: heapless::Deque::new(),
             dirty: false,
+            exact_budget: crate::counter::ExactBudget::new(),
             stats: SinkStats {
                 tx_dropped: 0,
                 events_dropped: 0,
@@ -869,18 +907,28 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         self.dirty = true;
     }
 
+    fn counter_policy(&self) -> crate::counter::CounterPolicy {
+        crate::counter::CounterPolicy {
+            stride: self.config.counter_persist_stride.max(1),
+            exact_burst: self.config.exact_counter_burst,
+            exact_refill_ms: self.config.exact_counter_refill_ms,
+        }
+    }
+
     /// Sink Table entries.
     pub fn entries(&self) -> &[SinkEntry] {
         &self.table
     }
 
-    /// Restore an entry from persistent storage, skipping a protected
-    /// entry's counter ahead by `counter_persist_stride - 1` (see
-    /// [`crate::proxy::Proxy::restore`]).
+    /// Restore an entry from persistent storage: a protected entry's counter
+    /// moves to the highest value accepted before the reboot (the stored
+    /// counter when written exactly, otherwise skipped ahead by
+    /// `counter_persist_stride - 1`; see [`crate::proxy::Proxy::restore`]).
     pub fn restore(&mut self, mut entry: SinkEntry) -> Result<()> {
         if entry.security_level.is_protected() {
-            let skip = self.config.counter_persist_stride.max(1) - 1;
-            entry.frame_counter = entry.persisted_counter.saturating_add(skip);
+            entry.frame_counter = self
+                .counter_policy()
+                .restore_floor(entry.persisted_counter, entry.counter_exact);
         }
         if let Some(i) = self.find(&entry.gpd_id) {
             self.table[i] = entry;
@@ -1112,16 +1160,27 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
     /// Enter sink commissioning mode (local API, e.g. a button), optionally
     /// broadcasting GP Proxy Commissioning Mode (enter) to the proxies.
     ///
-    /// The window is armed when gpsCommissioningExitMode has "on window
-    /// expiration" or no exit condition at all; a second call restarts it.
-    /// Refused with [`Error::Unsupported`] while gpsSecurityLevel asks to
-    /// involve the Trust Center.
+    /// A locally opened window always ends after gpsCommissioningWindow
+    /// (default 180 s), also when gpsCommissioningExitMode only asks to exit
+    /// on the first pairing: a button press must never leave the sink, and
+    /// the proxies it involved, in commissioning mode indefinitely. A second
+    /// call restarts the window. Refused with [`Error::Unsupported`] while
+    /// gpsSecurityLevel asks to involve the Trust Center.
     pub fn enter_commissioning(&mut self, now_ms: u32, involve_proxies: bool) -> Result<()> {
+        self.enter(now_ms, involve_proxies, true)
+    }
+
+    /// Enter commissioning mode; `local` arms gpsCommissioningWindow even
+    /// without "on window expiration" in gpsCommissioningExitMode. GP Sink
+    /// Commissioning Mode from the network follows the exit mode exactly
+    /// (the window is armed with "on window expiration" or no exit
+    /// condition at all).
+    fn enter(&mut self, now_ms: u32, involve_proxies: bool, local: bool) -> Result<()> {
         if self.config.security_level & security_level_attr::INVOLVE_TC != 0 {
             return Err(Error::Unsupported);
         }
         let em = self.config.exit_mode & 0x07;
-        let window = (em & exit_mode_attr::ON_WINDOW_EXPIRATION != 0 || em == 0)
+        let window = (local || em & exit_mode_attr::ON_WINDOW_EXPIRATION != 0 || em == 0)
             .then_some(self.config.commissioning_window_s);
         let pcm = self.proxy_commissioning_mode(true);
         self.commissioning = Some(CommissioningState {
@@ -1353,6 +1412,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             command_id,
             payload,
             source: Source::Direct,
+            now_ms,
         };
         self.process(aes, &rx)
     }
@@ -1432,7 +1492,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 return zcl_status::INVALID_FIELD;
             }
             if self
-                .enter_commissioning(now_ms, m.options & INVOLVE_PROXIES != 0)
+                .enter(now_ms, m.options & INVOLVE_PROXIES != 0, false)
                 .is_err()
             {
                 return zcl_status::UNSUP_COMMAND;
@@ -1512,6 +1572,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             command_id: n.command_id,
             payload,
             source: Source::Notification,
+            now_ms,
         };
         self.process(aes, &rx)
     }
@@ -1588,6 +1649,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             command_id,
             payload,
             source: Source::Commissioning,
+            now_ms,
         };
         self.process(aes, &rx)
     }
@@ -1669,12 +1731,20 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         if let Err(drop) = self.check_operational(i, rx) {
             return SinkOutcome::Dropped(drop);
         }
-        let stride = self.config.counter_persist_stride.max(1);
+        let policy = self.counter_policy();
         let e = &mut self.table[i];
         e.frame_counter = rx.counter;
-        if e.security_level.is_protected() && rx.counter.wrapping_sub(e.persisted_counter) >= stride
+        if e.security_level.is_protected()
+            && crate::counter::on_accepted(
+                &mut e.persisted_counter,
+                &mut e.counter_exact,
+                rx.counter,
+                crate::counter::is_event_command(rx.command_id),
+                &mut self.exact_budget,
+                &policy,
+                rx.now_ms,
+            )
         {
-            e.persisted_counter = rx.counter;
             self.dirty = true;
         }
         let device_id = e.device_id;
@@ -1877,6 +1947,8 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         let announce = (entry.communication_mode != CommunicationMode::LightweightUnicast)
             .then(|| entry.alias());
         entry.persisted_counter = entry.frame_counter;
+        // A new entry has accepted nothing yet: its counter is exact.
+        entry.counter_exact = self.config.exact_counter_burst != 0;
         let old_groups = match self.find(&gpd_id) {
             Some(i) => {
                 // A repeated commissioning that changes nothing but the
@@ -1891,6 +1963,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                     self.dirty = true;
                 } else {
                     entry.persisted_counter = old.persisted_counter;
+                    entry.counter_exact = old.counter_exact;
                 }
                 let old_groups = old.group_ids();
                 *old = entry;
@@ -2292,6 +2365,65 @@ mod tests {
         assert_eq!(d.security_level, SecurityLevel::None);
         assert_eq!(d.frame_counter, 9);
         assert_eq!(d.key, None);
+    }
+
+    #[test]
+    fn a_local_window_times_out_even_when_exiting_on_first_pairing() {
+        // The default exit mode is "on first pairing" only (gecko_sdk).
+        let mut s = default_sink();
+        assert_eq!(s.config().exit_mode, exit_mode_attr::ON_FIRST_PAIRING);
+        s.enter_commissioning(1000, true).unwrap();
+        let tx = drain(&mut s, 1000);
+        // The proxies are told to exit on the first pairing, no window.
+        assert_eq!(command(&tx[0]).0, client_cmd::PROXY_COMMISSIONING_MODE);
+        assert_eq!(
+            s.take_event(),
+            Some(SinkEvent::CommissioningEntered {
+                window_s: Some(180),
+                involve_proxies: true
+            })
+        );
+        assert_eq!(s.next_deadline(), Some(181_000));
+        drain(&mut s, 180_999);
+        assert!(s.in_commissioning_mode());
+        // The window elapses: the sink leaves and tells the proxies, which
+        // had no window of their own.
+        let tx = drain(&mut s, 181_000);
+        assert!(!s.in_commissioning_mode());
+        assert_eq!(
+            s.take_event(),
+            Some(SinkEvent::CommissioningLeft(SinkCommissioningExit::Timeout))
+        );
+        assert_eq!(tx.len(), 1);
+        let (id, payload) = command(&tx[0]);
+        assert_eq!(id, client_cmd::PROXY_COMMISSIONING_MODE);
+        assert_eq!(payload[0] & 0x01, 0, "exit");
+        // GP Sink Commissioning Mode from the network keeps the exit mode:
+        // no window.
+        let mut aes = SoftwareAesProvider;
+        let enter = SinkCommissioningMode {
+            options: sink_commissioning_options::ACTION
+                | sink_commissioning_options::INVOLVE_PROXIES,
+            gpm_addr_for_security: 0xFFFF,
+            gpm_addr_for_pairing: 0xFFFF,
+            sink_endpoint: 0xFF,
+        };
+        let mut b = [0u8; 8];
+        let n = enter.encode(&mut b).unwrap();
+        s.on_server_command(
+            &mut aes,
+            &ServerCommand {
+                src_nwk: 0,
+                unicast: true,
+                tsn: 1,
+                command_id: server_cmd::SINK_COMMISSIONING_MODE,
+                payload: &b[..n],
+            },
+            200_000,
+        )
+        .unwrap();
+        assert!(s.in_commissioning_mode());
+        assert_eq!(s.next_deadline(), None);
     }
 
     #[test]
@@ -3204,6 +3336,89 @@ mod tests {
         // The first frame above the floor is persisted.
         assert!(rebooted.take_dirty());
         assert_eq!(rebooted.required_groups().next(), Some(derive_alias(&GPD)));
+    }
+
+    /// The entry as the runtime journals it: encoding plus counter mode.
+    fn stored(s: &S) -> (heapless::Vec<u8, MAX_SINK_ENTRY_ENCODED_LEN>, bool) {
+        let entry = &s.entries()[0];
+        let mut b = [0u8; MAX_SINK_ENTRY_ENCODED_LEN];
+        let n = entry.encode(&mut b).unwrap();
+        (
+            heapless::Vec::from_slice(&b[..n]).unwrap(),
+            entry.counter_exact(),
+        )
+    }
+
+    fn reboot_from(stored: &(heapless::Vec<u8, MAX_SINK_ENTRY_ENCODED_LEN>, bool)) -> S {
+        let (entry, _) = SinkEntry::decode(&stored.0).unwrap();
+        let mut s = default_sink();
+        s.restore(entry.with_counter_exact(stored.1)).unwrap();
+        s
+    }
+
+    /// Reboot after `n` Toggles (exact) or reports (batched): no counter is
+    /// accepted twice and the first Toggle after the reboot works.
+    #[test]
+    fn reboot_after_1_2_64_65_frames_in_both_modes() {
+        const S_: u32 = DEFAULT_SINK_COUNTER_PERSIST_STRIDE;
+        let mut aes = SoftwareAesProvider;
+        let report = [0x02, 0x04, 0x00, 0x00, 0x29, 0x10, 0x09];
+        for n in [1u32, 2, 64, 65] {
+            for switch in [true, false] {
+                let mut s = commissioned();
+                assert!(s.entries()[0].counter_exact(), "new entries are exact");
+                s.take_dirty();
+                let mut flash = stored(&s);
+                let mut now = 100;
+                let rx = |s: &mut S, fc: u32, now: u32, aes: &mut SoftwareAesProvider| {
+                    let f = if switch {
+                        frame(SecurityLevel::Encrypted, fc, false, 0x22, &[])
+                    } else {
+                        frame(SecurityLevel::Encrypted, fc, false, 0xA0, &report)
+                    };
+                    let outcome = s.on_gpdf(aes, &f.gpdf(), now);
+                    while s.take_command().is_some() {}
+                    while s.take_event().is_some() {}
+                    outcome
+                };
+                for fc in 11..=10 + n {
+                    now += 60_000;
+                    let outcome = rx(&mut s, fc, now, &mut aes);
+                    assert!(
+                        matches!(
+                            outcome,
+                            SinkOutcome::Translated | SinkOutcome::PassedThrough
+                        ),
+                        "n {n} fc {fc}: {outcome:?}"
+                    );
+                    if s.take_dirty() {
+                        flash = stored(&s);
+                    }
+                }
+                assert_eq!(s.entries()[0].counter_exact(), switch);
+                let mut r = reboot_from(&flash);
+                for fc in 10..=10 + n {
+                    now += 1_000;
+                    assert_eq!(
+                        rx(&mut r, fc, now, &mut aes),
+                        SinkOutcome::Dropped(SinkDrop::Stale),
+                        "n {n} switch {switch}: replayed {fc}"
+                    );
+                }
+                let floor = r.entries()[0].frame_counter;
+                if switch {
+                    assert_eq!(floor, 10 + n);
+                    now += 60_000;
+                    assert_eq!(
+                        rx(&mut r, 11 + n, now, &mut aes),
+                        SinkOutcome::Translated,
+                        "n {n}: the first Toggle after the reboot"
+                    );
+                } else {
+                    assert!(floor >= 10 + n && floor < 10 + n + S_, "n {n}: {floor}");
+                }
+            }
+        }
     }
 
     #[test]
