@@ -58,6 +58,8 @@ pub mod chip_temperature;
 pub mod end_device;
 #[cfg(any(target_os = "none", test))]
 pub mod executor;
+#[cfg(all(target_os = "none", feature = "combo-light"))]
+pub mod flash_timing;
 #[cfg(all(
     target_os = "none",
     any(
@@ -67,8 +69,6 @@ pub mod executor;
     )
 ))]
 mod flash_window;
-#[cfg(all(target_os = "none", feature = "combo-light"))]
-pub mod flash_timing;
 pub mod migration;
 #[cfg(feature = "esp32h2")]
 pub mod pad_isolation;
