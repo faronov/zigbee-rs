@@ -592,6 +592,11 @@ struct TxQueueEntry {
     command_id: u8,
     payload: heapless::Vec<u8, MAX_DOWNLINK_PAYLOAD>,
     expires_ms: u32,
+    /// Queued by this node's own sink (a combo commissioning a GPD it hears
+    /// directly): kept when another sink's Response appoints another
+    /// TempMaster, and not replaced by another sink's Response.
+    #[cfg(feature = "sink")]
+    local: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -725,6 +730,9 @@ pub struct Proxy<const N: usize, const Q: usize> {
     dirty: bool,
     /// Bounds exact frame-counter writes ([`crate::counter`]).
     exact_budget: crate::counter::ExactBudget,
+    /// The GP Response being handled came from this node's own sink.
+    #[cfg(feature = "sink")]
+    response_from_own_sink: bool,
     /// The commissioning window elapsed and the owner was not told yet.
     commissioning_timed_out: bool,
     stats: ForwardStats,
@@ -797,6 +805,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             notification_retries: heapless::Vec::new(),
             dirty: false,
             exact_budget: crate::counter::ExactBudget::new(),
+            #[cfg(feature = "sink")]
+            response_from_own_sink: false,
             commissioning_timed_out: false,
             stats: ForwardStats {
                 sent: 0,
@@ -1674,6 +1684,10 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             }
             client_cmd::RESPONSE => {
                 let r = Response::decode(payload)?;
+                #[cfg(feature = "sink")]
+                {
+                    self.response_from_own_sink = src_nwk == self.own_nwk;
+                }
                 self.on_response(&r, now_ms)?;
             }
             client_cmd::NOTIFICATION_RESPONSE => {
@@ -1931,6 +1945,15 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     /// [`transmit_channel`](Self::transmit_channel)). A full gpTxQueue returns
     /// [`Error::BufferFull`]. A Response appointing another proxy drops our
     /// queued GPDF for that GPD and clears FirstToForward.
+    ///
+    /// `sink` builds: a Response from this node's own sink
+    /// (`response_from_own_sink`) queues a *local* GPDF.
+    /// Its queued GPDF is the combo's own commissioning reply to a GPD it
+    /// heard directly; a concurrent commissioning by another sink (zigpy
+    /// answers every Commissioning Notification and appoints the TempMaster
+    /// it prefers) must not cancel or replace it. Seen on hardware
+    /// 2026-11-17: zigpy appointed a proxy that could not transmit, which
+    /// cancelled the combo's queued reply for every attempt of the GPD.
     fn on_response(&mut self, r: &Response<'_>, _now_ms: u32) -> Result<()> {
         if r.temp_master_short == self.own_nwk {
             #[cfg(feature = "proxy-bidirectional")]
@@ -1940,6 +1963,15 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         }
         #[cfg(feature = "proxy-bidirectional")]
         {
+            #[cfg(feature = "sink")]
+            if self
+                .bidi
+                .tx_queue
+                .iter()
+                .any(|e| e.local && e.gpd_id.matches(&r.gpd_id))
+            {
+                return Ok(());
+            }
             self.bidi.tx_queue.retain(|e| !e.gpd_id.matches(&r.gpd_id));
             if self.is_temp_master_for(&r.gpd_id) {
                 self.bidi.temp_master_for = None;
@@ -1958,6 +1990,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
 
     #[cfg(feature = "proxy-bidirectional")]
     fn queue_response(&mut self, r: &Response<'_>, now_ms: u32) -> Result<()> {
+        #[cfg(feature = "sink")]
+        let local = self.response_from_own_sink;
         if !self.bidi.capable || r.transmit_on_endpoint_match {
             return Err(Error::Unsupported);
         }
@@ -1993,10 +2027,17 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             command_id: r.command_id,
             payload,
             expires_ms: now_ms.wrapping_add(self.config.tx_queue_lifetime_ms),
+            #[cfg(feature = "sink")]
+            local,
         };
         let q = &mut self.bidi.tx_queue;
         q.retain(|e| !due(now_ms, e.expires_ms));
         if let Some(e) = q.iter_mut().find(|e| e.gpd_id.matches(&r.gpd_id)) {
+            // Another sink's Response never replaces our own sink's reply.
+            #[cfg(feature = "sink")]
+            if e.local && !local {
+                return Ok(());
+            }
             *e = entry; // ENTRY_REPLACED
         } else {
             q.push(entry).map_err(|_| Error::BufferFull)?; // QUEUE_FULL

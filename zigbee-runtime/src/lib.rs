@@ -16970,6 +16970,177 @@ mod parent_router_tests {
         device
     }
 
+    /// Combo as its own TempMaster (`green-power-sink` +
+    /// `green-power-bidirectional`): the sink hears a bidirectional GPD's
+    /// Commissioning GPDF directly and answers with a GP Response appointing
+    /// this node; the GPD's next rxAfterTx GPDF must get the Commissioning
+    /// Reply by timed TX, also when another sink (zigpy) answers the same
+    /// GPDF with a Response appointing another proxy in between.
+    #[cfg(all(feature = "green-power-sink", feature = "green-power-bidirectional"))]
+    #[test]
+    fn gp_combo_is_its_own_temp_master_for_direct_bidirectional_commissioning() {
+        use zigbee_aps::ApsTxOptions;
+        use zigbee_aps::apsde::ApsdeDataRequest;
+        use zigbee_aps::{ApsAddress, ApsAddressMode};
+        use zigbee_gp::cluster::{Response, client_cmd};
+        use zigbee_gp::commissioning::{CommissioningPayload, CommissioningSecurity};
+        use zigbee_gp::frame::{FrameType, GpdfParams};
+        use zigbee_gp::security::{self, DEFAULT_TC_LINK_KEY, Direction};
+        use zigbee_gp::types::{GpdId, KeyType, SecurityLevel};
+
+        const SRC: u32 = 0x293C_9879;
+        const KEY: [u8; 16] = [0x5D; 16];
+        const RX_END_US: u32 = 4_000_000;
+        let gpd = GpdId::SrcId(SRC);
+        let commissioning = |mac_seq: u8| {
+            let wrapped = security::wrap_key(
+                &mut MockMac::new([0; 8]),
+                &DEFAULT_TC_LINK_KEY,
+                &gpd,
+                Direction::FromGpd,
+                0,
+                &KEY,
+            )
+            .unwrap();
+            let p = CommissioningPayload {
+                device_id: 0x33,
+                mac_seq_num_capability: false,
+                rx_on_capability: true,
+                pan_id_request: false,
+                security_key_request: false,
+                fixed_location: true,
+                security: Some(CommissioningSecurity {
+                    level: SecurityLevel::Encrypted,
+                    key_type: KeyType::IndividualKey,
+                    key: Some((wrapped.key, Some(u32::from_le_bytes(wrapped.mic)))),
+                    outgoing_counter: Some(7072),
+                }),
+                app_info: None,
+            };
+            let mut b = [0u8; 64];
+            let n = p.encode(&mut b).unwrap();
+            let mut raw = [0u8; 127];
+            let len = security::build_gpdf(
+                &mut MockMac::new([0; 8]),
+                None,
+                &GpdfParams {
+                    frame_type: FrameType::Data,
+                    auto_commissioning: false,
+                    src_id: Some(SRC),
+                    security_level: SecurityLevel::None,
+                    individual_key: false,
+                    rx_after_tx: true,
+                    to_gpd: false,
+                    frame_counter: 0,
+                },
+                mac_seq,
+                0xE0,
+                &b[..n],
+                &mut raw,
+            )
+            .unwrap();
+            McpsDataIndication {
+                src_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+                dst_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+                lqi: 180,
+                payload: MacFrame::from_slice(&raw[7..len])
+                    .unwrap()
+                    .with_mac_sequence(mac_seq)
+                    .with_rx_end_us(RX_END_US),
+                security_use: false,
+            }
+        };
+        // zigpy's GP Response for the same GPD, appointing `temp_master`.
+        let mut coordinator = centralized_coordinator();
+        let mut zigpy_response =
+            |temp_master: u16| {
+                let response = Response {
+                    gpd_id: gpd,
+                    transmit_on_endpoint_match: false,
+                    temp_master_short: temp_master,
+                    temp_master_tx_channel: 15 - 11,
+                    command_id: 0xF0,
+                    payload: &[0x00],
+                };
+                let mut zcl = [0u8; 64];
+                zcl[..3].copy_from_slice(&[0x19, 0x43, client_cmd::RESPONSE]);
+                let len = 3 + response.encode(&mut zcl[3..]).unwrap();
+                block_on(coordinator.bdb.zdo_mut().aps_mut().apsde_data_request(
+                    &ApsdeDataRequest {
+                        dst_addr_mode: ApsAddressMode::Short,
+                        dst_address: ApsAddress::Short(ShortAddress(0xFFFD)),
+                        dst_endpoint: 242,
+                        profile_id: 0xA1E0,
+                        cluster_id: 0x0021,
+                        src_endpoint: 242,
+                        payload: &zcl[..len],
+                        tx_options: ApsTxOptions {
+                            use_nwk_key: true,
+                            ..ApsTxOptions::default()
+                        },
+                        radius: 0,
+                        alias_src_addr: None,
+                        alias_seq: None,
+                    },
+                ))
+                .unwrap();
+                McpsDataIndication {
+                    src_address: MacAddress::Short(PAN, ShortAddress::COORDINATOR),
+                    dst_address: MacAddress::Short(PAN, ShortAddress(0xFFFF)),
+                    lqi: 200,
+                    payload: MacFrame::from_slice(
+                        coordinator
+                            .mac()
+                            .tx_history()
+                            .last()
+                            .unwrap()
+                            .payload
+                            .as_slice(),
+                    )
+                    .unwrap(),
+                    security_use: false,
+                }
+            };
+
+        for zigpy_in_between in [None, Some(0x4A76u16), Some(ROUTER.0)] {
+            let mut router = gp_combo_router();
+            router.mac_mut().set_timed_tx(true);
+            router.gp_sink_enter_commissioning(true).unwrap();
+            block_on(router.gp_poll());
+            router.mac_mut().clear_tx_history();
+
+            // First Commissioning GPDF: nothing queued yet; the sink answers.
+            router.mac_mut().set_time_micros(RX_END_US + 900);
+            assert!(block_on(router.process_incoming(&commissioning(1), &mut [])).is_none());
+            assert!(router.mac().timed_tx_history().is_empty());
+            block_on(router.gp_poll());
+            assert!(
+                router.gp_proxy().bidirectional(),
+                "case {zigpy_in_between:?}: the combo must be a TempMaster"
+            );
+            if let Some(temp_master) = zigpy_in_between {
+                let response = zigpy_response(temp_master);
+                block_on(router.process_incoming(&response, &mut []));
+            }
+
+            // The GPD retries; the Commissioning Reply goes out in its window.
+            router.mac_mut().set_time_micros(RX_END_US + 900);
+            block_on(router.process_incoming(&commissioning(2), &mut []));
+            let sent = router.mac().timed_tx_history();
+            assert_eq!(
+                sent.len(),
+                1,
+                "case {zigpy_in_between:?}: Commissioning Reply in the window"
+            );
+            assert_eq!(sent[0].at_us, RX_END_US + 20_000);
+            let reply =
+                zigbee_gp::frame::parse(&sent[0].frame[7..], sent[0].frame[2], None).unwrap();
+            assert!(reply.header.to_gpd);
+            assert_eq!(reply.header.gpd_id, Some(gpd));
+            assert_eq!(reply.clear_command_id(), Some(0xF0));
+        }
+    }
+
     /// GP Combo end to end (`green-power-sink`): sink commissioning mode,
     /// a GPD Commissioning GPDF heard directly, the Sink Table entry and GP
     /// Pairing, a secured Toggle GPDF that toggles the local On/Off cluster,
