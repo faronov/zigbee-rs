@@ -38,7 +38,7 @@
 | TempMaster (`zigbee-runtime/green-power-bidirectional`, router `green-power-bidirectional`): proxy advertises bidirectional only when the MAC has timed TX, sends a queued GP Response GPDF `tx_offset_us` (20 ms) after the end of the triggering GPDF, no CSMA, no ACK | implemented, opt-in (not in any default image) | end-to-end host test: GP Response from the sink → rxAfterTx GPDF → Commissioning Reply scheduled at RX end + 20 ms. Lab-tested on the H2-Zero 2026-11-14 with an injected GPD (radio-lab): forwarded first (+41 ms), appointed TempMaster by zigpy, 10 of 11 Commissioning Replies sent on time, 1 reported `Missed` (§6.8). **Not yet with a real bidirectional GPD** |
 | GPD bidirectional mode (`gpd-app/bidirectional`, MG22 example feature `bidirectional`, product `BIDIRECTIONAL` policy) | implemented, opt-in | host tests: reply in the window → Success and channel persisted; replies at both edges of the spec window (20 ms and 25 ms + GPDF airtime after the GPDF start) and at the measured IKEA offset received; no reply → stays uncommissioned without counter reuse; wrong security level rejected; delivered key replaces the GPD key; invalid policy rejected. Lab-tested on hardware 2026-11-14 (182b358, `lab-tx-power` build): commissioned into ZHA through IKEA 0x43FD as TempMaster, Success accepted, reports in HA, Resumed after reset with channel and counter (§6.9). **Not yet through our proxy** |
 | Full proxy (`zigbee-gp/proxy-full`, `zigbee-runtime/green-power-full-proxy`) | in progress, opt-in (§2 row (b)) | host tests |
-| Combo / Sink (`zigbee-gp/sink`, `zigbee-runtime/green-power-sink`, router-app `green-power-sink`): Sink Table, sink commissioning mode, GPD commissioning (direct and Commissioning Notification, bidirectional through a TempMaster), Notification processing, Notification Response, Sink Table Request, sink attributes, built-in GPD → ZCL translation to one local endpoint, Sink Table in the GP journal | implemented, opt-in (not in any default image) | host tests (`zigbee-gp` sink unit tests, zigpy golden vectors, `gp_store` sink journal tests, runtime end-to-end `gp_combo_commissions_a_switch_and_toggles_the_local_light`); ESP32-H2 and nRF52840 router builds (§4.5); first product: Waveshare ESP32-H2-Zero combo light (`combo-light`, On/Off Light endpoint on the WS2812, BOOT opens sink commissioning, TempMaster included; §3.7). **Lab-tested on the H2-Zero (2026-11-15/16, §6.10)**: BOOT window, direct commissioning of a unidirectional GP switch, Toggles to the light, Sink Table across a power cycle. Adaptive counters across a power cycle and the 180 s BOOT timeout: lab-tested 2026-11-17. Bidirectional GPD directly into the sink: host-tested, hardware test pending |
+| Combo / Sink (`zigbee-gp/sink`, `zigbee-runtime/green-power-sink`, router-app `green-power-sink`): Sink Table, sink commissioning mode, GPD commissioning (direct and Commissioning Notification, bidirectional through a TempMaster), Notification processing, Notification Response, Sink Table Request, sink attributes, built-in GPD → ZCL translation to one local endpoint, Sink Table in the GP journal | implemented, opt-in (not in any default image) | host tests (`zigbee-gp` sink unit tests, zigpy golden vectors, `gp_store` sink journal tests, runtime end-to-end `gp_combo_commissions_a_switch_and_toggles_the_local_light`); ESP32-H2 and nRF52840 router builds (§4.5); first product: Waveshare ESP32-H2-Zero combo light (`combo-light`, On/Off Light endpoint on the WS2812, BOOT opens sink commissioning, TempMaster included; §3.7). **Lab-tested on the H2-Zero (2026-11-15/16, §6.10)**: BOOT window, direct commissioning of a unidirectional GP switch, Toggles to the light, Sink Table across a power cycle. Adaptive counters across a power cycle and the 180 s BOOT timeout: lab-tested 2026-11-17. Bidirectional GPD directly into the sink: host-tested; the 2026-11-17 hardware attempt did not reach it (the GPD's scan ended before permit join opened, §6.10), re-test pending |
 | Adaptive frame-counter persistence (`zigbee_gp::counter`, Proxy and Sink Table, exact flag in the GP journal's counter records) | implemented, in every GP image | host tests (§3.3); lab-tested on the H2-Zero combo 2026-11-17: after a power cycle the switch's first presses toggled the light, none dropped (§6.10) |
 
 Implementation notes that differ from the design below:
@@ -1863,6 +1863,24 @@ Sessions in `~/.hwlab/sessions/2026-11-17T154805Z-h2zero-recommission-switch`,
   identity journals (0x70000, 0x74000) byte-identical to the backup, and
   `flash verify` passed. After a reset the GPD resumed SrcID 0x293C9879,
   counter 7072, channel none (not commissioned).
+- **Bidirectional sensor directly into the sink: not exercised**
+  (2026-11-17, session `…161149Z-h2zero-sink-bidi-sensor`, H2-Zero and
+  MG22 logs). BOOT opened the sink window at 18:43:07.27 (`window_s:
+  Some(180)`, Proxy Commissioning Mode broadcast). The BTN0 long press
+  started the GPD's beacon scan at 18:43:22.22; it ended at 18:43:24.50
+  with `commissioning failed: NoPermitJoinNetwork`. ZHA's
+  Mgmt_Permit_Joining (60 s, to the H2-Zero only) reached the router at
+  18:43:24.85, 0.35 s after the scan ended (zigpy's Proxy Commissioning
+  Mode 0.08 s earlier). The GPD therefore sent no Commissioning GPDF:
+  none of the proof lines (`CommissioningReplySent`, `TempMaster GPDF
+  sent`, `Commissioned`) could appear and no sensor reports reached the
+  sink (the GPD logged `Err(NotCommissioned)` every 60 s). The sink window
+  ended with `CommissioningLeft(Timeout)` at 18:46:07.30, 180.0 s after
+  BOOT (a second hardware confirmation of the timeout). Not a sink or
+  TempMaster defect: the test ordering must be permit join confirmed at
+  the router first (its log shows `Permit joining: duration=60`), then
+  BOOT, then BTN0 within the remaining window. The GPD scans for a
+  joinable network only once per long press (about 2.3 s).
 
 ## 7. Open questions for the user
 
