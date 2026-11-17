@@ -13,8 +13,11 @@
 > TempMaster (IKEA), not through our proxy. M4 hardware gate 2 was
 > accepted as partial on 2026-11-14 (gate 1 + gate 2b, §6.7, §6.9). The full proxy
 > is in progress (M5, opt-in). Combo/Sink (layer (c)) is implemented opt-in
-> behind `green-power-sink` and host-tested only: it is in no image and has
-> not run on hardware (§3.7, §4.5). Spec
+> behind `green-power-sink`; it is in no default image. On the ESP32-H2-Zero
+> combo light (`combo-light`) it is lab-tested on hardware: a GP switch and
+> a bidirectional MG22 sensor commission directly into the sink, the latter
+> with the combo as its own TempMaster (3 of 3 rounds, 2026-11-17; §3.7,
+> §4.5, §6.10). Spec
 > references are to GP 1.0a (docs-09-5499-26) and GP 1.1 where noted.
 
 ## 0. Implementation status
@@ -35,10 +38,10 @@
 | ZHA quirk `tools/zha-quirks/zigbee_rs_gp.py` | lab-tested | loaded by a ZHA config-entry reload (no HA restart) on HA 2026.11; temperature/humidity entities; battery voltage/percentage entities (331f8ea) deployed 2026-11-13 and showing 3.4 V / 100 %; switch event entity with `off`/`on`/`toggle` |
 | Default-on in every router (`router` = `router-core` + `green-power`) with a product-owned Proxy Table partition: ESP32-C6/H2 (`zbnv` 0x3F8000), nRF52840 (0xF8000), nRF52833 (0x78000), EFR32MG21 (0x70000), ZBT-1 (0xF0000), STM32WB5MM-DK (0x080CF000), BL702 (0xF7000), TLSR8258 (0x6E000), mock-light (RAM store) | implemented | every image builds and passes its layout and stack gates; product host tests with and without `green-power`; hardware: ESP32-H2-Zero forwarding (§6); ZBT-1 `zrs-boot` boots with the proxy running, empty table, no forwarding observed (§4.1). The other targets compile only |
 | Timed-TX capability (`zigbee-mac/timed-tx`): `RadioPhy::TIMED_TX` / `transmit_at`, `PhyRxFrame::rx_end_us`, `PhyError::Missed`, `MacDriver::timed_tx_supported` / `transmit_raw_at`; ESP backend with an RX_DONE timestamp (vendored esp-radio `ieee802154-rx-timestamp`) | implemented, opt-in | host tests (SoftMac timed payload, mock timed TX); ESP32-H2 lab-tested on air 2026-11-14: reply preamble 19,998–20,007 µs after the end of the GPDF in 4 of 5, 20,222 µs in 1, after calibrating `TIMED_TX_START_LEAD_US` to 425 µs (§6.8). ESP32-C6 not measured |
-| TempMaster (`zigbee-runtime/green-power-bidirectional`, router `green-power-bidirectional`): proxy advertises bidirectional only when the MAC has timed TX, sends a queued GP Response GPDF `tx_offset_us` (20 ms) after the end of the triggering GPDF, no CSMA, no ACK | implemented, opt-in (not in any default image) | end-to-end host test: GP Response from the sink → rxAfterTx GPDF → Commissioning Reply scheduled at RX end + 20 ms. Lab-tested on the H2-Zero 2026-11-14 with an injected GPD (radio-lab): forwarded first (+41 ms), appointed TempMaster by zigpy, 10 of 11 Commissioning Replies sent on time, 1 reported `Missed` (§6.8). **Not yet with a real bidirectional GPD** |
+| TempMaster (`zigbee-runtime/green-power-bidirectional`, router `green-power-bidirectional`): proxy advertises bidirectional only when the MAC has timed TX, sends a queued GP Response GPDF `tx_offset_us` (20 ms) after the end of the triggering GPDF, no CSMA, no ACK | implemented, opt-in (not in any default image) | end-to-end host test: GP Response from the sink → rxAfterTx GPDF → Commissioning Reply scheduled at RX end + 20 ms. Lab-tested on the H2-Zero 2026-11-14 with an injected GPD (radio-lab): forwarded first (+41 ms), appointed TempMaster by zigpy, 10 of 11 Commissioning Replies sent on time, 1 reported `Missed` (§6.8). With a real bidirectional GPD (MG22 sensor) the combo light as its own TempMaster commissioned it 3 of 3 times on 2026-11-17, the reply armed in the radio and started by its interrupts (`MacDriver::arm_gp_reply`, ESP32 only; other MACs keep the task-scheduled reply) (§6.10). With zigpy appointing our proxy for a GPD commissioning into ZHA: not tested |
 | GPD bidirectional mode (`gpd-app/bidirectional`, MG22 example feature `bidirectional`, product `BIDIRECTIONAL` policy) | implemented, opt-in | host tests: reply in the window → Success and channel persisted; replies at both edges of the spec window (20 ms and 25 ms + GPDF airtime after the GPDF start) and at the measured IKEA offset received; no reply → stays uncommissioned without counter reuse; wrong security level rejected; delivered key replaces the GPD key; invalid policy rejected. Lab-tested on hardware 2026-11-14 (182b358, `lab-tx-power` build): commissioned into ZHA through IKEA 0x43FD as TempMaster, Success accepted, reports in HA, Resumed after reset with channel and counter (§6.9). **Not yet through our proxy** |
 | Full proxy (`zigbee-gp/proxy-full`, `zigbee-runtime/green-power-full-proxy`) | in progress, opt-in (§2 row (b)) | host tests |
-| Combo / Sink (`zigbee-gp/sink`, `zigbee-runtime/green-power-sink`, router-app `green-power-sink`): Sink Table, sink commissioning mode, GPD commissioning (direct and Commissioning Notification, bidirectional through a TempMaster), Notification processing, Notification Response, Sink Table Request, sink attributes, built-in GPD → ZCL translation to one local endpoint, Sink Table in the GP journal | implemented, opt-in (not in any default image) | host tests (`zigbee-gp` sink unit tests, zigpy golden vectors, `gp_store` sink journal tests, runtime end-to-end `gp_combo_commissions_a_switch_and_toggles_the_local_light`); ESP32-H2 and nRF52840 router builds (§4.5); first product: Waveshare ESP32-H2-Zero combo light (`combo-light`, On/Off Light endpoint on the WS2812, BOOT opens sink commissioning, TempMaster included; §3.7). **Lab-tested on the H2-Zero (2026-11-15/16, §6.10)**: BOOT window, direct commissioning of a unidirectional GP switch, Toggles to the light, Sink Table across a power cycle. Adaptive counters across a power cycle and the 180 s BOOT timeout: lab-tested 2026-11-17. Bidirectional GPD directly into the sink with the combo as its own TempMaster: lab-tested 2026-11-17 after two fixes (zigpy's Response no longer cancels the combo's reply; the reply is sent before the GPDF is processed), 1 of 3 replies refused by a busy radio (preemption fix da33af4, hardware re-test pending) (§6.10) |
+| Combo / Sink (`zigbee-gp/sink`, `zigbee-runtime/green-power-sink`, router-app `green-power-sink`): Sink Table, sink commissioning mode, GPD commissioning (direct and Commissioning Notification, bidirectional through a TempMaster), Notification processing, Notification Response, Sink Table Request, sink attributes, built-in GPD → ZCL translation to one local endpoint, Sink Table in the GP journal | implemented, opt-in (not in any default image) | host tests (`zigbee-gp` sink unit tests, zigpy golden vectors, `gp_store` sink journal tests, runtime end-to-end `gp_combo_commissions_a_switch_and_toggles_the_local_light`); ESP32-H2 and nRF52840 router builds (§4.5); first product: Waveshare ESP32-H2-Zero combo light (`combo-light`, On/Off Light endpoint on the WS2812, BOOT opens sink commissioning, TempMaster included; §3.7). **Lab-tested on the H2-Zero (2026-11-15/16, §6.10)**: BOOT window, direct commissioning of a unidirectional GP switch, Toggles to the light, Sink Table across a power cycle. Adaptive counters across a power cycle and the 180 s BOOT timeout: lab-tested 2026-11-17. Bidirectional GPD directly into the sink with the combo as its own TempMaster: **proven on hardware on the ESP32-H2 2026-11-17**: 3 of 3 rounds with the reply started from the radio interrupts (7b2d6ca), after the fixes for zigpy's Response cancelling the combo's reply, the reply ordering and the busy radio (§6.10) |
 | Adaptive frame-counter persistence (`zigbee_gp::counter`, Proxy and Sink Table, exact flag in the GP journal's counter records) | implemented, in every GP image | host tests (§3.3); lab-tested on the H2-Zero combo 2026-11-17: after a power cycle the switch's first presses toggled the light, none dropped (§6.10) |
 
 Implementation notes that differ from the design below:
@@ -218,7 +221,7 @@ panic `Location` line/column fields); §4.1 records the proof.
 | (a) Proxy Basic | `proxy-basic` / `green-power-proxy` / `green-power` | dGP stub (version-3 demux, GPDF codec, security processing for proxy-table entries), proxy table plus journal, duplicate filter, commissioning mode, Commissioning Notification, Notification in derived/pre-commissioned groupcast and lightweight unicast, Pairing, Proxy Commissioning Mode, Proxy Table Request/Response, gppFunctionality attributes, GP 1.1.1 tunnelling delay (A.3.6.3.1). Unidirectional only. |
 | (a+) Basic with bidirectional commissioning | `proxy-bidir-commissioning` | gpTxQueue (≥ 5 entries, one per GPD), GP Response handling in the TempMaster role, timed transmission on the operational channel, Commissioning Reply. *(verify 1.1: possibly mandatory for Basic)* |
 | (b) Full proxy | `proxy-full` (implies the above) | **In progress (M5):** protected IEEE ApplicationID 2 GPDF authentication/forwarding; full-unicast Pairing and Notification Response matching; bounded retries with readable/writable retry attributes; temporary channel switch for a Maintenance Channel Configuration (A.3.9.1 step 8: the radio moves to the GPD's transmit channel, serves only its Channel Request, defers network transmissions and returns after delivery or 5 s); strict GP Tunneling Stop payload codec. gppFunctionality adds full unicast and GPD IEEE address. Tunneling Stop is a GP 1.0 optional command that the Silicon Labs GP 1.1 client neither sends nor handles, so no behaviour is attached to it. Pairing Search and Proxy Table maintenance are deferred: neither zigpy nor the Silicon Labs client uses them. Remaining: Combo/Sink and counter-reservation optimization. |
-| (c) Combo / Sink | `sink` (implies `proxy`) / `green-power-sink` (implies `green-power`) / `green-power-sink` | **Implemented opt-in, host-tested, not hardware-tested (§3.7):** GP server on GPEP: Sink Table plus journal, sink commissioning mode (local API or GP Sink Commissioning Mode, window, exit on first pairing, GP Proxy Commissioning Mode to the proxies), direct GPDF reception, Notification and Commissioning Notification handling, bidirectional commissioning (GP Response with Commissioning Reply, Success), decommissioning, GP Pairing and alias Device_annce generation, GP Notification Response, Sink Table Request/Response, sink attributes 0x0000–0x0007, built-in translation (Off/On/Toggle → On/Off, Level Control Move/Step/Stop) to one local application endpoint. **Deferred:** Translation Table Update/Request and per-GPD translations, GP Pairing Configuration, Application Description, Channel Request handling, key provisioning to a GPD, GPM / involve-TC commissioning, GP Pairing Search |
+| (c) Combo / Sink | `sink` (implies `proxy`) / `green-power-sink` (implies `green-power`) / `green-power-sink` | **Implemented opt-in, host-tested; lab-tested on the ESP32-H2-Zero combo light (§3.7, §6.10):** GP server on GPEP: Sink Table plus journal, sink commissioning mode (local API or GP Sink Commissioning Mode, window, exit on first pairing, GP Proxy Commissioning Mode to the proxies), direct GPDF reception, Notification and Commissioning Notification handling, bidirectional commissioning (GP Response with Commissioning Reply, Success), decommissioning, GP Pairing and alias Device_annce generation, GP Notification Response, Sink Table Request/Response, sink attributes 0x0000–0x0007, built-in translation (Off/On/Toggle → On/Off, Level Control Move/Step/Stop) to one local application endpoint. **Deferred:** Translation Table Update/Request and per-GPD translations, GP Pairing Configuration, Application Description, Channel Request handling, key provisioning to a GPD, GPM / involve-TC commissioning, GP Pairing Search |
 | (d) GPD app | `gpd` (frame builder and security only) + `apps/gpd` | No NWK/APS/ZDO/BDB. Commissioning (uni- and bidirectional), Channel Request, data and attribute reports, switch commands, secure frame-counter journal, sleep between reports |
 
 `security-level-1` is not a separate flag. Level 1 costs a few dozen bytes,
@@ -2007,7 +2010,32 @@ Sessions in `~/.hwlab/sessions/2026-11-17T154805Z-h2zero-recommission-switch`,
     (esp-storage), so a journal write during the 20 ms countdown can still
     delay a reply. Flashed with hwlab 2026-11-17 (backup sha
     `8b14e36d…0cedfd`, app sha `26fbc349…da2fbf`, `zbnv` kept); resumed as
-    0x7C87 with its 4 GP journal entries. Hardware gate: three rounds.
+    0x7C87 with its 4 GP journal entries.
+- **Three rounds with 7b2d6ca: PASSED 3 of 3** (2026-11-17, session
+  `…202955Z-h2zero-radio-reply-3round`, rounds at capture 1919–1926,
+  2099–2106 and 2295–2303 s). Each round: `CommissioningReplySent` on the
+  GPD's first Commissioning GPDF; on its second, `TempMaster GPDF sent by
+  the radio (15 B): on air +20069 us after the GPDF`; MG22 `commissioned on
+  channel 15` (LQI 165 / 143 / 159); sink `Commissioned { gpd_id:
+  SrcId(691837049), device_id: 51 }`, `CommissioningLeft(FirstPairing)`. No
+  `not sent` line in any round. The blue blink after commissioning was
+  ZHA's 90 s permit-join window, as expected. **Bidirectional direct
+  commissioning into the combo sink, with the combo as its own
+  TempMaster, is proven on hardware on the ESP32-H2.** The on-air offset
+  (+20,069 µs) is the PHY's estimate from the Timer0 interrupt time plus
+  the calibrated 425 µs start lead, not a sniffer measurement; the GPD
+  accepting the reply in every round confirms it lies in its window.
+- **Follow-up: main-loop latency besides flash.** During commissioning the
+  combo logged `slow loop step` iterations of 41–73 ms: 72.8 ms with one
+  journal erase (21.5 ms) and 10 writes, but also 45 ms and 41 ms with no
+  flash work at all. The radio-started reply no longer depends on the loop,
+  but the other GP deadlines (tunnelling delays, Notification retries,
+  Sink commissioning bookkeeping) and ZHA traffic still do. To do:
+  attribute the flash-free stalls (candidates: CSMA-CA waits and busy-radio
+  deferrals of GP Pairing / Proxy Commissioning Mode broadcasts and their
+  relays, USB-Serial-JTAG log flushes, sink key unwrap / CCM* work), then
+  bound or split them; keep journal erases out of the 20 ms countdown
+  (esp-storage masks interrupts during an erase).
 
 ## 7. Open questions for the user
 
@@ -2051,7 +2079,10 @@ Sessions in `~/.hwlab/sessions/2026-11-17T154805Z-h2zero-recommission-switch`,
    PR #1970 open, §6.9.)*
 5. Full proxy (channel switch, unicast modes, key types, IEEE ApplicationID).
 6. Combo/Sink with translation table. *(Implemented opt-in, host-tested,
-   §3.7, §4.5; Translation Table commands deferred; hardware not started.)*
+   §3.7, §4.5; Translation Table commands deferred. Lab-tested on the
+   ESP32-H2-Zero combo light: direct switch and bidirectional sensor
+   commissioning, translated Toggles, persistence across power cycles,
+   §6.10.)*
 
 Each step ends with host tests, the feature-off byte-identity check, and
 size and RAM deltas recorded here before the next step starts.
