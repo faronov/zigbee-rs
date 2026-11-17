@@ -14718,16 +14718,27 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         // A bidirectional GPD listens gpTxOffset after this GPDF; the
         // TempMaster reply goes out from here, before any other work of the
         // event loop (persistence, reporting) can delay it.
-        #[cfg(feature = "green-power-bidirectional")]
+        #[cfg(all(
+            feature = "green-power-bidirectional",
+            not(feature = "green-power-sink")
+        ))]
         if zigbee_gp::frame::is_gpdf(mac_payload) {
             if let Some(downlink) = self.gp_receive_gpdf_bidirectional(indication) {
                 self.gp_send_downlink(downlink).await;
             }
-            // Combo: the sink's translation of a GPDF heard directly.
-            #[cfg(feature = "green-power-sink")]
-            return self.gp_sink_deliver(clusters);
-            #[cfg(not(feature = "green-power-sink"))]
             return None;
+        }
+        // Combo TempMaster: the reply goes out before the proxy and the sink
+        // process the GPDF (the sink's commissioning work and its logging
+        // cost more than the 20 ms gpTxOffset on hardware).
+        #[cfg(all(feature = "green-power-bidirectional", feature = "green-power-sink"))]
+        if zigbee_gp::frame::is_gpdf(mac_payload) {
+            if let Some(downlink) = self.gp_downlink_first(indication) {
+                self.gp_send_downlink(downlink).await;
+            }
+            self.gp_receive_gpdf(indication);
+            // Combo: the sink's translation of a GPDF heard directly.
+            return self.gp_sink_deliver(clusters);
         }
 
         // NWK layer: header parsing, broadcast eligibility, BTR/relay for
@@ -17123,9 +17134,16 @@ mod parent_router_tests {
                 block_on(router.process_incoming(&response, &mut []));
             }
 
-            // The GPD retries; the Commissioning Reply goes out in its window.
+            // The GPD retries; the Commissioning Reply goes out in its window,
+            // before the stack decrypts anything (the sink unwraps the GPD
+            // key of this Commissioning GPDF only after the TX).
             router.mac_mut().set_time_micros(RX_END_US + 900);
+            let keyings = router.mac().aes_keyings();
             block_on(router.process_incoming(&commissioning(2), &mut []));
+            assert!(
+                router.mac().aes_keyings() > keyings,
+                "the sink processes the GPDF"
+            );
             let sent = router.mac().timed_tx_history();
             assert_eq!(
                 sent.len(),
@@ -17133,6 +17151,10 @@ mod parent_router_tests {
                 "case {zigpy_in_between:?}: Commissioning Reply in the window"
             );
             assert_eq!(sent[0].at_us, RX_END_US + 20_000);
+            assert_eq!(
+                sent[0].aes_keyings_before, keyings,
+                "case {zigpy_in_between:?}: the reply must leave before the sink's work"
+            );
             let reply =
                 zigbee_gp::frame::parse(&sent[0].frame[7..], sent[0].frame[2], None).unwrap();
             assert!(reply.header.to_gpd);

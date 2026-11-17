@@ -70,6 +70,8 @@ pub struct MockMac {
     timed_tx: Option<bool>,
     #[cfg(feature = "timed-tx")]
     timed_tx_history: Vec<TimedTxRecord, 8>,
+    /// AES keyings through [`zigbee_crypto::ForwardAesProvider`].
+    aes_keyings: u32,
 }
 
 /// A frame sent with [`MacDriver::transmit_raw_at`] (`timed-tx`).
@@ -82,6 +84,10 @@ pub struct TimedTxRecord {
     pub at_us: u32,
     /// Mock clock when the call was made.
     pub called_us: u32,
+    /// AES keyings (see [`MockMac::aes_keyings`]) before the call: lets a
+    /// test check that a timed reply went out before the stack decrypted
+    /// anything else.
+    pub aes_keyings_before: u32,
 }
 
 /// Record of a transmitted frame (for test assertions)
@@ -146,7 +152,14 @@ impl MockMac {
             timed_tx: None,
             #[cfg(feature = "timed-tx")]
             timed_tx_history: Vec::new(),
+            aes_keyings: 0,
         }
+    }
+
+    /// Number of AES keys set up through this MAC's
+    /// [`zigbee_crypto::ForwardAesProvider`] (one per CCM* operation).
+    pub fn aes_keyings(&self) -> u32 {
+        self.aes_keyings
     }
 
     /// Enable timed transmission (`timed-tx`). `meets_instants` is `true`
@@ -263,7 +276,15 @@ impl MockMac {
     }
 }
 
-impl zigbee_crypto::ForwardAesProvider for MockMac {}
+impl zigbee_crypto::ForwardAesProvider for MockMac {
+    fn forward_cipher(
+        &mut self,
+        key: &zigbee_crypto::AesKey,
+    ) -> impl zigbee_crypto::Aes128Forward + '_ {
+        self.aes_keyings = self.aes_keyings.wrapping_add(1);
+        zigbee_crypto::SoftwareAes128::new(key)
+    }
+}
 impl PlatformServices for MockMac {
     fn monotonic_micros(&self) -> u32 {
         self.time_micros
@@ -639,6 +660,7 @@ impl MacDriver for MockMac {
             frame: Vec::from_slice(frame).map_err(|_| MacError::FrameTooLong)?,
             at_us,
             called_us: self.time_micros,
+            aes_keyings_before: self.aes_keyings,
         };
         self.timed_tx_history
             .push(record)

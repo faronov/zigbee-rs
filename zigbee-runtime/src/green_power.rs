@@ -84,6 +84,10 @@ pub(crate) struct GpDownlink {
     len: u8,
     /// Start instant ([`zigbee_mac::PlatformServices::monotonic_micros`]).
     at_us: u32,
+    /// When the reply was built (`green-power-sink`: logged after the TX
+    /// with the instant, to show the latency budget).
+    #[cfg(feature = "green-power-sink")]
+    built_us: u32,
 }
 
 /// Bound on transmissions per [`ZigbeeDevice::gp_poll`] call, so one call
@@ -319,12 +323,36 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         proxy.set_operational_channel(channel);
     }
 
+    /// Combo TempMaster (`green-power-sink`): only the gpTxQueue GPDF a
+    /// received GPDF triggers, built and scheduled for
+    /// [`Self::gp_send_downlink`]. The caller transmits it *before* the proxy
+    /// and the sink process the GPDF with [`Self::gp_receive_gpdf`]: the
+    /// sink's commissioning work (key unwrap, logging) on the same frame
+    /// pushed the reply past its instant on hardware (2026-11-17). The
+    /// reply is built from the Proxy Table entry before `on_gpdf` advances
+    /// the GPD's counter, as without the sink.
+    #[cfg(all(feature = "green-power-bidirectional", feature = "green-power-sink"))]
+    #[inline(never)]
+    pub(crate) fn gp_downlink_first(
+        &mut self,
+        indication: &McpsDataIndication,
+    ) -> Option<GpDownlink> {
+        if !self.gp_active() {
+            return None;
+        }
+        self.gp_sync_bidirectional();
+        self.gp_take_downlink(indication)
+    }
+
     /// Handle a received GPDF (NWK protocol version 3) as TempMaster: the
     /// proxy processes it as [`Self::gp_receive_gpdf`] does, and the gpTxQueue
     /// GPDF it triggers (GP 1.1 A.3.9.1) is returned, already built and
     /// scheduled [`ProxyConfig::tx_offset_us`] after the end of
     /// `indication`, for [`Self::gp_send_downlink`].
-    #[cfg(feature = "green-power-bidirectional")]
+    #[cfg(all(
+        feature = "green-power-bidirectional",
+        not(feature = "green-power-sink")
+    ))]
     #[inline(never)]
     pub(crate) fn gp_receive_gpdf_bidirectional(
         &mut self,
@@ -364,6 +392,8 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             frame: [0; GP_DOWNLINK_FRAME_LEN],
             len: 0,
             at_us: rx_end_us.wrapping_add(self.green_power.proxy.config().tx_offset_us),
+            #[cfg(feature = "green-power-sink")]
+            built_us: 0,
         };
         let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
         // The MAC sequence number is set from macDSN when sending.
@@ -372,6 +402,10 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                 .proxy
                 .take_downlink(mac, &frame, now_ms, 0, &mut downlink.frame)?;
         downlink.len = len as u8;
+        #[cfg(feature = "green-power-sink")]
+        {
+            downlink.built_us = self.bdb.zdo().nwk().mac().monotonic_micros();
+        }
         Some(downlink)
     }
 
@@ -390,9 +424,41 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         }
         let frame = &downlink.frame[..usize::from(downlink.len)];
         let result = mac.transmit_raw_at(frame, downlink.at_us).await;
+        #[cfg(not(feature = "green-power-sink"))]
         match result {
             Ok(()) => log::info!("[GP] TempMaster GPDF sent ({} B)", downlink.len),
             Err(error) => log::warn!("[GP] TempMaster GPDF not sent: {:?}", error),
+        }
+        // After the TX: the reply was built `built` µs after the end of the
+        // triggering GPDF, was due at `due` and the MAC returned at `done`.
+        #[cfg(feature = "green-power-sink")]
+        {
+            let tx_offset = self.green_power.proxy.config().tx_offset_us;
+            let rx_end = downlink.at_us.wrapping_sub(tx_offset);
+            let done = self
+                .bdb
+                .zdo()
+                .nwk()
+                .mac()
+                .monotonic_micros()
+                .wrapping_sub(rx_end);
+            let built = downlink.built_us.wrapping_sub(rx_end) as i32;
+            match result {
+                Ok(()) => log::info!(
+                    "[GP] TempMaster GPDF sent ({} B): built +{} us, due +{} us, done +{} us after the GPDF",
+                    downlink.len,
+                    built,
+                    tx_offset,
+                    done as i32
+                ),
+                Err(error) => log::warn!(
+                    "[GP] TempMaster GPDF not sent: {:?}: built +{} us, due +{} us, done +{} us after the GPDF",
+                    error,
+                    built,
+                    tx_offset,
+                    done as i32
+                ),
+            }
         }
         // A delivered Channel Configuration ends a temporary channel.
         #[cfg(feature = "green-power-full-proxy")]
