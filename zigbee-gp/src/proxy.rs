@@ -2183,6 +2183,82 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         Some(n)
     }
 
+    /// The gpTxQueue GPDF a radio can send by itself (`zigbee_mac`
+    /// `arm_gp_reply`): built into `out` (MAC frame without FCS) as
+    /// [`take_downlink`](Self::take_downlink) builds it for an
+    /// *unprotected* `rxAfterTx` GPDF from its GPD, and returned with the
+    /// GPD's SrcID. The entry stays queued until
+    /// [`radio_downlink_sent`](Self::radio_downlink_sent).
+    ///
+    /// The radio sends the frame only in reply to an unprotected GPDF
+    /// (Commissioning, or a GPD without security): such a trigger has no
+    /// MIC or counter to verify and gets an unprotected reply, so no check
+    /// of [`take_downlink`](Self::take_downlink) is skipped. Protected
+    /// triggers are still answered from the task. Maintenance frames
+    /// (Channel Configuration) and ApplicationID 0b010 GPDs are not armed.
+    ///
+    /// Owners call this whenever the queue may have changed and re-arm the
+    /// radio when the frame differs; `None` means nothing to arm (also
+    /// while a Channel Configuration is delivered off-channel).
+    #[cfg(feature = "proxy-bidirectional")]
+    pub fn radio_downlink<P: ForwardAesProvider>(
+        &mut self,
+        aes: &mut P,
+        now_ms: u32,
+        mac_seq: u8,
+        out: &mut [u8],
+    ) -> Option<(u32, usize)> {
+        if !self.bidi.capable {
+            return None;
+        }
+        #[cfg(feature = "proxy-full")]
+        {
+            self.expire_transmit_channel(now_ms);
+            if self.on_transmit_channel(now_ms) {
+                return None;
+            }
+        }
+        self.bidi.tx_queue.retain(|e| !due(now_ms, e.expires_ms));
+        let e = self
+            .bidi
+            .tx_queue
+            .iter()
+            .find(|e| matches!(e.gpd_id, GpdId::SrcId(src_id) if src_id != 0))?;
+        let GpdId::SrcId(src_id) = e.gpd_id else {
+            return None;
+        };
+        let params = GpdfParams {
+            frame_type: FrameType::Data,
+            auto_commissioning: false,
+            src_id: Some(src_id),
+            security_level: SecurityLevel::None,
+            individual_key: false,
+            rx_after_tx: false,
+            to_gpd: true,
+            frame_counter: 0,
+        };
+        let n = security::build_gpdf(aes, None, &params, mac_seq, e.command_id, &e.payload, out)
+            .ok()?;
+        Some((src_id, n))
+    }
+
+    /// The radio sent the [`radio_downlink`](Self::radio_downlink) GPDF for
+    /// SrcID `src_id`: it leaves the gpTxQueue as after
+    /// [`take_downlink`](Self::take_downlink). Returns whether it was
+    /// still queued.
+    #[cfg(feature = "proxy-bidirectional")]
+    pub fn radio_downlink_sent(&mut self, src_id: u32) -> bool {
+        let gpd = GpdId::SrcId(src_id);
+        let q = &mut self.bidi.tx_queue;
+        match q.iter().position(|e| e.gpd_id == gpd) {
+            Some(i) => {
+                q.swap_remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn proxy_table_response(&self, dst: u16, req: &ProxyTableRequest) -> Result<GpTx> {
         let mut payload = heapless::Vec::<u8, MAX_GP_COMMAND_LEN>::new();
         let _ = payload.resize_default(MAX_GP_COMMAND_LEN);
@@ -3965,6 +4041,44 @@ mod tests {
                 p.on_gpdf(&mut SoftwareAesProvider, &gpdf(&trigger), GppGpdLink(0), 20),
                 GpdfOutcome::Notification
             );
+        }
+
+        /// The frame a radio arms is byte for byte the reply the task would
+        /// build for an unprotected trigger; it stays queued until the
+        /// radio reports it sent, and expiry or a Maintenance-only queue
+        /// arms nothing.
+        #[test]
+        fn radio_downlink_matches_the_task_reply_to_an_unprotected_trigger() {
+            let src = 0x6D6B_F300;
+            let gpd = GpdId::SrcId(src);
+            let radio = |p: &mut P, now_ms: u32| {
+                let mut out = [0u8; 64];
+                p.radio_downlink(&mut SoftwareAesProvider, now_ms, 0x42, &mut out)
+                    .map(|(src, n)| (src, heapless::Vec::<u8, 64>::from_slice(&out[..n]).unwrap()))
+            };
+            let mut p = bidi_proxy(1);
+            assert!(radio(&mut p, 0).is_none());
+            // A Channel Configuration (Maintenance) is never armed.
+            response(&mut p, GpdId::SrcId(0), 0x1234, CHANNEL, 0xF3, &[0x1F], 0).unwrap();
+            assert!(radio(&mut p, 0).is_none());
+            response(&mut p, gpd, 0x1234, CHANNEL, 0xF0, &[0x98], 0).unwrap();
+            let (armed_src, armed) = radio(&mut p, 5).unwrap();
+            assert_eq!(armed_src, src);
+            // Still queued: the task builds the same frame.
+            let trigger = uplink(Some(src), None, 0, true, cmd::COMMISSIONING, &[0x02]);
+            let mut q = bidi_proxy(1);
+            response(&mut q, gpd, 0x1234, CHANNEL, 0xF0, &[0x98], 0).unwrap();
+            assert_eq!(take(&mut q, &trigger, 5).unwrap(), armed);
+            // Sent by the radio: gone, exactly once.
+            assert!(p.radio_downlink_sent(src));
+            assert!(!p.radio_downlink_sent(src));
+            assert!(take(&mut p, &trigger, 5).is_none());
+            assert!(radio(&mut p, 5).is_none());
+            // An expired entry is not armed.
+            response(&mut p, gpd, 0x1234, CHANNEL, 0xF0, &[0x98], 10).unwrap();
+            assert!(radio(&mut p, 10).is_some());
+            let lifetime = p.config().tx_queue_lifetime_ms;
+            assert!(radio(&mut p, 10 + lifetime).is_none());
         }
 
         #[test]

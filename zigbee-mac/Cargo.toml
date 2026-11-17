@@ -64,7 +64,7 @@ green-power = []
 # window. Off by default; images without it are unchanged. On ESP32-C6/H2 it
 # time-stamps every received frame in the RX_DONE interrupt
 # (vendor/esp-radio/LOCAL-PATCHES.md).
-timed-tx = ["esp-radio?/ieee802154-rx-timestamp"]
+timed-tx = ["esp-radio?/ieee802154-rx-timestamp", "esp-radio?/ieee802154-triggered-tx"]
 
 # Platform backends
 esp32c6 = [

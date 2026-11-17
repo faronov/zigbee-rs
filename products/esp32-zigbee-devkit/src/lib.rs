@@ -67,6 +67,8 @@ pub mod executor;
     )
 ))]
 mod flash_window;
+#[cfg(all(target_os = "none", feature = "combo-light"))]
+pub mod flash_timing;
 pub mod migration;
 #[cfg(feature = "esp32h2")]
 pub mod pad_isolation;

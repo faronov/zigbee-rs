@@ -60,11 +60,17 @@ impl<const START: u32, const SIZE: usize> NorFlash for FlashWindow<START, SIZE> 
         let physical_to = physical_from
             .checked_add(to - from)
             .ok_or(FlashStorageError::OutOfBounds)?;
+        #[cfg(feature = "combo-light")]
+        return crate::flash_timing::erase(|| self.flash.erase(physical_from, physical_to));
+        #[cfg(not(feature = "combo-light"))]
         self.flash.erase(physical_from, physical_to)
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
         let physical = Self::physical_offset(offset, bytes.len())?;
+        #[cfg(feature = "combo-light")]
+        return crate::flash_timing::write(|| self.flash.write(physical, bytes));
+        #[cfg(not(feature = "combo-light"))]
         self.flash.write(physical, bytes)
     }
 }

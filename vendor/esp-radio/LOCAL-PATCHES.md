@@ -265,3 +265,35 @@ Not checked against ESP-IDF; the on-air measurement is the reference.
   completes during the STOP is preserved and refuses, as before. Only
   `zigbee-mac`'s timed transmission (`transmit_at`) uses it.
 
+
+## Reply started from the radio interrupts (`ieee802154-triggered-tx`)
+
+Opt-in cargo feature (implies `ieee802154-rx-timestamp`); `zigbee-mac`
+enables it with `timed-tx`. Without it the crate compiles as before.
+
+- **Why:** the task-scheduled timed transmission above only meets
+  gpTxOffset when the task handles the GPDF within ~19 ms. On the
+  ESP32-H2-Zero combo (2026-11-17, three commissioning rounds) the task saw
+  the trigger 20–173 ms after it ended while the event loop was busy, and
+  two rounds of three failed with `TransactionExpired`.
+- **Patch:** `Ieee802154::arm_triggered_tx(frame, trigger, delay_us)` stores
+  a pre-built frame and a trigger predicate. The RX_DONE branch of
+  `zb_mac_handler` (after the queue push and receiver restart) calls the
+  predicate with the received frame; a match programs IEEE802154 Timer0
+  (`TIMER0_THRESHOLD`, µs, as ESP-IDF `ieee802154_transmit_at`) for
+  `delay_us` after the RX_DONE time stamp and enables `Timer0Overflow`.
+  The overflow interrupt stops a reception in progress (as the preempting
+  TX above) and starts the frame with `TxStart`; while the radio is in
+  `Transmit`/`TxAck` it retries in 25 µs steps until 300 µs past the
+  instant. The outcome (`Sent`/`Busy` with µs after RX_DONE, `Late` when the
+  trigger interrupt itself came after the instant) is taken once with
+  `take_triggered_tx_outcome`. The trigger fires once; the owner re-arms.
+- **Interlocks:** while the countdown runs, thread transmissions and
+  `can_transmit` return `Busy` (the radio must be free at the instant) and
+  `try_suspend` refuses. The TX_DONE of the triggered frame is not reported
+  to the thread's TX-done callback, which may be waiting for a frame of its
+  own; `cancel_transmit` clears that state.
+- **Limits:** flash erase/write runs with interrupts masked (esp-storage
+  `critical-section`), so a journal write during the 20 ms countdown still
+  delays the reply. Timer0 units are taken from ESP-IDF's comment
+  ("unit: 1us"); the `Sent` outcome logs the measured µs after RX_DONE.

@@ -343,6 +343,30 @@ pub trait RadioPhy {
         Err(PhyError::Unsupported)
     }
 
+    /// Arm `frame` (a MAC frame without FCS) to start `offset_us` after the
+    /// end of the next received frame [`crate::gp_reply::gpdf_triggers_reply`]
+    /// accepts for `src_id`, from the radio's own interrupts (`timed-tx`).
+    /// Replaces an armed frame.
+    #[cfg(feature = "timed-tx")]
+    fn arm_gp_reply(
+        &mut self,
+        _src_id: u32,
+        _frame: &[u8],
+        _offset_us: u32,
+    ) -> Result<(), PhyError> {
+        Err(PhyError::Unsupported)
+    }
+
+    /// Cancel an armed reply (`timed-tx`).
+    #[cfg(feature = "timed-tx")]
+    fn disarm_gp_reply(&mut self) {}
+
+    /// Outcome of the last triggered reply, once (`timed-tx`).
+    #[cfg(feature = "timed-tx")]
+    fn take_gp_reply_outcome(&mut self) -> Option<crate::gp_reply::GpReplyOutcome> {
+        None
+    }
+
     /// Follow `macRxOnWhenIdle`: keep the receiver (and its ISR receive /
     /// auto-ACK path) armed between MAC operations when `enabled`.
     ///

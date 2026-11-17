@@ -33,6 +33,8 @@ pub use self::{
 };
 #[cfg(feature = "ieee802154-ack-pending")]
 pub use self::raw::AckPendingFn;
+#[cfg(feature = "ieee802154-triggered-tx")]
+pub use self::raw::{TRIGGERED_LATE_US, TriggerFn, TriggeredOutcome};
 
 mod fcf;
 mod frame;
@@ -345,6 +347,41 @@ impl<'a> Ieee802154<'a> {
         self.transmit_buffer[1..][..frame.len()].copy_from_slice(frame);
         self.transmit_buffer[0] = frame.len() as u8;
         raw::transmit_preempting_rx(self.transmit_buffer.as_ptr())
+    }
+
+    /// Arm a transmission of the raw MAC `frame` (without FCS) that the
+    /// RX_DONE interrupt starts `delay_us` after the end of the first
+    /// received frame `trigger` accepts, abandoning a reception then in
+    /// progress (local patch `ieee802154-triggered-tx`, for a Green Power
+    /// TempMaster: the reply must not wait for the task that processes the
+    /// trigger). Replaces an armed frame; [`Error::Busy`] while a triggered
+    /// transmission is counting down.
+    #[cfg(feature = "ieee802154-triggered-tx")]
+    pub fn arm_triggered_tx(
+        &mut self,
+        frame: &[u8],
+        trigger: raw::TriggerFn,
+        delay_us: u32,
+    ) -> Result<(), Error> {
+        let mut buffer = [0u8; FRAME_SIZE];
+        if frame.len() + 2 > FRAME_SIZE - 1 {
+            return Err(Error::Incomplete);
+        }
+        buffer[0] = (frame.len() + 2) as u8;
+        buffer[1..][..frame.len()].copy_from_slice(frame);
+        raw::arm_triggered(&buffer[..frame.len() + 3], trigger, delay_us)
+    }
+
+    /// Cancel an armed (or counting down) triggered transmission.
+    #[cfg(feature = "ieee802154-triggered-tx")]
+    pub fn disarm_triggered_tx(&mut self) {
+        raw::disarm_triggered();
+    }
+
+    /// Outcome of the last triggered transmission, once.
+    #[cfg(feature = "ieee802154-triggered-tx")]
+    pub fn take_triggered_tx_outcome(&mut self) -> Option<raw::TriggeredOutcome> {
+        raw::take_triggered_outcome()
     }
 
     /// Install the hook that decides the Frame Pending bit of every hardware

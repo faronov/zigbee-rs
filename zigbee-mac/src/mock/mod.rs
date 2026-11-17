@@ -70,8 +70,20 @@ pub struct MockMac {
     timed_tx: Option<bool>,
     #[cfg(feature = "timed-tx")]
     timed_tx_history: Vec<TimedTxRecord, 8>,
+    /// Armed GP reply support and state (`timed-tx`).
+    #[cfg(feature = "timed-tx")]
+    gp_reply: MockGpReply,
     /// AES keyings through [`zigbee_crypto::ForwardAesProvider`].
     aes_keyings: u32,
+}
+
+#[cfg(feature = "timed-tx")]
+#[derive(Debug, Default)]
+struct MockGpReply {
+    supported: bool,
+    armed: Option<(u32, Vec<u8, 127>, u32)>,
+    outcome: Option<crate::gp_reply::GpReplyOutcome>,
+    history: Vec<TimedTxRecord, 8>,
 }
 
 /// A frame sent with [`MacDriver::transmit_raw_at`] (`timed-tx`).
@@ -152,6 +164,8 @@ impl MockMac {
             timed_tx: None,
             #[cfg(feature = "timed-tx")]
             timed_tx_history: Vec::new(),
+            #[cfg(feature = "timed-tx")]
+            gp_reply: MockGpReply::default(),
             aes_keyings: 0,
         }
     }
@@ -174,6 +188,58 @@ impl MockMac {
     #[cfg(feature = "timed-tx")]
     pub fn timed_tx_history(&self) -> &[TimedTxRecord] {
         &self.timed_tx_history
+    }
+
+    /// Let [`MacDriver::arm_gp_reply`] succeed (`timed-tx`), as on a radio
+    /// that starts the reply from its own interrupts.
+    #[cfg(feature = "timed-tx")]
+    pub fn set_gp_reply_radio(&mut self, supported: bool) {
+        self.gp_reply.supported = supported;
+        if !supported {
+            self.gp_reply.armed = None;
+        }
+    }
+
+    /// The armed GP reply: SrcID, MAC frame without FCS, offset in µs.
+    #[cfg(feature = "timed-tx")]
+    pub fn armed_gp_reply(&self) -> Option<(u32, &[u8], u32)> {
+        self.gp_reply
+            .armed
+            .as_ref()
+            .map(|(src, frame, offset)| (*src, frame.as_slice(), *offset))
+    }
+
+    /// Simulate the radio's receive interrupt for `mac_frame` (MAC header
+    /// on, no FCS) ending at `rx_end_us`: an armed reply it triggers is
+    /// sent at `rx_end_us` + offset (recorded in
+    /// [`Self::gp_reply_history`]), and disarmed. Returns whether it fired.
+    #[cfg(feature = "timed-tx")]
+    pub fn radio_receive_gp_trigger(&mut self, mac_frame: &[u8], rx_end_us: u32) -> bool {
+        let Some((src_id, _, _)) = &self.gp_reply.armed else {
+            return false;
+        };
+        if !crate::gp_reply::gpdf_triggers_reply(mac_frame, *src_id) {
+            return false;
+        }
+        let (src_id, frame, offset_us) = self.gp_reply.armed.take().unwrap();
+        let _ = self.gp_reply.history.push(TimedTxRecord {
+            frame,
+            at_us: rx_end_us.wrapping_add(offset_us),
+            called_us: rx_end_us,
+            aes_keyings_before: self.aes_keyings,
+        });
+        self.gp_reply.outcome = Some(crate::gp_reply::GpReplyOutcome {
+            src_id,
+            result: Ok(()),
+            after_us: offset_us,
+        });
+        true
+    }
+
+    /// GP replies the simulated radio sent by itself (`timed-tx`).
+    #[cfg(feature = "timed-tx")]
+    pub fn gp_reply_history(&self) -> &[TimedTxRecord] {
+        &self.gp_reply.history
     }
 
     /// Set the mock clock.
@@ -669,6 +735,26 @@ impl MacDriver for MockMac {
             self.time_micros = at_us;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "timed-tx")]
+    fn arm_gp_reply(&mut self, src_id: u32, frame: &[u8], offset_us: u32) -> Result<(), MacError> {
+        if !self.gp_reply.supported {
+            return Err(MacError::Unsupported);
+        }
+        let frame = Vec::from_slice(frame).map_err(|_| MacError::FrameTooLong)?;
+        self.gp_reply.armed = Some((src_id, frame, offset_us));
+        Ok(())
+    }
+
+    #[cfg(feature = "timed-tx")]
+    fn disarm_gp_reply(&mut self) {
+        self.gp_reply.armed = None;
+    }
+
+    #[cfg(feature = "timed-tx")]
+    fn take_gp_reply_outcome(&mut self) -> Option<crate::gp_reply::GpReplyOutcome> {
+        self.gp_reply.outcome.take()
     }
 
     fn capabilities(&self) -> MacCapabilities {
