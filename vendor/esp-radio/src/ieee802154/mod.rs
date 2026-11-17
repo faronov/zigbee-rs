@@ -331,6 +331,22 @@ impl<'a> Ieee802154<'a> {
         raw::transmit_discarding(self.transmit_buffer.as_ptr(), false, discard_received)
     }
 
+    /// Transmit a raw frame now, abandoning a frame that is being received
+    /// (local patch, `ieee802154-rx-timestamp`): for transmissions at an
+    /// instant without CSMA/CA (Green Power TempMaster). Refuses with
+    /// [`Error::Busy`] only during an application TX, a hardware ACK or
+    /// pending interrupt work.
+    #[cfg(feature = "ieee802154-rx-timestamp")]
+    #[inline(always)]
+    pub fn transmit_raw_preempting_rx(&mut self, frame: &[u8]) -> Result<(), Error> {
+        if frame.len() > self.transmit_buffer.len() - 1 {
+            return Err(Error::Incomplete);
+        }
+        self.transmit_buffer[1..][..frame.len()].copy_from_slice(frame);
+        self.transmit_buffer[0] = frame.len() as u8;
+        raw::transmit_preempting_rx(self.transmit_buffer.as_ptr())
+    }
+
     /// Install the hook that decides the Frame Pending bit of every hardware
     /// auto-ACK (local patch). It runs in the RX_DONE interrupt, before the
     /// ACK is sent, with the received MAC frame (FCS bytes replaced by

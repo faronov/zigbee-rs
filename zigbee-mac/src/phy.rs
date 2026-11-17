@@ -336,6 +336,8 @@ pub trait RadioPhy {
     /// [`PhyError::Missed`] without transmitting when `at_us` has already
     /// passed by more than the PHY's start tolerance or lies further ahead
     /// than it is prepared to wait; the PHY documents both bounds.
+    /// [`PhyError::ChannelBusy`] when the radio itself refused until that
+    /// tolerance passed.
     #[cfg(feature = "timed-tx")]
     async fn transmit_at(&mut self, _frame: &[u8], _at_us: u32) -> Result<(), PhyError> {
         Err(PhyError::Unsupported)
@@ -375,12 +377,22 @@ pub(crate) fn transmit_with_deadline(
     mut now: impl FnMut() -> u32,
     mut transmit: impl FnMut() -> Result<(), PhyError>,
 ) -> Result<(), PhyError> {
+    // A deadline that passes while the radio refuses as busy is a channel
+    // access failure, not a late caller: the two need different fixes.
+    let mut refused = false;
     loop {
         if now().wrapping_sub(start_at_us) as i32 > late_us as i32 {
-            return Err(PhyError::Missed);
+            return Err(if refused {
+                PhyError::ChannelBusy
+            } else {
+                PhyError::Missed
+            });
         }
         match transmit() {
-            Err(PhyError::ChannelBusy) => core::hint::spin_loop(),
+            Err(PhyError::ChannelBusy) => {
+                refused = true;
+                core::hint::spin_loop();
+            }
             result => return result,
         }
     }
@@ -423,7 +435,8 @@ mod tests {
                 }
             },
         );
-        assert_eq!(result, Err(PhyError::Missed));
+        // The radio refused until the deadline: reported as a busy channel.
+        assert_eq!(result, Err(PhyError::ChannelBusy));
         assert_eq!(attempts.get(), 1);
     }
 

@@ -259,12 +259,38 @@ pub(crate) fn transmit_discarding(
     cca: bool,
     discard_queued: bool,
 ) -> Result<(), super::Error> {
+    transmit_inner(frame, cca, discard_queued, false)
+}
+
+/// Transmit at once, abandoning a frame being received (local patch,
+/// `ieee802154-rx-timestamp`): a Green Power TempMaster starts its frame at
+/// an instant, without CSMA/CA (GP 1.1 A.1.5.2.2), as ESP-IDF's
+/// `ieee802154_transmit` does (`stop_current_operation`). An application
+/// TX, a hardware ACK and unprocessed interrupt work still refuse with
+/// `Busy`; a reception that completes during the STOP is preserved (and
+/// refuses with `Busy`) as in [`transmit_discarding`].
+#[cfg(feature = "ieee802154-rx-timestamp")]
+#[inline(always)]
+pub(crate) fn transmit_preempting_rx(frame: *const u8) -> Result<(), super::Error> {
+    transmit_inner(frame, false, false, true)
+}
+
+#[inline(always)]
+fn transmit_inner(
+    frame: *const u8,
+    cca: bool,
+    discard_queued: bool,
+    preempt_rx: bool,
+) -> Result<(), super::Error> {
     use super::suspend::Boundary;
     STATE.with(|state| {
         match state.state {
             Ieee802154State::Sleep => return Err(super::Error::Sleeping),
             Ieee802154State::Transmit | Ieee802154State::TxAck => return Err(super::Error::Busy),
-            _ if events() != 0 || receive_in_progress() || rx_queue_blocks_tx(state) => {
+            _ if events() != 0
+                || (!preempt_rx && receive_in_progress())
+                || rx_queue_blocks_tx(state) =>
+            {
                 return Err(super::Error::Busy);
             }
             _ => {}

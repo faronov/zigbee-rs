@@ -547,11 +547,14 @@ impl<'a> EspRadioPhy<'a> {
         Ok(())
     }
 
-    /// Hand `frame` to the radio now, without CCA, retrying a `Busy`
-    /// radio until `late_by_us` would exceed [`TIMED_TX_LATE_US`]
+    /// Hand `frame` to the radio now, without CCA, abandoning a frame being
+    /// received, retrying a `Busy` radio (own TX, hardware ACK, pending
+    /// interrupt work) until `late_by_us` would exceed [`TIMED_TX_LATE_US`]
     /// (`timed-tx`), then wait for TX-done. Unlike [`Self::transmit`] there
     /// is no backoff after a busy radio: a late frame misses the peer's
-    /// receive window.
+    /// receive window. A radio that stayed busy past the deadline reports
+    /// [`PhyError::ChannelBusy`], a caller that came too late
+    /// [`PhyError::Missed`].
     #[cfg(feature = "timed-tx")]
     #[inline(never)]
     fn transmit_timed(&mut self, frame: &[u8], start_at_us: u32) -> Result<(), PhyError> {
@@ -568,9 +571,11 @@ impl<'a> EspRadioPhy<'a> {
             start_at_us,
             TIMED_TX_LATE_US,
             || Instant::now().as_micros() as u32,
+            // Without CSMA/CA (GP TempMaster): a frame being received is
+            // abandoned rather than waited for (vendor local patch).
             || {
                 self.driver
-                    .transmit_raw_discarding(&padded[..frame.len() + 2], false)
+                    .transmit_raw_preempting_rx(&padded[..frame.len() + 2])
                     .map_err(map_radio_error)
             },
         )?;

@@ -248,3 +248,20 @@ compiles to the same code as before.
   chapter, M4 results.
 
 Not checked against ESP-IDF; the on-air measurement is the reference.
+
+## Timed transmission preempts a reception (`ieee802154-rx-timestamp`)
+
+- **Why:** `transmit_raw*` refuses with `Busy` while a frame is being
+  received (local CSMA behaviour, see above). A Green Power TempMaster
+  reply is sent at an instant without CSMA/CA (GP 1.1 A.1.5.2.2). On the
+  ESP32-H2-Zero combo (2026-11-17, during commissioning with heavy GP
+  broadcast traffic) one of three replies was refused until its deadline
+  passed (`TransactionExpired`, returned 337 µs after the start instant).
+- **Patch:** `Ieee802154::transmit_raw_preempting_rx` (and
+  `raw::transmit_preempting_rx`) skip only the receive-in-progress check;
+  STOP then abandons the reception, as ESP-IDF `ieee802154_transmit`
+  (`stop_current_operation`) does. An application TX, a hardware ACK and
+  pending interrupt work still refuse with `Busy`, and a reception that
+  completes during the STOP is preserved and refuses, as before. Only
+  `zigbee-mac`'s timed transmission (`transmit_at`) uses it.
+
