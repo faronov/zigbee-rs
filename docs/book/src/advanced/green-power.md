@@ -1952,6 +1952,62 @@ Sessions in `~/.hwlab/sessions/2026-11-17T154805Z-h2zero-recommission-switch`,
   sends without CSMA/CA. Host test for the error split; the preemption
   needs a hardware run. Images without timed TX are unchanged (panic
   Location words only); combo light 563,368 B flash / 70,692 B `.bss`.
+- **Three rounds with da33af4: 1 of 3 passed** (2026-11-17, session
+  `…190251Z-h2zero-tempmaster-preempt-retest`, capture seconds). No
+  `ChannelAccessFailure` any more (the preemption works), but the task now
+  came too late:
+  - round 1 (1758–1768): one reply `sent`, built +1925 us, done +20698 us,
+    not taken by the GPD (its first window; not explained), then four
+    `TransactionExpired` built +68,352 / +96,961 / +101,460 / +157,173 us;
+    MG22 `NoCommissioningReply`;
+  - round 2 (2547–2555): `sent`, built +1912 us, done +20722 us; MG22
+    commissioned, sink `Commissioned`, `FirstPairing`. PASS;
+  - round 3 (2764–2774): `TransactionExpired` built +20,340, +157,031,
+    +131,115, +173,585, +92,930 us; MG22 `NoCommissioningReply`.
+
+  The GPDF reached the reply code up to 173 ms after it ended: the single
+  event loop was busy with other work (the log was silent during those
+  gaps; commissioning brings GP Pairing / Proxy Commissioning Mode
+  broadcasts and their relays, ZHA traffic, journal writes). A reply
+  scheduled from the task cannot meet a 20 ms instant behind that.
+- **Reply started from the radio interrupts (7b2d6ca, opt-in with
+  `green-power-bidirectional`).** The reply no longer waits for the task:
+  - `Proxy::radio_downlink` builds the gpTxQueue GPDF a radio can send by
+    itself: the unprotected reply to an unprotected `rxAfterTx` GPDF from
+    its GPD, byte for byte what `take_downlink` builds for that trigger
+    (host test). Commissioning GPDFs are unprotected, so no MIC or
+    freshness check is skipped; protected triggers keep the task path with
+    its checks. Maintenance frames and ApplicationID 0b010 are not armed.
+  - The runtime keeps it armed in the MAC (`MacDriver::arm_gp_reply`, with
+    the next macDSN) after every `gp_poll` and re-arms when the queue
+    changes; a reply the radio sent leaves the gpTxQueue; the task path
+    does not send a trigger of an armed reply a second time.
+  - ESP32-H2/C6: the PHY arms esp-radio (local patch
+    `ieee802154-triggered-tx`, vendor `LOCAL-PATCHES.md`). The RX_DONE
+    interrupt matches the trigger (`zigbee_mac::gp_reply::
+    gpdf_triggers_reply`, host-tested) and programs IEEE802154 Timer0; its
+    interrupt starts the frame `TIMED_TX_START_LEAD_US` before
+    gpTxOffset, abandoning a reception, retrying while the radio sends
+    until 300 µs late. While it counts down, thread transmissions wait.
+    Other MACs return `Unsupported` and keep the task path.
+  - Logs: `[GP] TempMaster GPDF sent by the radio (N B): on air +X us
+    after the GPDF` (estimate: Timer0 interrupt time + the 425 µs lead) or
+    `not sent by the radio: …`.
+  - The combo lab image also logs loop iterations over 40 ms with the
+    journals' flash erase/write count and longest duration, and the
+    longest iteration in the 60 s summary. First boot: `slow loop step
+    67845 us | flash erases 1 (max 21310 us) writes 4 (max 2936 us)`
+    (resume persistence); in the minute before, the longest iteration was
+    45 ms without any flash work.
+  - Host test `gp_combo_radio_sends_the_armed_reply_however_late_the_task_is`
+    (mock radio fires the armed reply; the task sees the trigger 150 ms
+    later and must not send it again). Non-GP router images unchanged
+    apart from panic Location words; combo light 568,418 B flash /
+    70,924 B `.bss` (+5,050 / +232). Flash erases still mask interrupts
+    (esp-storage), so a journal write during the 20 ms countdown can still
+    delay a reply. Flashed with hwlab 2026-11-17 (backup sha
+    `8b14e36d…0cedfd`, app sha `26fbc349…da2fbf`, `zbnv` kept); resumed as
+    0x7C87 with its 4 GP journal entries. Hardware gate: three rounds.
 
 ## 7. Open questions for the user
 
