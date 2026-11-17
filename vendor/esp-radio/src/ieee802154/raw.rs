@@ -127,6 +127,218 @@ fn rx_timestamp_us() -> u64 {
         .as_micros()
 }
 
+/// Decides, in the RX_DONE interrupt, whether a received frame (FCS bytes
+/// replaced by RSSI/LQI) triggers the armed transmission (local patch
+/// `ieee802154-triggered-tx`). Must be short and must not block.
+#[cfg(feature = "ieee802154-triggered-tx")]
+pub type TriggerFn = fn(&[u8]) -> bool;
+
+/// What became of an armed transmission (`ieee802154-triggered-tx`).
+#[cfg(feature = "ieee802154-triggered-tx")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggeredOutcome {
+    /// Started `fired_after_us` after the triggering frame's RX_DONE.
+    Sent { fired_after_us: u32 },
+    /// The radio was transmitting or sending an ACK until the instant had
+    /// passed by [`TRIGGERED_LATE_US`]; nothing was sent.
+    Busy { fired_after_us: u32 },
+    /// The trigger was handled `handled_after_us` after its RX_DONE, past
+    /// the instant (interrupt latency); nothing was sent.
+    Late { handled_after_us: u32 },
+}
+
+/// How late an armed transmission may still start (`ieee802154-triggered-tx`).
+#[cfg(feature = "ieee802154-triggered-tx")]
+pub const TRIGGERED_LATE_US: u32 = 300;
+
+#[cfg(feature = "ieee802154-triggered-tx")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TriggeredPhase {
+    Idle,
+    /// Waiting for the trigger frame.
+    Armed,
+    /// Timer0 runs towards the instant (`esp_hal` microseconds).
+    Waiting { rx_done_us: u64, target_us: u64 },
+}
+
+#[cfg(feature = "ieee802154-triggered-tx")]
+struct Triggered {
+    phase: TriggeredPhase,
+    trigger: Option<TriggerFn>,
+    /// From the trigger's RX_DONE time stamp to the TX command, µs.
+    delay_us: u32,
+    outcome: Option<TriggeredOutcome>,
+    /// The triggered frame is on air: its TX_DONE is not reported to the
+    /// thread, which may be waiting for a TX_DONE of its own.
+    on_air: bool,
+}
+
+#[cfg(feature = "ieee802154-triggered-tx")]
+static TRIGGERED: NonReentrantMutex<Triggered> = NonReentrantMutex::new(Triggered {
+    phase: TriggeredPhase::Idle,
+    trigger: None,
+    delay_us: 0,
+    outcome: None,
+    on_air: false,
+});
+
+/// Length-prefixed frame of the armed transmission; the TX DMA reads it.
+#[cfg(feature = "ieee802154-triggered-tx")]
+static mut TRIGGERED_BUFFER: [u8; FRAME_SIZE] = [0u8; FRAME_SIZE];
+
+/// Arm a transmission of `frame` (length-prefixed PSDU, FCS included in the
+/// length) that the RX_DONE interrupt starts `delay_us` after the end of
+/// the first received frame `trigger` accepts. Replaces an armed frame;
+/// refused with `Busy` while a triggered transmission is already counting
+/// down.
+#[cfg(feature = "ieee802154-triggered-tx")]
+pub(crate) fn arm_triggered(frame: &[u8], trigger: TriggerFn, delay_us: u32) -> Result<(), super::Error> {
+    if frame.len() > FRAME_SIZE {
+        return Err(super::Error::Incomplete);
+    }
+    TRIGGERED.with(|t| {
+        if matches!(t.phase, TriggeredPhase::Waiting { .. }) {
+            return Err(super::Error::Busy);
+        }
+        // SAFETY: no triggered TX is counting down or on air (Idle/Armed),
+        // so the DMA does not read the buffer; interrupts are masked while
+        // `TRIGGERED` is held.
+        unsafe {
+            let buffer = &mut *core::ptr::addr_of_mut!(TRIGGERED_BUFFER);
+            buffer[..frame.len()].copy_from_slice(frame);
+        }
+        t.trigger = Some(trigger);
+        t.delay_us = delay_us;
+        t.phase = TriggeredPhase::Armed;
+        Ok(())
+    })
+}
+
+/// Disarm; a countdown in progress is cancelled.
+#[cfg(feature = "ieee802154-triggered-tx")]
+pub(crate) fn disarm_triggered() {
+    TRIGGERED.with(|t| {
+        if matches!(t.phase, TriggeredPhase::Waiting { .. }) {
+            set_cmd(Command::Timer0Stop);
+            disable_events(Event::Timer0Overflow as u16);
+            clear_events(Event::Timer0Overflow as u16);
+        }
+        t.phase = TriggeredPhase::Idle;
+    });
+}
+
+/// Take the outcome of the last triggered transmission.
+#[cfg(feature = "ieee802154-triggered-tx")]
+pub(crate) fn take_triggered_outcome() -> Option<TriggeredOutcome> {
+    TRIGGERED.with(|t| t.outcome.take())
+}
+
+/// A triggered transmission is counting down: thread-level transmissions
+/// wait, so the radio is free at the instant.
+#[cfg(feature = "ieee802154-triggered-tx")]
+#[inline(always)]
+fn triggered_waiting() -> bool {
+    TRIGGERED.with(|t| matches!(t.phase, TriggeredPhase::Waiting { .. }))
+}
+
+#[cfg(not(feature = "ieee802154-triggered-tx"))]
+#[inline(always)]
+fn triggered_waiting() -> bool {
+    false
+}
+
+/// RX_DONE: start the countdown when the armed trigger accepts `frame`.
+#[cfg(feature = "ieee802154-triggered-tx")]
+fn triggered_on_rx(frame: &[u8], rx_done_us: u64) {
+    TRIGGERED.with(|t| {
+        if t.phase != TriggeredPhase::Armed || !t.trigger.is_some_and(|hook| hook(frame)) {
+            return;
+        }
+        let target_us = rx_done_us + u64::from(t.delay_us);
+        let now = rx_timestamp_us();
+        if now >= target_us {
+            t.outcome = Some(TriggeredOutcome::Late {
+                handled_after_us: (now - rx_done_us) as u32,
+            });
+            t.phase = TriggeredPhase::Idle;
+            return;
+        }
+        IEEE802154::regs()
+            .time(0)
+            .threshold()
+            .write(|w| unsafe { w.timer0_threshold().bits((target_us - now) as u32) });
+        clear_events(Event::Timer0Overflow as u16);
+        enable_events(Event::Timer0Overflow as u16);
+        set_cmd(Command::Timer0Start);
+        t.phase = TriggeredPhase::Waiting {
+            rx_done_us,
+            target_us,
+        };
+    });
+}
+
+/// Timer0 overflow: start the armed frame now, abandoning a reception (GP
+/// TempMaster: no CSMA/CA); an own TX or ACK is waited for in short steps
+/// until [`TRIGGERED_LATE_US`].
+#[cfg(feature = "ieee802154-triggered-tx")]
+fn triggered_fire() {
+    set_cmd(Command::Timer0Stop);
+    disable_events(Event::Timer0Overflow as u16);
+    let mut notify = None;
+    TRIGGERED.with(|t| {
+        let TriggeredPhase::Waiting {
+            rx_done_us,
+            target_us,
+        } = t.phase
+        else {
+            return;
+        };
+        let now = rx_timestamp_us();
+        let fired_after_us = now.saturating_sub(rx_done_us) as u32;
+        STATE.with(|state| match state.state {
+            Ieee802154State::Transmit | Ieee802154State::TxAck | Ieee802154State::Sleep => {
+                if now.saturating_sub(target_us) < u64::from(TRIGGERED_LATE_US) {
+                    // Try again shortly.
+                    IEEE802154::regs()
+                        .time(0)
+                        .threshold()
+                        .write(|w| unsafe { w.timer0_threshold().bits(25) });
+                    enable_events(Event::Timer0Overflow as u16);
+                    set_cmd(Command::Timer0Start);
+                    return;
+                }
+                t.outcome = Some(TriggeredOutcome::Busy { fired_after_us });
+                t.phase = TriggeredPhase::Idle;
+            }
+            _ => {
+                use super::suspend::Boundary;
+                let mut boundary = SleepBoundary(state);
+                boundary.stop();
+                // A reception that completed during STOP is preserved.
+                if boundary.finish_stop() {
+                    notify = Some(Ieee802154State::Receive);
+                }
+                tx_init(core::ptr::addr_of!(TRIGGERED_BUFFER).cast());
+                ieee802154_set_txrx_pti(Ieee802154TxRxScene::Tx);
+                set_cmd(Command::TxStart);
+                state.state = Ieee802154State::Transmit;
+                t.outcome = Some(TriggeredOutcome::Sent { fired_after_us });
+                t.on_air = true;
+                t.phase = TriggeredPhase::Idle;
+            }
+        });
+    });
+    if let Some(state) = notify {
+        notify_state(state);
+    }
+}
+
+/// TX_DONE of the triggered frame (consumed: the thread is not notified).
+#[cfg(feature = "ieee802154-triggered-tx")]
+fn triggered_tx_done() -> bool {
+    TRIGGERED.with(|t| core::mem::replace(&mut t.on_air, false))
+}
+
 pub(crate) fn esp_ieee802154_enable<'d>(
     radio: &mut IEEE802154<'d>,
 ) -> (PhyClockGuard<'d>, PhyInitGuard<'d>) {
@@ -259,12 +471,39 @@ pub(crate) fn transmit_discarding(
     cca: bool,
     discard_queued: bool,
 ) -> Result<(), super::Error> {
+    transmit_inner(frame, cca, discard_queued, false)
+}
+
+/// Transmit at once, abandoning a frame being received (local patch,
+/// `ieee802154-rx-timestamp`): a Green Power TempMaster starts its frame at
+/// an instant, without CSMA/CA (GP 1.1 A.1.5.2.2), as ESP-IDF's
+/// `ieee802154_transmit` does (`stop_current_operation`). An application
+/// TX, a hardware ACK and unprocessed interrupt work still refuse with
+/// `Busy`; a reception that completes during the STOP is preserved (and
+/// refuses with `Busy`) as in [`transmit_discarding`].
+#[cfg(feature = "ieee802154-rx-timestamp")]
+#[inline(always)]
+pub(crate) fn transmit_preempting_rx(frame: *const u8) -> Result<(), super::Error> {
+    transmit_inner(frame, false, false, true)
+}
+
+#[inline(always)]
+fn transmit_inner(
+    frame: *const u8,
+    cca: bool,
+    discard_queued: bool,
+    preempt_rx: bool,
+) -> Result<(), super::Error> {
     use super::suspend::Boundary;
     STATE.with(|state| {
         match state.state {
             Ieee802154State::Sleep => return Err(super::Error::Sleeping),
             Ieee802154State::Transmit | Ieee802154State::TxAck => return Err(super::Error::Busy),
-            _ if events() != 0 || receive_in_progress() || rx_queue_blocks_tx(state) => {
+            _ if events() != 0
+                || (!preempt_rx && receive_in_progress())
+                || rx_queue_blocks_tx(state)
+                || triggered_waiting() =>
+            {
                 return Err(super::Error::Busy);
             }
             _ => {}
@@ -376,6 +615,8 @@ pub(crate) fn can_transmit() -> Result<(), super::Error> {
         Ieee802154State::Sleep => Err(super::Error::Sleeping),
         Ieee802154State::Transmit | Ieee802154State::TxAck => Err(super::Error::Busy),
         _ if events() != 0 || receive_in_progress() => Err(super::Error::Busy),
+        #[cfg(feature = "ieee802154-triggered-tx")]
+        _ if triggered_waiting() => Err(super::Error::Busy),
         _ => Ok(()),
     })
 }
@@ -434,6 +675,10 @@ impl super::suspend::Boundary for SleepBoundary<'_> {
 }
 
 pub(crate) fn try_suspend(discard_queued: bool) -> Result<(), super::SuspendError> {
+    #[cfg(feature = "ieee802154-triggered-tx")]
+    if triggered_waiting() {
+        return Err(super::SuspendError::Busy);
+    }
     STATE.with(|state| {
         if discard_queued {
             state.rx_queue.clear();
@@ -465,6 +710,9 @@ pub(crate) fn cancel_transmit() {
             enable_rx();
         }
     });
+    // A cancelled frame produces no TX_DONE.
+    #[cfg(feature = "ieee802154-triggered-tx")]
+    TRIGGERED.with(|t| t.on_air = false);
 }
 
 pub(crate) fn shutdown() {
@@ -662,6 +910,13 @@ fn zb_mac_handler() {
 
     if events & Event::TxDone != 0 {
         trace!("tx done");
+        #[cfg(feature = "ieee802154-triggered-tx")]
+        if triggered_tx_done() {
+            STATE.with(next_operation_inner);
+        } else {
+            next_operation();
+        }
+        #[cfg(not(feature = "ieee802154-triggered-tx"))]
         next_operation();
     }
 
@@ -670,6 +925,11 @@ fn zb_mac_handler() {
         trace!("RxAbort");
         tx_ack_aborted();
         abort_rx();
+    }
+
+    #[cfg(feature = "ieee802154-triggered-tx")]
+    if events & Event::Timer0Overflow != 0 {
+        triggered_fire();
     }
 
     if events & Event::RxDone != 0 {
@@ -713,6 +973,15 @@ fn zb_mac_handler() {
                     // esp_ieee802154_coex_pti_set(IEEE802154_IDLE_RX);
                 }
             });
+
+            // After the frame is queued and the receiver restarted; a
+            // triggering frame is broadcast, never auto-acknowledged.
+            #[cfg(feature = "ieee802154-triggered-tx")]
+            {
+                let buffer = &*core::ptr::addr_of!(RX_BUFFER);
+                let len = usize::from(buffer[0]).min(FRAME_SIZE - 1);
+                triggered_on_rx(&buffer[1..][..len], timestamp_us);
+            }
 
             notify_state(state_for_notify)
         }

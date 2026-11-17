@@ -84,6 +84,28 @@ pub(crate) struct GpDownlink {
     len: u8,
     /// Start instant ([`zigbee_mac::PlatformServices::monotonic_micros`]).
     at_us: u32,
+    /// When the reply was built (`green-power-sink`: logged after the TX
+    /// with the instant, to show the latency budget).
+    #[cfg(feature = "green-power-sink")]
+    built_us: u32,
+}
+
+/// The gpTxQueue GPDF armed in the radio ([`MacDriver::arm_gp_reply`]):
+/// the radio's interrupts send it gpTxOffset after the GPD's next
+/// unprotected `rxAfterTx` GPDF, however late the task handles that GPDF.
+/// On the ESP32-H2 combo the task saw triggers 68–173 ms after they ended
+/// during a commissioning burst (2026-11-17), far past the 20 ms instant.
+#[cfg(feature = "green-power-bidirectional")]
+pub(crate) struct GpRadioReply {
+    /// The MAC cannot arm replies: only the task path is used.
+    unsupported: bool,
+    /// Bytes of the armed frame (MAC sequence number 0), 0 = none armed.
+    len: u8,
+    src_id: u32,
+    frame: [u8; GP_DOWNLINK_FRAME_LEN],
+    /// [`zigbee_mac::PlatformServices::monotonic_micros`] when armed: only
+    /// GPDFs that ended later can have triggered it.
+    armed_at_us: u32,
 }
 
 /// Bound on transmissions per [`ZigbeeDevice::gp_poll`] call, so one call
@@ -153,6 +175,8 @@ pub struct GreenPowerState {
     /// delivery; `None` while on the operational channel.
     #[cfg(feature = "green-power-full-proxy")]
     off_channel: Option<u8>,
+    #[cfg(feature = "green-power-bidirectional")]
+    radio_reply: GpRadioReply,
     #[cfg(feature = "green-power-sink")]
     sink: GpSink,
     /// The GP frame being handled was APS-unicast to this node.
@@ -169,6 +193,14 @@ impl GreenPowerState {
             tsn: 0,
             #[cfg(feature = "green-power-full-proxy")]
             off_channel: None,
+            #[cfg(feature = "green-power-bidirectional")]
+            radio_reply: GpRadioReply {
+                unsupported: false,
+                len: 0,
+                src_id: 0,
+                frame: [0; GP_DOWNLINK_FRAME_LEN],
+                armed_at_us: 0,
+            },
             #[cfg(feature = "green-power-sink")]
             sink: GpSink::new(zigbee_gp::sink::SinkConfig::default()),
             #[cfg(feature = "green-power-sink")]
@@ -319,12 +351,36 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         proxy.set_operational_channel(channel);
     }
 
+    /// Combo TempMaster (`green-power-sink`): only the gpTxQueue GPDF a
+    /// received GPDF triggers, built and scheduled for
+    /// [`Self::gp_send_downlink`]. The caller transmits it *before* the proxy
+    /// and the sink process the GPDF with [`Self::gp_receive_gpdf`]: the
+    /// sink's commissioning work (key unwrap, logging) on the same frame
+    /// pushed the reply past its instant on hardware (2026-11-17). The
+    /// reply is built from the Proxy Table entry before `on_gpdf` advances
+    /// the GPD's counter, as without the sink.
+    #[cfg(all(feature = "green-power-bidirectional", feature = "green-power-sink"))]
+    #[inline(never)]
+    pub(crate) fn gp_downlink_first(
+        &mut self,
+        indication: &McpsDataIndication,
+    ) -> Option<GpDownlink> {
+        if !self.gp_active() {
+            return None;
+        }
+        self.gp_sync_bidirectional();
+        self.gp_take_downlink(indication)
+    }
+
     /// Handle a received GPDF (NWK protocol version 3) as TempMaster: the
     /// proxy processes it as [`Self::gp_receive_gpdf`] does, and the gpTxQueue
     /// GPDF it triggers (GP 1.1 A.3.9.1) is returned, already built and
     /// scheduled [`ProxyConfig::tx_offset_us`] after the end of
     /// `indication`, for [`Self::gp_send_downlink`].
-    #[cfg(feature = "green-power-bidirectional")]
+    #[cfg(all(
+        feature = "green-power-bidirectional",
+        not(feature = "green-power-sink")
+    ))]
     #[inline(never)]
     pub(crate) fn gp_receive_gpdf_bidirectional(
         &mut self,
@@ -349,6 +405,7 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             return None;
         }
         let rx_end_us = indication.payload.rx_end_us();
+        self.gp_radio_reply_outcome();
         let now_ms = self.gp_now_ms();
         let mac_src_ieee = match indication.src_address {
             MacAddress::Extended(_, ieee) => Some(ieee),
@@ -360,10 +417,28 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             mac_src_ieee,
         )
         .ok()?;
+        // A trigger of the reply armed in the radio (the criteria of
+        // `zigbee_mac::gp_reply::gpdf_triggers_reply`) is the radio's to
+        // answer, and already answered when the task is late: no second,
+        // timed transmission from the task.
+        let armed = &self.green_power.radio_reply;
+        let h = &frame.header;
+        if armed.len != 0
+            && rx_end_us.wrapping_sub(armed.armed_at_us) as i32 > 0
+            && h.frame_type == zigbee_gp::frame::FrameType::Data
+            && h.gpd_id == Some(zigbee_gp::types::GpdId::SrcId(armed.src_id))
+            && !h.security_level.is_protected()
+            && h.rx_after_tx
+            && !h.to_gpd
+        {
+            return None;
+        }
         let mut downlink = GpDownlink {
             frame: [0; GP_DOWNLINK_FRAME_LEN],
             len: 0,
             at_us: rx_end_us.wrapping_add(self.green_power.proxy.config().tx_offset_us),
+            #[cfg(feature = "green-power-sink")]
+            built_us: 0,
         };
         let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
         // The MAC sequence number is set from macDSN when sending.
@@ -372,6 +447,10 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                 .proxy
                 .take_downlink(mac, &frame, now_ms, 0, &mut downlink.frame)?;
         downlink.len = len as u8;
+        #[cfg(feature = "green-power-sink")]
+        {
+            downlink.built_us = self.bdb.zdo().nwk().mac().monotonic_micros();
+        }
         Some(downlink)
     }
 
@@ -390,9 +469,41 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         }
         let frame = &downlink.frame[..usize::from(downlink.len)];
         let result = mac.transmit_raw_at(frame, downlink.at_us).await;
+        #[cfg(not(feature = "green-power-sink"))]
         match result {
             Ok(()) => log::info!("[GP] TempMaster GPDF sent ({} B)", downlink.len),
             Err(error) => log::warn!("[GP] TempMaster GPDF not sent: {:?}", error),
+        }
+        // After the TX: the reply was built `built` µs after the end of the
+        // triggering GPDF, was due at `due` and the MAC returned at `done`.
+        #[cfg(feature = "green-power-sink")]
+        {
+            let tx_offset = self.green_power.proxy.config().tx_offset_us;
+            let rx_end = downlink.at_us.wrapping_sub(tx_offset);
+            let done = self
+                .bdb
+                .zdo()
+                .nwk()
+                .mac()
+                .monotonic_micros()
+                .wrapping_sub(rx_end);
+            let built = downlink.built_us.wrapping_sub(rx_end) as i32;
+            match result {
+                Ok(()) => log::info!(
+                    "[GP] TempMaster GPDF sent ({} B): built +{} us, due +{} us, done +{} us after the GPDF",
+                    downlink.len,
+                    built,
+                    tx_offset,
+                    done as i32
+                ),
+                Err(error) => log::warn!(
+                    "[GP] TempMaster GPDF not sent: {:?}: built +{} us, due +{} us, done +{} us after the GPDF",
+                    error,
+                    built,
+                    tx_offset,
+                    done as i32
+                ),
+            }
         }
         // A delivered Channel Configuration ends a temporary channel.
         #[cfg(feature = "green-power-full-proxy")]
@@ -785,6 +896,8 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
     pub async fn gp_poll(&mut self) {
         if !self.gp_active() {
             self.green_power.reply = None;
+            #[cfg(feature = "green-power-bidirectional")]
+            self.gp_disarm_radio_reply();
             return;
         }
         // Retune first: due network frames are sent only on the operational
@@ -793,6 +906,10 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         self.gp_sync_radio_channel().await;
         let own_nwk = self.bdb.zdo().nwk().nib().network_address.0;
         self.green_power.proxy.set_own_nwk(own_nwk);
+        // Before the sink queues new replies: a reply the radio sent leaves
+        // the gpTxQueue, a newer one for the same GPD stays.
+        #[cfg(feature = "green-power-bidirectional")]
+        self.gp_radio_reply_outcome();
         for _ in 0..MAX_TX_PER_POLL {
             // The sink's frames share the reply slot (one transmit path).
             #[cfg(feature = "green-power-sink")]
@@ -816,6 +933,103 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                 }
             };
             self.gp_transmit(frame).await;
+        }
+        #[cfg(feature = "green-power-bidirectional")]
+        self.gp_sync_radio_reply().await;
+    }
+
+    /// Keep the radio armed with the gpTxQueue GPDF it can send by itself
+    /// ([`Proxy::radio_downlink`]), after reporting what became of the last
+    /// armed one. The MAC sequence number is taken from macDSN when arming.
+    #[cfg(feature = "green-power-bidirectional")]
+    #[inline(never)]
+    async fn gp_sync_radio_reply(&mut self) {
+        use zigbee_mac::pib::{PibAttribute, PibValue};
+        if self.green_power.radio_reply.unsupported {
+            return;
+        }
+        self.gp_radio_reply_outcome();
+        let now_ms = self.gp_now_ms();
+        let mut frame = [0u8; GP_DOWNLINK_FRAME_LEN];
+        let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+        let candidate = self
+            .green_power
+            .proxy
+            .radio_downlink(mac, now_ms, 0, &mut frame);
+        let armed = &self.green_power.radio_reply;
+        let current =
+            (armed.len != 0).then(|| (armed.src_id, &armed.frame[..usize::from(armed.len)]));
+        if candidate.map(|(src_id, len)| (src_id, &frame[..len])) == current {
+            return;
+        }
+        let Some((src_id, len)) = candidate else {
+            self.gp_disarm_radio_reply();
+            return;
+        };
+        let mut on_air = frame;
+        if let Ok(PibValue::U8(dsn)) = mac.mlme_get(PibAttribute::MacDsn).await {
+            on_air[2] = dsn;
+            let _ = mac
+                .mlme_set(PibAttribute::MacDsn, PibValue::U8(dsn.wrapping_add(1)))
+                .await;
+        }
+        let offset_us = self.green_power.proxy.config().tx_offset_us;
+        let armed_at_us = mac.monotonic_micros();
+        let reply = &mut self.green_power.radio_reply;
+        match mac.arm_gp_reply(src_id, &on_air[..len], offset_us) {
+            Ok(()) => {
+                reply.len = len as u8;
+                reply.src_id = src_id;
+                reply.frame = frame;
+                reply.armed_at_us = armed_at_us;
+            }
+            Err(zigbee_mac::MacError::Unsupported) => {
+                reply.unsupported = true;
+                reply.len = 0;
+            }
+            // E.g. a reply counting down: retried on the next poll.
+            Err(_) => reply.len = 0,
+        }
+    }
+
+    #[cfg(feature = "green-power-bidirectional")]
+    fn gp_disarm_radio_reply(&mut self) {
+        if self.green_power.radio_reply.len != 0 {
+            self.green_power.radio_reply.len = 0;
+            self.bdb
+                .zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .mac_mut()
+                .disarm_gp_reply();
+        }
+    }
+
+    /// Report the radio's last armed reply, once; a sent GPDF leaves the
+    /// gpTxQueue. Any outcome disarms the radio.
+    #[cfg(feature = "green-power-bidirectional")]
+    fn gp_radio_reply_outcome(&mut self) {
+        let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+        let Some(outcome) = mac.take_gp_reply_outcome() else {
+            return;
+        };
+        let reply = &mut self.green_power.radio_reply;
+        let len = reply.len;
+        reply.len = 0;
+        match outcome.result {
+            Ok(()) => {
+                self.green_power.proxy.radio_downlink_sent(outcome.src_id);
+                log::info!(
+                    "[GP] TempMaster GPDF sent by the radio ({} B): on air +{} us after the GPDF",
+                    len,
+                    outcome.after_us
+                );
+            }
+            Err(error) => log::warn!(
+                "[GP] TempMaster GPDF not sent by the radio: {:?} at +{} us after the GPDF",
+                error,
+                outcome.after_us
+            ),
         }
     }
 

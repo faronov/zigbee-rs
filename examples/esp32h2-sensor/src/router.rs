@@ -78,7 +78,11 @@ async fn run(app: &'static mut App, mut trigger: CommissioningTrigger) -> ! {
     let mut next_summary = Instant::now() + SUMMARY_PERIOD;
     #[cfg(feature = "combo-light")]
     let mut combo = combo::Combo::new();
+    #[cfg(feature = "combo-light")]
+    let mut loop_timing = LoopTiming::default();
     loop {
+        #[cfg(feature = "combo-light")]
+        let step_started = Instant::now();
         if trigger.poll(app.awaiting_commissioning_request()) {
             app.request_commissioning();
         }
@@ -100,9 +104,13 @@ async fn run(app: &'static mut App, mut trigger: CommissioningTrigger) -> ! {
             let permit_join = permit_join || app.node().device().gp_sink().in_commissioning_mode();
             app.parts_mut().status.refresh(permit_join);
         }
+        #[cfg(feature = "combo-light")]
+        loop_timing.record(step_started.elapsed());
         if Instant::now() >= next_summary {
             next_summary += SUMMARY_PERIOD;
             log_summary(app);
+            #[cfg(feature = "combo-light")]
+            loop_timing.log_and_reset();
         }
     }
 }
@@ -234,6 +242,53 @@ fn log_summary(app: &App) {
         app.node().device().gp_sink().entries().len(),
         app.node().profile().component().is_on()
     );
+}
+
+/// Event-loop latency of the GP Combo light (`combo-light`, lab): a GPDF
+/// waits in the radio queue while one loop iteration runs. Iterations over
+/// [`LoopTiming::SLOW`] are logged at once with the journal flash work
+/// since the previous report; the summary adds the longest iteration.
+#[cfg(feature = "combo-light")]
+#[derive(Default)]
+struct LoopTiming {
+    max_us: u64,
+    slow: u32,
+}
+
+#[cfg(feature = "combo-light")]
+impl LoopTiming {
+    const SLOW: Duration = Duration::from_millis(40);
+
+    fn record(&mut self, elapsed: Duration) {
+        self.max_us = self.max_us.max(elapsed.as_micros());
+        if elapsed > Self::SLOW {
+            self.slow += 1;
+            let flash = product::flash_timing::take();
+            log::warn!(
+                "[ESP32-H2] slow loop step {} us | flash erases {} (max {} us) writes {} (max {} us)",
+                elapsed.as_micros(),
+                flash.erases,
+                flash.erase_max_us,
+                flash.writes,
+                flash.write_max_us
+            );
+        }
+    }
+
+    fn log_and_reset(&mut self) {
+        let flash = product::flash_timing::take();
+        log::info!(
+            "[ESP32-H2] loop max {} us, {} over {} ms | flash erases {} (max {} us) writes {} (max {} us)",
+            self.max_us,
+            self.slow,
+            Self::SLOW.as_millis(),
+            flash.erases,
+            flash.erase_max_us,
+            flash.writes,
+            flash.write_max_us
+        );
+        *self = Self::default();
+    }
 }
 
 /// GP Combo light (`combo-light`): BOOT opens sink commissioning, sink

@@ -1581,6 +1581,28 @@ macro_rules! soft_mac_driver_common {
             self.phy.transmit_at(frame, at_us).await.map_err(phy_error)
         }
 
+        #[cfg(feature = "timed-tx")]
+        fn arm_gp_reply(
+            &mut self,
+            src_id: u32,
+            frame: &[u8],
+            offset_us: u32,
+        ) -> Result<(), MacError> {
+            self.phy
+                .arm_gp_reply(src_id, frame, offset_us)
+                .map_err(phy_error)
+        }
+
+        #[cfg(feature = "timed-tx")]
+        fn disarm_gp_reply(&mut self) {
+            self.phy.disarm_gp_reply();
+        }
+
+        #[cfg(feature = "timed-tx")]
+        fn take_gp_reply_outcome(&mut self) -> Option<crate::gp_reply::GpReplyOutcome> {
+            self.phy.take_gp_reply_outcome()
+        }
+
         fn capabilities(&self) -> MacCapabilities {
             let phy = self.phy.capabilities();
             MacCapabilities {

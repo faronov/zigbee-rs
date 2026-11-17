@@ -28,6 +28,8 @@ extern crate alloc;
 #[cfg(any(feature = "esp-parent", test))]
 pub mod ack_pending;
 pub mod frames;
+#[cfg(feature = "timed-tx")]
+pub mod gp_reply;
 pub mod lqi;
 pub mod phy;
 pub mod pib;
@@ -330,6 +332,32 @@ pub trait MacDriver: PlatformServices {
     #[cfg(feature = "timed-tx")]
     async fn transmit_raw_at(&mut self, _frame: &[u8], _at_us: u32) -> Result<(), MacError> {
         Err(MacError::Unsupported)
+    }
+
+    /// Arm a Green Power TempMaster reply in the radio: `frame` (a MAC frame
+    /// without FCS) is started `offset_us` after the end of the next
+    /// unprotected rxAfterTx GPDF from SrcID `src_id`, by the radio's own
+    /// receive and timer interrupts (see [`gp_reply`]). Replaces an armed
+    /// reply. [`MacError::Unsupported`] when the radio cannot; the caller
+    /// then relies on [`Self::transmit_raw_at`] from the task.
+    #[cfg(feature = "timed-tx")]
+    fn arm_gp_reply(
+        &mut self,
+        _src_id: u32,
+        _frame: &[u8],
+        _offset_us: u32,
+    ) -> Result<(), MacError> {
+        Err(MacError::Unsupported)
+    }
+
+    /// Cancel an armed reply.
+    #[cfg(feature = "timed-tx")]
+    fn disarm_gp_reply(&mut self) {}
+
+    /// What became of the last armed reply that was triggered, once.
+    #[cfg(feature = "timed-tx")]
+    fn take_gp_reply_outcome(&mut self) -> Option<gp_reply::GpReplyOutcome> {
+        None
     }
 
     // ── Capability queries ──────────────────────────────────

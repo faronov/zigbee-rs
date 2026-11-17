@@ -58,6 +58,8 @@ pub mod chip_temperature;
 pub mod end_device;
 #[cfg(any(target_os = "none", test))]
 pub mod executor;
+#[cfg(all(target_os = "none", feature = "combo-light"))]
+pub mod flash_timing;
 #[cfg(all(
     target_os = "none",
     any(

@@ -288,6 +288,16 @@ const TX_POWER_RANGE: (i8, i8) = (-15, 20);
 #[cfg(not(feature = "esp32c6"))]
 const TX_POWER_RANGE: (i8, i8) = (-24, 20);
 
+/// SrcID whose GPDF triggers the armed GP reply (`timed-tx`).
+#[cfg(feature = "timed-tx")]
+static GP_REPLY_SRC_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// esp-radio trigger, in the RX_DONE interrupt (`timed-tx`).
+#[cfg(feature = "timed-tx")]
+fn gp_reply_trigger(frame: &[u8]) -> bool {
+    crate::gp_reply::gpdf_triggers_reply(frame, GP_REPLY_SRC_ID.load(Ordering::Relaxed))
+}
+
 /// TX completion flag — set by ISR callback, cleared before TX.
 static TX_COMPLETE: AtomicBool = AtomicBool::new(false);
 
@@ -363,6 +373,12 @@ pub struct EspRadioPhy<'a> {
     /// Data-poll Frame Pending window; see
     /// [`Self::with_poll_response_wait_us`].
     poll_response_wait_us: u32,
+    /// SrcID of the armed GP reply, and the outcome of the previous one
+    /// collected when re-arming (`timed-tx`).
+    #[cfg(feature = "timed-tx")]
+    gp_reply_src: u32,
+    #[cfg(feature = "timed-tx")]
+    gp_reply_outcome: Option<crate::gp_reply::GpReplyOutcome>,
 }
 
 impl<'a> EspRadioPhy<'a> {
@@ -383,6 +399,10 @@ impl<'a> EspRadioPhy<'a> {
             aes_engine: None,
             parked: ParkedRx::new(),
             poll_response_wait_us: <Self as RadioPhy>::POLL_RESPONSE_WAIT_US,
+            #[cfg(feature = "timed-tx")]
+            gp_reply_src: 0,
+            #[cfg(feature = "timed-tx")]
+            gp_reply_outcome: None,
         };
         this.rearm_receive();
         this
@@ -547,11 +567,14 @@ impl<'a> EspRadioPhy<'a> {
         Ok(())
     }
 
-    /// Hand `frame` to the radio now, without CCA, retrying a `Busy`
-    /// radio until `late_by_us` would exceed [`TIMED_TX_LATE_US`]
+    /// Hand `frame` to the radio now, without CCA, abandoning a frame being
+    /// received, retrying a `Busy` radio (own TX, hardware ACK, pending
+    /// interrupt work) until `late_by_us` would exceed [`TIMED_TX_LATE_US`]
     /// (`timed-tx`), then wait for TX-done. Unlike [`Self::transmit`] there
     /// is no backoff after a busy radio: a late frame misses the peer's
-    /// receive window.
+    /// receive window. A radio that stayed busy past the deadline reports
+    /// [`PhyError::ChannelBusy`], a caller that came too late
+    /// [`PhyError::Missed`].
     #[cfg(feature = "timed-tx")]
     #[inline(never)]
     fn transmit_timed(&mut self, frame: &[u8], start_at_us: u32) -> Result<(), PhyError> {
@@ -568,9 +591,11 @@ impl<'a> EspRadioPhy<'a> {
             start_at_us,
             TIMED_TX_LATE_US,
             || Instant::now().as_micros() as u32,
+            // Without CSMA/CA (GP TempMaster): a frame being received is
+            // abandoned rather than waited for (vendor local patch).
             || {
                 self.driver
-                    .transmit_raw_discarding(&padded[..frame.len() + 2], false)
+                    .transmit_raw_preempting_rx(&padded[..frame.len() + 2])
                     .map_err(map_radio_error)
             },
         )?;
@@ -586,6 +611,32 @@ impl<'a> EspRadioPhy<'a> {
             core::hint::spin_loop();
         }
         Ok(())
+    }
+
+    /// The esp-radio outcome of the armed reply, with its SrcID.
+    #[cfg(feature = "timed-tx")]
+    fn collect_gp_reply_outcome(&mut self) -> Option<crate::gp_reply::GpReplyOutcome> {
+        use esp_radio::ieee802154::TriggeredOutcome;
+        let src_id = self.gp_reply_src;
+        // `fired_after_us` counts from RX_DONE to the TX command; the frame
+        // reaches the air the start lead later.
+        let (result, after_us) = match self.driver.take_triggered_tx_outcome()? {
+            TriggeredOutcome::Sent { fired_after_us } => {
+                (Ok(()), fired_after_us + TIMED_TX_START_LEAD_US)
+            }
+            TriggeredOutcome::Busy { fired_after_us } => (
+                Err(PhyError::ChannelBusy),
+                fired_after_us + TIMED_TX_START_LEAD_US,
+            ),
+            TriggeredOutcome::Late { handled_after_us } => {
+                (Err(PhyError::Missed), handled_after_us)
+            }
+        };
+        Some(crate::gp_reply::GpReplyOutcome {
+            src_id,
+            result,
+            after_us,
+        })
     }
 
     /// esp-radio refused a transmission with `Busy` because the radio is
@@ -816,6 +867,44 @@ impl RadioPhy for EspRadioPhy<'_> {
             spin_micros(ahead as u64);
         }
         self.transmit_timed(frame, start_at_us)
+    }
+
+    /// Armed in esp-radio (local patch `ieee802154-triggered-tx`): the
+    /// RX_DONE interrupt matches the trigger and programs the radio's
+    /// Timer0, whose interrupt starts the frame [`TIMED_TX_START_LEAD_US`]
+    /// before `offset_us` after the GPDF, independent of the task.
+    #[cfg(feature = "timed-tx")]
+    fn arm_gp_reply(&mut self, src_id: u32, frame: &[u8], offset_us: u32) -> Result<(), PhyError> {
+        if frame.len() > MAX_PHY_FRAME_LEN {
+            return Err(PhyError::FrameTooLong);
+        }
+        let Some(delay_us) = offset_us.checked_sub(TIMED_TX_START_LEAD_US) else {
+            return Err(PhyError::Missed);
+        };
+        // Disarm before the trigger SrcID changes, and keep an outcome of
+        // the previous reply with its SrcID.
+        self.driver.disarm_triggered_tx();
+        if let Some(outcome) = self.collect_gp_reply_outcome() {
+            self.gp_reply_outcome = Some(outcome);
+        }
+        GP_REPLY_SRC_ID.store(src_id, Ordering::Relaxed);
+        self.gp_reply_src = src_id;
+        self.driver
+            .arm_triggered_tx(frame, gp_reply_trigger, delay_us)
+            .map_err(map_radio_error)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "timed-tx")]
+    fn disarm_gp_reply(&mut self) {
+        self.driver.disarm_triggered_tx();
+    }
+
+    #[cfg(feature = "timed-tx")]
+    fn take_gp_reply_outcome(&mut self) -> Option<crate::gp_reply::GpReplyOutcome> {
+        self.gp_reply_outcome
+            .take()
+            .or_else(|| self.collect_gp_reply_outcome())
     }
 
     /// ACKs are generated by the radio (`auto_ack_tx`).

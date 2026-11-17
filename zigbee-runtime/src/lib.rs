@@ -14718,16 +14718,27 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         // A bidirectional GPD listens gpTxOffset after this GPDF; the
         // TempMaster reply goes out from here, before any other work of the
         // event loop (persistence, reporting) can delay it.
-        #[cfg(feature = "green-power-bidirectional")]
+        #[cfg(all(
+            feature = "green-power-bidirectional",
+            not(feature = "green-power-sink")
+        ))]
         if zigbee_gp::frame::is_gpdf(mac_payload) {
             if let Some(downlink) = self.gp_receive_gpdf_bidirectional(indication) {
                 self.gp_send_downlink(downlink).await;
             }
-            // Combo: the sink's translation of a GPDF heard directly.
-            #[cfg(feature = "green-power-sink")]
-            return self.gp_sink_deliver(clusters);
-            #[cfg(not(feature = "green-power-sink"))]
             return None;
+        }
+        // Combo TempMaster: the reply goes out before the proxy and the sink
+        // process the GPDF (the sink's commissioning work and its logging
+        // cost more than the 20 ms gpTxOffset on hardware).
+        #[cfg(all(feature = "green-power-bidirectional", feature = "green-power-sink"))]
+        if zigbee_gp::frame::is_gpdf(mac_payload) {
+            if let Some(downlink) = self.gp_downlink_first(indication) {
+                self.gp_send_downlink(downlink).await;
+            }
+            self.gp_receive_gpdf(indication);
+            // Combo: the sink's translation of a GPDF heard directly.
+            return self.gp_sink_deliver(clusters);
         }
 
         // NWK layer: header parsing, broadcast eligibility, BTR/relay for
@@ -16968,6 +16979,347 @@ mod parent_router_tests {
                 ..zigbee_gp::sink::SinkConfig::default()
             });
         device
+    }
+
+    /// Combo as its own TempMaster (`green-power-sink` +
+    /// `green-power-bidirectional`): the sink hears a bidirectional GPD's
+    /// Commissioning GPDF directly and answers with a GP Response appointing
+    /// this node; the GPD's next rxAfterTx GPDF must get the Commissioning
+    /// Reply by timed TX, also when another sink (zigpy) answers the same
+    /// GPDF with a Response appointing another proxy in between.
+    #[cfg(all(feature = "green-power-sink", feature = "green-power-bidirectional"))]
+    #[test]
+    fn gp_combo_is_its_own_temp_master_for_direct_bidirectional_commissioning() {
+        use zigbee_aps::ApsTxOptions;
+        use zigbee_aps::apsde::ApsdeDataRequest;
+        use zigbee_aps::{ApsAddress, ApsAddressMode};
+        use zigbee_gp::cluster::{Response, client_cmd};
+        use zigbee_gp::commissioning::{CommissioningPayload, CommissioningSecurity};
+        use zigbee_gp::frame::{FrameType, GpdfParams};
+        use zigbee_gp::security::{self, DEFAULT_TC_LINK_KEY, Direction};
+        use zigbee_gp::types::{GpdId, KeyType, SecurityLevel};
+
+        const SRC: u32 = 0x293C_9879;
+        const KEY: [u8; 16] = [0x5D; 16];
+        const RX_END_US: u32 = 4_000_000;
+        let gpd = GpdId::SrcId(SRC);
+        let commissioning = |mac_seq: u8| {
+            let wrapped = security::wrap_key(
+                &mut MockMac::new([0; 8]),
+                &DEFAULT_TC_LINK_KEY,
+                &gpd,
+                Direction::FromGpd,
+                0,
+                &KEY,
+            )
+            .unwrap();
+            let p = CommissioningPayload {
+                device_id: 0x33,
+                mac_seq_num_capability: false,
+                rx_on_capability: true,
+                pan_id_request: false,
+                security_key_request: false,
+                fixed_location: true,
+                security: Some(CommissioningSecurity {
+                    level: SecurityLevel::Encrypted,
+                    key_type: KeyType::IndividualKey,
+                    key: Some((wrapped.key, Some(u32::from_le_bytes(wrapped.mic)))),
+                    outgoing_counter: Some(7072),
+                }),
+                app_info: None,
+            };
+            let mut b = [0u8; 64];
+            let n = p.encode(&mut b).unwrap();
+            let mut raw = [0u8; 127];
+            let len = security::build_gpdf(
+                &mut MockMac::new([0; 8]),
+                None,
+                &GpdfParams {
+                    frame_type: FrameType::Data,
+                    auto_commissioning: false,
+                    src_id: Some(SRC),
+                    security_level: SecurityLevel::None,
+                    individual_key: false,
+                    rx_after_tx: true,
+                    to_gpd: false,
+                    frame_counter: 0,
+                },
+                mac_seq,
+                0xE0,
+                &b[..n],
+                &mut raw,
+            )
+            .unwrap();
+            McpsDataIndication {
+                src_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+                dst_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+                lqi: 180,
+                payload: MacFrame::from_slice(&raw[7..len])
+                    .unwrap()
+                    .with_mac_sequence(mac_seq)
+                    .with_rx_end_us(RX_END_US),
+                security_use: false,
+            }
+        };
+        // zigpy's GP Response for the same GPD, appointing `temp_master`.
+        let mut coordinator = centralized_coordinator();
+        let mut zigpy_response =
+            |temp_master: u16| {
+                let response = Response {
+                    gpd_id: gpd,
+                    transmit_on_endpoint_match: false,
+                    temp_master_short: temp_master,
+                    temp_master_tx_channel: 15 - 11,
+                    command_id: 0xF0,
+                    payload: &[0x00],
+                };
+                let mut zcl = [0u8; 64];
+                zcl[..3].copy_from_slice(&[0x19, 0x43, client_cmd::RESPONSE]);
+                let len = 3 + response.encode(&mut zcl[3..]).unwrap();
+                block_on(coordinator.bdb.zdo_mut().aps_mut().apsde_data_request(
+                    &ApsdeDataRequest {
+                        dst_addr_mode: ApsAddressMode::Short,
+                        dst_address: ApsAddress::Short(ShortAddress(0xFFFD)),
+                        dst_endpoint: 242,
+                        profile_id: 0xA1E0,
+                        cluster_id: 0x0021,
+                        src_endpoint: 242,
+                        payload: &zcl[..len],
+                        tx_options: ApsTxOptions {
+                            use_nwk_key: true,
+                            ..ApsTxOptions::default()
+                        },
+                        radius: 0,
+                        alias_src_addr: None,
+                        alias_seq: None,
+                    },
+                ))
+                .unwrap();
+                McpsDataIndication {
+                    src_address: MacAddress::Short(PAN, ShortAddress::COORDINATOR),
+                    dst_address: MacAddress::Short(PAN, ShortAddress(0xFFFF)),
+                    lqi: 200,
+                    payload: MacFrame::from_slice(
+                        coordinator
+                            .mac()
+                            .tx_history()
+                            .last()
+                            .unwrap()
+                            .payload
+                            .as_slice(),
+                    )
+                    .unwrap(),
+                    security_use: false,
+                }
+            };
+
+        for zigpy_in_between in [None, Some(0x4A76u16), Some(ROUTER.0)] {
+            let mut router = gp_combo_router();
+            router.mac_mut().set_timed_tx(true);
+            router.gp_sink_enter_commissioning(true).unwrap();
+            block_on(router.gp_poll());
+            router.mac_mut().clear_tx_history();
+
+            // First Commissioning GPDF: nothing queued yet; the sink answers.
+            router.mac_mut().set_time_micros(RX_END_US + 900);
+            assert!(block_on(router.process_incoming(&commissioning(1), &mut [])).is_none());
+            assert!(router.mac().timed_tx_history().is_empty());
+            block_on(router.gp_poll());
+            assert!(
+                router.gp_proxy().bidirectional(),
+                "case {zigpy_in_between:?}: the combo must be a TempMaster"
+            );
+            if let Some(temp_master) = zigpy_in_between {
+                let response = zigpy_response(temp_master);
+                block_on(router.process_incoming(&response, &mut []));
+            }
+
+            // The GPD retries; the Commissioning Reply goes out in its window,
+            // before the stack decrypts anything (the sink unwraps the GPD
+            // key of this Commissioning GPDF only after the TX).
+            router.mac_mut().set_time_micros(RX_END_US + 900);
+            let keyings = router.mac().aes_keyings();
+            block_on(router.process_incoming(&commissioning(2), &mut []));
+            assert!(
+                router.mac().aes_keyings() > keyings,
+                "the sink processes the GPDF"
+            );
+            let sent = router.mac().timed_tx_history();
+            assert_eq!(
+                sent.len(),
+                1,
+                "case {zigpy_in_between:?}: Commissioning Reply in the window"
+            );
+            assert_eq!(sent[0].at_us, RX_END_US + 20_000);
+            assert_eq!(
+                sent[0].aes_keyings_before, keyings,
+                "case {zigpy_in_between:?}: the reply must leave before the sink's work"
+            );
+            let reply =
+                zigbee_gp::frame::parse(&sent[0].frame[7..], sent[0].frame[2], None).unwrap();
+            assert!(reply.header.to_gpd);
+            assert_eq!(reply.header.gpd_id, Some(gpd));
+            assert_eq!(reply.clear_command_id(), Some(0xF0));
+        }
+    }
+
+    /// The Commissioning Reply is armed in the radio as soon as the sink
+    /// queues it; the radio sends it gpTxOffset after the GPD's next
+    /// Commissioning GPDF however late the task handles that GPDF, and the
+    /// task then neither sends it again nor keeps it queued. Seen on
+    /// hardware 2026-11-17: the task saw triggers 68–173 ms late.
+    #[cfg(all(feature = "green-power-sink", feature = "green-power-bidirectional"))]
+    #[test]
+    fn gp_combo_radio_sends_the_armed_reply_however_late_the_task_is() {
+        use zigbee_gp::commissioning::{CommissioningPayload, CommissioningSecurity};
+        use zigbee_gp::frame::{FrameType, GpdfParams};
+        use zigbee_gp::security::{self, DEFAULT_TC_LINK_KEY, Direction};
+        use zigbee_gp::types::{GpdId, KeyType, SecurityLevel};
+
+        const SRC: u32 = 0x293C_9879;
+        const KEY: [u8; 16] = [0x5D; 16];
+        let gpd = GpdId::SrcId(SRC);
+        // Unprotected Commissioning GPDF carrying a TC-LK-protected key, as
+        // the MG22 sends it: (MAC frame, indication).
+        let commissioning = |mac_seq: u8, rx_end_us: u32| {
+            let wrapped = security::wrap_key(
+                &mut MockMac::new([0; 8]),
+                &DEFAULT_TC_LINK_KEY,
+                &gpd,
+                Direction::FromGpd,
+                0,
+                &KEY,
+            )
+            .unwrap();
+            let p = CommissioningPayload {
+                device_id: 0x33,
+                mac_seq_num_capability: false,
+                rx_on_capability: true,
+                pan_id_request: false,
+                security_key_request: false,
+                fixed_location: true,
+                security: Some(CommissioningSecurity {
+                    level: SecurityLevel::Encrypted,
+                    key_type: KeyType::IndividualKey,
+                    key: Some((wrapped.key, Some(u32::from_le_bytes(wrapped.mic)))),
+                    outgoing_counter: Some(7072),
+                }),
+                app_info: None,
+            };
+            let mut b = [0u8; 64];
+            let n = p.encode(&mut b).unwrap();
+            let mut raw = [0u8; 127];
+            let len = security::build_gpdf(
+                &mut MockMac::new([0; 8]),
+                None,
+                &GpdfParams {
+                    frame_type: FrameType::Data,
+                    auto_commissioning: false,
+                    src_id: Some(SRC),
+                    security_level: SecurityLevel::None,
+                    individual_key: false,
+                    rx_after_tx: true,
+                    to_gpd: false,
+                    frame_counter: 0,
+                },
+                mac_seq,
+                0xE0,
+                &b[..n],
+                &mut raw,
+            )
+            .unwrap();
+            let indication = McpsDataIndication {
+                src_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+                dst_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+                lqi: 180,
+                payload: MacFrame::from_slice(&raw[7..len])
+                    .unwrap()
+                    .with_mac_sequence(mac_seq)
+                    .with_rx_end_us(rx_end_us),
+                security_use: false,
+            };
+            (
+                heapless::Vec::<u8, 127>::from_slice(&raw[..len]).unwrap(),
+                indication,
+            )
+        };
+
+        for radio_first in [true, false] {
+            let mut router = gp_combo_router();
+            router.mac_mut().set_timed_tx(true);
+            router.mac_mut().set_gp_reply_radio(true);
+            router.gp_sink_enter_commissioning(true).unwrap();
+            block_on(router.gp_poll());
+            assert!(router.mac().armed_gp_reply().is_none());
+
+            // First attempt: the sink answers; the reply is armed at once.
+            router.mac_mut().set_time_micros(1_000_000);
+            let (_, first) = commissioning(1, 1_000_000);
+            block_on(router.process_incoming(&first, &mut []));
+            block_on(router.gp_poll());
+            let (armed_src, armed, offset) = router.mac().armed_gp_reply().unwrap();
+            assert_eq!((armed_src, offset), (SRC, 20_000));
+            let reply = zigbee_gp::frame::parse(&armed[7..], armed[2], None).unwrap();
+            assert!(reply.header.to_gpd && !reply.header.rx_after_tx);
+            assert_eq!(reply.header.gpd_id, Some(gpd));
+            assert_eq!(reply.header.security_level, SecurityLevel::None);
+            assert_eq!(reply.clear_command_id(), Some(0xF0));
+            let armed = heapless::Vec::<u8, 127>::from_slice(armed).unwrap();
+
+            // Second attempt, 500 ms later; the task sees it 150 ms late.
+            let rx_end = 1_500_000;
+            let (mac_frame, second) = commissioning(2, rx_end);
+            router.mac_mut().set_time_micros(rx_end + 150_000);
+            if radio_first {
+                assert!(
+                    router
+                        .mac_mut()
+                        .radio_receive_gp_trigger(&mac_frame, rx_end)
+                );
+                block_on(router.process_incoming(&second, &mut []));
+            } else {
+                // The task was quick; the radio still sends at the instant.
+                block_on(router.process_incoming(&second, &mut []));
+                assert!(
+                    router
+                        .mac_mut()
+                        .radio_receive_gp_trigger(&mac_frame, rx_end)
+                );
+            }
+            assert!(
+                router.mac().timed_tx_history().is_empty(),
+                "radio_first {radio_first}: the task must not send the reply again"
+            );
+            let sent = router.mac().gp_reply_history();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].at_us, rx_end + 20_000);
+            assert_eq!(sent[0].frame, armed);
+
+            // The sink answered the second attempt too (a GPD that missed the
+            // reply retries; one that got it sends Success instead): its new
+            // reply is armed, with the next MAC sequence number, and serves
+            // the third attempt — again from the radio only.
+            block_on(router.gp_poll());
+            let (_, rearmed, _) = router.mac().armed_gp_reply().unwrap();
+            assert_eq!(rearmed[2], armed[2].wrapping_add(1));
+            assert_eq!(rearmed[3..], armed[3..]);
+            let (mac_frame, third) = commissioning(3, 2_000_000);
+            router.mac_mut().set_time_micros(2_000_900);
+            block_on(router.process_incoming(&third, &mut []));
+            assert!(
+                router
+                    .mac_mut()
+                    .radio_receive_gp_trigger(&mac_frame, 2_000_000)
+            );
+            assert!(router.mac().timed_tx_history().is_empty());
+            assert_eq!(router.mac().gp_reply_history().len(), 2);
+            // Leaving the network disarms the radio.
+            block_on(router.gp_poll());
+            assert!(router.mac().armed_gp_reply().is_some());
+            let _ = block_on(router.leave());
+            block_on(router.gp_poll());
+            assert!(router.mac().armed_gp_reply().is_none());
+        }
     }
 
     /// GP Combo end to end (`green-power-sink`): sink commissioning mode,
