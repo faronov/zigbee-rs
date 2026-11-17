@@ -10,6 +10,10 @@
 //! to the console and the WS2812 on GPIO8; BOOT (GPIO9) re-arms
 //! commissioning after a Leave.
 //!
+//! With `combo-light` the endpoint is an HA On/Off Light shown on the WS2812
+//! and a GP Combo sink delivers paired GPD switch commands to it; BOOT
+//! pressed while joined opens sink commissioning mode (see [`combo`]).
+//!
 //! No OTA client: this image is installed over the serial/JTAG link into
 //! `ota_0`. The router never enters light sleep (`macRxOnWhenIdle`).
 
@@ -72,6 +76,8 @@ async fn run(app: &'static mut App, mut trigger: CommissioningTrigger) -> ! {
         roles::fatal(app.parts_mut(), ARCHETYPE, error);
     }
     let mut next_summary = Instant::now() + SUMMARY_PERIOD;
+    #[cfg(feature = "combo-light")]
+    let mut combo = combo::Combo::new();
     loop {
         if trigger.poll(app.awaiting_commissioning_request()) {
             app.request_commissioning();
@@ -81,11 +87,17 @@ async fn run(app: &'static mut App, mut trigger: CommissioningTrigger) -> ! {
         if let Err(error) = app.step().await {
             roles::fatal(app.parts_mut(), ARCHETYPE, error);
         }
+        #[cfg(feature = "combo-light")]
+        combo.service(app, &mut trigger);
         #[cfg(feature = "status-led")]
         {
             // Advance the LED blink/hold; the NIB tracks the timed
             // permit-join close, which raises no stack event.
             let permit_join = app.node().device().bdb().zdo().nwk().nib().permit_joining;
+            // Combo: an open GP sink commissioning window blinks like an
+            // open network.
+            #[cfg(feature = "combo-light")]
+            let permit_join = permit_join || app.node().device().gp_sink().in_commissioning_mode();
             app.parts_mut().status.refresh(permit_join);
         }
         if Instant::now() >= next_summary {
@@ -165,6 +177,15 @@ fn compose(
         app.set_green_power_store(GP_STORE.init(product::router::gp_proxy_table_store()));
         app
     };
+    // Translated GPD commands go to the On/Off Light endpoint.
+    #[cfg(feature = "combo-light")]
+    let app = {
+        let mut app = app;
+        app.node_mut()
+            .device_mut()
+            .gp_sink_set_endpoint(Some(product::router::COMBO_SINK_ENDPOINT));
+        app
+    };
     APP.init(app)
 }
 
@@ -206,5 +227,64 @@ fn log_summary(app: &App) {
             stats.sent,
             stats.cancelled
         );
+    }
+    #[cfg(feature = "combo-light")]
+    log::info!(
+        "[ESP32-H2] GP sink entries {} | light {}",
+        app.node().device().gp_sink().entries().len(),
+        app.node().profile().component().is_on()
+    );
+}
+
+/// GP Combo light (`combo-light`): BOOT opens sink commissioning, sink
+/// events go to the console, the On/Off Light's timers advance and its
+/// state is shown on the WS2812.
+#[cfg(feature = "combo-light")]
+mod combo {
+    use super::{App, CommissioningTrigger};
+    use embassy_time::{Duration, Instant};
+
+    /// OnTime/OffWaitTime tick (ZCL: 1/10 s).
+    const DECISECOND: Duration = Duration::from_millis(100);
+
+    pub struct Combo {
+        next_tick: Instant,
+    }
+
+    impl Combo {
+        pub fn new() -> Self {
+            Self {
+                next_tick: Instant::now() + DECISECOND,
+            }
+        }
+
+        /// Call once per run-loop step.
+        #[inline(never)]
+        pub fn service(&mut self, app: &mut App, trigger: &mut CommissioningTrigger) {
+            let device = app.node_mut().device_mut();
+            if trigger.take_press() {
+                if !device.is_joined() {
+                    log::info!("[ESP32-H2] BOOT: not joined, no GP sink commissioning");
+                } else if device.gp_sink().in_commissioning_mode() {
+                    log::info!("[ESP32-H2] BOOT: GP sink commissioning already open");
+                } else if let Err(error) = device.gp_sink_enter_commissioning(true) {
+                    log::warn!("[ESP32-H2] GP sink commissioning refused: {:?}", error);
+                }
+            }
+            while let Some(event) = device.gp_sink_take_event() {
+                log::info!("[ESP32-H2] GP sink {:?}", event);
+            }
+            let now = Instant::now();
+            if now >= self.next_tick {
+                let elapsed = (now - self.next_tick).as_ticks() / DECISECOND.as_ticks() + 1;
+                self.next_tick += DECISECOND * elapsed as u32;
+                app.node_mut()
+                    .profile_mut()
+                    .component_mut()
+                    .tick_by(elapsed as u32);
+            }
+            let on = app.node().profile().component().is_on();
+            app.parts_mut().status.set_light(on);
+        }
     }
 }

@@ -591,3 +591,172 @@ mod proxy {
         assert_eq!(p.on_gpdf(&mut aes, &f, LINK, 10), GpdfOutcome::Notification);
     }
 }
+
+/// The sink (combo) side against zigpy's own encodings: every frame the sink
+/// sends that zigpy also builds is byte-identical, and zigpy-built proxy
+/// frames are consumed.
+#[cfg(feature = "sink")]
+mod sink {
+    use super::*;
+    use zigbee_gp::cluster::{client_cmd, server_cmd};
+    use zigbee_gp::proxy::{GpTx, TxFrame};
+    use zigbee_gp::sink::{
+        ServerCommand, Sink, SinkConfig, SinkEvent, SinkOutcome, exit_mode_attr, zcl_status,
+    };
+
+    fn gp_command(tx: &GpTx) -> (u8, &[u8]) {
+        match &tx.frame {
+            TxFrame::GpCommand {
+                command_id,
+                payload,
+            } => (*command_id, &payload[..]),
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+
+    /// Configured like ZHA: commissioned groupcast to 0x0B84, window
+    /// 180 s, exit on window or explicit exit.
+    fn zha_like_sink() -> Sink<4, 4> {
+        let mut s = Sink::new(SinkConfig {
+            communication_mode: CommunicationMode::CommissionedGroupcast,
+            commissioned_group: Some(0x0B84),
+            exit_mode: exit_mode_attr::ON_WINDOW_EXPIRATION
+                | exit_mode_attr::ON_PROXY_COMMISSIONING_MODE_EXIT,
+            commissioning_window_s: 180,
+            endpoint: Some(1),
+            ..SinkConfig::default()
+        });
+        s.set_own_address(0x0000, [0x11; 8], 0x1A62);
+        s.set_operational_channel(25);
+        s
+    }
+
+    #[test]
+    fn sink_commissioning_frames_match_zigpy() {
+        let mut aes = SoftwareAesProvider;
+        let mut s = zha_like_sink();
+        s.enter_commissioning(0, true).unwrap();
+        let tx = s.poll(0).unwrap().tx;
+        assert_eq!(
+            gp_command(&tx),
+            (client_cmd::PROXY_COMMISSIONING_MODE, v::PCM_ENTER_180)
+        );
+
+        // zigpy's Commissioning Notification of the sensor (proxy 0x1234).
+        assert_eq!(
+            s.on_server_command(
+                &mut aes,
+                &ServerCommand {
+                    src_nwk: 0x1234,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::COMMISSIONING_NOTIFICATION,
+                    payload: v::COMMISSIONING_NOTIFICATION_PROXY_INFO
+                },
+                10
+            ),
+            Ok((zcl_status::SUCCESS, Some(SinkOutcome::Commissioned)))
+        );
+        let tx = s.poll(10).unwrap().tx;
+        assert_eq!(gp_command(&tx), (client_cmd::PAIRING, v::PAIRING_ADD_L3));
+        assert!(matches!(
+            s.poll(10).unwrap().tx.frame,
+            TxFrame::DeviceAnnce { .. }
+        ));
+
+        // zigpy-encoded Notifications from the proxy, then the GPDF heard
+        // directly.
+        assert_eq!(
+            s.on_server_command(
+                &mut aes,
+                &ServerCommand {
+                    src_nwk: 0x1234,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::NOTIFICATION,
+                    payload: v::NOTIFICATION_COMM_GROUP_L3
+                },
+                20
+            ),
+            Ok((zcl_status::SUCCESS, Some(SinkOutcome::PassedThrough)))
+        );
+        assert!(core::iter::from_fn(|| s.take_event()).any(|e| matches!(
+            e,
+            SinkEvent::GpdCommand {
+                command_id: cmd::ATTRIBUTE_REPORTING,
+                ..
+            }
+        )));
+        assert_eq!(
+            s.on_server_command(
+                &mut aes,
+                &ServerCommand {
+                    src_nwk: 0x1234,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::NOTIFICATION,
+                    payload: v::NOTIFICATION_RX_AFTER_TX_PROXY_INFO
+                },
+                30
+            ),
+            Ok((zcl_status::SUCCESS, Some(SinkOutcome::Translated)))
+        );
+        assert_eq!(s.take_command().unwrap().translation.command_id, 0x02);
+        let mac = parse_mac(v::GPDF_L3_TOGGLE).unwrap();
+        let f = parse(&v::GPDF_L3_TOGGLE[mac.payload_offset..], mac.seq, None).unwrap();
+        assert_eq!(s.on_gpdf(&mut aes, &f, 40), SinkOutcome::Translated);
+        assert_eq!(s.entries()[0].frame_counter, 0x13);
+
+        s.exit_commissioning();
+        let tx = s.poll(50).unwrap().tx;
+        assert_eq!(
+            gp_command(&tx),
+            (client_cmd::PROXY_COMMISSIONING_MODE, v::PCM_EXIT)
+        );
+    }
+
+    #[test]
+    fn sink_commissioning_reply_matches_zigpy() {
+        let mut aes = SoftwareAesProvider;
+        let mut s = zha_like_sink();
+        s.enter_commissioning(0, false).unwrap();
+        let cn = CommissioningNotification {
+            gpd_id: GpdId::SrcId(v::SRC_ID),
+            rx_after_tx: true,
+            security_level: SecurityLevel::None,
+            key_type: KeyType::NoKey,
+            security_failed: None,
+            bidirectional_cap: true,
+            frame_counter: 5,
+            command_id: cmd::COMMISSIONING,
+            payload: Some(v::COMMISSIONING_SENSOR_L3),
+            proxy_info: ProxyInfo::Link {
+                gpp_short: 0x1234,
+                link: LINK,
+            },
+        };
+        let payload = encode::<96>(|b| cn.encode(b));
+        assert_eq!(
+            s.on_server_command(
+                &mut aes,
+                &ServerCommand {
+                    src_nwk: 0x1234,
+                    unicast: false,
+                    tsn: 0x42,
+                    command_id: server_cmd::COMMISSIONING_NOTIFICATION,
+                    payload: &payload
+                },
+                10
+            ),
+            Ok((
+                zcl_status::SUCCESS,
+                Some(SinkOutcome::CommissioningReplySent)
+            ))
+        );
+        let tx = s.poll(10).unwrap().tx;
+        assert_eq!(
+            gp_command(&tx),
+            (client_cmd::RESPONSE, v::RESPONSE_COMMISSIONING_REPLY)
+        );
+    }
+}

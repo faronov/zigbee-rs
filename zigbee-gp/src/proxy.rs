@@ -86,6 +86,11 @@ pub const GP_TX_QUEUE_LEN: usize = 5;
 pub const MAX_DOWNLINK_PAYLOAD: usize = 32;
 /// Default gpTxQueueEntryLifetime, ms.
 pub const DEFAULT_TX_QUEUE_LIFETIME_MS: u32 = 10_000;
+/// How long a TempMaster stays on a GPD's transmit channel waiting for the
+/// Channel Request that releases a queued Channel Configuration, ms. Matches
+/// the Silicon Labs GP client's channel-delivery timeout.
+#[cfg(feature = "proxy-full")]
+pub const CHANNEL_DELIVERY_TIMEOUT_MS: u32 = 5_000;
 /// gpTxOffset: a queued GPDF starts (first preamble symbol) this long after
 /// the *end* of the triggering GPDF, in µs. GP 1.1.1 measures gpTxOffset
 /// (20 ms) from the *start* of the triggering GPDF and allows
@@ -100,6 +105,16 @@ pub const GP_TX_OFFSET_US: u32 = 20_000;
 
 /// Default [`ProxyConfig::counter_persist_stride`].
 pub const DEFAULT_COUNTER_PERSIST_STRIDE: u32 = 64;
+/// GP 1.1 default gppNotificationRetryNumber (A.3.4.2).
+#[cfg(feature = "proxy-full")]
+pub const DEFAULT_NOTIFICATION_RETRY_NUMBER: u8 = 2;
+/// GP 1.1 default gppNotificationRetryTimer, milliseconds (A.3.4.2).
+#[cfg(feature = "proxy-full")]
+pub const DEFAULT_NOTIFICATION_RETRY_TIMER_MS: u8 = 100;
+/// Bounded outstanding full-unicast acknowledgements for the router's
+/// default four pending forwards and two full-unicast sinks per entry.
+#[cfg(feature = "proxy-full")]
+pub const NOTIFICATION_RETRY_QUEUE_LEN: usize = 8;
 
 /// Proxy configuration selected by the product.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,10 +133,26 @@ pub struct ProxyConfig {
     /// its counter passes the skipped-ahead floor. The default 64 keeps one
     /// GPD reporting every 60 s near ten years of a 10k-cycle, 4 KiB-sector
     /// two-sector journal (one write per ~64 min; see the GP design doc).
+    ///
+    /// This batched mode applies to reports; event commands (switches) are
+    /// written exactly while [`exact_counter_burst`](Self::exact_counter_burst)
+    /// allows it (see [`crate::counter`]).
     pub counter_persist_stride: u32,
+    /// Exact counter writes allowed in a burst ([`crate::counter`]); 0 keeps
+    /// every entry batched.
+    pub exact_counter_burst: u8,
+    /// One exact counter write is refilled per this many milliseconds.
+    pub exact_counter_refill_ms: u32,
     /// gpTxQueueEntryLifetime of a GPDF queued by a GP Response, ms
     /// (bidirectional proxies only).
     pub tx_queue_lifetime_ms: u32,
+    /// Number of GP Notification retries after the initial full-unicast
+    /// transmission.
+    #[cfg(feature = "proxy-full")]
+    pub notification_retry_number: u8,
+    /// Delay between full-unicast GP Notification transmissions, ms.
+    #[cfg(feature = "proxy-full")]
+    pub notification_retry_timer_ms: u8,
     /// Start of a GPDF sent from the gpTxQueue, in µs after the end of the
     /// GPDF that opened the GPD's receive window ([`GP_TX_OFFSET_US`]).
     #[cfg(feature = "proxy-bidirectional")]
@@ -130,14 +161,25 @@ pub struct ProxyConfig {
 
 impl Default for ProxyConfig {
     fn default() -> Self {
-        Self {
-            default_commissioning_window_s: DEFAULT_COMMISSIONING_WINDOW_S,
-            counter_persist_stride: DEFAULT_COUNTER_PERSIST_STRIDE,
-            tx_queue_lifetime_ms: DEFAULT_TX_QUEUE_LIFETIME_MS,
-            #[cfg(feature = "proxy-bidirectional")]
-            tx_offset_us: GP_TX_OFFSET_US,
-        }
+        Self::DEFAULT
     }
+}
+
+impl ProxyConfig {
+    /// The defaults, usable in constants.
+    pub const DEFAULT: Self = Self {
+        default_commissioning_window_s: DEFAULT_COMMISSIONING_WINDOW_S,
+        counter_persist_stride: DEFAULT_COUNTER_PERSIST_STRIDE,
+        exact_counter_burst: crate::counter::DEFAULT_EXACT_COUNTER_BURST,
+        exact_counter_refill_ms: crate::counter::DEFAULT_EXACT_COUNTER_REFILL_MS,
+        tx_queue_lifetime_ms: DEFAULT_TX_QUEUE_LIFETIME_MS,
+        #[cfg(feature = "proxy-full")]
+        notification_retry_number: DEFAULT_NOTIFICATION_RETRY_NUMBER,
+        #[cfg(feature = "proxy-full")]
+        notification_retry_timer_ms: DEFAULT_NOTIFICATION_RETRY_TIMER_MS,
+        #[cfg(feature = "proxy-bidirectional")]
+        tx_offset_us: GP_TX_OFFSET_US,
+    };
 }
 
 /// A unicast sink of a Proxy Table entry.
@@ -200,6 +242,8 @@ pub struct ProxyEntry {
     /// Search counter (inactive / invalid entries).
     pub search_counter: u8,
     persisted_counter: u32,
+    /// The last write stored the counter exactly ([`crate::counter`]).
+    counter_exact: bool,
 }
 
 impl ProxyEntry {
@@ -225,16 +269,40 @@ impl ProxyEntry {
             groupcast_radius: 0,
             search_counter: 0,
             persisted_counter: 0,
+            counter_exact: false,
         }
+    }
+
+    /// Whether the frame counter is stored exactly (written on every
+    /// accepted frame) rather than batched; persistence stores this with
+    /// the counter ([`crate::counter`]).
+    pub fn counter_exact(&self) -> bool {
+        self.counter_exact
+    }
+
+    /// The entry as restored from storage that recorded the counter mode
+    /// `exact` (storage without the mode restores batched: `false`).
+    pub fn with_counter_exact(mut self, exact: bool) -> Self {
+        self.counter_exact = exact;
+        self
     }
 
     /// Whether `self` and `other` differ at most in the frame counter.
     fn same_except_counter(&mut self, other: &Self) -> bool {
-        let counters = (self.frame_counter, self.persisted_counter);
+        let counters = (
+            self.frame_counter,
+            self.persisted_counter,
+            self.counter_exact,
+        );
         self.frame_counter = other.frame_counter;
         self.persisted_counter = other.persisted_counter;
+        self.counter_exact = other.counter_exact;
         let same = *self == *other;
-        (self.frame_counter, self.persisted_counter) = counters;
+        (
+            self.frame_counter,
+            self.persisted_counter,
+            self.counter_exact,
+        ) = counters;
         same
     }
 
@@ -484,6 +552,20 @@ struct Dest {
     addr: DestAddr,
     alias: Option<(u16, u8)>,
     radius: u8,
+    #[cfg(feature = "proxy-full")]
+    full_unicast: bool,
+}
+
+#[cfg(feature = "proxy-full")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotificationRetry {
+    due_ms: u32,
+    gpd_id: GpdId,
+    frame_counter: u32,
+    sink_nwk: u16,
+    sink_ieee: IeeeAddress,
+    tx: GpTx,
+    retries_left: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,6 +621,11 @@ pub enum DropReason {
     Duplicate,
     /// Reserved SrcID or malformed payload.
     Invalid,
+    /// IEEE-addressed GPDs require the Full Proxy feature.
+    UnsupportedApplicationId,
+    /// The proxy is temporarily on a GPD's transmit channel to deliver a
+    /// Channel Configuration; only that GPD's Channel Request is served.
+    OffChannel,
     /// Transmission queue full.
     QueueFull,
 }
@@ -609,6 +696,9 @@ pub struct ForwardStats {
     /// GPDF forwards cancelled before any transmission because another
     /// proxy tunnelled the same GPDF first (A.3.5.2.1).
     pub cancelled: u32,
+    /// Full-unicast forwards whose retry state could not be queued.
+    #[cfg(feature = "proxy-full")]
+    pub retry_queue_full: u32,
 }
 
 /// Our pending forward of a GPDF that another proxy's GP Notification
@@ -630,7 +720,11 @@ pub struct Proxy<const N: usize, const Q: usize> {
     dup: DuplicateFilter<8>,
     commissioning: Option<CommissioningState>,
     pending: heapless::Vec<Pending, Q>,
+    #[cfg(feature = "proxy-full")]
+    notification_retries: heapless::Vec<NotificationRetry, NOTIFICATION_RETRY_QUEUE_LEN>,
     dirty: bool,
+    /// Bounds exact frame-counter writes ([`crate::counter`]).
+    exact_budget: crate::counter::ExactBudget,
     /// The commissioning window elapsed and the owner was not told yet.
     commissioning_timed_out: bool,
     stats: ForwardStats,
@@ -649,6 +743,17 @@ struct Bidirectional {
     /// GPD this proxy was last appointed TempMaster for; it uses the
     /// shortest tunnelling delay for that GPD (A.3.9.1 step 12).
     temp_master_for: Option<GpdId>,
+    /// Temporary transmit channel for a Channel Configuration delivery
+    /// (A.3.9.1 step 8), and when the proxy gives up waiting there.
+    #[cfg(feature = "proxy-full")]
+    transmit_channel: Option<TransmitChannel>,
+}
+
+#[cfg(feature = "proxy-full")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransmitChannel {
+    channel: u8,
+    until_ms: u32,
 }
 
 fn due(now: u32, deadline: u32) -> bool {
@@ -688,11 +793,16 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             dup: DuplicateFilter::new(crate::dup::DUPLICATE_TIMEOUT_MS),
             commissioning: None,
             pending: heapless::Vec::new(),
+            #[cfg(feature = "proxy-full")]
+            notification_retries: heapless::Vec::new(),
             dirty: false,
+            exact_budget: crate::counter::ExactBudget::new(),
             commissioning_timed_out: false,
             stats: ForwardStats {
                 sent: 0,
                 cancelled: 0,
+                #[cfg(feature = "proxy-full")]
+                retry_queue_full: 0,
             },
             #[cfg(feature = "proxy-bidirectional")]
             bidi: Bidirectional {
@@ -700,7 +810,17 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 operational_channel: 0,
                 tx_queue: heapless::Vec::new(),
                 temp_master_for: None,
+                #[cfg(feature = "proxy-full")]
+                transmit_channel: None,
             },
+        }
+    }
+
+    fn counter_policy(&self) -> crate::counter::CounterPolicy {
+        crate::counter::CounterPolicy {
+            stride: self.config.counter_persist_stride.max(1),
+            exact_burst: self.config.exact_counter_burst,
+            exact_refill_ms: self.config.exact_counter_refill_ms,
         }
     }
 
@@ -720,6 +840,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     pub fn clear(&mut self) {
         self.table.clear();
         self.pending.clear();
+        #[cfg(feature = "proxy-full")]
+        self.notification_retries.clear();
         self.commissioning = None;
         self.commissioning_timed_out = false;
         self.dup = DuplicateFilter::new(crate::dup::DUPLICATE_TIMEOUT_MS);
@@ -728,6 +850,10 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         {
             self.bidi.tx_queue.clear();
             self.bidi.temp_master_for = None;
+            #[cfg(feature = "proxy-full")]
+            {
+                self.bidi.transmit_channel = None;
+            }
         }
     }
 
@@ -756,6 +882,10 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         self.bidi.capable = capable;
         if !capable {
             self.bidi.tx_queue.clear();
+            #[cfg(feature = "proxy-full")]
+            {
+                self.bidi.transmit_channel = None;
+            }
         }
     }
 
@@ -765,7 +895,56 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         if self.bidi.operational_channel != channel {
             self.bidi.operational_channel = channel;
             self.bidi.tx_queue.clear();
+            #[cfg(feature = "proxy-full")]
+            {
+                self.bidi.transmit_channel = None;
+            }
         }
+    }
+
+    /// The channel the radio must be on for a Channel Configuration
+    /// delivery (A.3.9.1 step 8), or `None` when the proxy needs the
+    /// operational channel. The owner tunes the radio to it and back; while
+    /// it is set the proxy serves only Channel Requests and defers its
+    /// network transmissions.
+    #[cfg(feature = "proxy-full")]
+    pub fn transmit_channel(&self, now_ms: u32) -> Option<u8> {
+        self.bidi
+            .transmit_channel
+            .filter(|t| !due(now_ms, t.until_ms))
+            .map(|t| t.channel)
+    }
+
+    /// Leave the transmit channel once its delivery is done or timed out,
+    /// dropping an undelivered Channel Configuration.
+    #[cfg(feature = "proxy-full")]
+    fn expire_transmit_channel(&mut self, now_ms: u32) {
+        if self
+            .bidi
+            .transmit_channel
+            .is_some_and(|t| due(now_ms, t.until_ms))
+        {
+            self.end_transmit_channel();
+        }
+    }
+
+    #[cfg(feature = "proxy-full")]
+    fn end_transmit_channel(&mut self) {
+        if self.bidi.transmit_channel.take().is_some() {
+            self.bidi.tx_queue.retain(|e| e.gpd_id != GpdId::SrcId(0));
+        }
+    }
+
+    /// Drop a pending Channel Configuration delivery, e.g. when the radio
+    /// cannot tune to its transmit channel.
+    #[cfg(feature = "proxy-full")]
+    pub fn abandon_transmit_channel(&mut self) {
+        self.end_transmit_channel();
+    }
+
+    #[cfg(feature = "proxy-full")]
+    fn on_transmit_channel(&self, now_ms: u32) -> bool {
+        self.transmit_channel(now_ms).is_some()
     }
 
     /// Whether this proxy has no gpTxQueue room for `gpd` (Notification
@@ -835,15 +1014,16 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
 
     /// Restore an entry from persistent storage.
     ///
-    /// A protected entry's frame counter is skipped ahead to the highest
-    /// value the proxy may have accepted before the reboot (`stored +
-    /// counter_persist_stride - 1`), so no frame it saw is accepted again.
-    /// The persisted value stays the stored one: the first frame above the
-    /// floor is persisted.
+    /// A protected entry's frame counter is moved to the highest value the
+    /// proxy may have accepted before the reboot: the stored counter when it
+    /// was written exactly, otherwise `stored + counter_persist_stride - 1`
+    /// ([`crate::counter`]), so no frame it saw is accepted again. The
+    /// persisted value stays the stored one.
     pub fn restore(&mut self, mut entry: ProxyEntry) -> Result<()> {
         if entry.security_level.is_protected() {
-            let skip = self.config.counter_persist_stride.max(1) - 1;
-            entry.frame_counter = entry.persisted_counter.saturating_add(skip);
+            entry.frame_counter = self
+                .counter_policy()
+                .restore_floor(entry.persisted_counter, entry.counter_exact);
         }
         if let Some(i) = self.find(&entry.gpd_id) {
             self.table[i] = entry;
@@ -879,6 +1059,16 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 w.u8(N.min(u8::MAX as usize) as u8)?;
                 UINT8
             }
+            #[cfg(feature = "proxy-full")]
+            attr::GPP_NOTIFICATION_RETRY_NUMBER => {
+                w.u8(self.config.notification_retry_number)?;
+                UINT8
+            }
+            #[cfg(feature = "proxy-full")]
+            attr::GPP_NOTIFICATION_RETRY_TIMER => {
+                w.u8(self.config.notification_retry_timer_ms)?;
+                UINT8
+            }
             attr::PROXY_TABLE => {
                 let mut total = 0usize;
                 let mut tmp = [0u8; MAX_ENTRY_ENCODED_LEN];
@@ -898,7 +1088,12 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 } else {
                     0
                 };
-                w.u24(functionality::BASIC_PROXY | bidirectional)?;
+                let full_proxy = if cfg!(feature = "proxy-full") {
+                    functionality::FULL_UNICAST | functionality::IEEE_ADDRESS
+                } else {
+                    0
+                };
+                w.u24(functionality::BASIC_PROXY | bidirectional | full_proxy)?;
                 BITMAP24
             }
             attr::GPP_ACTIVE_FUNCTIONALITY => {
@@ -932,11 +1127,24 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
 
     /// Next time `poll` has work, if any.
     pub fn next_deadline(&self) -> Option<u32> {
+        // Network transmissions wait until the radio is back on the
+        // operational channel.
+        #[cfg(feature = "proxy-full")]
+        if let Some(t) = self.bidi.transmit_channel {
+            return Some(t.until_ms);
+        }
         let mut best: Option<u32> = self.commissioning.and_then(|c| c.deadline_ms);
         for p in &self.pending {
             best = Some(match best {
                 Some(b) if due(p.due_ms, b) => b,
                 _ => p.due_ms,
+            });
+        }
+        #[cfg(feature = "proxy-full")]
+        for retry in &self.notification_retries {
+            best = Some(match best {
+                Some(b) if due(retry.due_ms, b) => b,
+                _ => retry.due_ms,
             });
         }
         best
@@ -946,6 +1154,43 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     /// repeatedly until it returns `None`.
     pub fn poll(&mut self, now_ms: u32) -> Option<GpTx> {
         self.expire_commissioning(now_ms);
+        #[cfg(feature = "proxy-full")]
+        {
+            self.expire_transmit_channel(now_ms);
+            if self.on_transmit_channel(now_ms) {
+                return None;
+            }
+        }
+        #[cfg(feature = "proxy-full")]
+        if let Some(i) = self
+            .notification_retries
+            .iter()
+            .position(|r| due(now_ms, r.due_ms))
+        {
+            let mut retry = self.notification_retries.remove(i);
+            let sink = self.find(&retry.gpd_id).and_then(|i| {
+                self.table[i]
+                    .unicast_sinks
+                    .iter()
+                    .find(|sink| sink.ieee == retry.sink_ieee && sink.full)
+                    .copied()
+            });
+            if let Some(sink) = sink {
+                retry.sink_nwk = sink.nwk;
+                retry.tx.dest = DestAddr::Unicast {
+                    nwk: sink.nwk,
+                    ieee: Some(sink.ieee),
+                };
+                let tx = retry.tx.clone();
+                if retry.retries_left > 1 {
+                    retry.retries_left -= 1;
+                    retry.due_ms =
+                        now_ms.wrapping_add(u32::from(self.config.notification_retry_timer_ms));
+                    let _ = self.notification_retries.push(retry);
+                }
+                return Some(tx);
+            }
+        }
         let idx = self.pending.iter().position(|p| due(now_ms, p.due_ms))?;
         let p = &mut self.pending[idx];
         if p.origin.is_some() && !p.started {
@@ -961,6 +1206,28 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         };
         let forwarded_group = matches!(d.addr, DestAddr::Group(_));
         let origin = p.origin;
+        #[cfg(feature = "proxy-full")]
+        let retry = (d.full_unicast && self.config.notification_retry_number > 0)
+            .then(|| {
+                let (gpd_id, frame_counter) = origin?;
+                let DestAddr::Unicast {
+                    nwk: sink_nwk,
+                    ieee: Some(sink_ieee),
+                } = d.addr
+                else {
+                    return None;
+                };
+                Some(NotificationRetry {
+                    due_ms: now_ms.wrapping_add(u32::from(self.config.notification_retry_timer_ms)),
+                    gpd_id,
+                    frame_counter,
+                    sink_nwk,
+                    sink_ieee,
+                    tx: tx.clone(),
+                    retries_left: self.config.notification_retry_number,
+                })
+            })
+            .flatten();
         if p.dests.is_empty() {
             self.pending.swap_remove(idx);
         }
@@ -969,6 +1236,12 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             && let Some(i) = self.find(&gpd)
         {
             self.table[i].first_to_forward = true;
+        }
+        #[cfg(feature = "proxy-full")]
+        if let Some(retry) = retry
+            && self.notification_retries.push(retry).is_err()
+        {
+            self.stats.retry_queue_full = self.stats.retry_queue_full.wrapping_add(1);
         }
         Some(tx)
     }
@@ -1020,6 +1293,18 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         let h = &frame.header;
         if h.to_gpd {
             return GpdfOutcome::Dropped(ToGpd);
+        }
+        if h.app_id == ApplicationId::Ieee && !cfg!(feature = "proxy-full") {
+            return GpdfOutcome::Dropped(UnsupportedApplicationId);
+        }
+        // The Channel Request that releases the Channel Configuration was
+        // already served by `take_downlink`; nothing is tunnelled from here.
+        #[cfg(feature = "proxy-full")]
+        {
+            self.expire_transmit_channel(now_ms);
+            if self.on_transmit_channel(now_ms) {
+                return GpdfOutcome::Dropped(OffChannel);
+            }
         }
         let gpd = h.gpd_id.unwrap_or(GpdId::SrcId(0));
         let entry_idx = self.find(&gpd);
@@ -1111,11 +1396,25 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         if self.dup.check_and_record(&gpd, counter, now_ms) {
             return GpdfOutcome::Dropped(Duplicate);
         }
-        let stride = self.config.counter_persist_stride.max(1);
+        let policy = self.counter_policy();
         let e = &mut self.table[i];
-        if protected || e.mac_seq_cap {
+        if protected {
             e.frame_counter = counter;
-            if counter.wrapping_sub(e.persisted_counter) >= stride {
+            let event = command_id.is_some_and(crate::counter::is_event_command);
+            if crate::counter::on_accepted(
+                &mut e.persisted_counter,
+                &mut e.counter_exact,
+                counter,
+                event,
+                &mut self.exact_budget,
+                &policy,
+                now_ms,
+            ) {
+                self.dirty = true;
+            }
+        } else if e.mac_seq_cap {
+            e.frame_counter = counter;
+            if counter.wrapping_sub(e.persisted_counter) >= policy.stride {
                 e.persisted_counter = counter;
                 self.dirty = true;
             }
@@ -1184,6 +1483,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 },
                 alias: None,
                 radius: 0,
+                #[cfg(feature = "proxy-full")]
+                full_unicast: s.full,
             });
         }
         if e.derived_group {
@@ -1194,6 +1495,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                     alias_seq::derive(frame.mac_seq, alias_seq::DERIVED_GROUPCAST),
                 )),
                 radius: e.groupcast_radius,
+                #[cfg(feature = "proxy-full")]
+                full_unicast: false,
             });
         }
         for g in &e.groups {
@@ -1204,6 +1507,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                     alias_seq::derive(frame.mac_seq, alias_seq::COMMISSIONED_GROUPCAST),
                 )),
                 radius: e.groupcast_radius,
+                #[cfg(feature = "proxy-full")]
+                full_unicast: false,
             });
         }
         if dests.is_empty() {
@@ -1319,6 +1624,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             addr: dest_addr,
             alias,
             radius: 0,
+            #[cfg(feature = "proxy-full")]
+            full_unicast: false,
         });
         let delay = if h.rx_after_tx {
             tunneling_delay_ms(true, self.is_temp_master_for(gpd), false, link)
@@ -1371,6 +1678,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             }
             client_cmd::NOTIFICATION_RESPONSE => {
                 let r = NotificationResponse::decode(payload)?;
+                #[cfg(feature = "proxy-full")]
+                self.acknowledge_notification(src_nwk, &r.gpd_id, r.frame_counter, r.no_pairing);
                 if let Some(i) = self.find(&r.gpd_id) {
                     let e = &mut self.table[i];
                     e.first_to_forward |= r.first_to_forward;
@@ -1387,6 +1696,29 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             _ => return Err(Error::Unsupported),
         }
         Ok(fx)
+    }
+
+    #[cfg(feature = "proxy-full")]
+    fn acknowledge_notification(
+        &mut self,
+        src_nwk: u16,
+        gpd_id: &GpdId,
+        frame_counter: u32,
+        no_pairing: bool,
+    ) {
+        let current_sink = self.find(gpd_id).and_then(|i| {
+            self.table[i]
+                .unicast_sinks
+                .iter()
+                .find(|sink| sink.nwk == src_nwk && sink.full)
+                .map(|sink| sink.ieee)
+        });
+        self.notification_retries.retain(|retry| {
+            let same_delivery = retry.gpd_id.matches(gpd_id)
+                && (retry.sink_nwk == src_nwk || Some(retry.sink_ieee) == current_sink)
+                && (no_pairing || retry.frame_counter == frame_counter);
+            !same_delivery
+        });
     }
 
     fn on_proxy_commissioning_mode(
@@ -1573,10 +1905,16 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             }
             _ => return Err(Error::Unsupported),
         }
+        let new_entry = before.is_none();
         if before.is_none_or(|b| !e.same_except_counter(&b))
             || e.frame_counter.wrapping_sub(e.persisted_counter) >= stride
         {
             e.persisted_counter = e.frame_counter;
+            // A new entry has accepted nothing yet: its counter is exact.
+            // An existing one keeps its mode.
+            if new_entry && self.config.exact_counter_burst != 0 {
+                e.counter_exact = true;
+            }
             self.dirty = true;
         }
         Ok(())
@@ -1588,8 +1926,9 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
     /// GPD's next `rxAfterTx` window and sets FirstToForward. It fails with
     /// [`Error::Unsupported`] when this proxy cannot act as TempMaster
     /// (unidirectional build or platform), or when the TempMaster would have
-    /// to switch to another channel (Channel Configuration delivery on a
-    /// non-operational channel). A full gpTxQueue returns
+    /// to switch to another channel: only a `proxy-full` build switches, and
+    /// only for a Maintenance Channel Configuration (see
+    /// [`transmit_channel`](Self::transmit_channel)). A full gpTxQueue returns
     /// [`Error::BufferFull`]. A Response appointing another proxy drops our
     /// queued GPDF for that GPD and clears FirstToForward.
     fn on_response(&mut self, r: &Response<'_>, _now_ms: u32) -> Result<()> {
@@ -1605,6 +1944,11 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
             if self.is_temp_master_for(&r.gpd_id) {
                 self.bidi.temp_master_for = None;
             }
+            // Another proxy delivers the Channel Configuration.
+            #[cfg(feature = "proxy-full")]
+            if r.gpd_id == GpdId::SrcId(0) {
+                self.end_transmit_channel();
+            }
         }
         if let Some(i) = self.find(&r.gpd_id) {
             self.table[i].first_to_forward = false;
@@ -1617,9 +1961,30 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         if !self.bidi.capable || r.transmit_on_endpoint_match {
             return Err(Error::Unsupported);
         }
-        // Delivery on another channel needs the TempMaster channel switch
-        // of A.3.9.1 step 8 (proxy-full).
-        if self.bidi.operational_channel == 0 || r.tx_channel() != self.bidi.operational_channel {
+        if self.bidi.operational_channel == 0 {
+            return Err(Error::Unsupported);
+        }
+        let off_channel = r.tx_channel() != self.bidi.operational_channel;
+        #[cfg(feature = "proxy-full")]
+        {
+            self.expire_transmit_channel(now_ms);
+            let other_channel = self
+                .bidi
+                .transmit_channel
+                .is_some_and(|t| t.channel != r.tx_channel());
+            // A.3.9.1 step 8: only a Maintenance Channel Configuration is
+            // delivered off the operational channel, one channel at a time.
+            if off_channel
+                && (r.gpd_id != GpdId::SrcId(0)
+                    || r.command_id != cmd::CHANNEL_CONFIGURATION
+                    || other_channel)
+            {
+                return Err(Error::Unsupported);
+            }
+        }
+        // Without proxy-full there is no channel switch.
+        #[cfg(not(feature = "proxy-full"))]
+        if off_channel {
             return Err(Error::Unsupported);
         }
         let payload = heapless::Vec::from_slice(r.payload).map_err(|_| Error::BufferFull)?;
@@ -1639,6 +2004,13 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         self.bidi.temp_master_for = Some(r.gpd_id);
         if let Some(i) = self.find(&r.gpd_id) {
             self.table[i].first_to_forward = true;
+        }
+        #[cfg(feature = "proxy-full")]
+        if off_channel {
+            self.bidi.transmit_channel = Some(TransmitChannel {
+                channel: r.tx_channel(),
+                until_ms: now_ms.wrapping_add(CHANNEL_DELIVERY_TIMEOUT_MS),
+            });
         }
         Ok(())
     }
@@ -1676,6 +2048,15 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         }
         let channel_request = frame.clear_command_id() == Some(cmd::CHANNEL_REQUEST);
         if !h.rx_after_tx && !channel_request {
+            return None;
+        }
+        #[cfg(feature = "proxy-full")]
+        let on_transmit_channel = {
+            self.expire_transmit_channel(now_ms);
+            self.on_transmit_channel(now_ms)
+        };
+        #[cfg(feature = "proxy-full")]
+        if on_transmit_channel && !channel_request {
             return None;
         }
         self.bidi.tx_queue.retain(|e| !due(now_ms, e.expires_ms));
@@ -1749,6 +2130,15 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
         )
         .ok()?;
         self.bidi.tx_queue.swap_remove(idx);
+        // A.3.9.1 step 8: back to the operational channel. The Channel
+        // Request is not tunnelled, or the sink would answer it with yet
+        // another off-channel GP Response.
+        #[cfg(feature = "proxy-full")]
+        if maintenance && on_transmit_channel {
+            self.end_transmit_channel();
+            let counter = u32::from(frame.mac_seq);
+            let _ = self.dup.check_and_record(&gpd, counter, now_ms);
+        }
         Some(n)
     }
 
@@ -1904,6 +2294,8 @@ impl<const N: usize, const Q: usize> Proxy<N, Q> {
                 addr: DestAddr::Broadcast(BROADCAST_RX_ON_WHEN_IDLE),
                 alias: Some((nwk, 0)),
                 radius: 0,
+                #[cfg(feature = "proxy-full")]
+                full_unicast: false,
             });
             let delay = D_MIN_U_MS + random % (D_MAX_MS - D_MIN_U_MS + 1);
             let _ = self.schedule(Pending {
@@ -1980,7 +2372,21 @@ mod tests {
     }
 
     fn paired_proxy(fc: u32) -> P {
-        let mut p = P::new(ProxyConfig::default());
+        paired_proxy_with(ProxyConfig::default(), fc)
+    }
+
+    /// Batched counter persistence only (the original behaviour).
+    const BATCHED: ProxyConfig = ProxyConfig {
+        exact_counter_burst: 0,
+        ..ProxyConfig::DEFAULT
+    };
+
+    fn batched_proxy(fc: u32) -> P {
+        paired_proxy_with(BATCHED, fc)
+    }
+
+    fn paired_proxy_with(config: ProxyConfig, fc: u32) -> P {
+        let mut p = P::new(config);
         p.set_own_nwk(0x1234);
         let mut reply = None;
         let fx = p
@@ -2007,7 +2413,25 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes([out[0], out[1], out[2], 0]),
             functionality::BASIC_PROXY
+                | if cfg!(feature = "proxy-full") {
+                    functionality::FULL_UNICAST | functionality::IEEE_ADDRESS
+                } else {
+                    0
+                }
         );
+        #[cfg(feature = "proxy-full")]
+        {
+            assert_eq!(
+                p.read_attribute(attr::GPP_NOTIFICATION_RETRY_NUMBER, &mut out),
+                Ok(Some((0x20, 1)))
+            );
+            assert_eq!(out[0], DEFAULT_NOTIFICATION_RETRY_NUMBER);
+            assert_eq!(
+                p.read_attribute(attr::GPP_NOTIFICATION_RETRY_TIMER, &mut out),
+                Ok(Some((0x20, 1)))
+            );
+            assert_eq!(out[0], DEFAULT_NOTIFICATION_RETRY_TIMER_MS);
+        }
         assert_eq!(
             p.read_attribute(attr::GPP_ACTIVE_FUNCTIONALITY, &mut out),
             Ok(Some((0x1A, 3)))
@@ -2359,6 +2783,15 @@ mod tests {
 
     /// Encrypted OFF GPDF of SRC with KEY_C0, NWK part (no MAC header).
     fn secure_off(fc: u32, rx_after_tx: bool) -> heapless::Vec<u8, 64> {
+        secure_command(fc, rx_after_tx, cmd::OFF, &[])
+    }
+
+    fn secure_command(
+        fc: u32,
+        rx_after_tx: bool,
+        command: u8,
+        payload: &[u8],
+    ) -> heapless::Vec<u8, 64> {
         let params = crate::frame::GpdfParams {
             frame_type: FrameType::Data,
             auto_commissioning: false,
@@ -2375,8 +2808,8 @@ mod tests {
             Some(&KEY_C0),
             &params,
             fc as u8,
-            cmd::OFF,
-            &[],
+            command,
+            payload,
             &mut out,
         )
         .unwrap();
@@ -2458,7 +2891,9 @@ mod tests {
             p.forward_stats(),
             ForwardStats {
                 sent: 1,
-                cancelled: 1
+                cancelled: 1,
+                #[cfg(feature = "proxy-full")]
+                retry_queue_full: 0,
             }
         );
     }
@@ -2518,7 +2953,9 @@ mod tests {
             p.forward_stats(),
             ForwardStats {
                 sent: 0,
-                cancelled: 1
+                cancelled: 1,
+                #[cfg(feature = "proxy-full")]
+                retry_queue_full: 0,
             }
         );
     }
@@ -2557,7 +2994,7 @@ mod tests {
     fn repeated_pairing_does_not_rewrite_the_table() {
         const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
         // ZHA sends the same GP Pairing for every commissioning GPDF.
-        let mut p = paired_proxy(1176);
+        let mut p = batched_proxy(1176);
         let fx = pair(&mut p, &zha_pairing(1176));
         assert!(fx.groups.is_empty());
         assert!(!p.take_dirty(), "identical pairing");
@@ -2584,7 +3021,8 @@ mod tests {
 
     /// The Proxy Table snapshot the runtime journals when the proxy
     /// reports it dirty.
-    type Flash = heapless::Vec<heapless::Vec<u8, MAX_ENTRY_ENCODED_LEN>, 4>;
+    /// Each entry's encoding and its stored counter mode.
+    type Flash = heapless::Vec<(heapless::Vec<u8, MAX_ENTRY_ENCODED_LEN>, bool), 4>;
 
     fn journal(p: &P) -> Flash {
         let mut out = [0u8; MAX_ENTRY_ENCODED_LEN];
@@ -2592,7 +3030,10 @@ mod tests {
             .iter()
             .map(|e| {
                 let n = e.encode(&mut out).unwrap();
-                heapless::Vec::from_slice(&out[..n]).unwrap()
+                (
+                    heapless::Vec::from_slice(&out[..n]).unwrap(),
+                    e.counter_exact(),
+                )
             })
             .collect()
     }
@@ -2601,10 +3042,10 @@ mod tests {
     fn reboot(config: ProxyConfig, flash: &Flash) -> P {
         let mut rebooted = P::new(config);
         rebooted.set_own_nwk(0x1234);
-        for bytes in flash {
+        for (bytes, exact) in flash {
             let (entry, used) = ProxyEntry::decode(bytes).unwrap();
             assert_eq!(used, bytes.len());
-            rebooted.restore(entry).unwrap();
+            rebooted.restore(entry.with_counter_exact(*exact)).unwrap();
         }
         rebooted
     }
@@ -2618,7 +3059,7 @@ mod tests {
     #[test]
     fn reboot_skips_the_counter_ahead_by_the_stride() {
         const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
-        let mut p = paired_proxy(1000);
+        let mut p = batched_proxy(1000);
         let flash = journal(&p);
         // Accept frames up to the last one before the next write.
         let mut now = 0;
@@ -2657,7 +3098,7 @@ mod tests {
     #[test]
     fn reboot_after_a_write_rejects_replays_below_the_new_floor() {
         const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
-        let mut p = paired_proxy(1000);
+        let mut p = batched_proxy(1000);
         assert_eq!(gpdf(&mut p, 1000 + S, 1_000), GpdfOutcome::Notification);
         assert!(p.take_dirty(), "written at 1000+stride");
         let flash = journal(&p);
@@ -2696,9 +3137,111 @@ mod tests {
         assert_eq!(gpdf(&mut p, 1002, 3_000), GpdfOutcome::Notification);
     }
 
+    /// Send every due notification (keeps the forward queue empty).
+    fn drain(p: &mut P, now_ms: u32) {
+        while p.poll(now_ms.wrapping_add(1_000)).is_some() {}
+    }
+
+    /// An attribute report (0xA0, batched persistence) with counter `fc`.
+    fn report(p: &mut P, fc: u32, now_ms: u32) -> GpdfOutcome {
+        let raw = secure_command(fc, false, 0xA0, &[0x02, 0x04, 0x00, 0x00, 0x29, 0x10, 0x09]);
+        let f = parse(&raw, fc as u8, None).unwrap();
+        p.on_gpdf(&mut SoftwareAesProvider, &f, GppGpdLink(0), now_ms)
+    }
+
+    /// Reboot after `n` frames of a switch (exact) or a sensor (batched):
+    /// nothing accepted before is accepted again, and a switch's next press
+    /// is accepted at once.
+    #[test]
+    fn reboot_after_1_2_64_65_frames_in_both_modes() {
+        const S: u32 = DEFAULT_COUNTER_PERSIST_STRIDE;
+        for n in [1u32, 2, 64, 65] {
+            for switch in [true, false] {
+                let mut p = paired_proxy(1000);
+                let mut flash = journal(&p);
+                let mut now = 0;
+                for fc in 1001..=1000 + n {
+                    // A press or report a minute apart (inside the budget).
+                    now += 60_000;
+                    let outcome = if switch {
+                        gpdf(&mut p, fc, now)
+                    } else {
+                        report(&mut p, fc, now)
+                    };
+                    assert_eq!(outcome, GpdfOutcome::Notification, "n {n} fc {fc}");
+                    drain(&mut p, now);
+                    if p.take_dirty() {
+                        flash = journal(&p);
+                    }
+                }
+                let mut r = reboot(p.config, &flash);
+                for fc in 1000..=1000 + n {
+                    now += 1_000;
+                    let outcome = if switch {
+                        gpdf(&mut r, fc, now)
+                    } else {
+                        report(&mut r, fc, now)
+                    };
+                    assert_eq!(
+                        outcome,
+                        GpdfOutcome::Dropped(DropReason::Stale),
+                        "n {n} switch {switch}: replayed {fc}"
+                    );
+                }
+                let next = 1000 + n + 1;
+                now += 60_000;
+                if switch {
+                    assert!(p.entries()[0].counter_exact());
+                    assert_eq!(
+                        gpdf(&mut r, next, now),
+                        GpdfOutcome::Notification,
+                        "n {n}: the first press after the reboot"
+                    );
+                } else {
+                    let floor = r.entries()[0].frame_counter;
+                    assert!(floor >= 1000 + n && floor < 1000 + n + S, "n {n}: {floor}");
+                    assert!(!p.entries()[0].counter_exact());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn presses_beyond_the_budget_fall_back_to_batched_safely() {
+        let mut p = paired_proxy(0);
+        let mut flash = journal(&p);
+        let mut writes = 0;
+        // 40 presses inside one second: the burst of 16 is written exactly,
+        // then one batched write, then nothing until the stride.
+        for fc in 1..=40 {
+            assert_eq!(gpdf(&mut p, fc, fc * 10), GpdfOutcome::Notification);
+            drain(&mut p, fc * 10);
+            if p.take_dirty() {
+                writes += 1;
+                flash = journal(&p);
+            }
+        }
+        assert_eq!(writes, 17);
+        assert!(!p.entries()[0].counter_exact());
+        let mut r = reboot(p.config, &flash);
+        for fc in 1..=40 {
+            assert_eq!(
+                gpdf(&mut r, fc, 1_000),
+                GpdfOutcome::Dropped(DropReason::Stale),
+                "replayed {fc}"
+            );
+        }
+        // A minute later the budget allows exact writes again.
+        assert_eq!(gpdf(&mut p, 41, 70_000), GpdfOutcome::Notification);
+        assert!(p.take_dirty());
+        assert!(p.entries()[0].counter_exact());
+        let mut r = reboot(p.config, &journal(&p));
+        assert_eq!(gpdf(&mut r, 42, 71_000), GpdfOutcome::Notification);
+    }
+
     #[test]
     fn skip_ahead_saturates_and_leaves_unprotected_entries_alone() {
-        let mut p = paired_proxy(u32::MAX - 3);
+        let mut p = batched_proxy(u32::MAX - 3);
         let p2 = reboot(p.config, &journal(&p));
         assert_eq!(p2.entries()[0].frame_counter, u32::MAX, "exhausted");
         // An unsecured MAC-sequence entry keeps its 8-bit window.
@@ -2814,7 +3357,9 @@ mod tests {
         let n = p.entries()[0].encode(&mut buf).unwrap();
         let (e, used) = ProxyEntry::decode(&buf[..n]).unwrap();
         assert_eq!(used, n);
-        assert_eq!(e, p.entries()[0]);
+        // The counter mode is stored next to the entry, not in it.
+        assert!(!e.counter_exact());
+        assert_eq!(e.with_counter_exact(true), p.entries()[0]);
 
         let rm = Pairing {
             gpd_id: GpdId::SrcId(SRC),
@@ -2924,6 +3469,275 @@ mod tests {
         // Every rxAfterTx forward starts after the GPD's receive window
         // opens at gpTxOffset.
         const { assert!(D_MIN_B_MS > GP_TX_OFFSET_US / 1000) };
+    }
+
+    #[cfg(feature = "proxy-full")]
+    #[test]
+    fn full_unicast_notification_retries_and_stops_on_matching_response() {
+        let gpd_id = GpdId::SrcId(SRC);
+        let sink_nwk = 0x4567;
+        let mut proxy = P::new(ProxyConfig {
+            counter_persist_stride: 1,
+            ..ProxyConfig::default()
+        });
+        let mut entry = ProxyEntry::new(gpd_id);
+        entry
+            .unicast_sinks
+            .push(UnicastSink {
+                ieee: [1, 2, 3, 4, 5, 6, 7, 8],
+                nwk: sink_nwk,
+                full: true,
+            })
+            .unwrap();
+        proxy.restore(entry).unwrap();
+        let frame = parse(&[0x0C, 0x21, 0x43, 0x65, 0x87, cmd::TOGGLE], 9, None).unwrap();
+        assert_eq!(
+            proxy.on_gpdf(&mut SoftwareAesProvider, &frame, GppGpdLink(0xC0), 0),
+            GpdfOutcome::Notification
+        );
+
+        let first = proxy.poll(D_MIN_U_MS).unwrap();
+        assert_eq!(
+            first.dest,
+            DestAddr::Unicast {
+                nwk: sink_nwk,
+                ieee: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+            }
+        );
+        assert_eq!(proxy.next_deadline(), Some(D_MIN_U_MS + 100));
+        assert!(proxy.poll(D_MIN_U_MS + 99).is_none());
+        let retry = proxy.poll(D_MIN_U_MS + 100).unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(proxy.next_deadline(), Some(D_MIN_U_MS + 200));
+
+        let response = NotificationResponse {
+            gpd_id,
+            first_to_forward: true,
+            no_pairing: false,
+            frame_counter: 9,
+        };
+        let mut payload = [0u8; 16];
+        let len = response.encode(&mut payload).unwrap();
+        let mut reply = None;
+        proxy
+            .on_client_command(
+                sink_nwk + 1,
+                client_cmd::NOTIFICATION_RESPONSE,
+                &payload[..len],
+                D_MIN_U_MS + 110,
+                &mut reply,
+            )
+            .unwrap();
+        assert_eq!(proxy.next_deadline(), Some(D_MIN_U_MS + 200));
+
+        let stale_response = NotificationResponse {
+            frame_counter: 8,
+            ..response
+        };
+        let stale_len = stale_response.encode(&mut payload).unwrap();
+        proxy
+            .on_client_command(
+                sink_nwk,
+                client_cmd::NOTIFICATION_RESPONSE,
+                &payload[..stale_len],
+                D_MIN_U_MS + 115,
+                &mut reply,
+            )
+            .unwrap();
+        assert_eq!(proxy.next_deadline(), Some(D_MIN_U_MS + 200));
+
+        let len = response.encode(&mut payload).unwrap();
+        proxy
+            .on_client_command(
+                sink_nwk,
+                client_cmd::NOTIFICATION_RESPONSE,
+                &payload[..len],
+                D_MIN_U_MS + 120,
+                &mut reply,
+            )
+            .unwrap();
+        assert_eq!(proxy.next_deadline(), None);
+        assert!(proxy.poll(D_MIN_U_MS + 500).is_none());
+    }
+
+    #[cfg(feature = "proxy-full")]
+    #[test]
+    fn full_unicast_retry_count_is_bounded() {
+        let gpd_id = GpdId::SrcId(SRC);
+        let mut proxy = P::new(ProxyConfig {
+            notification_retry_number: 1,
+            ..ProxyConfig::default()
+        });
+        let mut entry = ProxyEntry::new(gpd_id);
+        entry
+            .unicast_sinks
+            .push(UnicastSink {
+                ieee: [1, 2, 3, 4, 5, 6, 7, 8],
+                nwk: 0x4567,
+                full: true,
+            })
+            .unwrap();
+        proxy.restore(entry).unwrap();
+        let frame = parse(&[0x0C, 0x21, 0x43, 0x65, 0x87, cmd::TOGGLE], 9, None).unwrap();
+        proxy.on_gpdf(&mut SoftwareAesProvider, &frame, GppGpdLink(0xC0), 0);
+
+        assert!(proxy.poll(D_MIN_U_MS).is_some());
+        assert!(proxy.poll(D_MIN_U_MS + 100).is_some());
+        assert_eq!(proxy.next_deadline(), None);
+        assert!(proxy.poll(D_MIN_U_MS + 200).is_none());
+    }
+
+    #[cfg(feature = "proxy-full")]
+    #[test]
+    fn no_pairing_response_cancels_pending_full_unicast_retries() {
+        let gpd_id = GpdId::SrcId(SRC);
+        let mut proxy = P::new(ProxyConfig::default());
+        let mut entry = ProxyEntry::new(gpd_id);
+        entry
+            .unicast_sinks
+            .push(UnicastSink {
+                ieee: [1, 2, 3, 4, 5, 6, 7, 8],
+                nwk: 0x4567,
+                full: true,
+            })
+            .unwrap();
+        proxy.restore(entry).unwrap();
+        let frame = parse(&[0x0C, 0x21, 0x43, 0x65, 0x87, cmd::TOGGLE], 9, None).unwrap();
+        proxy.on_gpdf(&mut SoftwareAesProvider, &frame, GppGpdLink(0xC0), 0);
+        assert!(proxy.poll(D_MIN_U_MS).is_some());
+
+        let response = NotificationResponse {
+            gpd_id,
+            first_to_forward: false,
+            no_pairing: true,
+            frame_counter: 2,
+        };
+        let mut payload = [0u8; 16];
+        let len = response.encode(&mut payload).unwrap();
+        let mut reply = None;
+        proxy
+            .on_client_command(
+                0x4567,
+                client_cmd::NOTIFICATION_RESPONSE,
+                &payload[..len],
+                D_MIN_U_MS,
+                &mut reply,
+            )
+            .unwrap();
+
+        assert_eq!(proxy.next_deadline(), None);
+        assert!(proxy.poll(D_MIN_U_MS + 100).is_none());
+    }
+
+    #[cfg(feature = "proxy-full")]
+    #[test]
+    fn full_unicast_retry_tracks_sink_device_annce_address_update() {
+        let gpd_id = GpdId::SrcId(SRC);
+        let ieee = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut proxy = P::new(ProxyConfig::default());
+        let mut entry = ProxyEntry::new(gpd_id);
+        entry
+            .unicast_sinks
+            .push(UnicastSink {
+                ieee,
+                nwk: 0x4567,
+                full: true,
+            })
+            .unwrap();
+        proxy.restore(entry).unwrap();
+        let frame = parse(&[0x0C, 0x21, 0x43, 0x65, 0x87, cmd::TOGGLE], 9, None).unwrap();
+        proxy.on_gpdf(&mut SoftwareAesProvider, &frame, GppGpdLink(0xC0), 0);
+        assert!(proxy.poll(D_MIN_U_MS).is_some());
+
+        proxy.on_device_annce(0x6789, ieee, D_MIN_U_MS, 0);
+        let retry = proxy.poll(D_MIN_U_MS + 100).unwrap();
+        assert_eq!(
+            retry.dest,
+            DestAddr::Unicast {
+                nwk: 0x6789,
+                ieee: Some(ieee),
+            }
+        );
+    }
+
+    #[cfg(not(feature = "proxy-full"))]
+    #[test]
+    fn basic_proxy_rejects_ieee_addressed_gpdfs() {
+        let ieee = [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE];
+        let frame = parse(&[0x8C, 0x02, 0x0B, cmd::TOGGLE], 7, Some(ieee)).unwrap();
+        let mut proxy = P::new(ProxyConfig::default());
+        assert_eq!(
+            proxy.on_gpdf(&mut SoftwareAesProvider, &frame, GppGpdLink(0xC0), 0),
+            GpdfOutcome::Dropped(DropReason::UnsupportedApplicationId)
+        );
+    }
+
+    #[cfg(feature = "proxy-full")]
+    #[test]
+    fn full_proxy_authenticates_and_forwards_protected_ieee_gpdfs() {
+        let ieee = [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE];
+        let gpd = GpdId::Ieee {
+            ieee,
+            endpoint: 0x0B,
+        };
+        let mut proxy = P::new(ProxyConfig::default());
+        let mut entry = ProxyEntry::new(gpd);
+        entry.security_level = SecurityLevel::Encrypted;
+        entry.key_type = KeyType::GpdGroupKey;
+        entry.key = Some(KEY_C0);
+        entry.frame_counter = 1;
+        entry.persisted_counter = 1;
+        entry.derived_group = true;
+        proxy.restore(entry).unwrap();
+
+        let frame_counter = 100;
+        let header = [
+            0x8C,
+            0x02 | ((SecurityLevel::Encrypted as u8) << 3),
+            0x0B,
+            frame_counter as u8,
+            (frame_counter >> 8) as u8,
+            (frame_counter >> 16) as u8,
+            (frame_counter >> 24) as u8,
+        ];
+        let mut protected = [0u8; 16];
+        let protected_len = security::seal(
+            &mut SoftwareAesProvider,
+            &KEY_C0,
+            &security::SealContext {
+                gpd,
+                frame_counter,
+                level: SecurityLevel::Encrypted,
+                direction: Direction::FromGpd,
+            },
+            &header,
+            &[cmd::TOGGLE],
+            &mut protected,
+        )
+        .unwrap();
+        let mut msdu = heapless::Vec::<u8, 32>::new();
+        msdu.extend_from_slice(&header).unwrap();
+        msdu.extend_from_slice(&protected[..protected_len]).unwrap();
+
+        let mut forged = msdu.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        let forged_frame = parse(&forged, 7, Some(ieee)).unwrap();
+        assert_eq!(
+            proxy.on_gpdf(&mut SoftwareAesProvider, &forged_frame, GppGpdLink(0xC0), 0),
+            GpdfOutcome::Dropped(DropReason::AuthFailed)
+        );
+
+        let frame = parse(&msdu, 7, Some(ieee)).unwrap();
+
+        assert_eq!(
+            proxy.on_gpdf(&mut SoftwareAesProvider, &frame, GppGpdLink(0xC0), 0),
+            GpdfOutcome::Notification
+        );
+        let tx = proxy.poll(D_MIN_U_MS).unwrap();
+        let TxFrame::GpCommand { payload, .. } = tx.frame else {
+            panic!()
+        };
+        assert_eq!(Notification::decode(&payload).unwrap().gpd_id, gpd);
     }
 
     #[cfg(feature = "proxy-bidirectional")]
@@ -3182,6 +3996,114 @@ mod tests {
                 late,
             )
             .unwrap();
+        }
+
+        #[cfg(feature = "proxy-full")]
+        fn commissioning(p: &mut P, now_ms: u32) {
+            let mut reply = None;
+            p.on_client_command(
+                0,
+                client_cmd::PROXY_COMMISSIONING_MODE,
+                &zha_pcm(true),
+                now_ms,
+                &mut reply,
+            )
+            .unwrap();
+        }
+
+        #[cfg(feature = "proxy-full")]
+        #[test]
+        fn channel_configuration_is_delivered_on_the_gpd_transmit_channel() {
+            const TX_CHANNEL: u8 = 15;
+            let mut p = bidi_proxy(1);
+            commissioning(&mut p, 0);
+            // Only a Maintenance Channel Configuration may move the radio.
+            assert_eq!(
+                response(
+                    &mut p,
+                    GpdId::SrcId(SRC),
+                    0x1234,
+                    TX_CHANNEL,
+                    0xF3,
+                    &[0x1E],
+                    0
+                ),
+                Err(Error::Unsupported)
+            );
+            assert_eq!(p.transmit_channel(0), None);
+            response(
+                &mut p,
+                GpdId::SrcId(0),
+                0x1234,
+                TX_CHANNEL,
+                0xF3,
+                &[0x1E],
+                0,
+            )
+            .unwrap();
+            assert_eq!(p.transmit_channel(0), Some(TX_CHANNEL));
+            // One channel at a time.
+            assert_eq!(
+                response(&mut p, GpdId::SrcId(0), 0x1234, 20, 0xF3, &[0x1E], 1),
+                Err(Error::Unsupported)
+            );
+            assert_eq!(p.next_deadline(), Some(CHANNEL_DELIVERY_TIMEOUT_MS));
+
+            // Off channel: other GPDFs are neither answered nor tunnelled,
+            // and network transmissions wait.
+            let data = uplink(Some(SRC), Some(&KEY_C0), 2, true, cmd::TOGGLE, &[]);
+            assert!(take(&mut p, &data, 10).is_none());
+            assert_eq!(
+                p.on_gpdf(&mut SoftwareAesProvider, &gpdf(&data), GppGpdLink(0), 10),
+                GpdfOutcome::Dropped(DropReason::OffChannel)
+            );
+            assert!(p.poll(10).is_none());
+
+            let req = uplink(None, None, 0, false, cmd::CHANNEL_REQUEST, &[0xEE]);
+            let down = take(&mut p, &req, 20).unwrap();
+            assert_eq!(&down[7..], &[0x0D, 0xF3, 0x1E]);
+            assert_eq!(p.transmit_channel(20), None);
+            // The releasing Channel Request is not tunnelled back to the sink.
+            assert_eq!(
+                p.on_gpdf(&mut SoftwareAesProvider, &gpdf(&req), GppGpdLink(0), 20),
+                GpdfOutcome::Dropped(DropReason::Duplicate)
+            );
+        }
+
+        #[cfg(feature = "proxy-full")]
+        #[test]
+        fn undelivered_channel_configuration_times_out_back_to_operation() {
+            let mut p = bidi_proxy(1);
+            response(&mut p, GpdId::SrcId(0), 0x1234, 15, 0xF3, &[0x1E], 0).unwrap();
+            let end = CHANNEL_DELIVERY_TIMEOUT_MS;
+            assert_eq!(p.transmit_channel(end - 1), Some(15));
+            assert_eq!(p.transmit_channel(end), None);
+            assert!(p.poll(end).is_none());
+            assert_eq!(p.next_deadline(), None);
+            // The undelivered frame is gone; a later Channel Request on the
+            // operational channel gets nothing.
+            let req = uplink(None, None, 0, false, cmd::CHANNEL_REQUEST, &[0xEE]);
+            assert!(take(&mut p, &req, end + 1).is_none());
+            // Normal tunnelling resumes.
+            let data = uplink(Some(SRC), Some(&KEY_C0), 2, false, cmd::TOGGLE, &[]);
+            assert_eq!(
+                p.on_gpdf(
+                    &mut SoftwareAesProvider,
+                    &gpdf(&data),
+                    GppGpdLink(0),
+                    end + 1
+                ),
+                GpdfOutcome::Notification
+            );
+        }
+
+        #[cfg(feature = "proxy-full")]
+        #[test]
+        fn other_temp_master_ends_our_channel_delivery() {
+            let mut p = bidi_proxy(1);
+            response(&mut p, GpdId::SrcId(0), 0x1234, 15, 0xF3, &[0x1E], 0).unwrap();
+            response(&mut p, GpdId::SrcId(0), 0x5678, 15, 0xF3, &[0x1E], 1).unwrap();
+            assert_eq!(p.transmit_channel(1), None);
         }
 
         #[test]

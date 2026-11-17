@@ -420,6 +420,64 @@ mod tests {
     }
 
     #[test]
+    fn protected_ieee_gpdf_round_trips_at_levels_2_and_3() {
+        let ieee = [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE];
+        let gpd = GpdId::Ieee {
+            ieee,
+            endpoint: 0x0B,
+        };
+        let mut provider = SoftwareAesProvider;
+
+        for level in [SecurityLevel::FullCounterMic, SecurityLevel::Encrypted] {
+            let frame_counter = 0x1234_5678;
+            let header = [
+                0x8C,
+                0x02 | ((level as u8) << 3),
+                0x0B,
+                frame_counter as u8,
+                (frame_counter >> 8) as u8,
+                (frame_counter >> 16) as u8,
+                (frame_counter >> 24) as u8,
+            ];
+            let clear = [crate::types::cmd::TOGGLE, 0x5A];
+            let mut protected = [0u8; 16];
+            let protected_len = seal(
+                &mut provider,
+                &KEY_C0,
+                &SealContext {
+                    gpd,
+                    frame_counter,
+                    level,
+                    direction: Direction::FromGpd,
+                },
+                &header,
+                &clear,
+                &mut protected,
+            )
+            .unwrap();
+            let mut msdu = heapless::Vec::<u8, 32>::new();
+            msdu.extend_from_slice(&header).unwrap();
+            msdu.extend_from_slice(&protected[..protected_len]).unwrap();
+
+            let frame = parse(&msdu, 7, Some(ieee)).unwrap();
+            assert_eq!(frame.header.gpd_id, Some(gpd));
+            assert_eq!(frame.header.security_level, level);
+            assert_eq!(
+                &open(&mut provider, &KEY_C0, &frame, Direction::FromGpd).unwrap()[..],
+                &clear
+            );
+
+            let mut forged = msdu.clone();
+            *forged.last_mut().unwrap() ^= 1;
+            let frame = parse(&forged, 7, Some(ieee)).unwrap();
+            assert_eq!(
+                open(&mut provider, &KEY_C0, &frame, Direction::FromGpd),
+                Err(Error::AuthFailed)
+            );
+        }
+    }
+
+    #[test]
     fn tampered_frame_fails_auth() {
         // Frame counter changed from 2 to 3 in the authenticated header.
         let msdu = [

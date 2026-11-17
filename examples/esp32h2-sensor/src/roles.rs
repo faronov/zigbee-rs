@@ -136,6 +136,10 @@ pub struct CommissioningTrigger {
     button: Input<'static>,
     was_pressed: bool,
     awaiting_since: Option<Instant>,
+    /// `combo-light`: a BOOT press while not awaiting commissioning, for
+    /// [`take_press`](Self::take_press).
+    #[cfg(feature = "combo-light")]
+    press: bool,
 }
 
 impl CommissioningTrigger {
@@ -144,7 +148,16 @@ impl CommissioningTrigger {
             was_pressed: button.is_low(),
             button,
             awaiting_since: None,
+            #[cfg(feature = "combo-light")]
+            press: false,
         }
+    }
+
+    /// `combo-light`: whether BOOT was pressed while no commissioning
+    /// request was awaited (e.g. while joined) since the last call.
+    #[cfg(feature = "combo-light")]
+    pub fn take_press(&mut self) -> bool {
+        core::mem::take(&mut self.press)
     }
 
     /// Call once per run-loop step; `true` means request commissioning.
@@ -153,6 +166,10 @@ impl CommissioningTrigger {
         let press_edge = pressed && !self.was_pressed;
         self.was_pressed = pressed;
         if !awaiting {
+            #[cfg(feature = "combo-light")]
+            {
+                self.press |= press_edge;
+            }
             self.awaiting_since = None;
             return false;
         }

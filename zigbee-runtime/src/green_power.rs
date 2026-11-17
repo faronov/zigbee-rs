@@ -24,6 +24,16 @@
 //! Proxy Table persistence is the product's responsibility through
 //! [`crate::gp_store`]; [`ZigbeeDevice::gp_take_dirty`] reports when the table
 //! changed.
+//!
+//! With `green-power-sink` the router is also a GP sink (combo device,
+//! [`zigbee_gp::sink`]): GP server commands on the GP endpoint (GP
+//! Notification, GP Commissioning Notification, GP Sink Commissioning Mode,
+//! GP Sink Table Request, server attribute reads and writes) go to the sink;
+//! a GPDF heard directly is processed by the sink as well as by the proxy and
+//! is never tunnelled to this node; translated GPD commands are delivered to
+//! the configured local application endpoint through the ZCL dispatcher as
+//! locally originated, non-unicast commands; the Sink Table shares the GP
+//! journal of [`crate::gp_store`].
 
 use zigbee_aps::ApsTxOptions;
 use zigbee_aps::apsde::{ApsdeDataIndication, ApsdeDataRequest};
@@ -48,6 +58,18 @@ pub const GP_TX_QUEUE_DEPTH: usize = 4;
 
 /// The router's Green Power proxy.
 pub type GpProxy = Proxy<GP_PROXY_TABLE_ENTRIES, GP_TX_QUEUE_DEPTH>;
+
+/// Sink Table capacity of a combo built with `green-power-sink`.
+#[cfg(feature = "green-power-sink")]
+pub const GP_SINK_TABLE_ENTRIES: usize = 8;
+/// Queued sink transmissions (GP Pairing, Proxy Commissioning Mode, GP
+/// Response, responses, alias `Device_annce`).
+#[cfg(feature = "green-power-sink")]
+pub const GP_SINK_TX_QUEUE_DEPTH: usize = 4;
+
+/// The combo's Green Power sink.
+#[cfg(feature = "green-power-sink")]
+pub type GpSink = zigbee_gp::sink::Sink<GP_SINK_TABLE_ENTRIES, GP_SINK_TX_QUEUE_DEPTH>;
 
 /// Largest GPDF the TempMaster sends to a GPD: 7-octet MAC header, NWK
 /// header with SrcID and frame counter (10), command ID plus
@@ -75,6 +97,9 @@ const ZCL_SERVER_TO_CLIENT: u8 = 0x08;
 const ZCL_DISABLE_DEFAULT_RESPONSE: u8 = 0x10;
 const ZCL_READ_ATTRIBUTES: u8 = 0x00;
 const ZCL_READ_ATTRIBUTES_RESPONSE: u8 = 0x01;
+const ZCL_WRITE_ATTRIBUTES: u8 = 0x02;
+const ZCL_WRITE_ATTRIBUTES_RESPONSE: u8 = 0x04;
+const ZCL_DEFAULT_RESPONSE: u8 = 0x0B;
 const ZCL_UNSUPPORTED_ATTRIBUTE: u8 = 0x86;
 const ZCL_INSUFFICIENT_SPACE: u8 = 0x89;
 
@@ -124,6 +149,15 @@ pub struct GreenPowerState {
     /// the next [`ZigbeeDevice::gp_poll`].
     reply: Option<OutFrame>,
     tsn: u8,
+    /// Temporary channel the radio was tuned to for a Channel Configuration
+    /// delivery; `None` while on the operational channel.
+    #[cfg(feature = "green-power-full-proxy")]
+    off_channel: Option<u8>,
+    #[cfg(feature = "green-power-sink")]
+    sink: GpSink,
+    /// The GP frame being handled was APS-unicast to this node.
+    #[cfg(feature = "green-power-sink")]
+    rx_unicast: bool,
 }
 
 impl GreenPowerState {
@@ -133,6 +167,12 @@ impl GreenPowerState {
             clock: GpClock::new(),
             reply: None,
             tsn: 0,
+            #[cfg(feature = "green-power-full-proxy")]
+            off_channel: None,
+            #[cfg(feature = "green-power-sink")]
+            sink: GpSink::new(zigbee_gp::sink::SinkConfig::default()),
+            #[cfg(feature = "green-power-sink")]
+            rx_unicast: false,
         }
     }
 
@@ -157,6 +197,21 @@ impl GreenPowerState {
     pub(crate) fn clear(&mut self) {
         self.proxy.clear();
         self.reply = None;
+        // Leave and rejoin retune the radio themselves.
+        #[cfg(feature = "green-power-full-proxy")]
+        {
+            self.off_channel = None;
+        }
+        #[cfg(feature = "green-power-sink")]
+        self.sink.clear();
+    }
+
+    /// Record whether the APS frame about to be handled was unicast to this
+    /// node (GP Notification Response, Sink Table Response, Default
+    /// Response only answer unicast requests).
+    #[cfg(feature = "green-power-sink")]
+    pub(crate) fn set_rx_unicast(&mut self, unicast: bool) {
+        self.rx_unicast = unicast;
     }
 
     fn next_tsn(&mut self) -> u8 {
@@ -205,8 +260,14 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         &mut self.green_power.proxy
     }
 
-    /// Whether the Proxy Table changed since the last call (persist it).
+    /// Whether the Proxy Table (or, with `green-power-sink`, the Sink Table)
+    /// changed since the last call (persist it).
     pub fn gp_take_dirty(&mut self) -> bool {
+        #[cfg(feature = "green-power-sink")]
+        if self.green_power.sink.take_dirty() {
+            self.green_power.proxy.take_dirty();
+            return true;
+        }
         self.green_power.proxy.take_dirty()
     }
 
@@ -220,6 +281,13 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
     pub fn gp_restore_groups(&mut self) {
         let aps = self.bdb.zdo_mut().aps_mut();
         for group in self.green_power.proxy.required_groups() {
+            let _ = aps.apsme_add_group(&zigbee_aps::apsme::ApsmeAddGroupRequest {
+                group_address: group,
+                endpoint: GP_ENDPOINT,
+            });
+        }
+        #[cfg(feature = "green-power-sink")]
+        for group in self.green_power.sink.required_groups() {
             let _ = aps.apsme_add_group(&zigbee_aps::apsme::ApsmeAddGroupRequest {
                 group_address: group,
                 endpoint: GP_ENDPOINT,
@@ -326,6 +394,42 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             Ok(()) => log::info!("[GP] TempMaster GPDF sent ({} B)", downlink.len),
             Err(error) => log::warn!("[GP] TempMaster GPDF not sent: {:?}", error),
         }
+        // A delivered Channel Configuration ends a temporary channel.
+        #[cfg(feature = "green-power-full-proxy")]
+        self.gp_sync_radio_channel().await;
+    }
+
+    /// Tune the radio to the channel the proxy needs: a GPD's transmit
+    /// channel while a Channel Configuration waits for delivery (GP 1.1
+    /// A.3.9.1 step 8), otherwise back to the operational channel.
+    #[cfg(feature = "green-power-full-proxy")]
+    async fn gp_sync_radio_channel(&mut self) {
+        let now_ms = self.gp_now_ms();
+        let wanted = self.green_power.proxy.transmit_channel(now_ms);
+        if wanted == self.green_power.off_channel {
+            return;
+        }
+        let channel = wanted.unwrap_or(self.bdb.zdo().nwk().nib().logical_channel);
+        let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+        match mac
+            .mlme_set(
+                zigbee_mac::PibAttribute::PhyCurrentChannel,
+                zigbee_mac::PibValue::U8(channel),
+            )
+            .await
+        {
+            Ok(()) => {
+                log::info!("[GP] radio on channel {}", channel);
+                self.green_power.off_channel = wanted;
+            }
+            Err(error) => {
+                log::warn!("[GP] channel {} switch failed: {:?}", channel, error);
+                if wanted.is_some() {
+                    // Give up the delivery rather than retrying every pass.
+                    self.green_power.proxy.abandon_transmit_channel();
+                }
+            }
+        }
     }
 
     /// Handle a received GPDF (NWK protocol version 3). Never reaches the
@@ -361,6 +465,16 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                 log::debug!("[GP] GPDF {:?} dropped: {:?}", frame.header.gpd_id, reason)
             }
             _ => log::info!("[GP] GPDF {:?}: {:?}", frame.header.gpd_id, outcome),
+        }
+        // Combo: the sink processes the GPDF itself; it is not tunnelled to
+        // this node.
+        #[cfg(feature = "green-power-sink")]
+        {
+            self.gp_sink_sync();
+            let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+            let outcome = self.green_power.sink.on_gpdf(mac, &frame, now_ms);
+            gp_log_sink_outcome(frame.header.gpd_id, outcome);
+            self.gp_sink_apply_groups();
         }
     }
 
@@ -445,9 +559,24 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                         src_addr
                     );
                 }
+                #[cfg(feature = "green-power-sink")]
+                self.gp_sink_server_command(src_addr, fc, tsn, command, payload, now_ms);
             }
-        } else if fc & 0x03 == 0 && to_client && command == ZCL_READ_ATTRIBUTES {
-            self.gp_read_attributes(src_addr, tsn, payload);
+        } else if fc & 0x03 == 0 && to_client {
+            match command {
+                ZCL_READ_ATTRIBUTES => self.gp_read_attributes(src_addr, tsn, payload),
+                ZCL_WRITE_ATTRIBUTES => self.gp_write_attributes(src_addr, tsn, payload),
+                _ => {}
+            }
+        }
+        // GP server attributes (sink, 0x0000-0x0007).
+        #[cfg(feature = "green-power-sink")]
+        if fc & 0x03 == 0 && !to_client {
+            match command {
+                ZCL_READ_ATTRIBUTES => self.gp_sink_read_attributes(src_addr, tsn, payload),
+                ZCL_WRITE_ATTRIBUTES => self.gp_sink_write_attributes(src_addr, tsn, payload),
+                _ => {}
+            }
         }
         true
     }
@@ -463,6 +592,11 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                     });
                 }
                 GroupChange::Leave(group) => {
+                    // The combo's sink may still need the group.
+                    #[cfg(feature = "green-power-sink")]
+                    if self.green_power.sink.required_groups().any(|g| g == group) {
+                        continue;
+                    }
                     let _ = aps.apsme_remove_group(&zigbee_aps::apsme::ApsmeRemoveGroupRequest {
                         group_address: group,
                         endpoint: GP_ENDPOINT,
@@ -545,7 +679,30 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                     payload,
                 },
             },
-            zcl_frame_control: ZCL_DISABLE_DEFAULT_RESPONSE,
+            zcl_frame_control: ZCL_SERVER_TO_CLIENT | ZCL_DISABLE_DEFAULT_RESPONSE,
+            tsn: Some(tsn),
+        });
+    }
+
+    /// Apply Write Attributes to the Full Proxy retry controls and answer
+    /// unsupported/read-only attributes with their ZCL status.
+    fn gp_write_attributes(&mut self, src_addr: u16, tsn: u8, request: &[u8]) {
+        let (command_id, payload) =
+            gp_write_attributes_response(&mut self.green_power.proxy, request);
+        self.green_power.reply = Some(OutFrame {
+            tx: GpTx {
+                dest: DestAddr::Unicast {
+                    nwk: src_addr,
+                    ieee: None,
+                },
+                alias: None,
+                radius: 0,
+                frame: TxFrame::GpCommand {
+                    command_id,
+                    payload,
+                },
+            },
+            zcl_frame_control: ZCL_SERVER_TO_CLIENT | ZCL_DISABLE_DEFAULT_RESPONSE,
             tsn: Some(tsn),
         });
     }
@@ -586,7 +743,33 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         if self.green_power.reply.is_some() {
             return Some(0);
         }
+        #[cfg(feature = "green-power-full-proxy")]
+        {
+            let now_ms = self.gp_now_ms();
+            if self.green_power.proxy.transmit_channel(now_ms) != self.green_power.off_channel {
+                return Some(0);
+            }
+        }
+        #[cfg(feature = "green-power-sink")]
+        if self.green_power.sink.has_tx() {
+            return Some(0);
+        }
+        #[cfg(not(feature = "green-power-sink"))]
         let deadline = self.green_power.proxy.next_deadline()?;
+        #[cfg(feature = "green-power-sink")]
+        let deadline = match (
+            self.green_power.proxy.next_deadline(),
+            self.green_power.sink.next_deadline(),
+        ) {
+            (Some(a), Some(b)) => {
+                if b.wrapping_sub(a) < 0x8000_0000 {
+                    a
+                } else {
+                    b
+                }
+            }
+            (a, b) => a.or(b)?,
+        };
         let now_ms = self.gp_now_ms();
         let remaining_ms = deadline.wrapping_sub(now_ms);
         Some(if remaining_ms >= 0x8000_0000 {
@@ -604,9 +787,18 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             self.green_power.reply = None;
             return;
         }
+        // Retune first: due network frames are sent only on the operational
+        // channel, a Channel Configuration only on the GPD's.
+        #[cfg(feature = "green-power-full-proxy")]
+        self.gp_sync_radio_channel().await;
         let own_nwk = self.bdb.zdo().nwk().nib().network_address.0;
         self.green_power.proxy.set_own_nwk(own_nwk);
         for _ in 0..MAX_TX_PER_POLL {
+            // The sink's frames share the reply slot (one transmit path).
+            #[cfg(feature = "green-power-sink")]
+            if self.green_power.reply.is_none() {
+                self.green_power.reply = self.gp_sink_next_frame();
+            }
             let frame = match self.green_power.reply.take() {
                 Some(frame) => frame,
                 None => {
@@ -695,6 +887,528 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
     }
 }
 
+#[cfg(feature = "green-power-sink")]
+fn gp_log_sink_outcome(
+    gpd: Option<zigbee_gp::types::GpdId>,
+    outcome: zigbee_gp::sink::SinkOutcome,
+) {
+    match outcome {
+        zigbee_gp::sink::SinkOutcome::Dropped(reason) => {
+            log::debug!("[GP] sink {:?} dropped: {:?}", gpd, reason)
+        }
+        _ => log::info!("[GP] sink {:?}: {:?}", gpd, outcome),
+    }
+}
+
+#[cfg(feature = "green-power-sink")]
+fn gp_log_sink_command(src: u16, command: u8, outcome: zigbee_gp::sink::SinkOutcome) {
+    match outcome {
+        zigbee_gp::sink::SinkOutcome::Dropped(reason) => {
+            log::debug!(
+                "[GP] sink cmd 0x{:02X} from 0x{:04X} dropped: {:?}",
+                command,
+                src,
+                reason
+            )
+        }
+        _ => log::info!(
+            "[GP] sink cmd 0x{:02X} from 0x{:04X}: {:?}",
+            command,
+            src,
+            outcome
+        ),
+    }
+}
+
+/// ZCL Read Attributes Response records for `request`, served by `read`;
+/// stops at the last record that fits one frame (ZCL 2.5.2.3).
+#[cfg(feature = "green-power-sink")]
+fn gp_read_attributes_payload(
+    request: &[u8],
+    mut read: impl FnMut(u16, &mut [u8]) -> zigbee_gp::Result<Option<(u8, usize)>>,
+) -> heapless::Vec<u8, { zigbee_gp::proxy::MAX_GP_COMMAND_LEN }> {
+    let mut payload = heapless::Vec::new();
+    let mut value = [0u8; MAX_TX_PAYLOAD];
+    for id in request.chunks_exact(2) {
+        let id_bytes = [id[0], id[1]];
+        let record_start = payload.len();
+        let ok = match read(u16::from_le_bytes(id_bytes), &mut value) {
+            Ok(Some((data_type, len))) => {
+                payload.extend_from_slice(&id_bytes).is_ok()
+                    && payload.push(0x00).is_ok()
+                    && payload.push(data_type).is_ok()
+                    && payload.extend_from_slice(&value[..len]).is_ok()
+            }
+            Ok(None) => {
+                payload.extend_from_slice(&id_bytes).is_ok()
+                    && payload.push(ZCL_UNSUPPORTED_ATTRIBUTE).is_ok()
+            }
+            Err(_) => {
+                payload.extend_from_slice(&id_bytes).is_ok()
+                    && payload.push(ZCL_INSUFFICIENT_SPACE).is_ok()
+            }
+        };
+        if !ok || payload.len() > MAX_TX_PAYLOAD {
+            payload.truncate(record_start);
+            break;
+        }
+    }
+    payload
+}
+
+/// Write Attributes to the GP server attributes of the sink: the response
+/// command and payload.
+#[cfg(feature = "green-power-sink")]
+fn gp_sink_write_attributes_response(
+    sink: &mut GpSink,
+    request: &[u8],
+) -> (
+    u8,
+    heapless::Vec<u8, { zigbee_gp::proxy::MAX_GP_COMMAND_LEN }>,
+) {
+    use zigbee_zcl::ZclStatus;
+    use zigbee_zcl::data_types::ZclValue;
+    use zigbee_zcl::foundation::write_attributes::{
+        WriteAttributeStatusRecord, WriteAttributesRequest, WriteAttributesResponse,
+    };
+    let mut payload = heapless::Vec::new();
+    let Ok(parsed) = WriteAttributesRequest::parse_checked(request) else {
+        let _ =
+            payload.extend_from_slice(&[ZCL_WRITE_ATTRIBUTES, ZclStatus::MalformedCommand as u8]);
+        return (ZCL_DEFAULT_RESPONSE, payload);
+    };
+    let mut applied = WriteAttributesResponse {
+        records: heapless::Vec::new(),
+    };
+    for record in &parsed.request.records {
+        let mut raw = [0u8; 2];
+        let value: &[u8] = match record.value {
+            ZclValue::Bitmap8(v) | ZclValue::U8(v) => {
+                raw[0] = v;
+                &raw[..1]
+            }
+            ZclValue::U16(v) => {
+                raw = v.to_le_bytes();
+                &raw[..2]
+            }
+            _ => &[],
+        };
+        let status = sink.write_attribute(record.id.0, record.data_type as u8, value);
+        let _ = applied.records.push(WriteAttributeStatusRecord {
+            status: ZclStatus::from_u8(status),
+            id: record.id,
+        });
+    }
+    let response = parsed.merge_in_request_order(&applied);
+    let mut encoded = [0u8; zigbee_gp::proxy::MAX_GP_COMMAND_LEN];
+    let len = response.serialize(&mut encoded);
+    let _ = payload.extend_from_slice(&encoded[..len]);
+    (ZCL_WRITE_ATTRIBUTES_RESPONSE, payload)
+}
+
+#[cfg(feature = "green-power-sink")]
+impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
+    /// The combo's Green Power sink (Sink Table inspection).
+    pub fn gp_sink(&self) -> &GpSink {
+        &self.green_power.sink
+    }
+
+    /// Mutable access to the sink, e.g. to apply the product's
+    /// [`zigbee_gp::sink::SinkConfig`] at boot.
+    pub fn gp_sink_mut(&mut self) -> &mut GpSink {
+        &mut self.green_power.sink
+    }
+
+    /// Choose the local application endpoint that receives translated GPD
+    /// commands (`None`: GPD commands are only reported as events).
+    pub fn gp_sink_set_endpoint(&mut self, endpoint: Option<u8>) {
+        self.green_power.sink.set_endpoint(endpoint);
+    }
+
+    /// Enter sink commissioning mode (e.g. on a button press), optionally
+    /// putting the network's proxies into commissioning mode too. Fails with
+    /// [`zigbee_gp::Error::Unsupported`] while this node is not a joined
+    /// router or when gpsSecurityLevel asks to involve the Trust Center.
+    pub fn gp_sink_enter_commissioning(
+        &mut self,
+        involve_proxies: bool,
+    ) -> Result<(), zigbee_gp::Error> {
+        if !self.gp_active() {
+            return Err(zigbee_gp::Error::Unsupported);
+        }
+        self.gp_sink_sync();
+        let now_ms = self.gp_now_ms();
+        self.green_power
+            .sink
+            .enter_commissioning(now_ms, involve_proxies)?;
+        log::info!(
+            "[GP] sink commissioning mode entered (proxies {})",
+            involve_proxies
+        );
+        Ok(())
+    }
+
+    /// Leave sink commissioning mode.
+    pub fn gp_sink_exit_commissioning(&mut self) {
+        self.green_power.sink.exit_commissioning();
+    }
+
+    /// Remove a GPD from the Sink Table (GP Pairing with RemoveGPD is
+    /// broadcast by the next [`gp_poll`](Self::gp_poll)).
+    pub fn gp_sink_remove(&mut self, gpd: &zigbee_gp::types::GpdId) -> bool {
+        let removed = self.green_power.sink.remove(gpd);
+        self.gp_sink_apply_groups();
+        removed
+    }
+
+    /// Next sink event (commissioning, decommissioning, untranslated GPD
+    /// commands such as attribute reports).
+    pub fn gp_sink_take_event(&mut self) -> Option<zigbee_gp::sink::SinkEvent> {
+        self.green_power.sink.take_event()
+    }
+
+    /// Give the sink this node's current addresses and channel.
+    pub(crate) fn gp_sink_sync(&mut self) {
+        let nib = self.bdb.zdo().nwk().nib();
+        let (nwk, ieee, pan_id, channel) = (
+            nib.network_address.0,
+            nib.ieee_address,
+            nib.pan_id.0,
+            nib.logical_channel,
+        );
+        let bidirectional = self.green_power.proxy.bidirectional();
+        let sink = &mut self.green_power.sink;
+        sink.set_own_address(nwk, ieee, pan_id);
+        sink.set_operational_channel(channel);
+        sink.set_direct_bidirectional(bidirectional);
+    }
+
+    /// Apply the sink's GPEP group changes; a group the proxy still needs is
+    /// kept.
+    fn gp_sink_apply_groups(&mut self) {
+        while let Some(change) = self.green_power.sink.take_group_change() {
+            let aps = self.bdb.zdo_mut().aps_mut();
+            match change {
+                GroupChange::Join(group) => {
+                    let _ = aps.apsme_add_group(&zigbee_aps::apsme::ApsmeAddGroupRequest {
+                        group_address: group,
+                        endpoint: GP_ENDPOINT,
+                    });
+                }
+                GroupChange::Leave(group) => {
+                    if self.green_power.proxy.required_groups().any(|g| g == group) {
+                        continue;
+                    }
+                    let _ = aps.apsme_remove_group(&zigbee_aps::apsme::ApsmeRemoveGroupRequest {
+                        group_address: group,
+                        endpoint: GP_ENDPOINT,
+                    });
+                }
+            }
+        }
+    }
+
+    /// A GP server command (client → server) for the sink. Unicast requests
+    /// get a ZCL Default Response on error or when it was not disabled
+    /// (ZCL 2.5.12).
+    fn gp_sink_server_command(
+        &mut self,
+        src_addr: u16,
+        fc: u8,
+        tsn: u8,
+        command: u8,
+        payload: &[u8],
+        now_ms: u32,
+    ) {
+        const ZCL_MALFORMED_COMMAND: u8 = 0x80;
+        const ZCL_UNSUP_CLUSTER_COMMAND: u8 = 0x81;
+        self.gp_sink_sync();
+        let unicast = self.green_power.rx_unicast;
+        let command_frame = zigbee_gp::sink::ServerCommand {
+            src_nwk: src_addr,
+            unicast,
+            tsn,
+            command_id: command,
+            payload,
+        };
+        let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
+        let status = match self
+            .green_power
+            .sink
+            .on_server_command(mac, &command_frame, now_ms)
+        {
+            Ok((status, outcome)) => {
+                if let Some(outcome) = outcome {
+                    gp_log_sink_command(src_addr, command, outcome);
+                }
+                status
+            }
+            Err(zigbee_gp::Error::Unsupported) => {
+                log::debug!("[GP] sink cmd 0x{:02X} not supported", command);
+                ZCL_UNSUP_CLUSTER_COMMAND
+            }
+            Err(error) => {
+                log::debug!("[GP] sink cmd 0x{:02X}: {:?}", command, error);
+                ZCL_MALFORMED_COMMAND
+            }
+        };
+        self.gp_sink_apply_groups();
+        if unicast && (status != 0 || fc & ZCL_DISABLE_DEFAULT_RESPONSE == 0) {
+            let mut response = heapless::Vec::new();
+            let _ = response.extend_from_slice(&[command, status]);
+            self.green_power.reply = Some(OutFrame {
+                tx: GpTx {
+                    dest: DestAddr::Unicast {
+                        nwk: src_addr,
+                        ieee: None,
+                    },
+                    alias: None,
+                    radius: 0,
+                    frame: TxFrame::GpCommand {
+                        command_id: ZCL_DEFAULT_RESPONSE,
+                        payload: response,
+                    },
+                },
+                zcl_frame_control: ZCL_SERVER_TO_CLIENT | ZCL_DISABLE_DEFAULT_RESPONSE,
+                tsn: Some(tsn),
+            });
+        }
+    }
+
+    /// Answer a Read Attributes request for the GP server attributes.
+    fn gp_sink_read_attributes(&mut self, src_addr: u16, tsn: u8, request: &[u8]) {
+        let sink = &self.green_power.sink;
+        let payload = gp_read_attributes_payload(request, |id, out| sink.read_attribute(id, out));
+        self.gp_sink_reply(src_addr, tsn, ZCL_READ_ATTRIBUTES_RESPONSE, payload);
+    }
+
+    /// Apply Write Attributes to the writable GP server attributes.
+    fn gp_sink_write_attributes(&mut self, src_addr: u16, tsn: u8, request: &[u8]) {
+        let (command_id, payload) =
+            gp_sink_write_attributes_response(&mut self.green_power.sink, request);
+        self.gp_sink_reply(src_addr, tsn, command_id, payload);
+    }
+
+    fn gp_sink_reply(
+        &mut self,
+        src_addr: u16,
+        tsn: u8,
+        command_id: u8,
+        payload: heapless::Vec<u8, { zigbee_gp::proxy::MAX_GP_COMMAND_LEN }>,
+    ) {
+        self.green_power.reply = Some(OutFrame {
+            tx: GpTx {
+                dest: DestAddr::Unicast {
+                    nwk: src_addr,
+                    ieee: None,
+                },
+                alias: None,
+                radius: 0,
+                frame: TxFrame::GpCommand {
+                    command_id,
+                    payload,
+                },
+            },
+            zcl_frame_control: ZCL_SERVER_TO_CLIENT | ZCL_DISABLE_DEFAULT_RESPONSE,
+            tsn: Some(tsn),
+        });
+    }
+
+    /// Deliver the sink's translated GPD commands to the local application
+    /// endpoint through the ZCL dispatcher, as locally originated (source:
+    /// this node, GP endpoint) non-unicast commands, so no ZCL response goes
+    /// on air. Returns the first resulting event.
+    #[inline(never)]
+    pub(crate) fn gp_sink_deliver(
+        &mut self,
+        clusters: &mut [crate::ClusterRef<'_>],
+    ) -> Option<crate::event_loop::StackEvent> {
+        let own_nwk = self.bdb.zdo().nwk().nib().network_address.0;
+        let mut event = None;
+        while let Some(command) = self.green_power.sink.take_command() {
+            let translation = &command.translation;
+            let mut zcl = [0u8; 3 + zigbee_gp::translation::MAX_TRANSLATED_PAYLOAD];
+            zcl[0] = ZCL_CLUSTER_SPECIFIC | ZCL_DISABLE_DEFAULT_RESPONSE;
+            zcl[1] = self.green_power.next_tsn();
+            zcl[2] = translation.command_id;
+            let len = 3 + translation.payload.len();
+            zcl[3..len].copy_from_slice(&translation.payload);
+            log::info!(
+                "[GP] sink {:?}: cluster 0x{:04X} cmd 0x{:02X} to endpoint {}",
+                command.gpd_id,
+                translation.cluster_id,
+                translation.command_id,
+                command.endpoint
+            );
+            // SAFETY: the ZCL scratch is only borrowed by the synchronous
+            // dispatcher, as in `dispatch_application_zcl`.
+            let zcl_scratch = unsafe { &mut *self.scratch.zcl.get() };
+            let ctx = crate::zcl_dispatch::LocalZclCtx::new(
+                &self.endpoints,
+                &mut self.basic_cluster,
+                &mut self.identify_clusters,
+                &mut self.reporting,
+                &mut self.remote_reporting,
+                &mut self.pending_responses,
+                clusters,
+                zcl_scratch,
+            )
+            .with_unicast(false);
+            #[cfg(any(feature = "groups", test))]
+            let ctx = ctx.with_group_table(self.bdb.zdo().aps().group_table());
+            let outcome = ctx.dispatch(
+                command.endpoint,
+                GP_ENDPOINT,
+                translation.cluster_id,
+                own_nwk,
+                &zcl[..len],
+            );
+            if event.is_none() {
+                event = outcome.event;
+            }
+        }
+        event
+    }
+
+    /// The sink's next frame. A GP Response that appoints this node
+    /// TempMaster is also handed to its own proxy: the broadcast does not
+    /// come back to the sender.
+    fn gp_sink_next_frame(&mut self) -> Option<OutFrame> {
+        self.gp_sink_sync();
+        let now_ms = self.gp_now_ms();
+        let out = self.green_power.sink.poll(now_ms)?;
+        #[cfg(feature = "green-power-bidirectional")]
+        if let TxFrame::GpCommand {
+            command_id: zigbee_gp::cluster::client_cmd::RESPONSE,
+            payload,
+        } = &out.tx.frame
+        {
+            self.gp_sync_bidirectional();
+            let own_nwk = self.bdb.zdo().nwk().nib().network_address.0;
+            let proxy = &mut self.green_power.proxy;
+            proxy.set_own_nwk(own_nwk);
+            let mut reply = None;
+            if let Err(error) = proxy.on_client_command(
+                own_nwk,
+                zigbee_gp::cluster::client_cmd::RESPONSE,
+                payload,
+                now_ms,
+                &mut reply,
+            ) {
+                log::warn!("[GP] own proxy refused the sink's GP Response: {:?}", error);
+            }
+        }
+        Some(OutFrame {
+            tx: out.tx,
+            zcl_frame_control: ZCL_CLUSTER_SPECIFIC
+                | ZCL_SERVER_TO_CLIENT
+                | ZCL_DISABLE_DEFAULT_RESPONSE,
+            tsn: out.tsn,
+        })
+    }
+}
+
+/// Build the response to a GP client-attribute Write Attributes request.
+/// Malformed records are rejected as a whole before the proxy configuration
+/// is changed.
+fn gp_write_attributes_response(
+    proxy: &mut GpProxy,
+    request: &[u8],
+) -> (
+    u8,
+    heapless::Vec<u8, { zigbee_gp::proxy::MAX_GP_COMMAND_LEN }>,
+) {
+    use zigbee_zcl::ZclStatus;
+    #[cfg(feature = "green-power-full-proxy")]
+    use zigbee_zcl::data_types::ZclValue;
+    use zigbee_zcl::foundation::write_attributes::{
+        WriteAttributeStatusRecord, WriteAttributesRequest, WriteAttributesResponse,
+    };
+
+    let Ok(parsed) = WriteAttributesRequest::parse_checked(request) else {
+        let mut payload = heapless::Vec::new();
+        let _ =
+            payload.extend_from_slice(&[ZCL_WRITE_ATTRIBUTES, ZclStatus::MalformedCommand as u8]);
+        return (ZCL_DEFAULT_RESPONSE, payload);
+    };
+
+    #[cfg(feature = "green-power-full-proxy")]
+    let mut config = *proxy.config();
+    #[cfg(feature = "green-power-full-proxy")]
+    let mut config_changed = false;
+    let mut response = WriteAttributesResponse {
+        records: heapless::Vec::new(),
+    };
+    let mut valid_records = parsed.request.records.iter();
+    let mut invalid_records = parsed.invalid_data_types.iter().peekable();
+    let record_count = parsed.request.records.len() + parsed.invalid_data_types.len();
+
+    for ordinal in 0..record_count {
+        let record_status = if invalid_records
+            .peek()
+            .is_some_and(|failure| usize::from(failure.ordinal) == ordinal)
+        {
+            invalid_records.next().map(|failure| failure.record)
+        } else {
+            valid_records.next().map(|record| {
+                let id = record.id.0;
+                let status = match id {
+                    #[cfg(feature = "green-power-full-proxy")]
+                    zigbee_gp::cluster::attr::GPP_NOTIFICATION_RETRY_NUMBER => {
+                        match (record.data_type, &record.value) {
+                            (zigbee_zcl::data_types::ZclDataType::U8, ZclValue::U8(value)) => {
+                                config.notification_retry_number = *value;
+                                config_changed = true;
+                                ZclStatus::Success
+                            }
+                            _ => ZclStatus::InvalidDataType,
+                        }
+                    }
+                    #[cfg(feature = "green-power-full-proxy")]
+                    zigbee_gp::cluster::attr::GPP_NOTIFICATION_RETRY_TIMER => {
+                        match (record.data_type, &record.value) {
+                            (zigbee_zcl::data_types::ZclDataType::U8, ZclValue::U8(value)) => {
+                                config.notification_retry_timer_ms = *value;
+                                config_changed = true;
+                                ZclStatus::Success
+                            }
+                            _ => ZclStatus::InvalidDataType,
+                        }
+                    }
+                    _ => {
+                        let mut value = [0u8; zigbee_gp::proxy::MAX_GP_COMMAND_LEN];
+                        match proxy.read_attribute(id, &mut value) {
+                            Ok(Some(_)) | Err(zigbee_gp::Error::BufferFull) => ZclStatus::ReadOnly,
+                            Ok(None) => ZclStatus::UnsupportedAttribute,
+                            Err(error) => {
+                                log::warn!("[GP] attribute 0x{:04X} read failed: {:?}", id, error);
+                                ZclStatus::Failure
+                            }
+                        }
+                    }
+                };
+                WriteAttributeStatusRecord {
+                    status,
+                    id: record.id,
+                }
+            })
+        };
+        if let Some(status) = record_status {
+            let _ = response.records.push(status);
+        }
+    }
+
+    #[cfg(feature = "green-power-full-proxy")]
+    if config_changed {
+        proxy.set_config(config);
+    }
+    let mut payload = heapless::Vec::new();
+    let mut encoded = [0u8; zigbee_gp::proxy::MAX_GP_COMMAND_LEN];
+    let len = response.serialize(&mut encoded);
+    let _ = payload.extend_from_slice(&encoded[..len]);
+    (ZCL_WRITE_ATTRIBUTES_RESPONSE, payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,6 +1437,75 @@ mod tests {
             Some((0x1D, 0x07, 0x02, &[][..]))
         );
         assert_eq!(parse_zcl(&[0x19, 0x07]), None);
+    }
+
+    #[cfg(feature = "green-power-full-proxy")]
+    #[test]
+    fn write_attributes_updates_full_proxy_retry_controls() {
+        let mut proxy = GpProxy::new(ProxyConfig::default());
+        let (command, response) = gp_write_attributes_response(
+            &mut proxy,
+            &[
+                0x12, 0x00, 0x20, 0x03, // retry count
+                0x13, 0x00, 0x20, 0x32, // retry timer, 50 ms
+            ],
+        );
+        assert_eq!(command, ZCL_WRITE_ATTRIBUTES_RESPONSE);
+        assert_eq!(response.as_slice(), &[0]);
+        assert_eq!(proxy.config().notification_retry_number, 3);
+        assert_eq!(proxy.config().notification_retry_timer_ms, 50);
+    }
+
+    #[cfg(feature = "green-power-full-proxy")]
+    #[test]
+    fn malformed_write_attributes_does_not_change_proxy_config() {
+        let mut proxy = GpProxy::new(ProxyConfig::default());
+        let (command, response) = gp_write_attributes_response(&mut proxy, &[0x12, 0x00, 0x20]);
+        assert_eq!(command, ZCL_DEFAULT_RESPONSE);
+        assert_eq!(
+            response.as_slice(),
+            &[
+                ZCL_WRITE_ATTRIBUTES,
+                zigbee_zcl::ZclStatus::MalformedCommand as u8
+            ]
+        );
+        assert_eq!(
+            proxy.config().notification_retry_number,
+            zigbee_gp::proxy::DEFAULT_NOTIFICATION_RETRY_NUMBER
+        );
+    }
+
+    #[cfg(feature = "green-power-full-proxy")]
+    #[test]
+    fn write_attributes_reports_type_read_only_and_unknown_errors() {
+        let mut proxy = GpProxy::new(ProxyConfig::default());
+        let (command, response) = gp_write_attributes_response(
+            &mut proxy,
+            &[
+                0x12, 0x00, 0x21, 0x03, 0x00, // retry count with wrong type
+                0x10, 0x00, 0x20, 0x03, // read-only max proxy table entries
+                0x34, 0x12, 0x20, 0x03, // unknown attribute
+            ],
+        );
+        assert_eq!(command, ZCL_WRITE_ATTRIBUTES_RESPONSE);
+        assert_eq!(
+            response.as_slice(),
+            &[
+                zigbee_zcl::ZclStatus::InvalidDataType as u8,
+                0x12,
+                0x00,
+                zigbee_zcl::ZclStatus::ReadOnly as u8,
+                0x10,
+                0x00,
+                ZCL_UNSUPPORTED_ATTRIBUTE,
+                0x34,
+                0x12,
+            ]
+        );
+        assert_eq!(
+            proxy.config().notification_retry_number,
+            zigbee_gp::proxy::DEFAULT_NOTIFICATION_RETRY_NUMBER
+        );
     }
 
     #[test]

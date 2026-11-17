@@ -37,6 +37,23 @@ pub static STATUS_PALETTE: StatusPalette = StatusPalette {
 
 const _: () = assert!(STATUS_PALETTE.is_valid());
 
+/// GP Combo light (`combo-light`): the On/Off Light's "on" colour, a dim
+/// warm white, shown only while the palette shows nothing (no status
+/// indication lit; the joined colour went dark after its hold).
+#[cfg(feature = "combo-light")]
+pub const LIGHT_ON: Rgb = Rgb::new(MAX_CHANNEL, 14, 4);
+
+/// What the WS2812 shows on the combo light: a lit status indication
+/// always wins; otherwise [`LIGHT_ON`] while the OnOff attribute is on.
+#[cfg(feature = "combo-light")]
+pub const fn combo_color(status: Rgb, light_on: bool) -> Rgb {
+    if light_on && status.is_off() {
+        LIGHT_ON
+    } else {
+        status
+    }
+}
+
 /// The board selected by the features and its LED colour byte order.
 pub use esp32_zigbee_devkit::status_led::{COLOR_ORDER, ColorOrder};
 pub use esp32_zigbee_devkit::{BOARD, Board};
@@ -93,6 +110,8 @@ mod adapter {
         indicator: StatusIndicator<'static>,
         shown: Option<Rgb>,
         write_failed: bool,
+        #[cfg(feature = "combo-light")]
+        light_on: bool,
     }
 
     impl<S: StatusSink> RgbStatusLed<S> {
@@ -112,6 +131,8 @@ mod adapter {
                 indicator: StatusIndicator::new(palette, now_ms()),
                 shown: None,
                 write_failed: false,
+                #[cfg(feature = "combo-light")]
+                light_on: false,
             };
             this.render();
             this
@@ -124,6 +145,16 @@ mod adapter {
             self.render();
         }
 
+        /// Combo light: show the On/Off Light's OnOff state whenever no
+        /// status indication is lit ([`super::combo_color`]).
+        #[cfg(feature = "combo-light")]
+        pub fn set_light(&mut self, on: bool) {
+            if self.light_on != on {
+                self.light_on = on;
+                self.render();
+            }
+        }
+
         /// Mutable access to the indicator, e.g. to feed OTA events.
         pub fn indicator_mut(&mut self) -> &mut StatusIndicator<'static> {
             &mut self.indicator
@@ -131,6 +162,8 @@ mod adapter {
 
         fn render(&mut self) {
             let color = self.indicator.update(now_ms());
+            #[cfg(feature = "combo-light")]
+            let color = super::combo_color(color, self.light_on);
             if self.shown == Some(color) {
                 return;
             }
@@ -206,5 +239,46 @@ mod tests {
         );
         assert_eq!(indicator.update(30_999), STATUS_PALETTE.joined.color);
         assert_eq!(indicator.update(31_000), Rgb::OFF);
+    }
+
+    #[cfg(feature = "combo-light")]
+    #[test]
+    fn combo_light_is_dim_distinct_and_never_hides_a_status() {
+        let c = LIGHT_ON;
+        assert!(!c.is_off());
+        assert!(c.r <= MAX_CHANNEL && c.g <= MAX_CHANNEL && c.b <= MAX_CHANNEL);
+        for a in ALL {
+            let status = STATUS_PALETTE.style(a).unwrap().color;
+            assert_ne!(c, status, "{a:?}");
+            // A lit status indication wins over the light, on or off.
+            assert_eq!(combo_color(status, true), status);
+            assert_eq!(combo_color(status, false), status);
+        }
+        assert_eq!(combo_color(Rgb::OFF, true), LIGHT_ON);
+        assert_eq!(combo_color(Rgb::OFF, false), Rgb::OFF);
+    }
+
+    #[cfg(feature = "combo-light")]
+    #[test]
+    fn combo_light_shows_after_the_joined_hold() {
+        let mut indicator = StatusIndicator::new(&STATUS_PALETTE, 0);
+        indicator.set_status(
+            RouterStatus::Online {
+                archetype: NodeArchetype::ParentRouter,
+                short_address: 0x0001,
+                identifying: false,
+            },
+            1_000,
+        );
+        assert_eq!(
+            combo_color(indicator.update(30_999), true),
+            STATUS_PALETTE.joined.color
+        );
+        assert_eq!(combo_color(indicator.update(31_000), true), LIGHT_ON);
+        indicator.set_permit_join(true);
+        assert_eq!(
+            combo_color(indicator.update(31_000), true),
+            STATUS_PALETTE.permit_join.color
+        );
     }
 }

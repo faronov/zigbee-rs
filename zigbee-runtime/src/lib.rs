@@ -14709,6 +14709,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         #[cfg(all(feature = "green-power", not(feature = "green-power-bidirectional")))]
         if zigbee_gp::frame::is_gpdf(mac_payload) {
             self.gp_receive_gpdf(indication);
+            // Combo: the sink's translation of a GPDF heard directly.
+            #[cfg(feature = "green-power-sink")]
+            return self.gp_sink_deliver(clusters);
+            #[cfg(not(feature = "green-power-sink"))]
             return None;
         }
         // A bidirectional GPD listens gpTxOffset after this GPDF; the
@@ -14719,6 +14723,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             if let Some(downlink) = self.gp_receive_gpdf_bidirectional(indication) {
                 self.gp_send_downlink(downlink).await;
             }
+            // Combo: the sink's translation of a GPDF heard directly.
+            #[cfg(feature = "green-power-sink")]
+            return self.gp_sink_deliver(clusters);
+            #[cfg(not(feature = "green-power-sink"))]
             return None;
         }
 
@@ -15135,8 +15143,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         // The only `M`-generic side effects — APS group-table updates and the
         // Finding & Binding Identify collection — are returned as actions and
         // applied here, after the borrow of runtime-local state is released.
+        #[cfg(feature = "green-power-sink")]
+        self.green_power.set_rx_unicast(
+            dst.0 < 0xFFF8 && aps_indication.dst_addr_mode != zigbee_aps::ApsAddressMode::Group,
+        );
         #[cfg(feature = "green-power")]
         if self.gp_handle_aps(&aps_indication, src_addr, nwk_security) {
+            // Combo: translated GPD commands from a GP Notification.
+            #[cfg(feature = "green-power-sink")]
+            return self.gp_sink_deliver(clusters);
+            #[cfg(not(feature = "green-power-sink"))]
             return None;
         }
         self.dispatch_application_zcl(clusters, &aps_indication, dst_ep, cluster_id, src_addr, dst)
@@ -16618,6 +16634,113 @@ mod parent_router_tests {
         assert_eq!(router.mac().timed_tx_history().len(), 1);
     }
 
+    /// GP Channel Configuration delivery off the operational channel
+    /// (`green-power-full-proxy`, GP 1.1 A.3.9.1 step 8): the TempMaster
+    /// tunes the radio to the GPD's transmit channel, answers its Channel
+    /// Request there and returns to the operational channel.
+    #[cfg(feature = "green-power-full-proxy")]
+    #[test]
+    fn gp_tempmaster_delivers_channel_configuration_on_the_transmit_channel() {
+        use zigbee_aps::ApsTxOptions;
+        use zigbee_aps::apsde::ApsdeDataRequest;
+        use zigbee_aps::{ApsAddress, ApsAddressMode};
+        use zigbee_gp::cluster::{Response, client_cmd};
+        use zigbee_gp::types::GpdId;
+        use zigbee_mac::{PibAttribute, PibValue};
+
+        const OPERATIONAL: u8 = 15;
+        const TRANSMIT: u8 = 20;
+        // Basic Channel Configuration: operational channel 15.
+        const CONFIGURATION: [u8; 1] = [0x10 | (OPERATIONAL - 11)];
+        // Maintenance GPDF without extension: Channel Request (0xE3).
+        const CHANNEL_REQUEST: [u8; 3] = [0x0D, 0xE3, 0x99];
+        const RX_END_US: u32 = 4_000_000;
+
+        let mut sink = centralized_coordinator();
+        let response = Response {
+            gpd_id: GpdId::SrcId(0),
+            transmit_on_endpoint_match: false,
+            temp_master_short: ROUTER.0,
+            temp_master_tx_channel: TRANSMIT - 11,
+            command_id: 0xF3,
+            payload: &CONFIGURATION,
+        };
+        let mut zcl = [0u8; 64];
+        zcl[..3].copy_from_slice(&[0x19, 0x43, client_cmd::RESPONSE]);
+        let len = 3 + response.encode(&mut zcl[3..]).unwrap();
+        block_on(
+            sink.bdb
+                .zdo_mut()
+                .aps_mut()
+                .apsde_data_request(&ApsdeDataRequest {
+                    dst_addr_mode: ApsAddressMode::Short,
+                    dst_address: ApsAddress::Short(ShortAddress(0xFFFD)),
+                    dst_endpoint: 242,
+                    profile_id: 0xA1E0,
+                    cluster_id: 0x0021,
+                    src_endpoint: 242,
+                    payload: &zcl[..len],
+                    tx_options: ApsTxOptions {
+                        use_nwk_key: true,
+                        ..ApsTxOptions::default()
+                    },
+                    radius: 0,
+                    alias_src_addr: None,
+                    alias_seq: None,
+                }),
+        )
+        .unwrap();
+        let response = McpsDataIndication {
+            src_address: MacAddress::Short(PAN, ShortAddress::COORDINATOR),
+            dst_address: MacAddress::Short(PAN, ShortAddress(0xFFFF)),
+            lqi: 200,
+            payload: MacFrame::from_slice(
+                sink.mac().tx_history().last().unwrap().payload.as_slice(),
+            )
+            .unwrap(),
+            security_use: false,
+        };
+        let channel_request = McpsDataIndication {
+            src_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+            dst_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+            lqi: 180,
+            payload: MacFrame::from_slice(&CHANNEL_REQUEST)
+                .unwrap()
+                .with_mac_sequence(7)
+                .with_rx_end_us(RX_END_US),
+            security_use: false,
+        };
+
+        let mut router = centralized_router();
+        router.bdb.zdo_mut().nwk_mut().nib_mut().logical_channel = OPERATIONAL;
+        router.mac_mut().set_timed_tx(true);
+        let radio_channel = |router: &mut ZigbeeDevice<MockMac, _>| {
+            let mac: &mut MockMac = router.mac_mut();
+            match block_on(mac.mlme_get(PibAttribute::PhyCurrentChannel)) {
+                Ok(PibValue::U8(channel)) => channel,
+                other => panic!("{other:?}"),
+            }
+        };
+        block_on(
+            router
+                .mac_mut()
+                .mlme_set(PibAttribute::PhyCurrentChannel, PibValue::U8(OPERATIONAL)),
+        )
+        .unwrap();
+
+        assert!(block_on(router.process_incoming(&response, &mut [])).is_none());
+        assert_eq!(router.gp_next_wait_us(), Some(0));
+        block_on(router.gp_poll());
+        assert_eq!(radio_channel(&mut router), TRANSMIT);
+
+        router.mac_mut().set_time_micros(RX_END_US + 900);
+        assert!(block_on(router.process_incoming(&channel_request, &mut [])).is_none());
+        let sent = router.mac().timed_tx_history();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(&sent[0].frame[7..], &[0x0D, 0xF3, CONFIGURATION[0]]);
+        assert_eq!(radio_channel(&mut router), OPERATIONAL);
+    }
+
     /// GP Proxy Basic end to end: a sink's GP Pairing arrives over the
     /// secured NWK, a paired L3 GPDF is tunnelled as a groupcast GP
     /// Notification under the GPD alias, a replay is rejected, and the
@@ -16771,18 +16894,17 @@ mod parent_router_tests {
         block_on(router.gp_poll());
         assert!(router.mac().tx_history().is_empty());
 
-        // The table survives a reboot with its group and its frame counter,
-        // skipped ahead by the persistence stride (every counter accepted
-        // since the last write is below stored + stride).
+        // The table survives a reboot with its group and its frame counter.
+        // An Off command is an event: its counter was written exactly, so
+        // the restore floor is the counter itself (no frame accepted twice,
+        // none lost).
         let mut store = crate::gp_store::RamGpProxyStore::new();
         assert!(router.save_gp_proxy_table_if_dirty(&mut store).unwrap());
         assert!(!router.save_gp_proxy_table_if_dirty(&mut store).unwrap());
         let mut rebooted = centralized_router();
         assert_eq!(rebooted.restore_gp_proxy_table(&mut store).unwrap(), 1);
-        assert_eq!(
-            rebooted.gp_proxy().entries()[0].frame_counter,
-            2 + zigbee_gp::proxy::DEFAULT_COUNTER_PERSIST_STRIDE - 1
-        );
+        assert!(rebooted.gp_proxy().entries()[0].counter_exact());
+        assert_eq!(rebooted.gp_proxy().entries()[0].frame_counter, 2);
         assert!(
             rebooted
                 .bdb
@@ -16810,6 +16932,338 @@ mod parent_router_tests {
             Err(crate::gp_store::GpStoreError::ForeignNetwork)
         );
         assert!(foreign.gp_proxy().entries().is_empty());
+    }
+
+    /// A joined router with an On/Off light endpoint 1, as a GP combo.
+    #[cfg(feature = "green-power-sink")]
+    fn gp_combo_router() -> ZigbeeDevice<MockMac, Router> {
+        let mut device = ZigbeeDevice::builder(MockMac::new(ROUTER_IEEE))
+            .device_type(DeviceType::Router)
+            .endpoint(1, 0x0104, crate::DeviceId::ON_OFF_LIGHT, |endpoint| {
+                endpoint.cluster_server(crate::ClusterId::ON_OFF)
+            })
+            .build_router();
+        device.bdb_mut().attributes_mut().node_is_on_a_network = true;
+        let aps = device.bdb_mut().zdo_mut().aps_mut();
+        aps.aib_mut().aps_trust_center_address = TC_IEEE;
+        let nwk = aps.nwk_mut();
+        nwk.set_joined(true);
+        nwk.security_mut().set_network_key(NETWORK_KEY, 0);
+        let nib = nwk.nib_mut();
+        nib.pan_id = PAN;
+        nib.network_address = ROUTER;
+        nib.extended_pan_id = [0xA5; 8];
+        nib.depth = 3;
+        nib.set_nwk_update_id(7);
+        nib.ieee_address = ROUTER_IEEE;
+        nib.parent_address = ShortAddress::COORDINATOR;
+        nib.security_enabled = true;
+        nib.active_key_seq_number = 0;
+        nib.outgoing_frame_counter_limit = 0x400;
+        nib.logical_channel = 15;
+        device
+            .gp_sink_mut()
+            .set_config(zigbee_gp::sink::SinkConfig {
+                endpoint: Some(1),
+                ..zigbee_gp::sink::SinkConfig::default()
+            });
+        device
+    }
+
+    /// GP Combo end to end (`green-power-sink`): sink commissioning mode,
+    /// a GPD Commissioning GPDF heard directly, the Sink Table entry and GP
+    /// Pairing, a secured Toggle GPDF that toggles the local On/Off cluster,
+    /// a replay rejected, a GP Notification from another proxy toggling it
+    /// back, that proxy's duplicate dropped, and a reboot through the GP
+    /// journal that keeps the entry and its counter floor.
+    #[cfg(feature = "green-power-sink")]
+    #[test]
+    fn gp_combo_commissions_a_switch_and_toggles_the_local_light() {
+        use zigbee_aps::ApsTxOptions;
+        use zigbee_aps::apsde::ApsdeDataRequest;
+        use zigbee_aps::{ApsAddress, ApsAddressMode};
+        use zigbee_gp::cluster::{Notification, Pairing, ProxyInfo, client_cmd, server_cmd};
+        use zigbee_gp::commissioning::{CommissioningPayload, CommissioningSecurity};
+        use zigbee_gp::frame::{FrameType, GpdfParams};
+        use zigbee_gp::security::{self, DEFAULT_TC_LINK_KEY, Direction};
+        use zigbee_gp::sink::SinkEvent;
+        use zigbee_gp::types::{GpdId, KeyType, SecurityLevel, derive_alias};
+        use zigbee_zcl::clusters::on_off::OnOffCluster;
+
+        const SRC: u32 = 0x7A6B_9879;
+        const KEY: [u8; 16] = [
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD,
+            0xCE, 0xCF,
+        ];
+        let gpd = GpdId::SrcId(SRC);
+        let alias = derive_alias(&gpd);
+
+        // A GPDF as the MAC hands it up: NWK bytes, MAC sequence number.
+        // MockMac provides the software AES.
+        let mut aes = MockMac::new([0; 8]);
+        let mut gpdf = |level: SecurityLevel, counter: u32, command: u8, payload: &[u8]| {
+            let mut raw = [0u8; 127];
+            let n = security::build_gpdf(
+                &mut aes,
+                level.is_protected().then_some(&KEY),
+                &GpdfParams {
+                    frame_type: FrameType::Data,
+                    auto_commissioning: false,
+                    src_id: Some(SRC),
+                    security_level: level,
+                    individual_key: level.is_protected(),
+                    rx_after_tx: false,
+                    to_gpd: false,
+                    frame_counter: counter,
+                },
+                counter as u8,
+                command,
+                payload,
+                &mut raw,
+            )
+            .unwrap();
+            McpsDataIndication {
+                src_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+                dst_address: MacAddress::Short(PanId(0xFFFF), ShortAddress(0xFFFF)),
+                lqi: 180,
+                payload: MacFrame::from_slice(&raw[7..n])
+                    .unwrap()
+                    .with_mac_sequence(counter as u8),
+                security_use: false,
+            }
+        };
+        let commissioning = {
+            let wrapped = security::wrap_key(
+                &mut MockMac::new([0; 8]),
+                &DEFAULT_TC_LINK_KEY,
+                &gpd,
+                Direction::FromGpd,
+                0,
+                &KEY,
+            )
+            .unwrap();
+            let p = CommissioningPayload {
+                device_id: 0x02,
+                mac_seq_num_capability: true,
+                rx_on_capability: false,
+                pan_id_request: false,
+                security_key_request: false,
+                fixed_location: true,
+                security: Some(CommissioningSecurity {
+                    level: SecurityLevel::Encrypted,
+                    key_type: KeyType::IndividualKey,
+                    key: Some((wrapped.key, Some(u32::from_le_bytes(wrapped.mic)))),
+                    outgoing_counter: Some(10),
+                }),
+                app_info: None,
+            };
+            let mut b = [0u8; 64];
+            let n = p.encode(&mut b).unwrap();
+            gpdf(SecurityLevel::None, 1, 0xE0, &b[..n])
+        };
+
+        let mut router = gp_combo_router();
+        let mut on_off = OnOffCluster::new();
+        let process = |router: &mut ZigbeeDevice<MockMac, Router>,
+                       on_off: &mut OnOffCluster,
+                       frame: &McpsDataIndication| {
+            let mut clusters = [crate::ClusterRef {
+                endpoint: 1,
+                cluster: on_off,
+            }];
+            block_on(router.process_incoming(frame, &mut clusters))
+        };
+
+        // Button: sink commissioning mode, proxies told by broadcast.
+        router.gp_sink_enter_commissioning(true).unwrap();
+        assert_eq!(router.gp_next_wait_us(), Some(0));
+        block_on(router.gp_poll());
+        assert_eq!(router.mac().tx_history().len(), 1);
+
+        // The GPD's Commissioning GPDF, heard directly.
+        router.mac_mut().clear_tx_history();
+        assert!(process(&mut router, &mut on_off, &commissioning).is_none());
+        let entry = &router.gp_sink().entries()[0];
+        assert_eq!(entry.gpd_id, gpd);
+        assert_eq!(entry.key, Some(KEY));
+        assert_eq!(entry.frame_counter, 10);
+        assert!(!router.gp_sink().in_commissioning_mode());
+        assert!(
+            router
+                .bdb
+                .zdo()
+                .aps()
+                .group_member_endpoints(alias)
+                .contains(&242)
+        );
+        // Our proxy did not tunnel the GPDF to us (it is not in proxy
+        // commissioning mode); the sink broadcasts GP Pairing, the alias
+        // Device_annce and GP Proxy Commissioning Mode (exit).
+        block_on(router.gp_poll());
+        assert_eq!(router.mac().tx_history().len(), 3);
+        assert!(router.gp_proxy().entries().is_empty());
+        let mut coordinator = centralized_coordinator();
+        let decrypt = |coordinator: &mut ZigbeeDevice<MockMac, Router>, nwk: &[u8]| {
+            let nwk_frame: heapless::Vec<u8, 128> = heapless::Vec::from_slice(nwk).unwrap();
+            match block_on(
+                coordinator
+                    .bdb
+                    .zdo_mut()
+                    .aps_mut()
+                    .nwk_mut()
+                    .process_incoming_nwk_frame(&nwk_frame, 200),
+            ) {
+                Some(zigbee_nwk::nlde::NwkIndication::Owned(aps)) => aps,
+                other => panic!("undecodable frame {other:?}"),
+            }
+        };
+        let pairing = decrypt(
+            &mut coordinator,
+            router.mac().tx_history()[0].payload.as_slice(),
+        );
+        // APS data broadcast to endpoint 242: FC, dst EP, cluster, profile,
+        // src EP, counter; then ZCL server → client.
+        let zcl = &pairing.payload[8..];
+        assert_eq!(zcl[0] & 0x08, 0x08);
+        assert_eq!(zcl[2], client_cmd::PAIRING);
+        let p = Pairing::decode(&zcl[3..]).unwrap();
+        assert_eq!(p.gpd_id, gpd);
+        assert!(p.add_sink);
+        assert_eq!(p.key, Some(KEY));
+        let mut commissioned = false;
+        while let Some(event) = router.gp_sink_take_event() {
+            commissioned |= matches!(event, SinkEvent::Commissioned { .. });
+        }
+        assert!(commissioned);
+
+        // A secured Toggle switches the local light on.
+        assert!(!on_off.is_on());
+        let toggle = gpdf(SecurityLevel::Encrypted, 11, 0x22, &[]);
+        let event = process(&mut router, &mut on_off, &toggle);
+        assert!(on_off.is_on());
+        assert!(matches!(
+            event,
+            Some(crate::event_loop::StackEvent::CommandReceived {
+                endpoint: 1,
+                source_endpoint: 242,
+                command_id: 0x02,
+                ..
+            })
+        ));
+        // No ZCL response to the locally delivered command goes on air.
+        router.mac_mut().clear_tx_history();
+        block_on(router.gp_poll());
+        assert!(router.mac().tx_history().is_empty());
+        // The repeated copy and a later replay are rejected.
+        assert!(process(&mut router, &mut on_off, &toggle).is_none());
+        block_on(router.mac_mut().delay_micros(3_000_000));
+        assert!(process(&mut router, &mut on_off, &toggle).is_none());
+        assert!(on_off.is_on());
+
+        // Another proxy tunnels the next Toggle as a groupcast GP
+        // Notification to the derived group.
+        let notification = Notification {
+            gpd_id: gpd,
+            also_unicast: false,
+            also_derived_group: true,
+            also_commissioned_group: false,
+            security_level: SecurityLevel::Encrypted,
+            key_type: KeyType::IndividualKey,
+            rx_after_tx: false,
+            tx_queue_full: false,
+            bidirectional_cap: false,
+            frame_counter: 12,
+            command_id: 0x22,
+            payload: Some(&[]),
+            proxy_info: ProxyInfo::None,
+        };
+        let mut zcl = [0u8; 64];
+        zcl[..3].copy_from_slice(&[0x11, 0x21, server_cmd::NOTIFICATION]);
+        let len = 3 + notification.encode(&mut zcl[3..]).unwrap();
+        let mut tunnel =
+            || {
+                block_on(coordinator.bdb.zdo_mut().aps_mut().apsde_data_request(
+                    &ApsdeDataRequest {
+                        dst_addr_mode: ApsAddressMode::Group,
+                        dst_address: ApsAddress::Group(alias),
+                        dst_endpoint: 242,
+                        profile_id: 0xA1E0,
+                        cluster_id: 0x0021,
+                        src_endpoint: 242,
+                        payload: &zcl[..len],
+                        tx_options: ApsTxOptions {
+                            use_nwk_key: true,
+                            ..ApsTxOptions::default()
+                        },
+                        radius: 0,
+                        alias_src_addr: None,
+                        alias_seq: None,
+                    },
+                ))
+                .unwrap();
+                McpsDataIndication {
+                    src_address: MacAddress::Short(PAN, ShortAddress::COORDINATOR),
+                    dst_address: MacAddress::Short(PAN, ShortAddress(0xFFFF)),
+                    lqi: 200,
+                    payload: MacFrame::from_slice(
+                        coordinator
+                            .mac()
+                            .tx_history()
+                            .last()
+                            .unwrap()
+                            .payload
+                            .as_slice(),
+                    )
+                    .unwrap(),
+                    security_use: false,
+                }
+            };
+        let first = tunnel();
+        assert!(process(&mut router, &mut on_off, &first).is_some());
+        assert!(!on_off.is_on());
+        // The same GPDF tunnelled again (another copy) is dropped.
+        let second = tunnel();
+        process(&mut router, &mut on_off, &second);
+        assert!(!on_off.is_on());
+        assert_eq!(router.gp_sink().entries()[0].frame_counter, 12);
+
+        // The Sink Table survives a reboot through the GP journal. Toggles
+        // are events: their counter is written exactly (the full record,
+        // then a counter record re-asserting the exact mode), so the first
+        // press after a reboot is accepted.
+        let mut journal = crate::gp_store::GpProxyJournal::<_, 4096>::new(
+            crate::gp_store::tests::MockFlash::new(),
+            0,
+            4096,
+        );
+        assert!(router.save_gp_proxy_table_if_dirty(&mut journal).unwrap());
+        let mut rebooted = gp_combo_router();
+        assert_eq!(rebooted.restore_gp_proxy_table(&mut journal).unwrap(), 1);
+        let restored = &rebooted.gp_sink().entries()[0];
+        assert_eq!(restored.key, Some(KEY));
+        assert!(restored.counter_exact());
+        assert_eq!(restored.frame_counter, 12);
+        assert!(
+            rebooted
+                .bdb
+                .zdo()
+                .aps()
+                .group_member_endpoints(alias)
+                .contains(&242)
+        );
+        let mut light = OnOffCluster::new();
+        assert!(process(&mut rebooted, &mut light, &toggle).is_none());
+        assert!(!light.is_on());
+        // The very next press is accepted and journalled (a compact counter
+        // record); a second reboot keeps it exactly.
+        let fresh = gpdf(SecurityLevel::Encrypted, 13, 0x22, &[]);
+        assert!(process(&mut rebooted, &mut light, &fresh).is_some());
+        assert!(light.is_on());
+        assert!(rebooted.save_gp_proxy_table_if_dirty(&mut journal).unwrap());
+        let mut again = gp_combo_router();
+        assert_eq!(again.restore_gp_proxy_table(&mut journal).unwrap(), 1);
+        assert_eq!(again.gp_sink().entries()[0].frame_counter, 13);
+        assert!(process(&mut again, &mut light, &fresh).is_none());
     }
 
     #[test]
