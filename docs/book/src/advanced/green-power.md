@@ -38,7 +38,7 @@
 | TempMaster (`zigbee-runtime/green-power-bidirectional`, router `green-power-bidirectional`): proxy advertises bidirectional only when the MAC has timed TX, sends a queued GP Response GPDF `tx_offset_us` (20 ms) after the end of the triggering GPDF, no CSMA, no ACK | implemented, opt-in (not in any default image) | end-to-end host test: GP Response from the sink → rxAfterTx GPDF → Commissioning Reply scheduled at RX end + 20 ms. Lab-tested on the H2-Zero 2026-11-14 with an injected GPD (radio-lab): forwarded first (+41 ms), appointed TempMaster by zigpy, 10 of 11 Commissioning Replies sent on time, 1 reported `Missed` (§6.8). **Not yet with a real bidirectional GPD** |
 | GPD bidirectional mode (`gpd-app/bidirectional`, MG22 example feature `bidirectional`, product `BIDIRECTIONAL` policy) | implemented, opt-in | host tests: reply in the window → Success and channel persisted; replies at both edges of the spec window (20 ms and 25 ms + GPDF airtime after the GPDF start) and at the measured IKEA offset received; no reply → stays uncommissioned without counter reuse; wrong security level rejected; delivered key replaces the GPD key; invalid policy rejected. Lab-tested on hardware 2026-11-14 (182b358, `lab-tx-power` build): commissioned into ZHA through IKEA 0x43FD as TempMaster, Success accepted, reports in HA, Resumed after reset with channel and counter (§6.9). **Not yet through our proxy** |
 | Full proxy (`zigbee-gp/proxy-full`, `zigbee-runtime/green-power-full-proxy`) | in progress, opt-in (§2 row (b)) | host tests |
-| Combo / Sink (`zigbee-gp/sink`, `zigbee-runtime/green-power-sink`, router-app `green-power-sink`): Sink Table, sink commissioning mode, GPD commissioning (direct and Commissioning Notification, bidirectional through a TempMaster), Notification processing, Notification Response, Sink Table Request, sink attributes, built-in GPD → ZCL translation to one local endpoint, Sink Table in the GP journal | implemented, opt-in (not in any default image) | host tests (`zigbee-gp` sink unit tests, zigpy golden vectors, `gp_store` sink journal tests, runtime end-to-end `gp_combo_commissions_a_switch_and_toggles_the_local_light`); ESP32-H2 and nRF52840 router builds (§4.5); first product: Waveshare ESP32-H2-Zero combo light (`combo-light`, On/Off Light endpoint on the WS2812, BOOT opens sink commissioning, TempMaster included; §3.7). **Lab-tested on the H2-Zero (2026-11-15/16, §6.10)**: BOOT window, direct commissioning of a unidirectional GP switch, Toggles to the light, Sink Table across a power cycle. Adaptive counters across a power cycle and the 180 s BOOT timeout: lab-tested 2026-11-17. Bidirectional GPD directly into the sink: host-tested; on hardware 2026-11-17 zigpy's concurrent GP Response cancelled the combo's own TempMaster reply (bug, fixed in 9e9c430, §6.10), hardware re-test pending |
+| Combo / Sink (`zigbee-gp/sink`, `zigbee-runtime/green-power-sink`, router-app `green-power-sink`): Sink Table, sink commissioning mode, GPD commissioning (direct and Commissioning Notification, bidirectional through a TempMaster), Notification processing, Notification Response, Sink Table Request, sink attributes, built-in GPD → ZCL translation to one local endpoint, Sink Table in the GP journal | implemented, opt-in (not in any default image) | host tests (`zigbee-gp` sink unit tests, zigpy golden vectors, `gp_store` sink journal tests, runtime end-to-end `gp_combo_commissions_a_switch_and_toggles_the_local_light`); ESP32-H2 and nRF52840 router builds (§4.5); first product: Waveshare ESP32-H2-Zero combo light (`combo-light`, On/Off Light endpoint on the WS2812, BOOT opens sink commissioning, TempMaster included; §3.7). **Lab-tested on the H2-Zero (2026-11-15/16, §6.10)**: BOOT window, direct commissioning of a unidirectional GP switch, Toggles to the light, Sink Table across a power cycle. Adaptive counters across a power cycle and the 180 s BOOT timeout: lab-tested 2026-11-17. Bidirectional GPD directly into the sink with the combo as its own TempMaster: lab-tested 2026-11-17 after two fixes (zigpy's Response no longer cancels the combo's reply; the reply is sent before the GPDF is processed), 1 of 3 replies refused by a busy radio (preemption fix da33af4, hardware re-test pending) (§6.10) |
 | Adaptive frame-counter persistence (`zigbee_gp::counter`, Proxy and Sink Table, exact flag in the GP journal's counter records) | implemented, in every GP image | host tests (§3.3); lab-tested on the H2-Zero combo 2026-11-17: after a power cycle the switch's first presses toggled the light, none dropped (§6.10) |
 
 Implementation notes that differ from the design below:
@@ -1901,7 +1901,57 @@ Sessions in `~/.hwlab/sessions/2026-11-17T154805Z-h2zero-recommission-switch`,
   words). Image 9e9c430 (app sha `8858ab55…6d2833`, 563,160 B flash /
   70,692 B `.bss`, +296 / +8) flashed with hwlab (backup sha
   `4ae5a109…5031fa`, `zbnv` kept); the router resumed as 0x7C87 with 1
-  proxy and 1 sink entry. Hardware re-test pending.
+  proxy and 1 sink entry.
+- **Re-test with 9e9c430: the reply survived zigpy but missed every
+  instant** (session `…175942Z-h2zero-tempmaster-fix-retest`). Five
+  attempts, each `CommissioningReplySent` and `TempMaster GPDF not sent:
+  TransactionExpired`; MG22 `NoCommissioningReply`. With the sink the
+  reply was built first but transmitted only after the proxy and the sink
+  had processed the triggering GPDF. Fixed in 72ad6b3: in combo builds the
+  reply is built and transmitted first, then the GPDF is processed (proxy
+  counter checks keep their order; proxy-only builds unchanged); the
+  host test checks with the mock MAC's AES-keying count that the reply
+  leaves before the sink unwraps the GPD key. The combo now logs, after the
+  TX, when the reply was built and when the MAC returned relative to the
+  end of the GPDF.
+- **Re-test with 72ad6b3: PASSED** (2026-11-17, session
+  `…182043Z-h2zero-tempmaster-order-retest`, capture seconds). Three
+  TempMaster replies to the MG22's attempts:
+  - 1557.598 `TempMaster GPDF sent (15 B): built +1882 us, due +20000 us,
+    done +20710 us` (not taken by the GPD);
+  - 1558.130 `not sent: TransactionExpired: built +4326 us, due +20000 us,
+    done +19912 us`;
+  - 1558.663 `sent (15 B): built +1932 us, done +20707 us`; MG22
+    `commissioned on channel 15 (LQI 153)` at 1558.703; H2-Zero
+    `sink …: Commissioned`, `GP sink Commissioned { gpd_id:
+    SrcId(691837049), device_id: 51 }`, `CommissioningLeft(FirstPairing)`,
+    GP Pairing, alias Device_annce, journal saved.
+  - First report 1571.4: `sink …: PassedThrough`, `GP sink GpdCommand {
+    … command_id: 162 }` (0xA2 Multi-Cluster Reporting), MG22 `report …
+    Ok(Some(7089))`.
+
+  Bidirectional commissioning directly into the combo sink, with the combo
+  as its own TempMaster, is proven on hardware. The reply is built
+  1.9–4.3 ms after the end of the GPDF, well inside gpTxOffset.
+- **The miss.** `done +19912 us` is not "before the due time": the PHY
+  issues the command `TIMED_TX_START_LEAD_US` (425 µs) early, at +19,575 µs,
+  and gives up `TIMED_TX_LATE_US` (300 µs) later, so a return at +19,912 µs
+  is that deadline plus the return path. With the reply built at
+  +4.3 ms the thread had 15 ms to spare, so a late wake-up is unlikely;
+  the radio refused the transmission (`Busy`) for the whole 300 µs, which
+  in the esp-radio patch set means a frame was being received (GP
+  broadcasts of the commissioning are dense at that moment), an own
+  hardware ACK, or pending interrupt work. The ESP PHY reported both "radio
+  busy until the deadline" and "caller late" as `Missed`
+  (`TransactionExpired`). Fixed in da33af4: `transmit_with_deadline`
+  reports `ChannelBusy` (MAC `ChannelAccessFailure`) when the radio refused
+  until the deadline, and the timed TX uses a new esp-radio local patch,
+  `transmit_raw_preempting_rx`, that abandons a frame being received (as
+  ESP-IDF `ieee802154_transmit` does); an own TX, a hardware ACK and
+  pending interrupt work still refuse. GP 1.1 A.1.5.2.2: the TempMaster
+  sends without CSMA/CA. Host test for the error split; the preemption
+  needs a hardware run. Images without timed TX are unchanged (panic
+  Location words only); combo light 563,368 B flash / 70,692 B `.bss`.
 
 ## 7. Open questions for the user
 
