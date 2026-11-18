@@ -38,9 +38,9 @@ const _: () = assert!(NV_OFFSET as usize + NV_SIZE == 0x0040_0000);
 // On both OTA-capable builds `layout` independently mirrors these addresses
 // (it must stay host-testable, so it cannot import this `target_os = "none"`
 // module) — cross-check them here so the two cannot silently drift apart.
-#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 const _: () = assert!(NV_OFFSET == crate::layout::NV_OFFSET);
-#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 const _: () = assert!(NV_SIZE as u32 == crate::layout::NV_SIZE);
 
 /// The reserved 8 KiB Zigbee NV window, bounded within the physical chip.

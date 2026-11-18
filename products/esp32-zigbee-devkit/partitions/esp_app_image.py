@@ -1,7 +1,7 @@
-"""Shared preflight for unsigned, plaintext ESP32-C6/H2 application images.
+"""Shared preflight for unsigned, plaintext ESP32-C6/H2/C5 application images.
 
 Mirrors products/esp32-zigbee-devkit/src/esp_image.rs, based on ESP-IDF
-v5.5.1 esp_image_format.c, bootloader_common_loader.c and C6/H2 soc.h.
+v5.5.1 esp_image_format.c, bootloader_common_loader.c and C6/H2/C5 soc.h.
 Both artifact sizing and Zigbee OTA packaging must use this validator.
 
 This is structural/integrity validation, NOT signature verification,
@@ -19,7 +19,16 @@ from dataclasses import dataclass
 from functools import reduce
 from operator import xor
 
-CHIP_IDS = {"esp32c6": 0x000D, "esp32h2": 0x0010}
+CHIP_IDS = {"esp32c6": 0x000D, "esp32h2": 0x0010, "esp32c5": 0x0017}
+# (SOC_DRAM_HIGH, SOC_RTC_DRAM_HIGH) per chip ID, ESP-IDF v5.5.1 soc.h.
+RAM_ENDS = {
+    0x000D: (0x40880000, 0x50004000),
+    0x0010: (0x40850000, 0x50001000),
+    0x0017: (0x40860000, 0x50004000),
+}
+# Flash offset of the second-stage bootloader (ESP-IDF
+# CONFIG_BOOTLOADER_OFFSET_IN_FLASH; the C5 ROM loads it from 0x2000).
+BOOTLOADER_OFFSETS = {"esp32c6": 0x0000, "esp32h2": 0x0000, "esp32c5": 0x2000}
 HEADER_SIZE = 24
 DIGEST_SIZE = 32
 IMAGE_MAGIC = 0xE9
@@ -99,10 +108,7 @@ def validate_application(
         )
     if image[23] != 1:
         raise ImageValidationError("NoAppendedHash", "appended SHA-256 is required")
-    ram_end, rtc_end = (
-        (0x40880000, 0x50004000) if chip_id == CHIP_IDS["esp32c6"]
-        else (0x40850000, 0x50001000)
-    )
+    ram_end, rtc_end = RAM_ENDS[chip_id]
     entry = struct.unpack_from("<I", image, 4)[0]
     chip_range = struct.unpack_from("<HH", image, 15)
     _revision_range(*chip_range, chip_revision, "ChipRevision")

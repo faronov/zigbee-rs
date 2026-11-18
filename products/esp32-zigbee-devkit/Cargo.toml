@@ -3,7 +3,7 @@ name = "esp32-zigbee-devkit-product"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Product configuration (persistence, OTA, profile) for the ESP32-C6/H2 Zigbee sensor firmware"
+description = "Product configuration (persistence, OTA, profile) for the ESP32-C6/H2/C5 Zigbee sensor firmware"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
@@ -38,8 +38,11 @@ critical-section = "1.2"
 embassy-time = "0.4"
 embassy-futures = "0.1"
 embassy-time-driver = { version = "0.2", features = ["tick-hz-1_000_000"] }
-esp-hal = { version = "=1.0.0", features = ["unstable"] }
-esp-storage = { version = "0.7", default-features = false, features = [
+# Version ranges: C6/H2 images lock esp-hal 1.0.0 / esp-storage 0.7, the
+# ESP32-C5 image esp-hal 1.1.x / esp-storage 0.9 and enables their `esp32c5`
+# features itself (the releases the other lockfiles pin have none).
+esp-hal = { version = ">=1.0.0, <1.2", features = ["unstable"] }
+esp-storage = { version = ">=0.7, <0.10", default-features = false, features = [
     "bytewise-read",
     "critical-section",
 ] }
@@ -104,6 +107,10 @@ esp32h2 = [
 # ESP-IDF bootloader still boots the native image unchecked; see
 # `signed_ota`.
 signed-ota = ["dep:mcuboot-image", "dep:zrs-boot-layout"]
+# ESP32-C5-DevKitC-1 (esp-hal 1.1 / esp-radio 0.18 train). No retained light
+# sleep (`light-sleep` is rejected): the C6/H2 sleep paths are chip-specific
+# ports that have not been done for the C5.
+esp32c5 = ["esp32-zigbee-devkit/esp32c5", "zigbee-runtime/ota"]
 # ESP32-H2 only, experimental: compile in the TOP/CPU/modem power-down
 # light sleep (`SleepMode::TopPowerDown`); the image selects it at runtime.
 h2-top-pd = ["esp32h2", "light-sleep", "esp32h2-sleep/top-pd"]

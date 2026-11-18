@@ -13,6 +13,8 @@ pub const DIGEST_SIZE: usize = 32;
 pub const IMAGE_MAGIC: u8 = 0xE9;
 pub const CHIP_ID_ESP32C6: u16 = 0x000D;
 pub const CHIP_ID_ESP32H2: u16 = 0x0010;
+/// ESP-IDF v5.5.1 `esp_app_format.h` `ESP_CHIP_ID_ESP32C5`.
+pub const CHIP_ID_ESP32C5: u16 = 0x0017;
 pub const MAX_SEGMENTS: usize = 16;
 pub const SEGMENT_HEADER_SIZE: usize = 8;
 pub const APP_DESC_SIZE: usize = 256;
@@ -22,6 +24,8 @@ pub const APP_DESC_MAGIC: u32 = 0xABCD_5432;
 pub const EXPECTED_CHIP_ID: u16 = CHIP_ID_ESP32C6;
 #[cfg(feature = "esp32h2")]
 pub const EXPECTED_CHIP_ID: u16 = CHIP_ID_ESP32H2;
+#[cfg(feature = "esp32c5")]
+pub const EXPECTED_CHIP_ID: u16 = CHIP_ID_ESP32C5;
 
 /// Actual hardware revision information, not the update's claimed revisions.
 /// Revision encoding is `major * 100 + minor`, as in ESP-IDF.
@@ -167,6 +171,13 @@ pub fn verify_image<E>(
     let (ram_end, rtc_end) = match header.chip_id {
         CHIP_ID_ESP32C6 => (0x4088_0000, 0x5000_4000),
         CHIP_ID_ESP32H2 => (0x4085_0000, 0x5000_1000),
+        // ESP-IDF v5.5.1 `soc/esp32c5/include/soc/soc.h`: SOC_DRAM_HIGH,
+        // SOC_RTC_DRAM_HIGH. Only in C5 builds, so the C6/H2 code is
+        // unchanged. The C5 flash-mapped window (SOC_IROM_HIGH 0x4400_0000)
+        // is wider than the 256-page rule below, which stays as a
+        // conservative bound (it covers the whole 4 MiB layout).
+        #[cfg(any(test, feature = "esp32c5"))]
+        CHIP_ID_ESP32C5 => (0x4086_0000, 0x5000_4000),
         found => return Err(ImageError::ChipMismatch { found }.into()),
     };
     if !revision_allowed(

@@ -1,10 +1,10 @@
 """Run with python3 -m unittest discover -s <this directory>.
 
-Set ESP_OTA_C6_IMAGE / ESP_OTA_H2_IMAGE to real espflash application files to
+Set ESP_OTA_C6_IMAGE / ESP_OTA_H2_IMAGE / ESP_OTA_C5_IMAGE to real espflash application files to
 include artifact compatibility. --write-corpus DIR writes these same vectors
 for the opt-in Rust `python_preflight_corpus` differential regression. Add
---chip esp32c6 or --chip esp32h2 to require/generate only that chip's real-image
-corpus. Without --chip, both real images are required and both corpora are written.
+--chip esp32c6, esp32h2 or esp32c5 to require/generate only that chip's real-image
+corpus. Without --chip, every real image is required and every corpus is written.
 """
 
 from __future__ import annotations
@@ -140,7 +140,11 @@ def vectors(chip: str):
 
 
 def real_image(chip: str, *, required: bool = False) -> bytes:
-    key = "ESP_OTA_C6_IMAGE" if chip == "esp32c6" else "ESP_OTA_H2_IMAGE"
+    key = {
+        "esp32c6": "ESP_OTA_C6_IMAGE",
+        "esp32h2": "ESP_OTA_H2_IMAGE",
+        "esp32c5": "ESP_OTA_C5_IMAGE",
+    }[chip]
     path = os.environ.get(key)
     if not path:
         message = f"set {key} to an actual espflash-generated application"

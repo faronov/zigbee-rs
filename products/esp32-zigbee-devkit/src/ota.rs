@@ -710,12 +710,25 @@ impl OtaFlash for EspOtaFlash {
         running_image::detect()
     }
 
+    #[cfg(not(feature = "esp32c5"))]
     fn image_compatibility(&mut self) -> Result<ImageCompatibility, FirmwareError> {
         use esp_hal::efuse::Efuse;
         let (major, minor) = Efuse::block_version();
         Ok(ImageCompatibility {
             chip_id: crate::esp_image::EXPECTED_CHIP_ID,
             chip_revision: Efuse::chip_revision(),
+            efuse_block_revision: major as u16 * 100 + minor as u16,
+        })
+    }
+
+    /// esp-hal 1.1 (ESP32-C5): free functions instead of `Efuse::`; same
+    /// `major * 100 + minor` encoding.
+    #[cfg(feature = "esp32c5")]
+    fn image_compatibility(&mut self) -> Result<ImageCompatibility, FirmwareError> {
+        let (major, minor) = esp_hal::efuse::block_version();
+        Ok(ImageCompatibility {
+            chip_id: crate::esp_image::EXPECTED_CHIP_ID,
+            chip_revision: esp_hal::efuse::chip_revision().combined(),
             efuse_block_revision: major as u16 * 100 + minor as u16,
         })
     }

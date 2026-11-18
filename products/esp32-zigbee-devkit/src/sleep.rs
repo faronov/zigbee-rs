@@ -25,7 +25,7 @@
 /// and PMU preparation. This is a policy floor, not a silicon timing guarantee.
 pub const MIN_SLEEP_US: u64 = 20_000;
 
-#[cfg(any(test, target_os = "none"))]
+#[cfg(any(test, all(target_os = "none", not(feature = "esp32c5"))))]
 use accounting::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +78,7 @@ pub struct SleepReport {
     pub top_powered_down: bool,
 }
 
-#[cfg(any(test, target_os = "none"))]
+#[cfg(any(test, all(target_os = "none", not(feature = "esp32c5"))))]
 mod accounting {
     use super::*;
 
@@ -196,7 +196,39 @@ pub use esp32h2_sleep::{Ext1Wake, PowerDown as RetainedPowerDown, SleepMode, TOP
 #[cfg(target_os = "none")]
 pub use hardware::LightSleep;
 
-#[cfg(target_os = "none")]
+/// ESP32-C5: no retained light-sleep port. `LightSleep` is uninhabited, so
+/// the shared wake path (`SensorWake`, which takes `Option<LightSleep>`)
+/// compiles and can only ever be given `None`: the CPU idles in WFI.
+#[cfg(all(target_os = "none", feature = "esp32c5"))]
+mod hardware {
+    use super::{SleepError, SleepReport};
+
+    /// No value of this type can exist on the ESP32-C5.
+    pub enum LightSleep<'d> {
+        #[doc(hidden)]
+        Unsupported(core::convert::Infallible, core::marker::PhantomData<&'d ()>),
+    }
+
+    impl LightSleep<'_> {
+        /// Unreachable: see the type.
+        ///
+        /// # Safety
+        ///
+        /// No preconditions; there is no value to call it on.
+        pub unsafe fn sleep(
+            &mut self,
+            _cs: critical_section::CriticalSection<'_>,
+            _duration_us: u64,
+            _gpio_wakeup: bool,
+        ) -> Result<SleepReport, SleepError> {
+            match *self {
+                Self::Unsupported(never, _) => match never {},
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "none", not(feature = "esp32c5")))]
 mod hardware {
     use super::*;
     use esp_hal::{

@@ -216,6 +216,19 @@ jobs:
             manifest: boards/esp32-zigbee-devkit/Cargo.toml
             workspace: boards/esp32-zigbee-devkit
             features: esp32h2,status-led
+          # ESP32-C5 (esp-hal 1.1 / esp-radio 0.18 train; no light sleep).
+          - name: ESP32-C5 sensor product
+            manifest: products/esp32-zigbee-devkit/Cargo.toml
+            workspace: products/esp32-zigbee-devkit
+            features: esp32c5,sed,roles
+          - name: ESP32-C5 router product (Green Power proxy, status LED)
+            manifest: products/esp32-zigbee-devkit/Cargo.toml
+            workspace: products/esp32-zigbee-devkit
+            features: esp32c5,roles,green-power,status-led
+          - name: ESP32 devkit board (ESP32-C5 status LED)
+            manifest: boards/esp32-zigbee-devkit/Cargo.toml
+            workspace: boards/esp32-zigbee-devkit
+            features: esp32c5,status-led
           - name: nRF52840 always-on End Device product
             manifest: products/nrf52840-router/Cargo.toml
             workspace: products/nrf52840-router
@@ -505,6 +518,7 @@ jobs:
           cargo fmt --manifest-path examples/nrf52840-sensor-uf2/Cargo.toml -- --check
           cargo fmt --manifest-path examples/esp32c6-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/esp32h2-sensor/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/esp32c5-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/cc2340-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/phy6222-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg1-sensor/Cargo.toml -- --check
@@ -1536,6 +1550,105 @@ jobs:
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.bin
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.app.bin
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.size.json
+          if-no-files-found: error
+
+  # ESP32-C5: esp-hal 1.1 / esp-radio 0.18 train (the first with C5 802.15.4),
+  # pinned by examples/esp32c5-sensor/Cargo.lock; the 802.15.4 driver is the
+  # C6/H2 one (vendor/esp-radio-0.18/LOCAL-PATCHES.md, checked below).
+  build-esp32c5:
+    name: Build ESP32-C5 sensor and router
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.ESP_PHY_RUST_TOOLCHAIN }}
+          targets: riscv32imac-unknown-none-elf
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: examples/esp32c5-sensor
+          key: riscv32imac-esp32c5-${{ env.ESP_PHY_RUST_TOOLCHAIN }}-ota-${{ hashFiles('examples/esp32c5-sensor/Cargo.lock', 'products/esp32-zigbee-devkit/partitions/**') }}
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: espflash@${{ env.ESPFLASH_VERSION }}
+      - name: Check the C5 802.15.4 driver against the C6/H2 driver
+        run: ./tools/check-esp-radio-c5-sync.sh
+      - name: Build and check ESP32-C5 images
+        working-directory: examples/esp32c5-sensor
+        run: |
+          cargo build --release --locked -Z build-std=core,alloc
+          cargo clippy --release --locked -Z build-std=core,alloc -- -D warnings
+          # `router` (with GP) last, so the checks below measure it.
+          for role in ed router-core router; do
+            cargo build --release --locked -Z build-std=core,alloc \
+              --no-default-features --features "$role"
+            cargo clippy --release --locked -Z build-std=core,alloc \
+              --no-default-features --features "$role" -- -D warnings
+          done
+          # Opt-in variants: ED with the WS2812 (GPIO27), bidirectional GP.
+          cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/variants \
+            --no-default-features --features ed,status-led -- -D warnings
+          cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/variants \
+            --no-default-features --features router,green-power-bidirectional -- -D warnings
+          DIR=target/riscv32imac-unknown-none-elf/release
+          CSV=../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv
+          for image in esp32c5-sensor esp32c5-ed esp32c5-router; do
+            espflash save-image --skip-update-check --chip esp32c5 \
+              --partition-table "$CSV" --target-app-partition ota_0 \
+              "$DIR/$image" "$DIR/$image.app.bin"
+            espflash save-image --skip-update-check --chip esp32c5 \
+              --merge --skip-padding --flash-size 4mb \
+              --partition-table "$CSV" --target-app-partition ota_0 \
+              "$DIR/$image" "$DIR/$image.bin"
+            python3 ../../products/esp32-zigbee-devkit/partitions/check-app-image-size.py \
+              --chip esp32c5 --slot ota_0 --merged "$DIR/$image.bin" "$DIR/$image.app.bin"
+          done
+          ../../tools/check-role-symbols.sh leaf "$DIR/esp32c5-sensor" "$DIR/esp32c5-ed"
+          ../../tools/check-role-symbols.sh parent "$DIR/esp32c5-router"
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          for elf in "$DIR/esp32c5-sensor" "$DIR/esp32c5-ed" "$DIR/esp32c5-router"; do
+            SYMS="$("$NM" --demangle "$elf")"
+            if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS" ||
+              ! grep -Eq 'EspHardwareAes128|EspAesEngine' <<<"$SYMS"; then
+              echo "$elf does not use the hardware AES backend alone" >&2
+              exit 1
+            fi
+            if [[ "$elf" == */esp32c5-router ]]; then
+              grep -q 'esp_hal::rmt::' <<<"$SYMS" ||
+                { echo "$elf is missing the RMT status LED driver" >&2; exit 1; }
+            elif grep -q 'esp_hal::rmt::' <<<"$SYMS"; then
+              echo "$elf links the RMT status LED driver without status-led" >&2
+              exit 1
+            fi
+          done
+      - name: ESP32-C5 OTA preflight and size report
+        run: |
+          DIR=examples/esp32c5-sensor/target/riscv32imac-unknown-none-elf/release
+          export ESP_OTA_C5_IMAGE="$PWD/$DIR/esp32c5-sensor.app.bin"
+          export ESP_OTA_TEST_IMAGE="$ESP_OTA_C5_IMAGE"
+          export ESP_OTA_PREFLIGHT_CORPUS="$RUNNER_TEMP/esp32c5-ota-corpus"
+          python3 products/esp32-zigbee-devkit/partitions/test_esp_app_image.py \
+            --write-corpus "$ESP_OTA_PREFLIGHT_CORPUS" --chip esp32c5
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo test --locked --manifest-path products/esp32-zigbee-devkit/Cargo.toml \
+            --target "$HOST_TARGET" --target-dir "$RUNNER_TEMP/esp32c5-ota-host" \
+            --no-default-features --features esp32c5 -- --include-ignored
+          for image in esp32c5-sensor esp32c5-router; do
+            ./tools/firmware-size-report.sh \
+              "$image" "$DIR/$image.app.bin" "$DIR/$image.size.json"
+          done
+      - name: Upload ESP32-C5 firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: esp32c5-firmware
+          path: |
+            examples/esp32c5-sensor/target/riscv32imac-unknown-none-elf/release/esp32c5-sensor.bin
+            examples/esp32c5-sensor/target/riscv32imac-unknown-none-elf/release/esp32c5-sensor.app.bin
+            examples/esp32c5-sensor/target/riscv32imac-unknown-none-elf/release/esp32c5-router.bin
+            examples/esp32c5-sensor/target/riscv32imac-unknown-none-elf/release/esp32c5-router.app.bin
+            examples/esp32c5-sensor/target/riscv32imac-unknown-none-elf/release/esp32c5-sensor.size.json
+            examples/esp32c5-sensor/target/riscv32imac-unknown-none-elf/release/esp32c5-router.size.json
           if-no-files-found: error
 
   build-esp-light-sleep:
