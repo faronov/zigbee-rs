@@ -6,7 +6,10 @@
 //! of the compile-time ZCL dispatcher. ZDO frames (endpoint 0) are copied
 //! as well, flagged `handled_by_ncp` when the runtime's ZDO server answers
 //! them, and still processed locally. The Green Power endpoint (242) stays
-//! with the runtime's GP proxy/sink.
+//! with the runtime's GP proxy/sink, except that with `green-power-ncp` in
+//! `HOST_SINK` mode the GP server frames (client → server: GP Notification,
+//! GP Commissioning Notification, ...) go to the host sink instead
+//! (`green_power::ncp`).
 //!
 //! The queue is a bounded process-wide singleton: an NCP image composes
 //! exactly one Zigbee device. When it is full the frame is dropped and
@@ -93,7 +96,19 @@ pub(crate) fn capture(
     if dst_ep == GP_ENDPOINT {
         return false;
     }
-    let host_only = is_host_endpoint(dst_ep);
+    copy(indication, mac_source, nwk_secured, src_ieee);
+    is_host_endpoint(dst_ep)
+}
+
+/// Queue a copy of `indication` for the host; a full queue or an ASDU
+/// longer than [`MAX_HOST_ASDU`] drops it and counts the drop.
+pub(crate) fn copy(
+    indication: &ApsdeDataIndication<'_>,
+    mac_source: &MacAddress,
+    nwk_secured: bool,
+    src_ieee: Option<IeeeAddress>,
+) {
+    let dst_ep = indication.dst_endpoint;
     let (dst_mode, dst) = match (indication.dst_addr_mode, indication.dst_address) {
         (ApsAddressMode::Group, ApsAddress::Group(group)) => (0x01, group),
         (_, ApsAddress::Short(address)) if address.0 >= 0xFFF8 => (0x0F, address.0),
@@ -115,7 +130,7 @@ pub(crate) fn capture(
             let mut state = STATE.borrow_ref_mut(cs);
             state.dropped = state.dropped.saturating_add(1);
         });
-        return host_only;
+        return;
     };
     let record = HostIndication {
         dst_mode,
@@ -139,19 +154,28 @@ pub(crate) fn capture(
             state.dropped = state.dropped.saturating_add(1);
         }
     });
-    host_only
 }
 
 impl<M: zigbee_mac::MacDriver, R: crate::role::DeviceRole> crate::ZigbeeDevice<M, R> {
     /// Hand an APS data indication to the host queue; `true` = consumed.
     pub(crate) fn host_passthrough_capture(
-        &self,
+        &mut self,
         aps_indication: &ApsdeDataIndication<'_>,
         mac_indication: &zigbee_mac::McpsDataIndication,
         nwk_source: zigbee_types::ShortAddress,
         nwk_secured: bool,
     ) -> bool {
         let src_ieee = self.bdb.zdo().nwk().find_ieee_by_short(nwk_source);
+        // Green Power frames for a host sink (`HOST_SINK`, spec 7.11).
+        #[cfg(feature = "green-power-ncp")]
+        if let Some(consumed) = self.gp_ncp_capture(
+            aps_indication,
+            &mac_indication.src_address,
+            nwk_secured,
+            src_ieee,
+        ) {
+            return consumed;
+        }
         capture(
             aps_indication,
             &mac_indication.src_address,
