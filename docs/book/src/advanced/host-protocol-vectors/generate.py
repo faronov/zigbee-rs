@@ -666,10 +666,11 @@ def build_messages():
         struct.pack("<IBBH", 5321, 3, 2, 17) + text, "UTF-8 text record (level 3 info)",
         {"time_ms": 5321, "level": 3, "module": 2, "seq": 17, "text": text.decode()})
     add("gp_sink_config_zigpy", EP_ZIGBEE, K_REQUEST, GP_SINK_CONFIG, 0x0107,
-        struct.pack("<BBHBHBB", 1, 2, 0x0B84, 0x05, 180, 0x01, 0),
-        "NCP sink authoritative; pre-commissioned groupcast to 0x0B84 like zigpy",
+        struct.pack("<BBHBHBB", 1, 2, 0x0B84, 0x05, 180, 0x00, 0),
+        "NCP sink authoritative; pre-commissioned groupcast to 0x0B84 and "
+        "security level 0 like zigpy (decision N1)",
         {"mode": 1, "communication_mode": 2, "group": "0x0b84", "exit_mode": 5,
-         "window_s": 180, "security_level": 1, "groupcast_radius": 0})
+         "window_s": 180, "security_level": 0, "groupcast_radius": 0})
     add("gp_sink_commissioning_enter", EP_ZIGBEE, K_REQUEST, GP_SINK_COMMISSIONING, 0x0108,
         struct.pack("<BBH", 1, 0x01, 254), "enter, involve proxies, 254 s (zigpy permit)")
     gpd_key = bytes.fromhex("c0c1c2c3c4c5c6c7c8c9cacbcccdcecf")

@@ -175,7 +175,7 @@ Planned placement, following the repository layering rules:
 | Byte-stream transports (USJ, UART + optional RTS/CTS, UHCI DMA RX) | chip HAL / platform glue exposing `embedded-io(-async)` `Read + Write` | `esp-hal` |
 | Desktop host tools (vector runner, noise bench, CLI, reference host) | `tools/zrhp/` (`std`) | `zigbee-zrhp` (`std`) |
 | Embedded hub | separate public repository `faronov/zigbee-rs-hub` (ESP32-S3, esp-idf-svc) | `zigbee-zrhp` (git dependency, `std`) |
-| zigpy library / Go adapter / zigbee-herdsman adapter | `zigpy-zrhp` (Python), `~/go_zboss-ncp/adapter/zrhp`, zigbee-herdsman `src/adapter/zrhp` | Ports of `zigbee-zrhp`, checked against the shared vectors |
+| zigpy library / Go adapter / zigbee-herdsman adapter | `zigpy-zrhp` (Python, under `faronov`, with the GP hook in the `faronov/zigpy` fork), `~/go_zboss-ncp/adapter/zrhp`, `src/adapter/zrhp` in a maintained zigbee-herdsman fork | Ports of `zigbee-zrhp`, checked against the shared vectors |
 
 The protocol crate must not depend on boards, products, vendor SDKs or
 logging transports. The transport adapters are the only platform-specific
@@ -208,7 +208,9 @@ Section 8 defines the paging protocol and section 9 maps every backup field.
 
 - **Protocol name:** ZRHP.
 - **Shared Rust crate:** `zigbee-zrhp`.
-- **Python package:** `zigpy-zrhp`; the zigpy radio type is `zrhp`.
+- **Python package:** `zigpy-zrhp` (repository under `faronov`); the zigpy
+  radio type is `zrhp`. The GP sink-on-radio hook lives in the
+  `faronov/zigpy` fork (decision N2).
 - **Go adapter:** `adapter/zrhp`.
 - **zigbee-herdsman adapter:** `zrhp`.
 - **Embedded hub:** `faronov/zigbee-rs-hub`.
@@ -340,7 +342,7 @@ flow control is USB NAK only. Section 11 lists the constraints this imposes.
 
 | Transport | Framing difference | Notes |
 |---|---|---|
-| USB vendor bulk | No COBS. Each frame is one USB bulk transfer terminated by a short packet or ZLP. CRC-32C is kept because USB CRC does not cover host-stack bugs. | Higher throughput on chips with a USB-OTG controller. Needs a VID/PID decision. |
+| USB vendor bulk | No COBS. Each frame is one USB bulk transfer terminated by a short packet or ZLP. CRC-32C is kept because USB CRC does not cover host-stack bugs. | Higher throughput on chips with a USB-OTG controller. Keeps Espressif's VID/PID (decision N8). |
 | SPI + INT (embedded host is the SPI master) | No COBS. Each transaction carries a 4-byte prefix `{u16 len, u16 ~len}` followed by the frame. The NCP raises INT while it has TX data or new credits. | ARQ, sessions and messages are unchanged. |
 
 No network transport is planned (decision 2026-11-18).
@@ -1044,7 +1046,7 @@ Config IDs (v1):
 | `0x0006` | `indirect_timeout_ms` |
 | `0x0007` | reserved (key-export locking is the command `SEC_LOCK_KEY_EXPORT`, 7.5) |
 | `0x0008` | `log_level` |
-| `0x0009` | `coex_enable` (0/1; only when `PTA_COEX`, 11.5) |
+| `0x0009` | `coex_enable` (0/1; volatile, default 0; only when `PTA_COEX`; the embedded hub drives it from its Wi-Fi state, 11.5) |
 | `0x000A` | `coex_tx_priority_mask` (bit0 MAC ACK frames, bit1 GP timed TX, bit2 TC/key transport, bit3 all) |
 
 `reset_reason` values: 0 unknown, 1 power-on, 2 software, 3 watchdog, 4
@@ -1247,8 +1249,9 @@ Go hub's generic interviewer already do.
 - **Unverified.** The EUI64 byte order fed to the hash is not confirmed.
   `ezsp_hashed_tclk.json` lists both candidates. The capability bit stays
   clear until gate H5 (14.6) has matched a key read from a real ZBT-1.
-- **Not used for new networks.** A network formed by zigbee-rs generates
-  random unique TCLKs and does not use hashed mode (Q-N3).
+- **Not used for new networks** (decision N3). A network formed by
+  zigbee-rs uses only random per-device TCLKs, never derived ones. Hashed
+  mode exists only to keep EZSP-migrated devices working.
 
 ### 7.6 TABLES (`0x05xx`, endpoint 3)
 
@@ -1369,6 +1372,16 @@ Behaviour in `HOST_SINK` mode:
   the NCP's proxy would never see it.
 - The NCP sink is disabled. The proxy behaves as on a router.
 
+**Security level** (decision N1).
+
+- The NCP product's sink default is `gpsSecurityLevel` **0x00**: GPDs with
+  security level 0, 2 or 3 are commissioned, as in zigpy.
+- This differs from the zigbee-rs **router** combo default of 0x01 (user
+  decision 2026-11-15), which is unchanged.
+- Unsecured GPDs are protected only by the 2 s duplicate filter and the MAC
+  sequence check, so anyone in radio range can replay or spoof them (13).
+  A host can raise the level with `GP_SINK_CONFIG`.
+
 **Commands.**
 
 | ID | Name | Request payload | Response after `status` | Map |
@@ -1413,7 +1426,9 @@ Both sinks must never pair, so in `NCP_SINK` mode the zigpy library (12.1)
 makes zigpy a **shadow sink**:
 
 1. **Same pairing semantics.** The library configures the NCP sink with
-   `communication_mode = 2`, `group = 0x0B84`. Pairings the NCP sends are
+   `communication_mode = 2`, `group = 0x0B84` and **`security_level = 0x00`**
+   (decision N1). This matches zigpy, so unsecured GPDs such as FlowerX GP
+   and BGT1 GP are accepted. Pairings the NCP sends are
    then identical in semantics to zigpy's, so a later move back to a zigpy
    sink (for example EZSP) keeps every proxy's pairing valid.
 2. **Permit join.** `permit(time_s)` → `NWK_PERMIT_JOIN` plus
@@ -1442,13 +1457,27 @@ makes zigpy a **shadow sink**:
    EZSP era) are pushed once with `GP_SINK_TABLE_PUT` (flags 0, no Pairing
    on air). The proxies are already paired to 0x0B84. The library compares
    `GP_SINK_TABLE_READ` with zigpy's GP devices at every start and resume.
-   Import is not commissioning, so `gpsSecurityLevel` does not block
-   imported level-0 GPDs (Q-N1).
+   Imported level-0 GPDs work, and so does re-commissioning them, because
+   the NCP sink accepts security level 0 (decision N1).
 
 Whether zigpy's internal sink path accepts NCP-decrypted packets
 (`security_status` already processed) and swallowed Pairings without
-retries must be proven by a zigpy-level test (14.3). An upstream zigpy hook
-for "radio-owned sink" would remove steps 2 and 4 (Q-N2).
+retries must be proven by a zigpy-level test (14.3).
+
+**Roadmap** (decision N2, amended).
+
+- **zigpy fork.** A "sink on radio" hook is added in **our zigpy fork**
+  (`faronov/zigpy`): a radio library declares that it owns the GP sink, and
+  `GreenPowerManager` delegates permit, pair and unpair to it instead of
+  transmitting. With the hook, steps 2 and 4 disappear; without it (stock
+  zigpy), the library keeps them.
+- **zigpy-zrhp.** Also maintained under `faronov`. Using the hook in Home
+  Assistant means installing the forked zigpy. The library must keep working
+  with stock zigpy through steps 2 and 4.
+- **Upstreaming.** No upstream zigpy PR is planned. Proposing the hook or
+  the library upstream is a later step that needs the user's approval.
+- **Go hub and zigbee-herdsman.** They move to `NCP_SINK` later. v1 keeps
+  them in `HOST_SINK`.
 
 **Translation.** The NCP has no local application endpoint, so
 `SinkConfig.endpoint = None`: no built-in GPD → ZCL translation runs on the
@@ -1751,7 +1780,7 @@ defines both layouts.
 | `ChildTableJournal` (64 children) | 2 × 4 KiB, 1 024 B slots | 8 KiB | 906 B record + trailer |
 | GP journal (Proxy 8 + Sink 16) | 2 × 8 KiB, 1 024 B slots | 16 KiB | Sink snapshot 1 + 16 × (1 + 45) = 737 B fits a slot. The proxy+sink pair uses 2 slots. 8 KiB sectors give room for adaptive counter records (32 B). |
 | APS tables (bindings, groups, application keys) | 2 × 4 KiB | 8 KiB | as on routers |
-| Identity and settings (IEEE override, UART default, coex enable) | 2 × 4 KiB | 8 KiB | — |
+| Identity and settings (IEEE override, UART default) | 2 × 4 KiB | 8 KiB | — |
 | **Total** | | **136 KiB** | — |
 
 Partition tables (proposal; the product's post-link layout check must
@@ -2299,8 +2328,9 @@ Sources: [ESP-TRM], [IDF-USJ], [esptool], [esp-hal].
 ### 11.3 Host rules for USJ ports
 
 - **Port identity.** Open the port by a stable identity, not by node name.
-  Match the Espressif VID/PID (believed to be `303a:1001`) and the USB serial
-  number. Both are **unverified for H2/C6** and must be confirmed. After an
+  Match the Espressif VID/PID, which ZRHP keeps (decision N8). It is
+  believed to be `303a:1001`. Also match the USB serial number. Both values
+  are **unverified for H2/C6**; gate H1 confirms them. After an
   NCP reset, expect the port to disappear and come back, possibly as a new
   `/dev/ttyACM*` or `/dev/cu.usbmodem*`. Reopen it and redo the handshake.
 - **DTR/RTS handling.**
@@ -2356,7 +2386,7 @@ Sources: [ESP-TBR-HW] and the board schematic v1.3 [ESP-TBR-SCH].
 | Part | Details |
 |---|---|
 | Host | ESP32-S3-WROOM-1 (8 MB flash, 2 MB PSRAM) |
-| NCP | ESP32-H2-MINI-1 (2 MB `-H2S` or 4 MB `-H4S` flash; which one is fitted must be read from the board, `SYS_GET_INFO.flash_size`) |
+| NCP | ESP32-H2-MINI-1 (2 MB `-H2S` or 4 MB `-H4S` flash). The variant on the user's board is **unknown**; see "Flash size" below. |
 | USB | Two USB-C ports, each wired to its SoC's USB-Serial-JTAG |
 | Ethernet | Optional W5500 daughter board on S3 SPI2 (hub-level, irrelevant to ZRHP) |
 
@@ -2388,8 +2418,11 @@ Sources: [ESP-TBR-HW] and the board schematic v1.3 [ESP-TBR-SCH].
     with the ring buffer in internal RAM.
 - **921 600 without flow control** is allowed after gate H8 shows no
   overflow while both chips write flash.
-- **Hardware flow control (optional).** The schematic's three populated
-  "Reserved" 0 Ω links can carry RTS/CTS, routed through both chips' GPIO
+- **Default** (decision N4): 460 800 without flow control. The DMA/IRAM RX
+  path above is **mandatory** on both sides.
+- **Hardware flow control: optional board modification.** This is
+  documented, not a default. The schematic's three populated "Reserved"
+  0 Ω links (R18–R20) can carry RTS/CTS, routed through both chips' GPIO
   matrices:
   - H2 `U0RTS` → GPIO4 → S3 GPIO5 as `U1CTS`;
   - S3 `U1RTS` → GPIO4 → H2 GPIO5 as `U0CTS`.
@@ -2403,6 +2436,20 @@ Sources: [ESP-TBR-HW] and the board schematic v1.3 [ESP-TBR-SCH].
   stall. The hub checks `SYS_GET_INFO.uart_flow` at session start and
   disables its CTS if the NCP reports none.
 
+**Flash size** (decision N4). Both partition tables of 8.9 (2 MB and 4 MB)
+are kept, and the size is detected at runtime:
+
+- **Provisioning.** The hub reads the H2's JEDEC flash ID through the ROM
+  loader before the first write, as esptool's `flash_id` does. It then
+  writes the bootloader, partition table and image built for that size.
+- **NCP.** At boot the NCP reads its flash ID and reports the size in
+  `SYS_GET_INFO.flash_size`. If the detected size is smaller than the end of
+  its partition table (a 4 MB image on a 2 MB part), the NCP refuses to
+  start the stack. It still answers `SYS_*`, raises `EVT_FATAL` (kind
+  "layout mismatch") and waits for a corrected image.
+- **Gate H8** checks which variant the user's board carries once it is on
+  hwlab.
+
 **NCP firmware update by the S3 host.**
 
 1. **Normal path: ZRHP `FW_*` over BULK.**
@@ -2410,12 +2457,21 @@ Sources: [ESP-TBR-HW] and the board schematic v1.3 [ESP-TBR-SCH].
      running until `FW_ACTIVATE`.
    - Trial boot, then `FW_CONFIRM` from the hub after a successful
      `NWK_INIT`, with bootloader rollback otherwise.
-   - The hub keeps two NCP images in its own flash: current and previous,
-     about 0.7–0.9 MB each in a dedicated S3 partition. This mirrors
-     Espressif's RCP update rules [ESP-TBR-RCP].
+   - The hub keeps **two NCP images** in its own flash (decision N6): the
+     **known-good** image and a **candidate**, about 0.7–0.9 MB each in a
+     dedicated S3 partition. This mirrors Espressif's RCP update rules
+     [ESP-TBR-RCP].
+   - A candidate becomes known-good only after `FW_CONFIRM`, which follows
+     a successful session and `NWK_INIT` on the new image.
+   - If the candidate fails, the hub restores the known-good image through
+     the ROM path (2). Failure means any of: the trial window expires
+     without confirmation; the H2 bootloader's own rollback does not bring
+     back a working session; or the NCP is unreachable after activation
+     beyond the resume budget.
 2. **Recovery and provisioning path: H2 ROM serial bootloader.** Used when
    no ZRHP session is possible: blank or corrupt NCP, major-version
-   mismatch, or a failed trial with no usable fallback.
+   mismatch, layout mismatch, or a failed candidate (rollback to the
+   known-good image).
    1. Drive BOOT (S3 GPIO8) low.
    2. Pulse RESET (S3 GPIO7) low for at least 10 ms and release it.
    3. Wait 50 ms, then release BOOT.
@@ -2460,10 +2516,15 @@ Sources: [ESP-TBR-HW] and the board schematic v1.3 [ESP-TBR-SCH].
     requests early with high priority. If grant is denied at the
     transmission instant, the reply is reported `Missed` and counted. The
     GPD retries commissioning.
-- **Enabling it.** `coex_enable` (config `0x0009`) is persisted. Capability
-  21 is set only when the board crate declares the PTA wiring. Recommended:
-  enable when the hub uses Wi-Fi; leave it off with W5500 Ethernet and Wi-Fi
-  disabled.
+- **Enabling it** (decision N7).
+  - PTA is **disabled by default**. `coex_enable` (config `0x0009`) is
+    volatile and reads 0 after every NCP boot.
+  - The hub enables it **automatically while its Wi-Fi is active**, and
+    disables it when Wi-Fi stops, for example on Ethernet-only operation
+    with the W5500. It re-applies the current state in every resume
+    replay (12.4).
+  - Capability 21 is set only when the board crate declares the PTA
+    wiring.
 - **Validation.** Gate H9 (14.6) measures PER and latency with Wi-Fi load,
   with coexistence on and off.
 
@@ -2472,6 +2533,10 @@ Sources: [ESP-TBR-HW] and the board schematic v1.3 [ESP-TBR-SCH].
 ## 12. Host integration
 
 ### 12.1 zigpy radio library (`zigpy-zrhp`, radio type `zrhp`)
+
+The library and the zigpy GP hook are maintained in `faronov` forks
+(decision N2). The library must also run on stock zigpy, falling back to the
+shadow-sink steps of 7.11.
 
 | zigpy `ControllerApplication` | ZRHP |
 |---|---|
@@ -2581,7 +2646,7 @@ Optional interfaces:
 | `NeighborTableProvider`, `RouteTableProvider` | `DIAG_GET_NEIGHBORS`, `DIAG_GET_ROUTES` |
 | `TxPowerProvider` | `NWK_SET_TX_POWER` |
 | `LinkHealthReporter`, `TransportCounterReporter` | Link counters (5.12) |
-| `GreenPowerAdapter` | v1 uses `HOST_SINK` mode (7.11): `GPCommissioningMode` sends the hub's own GP Proxy Commissioning Mode broadcast, which the NCP's local proxy also receives. `GPSetSharedKey` → `GP_SET_SHARED_KEY`. `NCP_SINK` mode needs hub work (Q-N2). |
+| `GreenPowerAdapter` | v1 uses `HOST_SINK` mode (7.11): `GPCommissioningMode` sends the hub's own GP Proxy Commissioning Mode broadcast, which the NCP's local proxy also receives. `GPSetSharedKey` → `GP_SET_SHARED_KEY`. `NCP_SINK` mode is on the roadmap after v1 (decision N2). |
 | `RuntimeCapabilityReporter` | `RuntimeCapabilityStatus{Negotiated, ProtocolMajor/Minor, BuildID, CapabilityBits = ncp_caps, MaxPayload = max_asdu}`, which matches `SYS_NEGOTIATE` one-to-one |
 | `InterviewableAdapter` | Not needed: ZDP passes through raw, so the generic interviewer works |
 
@@ -2621,8 +2686,9 @@ the bytes, because they contain no valid frame of their protocol.
 
 ### 12.3 zigbee-herdsman / Zigbee2MQTT adapter (decision 14)
 
-**Placement.** A new in-tree herdsman adapter `src/adapter/zrhp/`
-(TypeScript), proposed upstream:
+**Placement.** A herdsman adapter `src/adapter/zrhp/` (TypeScript) in a
+**maintained fork** of zigbee-herdsman, with Zigbee2MQTT pointed at the fork
+(decision N5). No upstream PR is planned for v1. The adapter contains:
 
 - adapter type `zrhp` in `TsType.Adapter`;
 - USB discovery by the USJ VID/PID and product string once they are
@@ -2692,7 +2758,7 @@ start.
 
 The adapter's import applies 9.1 and 9.4 (padding, `aps_margin = 2²⁰`).
 
-**Required upstream change.** To keep `stack_specific.zigbee_rs` (FC limits,
+**Required fork change.** To keep `stack_specific.zigbee_rs` (FC limits,
 GP tables) in `coordinator_backup.json`, herdsman's
 `toUnifiedBackup`/`fromUnifiedBackup` and `Models.Backup` need a pass-through
 for unknown `stack_specific` sections. Without it, a Z2M backup restores the
@@ -2701,7 +2767,8 @@ re-commission.
 
 **GP.** herdsman's controller implements its own GP sink (proxy
 commissioning, pairing). v1 runs the NCP in `HOST_SINK` mode for herdsman.
-`NCP_SINK` mode with a herdsman shadow is Q-N2.
+`NCP_SINK` mode with a herdsman shadow is on the roadmap after v1 (decision
+N2).
 
 **Tests.**
 
@@ -2741,7 +2808,9 @@ commissioning, pairing). v1 runs the NCP in `HOST_SINK` mode for herdsman.
 |---|---|
 | Profile | Embedded (3.3): RX window 8, LOG credit 0 by default |
 | Paging | `HOST_TABLES` set; standalone until the NCP cache fills (8.1) |
-| GP | `NCP_SINK` with the hub as GP shadow (`host_caps` bit3) |
+| GP | `NCP_SINK` with the hub as GP shadow (`host_caps` bit3), security level 0x00 |
+| PTA | `coex_enable` follows the hub's Wi-Fi state (decision N7), re-applied in resume |
+| NCP images | Known-good + candidate, rollback through the ROM path (decision N6); flash size detected at provisioning (decision N4) |
 | Resume | Seamless (12.1 steps). The hub owns EN/BOOT, so after the resume budget it can reset the NCP itself, and reflash it through the ROM path. |
 | Backup | Binary records (9.3) in the hub store. OCB JSON is optional: streamed on request through the hub API, or converted by a desktop tool. |
 
@@ -2786,6 +2855,11 @@ Controls:
   the BR board's EN/BOOT lines are physical-access-equivalent capabilities.
   The ROM path writes only signed images when secure boot is on, and never
   touches `zbnv` (11.5).
+- **Unsecured GPDs** (decision N1). Level-0 GPDs are accepted for zigpy
+  compatibility. Their commands are not authenticated: the duplicate filter
+  stops replays only within 2 s, and spoofing within radio range is
+  possible. Deployments that need authenticated switches set
+  `security_level` 2 or 3 with `GP_SINK_CONFIG`.
 - **Never logged:** keys, install codes and frame counters above debug
   level. `EVT_LOG_RECORD` must not contain key material at any level.
 
@@ -2880,7 +2954,10 @@ files directly; they do not copy values.
     `GreenPowerDevice` with one pairing on air. zigpy's Pairing, Proxy
     Commissioning Mode, Response and alias `Device_annce` are swallowed.
     `EVT_GP_FRAME` packets pass zigpy's counter checks. Import of
-    existing zigpy GP devices sends nothing on air.
+    existing zigpy GP devices sends nothing on air. A level-0 GPD
+    (FlowerX-GP-like Multi-Cluster Reporting) commissions and reports
+    with `security_level = 0x00`. Run against stock zigpy and against the
+    `faronov/zigpy` fork with the sink-on-radio hook.
   - **Sidecar rollback:** restoring an older `zigbee_zrhp.db` triggers the
     full writeback through `host_max_rev`.
   - **Key-export lock:** with the lock set, a backup is reported
@@ -2889,7 +2966,7 @@ files directly; they do not copy values.
 - **zigbee-herdsman** (12.3): adapter unit tests against the same simulator;
   the start-result rules (resumed / restored / reset); a Z2M
   `coordinator_backup.json` round trip including `stack_specific.zigbee_rs`
-  pass-through once the upstream change exists.
+  pass-through, which is part of the fork.
 - **Embedded host:** the hub's ZRHP layer runs the vectors and the ARQ traces
   on the host (`std`). The same code on the S3 is exercised by gate H12.
 
@@ -2960,11 +3037,11 @@ This is simulation-level evidence, not hardware evidence.
 | H5 | **ZBT-1 hashed-TCLK verification** (decision 8): read a device's derived TCLK from the user's ZBT-1 (EZSP key export of a device that completed a TCLK update) and compare it with both candidates in `ezsp_hashed_tclk.json` computed from that network's `hashed_tclk`. The match becomes the normative vector and enables capability bit 14. Then migrate ZBT-1 → H2 → ZBT-1 with real devices, checking APS-secured exchanges (Verify-Key, network-key rotation) with a hashed-key device after each move. |
 | H6 | NCP firmware update with trial boot, confirm, rollback and retained network state. |
 | H7 | 24 h soak with noise injection on the UART variant (921 600, RTS/CTS). |
-| H8 | **Thread BR board UART:** 460 800 and 921 600 without flow control, with both chips writing flash (`rx_overflow = 0`). RTS/CTS on the reserved lines (R19/R20 fitted? H2 GPIO4/5 usable?) up to 2 Mbaud. ROM-path recovery via S3 GPIO7/8 with `zbnv` preserved. |
-| H9 | **PTA coexistence:** Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on; GP TempMaster reply behaviour with grant denied. |
-| H10 | **GP combo on the NCP:** direct and proxy-tunnelled commissioning into the NCP sink with zigpy as shadow; a bidirectional GPD with the NCP as its own TempMaster; Sink Table across an NCP reboot (seamless resume) and across backup/restore. |
+| H8 | **Thread BR board UART:** 460 800 (default) and 921 600 without flow control, with both chips writing flash (`rx_overflow = 0`). Optional board mod: RTS/CTS on R19/R20 (fitted? H2 GPIO4/5 usable?) up to 2 Mbaud. Identify the H2 module's flash size (2 MB or 4 MB) via JEDEC ID, and check the NCP's layout-mismatch refusal. ROM-path recovery via S3 GPIO7/8 with `zbnv` preserved. |
+| H9 | **PTA coexistence:** Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on. The hub's automatic enable/disable follows Wi-Fi up/down, including Ethernet-only. GP TempMaster reply behaviour with grant denied. |
+| H10 | **GP combo on the NCP:** direct and proxy-tunnelled commissioning into the NCP sink with zigpy as shadow, including an unsecured (level-0) FlowerX GP / BGT1 GP; a bidirectional GPD with the NCP as its own TempMaster; Sink Table across an NCP reboot (seamless resume) and across backup/restore. |
 | H11 | **Z2M end to end:** zigbee-herdsman adapter with 10+ real devices; Z2M backup → restore on a fresh NCP. |
-| H12 | **Embedded hub:** S3 hub with a synthetic 2 000-device store (PSRAM budget of 3.4), paging forced by a reduced NCP cache, power cuts during writebacks, store journal recovery. |
+| H12 | **Embedded hub:** S3 hub with a synthetic 2 000-device store (PSRAM budget of 3.4), paging forced by a reduced NCP cache, power cuts during writebacks, store journal recovery. Candidate NCP image that fails its trial → automatic rollback to the known-good image through the ROM path, with network state retained. |
 
 ---
 
@@ -2981,7 +3058,7 @@ This is simulation-level evidence, not hardware evidence.
 | 7 | MAC/HAL: H2/C6 UART transport with UHCI RX DMA and optional RTS/CTS; USJ non-blocking pump; PTA follower in the ESP MAC | — | Host/unit tests, builds; hardware gates H1, H2, H8, H9 |
 | 8 | `apps/ncp-coordinator` over `TrustCenterCoordinatorApp` + GP combo | 1–6 | Host-tested against the Rust reference host over an in-memory pipe |
 | 9 | `products/esp32-zigbee-ncp`: 2 MB and 4 MB layouts (8.9), NV journals, identity, transport features (`transport-usj`, `transport-uart`), boards (H2 devkit, Thread BR H2 side), signed update, size report | 7, 8 | Builds, post-link layout checks, size budget |
-| 10 | Hosts: `zigpy-zrhp` (Python), Go `adapter/zrhp` (+ margin 10 000), zigbee-herdsman `zrhp` (TypeScript, plus the upstream backup pass-through), embedded `faronov/zigbee-rs-hub` (Rust, S3) | 1 vectors | Host-tested vs vectors and the simulated NCP |
+| 10 | Hosts: `zigpy-zrhp` (Python, under `faronov`) plus the sink-on-radio hook in the `faronov/zigpy` fork (no upstream PR; upstreaming later, with user approval), Go `adapter/zrhp` (+ margin 10 000), zigbee-herdsman fork with `zrhp` (TypeScript, plus the backup pass-through), embedded `faronov/zigbee-rs-hub` (Rust, S3) | 1 vectors | Host-tested vs vectors and the simulated NCP |
 | 11 | Noise bench (14.4), mcuemu scenario (14.5) | 1, 8 | Simulation |
 | 12 | Hardware gates H1–H12 | 9, 10 | Lab, then production-path evidence |
 
@@ -3015,38 +3092,27 @@ two requirements. Each decision is applied in the sections listed.
 | R1 | **Embedded host** from the start: Rust hub `faronov/zigbee-rs-hub` on the ESP32-S3 of the Espressif Thread BR / Zigbee GW board, using the shared crate `zigbee-zrhp`. Covers host profiles, minimum host buffers, BR-board UART, ROM-path NCP update and PTA. | 1 (G9), 3.2–3.4, 4.1, 4.4, 11.5, 12.4, gates H8, H9, H12 |
 | R2 | **No network transport in ZRHP** (USJ and UART only). The S3 hub's WebSocket JSON API is hub-level and out of scope. | Header, 1, 3.2, 4, 13 |
 
-**New open questions.**
+**Answers to the follow-up questions** (same day):
 
-1. **Q-N1: NCP sink security level for zigpy.** The zigbee-rs sink defaults
-   to `gpsSecurityLevel` 0x01 (user decision 2026-11-15), so new level-0
-   (unsecured) GPDs are refused. zigpy accepts level 0, and the user's
-   FlowerX GP / BGT1 GP sensors are unsecured. Imported entries keep
-   working (7.11 step 7), but re-commissioning one would be refused. Keep
-   0x01 for zigpy, or have the library set 0x00?
-2. **Q-N2: Upstream hooks for GP.** Propose a zigpy "radio-owned GP sink"
-   hook upstream, which would remove the library's swallowing of zigpy's
-   GP transmissions? Also, should the Go hub and herdsman move to
-   `NCP_SINK` mode later? v1 keeps them in `HOST_SINK`.
-3. **Q-N3: Derived TCLKs for new networks.** Should a network formed by
-   zigbee-rs use a hashed-TCLK-style scheme (root key + EUI64) instead of
-   random unique TCLKs? It would remove almost all per-device key storage
-   and paging, at the cost that the root key compromises every derived key.
-   Install-code and application keys stay stored either way.
-4. **Q-N4: Thread BR board flow control and flash.**
-   - Use the schematic's reserved lines (R19/R20) for RTS/CTS? That needs
-     both images and a check on the physical board.
-   - Or stay at 460 800 without flow control (Espressif's default)?
-   - Which ESP32-H2-MINI-1 variant (2 MB or 4 MB) is on the user's board?
-5. **Q-N5: zigbee-herdsman delivery.** Upstream PRs (adapter +
-   `stack_specific` pass-through) or a maintained fork until accepted?
-6. **Q-N6: S3 flash budget for NCP images.** The hub keeps the current and
-   previous NCP image, about 2 MiB of the S3's 8 MB. Acceptable?
-7. **Q-N7: PTA default on the BR product.** Keep it off by default, as
-   Espressif does, and let the hub enable it whenever its Wi-Fi is up? Or
-   leave it to user configuration?
-8. **Q-N8: USB identity.** Keep Espressif's USJ VID/PID (H2/C6 values to be
-   verified), or plan our own descriptors for the later USB vendor-bulk
-   transport?
+| # | Decision | Applied in |
+|---:|---|---|
+| N1 | NCP GP sink `gpsSecurityLevel` = **0x00** (zigpy-compatible): unsecured GPDs such as FlowerX GP / BGT1 GP are accepted. | 7.11, 12.4, 13, 14.3, H10, `messages.json` (`gp_sink_config_zigpy`) |
+| N2 | The **"sink on radio" hook** and all zigpy / `zigpy-zrhp` work live in **our fork** (`faronov/zigpy`, `faronov/zigpy-zrhp`). No upstream zigpy PR for now; upstreaming is a later step that needs the user's approval. The Go hub and zigbee-herdsman move to `NCP_SINK` later; v1 keeps `HOST_SINK` there (roadmap). | 3, 7.11, 12.2, 12.3, 14.3, 15 |
+| N3 | **No derived TCLKs** for new networks: random per-device TCLKs only. Hashed mode exists only for EZSP migration. | 7.5 |
+| N4 | BR board UART: **460 800 without flow control** by default, DMA/IRAM RX mandatory; RTS/CTS via R19/R20 documented as an optional board mod. H2 module flash size unknown: both 2 MB/4 MB partition tables kept, size detected at runtime (checked when the board is on hwlab). | 11.5, 8.9, H8 |
+| N5 | zigbee-herdsman: **maintained fork**, no upstream PR plan for v1. | 3, 12.3, 15 |
+| N6 | The S3 stores **known-good + candidate** NCP images, with rollback through the H2 ROM bootloader. | 11.5, 12.4, H12 |
+| N7 | PTA **disabled by default**; the hub enables it automatically while Wi-Fi is active (off with Ethernet-only). | 7.1, 11.5, 12.4, H9 |
+| N8 | USB identity: **keep Espressif's VID/PID**. | 4.3, 11.3, H1 |
+
+**Open questions.** None block the start of implementation. The remaining
+unknowns are hardware facts tracked as gates:
+
+- the USJ VID/PID and serial-number behaviour on H2/C6 (H1);
+- the H2 UART maximum rate (H2);
+- the EZSP hashed-TCLK byte order (H5);
+- the BR board's flash variant and R19/R20 fitting (H8);
+- PTA behaviour under Wi-Fi load (H9).
 
 ## 17. References
 

@@ -319,18 +319,18 @@
     "kind": 0,
     "msg_id": "0x0a01",
     "tid": 263,
-    "note": "NCP sink authoritative; pre-commissioned groupcast to 0x0B84 like zigpy",
+    "note": "NCP sink authoritative; pre-commissioned groupcast to 0x0B84 and security level 0 like zigpy (decision N1)",
     "fields": {
       "mode": 1,
       "communication_mode": 2,
       "group": "0x0b84",
       "exit_mode": 5,
       "window_s": 180,
-      "security_level": 1,
+      "security_level": 0,
       "groupcast_radius": 0
     },
-    "payload_hex": "0102840b05b4000100",
-    "message_hex": "00010a070109000102840b05b4000100"
+    "payload_hex": "0102840b05b4000000",
+    "message_hex": "00010a070109000102840b05b4000000"
   },
   {
     "name": "gp_sink_commissioning_enter",
