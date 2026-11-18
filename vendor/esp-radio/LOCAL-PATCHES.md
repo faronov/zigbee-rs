@@ -323,3 +323,45 @@ existing lines, so panic locations do not move).
 - **Hardware:** ESP32-C6 DevKit (2026-11-18): a 16-channel scan at
   `scan_duration` 3 completed and formation picked channel 16. ED values
   were not compared against a reference instrument.
+
+## External (PTA) coexistence hooks and priorities (`ieee802154-extcoex`)
+
+Opt-in cargo feature; only the ESP32-H2 NCP for the Thread Border Router
+board enables it (`esp32-zigbee-ncp-product/pta`). Without it the crate
+compiles to the same code as before: every in-place edit extends an existing
+line with `#[cfg]` statements (no line moves), and the new code is appended
+at the end of `raw.rs`/`mod.rs`.
+
+- **Why:** the ESP-IDF driver built with `CONFIG_ESP_COEX_EXTERNAL_COEXIST_
+  ENABLE` tells the external arbiter, before each radio operation, whether
+  a TX or an RX stage follows, and takes the per-scene PTIs from a
+  configurable table. Upstream esp-radio hard-codes the PTIs and has no
+  stage calls.
+- **Patch** (ESP-IDF **v5.5.1**, `components/ieee802154/driver/
+  esp_ieee802154_dev.c`):
+  - `esp_coex_ieee802154_extcoex_tx_stage()` at the end of `tx_init` and
+    when RX_DONE leads to an automatic ACK (`isr_handle_rx_done`);
+  - `esp_coex_ieee802154_extcoex_rx_stage()` at the start of `enable_rx`
+    and on ACK_TX_DONE (`isr_handle_ack_tx_done`); the TX_DONE call of
+    ESP-IDF is covered by `next_operation` → `enable_rx`.
+  - The scene PTIs come from `CoexPti` (`set_coex_pti`/`coex_pti`):
+    `idle`, `rx`, `tx`, `timed` (ESP-IDF `TX_AT`/`RX_AT`) and `ack`, with
+    the ESP-IDF defaults (`esp_ieee802154_util.c` `s_coex_config`: Idle, Low,
+    Low, Middle; ACK Middle from `ieee802154_mac_init`). Timed
+    transmissions (`transmit_raw_preempting_rx`, the triggered reply) use
+    the `TX_AT` scene as ESP-IDF's `ieee802154_transmit_at` does; without
+    the feature they use `Tx`.
+  - `set_coex_pti` writes the ACK PTI at once with the ZB_MAC interrupt
+    masked (same register as the TX/RX PTI the interrupt rewrites); scene
+    PTIs apply at the next scene change.
+- **Blob:** the functions are in the `libcoexist.a` that `esp-wifi-sys`
+  0.8.1 links (`coexist_api.o`); the ESP32-H2 archive is byte-identical to
+  ESP-IDF v5.5.1's (SHA-1 `d67b0a16d30eb2d876b6a717a84840ea14f18b82`). The
+  stage functions write the PTI offset (`0x600AD4D8[3:0]` = 0 / 0xF); the
+  PTI setters write IEEE802154 `COEX_PTI` through `coex_pti_tab`.
+- **Not included:** enabling the arbiter and routing the GPIO matrix
+  (application: `products/esp32-zigbee-ncp/src/pta.rs`); a TX aborted by
+  `TxCoexBreak` (grant denied) is still only cleared, not reported, so the
+  caller's TX-done timeout reports it.
+- **Hardware:** not yet run on the Thread BR board
+  (`examples/esp32-ncp` `pta_lab`).

@@ -546,3 +546,8 @@ impl Ieee802154<'_> {
         raw::energy_detect::cancel()
     }
 }
+
+/// External (PTA) coexistence priorities of the radio (local patch
+/// `ieee802154-extcoex`, declared last).
+#[cfg(feature = "ieee802154-extcoex")]
+pub use self::raw::extcoex::{CoexPriority, CoexPti, coex_pti, set_coex_pti};

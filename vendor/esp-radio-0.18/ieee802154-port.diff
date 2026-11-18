@@ -106,4 +106,14 @@
 +    radio.bind_mac_interrupt(zb_mac_handler);
  }
  
- fn ieee802154_set_txrx_pti(txrx_scene: Ieee802154TxRxScene) {
+ #[cfg(not(feature = "ieee802154-extcoex"))] fn ieee802154_set_txrx_pti(txrx_scene: Ieee802154TxRxScene) {
+@@ -1113,7 +1107,8 @@
+ pub(crate) mod extcoex {
+     use core::sync::atomic::{AtomicU32, Ordering};
+ 
+-    use esp_wifi_sys::include::{
++    // esp-radio 0.18 port: the coexistence bindings come from `crate::sys`.
++    use crate::sys::include::{
+         ieee802154_coex_event_t, ieee802154_coex_event_t_IEEE802154_HIGH,
+         ieee802154_coex_event_t_IEEE802154_IDLE, ieee802154_coex_event_t_IEEE802154_LOW,
+         ieee802154_coex_event_t_IEEE802154_MIDDLE,
