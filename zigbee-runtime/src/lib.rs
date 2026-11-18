@@ -833,7 +833,7 @@ mod builder_cluster_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "host-passthrough")))]
 mod resume_tests {
     use core::future::Future;
     use core::task::{Context, Poll, Waker};
@@ -14950,14 +14950,14 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         // kept out of the per-backend receive future.
         let (dst_ep, cluster_id, src_addr) = aps_route_metadata(&aps_indication);
 
-        // Send APS ACK now if the incoming frame requested one. This must
-        // happen for *every* endpoint (ZDO and application clusters alike),
-        // not just for ZDO — otherwise the coordinator/TC retransmits ZCL
-        // Read Attributes (e.g. Basic Manufacturer/Model) until the ZHA
-        // interview times out, leaving the device as `unk_manufacturer /
-        // unk_model` with empty endpoints. Spec: APS sub-layer ACKs precede
-        // any application-level response (ZB R22 §2.2.5.1).
+        // Send APS ACK now if the incoming frame requested one. This must happen for *every* endpoint (ZDO and application clusters alike),
+        // not just for ZDO — otherwise the coordinator/TC retransmits ZCL Read Attributes (e.g. Basic Manufacturer/Model) until the ZHA
+        // interview times out, leaving the device as `unk_manufacturer / unk_model` with empty endpoints. Spec: APS sub-layer ACKs precede any application-level response (ZB R22 §2.2.5.1).
         self.send_pending_aps_ack_if_ready().await;
+        #[cfg(feature = "host-passthrough")]
+        if self.host_passthrough_capture(&aps_indication, indication, src, nwk_security) {
+            return None;
+        }
 
         if dst_ep == 0x00 {
             if defer_binding {
@@ -15929,9 +15929,6 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 }
 
-// Parent-router (non-Trust-Center) scenarios; with `global-aps-counter` no
-// TC runtime installs the APS reservation, so their APS-secured sends are
-// refused by design.
 #[cfg(all(test, feature = "router", not(feature = "global-aps-counter")))]
 mod parent_router_tests {
     use super::child_store::{
@@ -20978,6 +20975,9 @@ mod start_identify_tests {
     }
 }
 
+/// Raw APS indications for an external host (declared last, see above).
+#[cfg(feature = "host-passthrough")]
+pub mod host_passthrough;
 /// Small durable application settings (declared last: keeps the line
 /// numbers above, which panic locations embed, unchanged).
 pub mod settings_journal;

@@ -6,6 +6,8 @@ license = "MIT OR Apache-2.0"
 description = "Zigbee device runtime — event loop, device builder, NV storage"
 
 [dependencies]
+# `host-passthrough` queue only.
+critical-section = { version = "1.2", optional = true }
 embedded-storage = { workspace = true }
 heapless = "0.9"
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
@@ -62,6 +64,10 @@ trust-center = ["router", "zigbee-aps/trust-center", "zigbee-bdb/trust-center"]
 # start = max(every per-key limit, the NWK limit). Off by default: images
 # without it are unchanged.
 global-aps-counter = ["trust-center", "zigbee-aps/global-aps-counter"]
+# Network co-processor: APS data frames for application endpoints go to a
+# bounded host queue (`host_passthrough`) instead of the ZCL dispatcher.
+# Off by default: images without it are unchanged.
+host-passthrough = ["dep:critical-section"]
 ota = []
 # Green Power Proxy Basic (GP 1.1) for routers: GPDF reception, Proxy Table,
 # GP Notification / Commissioning Notification tunnelling with NWK aliasing.
@@ -115,6 +121,7 @@ compact-single-endpoint = [
 ]
 
 [dev-dependencies]
+critical-section = { version = "1.2", features = ["std"] }
 # Runtime unit tests expose coordinator helpers under `cfg(test)`; compile the
 # BDB formation implementation without enabling router behavior.
 zigbee-bdb = { path = "../zigbee-bdb", default-features = false, features = ["formation"] }
