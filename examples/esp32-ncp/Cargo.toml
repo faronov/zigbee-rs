@@ -14,6 +14,13 @@ publish = false
 name = "esp32-ncp"
 path = "src/main.rs"
 
+# PTA lab image for the Thread BR board (never a product image):
+#   cargo build --release --no-default-features --features esp32h2,transport-uart,pta-lab --bin pta_lab
+[[bin]]
+name = "pta_lab"
+path = "src/bin/pta_lab.rs"
+required-features = ["pta-lab"]
+
 [dependencies]
 esp32-zigbee-ncp-product = { path = "../../products/esp32-zigbee-ncp" }
 # Executor and SYSTIMER embassy time driver (layout-independent glue).
@@ -32,6 +39,8 @@ zigbee-types = { path = "../../zigbee-types" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 esp-serial-stream = { path = "../../esp-serial-stream" }
 esp-thread-br-h2 = { path = "../../boards/esp-thread-br-h2", optional = true }
+# `pta_lab` console only (USB-Serial-JTAG of the H2).
+esp-println = { version = "0.12", features = ["esp32h2"], optional = true }
 
 esp-bootloader-esp-idf = { version = "0.4.0", default-features = false }
 esp-hal = { version = "=1.0.0", features = ["unstable"] }
@@ -67,6 +76,11 @@ transport-uart = ["esp32-zigbee-ncp-product/transport-uart"]
 thread-br-h2 = ["esp32-zigbee-ncp-product/thread-br-h2", "dep:esp-thread-br-h2"]
 rtscts-reserved-lines = ["thread-br-h2", "esp32-zigbee-ncp-product/rtscts-reserved-lines"]
 flash-2mb = ["esp32-zigbee-ncp-product/flash-2mb"]
+# PTA coexistence follower (product `pta::Pta`; adds the radio's
+# external-coexistence hooks). Not yet driven by `main.rs`.
+pta = ["thread-br-h2", "esp32-zigbee-ncp-product/pta"]
+# `pta_lab` binary (src/bin/pta_lab.rs).
+pta-lab = ["pta", "dep:esp-println"]
 
 [profile.release]
 opt-level = "s"
