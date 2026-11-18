@@ -161,7 +161,7 @@ fn main() -> ! {
         reset_reason: reset_reason(),
         key_export: true,
         max_children: zigbee_runtime::child_store::MAX_PERSISTED_CHILDREN as u32,
-        max_tc_devices: 32,
+        max_tc_devices: zigbee_bdb::trust_center::MAX_TRUST_CENTER_DEVICES as u32,
         stack_allowed: verdict.stack_allowed(),
     };
     log::info!(

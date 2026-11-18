@@ -73,9 +73,8 @@ pub const ACTIVE: Layout = LAYOUT_2MB;
 /// `zbnv`-relative journal windows (136 KiB used, 56 KiB spare).
 ///
 /// Each window holds two logical sectors (A at the window start, B at its
-/// middle). Where today's runtime journal uses smaller sectors than the
-/// window half (Trust Center devices, GP), the rest of the half is reserved
-/// for the planned streamed snapshots and 1 KiB slots (spec 8.9).
+/// middle). The GP journal still uses smaller sectors than its window half;
+/// the rest is reserved for its planned 1 KiB slots (spec 8.9).
 pub struct Nv;
 
 impl Nv {
@@ -84,10 +83,13 @@ impl Nv {
     pub const SECURITY: (u32, u32) = (0, 32 * KIB);
     /// `SecurityStateJournal` logical sector.
     pub const SECURITY_SECTOR: usize = 16 * 1024;
-    /// `TrustCenterDeviceJournal`: 2 × 32 KiB reserved; today's journal
-    /// uses the first 4 KiB of each half.
+    /// `TrustCenterStreamJournal`: 2 × 32 KiB logical sectors, each holding
+    /// a streamed 256-device snapshot (≤ 5 × 4 KiB chunks) plus room to
+    /// append smaller ones.
     pub const TRUST_CENTER: (u32, u32) = (32 * KIB, 64 * KIB);
-    /// `ChildTableJournal`: 2 × 4 KiB.
+    /// Trust Center journal logical sector.
+    pub const TRUST_CENTER_SECTOR: usize = 32 * 1024;
+    /// `ChildTableJournal`: 2 × 4 KiB, 1 024-byte slots (64 children).
     pub const CHILDREN: (u32, u32) = (96 * KIB, 8 * KIB);
     /// GP journal (Proxy + Sink tables): 2 × 8 KiB.
     pub const GREEN_POWER: (u32, u32) = (104 * KIB, 16 * KIB);
@@ -227,6 +229,15 @@ mod tests {
         }
         assert_eq!(end, 136 * KIB);
         assert_eq!(LAYOUT_4MB.zbnv_size - end, 56 * KIB);
+    }
+
+    #[test]
+    fn the_trust_center_window_holds_two_streamed_32k_sectors() {
+        // `stores::TrustCenterStore` streams 256-device snapshots (≤ 5 ×
+        // 4 KiB chunks) inside each 32 KiB half.
+        assert_eq!(2 * Nv::TRUST_CENTER_SECTOR as u32, Nv::TRUST_CENTER.1);
+        const { assert!(Nv::TRUST_CENTER_SECTOR >= 5 * 4096) };
+        const { assert!((Nv::TRUST_CENTER_SECTOR as u32).is_multiple_of(SECTOR_SIZE)) };
     }
 
     #[test]

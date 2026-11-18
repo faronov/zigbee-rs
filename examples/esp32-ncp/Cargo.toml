@@ -19,15 +19,19 @@ esp32-zigbee-ncp-product = { path = "../../products/esp32-zigbee-ncp" }
 # Executor and SYSTIMER embassy time driver (layout-independent glue).
 esp32-zigbee-devkit-product = { path = "../../products/esp32-zigbee-devkit" }
 ncp-coordinator-app = { path = "../../apps/ncp-coordinator" }
-router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter"] }
+router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity"] }
+# `ncp-capacity`: NCP table sizes (spec 8.9), incl. the 64-entry Frame
+# Pending table of the ESP parent MAC.
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = [
     "centralized-tclk",
     "trust-center",
     "global-aps-counter",
     "host-passthrough",
+    "ncp-capacity",
 ] }
-zigbee-mac = { path = "../../zigbee-mac", features = ["esp-parent", "pan-coordinator", "energy-detect"] }
+zigbee-mac = { path = "../../zigbee-mac", features = ["esp-parent", "pan-coordinator", "energy-detect", "ncp-capacity"] }
 zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-bdb = { path = "../../zigbee-bdb", default-features = false }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 esp-serial-stream = { path = "../../esp-serial-stream" }

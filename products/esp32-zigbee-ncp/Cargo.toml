@@ -34,8 +34,9 @@ zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, feat
     "trust-center",
     "global-aps-counter",
     "host-passthrough",
+    "ncp-capacity",
 ] }
-router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter"] }
+router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity"] }
 ncp-coordinator-app = { path = "../../apps/ncp-coordinator" }
 
 [features]
