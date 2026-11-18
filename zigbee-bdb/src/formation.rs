@@ -274,7 +274,7 @@ impl<M: MacDriver> BdbLayer<M> {
         );
 
         // Only a durably committed network may advertise a joining window.
-        let duration = core::cmp::min(BDB_MIN_COMMISSIONING_TIME, 254) as u8;
+        let duration = FORMATION_PERMIT_JOIN_S;
         if let Err(e) = self.zdo.nlme_permit_joining(duration).await {
             log::warn!("[BDB:Formation] Failed to open permit joining: {:?}", e);
             self.attributes.commissioning_status =
@@ -412,7 +412,11 @@ mod tests {
         assert_eq!(committed.trust_center_address, IEEE);
         assert!(bdb.zdo().nwk().is_joined());
         assert!(bdb.is_on_network());
-        assert!(bdb.zdo().nwk().nib().permit_joining);
+        // A network co-processor build leaves joining to the host.
+        assert_eq!(
+            bdb.zdo().nwk().nib().permit_joining,
+            !cfg!(feature = "formation-joining-closed")
+        );
         assert_eq!(bdb.zdo().nwk().nib().outgoing_frame_counter_limit, 0x800);
         assert!(bdb.zdo().nwk().nib().outgoing_frame_counter > 0x400);
 
@@ -425,3 +429,17 @@ mod tests {
         );
     }
 }
+
+/// Joining window opened by a successful formation (declared last).
+///
+/// `bdbcMinCommissioningTime`, capped to the 254 s a Mgmt_Permit_Joining_req
+/// can carry without meaning "forever". With `formation-joining-closed` the
+/// formed network stays closed (0 s, also broadcast to routers): on a network
+/// co-processor only the host decides when joining opens.
+const FORMATION_PERMIT_JOIN_S: u8 = if cfg!(feature = "formation-joining-closed") {
+    0
+} else if BDB_MIN_COMMISSIONING_TIME > 254 {
+    254
+} else {
+    BDB_MIN_COMMISSIONING_TIME as u8
+};
