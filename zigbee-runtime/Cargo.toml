@@ -80,9 +80,18 @@ ncp-capacity = [
     "zigbee-nwk/ncp-capacity",
 ]
 # Network co-processor: APS data frames for application endpoints go to a
-# bounded host queue (`host_passthrough`) instead of the ZCL dispatcher.
-# Off by default: images without it are unchanged.
-host-passthrough = ["dep:critical-section"]
+# bounded host queue (`host_passthrough`) instead of the ZCL dispatcher, with
+# the last hop RSSI and the APS security/key source; neighbour departures,
+# Trust Center join decisions and removals are recorded for the host; the ZDO
+# endpoint registry accepts host endpoints. Off by default: images without it
+# are unchanged.
+host-passthrough = [
+    "dep:critical-section",
+    "zigbee-mac/rx-rssi",
+    "zigbee-aps/host-passthrough",
+    "zigbee-nwk/host-passthrough",
+    "zigbee-zdo/host-passthrough",
+]
 ota = []
 # Green Power Proxy Basic (GP 1.1) for routers: GPDF reception, Proxy Table,
 # GP Notification / Commissioning Notification tunnelling with NWK aliasing.

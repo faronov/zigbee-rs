@@ -111,6 +111,9 @@ pub struct TrustCenterRuntime<S> {
     /// Durable global APS reservations committed since construction.
     #[cfg(feature = "global-aps-counter")]
     global_aps_commits: u32,
+    /// Decisions reported to a network co-processor host.
+    #[cfg(feature = "host-passthrough")]
+    host_events: HostEvents,
 }
 
 /// Remaining values below which the global APS reservation is extended
@@ -133,6 +136,104 @@ pub struct GlobalApsCheckpoint {
     pub commits: u32,
 }
 
+/// A Trust Center decision for a network co-processor host
+/// (`host-passthrough`, ZRHP `EVT_DEVICE_JOINED` / `EVT_DEVICE_LEFT`).
+#[cfg(feature = "host-passthrough")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustCenterHostEvent {
+    /// An Update-Device join or rejoin (from a parent router, or from this
+    /// coordinator for its own child) was decided.
+    Joined {
+        device_address: IeeeAddress,
+        short_address: ShortAddress,
+        /// The reporting parent; this coordinator's own IEEE for its child.
+        parent_address: IeeeAddress,
+        /// Unsecured join (association), secured rejoin, or Trust Center
+        /// (unsecured) rejoin.
+        status: zigbee_aps::apsme::ApsUpdateDeviceStatus,
+        /// Admitted (network key sent, or rejoin accepted); `false` when
+        /// rejected or removed by policy.
+        admitted: bool,
+    },
+    /// A parent reported, with Update-Device "device left", that the device
+    /// left the network (this coordinator's own IEEE for its own child).
+    Left {
+        device_address: IeeeAddress,
+        short_address: ShortAddress,
+        parent_address: IeeeAddress,
+    },
+    /// The Trust Center removed an admitted device (Remove-Device or Leave
+    /// request: a rejected rejoin, an expired join timeout, a failed key
+    /// exchange).
+    Removed {
+        device_address: IeeeAddress,
+        short_address: ShortAddress,
+        parent_address: IeeeAddress,
+    },
+}
+
+/// Trust Center host events held until the owner drains them.
+#[cfg(feature = "host-passthrough")]
+pub const TRUST_CENTER_HOST_EVENTS: usize = 8;
+
+#[cfg(feature = "host-passthrough")]
+struct HostEvents {
+    queue: heapless::Deque<TrustCenterHostEvent, TRUST_CENTER_HOST_EVENTS>,
+    dropped: u16,
+}
+
+#[cfg(feature = "host-passthrough")]
+impl HostEvents {
+    const fn new() -> Self {
+        Self {
+            queue: heapless::Deque::new(),
+            dropped: 0,
+        }
+    }
+
+    fn push(&mut self, event: TrustCenterHostEvent) {
+        if self.queue.push_back(event).is_err() {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    /// `accepted`: a join was admitted, or a departure report accepted.
+    fn update_device(&mut self, indication: ApsmeUpdateDeviceIndication, accepted: bool) {
+        let event = if indication.status == zigbee_aps::apsme::ApsUpdateDeviceStatus::DeviceLeft {
+            if !accepted {
+                return;
+            }
+            TrustCenterHostEvent::Left {
+                device_address: indication.device_address,
+                short_address: indication.device_short_address,
+                parent_address: indication.source_address,
+            }
+        } else {
+            TrustCenterHostEvent::Joined {
+                device_address: indication.device_address,
+                short_address: indication.device_short_address,
+                parent_address: indication.source_address,
+                status: indication.status,
+                admitted: accepted,
+            }
+        };
+        self.push(event);
+    }
+}
+
+#[cfg(feature = "host-passthrough")]
+impl<S> TrustCenterRuntime<S> {
+    /// Oldest Trust Center decision for the host (`host-passthrough`).
+    pub fn take_host_event(&mut self) -> Option<TrustCenterHostEvent> {
+        self.host_events.queue.pop_front()
+    }
+
+    /// Host events lost because the queue was full, since the last call.
+    pub fn take_host_events_dropped(&mut self) -> u16 {
+        core::mem::take(&mut self.host_events.dropped)
+    }
+}
+
 impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
     pub fn new(store: S) -> Self {
         Self {
@@ -152,6 +253,8 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             network_key_propagation_started: None,
             #[cfg(feature = "global-aps-counter")]
             global_aps_commits: 0,
+            #[cfg(feature = "host-passthrough")]
+            host_events: HostEvents::new(),
         }
     }
 
@@ -182,6 +285,8 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 network_key_propagation_started: _,
                 #[cfg(feature = "global-aps-counter")]
                     global_aps_commits: _,
+                #[cfg(feature = "host-passthrough")]
+                    host_events: _,
             } = runtime;
         };
         unsafe {
@@ -201,6 +306,8 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             core::ptr::addr_of_mut!((*slot).network_key_propagation_started).write(None);
             #[cfg(feature = "global-aps-counter")]
             core::ptr::addr_of_mut!((*slot).global_aps_commits).write(0);
+            #[cfg(feature = "host-passthrough")]
+            core::ptr::addr_of_mut!((*slot).host_events).write(HostEvents::new());
         }
     }
 
@@ -619,6 +726,10 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         self.initial_key_attempts.clear();
         self.network_key_propagation_started = None;
         self.cancel_delivery();
+        #[cfg(feature = "host-passthrough")]
+        {
+            self.host_events = HostEvents::new();
+        }
         self.store.clear()?;
         Ok(())
     }
@@ -980,6 +1091,8 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                     .any(|pending| pending.device_address == indication.device_address)
             })
         {
+            #[cfg(feature = "host-passthrough")]
+            self.host_events.update_device(indication, false);
             self.stage_unknown_removal(
                 device,
                 indication.source_address,
@@ -996,9 +1109,21 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                     indication.device_address,
                     error
                 );
+                #[cfg(feature = "host-passthrough")]
+                self.host_events.update_device(indication, false);
                 return Ok(());
             }
         };
+        #[cfg(feature = "host-passthrough")]
+        self.host_events.update_device(
+            indication,
+            matches!(
+                action,
+                TrustCenterAction::TransportNetworkKey { .. }
+                    | TrustCenterAction::None
+                    | TrustCenterAction::RevokeDevice { .. }
+            ),
+        );
         match action {
             TrustCenterAction::TransportNetworkKey { device_address, .. } => {
                 self.upsert_table_device(device, &device_address, true)?;
@@ -1160,6 +1285,12 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                         parent_address,
                         device_short_address,
                     )?;
+                    #[cfg(feature = "host-passthrough")]
+                    self.host_events.push(TrustCenterHostEvent::Removed {
+                        device_address,
+                        short_address: device_short_address,
+                        parent_address,
+                    });
                     self.resume_removal(device, device_address).await
                 } else {
                     self.stage_unknown_removal(device, parent_address, device_address)?;
@@ -4876,5 +5007,114 @@ mod tests {
             assert_eq!(raised.current, 0x0100_0000);
             assert_eq!(raised.durable_limit, 0x0100_0000 + APS_COUNTER_RESERVATION);
         }
+    }
+
+    /// `host-passthrough`: join decisions, departure reports and removals
+    /// are queued for the network co-processor host.
+    #[test]
+    #[cfg(feature = "host-passthrough")]
+    fn trust_center_decisions_are_reported_to_the_host() {
+        let mut device = coordinator();
+        let short_a = add_child(&mut device, CHILD_A);
+        let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
+        block_on(runtime.initialize(&mut device)).unwrap();
+        assert_eq!(runtime.take_host_event(), None);
+
+        join(&mut runtime, &mut device, CHILD_A, short_a);
+        assert_eq!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Joined {
+                device_address: CHILD_A,
+                short_address: short_a,
+                parent_address: TC,
+                status: ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
+                admitted: true,
+            })
+        );
+        assert_eq!(runtime.take_host_event(), None);
+
+        // An unknown device's secured rejoin through CHILD_A is refused.
+        let unknown = [0x99; 8];
+        let rejoin = ApsmeUpdateDeviceIndication {
+            source_address: CHILD_A,
+            device_address: unknown,
+            device_short_address: ShortAddress(0x4455),
+            status: ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+        };
+        block_on(
+            runtime.handle_indication(&mut device, ApsmeSecurityIndication::UpdateDevice(rejoin)),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Joined {
+                device_address: unknown,
+                short_address: ShortAddress(0x4455),
+                parent_address: CHILD_A,
+                status: ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+                admitted: false,
+            })
+        );
+        complete_pending_submission(&mut runtime, &mut device);
+        runtime
+            .complete_pending_device_revocation(&mut device, unknown)
+            .unwrap();
+
+        // A device that has not completed its admission and rejoins without
+        // `allow_rejoins` is removed by the Trust Center.
+        let short_b = ShortAddress(0x5566);
+        begin_join(&mut runtime, &mut device, CHILD_B, short_b);
+        assert!(matches!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Joined { admitted: true, .. })
+        ));
+        block_on(runtime.handle_indication(
+            &mut device,
+            ApsmeSecurityIndication::UpdateDevice(ApsmeUpdateDeviceIndication {
+                source_address: CHILD_A,
+                device_address: CHILD_B,
+                device_short_address: short_b,
+                status: ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+            }),
+        ))
+        .unwrap();
+        assert!(matches!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Joined {
+                device_address: CHILD_B,
+                admitted: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Removed {
+                device_address: CHILD_B,
+                short_address: short_b,
+                parent_address: CHILD_A,
+            })
+        );
+
+        // The coordinator reports its own child's departure.
+        block_on(runtime.handle_indication(
+            &mut device,
+            ApsmeSecurityIndication::UpdateDevice(ApsmeUpdateDeviceIndication {
+                source_address: TC,
+                device_address: CHILD_A,
+                device_short_address: short_a,
+                status: ApsUpdateDeviceStatus::DeviceLeft,
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Left {
+                device_address: CHILD_A,
+                short_address: short_a,
+                parent_address: TC,
+            })
+        );
+        assert_eq!(runtime.take_host_event(), None);
+        assert_eq!(runtime.take_host_events_dropped(), 0);
     }
 }
