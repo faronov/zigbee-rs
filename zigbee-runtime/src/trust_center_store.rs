@@ -15,19 +15,36 @@ const ROTATION_TRAILER_LEN: usize = 3;
 const UNKNOWN_REMOVAL_ENTRY_LEN: usize = 16;
 const UNKNOWN_REMOVAL_HEADER_LEN: usize = 1;
 pub const MAX_APPLICATION_KEY_REQUESTS: usize = 8;
-/// Durable global outgoing APS counter limit, appended by record version 5
-/// (`global-aps-counter`).
-#[cfg(feature = "global-aps-counter")]
+/// Parent-directed removal intents for rejected (unknown) devices. The
+/// coordinator NCP (`ncp-capacity`) bounds them at 32 (ZRHP spec 8.9);
+/// other builds keep one per Trust Center device slot.
+#[cfg(not(feature = "ncp-capacity"))]
+pub const MAX_PENDING_UNKNOWN_REMOVALS: usize = MAX_TRUST_CENTER_DEVICES;
+#[cfg(feature = "ncp-capacity")]
+pub const MAX_PENDING_UNKNOWN_REMOVALS: usize = 32;
+const _: () = assert!(MAX_PENDING_UNKNOWN_REMOVALS <= u8::MAX as usize);
+const _: () = assert!(MAX_APPLICATION_KEY_REQUESTS <= u8::MAX as usize);
+/// Trailer the current record version appends to the version-4 encoding:
+/// the durable global outgoing APS counter limit (version 5,
+/// `global-aps-counter`), preceded by the high byte of the device count
+/// (version 6, `ncp-capacity`: up to 256 devices).
+#[cfg(all(feature = "global-aps-counter", not(feature = "ncp-capacity")))]
 const GLOBAL_APS_TRAILER_LEN: usize = 4;
+#[cfg(feature = "ncp-capacity")]
+const GLOBAL_APS_TRAILER_LEN: usize = 5;
 #[cfg(not(feature = "global-aps-counter"))]
 const GLOBAL_APS_TRAILER_LEN: usize = 0;
+#[cfg(not(feature = "ncp-capacity"))]
+const _: () = assert!(MAX_TRUST_CENTER_DEVICES <= u8::MAX as usize);
+#[cfg(feature = "ncp-capacity")]
+const _: () = assert!(MAX_TRUST_CENTER_DEVICES <= u16::MAX as usize);
 pub const MAX_ENCODED_TRUST_CENTER_STATE_LEN: usize = STATE_HEADER_LEN
     + MAX_TRUST_CENTER_DEVICES * DEVICE_ENCODED_LEN
     + 1
     + MAX_APPLICATION_KEY_REQUESTS * APPLICATION_KEY_REQUEST_ENTRY_LEN
     + ROTATION_TRAILER_LEN
     + UNKNOWN_REMOVAL_HEADER_LEN
-    + MAX_TRUST_CENTER_DEVICES * UNKNOWN_REMOVAL_ENTRY_LEN
+    + MAX_PENDING_UNKNOWN_REMOVALS * UNKNOWN_REMOVAL_ENTRY_LEN
     + GLOBAL_APS_TRAILER_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +137,7 @@ pub struct PersistentTrustCenterState {
     rotation: Option<NetworkKeyRotation>,
     application_key_requests: Vec<ApplicationKeyRequestEntry, MAX_APPLICATION_KEY_REQUESTS>,
     devices: Vec<PersistentTrustCenterDevice, MAX_TRUST_CENTER_DEVICES>,
-    pending_unknown_removals: Vec<PendingUnknownRemoval, MAX_TRUST_CENTER_DEVICES>,
+    pending_unknown_removals: Vec<PendingUnknownRemoval, MAX_PENDING_UNKNOWN_REMOVALS>,
     /// Exclusive, durably reserved limit of the global outgoing APS counter
     /// (`global-aps-counter`); 0 = never reserved (a record written before
     /// the migration, version <= 4).
@@ -433,342 +450,228 @@ impl PersistentTrustCenterState {
         Ok(())
     }
 
+    /// Encoded length of [`Self::encode`] for this state.
+    pub fn encoded_len(&self) -> usize {
+        STATE_HEADER_LEN
+            + self.devices.len() * DEVICE_ENCODED_LEN
+            + 1
+            + self.application_key_requests.len() * APPLICATION_KEY_REQUEST_ENTRY_LEN
+            + ROTATION_TRAILER_LEN
+            + UNKNOWN_REMOVAL_HEADER_LEN
+            + self.pending_unknown_removals.len() * UNKNOWN_REMOVAL_ENTRY_LEN
+            + GLOBAL_APS_TRAILER_LEN
+    }
+
     pub fn encode(&self, output: &mut [u8; MAX_ENCODED_TRUST_CENTER_STATE_LEN]) -> usize {
         output.fill(0);
-        output[0..8].copy_from_slice(&self.extended_pan_id);
-        output[8] = self.devices.len() as u8;
+        let mut sink = SliceSink::new(output);
+        // The bounded tables never encode past `MAX_ENCODED_...`.
+        self.encode_into(&mut sink).unwrap_or_default()
+    }
+
+    /// Stream the current record version's encoding into `sink` (the
+    /// streamed multi-slot journal encodes without a full-size buffer).
+    pub(crate) fn encode_into(
+        &self,
+        sink: &mut impl SnapshotSink,
+    ) -> Result<usize, TrustCenterStoreError> {
+        let mut header = [0u8; STATE_HEADER_LEN];
+        header[0..8].copy_from_slice(&self.extended_pan_id);
+        // Low byte; version 6 appends the high byte (see the trailer below).
+        header[8] = self.devices.len() as u8;
         if let Some(pending) = self.pending_application_key {
-            output[9] = 1;
-            output[10..18].copy_from_slice(&pending.initiator_address);
-            output[18..26].copy_from_slice(&pending.responder_address);
-            output[26..42].copy_from_slice(&pending.key);
-            output[42] = u8::from(pending.delivered_to_initiator)
+            header[9] = 1;
+            header[10..18].copy_from_slice(&pending.initiator_address);
+            header[18..26].copy_from_slice(&pending.responder_address);
+            header[26..42].copy_from_slice(&pending.key);
+            header[42] = u8::from(pending.delivered_to_initiator)
                 | (u8::from(pending.delivered_to_responder) << 1);
         }
-        let mut offset = STATE_HEADER_LEN;
+        sink.put(&header)?;
         for stored in &self.devices {
-            let device = stored.device;
-            output[offset..offset + 8].copy_from_slice(&device.ieee_address);
-            output[offset + 8..offset + 16].copy_from_slice(&device.parent_address);
-            output[offset + 16..offset + 18].copy_from_slice(&device.short_address.0.to_le_bytes());
-            output[offset + 18..offset + 34].copy_from_slice(&device.link_key);
-            output[offset + 34] = encode_origin(device.key_origin);
-            output[offset + 35] = device.key_attributes as u8;
-            output[offset + 36] = device.join_timeout_remaining_secs;
-            output[offset + 37] = u8::from(stored.incoming_frame_counter_valid)
-                | (u8::from(stored.pending_link_key.is_some()) << 1)
-                | (u8::from(stored.network_key_pending) << 2)
-                | (u8::from(stored.confirm_key_pending.is_some()) << 3)
-                | (u8::from(stored.removal_pending) << 4)
-                | (u8::from(
-                    stored
-                        .pending_link_key
-                        .is_some_and(|pending| pending.transported),
-                ) << 5)
-                | (u8::from(stored.new_network_key_delivered) << 6)
-                | (u8::from(stored.is_router.is_some()) << 7);
-            output[offset + 38..offset + 42]
-                .copy_from_slice(&stored.outgoing_frame_counter.to_le_bytes());
-            output[offset + 42..offset + 46]
-                .copy_from_slice(&stored.outgoing_frame_counter_limit.to_le_bytes());
-            output[offset + 46..offset + 50]
-                .copy_from_slice(&stored.incoming_frame_counter.to_le_bytes());
-            if let Some(pending) = stored.pending_link_key {
-                output[offset + 50..offset + 66].copy_from_slice(&pending.key);
-                output[offset + 66..offset + 70]
-                    .copy_from_slice(&pending.outgoing_frame_counter.to_le_bytes());
-                output[offset + 70..offset + 74]
-                    .copy_from_slice(&pending.outgoing_frame_counter_limit.to_le_bytes());
-            }
-            output[offset + 74] = stored.confirm_key_pending.unwrap_or(0)
-                | (u8::from(stored.is_router == Some(true)) << 6);
-            offset += DEVICE_ENCODED_LEN;
+            sink.put(&encode_device(stored))?;
         }
-        output[offset] = self.application_key_requests.len() as u8;
-        offset += 1;
+        sink.put(&[self.application_key_requests.len() as u8])?;
         for entry in &self.application_key_requests {
-            output[offset..offset + 8].copy_from_slice(&entry.initiator_address);
-            output[offset + 8..offset + 16].copy_from_slice(&entry.responder_address);
-            offset += APPLICATION_KEY_REQUEST_ENTRY_LEN;
+            let mut encoded = [0u8; APPLICATION_KEY_REQUEST_ENTRY_LEN];
+            encoded[0..8].copy_from_slice(&entry.initiator_address);
+            encoded[8..16].copy_from_slice(&entry.responder_address);
+            sink.put(&encoded)?;
         }
-        if let Some(rotation) = self.rotation {
-            output[offset] = rotation.phase as u8;
-            output[offset + 1] = rotation.target_sequence;
-            output[offset + 2] = rotation.method as u8;
+        let mut rotation = [0u8; ROTATION_TRAILER_LEN];
+        if let Some(active) = self.rotation {
+            rotation = [
+                active.phase as u8,
+                active.target_sequence,
+                active.method as u8,
+            ];
         }
-        offset += ROTATION_TRAILER_LEN;
-        output[offset] = self.pending_unknown_removals.len() as u8;
-        offset += UNKNOWN_REMOVAL_HEADER_LEN;
+        sink.put(&rotation)?;
+        sink.put(&[self.pending_unknown_removals.len() as u8])?;
         for pending in &self.pending_unknown_removals {
-            output[offset..offset + 8].copy_from_slice(&pending.parent_address);
-            output[offset + 8..offset + 16].copy_from_slice(&pending.device_address);
-            offset += UNKNOWN_REMOVAL_ENTRY_LEN;
+            let mut encoded = [0u8; UNKNOWN_REMOVAL_ENTRY_LEN];
+            encoded[0..8].copy_from_slice(&pending.parent_address);
+            encoded[8..16].copy_from_slice(&pending.device_address);
+            sink.put(&encoded)?;
         }
+        #[cfg(feature = "ncp-capacity")]
+        sink.put(&[(self.devices.len() >> 8) as u8])?;
         #[cfg(feature = "global-aps-counter")]
-        {
-            output[offset..offset + GLOBAL_APS_TRAILER_LEN]
-                .copy_from_slice(&self.global_aps_limit.to_le_bytes());
-            offset += GLOBAL_APS_TRAILER_LEN;
-        }
-        offset
+        sink.put(&self.global_aps_limit.to_le_bytes())?;
+        Ok(self.encoded_len())
     }
 
     /// Decode the current record version's encoding.
-    #[cfg(not(feature = "global-aps-counter"))]
     pub fn decode(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_version(bytes, true, true, true)
+        Self::decode_from(&mut SliceSource::new(bytes))
     }
 
-    /// Decode the current record version's encoding (version 5: the
-    /// version-4 encoding plus the global APS limit trailer).
-    #[cfg(feature = "global-aps-counter")]
-    pub fn decode(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        let split = bytes
-            .len()
-            .checked_sub(GLOBAL_APS_TRAILER_LEN)
-            .ok_or(TrustCenterStoreError::Corrupt)?;
-        let mut state = Self::decode_v4(&bytes[..split])?;
-        state.global_aps_limit = u32::from_le_bytes([
-            bytes[split],
-            bytes[split + 1],
-            bytes[split + 2],
-            bytes[split + 3],
-        ]);
-        Ok(state)
+    /// Decode the current record version's encoding from `source`.
+    pub(crate) fn decode_from(
+        source: &mut impl SnapshotSource,
+    ) -> Result<Self, TrustCenterStoreError> {
+        Self::decode_version(source, Layout::CURRENT)
+    }
+
+    /// Version 5: the version-4 encoding plus the global APS limit.
+    #[cfg(feature = "ncp-capacity")]
+    fn decode_v5(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
+        Self::decode_version(&mut SliceSource::new(bytes), Layout::V5)
     }
 
     /// Version 4: no global APS limit (migrated on the first global-mode
     /// start).
     #[cfg(feature = "global-aps-counter")]
     fn decode_v4(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_version(bytes, true, true, true)
+        Self::decode_version(&mut SliceSource::new(bytes), Layout::V4)
     }
 
     fn decode_v3(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_version(bytes, true, true, false)
+        Self::decode_version(&mut SliceSource::new(bytes), Layout::V3)
     }
 
     fn decode_v2(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_version(bytes, true, false, false)
+        Self::decode_version(&mut SliceSource::new(bytes), Layout::V2)
     }
 
     fn decode_v1(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_version(bytes, false, false, false)
+        Self::decode_version(&mut SliceSource::new(bytes), Layout::V1)
     }
 
     fn decode_version(
-        bytes: &[u8],
-        has_rotation: bool,
-        has_unknown_removals: bool,
-        has_router_capability: bool,
+        source: &mut impl SnapshotSource,
+        layout: Layout,
     ) -> Result<Self, TrustCenterStoreError> {
+        let total = source.remaining();
+        let trailer_len = usize::from(layout.count_high) + if layout.global_limit { 4 } else { 0 };
+        let body_len = total
+            .checked_sub(trailer_len)
+            .ok_or(TrustCenterStoreError::Corrupt)?;
+        let count_high = if layout.count_high {
+            source.byte_at(body_len)?
+        } else {
+            0
+        };
+        let mut header = [0u8; STATE_HEADER_LEN];
+        if body_len < STATE_HEADER_LEN {
+            return Err(TrustCenterStoreError::Corrupt);
+        }
+        source.take(&mut header)?;
         let mut extended_pan_id = [0u8; 8];
-        extended_pan_id.copy_from_slice(bytes.get(0..8).ok_or(TrustCenterStoreError::Corrupt)?);
-        let count = usize::from(*bytes.get(8).ok_or(TrustCenterStoreError::Corrupt)?);
+        extended_pan_id.copy_from_slice(&header[0..8]);
+        let count = usize::from(header[8]) | (usize::from(count_high) << 8);
         let device_bytes_len = STATE_HEADER_LEN + count * DEVICE_ENCODED_LEN;
-        if count > MAX_TRUST_CENTER_DEVICES || bytes.len() < device_bytes_len {
+        if count > MAX_TRUST_CENTER_DEVICES || body_len < device_bytes_len {
             return Err(TrustCenterStoreError::Corrupt);
         }
         let mut state = Self::new(extended_pan_id);
-        state.pending_application_key = match bytes[9] {
+        state.pending_application_key = match header[9] {
             0 => {
-                if bytes[10..43].iter().any(|byte| *byte != 0) {
+                if header[10..43].iter().any(|byte| *byte != 0) {
                     return Err(TrustCenterStoreError::Corrupt);
                 }
                 None
             }
             1 => {
-                if bytes[42] & !0x03 != 0 {
+                if header[42] & !0x03 != 0 {
                     return Err(TrustCenterStoreError::Corrupt);
                 }
                 let mut initiator_address = [0u8; 8];
-                initiator_address.copy_from_slice(&bytes[10..18]);
+                initiator_address.copy_from_slice(&header[10..18]);
                 let mut responder_address = [0u8; 8];
-                responder_address.copy_from_slice(&bytes[18..26]);
+                responder_address.copy_from_slice(&header[18..26]);
                 let mut key = [0u8; 16];
-                key.copy_from_slice(&bytes[26..42]);
+                key.copy_from_slice(&header[26..42]);
                 Some(PendingApplicationLinkKey {
                     initiator_address,
                     responder_address,
                     key,
-                    delivered_to_initiator: bytes[42] & 0x01 != 0,
-                    delivered_to_responder: bytes[42] & 0x02 != 0,
+                    delivered_to_initiator: header[42] & 0x01 != 0,
+                    delivered_to_responder: header[42] & 0x02 != 0,
                 })
             }
             _ => return Err(TrustCenterStoreError::Corrupt),
         };
-        let mut offset = STATE_HEADER_LEN;
+        let mut encoded = [0u8; DEVICE_ENCODED_LEN];
         for _ in 0..count {
-            let encoded = &bytes[offset..offset + DEVICE_ENCODED_LEN];
-            let mut ieee_address = [0u8; 8];
-            ieee_address.copy_from_slice(&encoded[0..8]);
-            let mut parent_address = [0u8; 8];
-            parent_address.copy_from_slice(&encoded[8..16]);
-            let mut link_key = [0u8; 16];
-            link_key.copy_from_slice(&encoded[18..34]);
-            let key_origin = decode_origin(encoded[34])?;
-            let key_attributes = decode_attributes(encoded[35])?;
-            let allowed_flags = if has_router_capability {
-                0xFF
-            } else if has_rotation {
-                0x7F
-            } else {
-                0x3F
-            };
-            if encoded[37] & !allowed_flags != 0
-                || (encoded[37] & 0x20 != 0 && encoded[37] & 0x02 == 0)
-            {
-                return Err(TrustCenterStoreError::Corrupt);
-            }
-            let pending_link_key = if encoded[37] & 0x02 != 0 {
-                let mut key = [0u8; 16];
-                key.copy_from_slice(&encoded[50..66]);
-                Some(PendingTrustCenterLinkKey {
-                    key,
-                    outgoing_frame_counter: u32::from_le_bytes([
-                        encoded[66],
-                        encoded[67],
-                        encoded[68],
-                        encoded[69],
-                    ]),
-                    outgoing_frame_counter_limit: u32::from_le_bytes([
-                        encoded[70],
-                        encoded[71],
-                        encoded[72],
-                        encoded[73],
-                    ]),
-                    transported: encoded[37] & 0x20 != 0,
-                })
-            } else {
-                if encoded[50..74].iter().any(|byte| *byte != 0) {
-                    return Err(TrustCenterStoreError::Corrupt);
-                }
-                None
-            };
-            let is_router = if has_router_capability && encoded[37] & 0x80 != 0 {
-                Some(encoded[74] & 0x40 != 0)
-            } else {
-                if encoded[74] & 0x40 != 0 {
-                    return Err(TrustCenterStoreError::Corrupt);
-                }
-                None
-            };
-            let status = encoded[74] & !0x40;
-            let confirm_key_pending = if encoded[37] & 0x08 != 0 {
-                Some(status)
-            } else {
-                if status != 0 {
-                    return Err(TrustCenterStoreError::Corrupt);
-                }
-                None
-            };
+            source.take(&mut encoded)?;
             state
                 .devices
-                .push(PersistentTrustCenterDevice {
-                    device: TrustCenterDevice {
-                        ieee_address,
-                        parent_address,
-                        short_address: ShortAddress(u16::from_le_bytes([encoded[16], encoded[17]])),
-                        link_key,
-                        key_origin,
-                        key_attributes,
-                        join_timeout_remaining_secs: encoded[36],
-                        active: true,
-                    },
-                    incoming_frame_counter_valid: encoded[37] & 0x01 != 0,
-                    network_key_pending: encoded[37] & 0x04 != 0,
-                    confirm_key_pending,
-                    removal_pending: encoded[37] & 0x10 != 0,
-                    new_network_key_delivered: has_rotation && encoded[37] & 0x40 != 0,
-                    is_router,
-                    outgoing_frame_counter: u32::from_le_bytes([
-                        encoded[38],
-                        encoded[39],
-                        encoded[40],
-                        encoded[41],
-                    ]),
-                    outgoing_frame_counter_limit: u32::from_le_bytes([
-                        encoded[42],
-                        encoded[43],
-                        encoded[44],
-                        encoded[45],
-                    ]),
-                    incoming_frame_counter: u32::from_le_bytes([
-                        encoded[46],
-                        encoded[47],
-                        encoded[48],
-                        encoded[49],
-                    ]),
-                    pending_link_key,
-                })
+                .push(decode_device(&encoded, layout)?)
                 .map_err(|_| TrustCenterStoreError::Full)?;
-            offset += DEVICE_ENCODED_LEN;
         }
-        if has_rotation {
-            let allow_count = usize::from(
-                *bytes
-                    .get(device_bytes_len)
-                    .ok_or(TrustCenterStoreError::Corrupt)?,
-            );
-            let rotation_offset =
-                device_bytes_len + 1 + allow_count * APPLICATION_KEY_REQUEST_ENTRY_LEN;
-            let removal_offset = rotation_offset + ROTATION_TRAILER_LEN;
+        // Body bytes after the device records.
+        let rest = body_len - device_bytes_len;
+        if layout.rotation {
+            if rest == 0 {
+                return Err(TrustCenterStoreError::Corrupt);
+            }
+            let allow_count = usize::from(source.byte()?);
+            let removal_offset = 1 + allow_count * APPLICATION_KEY_REQUEST_ENTRY_LEN + 3;
             if allow_count > MAX_APPLICATION_KEY_REQUESTS
-                || bytes.len() < removal_offset
-                || (!has_unknown_removals && bytes.len() != removal_offset)
+                || rest < removal_offset
+                || (!layout.unknown_removals && rest != removal_offset)
             {
                 return Err(TrustCenterStoreError::Corrupt);
             }
-            let mut allow_offset = device_bytes_len + 1;
-            for _ in 0..allow_count {
-                let mut initiator_address = [0u8; 8];
-                initiator_address.copy_from_slice(&bytes[allow_offset..allow_offset + 8]);
-                let mut responder_address = [0u8; 8];
-                responder_address.copy_from_slice(&bytes[allow_offset + 8..allow_offset + 16]);
-                state
-                    .application_key_requests
-                    .push(ApplicationKeyRequestEntry {
-                        initiator_address,
-                        responder_address,
-                    })
-                    .map_err(|_| TrustCenterStoreError::Full)?;
-                allow_offset += APPLICATION_KEY_REQUEST_ENTRY_LEN;
-            }
-            state.rotation = match bytes[rotation_offset] {
+            state.decode_application_key_requests(source, allow_count)?;
+            let mut rotation = [0u8; ROTATION_TRAILER_LEN];
+            source.take(&mut rotation)?;
+            state.rotation = match rotation[0] {
                 0 => {
-                    if bytes[rotation_offset + 1] != 0 || bytes[rotation_offset + 2] != 0 {
+                    if rotation[1] != 0 || rotation[2] != 0 {
                         return Err(TrustCenterStoreError::Corrupt);
                     }
                     None
                 }
                 phase => Some(NetworkKeyRotation {
-                    target_sequence: bytes[rotation_offset + 1],
+                    target_sequence: rotation[1],
                     phase: NetworkKeyRotationPhase::from_u8(phase)
                         .ok_or(TrustCenterStoreError::Corrupt)?,
-                    method: NetworkKeyUpdateMethod::from_u8(bytes[rotation_offset + 2])
+                    method: NetworkKeyUpdateMethod::from_u8(rotation[2])
                         .ok_or(TrustCenterStoreError::Corrupt)?,
                 }),
             };
-            if has_unknown_removals {
-                let removal_count = usize::from(
-                    *bytes
-                        .get(removal_offset)
-                        .ok_or(TrustCenterStoreError::Corrupt)?,
-                );
-                if removal_count > MAX_TRUST_CENTER_DEVICES
-                    || bytes.len()
+            if layout.unknown_removals {
+                if rest == removal_offset {
+                    return Err(TrustCenterStoreError::Corrupt);
+                }
+                let removal_count = usize::from(source.byte()?);
+                if removal_count > MAX_PENDING_UNKNOWN_REMOVALS
+                    || rest
                         != removal_offset
                             + UNKNOWN_REMOVAL_HEADER_LEN
                             + removal_count * UNKNOWN_REMOVAL_ENTRY_LEN
                 {
                     return Err(TrustCenterStoreError::Corrupt);
                 }
-                let mut offset = removal_offset + UNKNOWN_REMOVAL_HEADER_LEN;
+                let mut entry = [0u8; UNKNOWN_REMOVAL_ENTRY_LEN];
                 for _ in 0..removal_count {
+                    source.take(&mut entry)?;
                     let mut parent_address = [0; 8];
-                    parent_address.copy_from_slice(&bytes[offset..offset + 8]);
+                    parent_address.copy_from_slice(&entry[0..8]);
                     let mut device_address = [0; 8];
-                    device_address.copy_from_slice(&bytes[offset + 8..offset + 16]);
+                    device_address.copy_from_slice(&entry[8..16]);
                     state
                         .pending_unknown_removals
                         .push(PendingUnknownRemoval {
@@ -776,39 +679,56 @@ impl PersistentTrustCenterState {
                             device_address,
                         })
                         .map_err(|_| TrustCenterStoreError::Full)?;
-                    offset += UNKNOWN_REMOVAL_ENTRY_LEN;
                 }
             }
-        } else if bytes.len() != device_bytes_len {
-            let allow_count = usize::from(
-                *bytes
-                    .get(device_bytes_len)
-                    .ok_or(TrustCenterStoreError::Corrupt)?,
-            );
+        } else if rest != 0 {
+            let allow_count = usize::from(source.byte()?);
             if allow_count > MAX_APPLICATION_KEY_REQUESTS
-                || bytes.len()
-                    != device_bytes_len + 1 + allow_count * APPLICATION_KEY_REQUEST_ENTRY_LEN
+                || rest != 1 + allow_count * APPLICATION_KEY_REQUEST_ENTRY_LEN
             {
                 return Err(TrustCenterStoreError::Corrupt);
             }
-            let mut allow_offset = device_bytes_len + 1;
-            for _ in 0..allow_count {
-                let mut initiator_address = [0u8; 8];
-                initiator_address.copy_from_slice(&bytes[allow_offset..allow_offset + 8]);
-                let mut responder_address = [0u8; 8];
-                responder_address.copy_from_slice(&bytes[allow_offset + 8..allow_offset + 16]);
-                state
-                    .application_key_requests
-                    .push(ApplicationKeyRequestEntry {
-                        initiator_address,
-                        responder_address,
-                    })
-                    .map_err(|_| TrustCenterStoreError::Full)?;
-                allow_offset += APPLICATION_KEY_REQUEST_ENTRY_LEN;
+            state.decode_application_key_requests(source, allow_count)?;
+        }
+        if layout.count_high {
+            // Already applied above (peeked before the devices).
+            source.byte()?;
+        }
+        if layout.global_limit {
+            let mut limit = [0u8; 4];
+            source.take(&mut limit)?;
+            #[cfg(feature = "global-aps-counter")]
+            {
+                state.global_aps_limit = u32::from_le_bytes(limit);
             }
+        }
+        if source.remaining() != 0 {
+            return Err(TrustCenterStoreError::Corrupt);
         }
         state.validate()?;
         Ok(state)
+    }
+
+    fn decode_application_key_requests(
+        &mut self,
+        source: &mut impl SnapshotSource,
+        count: usize,
+    ) -> Result<(), TrustCenterStoreError> {
+        let mut entry = [0u8; APPLICATION_KEY_REQUEST_ENTRY_LEN];
+        for _ in 0..count {
+            source.take(&mut entry)?;
+            let mut initiator_address = [0u8; 8];
+            initiator_address.copy_from_slice(&entry[0..8]);
+            let mut responder_address = [0u8; 8];
+            responder_address.copy_from_slice(&entry[8..16]);
+            self.application_key_requests
+                .push(ApplicationKeyRequestEntry {
+                    initiator_address,
+                    responder_address,
+                })
+                .map_err(|_| TrustCenterStoreError::Full)?;
+        }
+        Ok(())
     }
 }
 
@@ -861,7 +781,7 @@ pub const TRUST_CENTER_JOURNAL_SLOT_SIZE: usize = 4096;
 pub const TRUST_CENTER_JOURNAL_SLOTS_PER_SECTOR: usize =
     TRUST_CENTER_JOURNAL_SECTOR_SIZE / TRUST_CENTER_JOURNAL_SLOT_SIZE;
 
-const RECORD_MAGIC: [u8; 4] = *b"ZBTC";
+pub(crate) const RECORD_MAGIC: [u8; 4] = *b"ZBTC";
 const LEGACY_RECORD_VERSION: u8 = 1;
 const ROTATION_RECORD_VERSION: u8 = 2;
 const UNKNOWN_REMOVAL_RECORD_VERSION: u8 = 3;
@@ -872,19 +792,33 @@ pub const TRUST_CENTER_JOURNAL_FORMAT_VERSION: u8 = 4;
 /// Version 5 (`global-aps-counter`) appends the global outgoing APS limit.
 /// Firmware without the feature does not recognize it and starts with an
 /// empty Trust Center table rather than reusing a counter (spec 8.4).
-#[cfg(feature = "global-aps-counter")]
+#[cfg(all(feature = "global-aps-counter", not(feature = "ncp-capacity")))]
 pub const TRUST_CENTER_JOURNAL_FORMAT_VERSION: u8 = 5;
+/// Version 6 (`ncp-capacity`, coordinator NCP) inserts the high byte of a
+/// 16-bit device count (up to 256 devices) before the global APS limit and
+/// bounds removal intents at [`MAX_PENDING_UNKNOWN_REMOVALS`]. Its full
+/// snapshot no longer fits one 4 KiB slot; the NCP stores it with the
+/// streamed multi-slot `trust_center_stream::TrustCenterStreamJournal`.
+#[cfg(feature = "ncp-capacity")]
+pub const TRUST_CENTER_JOURNAL_FORMAT_VERSION: u8 = 6;
 #[cfg(feature = "global-aps-counter")]
 const GLOBAL_APS_RECORD_VERSION_PREDECESSOR: u8 = 4;
-const RECORD_VERSION: u8 = TRUST_CENTER_JOURNAL_FORMAT_VERSION;
+#[cfg(feature = "ncp-capacity")]
+const GLOBAL_APS_RECORD_VERSION: u8 = 5;
+pub(crate) const RECORD_VERSION: u8 = TRUST_CENTER_JOURNAL_FORMAT_VERSION;
 const RECORD_ENCODED_OFFSET: usize = 12;
 const RECORD_CRC_OFFSET: usize = TRUST_CENTER_JOURNAL_SLOT_SIZE - 12;
 const RECORD_PREFIX_LEN: usize = TRUST_CENTER_JOURNAL_SLOT_SIZE - 8;
 const RECORD_COMMIT_OFFSET: usize = TRUST_CENTER_JOURNAL_SLOT_SIZE - 8;
 const RECORD_COMMIT: [u8; 4] = *b"CMIT";
 
-const _: () =
-    assert!(RECORD_ENCODED_OFFSET + MAX_ENCODED_TRUST_CENTER_STATE_LEN <= RECORD_CRC_OFFSET);
+/// Bytes of encoded state one single-slot record holds.
+const RECORD_ENCODED_CAPACITY: usize = RECORD_CRC_OFFSET - RECORD_ENCODED_OFFSET;
+// Without `ncp-capacity` every state fits one slot. The 256-device NCP state
+// does not: this journal then refuses (`Full`) a state that does not fit,
+// and the NCP uses the streamed journal instead.
+#[cfg(not(feature = "ncp-capacity"))]
+const _: () = assert!(MAX_ENCODED_TRUST_CENTER_STATE_LEN <= RECORD_ENCODED_CAPACITY);
 
 pub struct TrustCenterDeviceJournal<S> {
     storage: S,
@@ -955,10 +889,20 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
             .map_err(|_| TrustCenterStoreError::Hardware)
     }
 
-    fn decode_record(
+    pub(crate) fn decode_record(
         record: &[u8; TRUST_CENTER_JOURNAL_SLOT_SIZE],
     ) -> Option<(u32, PersistentTrustCenterState)> {
-        #[cfg(feature = "global-aps-counter")]
+        #[cfg(feature = "ncp-capacity")]
+        let known_version = matches!(
+            record[4],
+            LEGACY_RECORD_VERSION
+                | ROTATION_RECORD_VERSION
+                | UNKNOWN_REMOVAL_RECORD_VERSION
+                | GLOBAL_APS_RECORD_VERSION_PREDECESSOR
+                | GLOBAL_APS_RECORD_VERSION
+                | RECORD_VERSION
+        );
+        #[cfg(all(feature = "global-aps-counter", not(feature = "ncp-capacity")))]
         let known_version = matches!(
             record[4],
             LEGACY_RECORD_VERSION
@@ -982,8 +926,7 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
             return None;
         }
         let encoded_len = u16::from_le_bytes([record[5], record[6]]) as usize;
-        if encoded_len > MAX_ENCODED_TRUST_CENTER_STATE_LEN
-            || RECORD_ENCODED_OFFSET + encoded_len > RECORD_CRC_OFFSET
+        if encoded_len > MAX_ENCODED_TRUST_CENTER_STATE_LEN || encoded_len > RECORD_ENCODED_CAPACITY
         {
             return None;
         }
@@ -1000,6 +943,8 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
         let encoded = &record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len];
         let state = match record[4] {
             RECORD_VERSION => PersistentTrustCenterState::decode(encoded),
+            #[cfg(feature = "ncp-capacity")]
+            GLOBAL_APS_RECORD_VERSION => PersistentTrustCenterState::decode_v5(encoded),
             #[cfg(feature = "global-aps-counter")]
             GLOBAL_APS_RECORD_VERSION_PREDECESSOR => PersistentTrustCenterState::decode_v4(encoded),
             UNKNOWN_REMOVAL_RECORD_VERSION => PersistentTrustCenterState::decode_v3(encoded),
@@ -1068,13 +1013,13 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
         let mut record = [0xFFu8; TRUST_CENTER_JOURNAL_SLOT_SIZE];
         record[0..4].copy_from_slice(&RECORD_MAGIC);
         record[4] = RECORD_VERSION;
-        let mut encoded = [0u8; MAX_ENCODED_TRUST_CENTER_STATE_LEN];
-        let encoded_len = state.encode(&mut encoded);
+        // Encode in place: the bytes after the encoding stay erased.
+        let encoded_len = state.encode_into(&mut SliceSink::new(
+            &mut record[RECORD_ENCODED_OFFSET..RECORD_CRC_OFFSET],
+        ))?;
         record[5..7].copy_from_slice(&(encoded_len as u16).to_le_bytes());
         record[7] = 0;
         record[8..12].copy_from_slice(&generation.to_le_bytes());
-        record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len]
-            .copy_from_slice(&encoded[..encoded_len]);
         let crc = crate::security_journal::crc32(&record[..RECORD_CRC_OFFSET]);
         record[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 
@@ -1129,6 +1074,11 @@ impl<S: NorFlash> TrustCenterDeviceStore for TrustCenterDeviceJournal<S> {
     }
 
     fn store(&mut self, state: &PersistentTrustCenterState) -> Result<(), TrustCenterStoreError> {
+        // Refuse before any erase: a state larger than one slot (possible only
+        // with `ncp-capacity`) belongs in the streamed journal.
+        if state.encoded_len() > RECORD_ENCODED_CAPACITY {
+            return Err(TrustCenterStoreError::Full);
+        }
         let current = self.current()?;
         let generation = match &current {
             Some(located) => located
@@ -1206,6 +1156,264 @@ fn decode_attributes(value: u8) -> Result<TrustCenterKeyAttributes, TrustCenterS
         2 => Ok(TrustCenterKeyAttributes::Verified),
         _ => Err(TrustCenterStoreError::Corrupt),
     }
+}
+
+/// Optional sections of one record version's encoding.
+#[derive(Debug, Clone, Copy)]
+struct Layout {
+    /// Version 2: application-key allowlist count is mandatory, followed by
+    /// the network-key rotation trailer.
+    rotation: bool,
+    /// Version 3: parent-directed removal intents for unknown devices.
+    unknown_removals: bool,
+    /// Version 4: router capability flag in each device record.
+    router_capability: bool,
+    /// Version 6: high byte of the device count before the APS limit.
+    count_high: bool,
+    /// Version 5: durable global outgoing APS limit.
+    global_limit: bool,
+}
+
+impl Layout {
+    const V1: Self = Self {
+        rotation: false,
+        unknown_removals: false,
+        router_capability: false,
+        count_high: false,
+        global_limit: false,
+    };
+    const V2: Self = Self {
+        rotation: true,
+        ..Self::V1
+    };
+    const V3: Self = Self {
+        unknown_removals: true,
+        ..Self::V2
+    };
+    const V4: Self = Self {
+        router_capability: true,
+        ..Self::V3
+    };
+    #[cfg(feature = "global-aps-counter")]
+    const V5: Self = Self {
+        global_limit: true,
+        ..Self::V4
+    };
+    #[cfg(feature = "ncp-capacity")]
+    const V6: Self = Self {
+        count_high: true,
+        ..Self::V5
+    };
+    #[cfg(not(feature = "global-aps-counter"))]
+    const CURRENT: Self = Self::V4;
+    #[cfg(all(feature = "global-aps-counter", not(feature = "ncp-capacity")))]
+    const CURRENT: Self = Self::V5;
+    #[cfg(feature = "ncp-capacity")]
+    const CURRENT: Self = Self::V6;
+}
+
+/// Sequential byte sink of the snapshot encoder.
+pub(crate) trait SnapshotSink {
+    /// Append `bytes`; `Full` when the destination cannot hold them.
+    fn put(&mut self, bytes: &[u8]) -> Result<(), TrustCenterStoreError>;
+}
+
+/// Byte source of the snapshot decoder: sequential reads plus one look-ahead
+/// at an absolute position (the version-6 device-count high byte).
+pub(crate) trait SnapshotSource {
+    /// Bytes not consumed yet.
+    fn remaining(&self) -> usize;
+    /// Copy the next `out.len()` bytes; `Corrupt` if fewer remain.
+    fn take(&mut self, out: &mut [u8]) -> Result<(), TrustCenterStoreError>;
+    /// The byte at `index` counted from the current position, without
+    /// consuming anything.
+    fn byte_at(&mut self, index: usize) -> Result<u8, TrustCenterStoreError>;
+
+    fn byte(&mut self) -> Result<u8, TrustCenterStoreError> {
+        let mut byte = [0u8];
+        self.take(&mut byte)?;
+        Ok(byte[0])
+    }
+}
+
+/// [`SnapshotSink`] over a bounded byte slice.
+pub(crate) struct SliceSink<'a> {
+    output: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> SliceSink<'a> {
+    pub(crate) fn new(output: &'a mut [u8]) -> Self {
+        Self { output, len: 0 }
+    }
+}
+
+impl SnapshotSink for SliceSink<'_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), TrustCenterStoreError> {
+        let end = self
+            .len
+            .checked_add(bytes.len())
+            .filter(|end| *end <= self.output.len())
+            .ok_or(TrustCenterStoreError::Full)?;
+        self.output[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// [`SnapshotSource`] over a byte slice.
+pub(crate) struct SliceSource<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> SliceSource<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+}
+
+impl SnapshotSource for SliceSource<'_> {
+    fn remaining(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn take(&mut self, out: &mut [u8]) -> Result<(), TrustCenterStoreError> {
+        if out.len() > self.bytes.len() {
+            return Err(TrustCenterStoreError::Corrupt);
+        }
+        let (head, tail) = self.bytes.split_at(out.len());
+        out.copy_from_slice(head);
+        self.bytes = tail;
+        Ok(())
+    }
+
+    fn byte_at(&mut self, index: usize) -> Result<u8, TrustCenterStoreError> {
+        self.bytes
+            .get(index)
+            .copied()
+            .ok_or(TrustCenterStoreError::Corrupt)
+    }
+}
+
+fn encode_device(stored: &PersistentTrustCenterDevice) -> [u8; DEVICE_ENCODED_LEN] {
+    let mut output = [0u8; DEVICE_ENCODED_LEN];
+    let device = stored.device;
+    output[0..8].copy_from_slice(&device.ieee_address);
+    output[8..16].copy_from_slice(&device.parent_address);
+    output[16..18].copy_from_slice(&device.short_address.0.to_le_bytes());
+    output[18..34].copy_from_slice(&device.link_key);
+    output[34] = encode_origin(device.key_origin);
+    output[35] = device.key_attributes as u8;
+    output[36] = device.join_timeout_remaining_secs;
+    output[37] = u8::from(stored.incoming_frame_counter_valid)
+        | (u8::from(stored.pending_link_key.is_some()) << 1)
+        | (u8::from(stored.network_key_pending) << 2)
+        | (u8::from(stored.confirm_key_pending.is_some()) << 3)
+        | (u8::from(stored.removal_pending) << 4)
+        | (u8::from(
+            stored
+                .pending_link_key
+                .is_some_and(|pending| pending.transported),
+        ) << 5)
+        | (u8::from(stored.new_network_key_delivered) << 6)
+        | (u8::from(stored.is_router.is_some()) << 7);
+    output[38..42].copy_from_slice(&stored.outgoing_frame_counter.to_le_bytes());
+    output[42..46].copy_from_slice(&stored.outgoing_frame_counter_limit.to_le_bytes());
+    output[46..50].copy_from_slice(&stored.incoming_frame_counter.to_le_bytes());
+    if let Some(pending) = stored.pending_link_key {
+        output[50..66].copy_from_slice(&pending.key);
+        output[66..70].copy_from_slice(&pending.outgoing_frame_counter.to_le_bytes());
+        output[70..74].copy_from_slice(&pending.outgoing_frame_counter_limit.to_le_bytes());
+    }
+    output[74] =
+        stored.confirm_key_pending.unwrap_or(0) | (u8::from(stored.is_router == Some(true)) << 6);
+    output
+}
+
+fn decode_device(
+    encoded: &[u8; DEVICE_ENCODED_LEN],
+    layout: Layout,
+) -> Result<PersistentTrustCenterDevice, TrustCenterStoreError> {
+    let mut ieee_address = [0u8; 8];
+    ieee_address.copy_from_slice(&encoded[0..8]);
+    let mut parent_address = [0u8; 8];
+    parent_address.copy_from_slice(&encoded[8..16]);
+    let mut link_key = [0u8; 16];
+    link_key.copy_from_slice(&encoded[18..34]);
+    let key_origin = decode_origin(encoded[34])?;
+    let key_attributes = decode_attributes(encoded[35])?;
+    let allowed_flags = if layout.router_capability {
+        0xFF
+    } else if layout.rotation {
+        0x7F
+    } else {
+        0x3F
+    };
+    if encoded[37] & !allowed_flags != 0 || (encoded[37] & 0x20 != 0 && encoded[37] & 0x02 == 0) {
+        return Err(TrustCenterStoreError::Corrupt);
+    }
+    let word = |offset: usize| {
+        u32::from_le_bytes([
+            encoded[offset],
+            encoded[offset + 1],
+            encoded[offset + 2],
+            encoded[offset + 3],
+        ])
+    };
+    let pending_link_key = if encoded[37] & 0x02 != 0 {
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&encoded[50..66]);
+        Some(PendingTrustCenterLinkKey {
+            key,
+            outgoing_frame_counter: word(66),
+            outgoing_frame_counter_limit: word(70),
+            transported: encoded[37] & 0x20 != 0,
+        })
+    } else {
+        if encoded[50..74].iter().any(|byte| *byte != 0) {
+            return Err(TrustCenterStoreError::Corrupt);
+        }
+        None
+    };
+    let is_router = if layout.router_capability && encoded[37] & 0x80 != 0 {
+        Some(encoded[74] & 0x40 != 0)
+    } else {
+        if encoded[74] & 0x40 != 0 {
+            return Err(TrustCenterStoreError::Corrupt);
+        }
+        None
+    };
+    let status = encoded[74] & !0x40;
+    let confirm_key_pending = if encoded[37] & 0x08 != 0 {
+        Some(status)
+    } else {
+        if status != 0 {
+            return Err(TrustCenterStoreError::Corrupt);
+        }
+        None
+    };
+    Ok(PersistentTrustCenterDevice {
+        device: TrustCenterDevice {
+            ieee_address,
+            parent_address,
+            short_address: ShortAddress(u16::from_le_bytes([encoded[16], encoded[17]])),
+            link_key,
+            key_origin,
+            key_attributes,
+            join_timeout_remaining_secs: encoded[36],
+            active: true,
+        },
+        incoming_frame_counter_valid: encoded[37] & 0x01 != 0,
+        network_key_pending: encoded[37] & 0x04 != 0,
+        confirm_key_pending,
+        removal_pending: encoded[37] & 0x10 != 0,
+        new_network_key_delivered: layout.rotation && encoded[37] & 0x40 != 0,
+        is_router,
+        outgoing_frame_counter: word(38),
+        outgoing_frame_counter_limit: word(42),
+        incoming_frame_counter: word(46),
+        pending_link_key,
+    })
 }
 
 #[cfg(test)]
@@ -1428,6 +1636,18 @@ mod tests {
             record[8..12].copy_from_slice(&1u32.to_le_bytes());
             record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len]
                 .copy_from_slice(&encoded[..encoded_len]);
+            // Version 5 is the version-4 body plus the APS limit, without the
+            // version-6 device-count high byte.
+            #[cfg(feature = "ncp-capacity")]
+            let encoded_len = if version == GLOBAL_APS_RECORD_VERSION {
+                let body = current_len - GLOBAL_APS_TRAILER_LEN;
+                record[RECORD_ENCODED_OFFSET + body..RECORD_ENCODED_OFFSET + body + 4]
+                    .copy_from_slice(&encoded[current_len - 4..current_len]);
+                body + 4
+            } else {
+                encoded_len
+            };
+            record[5..7].copy_from_slice(&(encoded_len as u16).to_le_bytes());
             let crc = crate::security_journal::crc32(&record[..RECORD_CRC_OFFSET]);
             record[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
             record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4].copy_from_slice(&RECORD_COMMIT);
@@ -1517,6 +1737,8 @@ mod tests {
             UNKNOWN_REMOVAL_RECORD_VERSION,
             #[cfg(feature = "global-aps-counter")]
             GLOBAL_APS_RECORD_VERSION_PREDECESSOR,
+            #[cfg(feature = "ncp-capacity")]
+            GLOBAL_APS_RECORD_VERSION,
         ] {
             let expected = state();
             let mut flash = MockFlash::new();
@@ -1574,7 +1796,7 @@ mod tests {
     #[test]
     fn unknown_removal_round_trip_is_bounded_and_never_creates_device_keys() {
         let mut state = state();
-        for index in 0..MAX_TRUST_CENTER_DEVICES {
+        for index in 0..MAX_PENDING_UNKNOWN_REMOVALS {
             let mut address = [0x99; 8];
             address[0] = index as u8;
             state
@@ -1593,7 +1815,7 @@ mod tests {
         assert_eq!(state.devices().len(), 1);
         assert_eq!(
             state.pending_unknown_removals().len(),
-            MAX_TRUST_CENTER_DEVICES
+            MAX_PENDING_UNKNOWN_REMOVALS
         );
         let before = state.clone();
         assert_eq!(
@@ -1616,7 +1838,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             state.pending_unknown_removals().len(),
-            MAX_TRUST_CENTER_DEVICES
+            MAX_PENDING_UNKNOWN_REMOVALS
         );
         assert!(state.device(&pending.device_address).is_none());
     }
@@ -1648,7 +1870,7 @@ mod tests {
             Err(TrustCenterStoreError::Corrupt)
         );
         let mut bad = bytes;
-        bad[count_offset] = (MAX_TRUST_CENTER_DEVICES + 1) as u8;
+        bad[count_offset] = (MAX_PENDING_UNKNOWN_REMOVALS + 1) as u8;
         assert_eq!(
             PersistentTrustCenterState::decode(&bad[..len]),
             Err(TrustCenterStoreError::Corrupt)
@@ -1797,7 +2019,7 @@ mod tests {
         );
         journal.store(&state).unwrap();
         let flash = journal.into_storage();
-        assert_eq!(flash.bytes[4], 5);
+        assert_eq!(flash.bytes[4], RECORD_VERSION);
         let mut reopened =
             TrustCenterDeviceJournal::new(flash, 0, TRUST_CENTER_JOURNAL_SECTOR_SIZE as u32);
         assert_eq!(

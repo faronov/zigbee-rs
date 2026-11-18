@@ -20981,3 +20981,18 @@ pub mod host_passthrough;
 /// Small durable application settings (declared last: keeps the line
 /// numbers above, which panic locations embed, unchanged).
 pub mod settings_journal;
+
+/// Table capacity selection: `ncp` with the `ncp-capacity` feature (the
+/// coordinator NCP, ZRHP spec 8.9), otherwise `default`. Only evaluated in
+/// constant contexts (declared last, like the modules above).
+pub(crate) const fn ncp_capacity(default: usize, ncp: usize) -> usize {
+    if cfg!(feature = "ncp-capacity") {
+        ncp
+    } else {
+        default
+    }
+}
+
+/// Streamed multi-slot Trust Center journal of the coordinator NCP.
+#[cfg(feature = "ncp-capacity")]
+pub mod trust_center_stream;

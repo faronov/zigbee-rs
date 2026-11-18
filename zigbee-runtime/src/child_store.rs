@@ -57,9 +57,9 @@ use zigbee_types::IeeeAddress;
 /// Largest child table this store persists.
 ///
 /// Matches the router neighbour-table capacity so a full child table always
-/// fits; the encoded form still fits one journal slot (see the layout asserts
-/// below).
-pub const MAX_PERSISTED_CHILDREN: usize = 32;
+/// fits (64 children in 1 024-byte slots with `ncp-capacity`, ZRHP spec 8.9);
+/// the encoded form still fits one journal slot (see the layout asserts below).
+pub const MAX_PERSISTED_CHILDREN: usize = crate::ncp_capacity(32, 64);
 
 /// Encoded size of one version-2/version-3 child record.
 const LEGACY_CHILD_ENTRY_LEN: usize = 12;
@@ -860,7 +860,7 @@ impl ChildTableStore for RamChildTableStore {
 /// Erase-unit size the journal assumes for each of its two sectors.
 pub const CHILD_JOURNAL_SECTOR_SIZE: usize = 4096;
 /// Size of one journal record slot.
-pub const CHILD_JOURNAL_SLOT_SIZE: usize = 512;
+pub const CHILD_JOURNAL_SLOT_SIZE: usize = crate::ncp_capacity(512, 1024);
 /// Slots that fit in one sector.
 pub const CHILD_JOURNAL_SLOTS_PER_SECTOR: usize =
     CHILD_JOURNAL_SECTOR_SIZE / CHILD_JOURNAL_SLOT_SIZE;
@@ -870,9 +870,9 @@ const RECORD_VERSION: u8 = 5;
 /// Encoded table starts here (magic 4 + version 1 + len 2 + reserved 1 +
 /// generation 4).
 const RECORD_ENCODED_OFFSET: usize = 12;
-const RECORD_CRC_OFFSET: usize = 500;
-const RECORD_PREFIX_LEN: usize = 504;
-const RECORD_COMMIT_OFFSET: usize = 504;
+const RECORD_CRC_OFFSET: usize = CHILD_JOURNAL_SLOT_SIZE - 12;
+const RECORD_PREFIX_LEN: usize = CHILD_JOURNAL_SLOT_SIZE - 8;
+const RECORD_COMMIT_OFFSET: usize = CHILD_JOURNAL_SLOT_SIZE - 8;
 const RECORD_COMMIT: [u8; 4] = *b"CMIT";
 /// Read-back granularity for slot scans and post-commit verification.
 const READBACK_CHUNK: usize = 128;
@@ -1797,7 +1797,10 @@ mod tests {
 
     #[test]
     fn journal_8k_survives_rollover_and_reopen() {
-        assert_eq!(Journal8K::SLOTS_PER_SECTOR, 16);
+        assert_eq!(
+            Journal8K::SLOTS_PER_SECTOR,
+            PAGE_8K / CHILD_JOURNAL_SLOT_SIZE
+        );
         let mut store = journal_8k(PageFlash8K::new());
         assert_eq!(store.load(), Ok(None));
         // Three full sectors' worth of commits forces two rollovers.
@@ -1966,5 +1969,34 @@ mod tests {
         assert_eq!(reopened.store(&good), Err(ChildStoreError::Hardware));
         reopened.storage.fail_reads = false;
         assert_eq!(reopened.load(), Ok(Some(good)));
+    }
+
+    /// Coordinator NCP: 64 children in one 1 024-byte slot (ZRHP spec 8.9).
+    #[cfg(feature = "ncp-capacity")]
+    #[test]
+    fn ncp_capacity_persists_64_children_in_1024_byte_slots() {
+        assert_eq!(MAX_PERSISTED_CHILDREN, 64);
+        assert_eq!(CHILD_JOURNAL_SLOT_SIZE, 1024);
+        assert_eq!(MAX_ENCODED_CHILD_TABLE_LEN, 906);
+        const { assert!(RECORD_ENCODED_OFFSET + MAX_ENCODED_CHILD_TABLE_LEN <= RECORD_CRC_OFFSET) };
+        let children: std::vec::Vec<_> = (0..MAX_PERSISTED_CHILDREN)
+            .map(|index| {
+                let mut entry = child(index as u8, 0x0100 + index as u16, (index % 15) as u8);
+                entry.ieee_address[7] = 0x5C;
+                entry
+            })
+            .collect();
+        let full = table(&children);
+        let mut overflow = full.clone();
+        let mut extra = child(0xFE, 0x7FFE, 8);
+        extra.ieee_address[7] = 0x5D;
+        assert_eq!(overflow.push(extra), Err(ChildStoreError::Full));
+
+        let mut store = journal_8k(PageFlash8K::new());
+        for _ in 0..(Journal8K::SLOTS_PER_SECTOR * 2 + 1) {
+            store.store(&full).unwrap();
+        }
+        let mut reopened = journal_8k(store.into_storage());
+        assert_eq!(reopened.load(), Ok(Some(full)));
     }
 }
