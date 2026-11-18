@@ -88,6 +88,9 @@ dev-unsigned-fw = ["esp32-zigbee-ncp-product/dev-unsigned-fw"]
 pta = ["thread-br-h2", "esp32-zigbee-ncp-product/pta"]
 # `pta_lab` binary (src/bin/pta_lab.rs).
 pta-lab = ["pta", "dep:esp-println"]
+# Lab: boot markers, panic/stage/transport records across resets and a
+# boot watchdog on UART0 (src/lab.rs; never in shipped images).
+boot-trace = []
 
 [profile.release]
 opt-level = "s"

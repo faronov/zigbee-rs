@@ -19,12 +19,13 @@
 --min-gap
 16384
 
-# Frames above 12 KiB must be reviewed. Ncp::new_into still builds the ZRHP
-# link engine (22.5 KiB) by value: boot only, beside the deeper composition.
+# Frames above 12 KiB must be reviewed. Ncp::new_into (inlined into the
+# example's `new_ncp` boot step) still builds the ZRHP link engine
+# (22.5 KiB) by value: boot only, beside the deeper composition.
 --max-frame
 12288
 --frame-allow
-<ncp_coordinator_app::ncp::Ncp<16>>::new_into=23552
+esp32_ncp::new_ncp=23552
 
 # Task context: `main` reaches the composition steps and, through the
 # executor, the root future's polls by direct calls. Every `log!` reaches the
@@ -55,7 +56,7 @@ RingLogger as log::Log>::log$
 --chain-budget
 boot=^esp32_ncp::compose$=33280
 --chain-budget
-serve=^esp32_ncp::serve$=29184
+serve=^esp32_ncp::serve$=29696
 # Trust Center: initialization, the step's TC service and persistence. Before
 # the in-place state fix these were 485-576 KiB (whole-state clones).
 --chain-budget

@@ -96,7 +96,8 @@ static LOGGER: RingLogger = RingLogger;
 const FW_VERSION: u32 = product::fw::parse_version(env!("CARGO_PKG_VERSION").as_bytes());
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    lab::panic(info);
     esp_hal::system::software_reset()
 }
 
@@ -141,9 +142,12 @@ fn reset_reason() -> u8 {
     }
 }
 
+mod lab;
+
 #[esp_hal::main]
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
+    lab::boot();
     // zigbee-mac's esp-radio driver allocates its receive queue.
     esp_alloc::heap_allocator!(size: 32768);
     let _ = log::set_logger(&LOGGER);
@@ -153,7 +157,7 @@ fn main() -> ! {
     // Identity item and otadata boot check, before the radio and the
     // stack exist (the check may program otadata).
     static PLATFORM: StaticCell<EspPlatform> = StaticCell::new();
-    let (platform, boot) = product::platform::boot(FW_VERSION, now_ms());
+    let (platform, boot) = boot_platform();
     match boot {
         BootOutcome::RolledBack { slot } => {
             log::error!("unconfirmed image rolled back to slot {}", slot);
@@ -218,7 +222,8 @@ fn main() -> ! {
     }
     static NCP: StaticCell<Ncp<LOG_RECORDS>> = StaticCell::new();
     static PORT: StaticCell<Port> = StaticCell::new();
-    let ncp = Ncp::new_into(NCP.uninit(), identity, cookie, now_us());
+    let ncp = new_ncp(NCP.uninit(), identity, cookie);
+    lab::stage(9);
     serve(ncp, host, PORT.init(port), platform)
 }
 
@@ -262,7 +267,7 @@ fn uart_host(
     let uart =
         esp_thread_br_h2::thread_br_h2_uart(uart0, tx, rx, config).unwrap_or_else(|_| halt());
     static MEMORY: ConstStaticCell<UartDmaMemory> = ConstStaticCell::new(UartDmaMemory::new());
-    let stream = UartDmaStream::new(uart, UartPort::Uart0, uhci, dma, MEMORY.take(), line)
+    let stream = UartDmaStream::new(uart, UartPort::Uart0, uhci, dma, 0, MEMORY.take(), line)
         .unwrap_or_else(|_| halt());
     static HOST: StaticCell<product::host::Host> = StaticCell::new();
     HOST.init(product::host::Host::new(stream))
@@ -419,6 +424,7 @@ async fn run(
     platform: &mut EspPlatform,
 ) -> ! {
     loop {
+        lab::tick(host);
         // Trial window without FW_CONFIRM: the previous image is selected
         // (or the next boot's check selects it); restart into it.
         if let TrialPoll::Expired { .. } = platform.poll_trial(now_ms()) {
@@ -477,4 +483,21 @@ impl Future for Nap {
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+/// Identity item and otadata boot check (its own frame: the FW engine and
+/// the journals are large and must not be inlined into `main`).
+#[inline(never)]
+fn boot_platform() -> (EspPlatform, BootOutcome) {
+    product::platform::boot(FW_VERSION, now_ms())
+}
+
+/// The NCP in static storage (its own frame, see `boot_platform`).
+#[inline(never)]
+fn new_ncp(
+    slot: &'static mut core::mem::MaybeUninit<Ncp<LOG_RECORDS>>,
+    identity: NcpIdentity,
+    cookie: u32,
+) -> &'static mut Ncp<LOG_RECORDS> {
+    Ncp::new_into(slot, identity, cookie, now_us())
 }
