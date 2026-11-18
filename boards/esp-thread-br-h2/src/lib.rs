@@ -53,8 +53,8 @@ pub const THREAD_BR_H2_UART: HostUartWiring = HostUartWiring {
     },
 };
 
-/// Thread BR board PTA wiring (H2 side). Wired on the board; no driver in
-/// the MAC yet.
+/// Thread BR board PTA wiring (H2 side; the H2 is the 4-wire follower,
+/// driven by `esp32-zigbee-ncp-product`'s `pta::Pta`, feature `pta`).
 pub const THREAD_BR_H2_PTA: PtaWiring = PtaWiring {
     request_gpio: 0,
     grant_gpio: 1,

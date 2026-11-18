@@ -11,7 +11,8 @@
 //! * the fitted-flash check ([`flash_size`]) and the flash windows
 //!   (`flash`, target only);
 //! * the host transport and its UART policy ([`transport`]);
-//! * the NV journals bound to their windows (`stores`, target only).
+//! * the NV journals bound to their windows (`stores`, target only);
+//! * PTA coexistence on the Thread BR board (`pta`, feature `pta`).
 //!
 //! The coordinator stack, the ZRHP protocol and the NCP command dispatch
 //! live in the shared crates; the composition root is
@@ -37,6 +38,8 @@ pub mod flash_size;
 #[cfg(target_os = "none")]
 pub mod host;
 pub mod layout;
+#[cfg(feature = "pta")]
+pub mod pta;
 #[cfg(target_os = "none")]
 pub mod stores;
 pub mod transport;
