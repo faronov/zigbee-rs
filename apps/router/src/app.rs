@@ -3754,3 +3754,35 @@ where
         Self::new_observed_with_aps_tables(node, children, aps_tables, policy, parts)
     }
 }
+
+// Declared last: inserting code above shifts the panic-location line numbers
+// of every image built from this crate.
+#[cfg(feature = "trust-center")]
+impl<'a, M, S, P, C, T, St, Sv, D, O, A>
+    TrustCenterCoordinatorApp<'a, M, S, P, C, T, St, Sv, D, O, A>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    T: TrustCenterDeviceStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    O: RouterObserver<M, Router>,
+    A: ApsTableLifecycle<M, S, P, Router>,
+{
+    /// The Trust Center runtime and the coordinator device at once (for
+    /// runtime calls that take the device, such as counter floors).
+    pub fn trust_center_and_device_mut(
+        &mut self,
+    ) -> (
+        &mut TrustCenterRuntime<T>,
+        &mut zigbee_runtime::ZigbeeDevice<M, Router>,
+    ) {
+        (
+            &mut self.trust_center,
+            self.coordinator.node_mut().device_mut(),
+        )
+    }
+}

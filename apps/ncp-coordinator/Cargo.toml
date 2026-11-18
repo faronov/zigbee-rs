@@ -1,0 +1,28 @@
+[package]
+name = "ncp-coordinator-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "ZRHP v1 network co-processor: coordinator, Trust Center and host protocol dispatch"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Platform-independent: the product supplies the transport, the identity and
+# the stack composition; this crate speaks ZRHP (zigbee-zrhp) and drives a
+# `CoordinatorPort`. No board, product or vendor dependency.
+[dependencies]
+critical-section = "1.2"
+heapless = "0.9"
+log = "0.4"
+zigbee-zrhp = { path = "../../zigbee-zrhp" }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["centralized-tclk", "trust-center", "global-aps-counter", "host-passthrough"] }
+router-app = { path = "../router", default-features = false, features = ["centralized-tclk", "global-aps-counter"] }
+
+[dev-dependencies]
+critical-section = { version = "1.2", features = ["std"] }
+pollster = "0.4"
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

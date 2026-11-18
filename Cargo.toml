@@ -63,6 +63,9 @@ exclude = [
     "products/efr32mg1-tradfri",
     "products/esp32-zigbee-devkit",
     "products/esp32-zigbee-ncp",
+    # NCP-only runtime features (global-aps-counter, host-passthrough) must
+    # not unify into the workspace test build: own manifest and lockfile.
+    "apps/ncp-coordinator",
     "esp-serial-stream",
     "boards/esp-thread-br-h2",
     "examples/esp32h2-ncp",
