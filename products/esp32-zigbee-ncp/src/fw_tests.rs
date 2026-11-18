@@ -593,3 +593,103 @@ fn staging_from_ota_1_targets_ota_0() {
     assert_eq!(flash.bytes(ota_slot_offset(0), image.len()), image);
     assert!(FLASH_SIZE >= ota_slot_offset(1) + OTA_SLOT_SIZE);
 }
+
+/// The selection step of the ESP-IDF v5.5.1 second-stage bootloader built
+/// with `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` (`bootloader/`), as in
+/// `components/bootloader_support/src/bootloader_utility.c`
+/// (`bootloader_utility_get_selected_boot_partition`): every
+/// `PENDING_VERIFY` entry becomes `ABORTED`; the valid entry with the
+/// highest sequence selects the slot; a `NEW` selected entry becomes
+/// `PENDING_VERIFY`. Each rewrite erases the otadata sector first
+/// (`write_otadata`). No valid entry and no factory app: `ota_0`.
+fn idf_rollback_bootloader(flash: &MockFlash) -> u8 {
+    use esp32_zigbee_devkit_product::otadata::STATE_PENDING_VERIFY;
+    let rewrite = |sector: u8, entry: OtaSelectEntry| {
+        let base = otadata_sector_offset(sector);
+        flash.put(base, &[0xFF; 4096]);
+        flash.put(base, &entry.encode());
+    };
+    let mut data = flash.otadata();
+    for sector in 0..2u8 {
+        let entry = data.entries[sector as usize];
+        if entry.state == STATE_PENDING_VERIFY {
+            rewrite(sector, entry.with_state(STATE_ABORTED));
+        }
+    }
+    data = flash.otadata();
+    let Some((sector, entry)) = data.active_entry() else {
+        return 0;
+    };
+    if entry.state == STATE_NEW {
+        rewrite(sector, entry.with_state(STATE_PENDING_VERIFY));
+    }
+    entry.slot().unwrap()
+}
+
+#[test]
+fn the_idf_rollback_bootloader_returns_to_the_previous_slot_without_fw_confirm() {
+    let flash = MockFlash::new();
+    let (_, file) = signed_newer();
+    let mut fw = engine(&flash, false);
+    stage(&mut fw, &file, NEWER).unwrap();
+    fw.activate().unwrap();
+    let activated = flash.data.borrow().clone();
+
+    // 1. Trial boot, the host confirms: the new slot stays selected.
+    let mut boot = flash.clone();
+    boot.set_running(idf_rollback_bootloader(&flash));
+    assert_eq!(boot.running.get(), Ok(1));
+    assert_eq!(
+        check_boot(&mut boot),
+        Ok(BootCheck::PendingVerify { slot: 1 })
+    );
+    assert_eq!(confirm_boot(&mut boot), Ok(true));
+    assert_eq!(idf_rollback_bootloader(&flash), 1);
+    assert_eq!(check_boot(&mut boot), Ok(BootCheck::Confirmed));
+
+    // 2. Trial boot, reset before FW_CONFIRM (host absent, SYS_RESET,
+    //    watchdog): the bootloader itself aborts the image.
+    *flash.data.borrow_mut() = activated.clone();
+    boot.set_running(idf_rollback_bootloader(&flash));
+    assert_eq!(
+        check_boot(&mut boot),
+        Ok(BootCheck::PendingVerify { slot: 1 })
+    );
+    boot.set_running(idf_rollback_bootloader(&flash));
+    assert_eq!(boot.running.get(), Ok(0));
+    assert!(matches!(
+        check_boot(&mut boot),
+        Ok(BootCheck::Confirmed | BootCheck::FallbackRecorded { slot: 0 })
+    ));
+    assert_eq!(idf_rollback_bootloader(&flash), 0, "stays on the old image");
+
+    // 3. The new image crashes before its application code runs (no
+    //    boot mark, no check_boot): the second boot returns to ota_0.
+    *flash.data.borrow_mut() = activated;
+    assert_eq!(idf_rollback_bootloader(&flash), 1);
+    assert_eq!(idf_rollback_bootloader(&flash), 0);
+    boot.set_running(0);
+    assert!(check_boot(&mut boot).is_ok());
+    assert_eq!(idf_rollback_bootloader(&flash), 0);
+}
+
+#[test]
+fn a_rollback_from_ota_1_returns_to_the_confirmed_ota_1_image() {
+    // Running a confirmed ota_1; stage ota_0, never confirm it.
+    let flash = MockFlash::new();
+    flash.put(
+        otadata_sector_offset(0),
+        &OtaSelectEntry::new(2, STATE_VALID).encode(),
+    );
+    flash.set_running(1);
+    let (_, file) = signed_newer();
+    let mut fw = engine(&flash, false);
+    stage(&mut fw, &file, NEWER).unwrap();
+    fw.activate().unwrap();
+    assert_eq!(idf_rollback_bootloader(&flash), 0);
+    assert_eq!(idf_rollback_bootloader(&flash), 1);
+    let mut boot = flash.clone();
+    boot.set_running(1);
+    assert!(check_boot(&mut boot).is_ok());
+    assert_eq!(idf_rollback_bootloader(&flash), 1);
+}

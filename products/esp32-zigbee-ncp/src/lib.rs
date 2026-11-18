@@ -49,12 +49,12 @@ pub mod platform;
 // The devkit product's MMU running-slot evidence, compiled against this
 // product's `crate::layout` (the NCP slot addresses). The file also carries
 // ESP32-C5 paths behind a feature this product does not have.
+#[cfg(feature = "pta")]
+pub mod pta;
 #[cfg(any(target_os = "none", test))]
 #[allow(dead_code, unexpected_cfgs)]
 #[path = "../../esp32-zigbee-devkit/src/running_image.rs"]
 mod running_image;
-#[cfg(feature = "pta")]
-pub mod pta;
 #[cfg(target_os = "none")]
 pub mod stores;
 #[cfg(test)]

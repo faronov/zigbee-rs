@@ -1,0 +1,3 @@
+09bc3c6ec725ba4eeb0f4c72f50efeddc7b13cd2f5249e7eb0d0640abffaf2f8  ./bootloader-esp32c6-4mb.bin
+054dd6d9faa0eb66056f480ab6e7061f218a0c6fbd0f546a3ea0366d55621665  ./bootloader-esp32h2-2mb.bin
+e644de30d3eb07fe282f456ef525f076be4516f83af402238e704d1e519268c8  ./bootloader-esp32h2-4mb.bin

@@ -1,0 +1,11 @@
+# zigbee-rs ESP32 NCP second-stage bootloader (ESP-IDF v5.5.1).
+# A/B rollback (spec 7.9 / 8.9, decision N6 amended 2026-11-18): an image
+# activated as NEW boots once as PENDING_VERIFY; a later boot that still
+# finds it PENDING_VERIFY marks it ABORTED and boots the previous slot.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# No eFuse anti-rollback: downgrades are refused by the NCP's FW_* policy.
+# CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK is not set
+CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
