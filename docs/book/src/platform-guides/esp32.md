@@ -740,8 +740,8 @@ Not yet shown on the C5: a captured association/Transport-Key exchange,
 children and Frame Pending (`data-req 0`), unicast relaying for another
 node, GP TempMaster timing, the status LED colours, OTA and any power
 measurement. Observation: repeated copies of one GPDF-tunnel broadcast
-from `0x9879` are logged as `[NWK] Frame counter replay` and dropped; the
-same message appears on the other ESP routers.
+from `0x9879` are logged as `[NWK] Frame counter replay` and dropped
+(not yet compared with the C6/H2 routers).
 
 ## Hardware validation
 
