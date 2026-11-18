@@ -411,13 +411,11 @@ pub struct NwkLayer<M: MacDriver> {
     link_status_age_counter: u16,
     /// Counter for stochastic child address assignment.
     next_child_addr_offset: u16,
-    /// Lifecycle outcome of the NWK command in the frame currently being
-    /// processed, collected by the layer above with
-    /// [`take_command_outcome`](Self::take_command_outcome).
-    ///
-    /// Reset at the start of every `process_incoming_nwk_frame` call so it can
-    /// only ever describe that call's frame.
+    /// Lifecycle outcome of the NWK command in the frame being processed,
+    /// collected with [`take_command_outcome`](Self::take_command_outcome);
+    /// reset at the start of every `process_incoming_nwk_frame` call.
     pending_command_outcome: Option<nlde::NwkCommandOutcome>,
+    host_events: host_events::HostNwkEvents,
     /// Whether the frame currently being processed carried a verified identity
     /// — it passed NWK CCM*, or the network runs without NWK security at all.
     ///
@@ -492,6 +490,7 @@ impl<M: MacDriver> NwkLayer<M> {
             link_status_age_counter: 0,
             next_child_addr_offset: 1,
             pending_command_outcome: None,
+            host_events: host_events::HostNwkEvents::new(),
             rx_authenticated: false,
             #[cfg(feature = "green-power")]
             tx_alias: None,
@@ -558,6 +557,7 @@ impl<M: MacDriver> NwkLayer<M> {
             core::ptr::addr_of_mut!((*slot).link_status_age_counter).write(0);
             core::ptr::addr_of_mut!((*slot).next_child_addr_offset).write(1);
             core::ptr::addr_of_mut!((*slot).pending_command_outcome).write(None);
+            core::ptr::addr_of_mut!((*slot).host_events).write(host_events::HostNwkEvents::new());
             core::ptr::addr_of_mut!((*slot).rx_authenticated).write(false);
             #[cfg(feature = "green-power")]
             core::ptr::addr_of_mut!((*slot).tx_alias).write(None);
@@ -1428,11 +1428,11 @@ impl<M: MacDriver> NwkLayer<M> {
                 short.0
             );
         }
+        crate::host_events::host_event!(self.host_note_aged(&evicted));
         evicted
     }
 
-    /// Re-install an authenticated child from durable persistence after a
-    /// router reboot.
+    /// Re-install an authenticated child from durable persistence (reboot).
     ///
     /// Restores the neighbour entry as an authenticated [`Child`] with the
     /// persisted identity, capability and accepted End Device Timeout
@@ -2385,3 +2385,7 @@ pub(crate) const fn ncp_capacity(default: usize, ncp: usize) -> usize {
         default
     }
 }
+
+/// Device departures for a network co-processor host (declared last: keeps
+/// the line numbers above, which panic locations embed, unchanged).
+pub mod host_events;

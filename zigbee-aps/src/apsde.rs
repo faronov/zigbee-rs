@@ -1571,7 +1571,7 @@ impl<M: MacDriver> ApsLayer<M> {
             self.queue_data_ack(&header, nwk_src, aps_key_origin);
         }
 
-        // Determine addressing
+        crate::host_rx_security!(self, aps_key_origin, aps_used_default_link_key);
         let dm = crate::frames::ApsDeliveryMode::from_u8(header.frame_control.delivery_mode)?;
         let (dst_addr_mode, dst_address, dst_ep) = match dm {
             ApsDeliveryMode::Unicast | ApsDeliveryMode::Broadcast => (
@@ -8620,5 +8620,127 @@ mod tests {
         assert_eq!(indication.dst_address, ApsAddress::Group(0x4321));
         assert_eq!(indication.dst_endpoint, 0xFF);
         assert_eq!(aps.group_member_endpoints(0x4321), &[3, 5]);
+    }
+
+    // ── Network co-processor receive metadata (`host-passthrough`) ─────
+
+    /// The host learns whether a data frame was APS-secured, and with which
+    /// kind of link key, separately from NWK security.
+    #[test]
+    #[cfg(all(feature = "router", feature = "host-passthrough"))]
+    fn last_rx_security_reports_aps_security_and_the_key_source() {
+        use crate::{ApsRxKeySource, ApsRxSecurity};
+        let (mut aps, app_key) = secured_unicast_node(0x1000);
+        assert_eq!(aps.last_rx_security(), ApsRxSecurity::default());
+
+        let payload = [0x18, 0x07, 0x0B];
+        assert!(deliver_secured_data(
+            &mut aps,
+            &secured_data_frame(&app_key, &CHILD_IEEE, 0x01, 0x100, &payload),
+        ));
+        assert_eq!(
+            aps.last_rx_security(),
+            ApsRxSecurity {
+                aps_secured: true,
+                key_source: ApsRxKeySource::Application,
+            }
+        );
+
+        let tc_key = [0xD4; 16];
+        aps.security_mut()
+            .add_key(crate::security::ApsLinkKeyEntry {
+                partner_address: CHILD_IEEE,
+                key: tc_key,
+                key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                outgoing_frame_counter: 0,
+                outgoing_frame_counter_limit: 0x1000,
+                incoming_frame_counter: 0,
+                incoming_frame_counter_valid: false,
+            })
+            .unwrap();
+        assert!(deliver_secured_data(
+            &mut aps,
+            &secured_data_frame(&tc_key, &CHILD_IEEE, 0x02, 0x200, &payload),
+        ));
+        assert_eq!(
+            aps.last_rx_security().key_source,
+            ApsRxKeySource::UniqueTrustCenter
+        );
+
+        // NWK-only security: not APS-secured, no key source.
+        let header = ApsHeader {
+            frame_control: ApsFrameControl {
+                frame_type: ApsFrameType::Data as u8,
+                delivery_mode: ApsDeliveryMode::Unicast as u8,
+                ack_format: false,
+                security: false,
+                ack_request: false,
+                extended_header: false,
+            },
+            dst_endpoint: Some(0x01),
+            group_address: None,
+            cluster_id: Some(0x0006),
+            profile_id: Some(0x0104),
+            src_endpoint: Some(0x01),
+            aps_counter: 0x03,
+            extended_header: None,
+        };
+        let mut frame = [0u8; 32];
+        let len = header.serialize(&mut frame);
+        frame[len] = 0x42;
+        assert!(deliver_secured_data(&mut aps, &frame[..len + 1]));
+        assert_eq!(aps.last_rx_security(), ApsRxSecurity::default());
+
+        assert_eq!(
+            ApsRxKeySource::from_origin(
+                Some(crate::security::ApsKeyOrigin::PreconfiguredGlobal),
+                false
+            ),
+            ApsRxKeySource::GlobalTrustCenter
+        );
+        assert_eq!(
+            ApsRxKeySource::from_origin(
+                Some(crate::security::ApsKeyOrigin::KeyPair {
+                    partner: CHILD_IEEE,
+                    key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+                }),
+                true
+            ),
+            ApsRxKeySource::GlobalTrustCenter,
+            "a key-pair partner verified with the default key is global"
+        );
+    }
+
+    /// The handle of an acknowledged unicast resolves to `Confirmed` when the
+    /// APS ACK arrives, and to `None` once its retries are exhausted.
+    #[test]
+    #[cfg(all(feature = "router", feature = "host-passthrough"))]
+    fn last_ack_handle_tracks_the_ack_outcome_of_the_last_request() {
+        let (mut aps, _) = secured_unicast_node(0x1000);
+        assert_eq!(aps.last_ack_handle(), None);
+
+        let acked = send_secured_unicast(&mut aps);
+        let handle = aps.last_ack_handle().expect("tracked");
+        assert_eq!(
+            (handle.destination(), handle.aps_counter()),
+            (CHILD_SHORT, acked)
+        );
+        assert_eq!(aps.ack_status(handle), Some(crate::ApsAckStatus::Pending));
+        assert!(aps.confirm_ack_with_security(CHILD_SHORT.0, acked, true));
+        assert_eq!(aps.ack_status(handle), Some(crate::ApsAckStatus::Confirmed));
+        aps.clear_ack_status(handle);
+        assert_eq!(aps.ack_status(handle), None);
+
+        let lost = send_secured_unicast(&mut aps);
+        let handle = aps.last_ack_handle().expect("tracked");
+        assert_eq!(handle.aps_counter(), lost);
+        // apscMaxFrameRetries (3) retries, then one more window.
+        for _ in 0..4 {
+            assert_eq!(aps.ack_status(handle), Some(crate::ApsAckStatus::Pending));
+            advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US);
+            let _ = aps.age_ack_table();
+        }
+        assert_eq!(aps.ack_status(handle), None, "retries exhausted");
+        assert_eq!(aps.last_ack_handle(), None);
     }
 }

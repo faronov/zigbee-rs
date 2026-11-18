@@ -1187,6 +1187,39 @@ fn bind_req_from_entry(entry: &BindingEntry) -> BindReq {
     }
 }
 
+/// Endpoints registered at run time by a network co-processor host
+/// (`host-passthrough`). They share the registry of the compile-time
+/// endpoints, so the ZDO server answers `Active_EP_req`, `Simple_Desc_req`
+/// and `Match_Desc_req` over both.
+#[cfg(feature = "host-passthrough")]
+impl<M: MacDriver> ZdoLayer<M> {
+    /// Register `desc`, replacing the endpoint with the same number in place
+    /// (its position in `Active_EP_rsp` is kept). Returns the replaced
+    /// descriptor; `TableFull` when a new endpoint does not fit.
+    pub fn upsert_endpoint(
+        &mut self,
+        desc: SimpleDescriptor,
+    ) -> Result<Option<SimpleDescriptor>, ZdpStatus> {
+        match self
+            .endpoints
+            .iter_mut()
+            .find(|registered| registered.endpoint == desc.endpoint)
+        {
+            Some(registered) => Ok(Some(core::mem::replace(registered, desc))),
+            None => self.register_endpoint(desc).map(|()| None),
+        }
+    }
+
+    /// Remove endpoint `endpoint` from the registry; returns its descriptor.
+    pub fn unregister_endpoint(&mut self, endpoint: u8) -> Option<SimpleDescriptor> {
+        let index = self
+            .endpoints
+            .iter()
+            .position(|registered| registered.endpoint == endpoint)?;
+        Some(self.endpoints.remove(index))
+    }
+}
+
 #[cfg(test)]
 mod capacity_tests {
     use super::*;
@@ -1231,5 +1264,24 @@ mod capacity_tests {
             zdo.register_endpoint(descriptor(240)),
             Err(ZdpStatus::TableFull)
         );
+    }
+
+    #[test]
+    #[cfg(feature = "host-passthrough")]
+    fn host_endpoints_replace_in_place_and_unregister() {
+        let mut zdo = zdo();
+        assert_eq!(zdo.register_endpoint(descriptor(1)), Ok(()));
+        assert_eq!(zdo.upsert_endpoint(descriptor(2)), Ok(None));
+        let mut replacement = descriptor(1);
+        replacement.device_id = 0x0005;
+        replacement.input_clusters.push(0x0006).unwrap();
+        let replaced = zdo.upsert_endpoint(replacement.clone()).unwrap();
+        assert_eq!(replaced.map(|desc| desc.device_id), Some(0x0302));
+        let order: heapless::Vec<u8, 4> = zdo.endpoints().iter().map(|d| d.endpoint).collect();
+        assert_eq!(order.as_slice(), &[1, 2], "replaced in place");
+        assert_eq!(zdo.find_endpoint(1), Some(&replacement));
+        assert_eq!(zdo.unregister_endpoint(1).map(|d| d.endpoint), Some(1));
+        assert_eq!(zdo.unregister_endpoint(1), None);
+        assert_eq!(zdo.endpoints().len(), 1);
     }
 }

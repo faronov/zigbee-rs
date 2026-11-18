@@ -3107,4 +3107,51 @@ mod tests {
             .collect();
         assert!(seeds.iter().any(|&seq| seq != seeds[0]));
     }
+
+    /// Host-registered endpoints (`host-passthrough`) are served like the
+    /// compile-time ones: Active_EP, Simple_Desc and Match_Desc see an added
+    /// endpoint, and no longer see a removed one.
+    #[test]
+    #[cfg(feature = "host-passthrough")]
+    fn host_registered_endpoints_are_served_by_the_zdo_server() {
+        let mut zdo = test_zdo();
+        let mut input_clusters = heapless::Vec::new();
+        input_clusters.push(0x0006u16).unwrap();
+        let host = crate::descriptors::SimpleDescriptor {
+            endpoint: 9,
+            profile_id: 0x0104,
+            device_id: 0x0005,
+            device_version: 1,
+            input_clusters,
+            output_clusters: heapless::Vec::new(),
+        };
+        assert_eq!(zdo.upsert_endpoint(host), Ok(None));
+
+        let local = LOCAL_SHORT.0.to_le_bytes();
+        block_on(
+            zdo.handle_indication(&unicast(crate::ACTIVE_EP_REQ, &[0x31, local[0], local[1]])),
+        )
+        .unwrap();
+        let (cluster, body) = last_zdp_tx(&zdo).expect("Active_EP_rsp");
+        assert_eq!(cluster, crate::ACTIVE_EP_RSP);
+        assert_eq!(&body[..], &[0x31, 0, local[0], local[1], 2, 1, 9]);
+
+        let payload = match_desc_payload(0x32, ShortAddress::BROADCAST, 0x0104, 0x0006);
+        block_on(zdo.handle_indication(&broadcast(crate::MATCH_DESC_REQ, &payload))).unwrap();
+        let (cluster, body) = last_zdp_tx(&zdo).expect("Match_Desc_rsp");
+        assert_eq!(cluster, crate::MATCH_DESC_RSP);
+        assert_eq!((body[1], body[4], body[5]), (0, 1, 9));
+
+        let simple = [0x33, local[0], local[1], 9];
+        block_on(zdo.handle_indication(&unicast(crate::SIMPLE_DESC_REQ, &simple))).unwrap();
+        let (cluster, body) = last_zdp_tx(&zdo).expect("Simple_Desc_rsp");
+        assert_eq!(cluster, crate::SIMPLE_DESC_RSP);
+        assert_eq!((body[1], body[5]), (ZdpStatus::Success as u8, 9));
+
+        assert!(zdo.unregister_endpoint(9).is_some());
+        let simple = [0x34, local[0], local[1], 9];
+        block_on(zdo.handle_indication(&unicast(crate::SIMPLE_DESC_REQ, &simple))).unwrap();
+        let (_, body) = last_zdp_tx(&zdo).expect("Simple_Desc_rsp");
+        assert_eq!(body[1], ZdpStatus::NotActive as u8);
+    }
 }

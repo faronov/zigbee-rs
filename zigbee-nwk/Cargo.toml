@@ -23,6 +23,10 @@ green-power = []
 # indirect queue 16 frames, NWK replay-floor table 128 and a NIB default of
 # `max_children = 64`. Off by default: images without it are unchanged.
 ncp-capacity = ["router"]
+# Network co-processor: record neighbour Leave indications (with the rejoin
+# bit) and aged-out children for the host (`host_events`). Off by default:
+# images without it are unchanged.
+host-passthrough = []
 
 [dev-dependencies]
 zigbee-mac = { version = "0.1.0", path = "../zigbee-mac", features = ["mock"] }

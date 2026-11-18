@@ -28,6 +28,10 @@ trust-center = ["router"]
 # `ApsSecurity::set_global_outgoing_counter`, every APS-secured send is
 # refused. Off by default: images without it are unchanged.
 global-aps-counter = ["trust-center"]
+# Network co-processor receive metadata (APS security of the last delivered
+# data frame, the handle of the last acknowledged unicast). Off by default:
+# images without it are unchanged.
+host-passthrough = []
 trace = ["zigbee-nwk/trace"]
 # Green Power alias transmission for GP Notification tunnelling. Off by default.
 green-power = ["zigbee-nwk/green-power"]
