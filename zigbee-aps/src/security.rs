@@ -23,9 +23,9 @@ use zigbee_crypto::{
 };
 use zigbee_types::IeeeAddress;
 
-/// Maximum number of link key entries.
+/// Maximum number of link key entries (256 with `ncp-capacity`, spec 8.9).
 #[cfg(feature = "trust-center")]
-pub const MAX_KEY_TABLE_ENTRIES: usize = 32;
+pub const MAX_KEY_TABLE_ENTRIES: usize = [32, 256][cfg!(feature = "ncp-capacity") as usize];
 #[cfg(not(feature = "trust-center"))]
 pub const MAX_KEY_TABLE_ENTRIES: usize = 16;
 
@@ -1342,3 +1342,41 @@ mod mmo_tests {
 mod global;
 #[cfg(feature = "global-aps-counter")]
 pub use global::GlobalApsCounter;
+
+/// Coordinator NCP link-key table (`ncp-capacity`, ZRHP spec 8.9).
+#[cfg(all(test, feature = "ncp-capacity"))]
+mod ncp_capacity_tests {
+    use super::*;
+
+    fn entry(index: u16) -> ApsLinkKeyEntry {
+        let [lo, hi] = index.to_le_bytes();
+        ApsLinkKeyEntry {
+            partner_address: [lo, hi, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A],
+            key: [lo; 16],
+            key_type: ApsKeyType::TrustCenterLinkKey,
+            outgoing_frame_counter: 0,
+            outgoing_frame_counter_limit: 0x400,
+            incoming_frame_counter: 0,
+            incoming_frame_counter_valid: false,
+        }
+    }
+
+    #[test]
+    fn the_link_key_table_holds_256_unique_keys_and_then_refuses() {
+        assert_eq!(MAX_KEY_TABLE_ENTRIES, 256);
+        let mut security = ApsSecurity::new();
+        for index in 0..MAX_KEY_TABLE_ENTRIES as u16 {
+            assert!(security.add_key(entry(index)).is_ok(), "key {index}");
+        }
+        assert_eq!(security.key_count(), MAX_KEY_TABLE_ENTRIES);
+        let last = entry(MAX_KEY_TABLE_ENTRIES as u16 - 1);
+        assert_eq!(
+            security
+                .find_key(&last.partner_address, ApsKeyType::TrustCenterLinkKey)
+                .map(|found| found.key),
+            Some(last.key)
+        );
+        // Fail closed: a full table refuses a new partner.
+        assert!(security.add_key(entry(0x7FFF)).is_err());
+    }
+}
