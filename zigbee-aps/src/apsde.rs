@@ -3075,18 +3075,10 @@ impl<M: MacDriver> ApsLayer<M> {
             .await
     }
 
+    #[cfg(not(feature = "global-aps-counter"))]
     fn next_default_tc_link_key_frame_counter(&mut self) -> Option<u32> {
-        // With `global-aps-counter` every APS-secured frame, including those
-        // under the preconfigured global keys, takes the one reserved APS
-        // counter.
-        #[cfg(feature = "global-aps-counter")]
-        {
-            self.security.next_global_frame_counter()
-        }
-        // The preconfigured global TC link key uses the same persistent
-        // outgoing security counter as NWK security. This matches the Telink
+        // The preconfigured global TC link key uses the same persistent outgoing security counter as NWK security. This matches the Telink
         // stack and prevents Request-Key from restarting at zero after boot.
-        #[cfg(not(feature = "global-aps-counter"))]
         self.nwk.nib_mut().next_frame_counter()
     }
 
