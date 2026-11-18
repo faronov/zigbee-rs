@@ -61,6 +61,8 @@ jobs:
         run: python3 -m unittest discover -s tools -p 'test_mac_footprint.py' -v
       - name: Test BL702 static stack gate
         run: python3 -m unittest discover -s tools -p 'test_bl702_stack_gate.py' -v
+      - name: Test ESP32 NCP static stack gate
+        run: python3 -m unittest discover -s tools -p 'test_esp32_ncp_stack_gate.py' -v
       - name: Test BL702 loader soak monitor
         run: python3 -m unittest discover -s tools -p 'test_bl702_soak_monitor.py' -v
       # ZRHP golden vectors must match their generator (spec 14.1).
@@ -1670,6 +1672,10 @@ jobs:
             exit 1
           fi
           "$NM" -S --size-sort -C "$ELF" | tail -n 12
+          # Static stack budget (boot composition, executor, Trust Center
+          # chains and nested interrupts) against the RAM left above .bss.
+          LLVM_BIN_DIR="$(dirname "$NM")" python3 ../../tools/esp32-ncp-stack-gate.py \
+            "$ELF" @../../tools/esp32-ncp-stack-gate.args
       - name: Upload NCP image
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

@@ -1,0 +1,66 @@
+# Static stack gate for the ESP32-H2/C6 ZRHP NCP images (examples/esp32-ncp).
+# Usage: tools/esp32-ncp-stack-gate.py ELF @tools/esp32-ncp-stack-gate.args
+#
+# Heuristic direct-call bound, not a whole-program proof: indirect calls
+# other than the log sink and the interrupt handlers are not followed. The
+# hardware stack paint stays the authoritative runtime evidence.
+
+# esp-hal: the main stack is all RAM above .bss/.noinit; the stack-guard word
+# (ESP_HAL_CONFIG_STACK_GUARD_OFFSET = 60, watchpoint-monitored) ends the
+# usable stack 64 B above `_stack_end_cpu0`.
+--guard
+64
+
+# H2 USJ fix build (ncp-capacity, 256 TC devices): 56 096 B usable; static
+# worst case 34 112 B task (boot composition: device assembly) + 512 B log
+# sink + 864 B interrupts = 35 488 B, a 20 608 B gap. H2 Thread-BR: 53 512 B
+# usable, 1 104 B interrupts, a 17 784 B gap. C6: 245 440 B usable. Not
+# measured on hardware.
+--min-gap
+16384
+
+# Frames above 12 KiB must be reviewed. Ncp::new_into still builds the ZRHP
+# link engine (22.5 KiB) by value: boot only, beside the deeper composition.
+--max-frame
+12288
+--frame-allow
+<ncp_coordinator_app::ncp::Ncp<16>>::new_into=23552
+
+# Task context: `main` reaches the composition steps and, through the
+# executor, the root future's polls by direct calls. Every `log!` reaches the
+# ring logger through `dyn Log`.
+--entry
+^main$
+--task-extra
+RingLogger as log::Log>::log$
+
+# Interrupts: `_start_TrapN_trap` reserves a 64 B frame, `handle_interrupts`
+# dispatches through the vector table with interrupts re-enabled (a higher
+# priority nests), so every bound #[handler] counts once. The radio handler
+# reaches the MAC completion callbacks through pointers.
+--trap-frame
+64
+--irq-dispatch
+^handle_interrupts$
+--irq-handler
+::__esp_hal_internal_
+--irq-callback
+^zigbee_mac::esp::radio_phy::on_
+# The trap entry switches to a reserved stack on overflow (exception path).
+--dynamic-allow
+^_pre_default_start_trap$
+
+# Chain budgets: worst depth below (and including) any matching function,
+# measured on the fix build, rounded up to the next 512 B. A regression fails.
+--chain-budget
+boot=^esp32_ncp::compose$=33280
+--chain-budget
+serve=^esp32_ncp::serve$=29184
+# Trust Center: initialization, the step's TC service and persistence. Before
+# the in-place state fix these were 485-576 KiB (whole-state clones).
+--chain-budget
+trust-center=TrustCenterCoordinatorApp<.*>>::(step_deferred_factory_reset|ensure_trust_center_initialized|service_network_key_rotation)::?=16384
+--chain-budget
+tc-runtime=^<zigbee_runtime::trust_center_runtime::TrustCenterRuntime<=9728
+--chain-budget
+tc-journal=TrustCenterStreamJournal<.*>>::(load_into|store|frame_snapshot|decode_snapshot|newest_framed)$=9216

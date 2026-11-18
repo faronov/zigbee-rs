@@ -1874,16 +1874,34 @@ fall back to (or keep) the previous complete snapshot (host fault-injection
 tests). A single-slot record of the previous NCP layout is read and
 migrated on the next store.
 
-Measured on the ESP32-H2 USJ image: `.bss` 128 120 → 191 560 B, `.data`
-6 140 B, so 60 300 B of the 258 000 B region remain for the stack. **This
-does not fit yet.** The Trust Center runtime clones its full persisted
-state (~23 KiB at 256 devices) for every mutation, and the composition
-builds the TC application on the stack before moving it into its static:
-`main`'s frame is 77 824 B and some Trust Center poll frames exceed 90 KiB
-(static frame analysis of the ELF). The image builds but would overflow its
-stack; it must not be flashed until the TC runtime mutates its state in
-place (or adopts the compact 48 B cache entry above) and the composition
-constructs the coordinator application in place.
+Measured on the ESP32-H2 USJ image: `.bss` 128 120 → 192 216 B, `.data`
+6 308 B, so 56 160 B of the 258 000 B region remain for the stack (56 096 B
+above esp-hal's stack-guard word).
+
+The first `ncp-capacity` image did not fit: the Trust Center runtime cloned
+its full persisted state (~23 KiB at 256 devices) for every mutation and the
+composition built the coordinator application (and the NCP) on the stack
+before moving them into statics (`main`'s frame 77 824 B, Trust Center poll
+frames up to 116 KiB, a 650 KiB static worst case). Now:
+
+- `TrustCenterRuntime` mutates its live state **in place** and commits it;
+  a failed store re-synchronises the live state from the journal in place
+  (`TrustCenterDeviceStore::load_into`), or closes the runtime (not
+  initialized) until it is re-initialized when that reload fails. RAM never
+  runs ahead of flash. The journals decode straight into caller storage and
+  scan by framing/CRC without materializing candidate states.
+- The app (`TrustCenterCoordinatorApp::new_with_aps_tables_into`), its Trust
+  Center runtime and table, and the NCP (`Ncp::new_into`) are constructed in
+  their static storage; `TcPort` borrows the app. The composition root runs
+  each construction step in its own frame.
+
+`tools/esp32-ncp-stack-gate.py` (CI job `build-esp32-ncp`) bounds the static
+worst case: the boot composition (device assembly, 34 112 B) plus the log
+sink and every interrupt handler nested once leaves 20.6 KiB on the H2 USJ
+image, 17.8 KiB on the Thread BR image (both ≥ the 16 KiB gate) and
+205 KiB on the C6. Trust Center chains are ≤ 16 KiB (step) and ≤ 9.5 KiB
+(runtime/journal). This is a direct-call bound, not hardware evidence: the
+images have not been flashed or stack-painted yet.
 
 ## 9. Backup, restore and Open Coordinator Backup
 
