@@ -1308,7 +1308,7 @@ Section 9 defines these commands.
 
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
-| `0x0701` | `DIAG_GET_COUNTERS` | `u8 group_mask` (bit0 link, bit1 MAC, bit2 NWK, bit3 APS, bit4 security, bit5 tables, bit6 queues) | `u8 n, n×{u16 id, u32 value}` | P (several counters exist, e.g. `replay_table_full`, `frame_pending_acks`; a registry is N) |
+| `0x0701` | `DIAG_GET_COUNTERS` | `u8 group_mask` (bit0 link, bit1 MAC, bit2 NWK, bit3 APS, bit4 security, bit5 tables, bit6 queues, bit7 Green Power) | `u8 n, n×{u16 id, u32 value}` | P (several counters exist, e.g. `replay_table_full`, `frame_pending_acks`; a registry is N) |
 | `0x0702` | `DIAG_RESET_COUNTERS` | `u8 group_mask` | — | N |
 | `0x0703` | `DIAG_GET_NEIGHBORS` | `u8 start` | `u8 total, u8 n, n×{[8] ieee, u16 nwk, u8 type, u8 rx_on, u8 relationship, u8 lqi, u8 outgoing_cost, u8 age}` | P |
 | `0x0704` | `DIAG_GET_ROUTES` | `u8 start` | `u8 total, u8 n, n×{u16 dst, u16 next_hop, u8 status, u8 flags}` | P |
@@ -1330,6 +1330,7 @@ Counter ID groups:
   writebacks, evictions, conflicts).
 - `0x07xx`: queues (APS queue high-water, `BUSY` responses, host-absent
   drops, indirect queue full).
+- `0x08xx` (group bit 7): Green Power (7.11).
 
 ### 7.9 FIRMWARE (`0x08xx`, endpoint 4)
 
@@ -1395,8 +1396,11 @@ State on master 184b82d (see [Green Power](green-power.md)):
 | Sink (`Sink<8, 4>`; Sink Table persisted in the GP journal as `ZBGS` records paired with the Proxy Table; adaptive per-GPD counter persistence) | Host-tested and lab-tested on the ESP32-H2-Zero combo light |
 | Bidirectional commissioning with the combo as its own TempMaster (reply armed in the radio and started from its interrupts, `MacDriver::arm_gp_reply`, ESP32 only) | Proven 3 of 3 on the H2 combo light on 2026-11-17 |
 
-None of this is validated **as a coordinator NCP** yet; gate H10 covers
-that. Since fd3bc03 the NWK layer also accepts the empty source-route relay
+The NCP integration (2026-11-19) is host-tested only: the commands and
+events below over the in-memory host link with the real Trust Center
+coordinator on a mock MAC (`apps/ncp-coordinator/tests/gp.rs`), and the GP
+journal in the NCP's `zbnv` geometry. None of it is validated **as a
+coordinator NCP** on hardware yet; gate H10 covers that. Since fd3bc03 the NWK layer also accepts the empty source-route relay
 lists that some coordinators send (section 7.3).
 
 **Sink modes.** There is exactly **one sink authority** per network on the
@@ -1528,12 +1532,60 @@ coordinator, and every accepted GPD command reaches the host as
 `EVT_GP_FRAME`.
 
 **Capacity.** `gp_sink_table` = 16 and `gp_proxy_table` = 8 on the H2 NCP
-(8.9). Today `GP_SINK_TABLE_ENTRIES` is a runtime constant (8), so making it
-a product parameter is runtime work (N).
+(8.9). `GP_SINK_TABLE_ENTRIES` follows the runtime's `ncp-capacity` product
+parameter (8 otherwise, so router images are unchanged); both values are
+reported in `SYS_NEGOTIATE`.
 
 **Backup.** Sink entries go to `stack_specific.zigbee_rs.gp_sink_table` as
 hex `R_GP_SINK` values, and proxy entries to `gp_proxy_table` (9.2). OCB
 itself has no GP fields.
+
+**Implementation notes** (`apps/ncp-coordinator/src/gp.rs` over
+`zigbee_runtime::green_power::ncp`, feature `green-power-ncp`):
+
+- The NCP boots in `NCP_SINK` with the defaults above (window 180 s, exit
+  on first pairing, derived groupcast). `GP_SINK_CONFIG` is kept in RAM:
+  a host sends it at every start. `window_s` 0 selects 180 s; a
+  `security_level` with bit 3 (involve the Trust Center) is
+  `UNSUPPORTED_COMMAND`. `GP_SINK_COMMISSIONING` (enter) also sets
+  `gpsCommissioningWindow` (non-zero `window_s`) and the "on first pairing"
+  exit bit from its flags; it needs a running network and `NCP_SINK`
+  (`INVALID_STATE`).
+- `GP_SET_SHARED_KEY` is `UNSUPPORTED_COMMAND`: the sink provisions no
+  shared GPD key (`zigbee_gp::sink`).
+- `EVT_GP_FRAME.result` follows the sink outcome: 0–4 as listed. Result 5
+  is not emitted by this build. A bidirectional commissioning reports the
+  Commissioning frame with result 3 and the completing frame (Success)
+  with result 2; `EVT_GP_COMMISSIONED` carries the full `R_GP_SINK`
+  (key, counter). `rssi` is -128 (the MAC reports none); `lqi` is the
+  GPDF's, or the APS frame's for a proxied one. An encrypted frame the sink
+  could not decrypt for the report keeps its raw payload, flag bit 1 clear,
+  `command_id` 0xFF.
+- `R_GP_SINK` carries one group: a pre-commissioned groupcast entry exports
+  its first group. `GP_SINK_TABLE_PUT` and `GP_SINK_REMOVE` need a running
+  network (`INVALID_STATE`; the table is restored from NV when the network
+  resumes). An imported entry's counter is taken as the last accepted one
+  and is persisted exactly. Table reads page at
+  400 record bytes (`n` may be smaller than the remaining entries; continue
+  at `start + n`). `R_GP_PROXY` holds one entry per record (`format_version`
+  1); with export locked its key bytes are zero.
+- `HOST_SINK` hands the host's GP Pairing and Proxy Commissioning Mode, not
+  only GP Response, to the local proxy (broadcast, group or unicast to the
+  NCP): its proxy must be paired and in commissioning mode like any other.
+  Its GP Notifications and Commissioning Notifications are copied once per
+  GPDF (several destinations), and one addressed to the NCP itself is not
+  transmitted. Group-addressed GP frames reach the host only for groups the
+  GP endpoint is a member of (the NCP sink's or the proxy's; there is no
+  host group-membership command yet).
+- Counters (`DIAG_GET_COUNTERS` group bit 7, IDs `0x08xx`): `0x0801`–
+  `0x080D` sink drops by `SinkDrop` reason (duplicates `0x0807`, stale
+  `0x0806`, unknown GPD `0x0803`), `0x0810` reports lost to a full queue,
+  `0x0811` local proxy copies, `0x0812` frames handed to a host sink,
+  `0x0813` `CONFLICT` refusals.
+- Persistence: the runtime's GP journal (`ZBGS` sink record paired with the
+  Proxy Table record, adaptive counter records) in the product's `zbnv` GP
+  window, 2 × 8 KiB logical sectors; restored by the coordinator's
+  `NWK_INIT` resume like the router combo's.
 
 ---
 
@@ -1793,7 +1845,7 @@ share it.
 | Children 64 (see below): neighbor table 32 → 96 (+64 × 32 B), child records 64 × 24 B, source-match table 16 → 64 (+48 × 10 B), indirect queue 8 → 16 frames (+8 × 128 B) | 5 088 | — |
 | APS request queue: `max_aps_inflight` 16 × 160 B | 2 560 | — |
 | Host-absent queue 32 × 80 B + miss queue 8 × 128 B + retry cache 64 × 24 B | 5 120 | — |
-| GP Sink Table 8 → 16 entries (+8 × ~80 B) | 640 | — |
+| GP Sink Table 8 → 16 entries (+8 × ~80 B) | 640 | Measured 2026-11-19 for the whole NCP GP combo (H2 Thread-BR image): device +4 928 B (Proxy 2 264 + Sink 2 480 + reply buffers), NCP report queue 916 B, `.data` +776 B; the 32 KiB `esp-alloc` heap moved to the reclaimed 2nd-stage bootloader RAM (`dram2_seg`), so the main stack grew by 25 860 B |
 | **Total static** | **≈ 130 000** | about 50 % of the region |
 | Remaining for stacks and margin | ≈ 128 000 | Must be confirmed by the product's post-link check and stack painting |
 
