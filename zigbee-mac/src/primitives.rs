@@ -736,3 +736,65 @@ mod parent_capability_tests {
         assert!(capabilities.coordinator);
     }
 }
+
+/// MLME-START validation for a parent-capable soft MAC (declared last).
+///
+/// Without the `pan-coordinator` feature this is exactly
+/// [`validate_router_start`]. With it, a PAN-coordinator start is accepted
+/// too: a Zigbee coordinator differs from a router at the MAC only in the
+/// PAN Coordinator beacon bit (supplied by the NWK beacon response) and its
+/// fixed short address `0x0000`, which must already be programmed.
+#[inline(always)]
+pub(crate) fn validate_parent_start(
+    req: &MlmeStartRequest,
+    short_address: zigbee_types::ShortAddress,
+) -> Result<(), MacError> {
+    #[cfg(feature = "pan-coordinator")]
+    if req.pan_coordinator {
+        if short_address.0 != 0x0000 {
+            return Err(MacError::InvalidParameter);
+        }
+        return validate_router_start(&MlmeStartRequest {
+            pan_coordinator: false,
+            ..*req
+        });
+    }
+    let _ = short_address;
+    validate_router_start(req)
+}
+
+#[cfg(all(test, feature = "pan-coordinator"))]
+mod pan_coordinator_tests {
+    use super::*;
+    use zigbee_types::{PanId, ShortAddress};
+
+    fn start(pan_coordinator: bool) -> MlmeStartRequest {
+        MlmeStartRequest {
+            pan_id: PanId(0x1A62),
+            channel: 15,
+            beacon_order: 15,
+            superframe_order: 15,
+            pan_coordinator,
+            battery_life_ext: false,
+        }
+    }
+
+    #[test]
+    fn coordinator_start_requires_short_address_zero() {
+        assert_eq!(validate_parent_start(&start(true), ShortAddress(0)), Ok(()));
+        assert_eq!(
+            validate_parent_start(&start(true), ShortAddress(1)),
+            Err(MacError::InvalidParameter)
+        );
+        assert_eq!(
+            validate_parent_start(&start(false), ShortAddress(1)),
+            Ok(())
+        );
+        let mut beacon = start(true);
+        beacon.beacon_order = 14;
+        assert_eq!(
+            validate_parent_start(&beacon, ShortAddress(0)),
+            Err(MacError::Unsupported)
+        );
+    }
+}

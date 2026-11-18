@@ -20,6 +20,22 @@
 //! - Parent/router role ([`EspRouterMac`], feature `esp-parent`): Frame
 //!   Pending in the hardware auto-ACK from a bounded source table
 
+/// Body of `EspRadioPhy::energy_detect`: the hardware ED scan with the
+/// `energy-detect` feature (local esp-radio patch), otherwise unsupported.
+/// A macro keeps the default build token-for-token unchanged.
+#[cfg(feature = "energy-detect")]
+macro_rules! energy_detect_body {
+    ($phy:expr, $duration_us:expr) => {
+        energy_detect($phy, $duration_us).await
+    };
+}
+#[cfg(not(feature = "energy-detect"))]
+macro_rules! energy_detect_body {
+    ($phy:expr, $duration_us:expr) => {
+        Err(PhyError::Unsupported)
+    };
+}
+
 mod radio_phy;
 
 use crate::esp_aes::{AesDriver, AesRegisters};

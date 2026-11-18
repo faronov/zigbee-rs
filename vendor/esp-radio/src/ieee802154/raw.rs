@@ -988,7 +988,7 @@ fn zb_mac_handler() {
     }
 
     if events & Event::AckRxDone != 0 {
-        trace!("EventAckRxDone");
+        trace!("EventAckRxDone"); // ED_DONE is handled after this block (`ieee802154-energy-detect`).
     }
 
     if events & Event::AckTxDone != 0 {
@@ -999,7 +999,7 @@ fn zb_mac_handler() {
     if events & Event::TxAbort != 0 {
         trace!("TxAbort");
         abort_tx();
-    }
+    } #[cfg(feature = "ieee802154-energy-detect")] energy_detect::on_interrupt(events);
 }
 
 fn freq_to_channel(freq: u8) -> u8 {
@@ -1012,4 +1012,73 @@ fn will_auto_send_ack(frame: &[u8]) -> bool {
 
 fn should_send_enhanced_ack(frame: &[u8]) -> bool {
     frame_is_ack_required(frame) && frame_get_version(frame) <= FRAME_VERSION_2 && tx_enhance_ack()
+}
+
+/// Energy detection (local patch `ieee802154-energy-detect`, declared last).
+///
+/// Ordering reference: ESP-IDF **v5.5.1** `esp_ieee802154_dev.c`
+/// (`ieee802154_energy_detect`: stop the current operation, update the PIB,
+/// `start_ed`; `isr_handle_ed_done` reads `ieee802154_ll_get_ed_rss`, then
+/// `next_operation`). The caller owns the driver exclusively while a
+/// measurement runs, so no transmission can start in the meantime.
+#[cfg(feature = "ieee802154-energy-detect")]
+pub(crate) mod energy_detect {
+    use core::sync::atomic::{AtomicI8, AtomicU8, Ordering};
+
+    use super::*;
+
+    const IDLE: u8 = 0;
+    const RUNNING: u8 = 1;
+    const DONE: u8 = 2;
+
+    static ED_STATE: AtomicU8 = AtomicU8::new(IDLE);
+    static ED_RSS: AtomicI8 = AtomicI8::new(i8::MIN);
+
+    /// Start one measurement of `duration_symbols` × 16 µs on the current
+    /// channel. Refused while a transmission, ACK or reception is active.
+    pub(crate) fn start(duration_symbols: u32) -> Result<(), crate::ieee802154::Error> {
+        STATE.with(|state| match state.state {
+            Ieee802154State::Sleep => Err(crate::ieee802154::Error::Sleeping),
+            Ieee802154State::Transmit | Ieee802154State::TxAck => {
+                Err(crate::ieee802154::Error::Busy)
+            }
+            _ if events() != 0 || receive_in_progress() => Err(crate::ieee802154::Error::Busy),
+            _ => {
+                stop_current_operation();
+                ieee802154_pib_update();
+                ED_STATE.store(RUNNING, Ordering::Release);
+                set_ed_duration(duration_symbols);
+                enable_events(Event::EdDone as u16);
+                set_cmd(Command::EdStart);
+                Ok(())
+            }
+        })
+    }
+
+    /// ZB_MAC interrupt part: latch the result and restart the receiver.
+    pub(crate) fn on_interrupt(events: u16) {
+        if events & Event::EdDone != 0 && ED_STATE.load(Ordering::Acquire) == RUNNING {
+            ED_RSS.store(ed_rss(), Ordering::Relaxed);
+            ED_STATE.store(DONE, Ordering::Release);
+            STATE.with(next_operation_inner);
+        }
+    }
+
+    /// The finished measurement in dBm, once.
+    pub(crate) fn take() -> Option<i8> {
+        ED_STATE
+            .compare_exchange(DONE, IDLE, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| ED_RSS.load(Ordering::Relaxed))
+    }
+
+    /// Abandon a measurement that did not complete and resume reception.
+    pub(crate) fn cancel() {
+        if ED_STATE.swap(IDLE, Ordering::AcqRel) == RUNNING {
+            STATE.with(|state| {
+                stop_current_operation();
+                next_operation_inner(state);
+            });
+        }
+    }
 }

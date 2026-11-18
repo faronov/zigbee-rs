@@ -946,9 +946,9 @@ impl RadioPhy for EspRadioPhy<'_> {
         Ok(())
     }
 
-    /// esp-radio 0.17 exposes no energy-detect measurement.
+    /// Hardware ED scan with the `energy-detect` feature, else unsupported.
     async fn energy_detect(&mut self, _duration_us: u32) -> Result<u8, PhyError> {
-        Err(PhyError::Unsupported)
+        energy_detect_body!(self, _duration_us)
     }
 
     /// Program the hardware address filter, or enter promiscuous mode
@@ -1136,4 +1136,27 @@ fn read_efuse_ieee() -> IeeeAddress {
     // Display order (OUI first), as Zigbee coordinators show it.
     log::info!("[ESP] EUI-64: {:016X}", u64::from_le_bytes(ieee));
     ieee
+}
+
+#[cfg(feature = "energy-detect")]
+async fn energy_detect(phy: &mut EspRadioPhy<'_>, duration_us: u32) -> Result<u8, PhyError> {
+    // 16 µs symbols; 8 symbols (128 µs) is the IEEE 802.15.4 ED minimum.
+    let symbols = (duration_us / 16).max(8);
+    phy.driver
+        .start_energy_detect(symbols)
+        .map_err(|_| PhyError::ChannelBusy)?;
+    // Bounded: the scan length plus a fixed margin for the ED_DONE interrupt.
+    let deadline =
+        Instant::now() + embassy_time::Duration::from_micros(u64::from(symbols) * 16 + 2_000);
+    loop {
+        if let Some(dbm) = phy.driver.take_energy_detect() {
+            let level = (i16::from(dbm) + 100).clamp(0, 105);
+            return Ok((level * 255 / 105) as u8);
+        }
+        if Instant::now() >= deadline {
+            phy.driver.cancel_energy_detect();
+            return Err(PhyError::Hardware);
+        }
+        Timer::after_micros(RX_POLL_INTERVAL_US).await;
+    }
 }

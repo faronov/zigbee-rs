@@ -1606,7 +1606,7 @@ macro_rules! soft_mac_driver_common {
         fn capabilities(&self) -> MacCapabilities {
             let phy = self.phy.capabilities();
             MacCapabilities {
-                coordinator: false,
+                coordinator: cfg!(feature = "pan-coordinator") && <Self as RoleOf>::Role::PARENT,
                 router: <Self as RoleOf>::Role::PARENT,
                 hardware_security: false,
                 max_payload: 102,
@@ -3500,7 +3500,14 @@ mod tests {
         let mut core = ParentCore::new_custom(TestPhy::new(), MacPib::new(IEEE, 1, 2)).unwrap();
         let mut coordinator = router_start(20);
         coordinator.pan_coordinator = true;
-        assert_eq!(core.start(coordinator), Err(MacError::Unsupported));
+        // A PAN-coordinator start needs the `pan-coordinator` feature and
+        // short address 0x0000; this core is a router (0x0001 below).
+        let expected = if cfg!(feature = "pan-coordinator") {
+            MacError::InvalidParameter
+        } else {
+            MacError::Unsupported
+        };
+        assert_eq!(core.start(coordinator), Err(expected));
         assert_eq!(core.phy().channel, 11);
 
         block_on(MacDriver::mlme_start(&mut core, router_start(20))).unwrap();
@@ -3513,6 +3520,23 @@ mod tests {
         );
         assert_eq!(core.phy().rx_on_when_idle, Some(true));
         assert!(MacDriver::capabilities(&core).router);
+    }
+
+    #[cfg(feature = "pan-coordinator")]
+    #[test]
+    fn pan_coordinator_start_with_short_address_zero() {
+        let mut core = ParentCore::new_custom(TestPhy::new(), MacPib::new(IEEE, 1, 2)).unwrap();
+        core.set_pib(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x0000)),
+        )
+        .unwrap();
+        let mut coordinator = router_start(25);
+        coordinator.pan_coordinator = true;
+        block_on(MacDriver::mlme_start(&mut core, coordinator)).unwrap();
+        assert_eq!(core.phy().channel, 25);
+        assert_eq!(core.pib().pan_id(), PAN);
+        assert!(MacDriver::capabilities(&core).coordinator);
     }
 
     #[test]

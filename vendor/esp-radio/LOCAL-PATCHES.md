@@ -297,3 +297,29 @@ enables it with `timed-tx`. Without it the crate compiles as before.
   `critical-section`), so a journal write during the 20 ms countdown still
   delays the reply. Timer0 units are taken from ESP-IDF's comment
   ("unit: 1us"); the `Sent` outcome logs the measured µs after RX_DONE.
+
+## Energy detection (`ieee802154-energy-detect`)
+
+Opt-in cargo feature; `zigbee-mac` enables it with `energy-detect` (used by
+the network co-processor for formation channel selection). Without it the
+crate compiles to the same code as before (the only in-place edits are on
+existing lines, so panic locations do not move).
+
+- **Why:** upstream esp-radio 0.17 has no ED scan; `MLME-SCAN(ED)` failed
+  with `Unsupported`, so NLME network formation could not pick a channel.
+- **Patch:** `Ieee802154::start_energy_detect(symbols)` refuses while a
+  transmission, ACK or reception is active, then (ESP-IDF **v5.5.1**
+  `ieee802154_energy_detect` / `start_ed`) stops the current operation,
+  updates the PIB, writes `ED_SCAN_DURATION` (16 µs symbols) and issues
+  `EdStart`. The ZB_MAC handler latches `ED_SCAN_CFG.ED_RSS` (dBm,
+  `EdSampleMode::Avg` from MAC init) on `EdDone` and restarts reception as
+  `isr_handle_ed_done` → `next_operation` does. `take_energy_detect` returns
+  the result once; `cancel_energy_detect` abandons a scan that did not
+  finish (the caller bounds the wait).
+- **Interlocks:** the owner holds the driver exclusively during the scan;
+  no thread transmission starts meanwhile. ED abort reasons (`EdAbort`,
+  `EdStop`, `EdCoexReject`) are not enabled as interrupts, so a coexistence
+  abort surfaces as the caller's timeout.
+- **Hardware:** ESP32-C6 DevKit (2026-11-18): a 16-channel scan at
+  `scan_duration` 3 completed and formation picked channel 16. ED values
+  were not compared against a reference instrument.
