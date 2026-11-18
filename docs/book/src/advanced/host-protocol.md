@@ -1804,8 +1804,9 @@ share it.
 - The binding limit is the child journal record: `8 + 2 + C × 14` bytes
   (`CHILD_ENTRY_LEN` = 14) must fit a slot minus its 16-byte CRC and
   commit trailer.
-  - Today's slots are 512 B, so C ≤ 34 (`MAX_PERSISTED_CHILDREN` = 32).
-  - With **1 024-byte slots**, C ≤ 71. 64 children need 906 B.
+  - Router images use 512 B slots, so C ≤ 34 (`MAX_PERSISTED_CHILDREN` = 32).
+  - With **1 024-byte slots**, C ≤ 71. 64 children need 906 B. The
+    `ncp-capacity` feature selects them (`MAX_PERSISTED_CHILDREN` = 64).
 - 64 is the first power of two that is ≥ 32 and fits. A restore whose child
   list exceeds 64 demotes the extras (note `CHILD_DEMOTED`), and they
   rejoin.
@@ -1819,7 +1820,7 @@ defines both layouts.
 | Journal | Geometry | Size | Calculation |
 |---|---|---:|---|
 | `SecurityStateJournal` (NWK and global APS reservations, keys, APS replay floors) | 2 × 16 KiB logical sectors | 32 KiB | Coordinator guide: 16 KiB sectors for the full 64-entry replay table |
-| `TrustCenterDeviceJournal` (256 cached entries) | 2 × 32 KiB | 64 KiB | Snapshot: 43 B header + 256 × 72 B (75 B today − 8 B per-key counter fields + 5 B rev/host-ack) + 32 removal intents × 16 B = 18 987 B ≈ 18.5 KiB. A logical sector holds one 20 KiB snapshot + 12 KiB of appends (≈ 128 × 96 B). The snapshot must be **streamed across slots** (new runtime work); today's single 4 KiB slot holds only 32 devices. |
+| `TrustCenterStreamJournal` (256 cached entries) | 2 × 32 KiB | 64 KiB | Implemented snapshot (record version 6): 43 B header + 256 × 75 B (per-key counter fields still encoded) + 1 + 8 × 16 B allowlist + 3 B rotation + 1 + 32 removal intents × 16 B + 5 B trailer = 19 893 B, **streamed** across 5 × 4 KiB chunk slots (4 060 B payload each) with a single commit marker after all chunks. The planned 72 B entries (rev/host-ack) and delta appends are not implemented: every store writes a full snapshot (a sector holds 8 one-chunk or one 5-chunk snapshot). |
 | `ChildTableJournal` (64 children) | 2 × 4 KiB, 1 024 B slots | 8 KiB | 906 B record + trailer |
 | GP journal (Proxy 8 + Sink 16) | 2 × 8 KiB, 1 024 B slots | 16 KiB | Sink snapshot 1 + 16 × (1 + 45) = 737 B fits a slot. The proxy+sink pair uses 2 slots. 8 KiB sectors give room for adaptive counter records (32 B). |
 | APS tables (bindings, groups, application keys) | 2 × 4 KiB | 8 KiB | as on routers |
@@ -1841,6 +1842,48 @@ enforce them):
   product's `zbnv` at 0x3F0000.
 - `SYS_GET_INFO.flash_size` lets hosts and the ROM recovery path pick the
   right images.
+
+**Implementation status (`ncp-capacity`).** One opt-in cargo feature per
+crate (`zigbee-nwk`, `zigbee-aps`, `zigbee-bdb`, `zigbee-mac`,
+`zigbee-runtime`, `router-app`) selects the NCP table sizes; only
+`apps/ncp-coordinator`, `products/esp32-zigbee-ncp` and
+`examples/esp32-ncp` enable it, and images without it are byte-identical.
+
+| Table | Router / TC build | `ncp-capacity` |
+|---|---:|---:|
+| APS link-key table (`MAX_KEY_TABLE_ENTRIES`) | 32 | 256 |
+| Trust Center devices (`MAX_TRUST_CENTER_DEVICES`) | 32 | 256 |
+| TC removal intents (`MAX_PENDING_UNKNOWN_REMOVALS`) | 32 | 32 |
+| Persisted APS application keys | 32 | 32 |
+| Address map | 32 | 512 |
+| Neighbor table | 32 | 96 |
+| NIB `max_children` default | 20 | 64 |
+| Persisted children / child-journal slot | 32 / 512 B | 64 / 1 024 B |
+| Source-route cache | 32 | 128 |
+| Indirect queue | 8 | 16 |
+| NWK replay-floor table | 64 | 128 |
+| ESP Frame Pending source table | 16 | 64 |
+| Security-journal replay domains | 112 | 400 (16 KiB sectors required) |
+
+The streamed Trust Center journal (`trust_center_stream`) writes every chunk
+prefix first and the commit marker of the last chunk last; a snapshot is
+current only when all chunks are contiguous, agree on generation/count/
+length, pass their chunk CRCs and the whole-snapshot CRC, are committed and
+decode. Torn stores, bit errors, missing chunks and generation wraparound
+fall back to (or keep) the previous complete snapshot (host fault-injection
+tests). A single-slot record of the previous NCP layout is read and
+migrated on the next store.
+
+Measured on the ESP32-H2 USJ image: `.bss` 128 120 → 191 560 B, `.data`
+6 140 B, so 60 300 B of the 258 000 B region remain for the stack. **This
+does not fit yet.** The Trust Center runtime clones its full persisted
+state (~23 KiB at 256 devices) for every mutation, and the composition
+builds the TC application on the stack before moving it into its static:
+`main`'s frame is 77 824 B and some Trust Center poll frames exceed 90 KiB
+(static frame analysis of the ELF). The image builds but would overflow its
+stack; it must not be flashed until the TC runtime mutates its state in
+place (or adopts the compact 48 B cache entry above) and the composition
+constructs the coordinator application in place.
 
 ## 9. Backup, restore and Open Coordinator Backup
 
