@@ -464,7 +464,8 @@ rather than noise.
 
 A REJECT of a DATA frame **consumes** that `seq` and that `ep_seq`. The
 receiver marks the seq as received (it appears in `ack`/`sack`), discards the
-payload, and advances that endpoint's expected `ep_seq` past it. The sender
+payload, and advances that endpoint's expected `ep_seq` and its credit
+edge past it (a rejected frame holds no buffer, so it costs no credit). The sender
 must report every message in the rejected frame to its upper layer with the
 local status `LINK_REJECTED` and must not retransmit the frame. The peer is
 told explicitly, the counter `tx_rejected` increases, and the link keeps
