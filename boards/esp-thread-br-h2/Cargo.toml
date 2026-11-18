@@ -1,0 +1,23 @@
+[package]
+name = "esp-thread-br-h2"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Espressif Thread Border Router / Zigbee Gateway board, ESP32-H2 side: host UART and PTA wiring"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Physical wiring only: no zigbee-runtime, no protocol, no NV placement.
+[dependencies]
+
+[target.'cfg(target_os = "none")'.dependencies]
+esp-hal = { version = "=1.0.0", features = ["unstable", "esp32h2"] }
+
+[features]
+default = []
+# Optional board modification: RTS/CTS on the reserved 0-ohm links R19/R20
+# (H2 GPIO4/GPIO5). Only together with a host image built for it.
+rtscts-reserved-lines = []
+
+[patch.crates-io]
+esp-hal = { path = "../../vendor/esp-hal" }

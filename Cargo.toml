@@ -63,6 +63,7 @@ exclude = [
     "products/esp32-zigbee-devkit",
     "products/esp32-zigbee-ncp",
     "esp-serial-stream",
+    "boards/esp-thread-br-h2",
     "examples/esp32h2-ncp",
     "products/nrf52840-sensor",
     "products/nrf52833-sensor",

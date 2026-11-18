@@ -1,0 +1,56 @@
+[package]
+name = "esp32-zigbee-ncp-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "ESP32-H2 ZRHP network co-processor product: identity, flash layouts, NV journals, transport selection"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# The product owns the NCP's identity, both partition tables (2 MB and
+# 4 MB, spec 8.9), the placement of every NV journal in `zbnv`, and which
+# host transport the image uses. The board crate only describes the chip
+# flash and the host UART wiring; the ZRHP stack lives in the shared crates.
+[dependencies]
+
+[target.'cfg(target_os = "none")'.dependencies]
+critical-section = "1.2"
+embedded-storage = "0.3"
+# Same configuration as the board crates: the ROM flash routines run with
+# interrupts masked (see boards/esp32-zigbee-devkit/Cargo.toml).
+esp-storage = { version = "0.7", default-features = false, features = [
+    "bytewise-read",
+    "critical-section",
+] }
+esp-thread-br-h2 = { path = "../../boards/esp-thread-br-h2", optional = true }
+# Single-future executor and SYSTIMER embassy time driver of the ESP32
+# devkit product (layout-independent platform glue; candidates for a shared
+# ESP platform crate).
+esp32-zigbee-devkit-product = { path = "../esp32-zigbee-devkit" }
+esp-serial-stream = { path = "../../esp-serial-stream" }
+esp-hal = { version = "=1.0.0", features = ["unstable"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["trust-center", "green-power"] }
+
+[features]
+default = []
+esp32h2 = [
+    "esp-storage/esp32h2",
+    "esp32-zigbee-devkit-product/esp32h2",
+    "esp-serial-stream/esp32h2",
+    "esp-hal/esp32h2",
+]
+# Host transport, exactly one per image (spec 11.4).
+transport-usj = []
+transport-uart = []
+# Build for the 2 MB partition table (default: 4 MB).
+flash-2mb = []
+# Board: Espressif Thread Border Router / Zigbee Gateway, H2 side (host
+# UART0 at 460 800 without flow control by default).
+thread-br-h2 = ["dep:esp-thread-br-h2"]
+# Optional board mod: RTS/CTS on the reserved lines R19/R20.
+rtscts-reserved-lines = ["thread-br-h2", "esp-thread-br-h2/rtscts-reserved-lines"]
+# Board: Waveshare ESP32-H2-Zero (USB-Serial-JTAG only; identity string).
+waveshare-h2-zero = []
+
+[patch.crates-io]
+esp-hal = { path = "../../vendor/esp-hal" }
