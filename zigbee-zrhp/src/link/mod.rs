@@ -17,11 +17,13 @@
 //! byte-identical retransmission) and `RXW` receive slots (reorder buffer,
 //! ≥ the advertised `rx_window`). Each slot holds one 640-byte payload.
 //!
-//! | Profile | `TXW` | `RXW` | RAM (approx.) |
+//! | Profile | `TXW` | `RXW` | `size_of::<Link>()` (x86-64) |
 //! |---|---:|---:|---:|
-//! | ESP32-H2 NCP | 16 | 16 | 21.6 KB |
-//! | ESP32-S3 embedded host | 8 (or 4) | 8 (or 4) | 11.1 KB (5.9 KB) |
-//! | Desktop host | 32 | 32 | 42 KB |
+//! | ESP32-H2 NCP | 16 | 16 | 22 528 B |
+//! | ESP32-S3 embedded host | 8 (or 4) | 8 (or 4) | 11 872 B (6 544 B) |
+//! | Desktop host | 32 | 32 | 43 840 B |
+//!
+//! (`tests/size.rs` keeps these within `slots × (640 + 48) + 656 + 1024`.)
 //!
 //! ```
 //! use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent};

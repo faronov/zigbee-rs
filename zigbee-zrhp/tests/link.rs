@@ -766,8 +766,21 @@ fn receiver_rejects_frames_beyond_credit() {
     assert_eq!(rej[0].header.ack, 2);
     assert_eq!(rig.link.rx_ack(), 2);
     assert_eq!(rig.delivered.len(), 1);
+    // The rejected frame costs no credit: after one consumer release the
+    // next ACK advertises BULK edge 3 (1 initial + 1 returned by the
+    // rejection + 1 released) and ep_seq 2 is accepted.
+    rig.link.release_credit(Endpoint::Bulk, 1);
+    rig.advance(2_000, &mut NoSource); // delayed ACK
+    let ack = rig
+        .sent
+        .iter()
+        .rfind(|s| s.header.ftype == FrameType::Ack)
+        .unwrap();
+    assert_eq!(ack.ack_body().2, [(4, 3)]);
+    rig.feed(&wire(&rig.data_header(2, 4, 2), &tagged_payload(2)));
+    assert_eq!(rig.delivered.len(), 2);
     // Unknown endpoint 9 is rejected too and also consumes its seq.
-    rig.feed(&wire(&rig.data_header(2, 9, 0), &tagged_payload(2)));
+    rig.feed(&wire(&rig.data_header(3, 9, 0), &tagged_payload(3)));
     rig.drain_tx(&mut NoSource);
     let last = rig
         .sent
@@ -775,7 +788,7 @@ fn receiver_rejects_frames_beyond_credit() {
         .rfind(|s| s.header.ftype == FrameType::Reject)
         .unwrap();
     assert_eq!(last.reject().reason, RejectReason::UnknownEndpoint as u8);
-    assert_eq!(rig.link.rx_ack(), 3);
+    assert_eq!(rig.link.rx_ack(), 4);
 }
 
 #[test]

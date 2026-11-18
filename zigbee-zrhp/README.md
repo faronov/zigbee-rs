@@ -36,7 +36,7 @@ use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent};
 use zigbee_zrhp::msg::Batch;
 use zigbee_zrhp::queue::EndpointQueues;
 
-// ESP32-H2 NCP: 16 TX + 16 RX slots (≈ 21.6 KB). `new` is const, so the
+// ESP32-H2 NCP: 16 TX + 16 RX slots (22.5 KB). `new` is const, so the
 // link can also live in a `static` (e.g. a StaticCell).
 let mut link = Link::<16, 16>::new(LinkConfig::ncp(), rng_nonzero_u32());
 let mut queues = EndpointQueues::<2048>::new();

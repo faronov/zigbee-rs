@@ -986,7 +986,12 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
             };
             self.expected_ep_seq[e] = exp.wrapping_add(1);
             if self.rx[i].state == RxState::Tombstone {
+                // A rejected frame consumed its ep_seq without holding a
+                // buffer: return that credit so the edge keeps tracking the
+                // free buffers.
                 self.rx[i].state = RxState::Free;
+                self.rx_credit_edge[e] = self.rx_credit_edge[e].wrapping_add(1);
+                self.credit_dirty |= 1 << e;
             } else {
                 self.rx[i].state = RxState::Ready(self.ready_counter);
                 self.ready_counter = self.ready_counter.wrapping_add(1);
