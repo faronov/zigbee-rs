@@ -93,7 +93,10 @@ impl TsensCalibration {
     }
 }
 
-#[cfg(target_os = "none")]
+// ESP32-C5: esp-hal 1.1 has no TSENS driver for the C5 and this module's
+// regi2c/eFuse access has not been ported to it, so C5 images get no die
+// temperature source (the C5 sensor reports the measurement as unavailable).
+#[cfg(all(target_os = "none", not(feature = "esp32c5")))]
 mod hw {
     use esp_hal::efuse::{Efuse, TEMP_CALIB};
     use esp_hal::peripherals::{I2C_ANA_MST, MODEM_LPCON, PMU};
@@ -203,7 +206,7 @@ mod hw {
     }
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", not(feature = "esp32c5")))]
 pub use hw::{Error, configure};
 
 #[cfg(test)]

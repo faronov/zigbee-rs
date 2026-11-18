@@ -1,4 +1,10 @@
-//! Actual running-image evidence for C6/H2; never interpret otadata as evidence.
+//! Actual running-image evidence for C6/H2/C5; never interpret otadata as evidence.
+//!
+//! ESP32-C5 (same sources, `esp32c5`): fixed 64 KiB pages (mmu_ll_get_page_size
+//! has no register), SOC_MMU_ENTRY_NUM=512, SOC_MMU_ACCESS_SPIRAM=BIT(9),
+//! SOC_MMU_VALID=BIT(10), SOC_MMU_SENSITIVE=BIT(11), value mask 0x1ff,
+//! SOC_MMU_MAX_PADDR_PAGE_NUM=512; the SPI0 MMU_ITEM_CONTENT/INDEX registers
+//! are at the same 0x6000_237c/0x6000_2380.
 //!
 //! Sources: ESP-IDF v5.5.1, for BOTH esp32c6 and esp32h2:
 //! - components/hal/<chip>/include/hal/mmu_ll.h:
@@ -36,7 +42,7 @@ pub enum RunningImageError {
     Changed,
 }
 
-#[cfg(any(target_os = "none", test))]
+#[cfg(any(test, all(target_os = "none", not(feature = "esp32c5"))))]
 fn page_shift(page_code: u8) -> Result<u32, RunningImageError> {
     match page_code {
         0..=3 => Ok(16 - page_code as u32),
@@ -44,7 +50,7 @@ fn page_shift(page_code: u8) -> Result<u32, RunningImageError> {
     }
 }
 
-#[cfg(any(target_os = "none", test))]
+#[cfg(any(test, all(target_os = "none", not(feature = "esp32c5"))))]
 fn entry_index(vaddr: u32, page_code: u8) -> Result<u32, RunningImageError> {
     let shift = page_shift(page_code)?;
     let linear = vaddr
@@ -54,7 +60,7 @@ fn entry_index(vaddr: u32, page_code: u8) -> Result<u32, RunningImageError> {
     Ok(linear >> shift)
 }
 
-#[cfg(any(target_os = "none", test))]
+#[cfg(any(test, all(target_os = "none", not(feature = "esp32c5"))))]
 fn mapped_slot(vaddr: u32, page_code: u8, raw_entry: u32) -> Result<u8, RunningImageError> {
     entry_index(vaddr, page_code)?;
     let shift = page_shift(page_code)?;
@@ -83,10 +89,51 @@ fn mapped_slot(vaddr: u32, page_code: u8, raw_entry: u32) -> Result<u8, RunningI
     Err(RunningImageError::OutsideOtaSlots)
 }
 
+/// ESP32-C5 entry: flash-mapped vaddr, 64 KiB page, 512 entries.
+#[cfg(any(test, all(target_os = "none", feature = "esp32c5")))]
+const C5_PAGE_SHIFT: u32 = 16;
+
+#[cfg(any(test, all(target_os = "none", feature = "esp32c5")))]
+fn c5_entry_index(vaddr: u32) -> Result<u32, RunningImageError> {
+    let linear = vaddr
+        .checked_sub(0x4200_0000)
+        .filter(|offset| *offset < (512 << C5_PAGE_SHIFT))
+        .ok_or(RunningImageError::NotFlashMapped)?;
+    Ok(linear >> C5_PAGE_SHIFT)
+}
+
+#[cfg(any(test, all(target_os = "none", feature = "esp32c5")))]
+fn c5_mapped_slot(vaddr: u32, raw_entry: u32) -> Result<u8, RunningImageError> {
+    c5_entry_index(vaddr)?;
+    // VALID = BIT(10); no bits above SENSITIVE = BIT(11).
+    if raw_entry & (1 << 10) == 0 || raw_entry & !0xfff != 0 {
+        return Err(RunningImageError::InvalidMapping);
+    }
+    if raw_entry & (1 << 11) != 0 {
+        return Err(RunningImageError::EncryptedFlash);
+    }
+    // ACCESS_SPIRAM = BIT(9): a PSRAM page is not application flash.
+    if raw_entry & (1 << 9) != 0 {
+        return Err(RunningImageError::InvalidMapping);
+    }
+    let physical_page = raw_entry & 0x1ff;
+    let physical = (physical_page << C5_PAGE_SHIFT) | (vaddr & ((1 << C5_PAGE_SHIFT) - 1));
+    if physical >= FLASH_SIZE {
+        return Err(RunningImageError::InvalidMapping);
+    }
+    for slot in 0..OTA_SLOT_COUNT {
+        let base = ota_slot_offset(slot);
+        if (base..base + OTA_SLOT_SIZE).contains(&physical) {
+            return Ok(slot);
+        }
+    }
+    Err(RunningImageError::OutsideOtaSlots)
+}
+
 /// Uses the normal `.text` placement of this function as the current-image
 /// anchor. RAM-only builds fail closed. Reading the table never changes a
 /// mapping; it temporarily changes and restores only the index selector.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", not(feature = "esp32c5")))]
 #[inline(never)]
 pub(super) fn detect() -> Result<u8, RunningImageError> {
     if esp_hal::efuse::Efuse::flash_encryption() {
@@ -113,9 +160,78 @@ pub(super) fn detect() -> Result<u8, RunningImageError> {
     })
 }
 
+/// ESP32-C5 variant of [`detect`]: no page-size register (fixed 64 KiB) and
+/// the C5 entry format; esp-hal 1.1 `efuse::flash_encryption()`.
+#[cfg(all(target_os = "none", feature = "esp32c5"))]
+#[inline(never)]
+pub(super) fn detect() -> Result<u8, RunningImageError> {
+    if esp_hal::efuse::flash_encryption() {
+        return Err(RunningImageError::EncryptedFlash);
+    }
+    let vaddr = detect as *const () as usize as u32;
+    critical_section::with(|_| {
+        // SAFETY: ESP-IDF v5.5.1 esp32c5 `spi_mem_reg.h`: SPI0 (0x6000_2000)
+        // MMU_ITEM_CONTENT +0x37c, MMU_ITEM_INDEX +0x380. Single core; the
+        // index selector is restored. No cache disable, remap or flash op.
+        unsafe {
+            let index = c5_entry_index(vaddr)?;
+            let selector = 0x6000_2380 as *mut u32;
+            let saved = selector.read_volatile();
+            selector.write_volatile(index);
+            let raw = (0x6000_237c as *const u32).read_volatile();
+            selector.write_volatile(saved);
+            c5_mapped_slot(vaddr, raw)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c5_translates_flash_pages_and_refuses_psram_encrypted_and_invalid() {
+        for slot in 0..OTA_SLOT_COUNT {
+            let offset = 0x3_0122;
+            let vaddr = 0x4200_0000 + offset;
+            let physical = ota_slot_offset(slot) + offset;
+            let raw = (1 << 10) | (physical >> C5_PAGE_SHIFT);
+            assert_eq!(c5_entry_index(vaddr), Ok(offset >> C5_PAGE_SHIFT));
+            assert_eq!(c5_mapped_slot(vaddr, raw), Ok(slot));
+            // The same page through PSRAM is not application flash.
+            assert_eq!(
+                c5_mapped_slot(vaddr, raw | (1 << 9)),
+                Err(RunningImageError::InvalidMapping)
+            );
+            assert_eq!(
+                c5_mapped_slot(vaddr, raw | (1 << 11)),
+                Err(RunningImageError::EncryptedFlash)
+            );
+            // The C6/H2 valid bit (9) alone is not valid on the C5.
+            assert_eq!(
+                c5_mapped_slot(vaddr, (1 << 9) | (physical >> C5_PAGE_SHIFT)),
+                Err(RunningImageError::InvalidMapping)
+            );
+        }
+        // 512 x 64 KiB virtual window: 0x4400_0000 is outside.
+        assert_eq!(
+            c5_entry_index(0x4400_0000),
+            Err(RunningImageError::NotFlashMapped)
+        );
+        assert_eq!(c5_entry_index(0x43FF_FFFF), Ok(511));
+        assert_eq!(
+            c5_mapped_slot(0x4080_0000, 0x401),
+            Err(RunningImageError::NotFlashMapped)
+        );
+        assert_eq!(
+            c5_mapped_slot(0x4200_0122, 0x1401),
+            Err(RunningImageError::InvalidMapping)
+        );
+        assert_eq!(
+            c5_mapped_slot(0x4200_0000, 0x400),
+            Err(RunningImageError::OutsideOtaSlots)
+        );
+    }
 
     #[test]
     fn translates_actual_code_page_with_documented_page_and_flash_bounds() {

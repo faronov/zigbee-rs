@@ -283,9 +283,10 @@ const DEFER_BACKOFF_SLOT_MASK: u32 = (1 << 3) - 1;
 /// Sleep between radio-queue polls in [`RadioPhy::receive`].
 const RX_POLL_INTERVAL_US: u64 = 200;
 
-#[cfg(feature = "esp32c6")]
+// ESP-IDF v5.5.1 `hal/<chip>/ieee802154_ll.h` IEEE802154_TXPOWER_VALUE_MIN/MAX.
+#[cfg(any(feature = "esp32c6", feature = "esp32c5"))]
 const TX_POWER_RANGE: (i8, i8) = (-15, 20);
-#[cfg(not(feature = "esp32c6"))]
+#[cfg(not(any(feature = "esp32c6", feature = "esp32c5")))]
 const TX_POWER_RANGE: (i8, i8) = (-24, 20);
 
 /// SrcID whose GPDF triggers the armed GP reply (`timed-tx`).
@@ -1119,15 +1120,23 @@ fn apply_radio_policy(cfg: &mut Config) {
     cfg.rx_queue_size = cfg.rx_queue_size.max(RADIO_RX_QUEUE_DEPTH);
 }
 
-/// Read the factory EUI-64 from the ESP32-C6/H2 eFuse, in over-the-air order.
+/// Read the factory EUI-64 from the ESP32-C6/H2/C5 eFuse, in over-the-air order.
 ///
 /// Same value as ESP-IDF `esp_read_mac(ESP_MAC_IEEE802154)`: base-MAC OUI,
 /// the `MAC_EXT` bytes, then the base-MAC NIC (see `crate::esp_identity`).
 fn read_efuse_ieee() -> IeeeAddress {
-    const EFUSE_RD_MAC_SYS_0: *const u32 = 0x600B_0844 as *const u32;
-    const EFUSE_RD_MAC_SYS_1: *const u32 = 0x600B_0848 as *const u32;
+    // EFUSE base + RD_MAC_SYS_0/1 (offsets 0x44/0x48 on every chip here).
+    // C6/H2: EFUSE at 0x600B_0800; C5: 0x600B_4800 (esp32c5 PAC, ESP-IDF
+    // `soc/esp32c5/register/soc/reg_base.h`). MAC_EXT is RD_MAC_SYS_1[31:16]
+    // on all three.
+    #[cfg(not(feature = "esp32c5"))]
+    const EFUSE_BASE: usize = 0x600B_0800;
+    #[cfg(feature = "esp32c5")]
+    const EFUSE_BASE: usize = 0x600B_4800;
+    const EFUSE_RD_MAC_SYS_0: *const u32 = (EFUSE_BASE + 0x44) as *const u32;
+    const EFUSE_RD_MAC_SYS_1: *const u32 = (EFUSE_BASE + 0x48) as *const u32;
 
-    // SAFETY: read-only eFuse shadow registers, identical on C6 and H2.
+    // SAFETY: read-only eFuse shadow registers of the selected chip.
     let lo = unsafe { core::ptr::read_volatile(EFUSE_RD_MAC_SYS_0) };
     // SAFETY: as above.
     let hi = unsafe { core::ptr::read_volatile(EFUSE_RD_MAC_SYS_1) };
@@ -1138,6 +1147,10 @@ fn read_efuse_ieee() -> IeeeAddress {
     ieee
 }
 
+/// Hardware ED scan on the current channel (local esp-radio patch
+/// `ieee802154-energy-detect`). The radio reports the average RSS in dBm,
+/// mapped linearly from -100..=+5 dBm onto 0..=255 like the BL702 backend.
+/// Reception pauses for the measurement and resumes afterwards.
 #[cfg(feature = "energy-detect")]
 async fn energy_detect(phy: &mut EspRadioPhy<'_>, duration_us: u32) -> Result<u8, PhyError> {
     // 16 µs symbols; 8 symbols (128 µs) is the IEEE 802.15.4 ED minimum.

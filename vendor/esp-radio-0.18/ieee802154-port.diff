@@ -1,0 +1,109 @@
+--- a/mod.rs
++++ b/mod.rs
+@@ -15,9 +15,14 @@
+ //! [IEEE 802.15.4]: https://en.wikipedia.org/wiki/IEEE_802.15.4
+ //! [esp-openthread]: https://github.com/esp-rs/esp-openthread
+ 
++// esp-radio 0.18 port: the crate denies `missing_docs`; upstream 0.18's
++// own `ieee802154/mod.rs` allows it the same way.
++#![allow(missing_docs)]
++
+ use byte::{BytesExt, TryRead};
+-use esp_hal::{clock::PhyClockGuard, peripherals::IEEE802154};
+-use esp_phy::{PhyController, PhyInitGuard};
++use esp_hal::peripherals::IEEE802154;
++// esp-radio 0.18 port: the PHY guards moved from `esp_hal::clock` to `esp_phy`.
++use esp_phy::{PhyClockGuard, PhyInitGuard};
+ use esp_sync::NonReentrantMutex;
+ use ieee802154::mac::{self, FooterMode, FrameSerDesContext};
+ 
+@@ -213,7 +218,7 @@
+     /// Restore the PHY and receiver after retained sleep, including rejected sleep.
+     pub fn resume(&mut self) {
+         if self.phy_init_guard.is_none() {
+-            self.phy_init_guard = Some(self.radio.enable_phy());
++            self.phy_init_guard = Some(esp_phy::enable_phy());
+             raw::resume();
+         }
+     }
+--- a/raw.rs
++++ b/raw.rs
+@@ -1,16 +1,18 @@
+ use alloc::collections::VecDeque as Queue;
+ 
+-use esp_hal::{
+-    clock::{ModemClockController, PhyClockGuard, init_radio_clocks},
+-    handler,
+-    interrupt::Priority,
+-    peripherals::IEEE802154,
+-};
+-use esp_phy::{PhyController, PhyInitGuard};
++use esp_hal::{handler, interrupt::Priority, peripherals::IEEE802154};
++// esp-radio 0.18 port: PHY guards come from `esp_phy`, the modem clock gate
++// and the radio clock initialisation from this crate's `radio_clocks`, the
++// coexistence bindings from `crate::sys` (as upstream 0.18 `raw.rs`).
++use esp_phy::{PhyClockGuard, PhyInitGuard};
+ use esp_sync::NonReentrantMutex;
+-use esp_wifi_sys::include::{
+-    ieee802154_coex_event_t, ieee802154_coex_event_t_IEEE802154_IDLE,
+-    ieee802154_coex_event_t_IEEE802154_LOW, ieee802154_coex_event_t_IEEE802154_MIDDLE,
++
++use crate::{
++    radio_clocks::{clocks_ll::enable_ieee802154, init_radio_clocks},
++    sys::include::{
++        ieee802154_coex_event_t, ieee802154_coex_event_t_IEEE802154_IDLE,
++        ieee802154_coex_event_t_IEEE802154_LOW, ieee802154_coex_event_t_IEEE802154_MIDDLE,
++    },
+ };
+ 
+ use super::{
+@@ -343,13 +345,13 @@
+     radio: &mut IEEE802154<'d>,
+ ) -> (PhyClockGuard<'d>, PhyInitGuard<'d>) {
+     init_radio_clocks();
+-    let phy_clock_guard = radio.enable_phy_clock();
+-    radio.enable_modem_clock(true);
++    let phy_clock_guard = esp_phy::enable_phy_clock();
++    enable_ieee802154(true);
+ 
+-    let phy_init_guard = radio.enable_phy();
++    let phy_init_guard = esp_phy::enable_phy();
+ 
+     esp_btbb_enable();
+-    ieee802154_mac_init();
++    ieee802154_mac_init(radio);
+     STATE.with(|state| {
+         state.state = Ieee802154State::Idle;
+         state.rx_queue.clear();
+@@ -363,8 +365,9 @@
+     unsafe { bt_bb_v2_init_cmplx(PHY_ENABLE_VERSION_PRINT) };
+ }
+ 
+-fn ieee802154_mac_init() {
+-    #[cfg(feature = "esp32c6")]
++fn ieee802154_mac_init(radio: &IEEE802154<'_>) {
++    // esp-radio 0.18 port: C5 shares the C6 coexistence PTI table fix-up.
++    #[cfg(any(esp32c6, esp32c5))]
+     unsafe {
+         unsafe extern "C" {
+             static mut coex_pti_tab_ptr: u32;
+@@ -410,17 +413,8 @@
+     // memset(s_rx_frame, 0, sizeof(s_rx_frame));
+     // s_ieee802154_state = IEEE802154_STATE_IDLE;
+ 
+-    unsafe {
+-        esp_hal::interrupt::bind_interrupt(
+-            esp_hal::peripherals::Interrupt::ZB_MAC,
+-            zb_mac_handler.handler(),
+-        );
+-    }
+-    esp_hal::interrupt::enable(
+-        esp_hal::peripherals::Interrupt::ZB_MAC,
+-        zb_mac_handler.priority(),
+-    )
+-    .unwrap();
++    // esp-radio 0.18 port: the peripheral binds and enables ZB_MAC.
++    radio.bind_mac_interrupt(zb_mac_handler);
+ }
+ 
+ fn ieee802154_set_txrx_pti(txrx_scene: Ieee802154TxRxScene) {

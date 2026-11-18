@@ -41,15 +41,16 @@ pub mod soft_mac;
     test,
     feature = "esp32c6",
     feature = "esp32h2",
+    feature = "esp32c5",
     feature = "nrf52840",
     feature = "nrf52833"
 ))]
 mod aes_kat;
 
-#[cfg(any(test, feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(any(test, feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 mod esp_aes;
 
-#[cfg(any(test, feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(any(test, feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 mod esp_identity;
 
 #[cfg(any(test, feature = "nrf52840", feature = "nrf52833"))]
@@ -58,7 +59,7 @@ mod nrf_aes;
 #[cfg(any(test, feature = "nrf-isr-phy"))]
 pub mod nrf_ack;
 
-#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 pub mod esp;
 
 #[cfg(any(feature = "nrf52840", feature = "nrf52833"))]

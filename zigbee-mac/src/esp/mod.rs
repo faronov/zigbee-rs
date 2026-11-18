@@ -1,6 +1,6 @@
-//! ESP32 MAC backend (ESP32-C6 / ESP32-H2).
+//! ESP32 MAC backend (ESP32-C6 / ESP32-H2 / ESP32-C5).
 //!
-//! The ESP32-C6/H2 IEEE 802.15.4 radio (`esp-radio::ieee802154`) is exposed
+//! The ESP32-C6/H2/C5 IEEE 802.15.4 radio (`esp-radio::ieee802154`) is exposed
 //! through the portable [`crate::RadioPhy`] contract ([`EspRadioPhy`]) and
 //! driven by the shared [`crate::SoftMacCore`] end-device MAC
 //! ([`EspSoftMac`]): scan, association, polling, CSMA-CA backoff and frame
@@ -9,6 +9,9 @@
 //! # Supported chips
 //! - ESP32-C6 (RISC-V, 2.4 GHz WiFi + BLE + 802.15.4)
 //! - ESP32-H2 (RISC-V, BLE + 802.15.4)
+//! - ESP32-C5 (RISC-V, dual-band WiFi 6 + BLE + 802.15.4; esp-hal 1.1 /
+//!   esp-radio 0.18 train, same patched 802.15.4 driver as C6/H2, see
+//!   `vendor/esp-radio-0.18/LOCAL-PATCHES.md`)
 //!
 //! # Features
 //! - Hardware auto-ACK and address filtering, software ACK-wait window
@@ -62,12 +65,12 @@ const AES_WAIT_LIMIT: u32 = 100_000;
 struct EspAesRegisters;
 
 fn release_aes_coupled_reset() {
-    // ESP-IDF's C6/H2 `aes_ll_reset_register()` clears the Digital Signature
+    // ESP-IDF's C6/H2/C5 `aes_ll_reset_register()` clears the Digital Signature
     // reset after resetting AES: the two blocks share reset logic, and AES can
     // otherwise remain held in reset even though its own clock guard is live.
     //
     // Use the HAL's chip-specific PAC accessor rather than a fixed PCR offset:
-    // DS_CONF is at 0xe0 on C6 and 0xdc on H2.
+    // DS_CONF is at 0xe0 on C6 and 0xdc on H2 (C5: PCR, from its PAC).
     esp_hal::peripherals::SYSTEM::regs()
         .ds_conf()
         .modify(|_, w| w.ds_rst_en().clear_bit());
@@ -82,7 +85,8 @@ impl EspAesRegisters {
 
     #[inline(always)]
     fn write(offset: usize, value: u32) {
-        // SAFETY: all offsets are fixed AES registers shared by C6 and H2.
+        // SAFETY: all offsets are fixed AES registers shared by C6, H2 and
+        // C5 (AES at 0x6008_8000 on all three).
         unsafe { core::ptr::write_volatile((AES_BASE + offset) as *mut u32, value) }
     }
 

@@ -1,9 +1,11 @@
 //! The board's addressable status LED.
 //!
-//! All three supported boards fit one WS2812-class RGB LED with its data
-//! input on GPIO8 (ESP32-C6-DevKitC-1, ESP32-H2-DevKitM-1, Waveshare
-//! ESP32-H2-Zero: WS2812B-0807 with a 10 kΩ resistor on GPIO8 and VDD on
-//! 3V3). It is not a plain GPIO LED: driving GPIO8 high/low cannot light
+//! Every supported board fits one WS2812-class RGB LED. Its data input is
+//! on GPIO8 on the ESP32-C6-DevKitC-1, ESP32-H2-DevKitM-1 and Waveshare
+//! ESP32-H2-Zero (WS2812B-0807 with a 10 kΩ resistor on GPIO8 and VDD on
+//! 3V3), and on GPIO27 on the ESP32-C5-DevKitC-1 (Espressif user guide
+//! v1.2: "Addressable RGB LED, driven by GPIO27"; GPIO27 is also a C5
+//! strapping pin). It is not a plain GPIO LED: driving the pin high/low cannot light
 //! it. The LED is driven by one RMT TX channel ([`StatusLed`], feature
 //! `status-led`, target only). The colour and bit encoding come from the
 //! platform-neutral `zigbee-ws2812` crate (zigbee-rs-drivers); this module
@@ -18,8 +20,12 @@
 //! quiescent current even when dark. Sleepy images must not construct
 //! [`StatusLed`]; they leave GPIO8 to the product's pad isolation.
 
-/// GPIO carrying the WS2812 data input on every supported board.
+/// GPIO carrying the WS2812 data input on the selected board.
+#[cfg(not(feature = "esp32c5"))]
 pub const STATUS_LED_GPIO: u8 = 8;
+/// GPIO carrying the WS2812 data input on the ESP32-C5-DevKitC-1.
+#[cfg(feature = "esp32c5")]
+pub const STATUS_LED_GPIO: u8 = 27;
 
 /// RMT tick rate used for the LED: ESP32-H2 XTAL 32 MHz / 2 and
 /// ESP32-C6 PLL 80 MHz / 5 (the RMT source clocks `esp-hal` selects), with
@@ -38,7 +44,9 @@ pub const COLOR_ORDER: ColorOrder = color_order(crate::BOARD);
 #[cfg(feature = "status-led")]
 pub const fn color_order(board: crate::Board) -> ColorOrder {
     match board {
-        crate::Board::EspressifC6DevKitC1 | crate::Board::EspressifH2DevKitM1 => ColorOrder::Grb,
+        crate::Board::EspressifC6DevKitC1
+        | crate::Board::EspressifH2DevKitM1
+        | crate::Board::EspressifC5DevKitC1 => ColorOrder::Grb,
         // Same as the S3/C3/C6-Zero (arduino-esp32 variants:
         // `LED_COLOR_ORDER_RGB`); confirmed on an H2-Zero.
         crate::Board::WaveshareH2Zero => ColorOrder::Rgb,
@@ -70,13 +78,13 @@ const _: () = {
 };
 
 #[cfg(all(target_os = "none", feature = "status-led"))]
-pub use driver::{StatusLed, StatusLedError};
+pub use driver::{StatusLed, StatusLedError, StatusLedPin};
 
 #[cfg(all(target_os = "none", feature = "status-led"))]
 mod driver {
     use esp_hal::Blocking;
     use esp_hal::gpio::Level;
-    use esp_hal::peripherals::{GPIO8, RMT};
+    use esp_hal::peripherals::RMT;
     use esp_hal::rmt::{Channel, Error, PulseCode, Rmt, Tx, TxChannelConfig, TxChannelCreator};
     use esp_hal::time::Rate;
 
@@ -84,9 +92,19 @@ mod driver {
 
     use super::{COLOR_ORDER, WS2812_TIMING};
 
+    /// The pin carrying the LED data input ([`super::STATUS_LED_GPIO`]).
+    #[cfg(not(feature = "esp32c5"))]
+    pub type StatusLedPin = esp_hal::peripherals::GPIO8<'static>;
+    /// The pin carrying the LED data input ([`super::STATUS_LED_GPIO`]).
+    #[cfg(feature = "esp32c5")]
+    pub type StatusLedPin = esp_hal::peripherals::GPIO27<'static>;
+
     #[derive(Debug, Clone, Copy, PartialEq)]
     pub enum StatusLedError {
         Rmt(Error),
+        /// esp-hal 1.1 (ESP32-C5) reports RMT set-up errors separately.
+        #[cfg(feature = "esp32c5")]
+        Config(esp_hal::rmt::ConfigError),
         /// An earlier start error consumed the RMT channel.
         ChannelLost,
     }
@@ -109,7 +127,8 @@ mod driver {
         /// Configure RMT channel 0 on GPIO8 with the line idling low. The
         /// LED keeps its power-on state (dark) until the first
         /// [`Self::write`].
-        pub fn new(rmt: RMT<'static>, pin: GPIO8<'static>) -> Result<Self, StatusLedError> {
+        #[cfg(not(feature = "esp32c5"))]
+        pub fn new(rmt: RMT<'static>, pin: StatusLedPin) -> Result<Self, StatusLedError> {
             let rmt = Rmt::new(rmt, Rate::from_hz(super::RMT_TICK_HZ))?;
             let channel = rmt.channel0.configure_tx(
                 pin,
@@ -123,8 +142,74 @@ mod driver {
             })
         }
 
+        /// esp-hal 1.1 (ESP32-C5): the channel is configured first and the
+        /// pin attached afterwards; the configuration is the same.
+        #[cfg(feature = "esp32c5")]
+        pub fn new(rmt: RMT<'static>, pin: StatusLedPin) -> Result<Self, StatusLedError> {
+            let rmt =
+                Rmt::new(rmt, Rate::from_hz(super::RMT_TICK_HZ)).map_err(StatusLedError::Config)?;
+            let channel = rmt
+                .channel0
+                .configure_tx(
+                    &TxChannelConfig::default()
+                        .with_clk_divider(1)
+                        .with_idle_output(true)
+                        .with_idle_output_level(Level::Low),
+                )
+                .map_err(StatusLedError::Config)?
+                .with_pin(pin);
+            Ok(Self {
+                channel: Some(channel),
+            })
+        }
+
+        /// The RMT symbols of one colour: 24 data bits, then the latch low
+        /// time; the zero second half of the latch symbol ends the
+        /// transmission (the same layout as `zigbee_ws2812::encode_frame`).
+        #[cfg(feature = "esp32c5")]
+        #[inline(always)]
+        fn frame(r: u8, g: u8, b: u8) -> [PulseCode; FRAME_SYMBOLS] {
+            let mut frame = [PulseCode::end_marker(); FRAME_SYMBOLS];
+            for (code, bit) in frame
+                .iter_mut()
+                .zip(encode(COLOR_ORDER, r, g, b, &WS2812_TIMING))
+            {
+                *code = PulseCode::new(Level::High, bit.high, Level::Low, bit.low);
+            }
+            frame[FRAME_SYMBOLS - 1] =
+                PulseCode::new(Level::Low, WS2812_TIMING.reset, Level::Low, 0);
+            frame
+        }
+
+        /// Send one colour and wait for the frame and its latch time
+        /// (about 330 µs, busy wait with interrupts enabled). esp-hal 1.1
+        /// (ESP32-C5) returns the channel with a start error, so it is kept.
+        #[cfg(feature = "esp32c5")]
+        pub fn write(&mut self, r: u8, g: u8, b: u8) -> Result<(), StatusLedError> {
+            let channel = self.channel.take().ok_or(StatusLedError::ChannelLost)?;
+            let frame = Self::frame(r, g, b);
+            let transaction = match channel.transmit(&frame) {
+                Ok(transaction) => transaction,
+                Err((error, channel)) => {
+                    self.channel = Some(channel);
+                    return Err(error.into());
+                }
+            };
+            match transaction.wait() {
+                Ok(channel) => {
+                    self.channel = Some(channel);
+                    Ok(())
+                }
+                Err((error, channel)) => {
+                    self.channel = Some(channel);
+                    Err(error.into())
+                }
+            }
+        }
+
         /// Send one colour and wait for the frame and its latch time
         /// (about 330 µs, busy wait with interrupts enabled).
+        #[cfg(not(feature = "esp32c5"))]
         pub fn write(&mut self, r: u8, g: u8, b: u8) -> Result<(), StatusLedError> {
             let channel = self.channel.take().ok_or(StatusLedError::ChannelLost)?;
             // 24 data bits, then the latch low time; the zero second half

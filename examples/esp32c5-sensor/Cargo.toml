@@ -1,0 +1,112 @@
+[package]
+name = "esp32c5-sensor"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+# ESP32-C5-DevKitC-1. One bin per Zigbee role, as examples/esp32c6-sensor:
+#   cargo build --release                                       # sed (default)
+#   cargo build --release --no-default-features --features ed
+#   cargo build --release --no-default-features --features router       # with Green Power
+#   cargo build --release --no-default-features --features router-core  # without it
+#
+# The ESP32-C5 needs the esp-hal 1.1 / esp-radio 0.18 release train (the
+# first with C5 support); this lockfile pins it. The C6/H2 examples keep
+# esp-hal 1.0.0 / esp-radio 0.17.0. Both trains run the same locally
+# patched IEEE 802.15.4 driver (vendor/esp-radio-0.18/LOCAL-PATCHES.md).
+[[bin]]
+name = "esp32c5-sensor"
+path = "src/main.rs"
+required-features = ["sed"]
+
+[[bin]]
+name = "esp32c5-ed"
+path = "src/ed.rs"
+required-features = ["ed"]
+
+[[bin]]
+name = "esp32c5-router"
+path = "src/router.rs"
+required-features = ["router-core"]
+
+[dependencies]
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac", features = ["esp32c5"] }
+zigbee-zcl = { path = "../../zigbee-zcl" }
+zigbee-runtime = { path = "../../zigbee-runtime", features = ["ota"] }
+sensor-sed-app = { path = "../../apps/sensor-sed", features = ["ota"], optional = true }
+router-app = { path = "../../apps/router", default-features = false, optional = true }
+zigbee-nwk = { path = "../../zigbee-nwk", optional = true }
+esp32-zigbee-devkit-product = { path = "../../products/esp32-zigbee-devkit", features = ["esp32c5"] }
+
+# ESP32-C5 HAL and runtime (esp-hal 1.1 release train).
+esp-bootloader-esp-idf = { version = "0.5.0", default-features = false, features = ["esp32c5"] }
+esp-hal = { version = "=1.1.2", features = ["esp32c5", "unstable"] }
+esp-radio = { version = "=0.18.0", features = ["esp32c5", "ieee802154", "unstable"] }
+esp-backtrace = { version = "0.19", features = ["esp32c5", "panic-handler", "println"] }
+esp-println = { version = "0.17", features = ["esp32c5"] }
+esp-alloc = { version = "0.10", features = ["esp32c5"] }
+# Not used directly: selects the C5 chip of the crates that zigbee-mac and
+# the board/product take as version ranges (their own manifests cannot name
+# `esp32c5`, which the C6/H2 releases lack).
+esp-sync = { version = "0.2", features = ["esp32c5"] }
+esp-storage = { version = "0.9", default-features = false, features = ["esp32c5", "bytewise-read", "critical-section"] }
+static_cell = "2"
+log = "0.4"
+
+# The product supplies the interrupt-driven clock and CPU-idle executor.
+embassy-time = { version = "0.4" }
+
+# Portable atomics for single-core RISC-V
+portable-atomic = { version = "1", features = ["unsafe-assume-single-core"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[features]
+default = ["sed"]
+# Sleepy environmental sensor. No retained light sleep on the C5 (the
+# product rejects `light-sleep` for this chip): the CPU idles in WFI.
+sed = ["dep:sensor-sed-app", "esp32-zigbee-devkit-product/sed"]
+# Always-on End Device: router-app AlwaysOnEndDeviceApp, end-device MAC.
+ed = ["dep:router-app", "dep:zigbee-nwk", "esp32-zigbee-devkit-product/roles"]
+# Router: `router-core` plus the Green Power proxy.
+router = ["router-core", "green-power"]
+# Router without Green Power: parent MAC (hardware auto-ACK with Frame
+# Pending from the PHY's source table), ParentRouterApp, durable child and
+# APS tables.
+router-core = [
+    "dep:router-app",
+    "router-app/router",
+    "zigbee-runtime/router",
+    "zigbee-mac/esp-parent",
+    "esp32-zigbee-devkit-product/roles",
+    "status-led",
+]
+# WS2812 status LED on GPIO27 (RMT) for the mains roles: always on in the
+# router, opt-in for the ED (`--features ed,status-led`).
+status-led = ["esp32-zigbee-devkit-product/status-led"]
+# Lab only, never in shipped images: red, green, blue for 3 s each when the
+# LED starts, to check the colour byte order of the board.
+status-led-selftest = ["status-led", "esp32-zigbee-devkit-product/status-led-selftest"]
+# Green Power Proxy Basic on the router (part of `router`).
+green-power = [
+    "router-core",
+    "router-app/green-power",
+    "esp32-zigbee-devkit-product/green-power",
+]
+# Opt-in bidirectional GP proxy (TempMaster): timed TX from the radio
+# interrupts into a GPD's rxAfterTx window, as on the C6/H2.
+green-power-bidirectional = [
+    "green-power",
+    "esp32-zigbee-devkit-product/green-power-bidirectional",
+]
+# Accept only signed MCUboot envelopes over OTA.
+signed-ota = ["esp32-zigbee-devkit-product/signed-ota"]
+
+[patch.crates-io]
+# esp-radio 0.18.0 with the same local IEEE 802.15.4 driver as the C6/H2
+# images (vendor/esp-radio-0.18/LOCAL-PATCHES.md). esp-hal 1.1.2 is used
+# unmodified from crates.io.
+esp-radio = { path = "../../vendor/esp-radio-0.18" }

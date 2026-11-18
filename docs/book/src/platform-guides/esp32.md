@@ -1,4 +1,8 @@
-# ESP32-C6 / ESP32-H2
+# ESP32-C6 / ESP32-H2 / ESP32-C5
+
+The ESP32-C5 joins later and differs in its HAL release train, board pins and
+missing sleep/temperature paths; see [ESP32-C5](#esp32-c5). Everything else
+on this page applies to all three chips unless it names one.
 
 The ESP products share a board flash resource, product profile/storage/OTA
 implementation, and the platform-independent sleepy-sensor lifecycle.
@@ -644,6 +648,100 @@ Each CI firmware build explicitly enables them with `--include-ignored`,
 using its freshly generated application and the shared Python/Rust validation
 corpus alongside size reporting and physical image/layout checks. These
 exercise flash mocks, not the physical device.
+
+## ESP32-C5
+
+Target: ESP32-C5-DevKitC-1 (v1.2 pinout), ESP32-C5 revision v1.0 (ECO2),
+`riscv32imac-unknown-none-elf`. Example crate: `examples/esp32c5-sensor`
+with the same bins and role features as the C6 (`esp32c5-sensor` /
+`esp32c5-ed` / `esp32c5-router`, models `ESP32-C5-{Sensor,ED,Router}`,
+OTA image type `0x0003`, image chip ID `0x0017`).
+
+### Release train
+
+The first esp-rs releases with ESP32-C5 IEEE 802.15.4 support are
+esp-radio 0.18.0 (PR #5070) with esp-hal 1.1, esp-phy 0.2 and
+`esp-wifi-sys-esp32c5` 0.2.0 (PHY/BTBB/coex libraries). The C6/H2 images
+stay on esp-hal 1.0.0 / esp-radio 0.17.0; each example's lockfile selects
+one train:
+
+| | C6 / H2 | C5 |
+|---|---|---|
+| esp-hal | 1.0.0 (`vendor/esp-hal`, retained-sleep patches) | 1.1.2 (crates.io, unmodified) |
+| esp-radio | 0.17.0 (`vendor/esp-radio`) | 0.18.0 (`vendor/esp-radio-0.18`) |
+| esp-storage / esp-alloc / esp-sync | 0.7 / 0.9 / 0.1 | 0.9 / 0.10 / 0.2 |
+| esp-bootloader-esp-idf / esp-println / esp-backtrace | 0.4 / 0.12 / 0.14 | 0.5 / 0.17 / 0.19 |
+
+`zigbee-mac`, the board and the product accept both trains through version
+ranges; the C5 example enables the `esp32c5` chip features of the shared
+esp-* crates itself, because the 1.0 train has no such feature. The C6/H2
+images do not change (see [image sizes](#esp32-c5-and-the-c6h2-images)).
+
+The C5's 802.15.4 driver is **not** upstream 0.18's rewrite: it is the
+C6/H2 driver with every local patch (TX preemption, interrupt-started
+triggered TX, Frame Pending hook, TxAck-abort fix, FCF offsets, retained
+suspend, …) ported to 0.18's internals; `tools/check-esp-radio-c5-sync.sh`
+(CI) keeps the two in step. See `vendor/esp-radio-0.18/LOCAL-PATCHES.md`.
+
+### Board
+
+| resource | C5 DevKitC-1 | source |
+|---|---|---|
+| WS2812 status LED | GPIO27 (RMT channel 0, GRB) | Espressif user guide v1.2: "Addressable RGB LED, driven by GPIO27" |
+| BOOT button | GPIO28 (active low, pull-up) | DevKitC-1 schematic v1.1: the BOOT key and the auto-program circuit drive IO28, the boot-mode strap |
+| flash | on-module (8 MiB on the N8R8); the product uses the same 4 MiB layout | |
+| second-stage bootloader | flash `0x2000` (ROM requirement) | ESP-IDF `CONFIG_BOOTLOADER_OFFSET_IN_FLASH` |
+
+GPIO27 and GPIO28 are strapping pins; the images only drive GPIO27 after
+boot (router, ED with `status-led`). The LED colour order is the WS2812B
+GRB of the other Espressif devkits and has **not** been checked on the
+board yet (`status-led-selftest` does that).
+
+### What the C5 does not have yet
+
+- **Retained light sleep:** the C6/H2 PMU sequences are chip ports; none
+  exists for the C5. `light-sleep` is rejected at compile time, the sleepy
+  image idles in WFI between polls. It is a functional SED, not a
+  low-power one.
+- **Die temperature:** esp-hal 1.1 has no C5 TSENS driver and the product's
+  calibrated path is not ported, so `esp32c5-sensor` reports every
+  temperature sample as failed (`NoTemperatureSource`) instead of an
+  invented value.
+- The OTA writer, running-image MMU check (C5: fixed 64 KiB pages, 512
+  entries, VALID bit 10) and image validator (C5 RAM bounds) are host-tested
+  only; no C5 OTA has run.
+
+### ESP32-C5 and the C6/H2 images
+
+The C6/H2 lockfiles are unchanged. Eight C6/H2 images (C6 sensor/ED/router,
+H2 sensor/ED/router/combo-light/thermometer) were built with `--locked` from
+`e07de1c` and from the C5 commit in the same directory (the crate hashes,
+and with them the RISC-V link order and relaxation, depend on the path):
+every application image has the same size, `.text`, `.data`, `.rwtext` and
+`.trap` are byte-identical, and `.rodata` differs only in 11–16 panic-location
+line numbers of edited source files. The thermometer image is byte-identical.
+
+### ESP32-C5 hardware results
+
+hwlab, ESP32-C5-DevKitC-1, C5 v1.0 (ROM `esp32c5-eco2-20250121`, XMC 8 MiB),
+flashed over the built-in USB-JTAG (`espusbjtag`) after a full verified
+flash backup; the original application can be restored from it.
+
+| check | result | hwlab session |
+|---|---|---|
+| boot | the espflash 4.5.0 C5 bootloader at `0x2000` loaded the router from `ota_0` (`chip revision: v1.0`, `ota_seq=1`); the image printed its EUI-64 `30:ED:A0:FF:FE:E4:6A:48` (eFuse `MAC_EXT` `ff:fe`) and opened a factory-new journal | `2026-11-18T181417Z-esp32c5-router-boot` |
+| 802.15.4 TX/RX | network steering sent Beacon Requests and received the beacons of 14 routers of the lab ZHA network (PAN `0xDFE9`, channel 15, LQI 31–175) and 3 on channel 20; every candidate was rejected only because permit-join was closed | same |
+
+| join and interview | joined the ZHA network (PAN `0xDFE9`) as Router `0xF020` under parent `0x43FD` while permit join was open; ZHA shows `Zigbee-RS ESP32-C5-Router`, Router, Mains, endpoint 1 Range Extender (Basic, Identify), node descriptor complete. Secured NWK frames decrypt, so Transport-Key was received. No console capture was running during the join itself (the image joined on its own retry), so the association and key exchange are inferred from the outcome | ZHA device registry, read-only |
+| router operation before the reset | `neighbours 19 children 0 routes 3`, `tx 848 tx-err 9 deferred 92 ack-tx 23 no-ack 10`; relayed NWK broadcasts and sent one GP Commissioning Notification as proxy | `2026-11-18T190024Z-esp32c5-router-join` (tail before the reset) |
+| reset/resume | after a debug-module system reset: `persistence migration: JournalPresent`, `Resume: addr=0xF020 PAN=0xDFE9 ch=15 parent=0x43FD`, `Router operation restored`, online without rejoin; ZHA `last_seen` advanced (21:02:03) with the same NWK address; 22 neighbours within 3 min | `2026-11-18T190024Z-esp32c5-router-join`, `2026-11-18T190533Z-esp32c5-router-after-resume2` |
+
+Not yet shown on the C5: a captured association/Transport-Key exchange,
+children and Frame Pending (`data-req 0`), unicast relaying for another
+node, GP TempMaster timing, the status LED colours, OTA and any power
+measurement. Observation: repeated copies of one GPDF-tunnel broadcast
+from `0x9879` are logged as `[NWK] Frame counter replay` and dropped
+(not yet compared with the C6/H2 routers).
 
 ## Hardware validation
 

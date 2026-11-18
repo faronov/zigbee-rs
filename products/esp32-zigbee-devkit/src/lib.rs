@@ -1,4 +1,4 @@
-//! Product configuration for the ESP32-C6/H2 Zigbee sensor firmware.
+//! Product configuration for the ESP32-C6/H2/C5 Zigbee sensor firmware.
 //!
 //! Builds on the physical chip flash exposed by `esp32-zigbee-devkit` (the
 //! board crate) and owns everything that crate deliberately does not:
@@ -32,8 +32,9 @@
 //! * [`firmware`] — firmware version helpers shared by the OTA and Basic
 //!   clusters.
 //!
-//! ESP32-C6 and ESP32-H2 use distinct OTA image types so a coordinator cannot
-//! offer an application image for the wrong chip.
+//! ESP32-C6, ESP32-H2 and ESP32-C5 use distinct OTA image types so a
+//! coordinator cannot offer an application image for the wrong chip. The C5
+//! has no retained light sleep here (`light-sleep` is rejected).
 //!
 //! Besides the sleepy sensor, the product owns two mains roles that share the
 //! same partition table and security journal (separated by [`role`] tags):
@@ -46,10 +47,18 @@
 
 #![cfg_attr(not(test), no_std)]
 
-#[cfg(all(feature = "esp32c6", feature = "esp32h2"))]
-compile_error!("select exactly one of the esp32c6 or esp32h2 features");
-#[cfg(not(any(feature = "esp32c6", feature = "esp32h2")))]
-compile_error!("select exactly one of the esp32c6 or esp32h2 features");
+#[cfg(any(
+    all(feature = "esp32c6", feature = "esp32h2"),
+    all(feature = "esp32c6", feature = "esp32c5"),
+    all(feature = "esp32h2", feature = "esp32c5"),
+))]
+compile_error!("select exactly one of the esp32c6, esp32h2 or esp32c5 features");
+#[cfg(not(any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5")))]
+compile_error!("select exactly one of the esp32c6, esp32h2 or esp32c5 features");
+// The retained light-sleep boundary (`sleep::LightSleep`) is a per-chip port
+// of ESP-IDF's PMU sequence; it exists for the C6 and H2 only.
+#[cfg(all(feature = "esp32c5", feature = "light-sleep"))]
+compile_error!("retained light sleep is not implemented for the ESP32-C5");
 
 #[cfg(all(target_os = "none", feature = "anomaly-record"))]
 pub mod anomaly;
@@ -99,23 +108,32 @@ mod radio_suspend_tests;
 #[path = "../../../vendor/esp-radio/src/ieee802154/fcf.rs"]
 mod radio_fcf_tests;
 
-#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 pub mod esp_image;
-#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 pub mod firmware;
-#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 pub mod layout;
-#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 pub mod ota;
-#[cfg(all(feature = "sed", any(feature = "esp32c6", feature = "esp32h2")))]
+#[cfg(all(
+    feature = "sed",
+    any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5")
+))]
 pub mod ota_boot;
-#[cfg(all(feature = "sed", any(feature = "esp32c6", feature = "esp32h2")))]
+#[cfg(all(
+    feature = "sed",
+    any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5")
+))]
 pub mod ota_transport;
-#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 pub mod otadata;
-#[cfg(any(feature = "esp32c6", feature = "esp32h2"))]
+#[cfg(any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 pub mod sha256;
-#[cfg(all(feature = "signed-ota", any(feature = "esp32c6", feature = "esp32h2")))]
+#[cfg(all(
+    feature = "signed-ota",
+    any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5")
+))]
 pub mod signed_ota;
 
 pub const MANUFACTURER: &str = "Zigbee-RS";
@@ -127,6 +145,8 @@ pub const ENDPOINT: u8 = 1;
 pub const MODEL: &str = "ESP32-C6-Sensor";
 #[cfg(feature = "esp32h2")]
 pub const MODEL: &str = "ESP32-H2-Sensor";
+#[cfg(feature = "esp32c5")]
+pub const MODEL: &str = "ESP32-C5-Sensor";
 
 /// Model identifiers of the mains role images.
 #[cfg(feature = "esp32c6")]
@@ -137,6 +157,10 @@ pub const END_DEVICE_MODEL: &str = "ESP32-C6-ED";
 pub const ROUTER_MODEL: &str = "ESP32-H2-Router";
 #[cfg(feature = "esp32h2")]
 pub const END_DEVICE_MODEL: &str = "ESP32-H2-ED";
+#[cfg(feature = "esp32c5")]
+pub const ROUTER_MODEL: &str = "ESP32-C5-Router";
+#[cfg(feature = "esp32c5")]
+pub const END_DEVICE_MODEL: &str = "ESP32-C5-ED";
 
 /// Security-journal role tags (`SecurityStateJournal::select_role_tag`).
 ///
@@ -164,5 +188,8 @@ pub const OTA_IMAGE_TYPE: u16 = 0x0001;
 /// Image type: 0x0002 = ESP32-H2 sensor.
 #[cfg(feature = "esp32h2")]
 pub const OTA_IMAGE_TYPE: u16 = 0x0002;
+/// Image type: 0x0003 = ESP32-C5 sensor.
+#[cfg(feature = "esp32c5")]
+pub const OTA_IMAGE_TYPE: u16 = 0x0003;
 /// Hardware version reported to the OTA server.
 pub const OTA_HARDWARE_VERSION: u16 = 1;
