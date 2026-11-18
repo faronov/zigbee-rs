@@ -774,11 +774,11 @@ fn take_from_radio(driver: &mut Ieee802154<'_>, frame: &mut PhyRxFrame) -> bool 
     if phr < 3 || phr >= raw.data.len() {
         return false;
     }
-    // The radio's own LQI byte is on an undocumented small scale (about 7
-    // at -84 dBm and 9 at -70 dBm on the C6). NWK link costs need the IEEE
-    // 0..=255 scale on every role: an end device's rejoin parent selection
-    // gates on link cost, and the raw byte maps every router to cost 7. So
-    // all images apply the stack-wide RSSI policy.
+    // The radio's own LQI byte is on an undocumented small scale (about 7 at
+    // -84 dBm, 9 at -70 dBm on the C6), but NWK link costs (and an end
+    // device's rejoin parent selection) need the IEEE 0..=255 scale on every
+    // role, so all images apply the stack-wide RSSI policy.
+    crate::rx_rssi!(frame, raw.data[phr - 1] as i8);
     let lqi = crate::lqi::from_rssi_dbm(raw.data[phr - 1] as i8);
     #[cfg(not(feature = "timed-tx"))]
     {

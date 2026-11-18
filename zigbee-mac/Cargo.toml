@@ -63,6 +63,11 @@ mock = []
 # (unsecured GPDF replay/duplicate counter). Off by default; shipped images
 # are byte-identical without it.
 green-power = []
+# Received-frame RSSI (dBm, last hop) in `PhyRxFrame`/`MacFrame`, measured
+# by the ESP32 PHY and `RSSI_UNKNOWN_DBM` (-128) on other backends. Used by
+# the network co-processor's host indications. Off by default; images without
+# it are unchanged.
+rx-rssi = []
 # Timed transmission: `RadioPhy::transmit_at` / `MacDriver::transmit_raw_at`
 # and the end-of-frame receive time in `PhyRxFrame`/`MacFrame`. Used by the
 # Green Power TempMaster (gpTxQueue) to answer inside a GPD's rxAfterTx

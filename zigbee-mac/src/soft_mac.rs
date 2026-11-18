@@ -1378,7 +1378,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             return None;
         }
 
-        Some(McpsDataIndication {
+        crate::rx_indication! {frame, McpsDataIndication {
             src_address: source,
             dst_address: destination,
             lqi: frame.lqi,
@@ -1389,7 +1389,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             #[cfg(feature = "timed-tx")]
             payload: timed_payload(&data[payload_offset..], data[2], frame.rx_end_us)?,
             security_use,
-        })
+        }}
     }
 
     /// The next queued data indication; non-data frames are discarded.
@@ -2299,6 +2299,33 @@ mod tests {
 
         frame.set(&gpdf, 150).unwrap();
         assert_eq!(frame.rx_end_us, 0);
+    }
+
+    /// `rx-rssi`: the PHY's RSSI reaches the data indication; a frame whose
+    /// PHY does not measure it reports `RSSI_UNKNOWN_DBM`.
+    #[test]
+    #[cfg(feature = "rx-rssi")]
+    fn received_frame_rssi_reaches_the_indication() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        let gpdf = [
+            0x01, 0x08, 0xA7, 0xFF, 0xFF, 0xFF, 0xFF, // MAC header, seq 0xA7
+            0x8C, 0x10, 0x32, 0x54, 0x76, 0x98, 0x20, // NWK FC v3, SrcID, Off
+        ];
+        let unmeasured = PhyRxFrame::from_slice(&gpdf, 150).unwrap();
+        assert_eq!(unmeasured.rssi_dbm, crate::RSSI_UNKNOWN_DBM);
+        let mut measured = unmeasured;
+        measured.rssi_dbm = -57;
+        let rx = &mut core.phy_mut().rx_frames;
+        rx.push_back(Ok(Some(measured))).unwrap();
+        rx.push_back(Ok(Some(unmeasured))).unwrap();
+
+        let indication = block_on(core.receive_data(5_000)).unwrap();
+        assert_eq!(indication.payload.rssi_dbm(), -57);
+        let indication = block_on(core.receive_data(5_000)).unwrap();
+        assert_eq!(indication.payload.rssi_dbm(), -128);
+        assert_eq!(MacFrame::new().rssi_dbm(), -128);
     }
 
     /// `timed-tx` on a PHY without it: not advertised, and a timed

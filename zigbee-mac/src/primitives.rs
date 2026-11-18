@@ -496,14 +496,14 @@ pub struct McpsDataIndication {
 pub struct MacFrame {
     buf: [u8; MAX_MAC_PAYLOAD],
     len: usize,
-    /// MAC header sequence number of the received frame. Green Power uses it
-    /// as the replay/duplicate counter of unsecured GPDFs (GP 1.1 A.3.6.1.3).
+    /// MAC sequence number: the unsecured-GPDF replay counter (GP A.3.6.1.3).
     #[cfg(feature = "green-power")]
     mac_sequence: u8,
-    /// End-of-frame receive time of a PHY with timed transmission
-    /// (`timed-tx`), see [`crate::PhyRxFrame::rx_end_us`].
+    /// End-of-frame receive time (`timed-tx`), see `PhyRxFrame::rx_end_us`.
     #[cfg(feature = "timed-tx")]
     rx_end_us: u32,
+    #[cfg(feature = "rx-rssi")]
+    rssi_dbm: i8,
 }
 
 impl MacFrame {
@@ -515,12 +515,13 @@ impl MacFrame {
             mac_sequence: 0,
             #[cfg(feature = "timed-tx")]
             rx_end_us: 0,
+            #[cfg(feature = "rx-rssi")]
+            rssi_dbm: crate::phy::RSSI_UNKNOWN_DBM,
         }
     }
 
     /// [`crate::PlatformServices::monotonic_micros`] at the end of the
-    /// received frame; 0 when the PHY does not time-stamp frames
-    /// (`timed-tx`).
+    /// received frame; 0 when not time-stamped (`timed-tx`).
     #[cfg(feature = "timed-tx")]
     pub fn rx_end_us(&self) -> u32 {
         self.rx_end_us
@@ -533,8 +534,7 @@ impl MacFrame {
         self
     }
 
-    /// MAC sequence number of the received frame (0 when the producer did
-    /// not record one).
+    /// MAC sequence number of the received frame (0 when not recorded).
     #[cfg(feature = "green-power")]
     pub fn mac_sequence(&self) -> u8 {
         self.mac_sequence
@@ -573,6 +573,26 @@ impl MacFrame {
 impl Default for MacFrame {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Received signal strength (`rx-rssi`).
+#[cfg(feature = "rx-rssi")]
+impl MacFrame {
+    /// RSSI of the received frame in dBm (last hop), or
+    /// [`crate::RSSI_UNKNOWN_DBM`] when the PHY does not measure it.
+    pub fn rssi_dbm(&self) -> i8 {
+        self.rssi_dbm
+    }
+
+    /// Record the RSSI of the received frame.
+    pub fn with_rssi_dbm(mut self, rssi_dbm: i8) -> Self {
+        self.rssi_dbm = rssi_dbm;
+        self
+    }
+
+    pub(crate) fn set_rssi_dbm(&mut self, rssi_dbm: i8) {
+        self.rssi_dbm = rssi_dbm;
     }
 }
 
