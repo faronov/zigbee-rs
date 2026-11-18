@@ -45,9 +45,15 @@ assert crc32c(b"123456789") == 0xE3069283
 
 
 def cobs_encode(data: bytes) -> bytes:
+    """Minimal COBS: a full 254-byte block at the very end is closed by its
+    0xFF code without a trailing empty 0x01 block (n + ceil(n/254) bytes)."""
     out = bytearray([0])
     code_index, code = 0, 1
     for byte in data:
+        if code == 0xFF:  # previous block full and more data follows
+            out[code_index] = code
+            code_index, code = len(out), 1
+            out.append(0)
         if byte == 0:
             out[code_index] = code
             code_index, code = len(out), 1
@@ -55,10 +61,6 @@ def cobs_encode(data: bytes) -> bytes:
         else:
             out.append(byte)
             code += 1
-            if code == 0xFF:
-                out[code_index] = code
-                code_index, code = len(out), 1
-                out.append(0)
     out[code_index] = code
     return bytes(out)
 
@@ -532,8 +534,14 @@ def build_crc_cobs():
     for name, raw in cases:
         enc = cobs_encode(raw)
         assert cobs_decode(enc) == raw and 0 not in enc
+        assert len(enc) == max(1, len(raw) + -(-len(raw) // 254))  # n + ceil(n/254), 5.1
         cobs["vectors"].append({"name": name, "raw_hex": hx(raw), "encoded_hex": hx(enc),
                                 "raw_len": len(raw), "encoded_len": len(enc)})
+    # Non-minimal encodings that every decoder must still accept (5.1).
+    nonminimal = bytes([0xFF]) + bytes([1]) * 254 + b"\x01"
+    assert cobs_decode(nonminimal) == bytes([1]) * 254
+    cobs["decode_only"] = [{"name": "run_254_trailing_empty_block", "raw_hex": hx(bytes([1]) * 254),
+                            "encoded_hex": hx(nonminimal)}]
     return crc, cobs
 
 
