@@ -3,10 +3,14 @@
 > **Status: design specification. The user's decisions of 2026-11-18 are
 > applied (section 16).** The shared crate `zigbee-zrhp` (step 1 of section
 > 15) implements the framing, the link layer and every message and record
-> codec, and passes all vectors; it is host-tested only. The zigbee-rs
-> coordinator and Trust Center are host-tested only (see
-> [Coordinator & Router](coordinator-router.md)), and no backend advertises a
-> hardware coordinator. The NCP application, zigpy library, Go adapter,
+> codec, and passes all vectors; it is host-tested only. A first NCP
+> (`apps/ncp-coordinator`, `products/esp32-zigbee-ncp`, `examples/esp32-ncp`)
+> implements the SYSTEM, DIAG, NWK, DATA, SEC and LOG subset listed in
+> [`apps/ncp-coordinator/README.md`](https://github.com/faronov/zigbee-rs/blob/zrhp-ncp/apps/ncp-coordinator/README.md);
+> on an ESP32-C6 DevKit (lab variant, USB-Serial-JTAG) it completed the
+> session, formed a network (soft MAC `pan-coordinator` + `energy-detect`)
+> and resumed it after a reset. No device has joined it yet and none of the
+> hardware gates H1–H12 has passed. The zigpy library, Go adapter,
 > zigbee-herdsman adapter and embedded hub described here do not exist yet.
 > Byte layouts are normative for v1. The golden vectors in
 > [`host-protocol-vectors/`](host-protocol-vectors/generate.py) are generated
