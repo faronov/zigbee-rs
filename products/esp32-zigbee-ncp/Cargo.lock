@@ -1227,6 +1227,7 @@ dependencies = [
  "zigbee-aps",
  "zigbee-bdb",
  "zigbee-mac",
+ "zigbee-nwk",
  "zigbee-runtime",
  "zigbee-types",
  "zigbee-zrhp",

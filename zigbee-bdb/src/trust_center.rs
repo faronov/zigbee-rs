@@ -12,8 +12,14 @@ use zigbee_aps::security::{AesKey, DEFAULT_TC_LINK_KEY, derive_verify_key_hash};
 use zigbee_crypto::{InstallCodeError, derive_install_code_key};
 use zigbee_types::{IeeeAddress, ShortAddress};
 
+/// Trust Center device table size: 32, or 256 for the coordinator NCP
+/// (`ncp-capacity`, ZRHP spec 8.9).
+#[cfg(not(feature = "ncp-capacity"))]
 pub const MAX_TRUST_CENTER_DEVICES: usize = 32;
-const _: () = assert!(MAX_TRUST_CENTER_DEVICES <= u32::BITS as usize);
+#[cfg(feature = "ncp-capacity")]
+pub const MAX_TRUST_CENTER_DEVICES: usize = 256;
+/// One pending-replacement bit per device slot.
+const PENDING_MASK_WORDS: usize = MAX_TRUST_CENTER_DEVICES.div_ceil(u32::BITS as usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustCenterKeyOrigin {
@@ -162,7 +168,7 @@ pub struct TrustCenterTable {
     devices: [Option<TrustCenterDevice>; MAX_TRUST_CENTER_DEVICES],
     /// Replacement keys awaiting Verify-Key, indexed with `devices`.
     pending_link_keys: [AesKey; MAX_TRUST_CENTER_DEVICES],
-    pending_link_key_mask: u32,
+    pending_link_key_mask: [u32; PENDING_MASK_WORDS],
 }
 
 impl TrustCenterTable {
@@ -170,7 +176,7 @@ impl TrustCenterTable {
         Self {
             devices: core::array::from_fn(|_| None),
             pending_link_keys: [[0u8; 16]; MAX_TRUST_CENTER_DEVICES],
-            pending_link_key_mask: 0,
+            pending_link_key_mask: [0; PENDING_MASK_WORDS],
         }
     }
 
@@ -216,7 +222,7 @@ impl TrustCenterTable {
     pub fn clear(&mut self) {
         self.devices.fill(None);
         self.pending_link_keys.fill([0u8; 16]);
-        self.pending_link_key_mask = 0;
+        self.pending_link_key_mask = [0; PENDING_MASK_WORDS];
     }
 
     pub fn provision_install_code(
@@ -481,7 +487,7 @@ impl TrustCenterTable {
             };
             let initial_exchange_pending = device.join_timeout_remaining_secs != 0
                 && device.key_attributes == TrustCenterKeyAttributes::Provisional;
-            let replacement_pending = self.pending_link_key_mask & (1u32 << index) != 0;
+            let replacement_pending = pending_bit(&self.pending_link_key_mask, index);
             if !initial_exchange_pending && !replacement_pending {
                 continue;
             }
@@ -494,7 +500,7 @@ impl TrustCenterTable {
                     // did not finish only abandons the replacement: the
                     // committed, verified key and the admission stay valid.
                     self.pending_link_keys[index] = [0u8; 16];
-                    self.pending_link_key_mask &= !(1u32 << index);
+                    clear_pending_bit(&mut self.pending_link_key_mask, index);
                     continue;
                 }
                 let action = TrustCenterAction::RemoveDevice {
@@ -504,7 +510,7 @@ impl TrustCenterTable {
                 };
                 device.active = false;
                 self.pending_link_keys[index] = [0u8; 16];
-                self.pending_link_key_mask &= !(1u32 << index);
+                clear_pending_bit(&mut self.pending_link_key_mask, index);
                 return action;
             }
         }
@@ -565,18 +571,26 @@ impl TrustCenterTable {
     }
 
     fn has_pending_link_key(&self, index: usize) -> bool {
-        self.pending_link_key_mask & (1u32 << index) != 0
+        pending_bit(&self.pending_link_key_mask, index)
     }
 
     fn set_pending_link_key(&mut self, index: usize, key: AesKey) {
         self.pending_link_keys[index] = key;
-        self.pending_link_key_mask |= 1u32 << index;
+        self.pending_link_key_mask[index / 32] |= 1u32 << (index % 32);
     }
 
     fn clear_pending_link_key(&mut self, index: usize) {
         self.pending_link_keys[index] = [0u8; 16];
-        self.pending_link_key_mask &= !(1u32 << index);
+        clear_pending_bit(&mut self.pending_link_key_mask, index);
     }
+}
+
+fn pending_bit(mask: &[u32; PENDING_MASK_WORDS], index: usize) -> bool {
+    mask[index / 32] & (1u32 << (index % 32)) != 0
+}
+
+fn clear_pending_bit(mask: &mut [u32; PENDING_MASK_WORDS], index: usize) {
+    mask[index / 32] &= !(1u32 << (index % 32));
 }
 
 impl Default for TrustCenterTable {
@@ -1260,5 +1274,61 @@ mod tests {
                 device_address: DEVICE
             }
         );
+    }
+}
+
+/// Coordinator NCP Trust Center table (`ncp-capacity`, ZRHP spec 8.9).
+#[cfg(all(test, feature = "ncp-capacity"))]
+mod ncp_capacity_tests {
+    use super::*;
+
+    fn ieee(index: usize) -> IeeeAddress {
+        let [lo, hi] = (index as u16).to_le_bytes();
+        [lo, hi, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C]
+    }
+
+    fn joined(index: usize) -> TrustCenterDevice {
+        TrustCenterDevice {
+            ieee_address: ieee(index),
+            parent_address: [0x11; 8],
+            short_address: ShortAddress(0x1000 + index as u16),
+            link_key: [index as u8; 16],
+            key_origin: TrustCenterKeyOrigin::GeneratedUnique,
+            key_attributes: TrustCenterKeyAttributes::Verified,
+            join_timeout_remaining_secs: 0,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn the_table_holds_256_devices_and_tracks_pending_keys_beyond_bit_31() {
+        assert_eq!(MAX_TRUST_CENTER_DEVICES, 256);
+        let mut table = TrustCenterTable::new();
+        for index in 0..MAX_TRUST_CENTER_DEVICES {
+            table.restore_device(joined(index)).unwrap();
+        }
+        assert_eq!(table.devices().count(), MAX_TRUST_CENTER_DEVICES);
+        assert_eq!(
+            table.restore_device(joined(MAX_TRUST_CENTER_DEVICES)),
+            Err(TrustCenterError::DeviceTableFull)
+        );
+        // Slots past the first mask word keep independent pending bits.
+        for index in [31, 32, 200, 255] {
+            table
+                .install_generated_trust_center_link_key(ieee(index), [0xA7; 16], 2)
+                .unwrap();
+        }
+        for index in 0..MAX_TRUST_CENTER_DEVICES {
+            assert_eq!(
+                table.has_pending_link_key_for(&ieee(index)),
+                matches!(index, 31 | 32 | 200 | 255),
+                "slot {index}"
+            );
+        }
+        // Verified devices abandon an unfinished re-key without removal.
+        assert_eq!(table.tick(2), TrustCenterAction::None);
+        assert!(!table.has_pending_link_key_for(&ieee(200)));
+        assert!(table.device(&ieee(200)).is_some());
+        assert_eq!(table.devices().count(), MAX_TRUST_CENTER_DEVICES);
     }
 }

@@ -18,10 +18,13 @@ zigbee-zrhp = { path = "../../zigbee-zrhp" }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac" }
 zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-nwk = { path = "../../zigbee-nwk" }
 # Only the host opens joining (NWK_PERMIT_JOIN); formation leaves it closed.
 zigbee-bdb = { path = "../../zigbee-bdb", default-features = false, features = ["formation-joining-closed"] }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["centralized-tclk", "trust-center", "global-aps-counter", "host-passthrough"] }
-router-app = { path = "../router", default-features = false, features = ["centralized-tclk", "global-aps-counter"] }
+# `ncp-capacity`: the NCP table sizes (256 TC devices/link keys, 512 address
+# map, 96 neighbors with 64 children, 128 source routes; spec 8.9).
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["centralized-tclk", "trust-center", "global-aps-counter", "host-passthrough", "ncp-capacity"] }
+router-app = { path = "../router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity"] }
 
 [dev-dependencies]
 critical-section = { version = "1.2", features = ["std"] }

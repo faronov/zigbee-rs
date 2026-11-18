@@ -31,6 +31,10 @@ global-aps-counter = ["trust-center"]
 trace = ["zigbee-nwk/trace"]
 # Green Power alias transmission for GP Notification tunnelling. Off by default.
 green-power = ["zigbee-nwk/green-power"]
+# Coordinator network co-processor capacity (ZRHP spec 8.9): a 256-entry APS
+# link-key table and the NWK `ncp-capacity` tables. Off by default: images
+# without it are unchanged.
+ncp-capacity = ["trust-center", "zigbee-nwk/ncp-capacity"]
 
 [dev-dependencies]
 zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }

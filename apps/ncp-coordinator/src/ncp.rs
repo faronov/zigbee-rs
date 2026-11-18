@@ -525,6 +525,23 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                         id: capacity::MAX_TC_DEVICES,
                         value: state.identity.max_tc_devices,
                     },
+                    // Table sizes of the linked stack (`ncp-capacity`).
+                    Capacity {
+                        id: capacity::LINK_KEY_CACHE,
+                        value: zigbee_aps::security::MAX_KEY_TABLE_ENTRIES as u32,
+                    },
+                    Capacity {
+                        id: capacity::ADDRESS_MAP_CACHE,
+                        value: zigbee_nwk::address_map::MAX_ADDRESS_MAP_ENTRIES as u32,
+                    },
+                    Capacity {
+                        id: capacity::SOURCE_ROUTE_CACHE,
+                        value: zigbee_nwk::routing::MAX_SOURCE_ROUTES as u32,
+                    },
+                    Capacity {
+                        id: capacity::NEIGHBOR_TABLE,
+                        value: zigbee_nwk::neighbor::MAX_NEIGHBORS as u32,
+                    },
                 ];
                 let response = SysNegotiateRsp {
                     major: MAJOR,

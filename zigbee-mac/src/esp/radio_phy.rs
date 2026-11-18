@@ -141,9 +141,9 @@ pub type EspSoftMac<'a> = SoftMacCore<EspRadioPhy<'a>, EndDevice, ESP_PENDING_RX
 /// Child sources the hardware auto-ACK can flag with Frame Pending at once.
 /// The parent core arms one entry per child with a queued indirect frame and
 /// one per association in progress; a full table is reported as
-/// `TransactionOverflow`, never silently dropped.
+/// `TransactionOverflow`, never silently dropped. 64 with `ncp-capacity`.
 #[cfg(feature = "esp-parent")]
-pub const ESP_ACK_PENDING_SOURCES: usize = 16;
+pub const ESP_ACK_PENDING_SOURCES: usize = [16, 64][cfg!(feature = "ncp-capacity") as usize];
 
 /// Indication slots of [`EspRouterMac`] (parent core `EVENTS`).
 #[cfg(feature = "esp-parent")]

@@ -15,7 +15,7 @@ use crate::role::ParentRole;
 use crate::security_store::{PersistentSecurityState, SecurityStateStore, SecurityStoreError};
 use crate::{TrustCenterMode, ZigbeeDevice};
 
-const _: () = assert!(zigbee_nwk::neighbor::MAX_NEIGHBORS <= u32::BITS as usize);
+const _: () = assert!(zigbee_nwk::neighbor::MAX_NEIGHBORS <= DeliveredMask::BITS as usize);
 
 /// Runtime policy default, matching the existing eight-second indirect queue
 /// lifetime. This is NOT an R22 numeric recommendation: the recommended maximum
@@ -35,7 +35,7 @@ pub(crate) struct ParentNetworkKeyForwarding {
     started_at: u32,
     window_us: u32,
     child_fingerprint: u32,
-    delivered: u32,
+    delivered: DeliveredMask,
     sequence: u8,
     cursor: u8,
     armed: bool,
@@ -232,7 +232,7 @@ impl<M: MacDriver, R: ParentRole> ZigbeeDevice<M, R> {
             && state.sequence == sequence
             && let Some(index) = index
         {
-            state.delivered |= 1u32 << index;
+            state.delivered |= 1 << index;
         }
     }
 
@@ -309,19 +309,19 @@ impl<M: MacDriver, R: ParentRole> ZigbeeDevice<M, R> {
             .enumerate()
             .filter(|(index, entry)| {
                 !entry.rx_on_when_idle
-                    && delivered & (1u32 << index) == 0
+                    && delivered & (1 << index) == 0
                     && !self
                         .bdb
                         .zdo()
                         .nwk()
                         .has_pending_indirect_kind(entry.network_address, kind)
             })
-            .min_by_key(|(index, _)| (index + 32 - cursor) % 32)
+            .min_by_key(|(index, _)| (index + MASK_BITS - cursor) % MASK_BITS)
             .map(|(index, entry)| (index, entry.network_address, entry.ieee_address));
         if let Some((index, short, ieee)) = child {
             R::parent_state_mut(&mut self.role_state)
                 .network_key_forwarding
-                .cursor = ((index + 1) % 32) as u8;
+                .cursor = ((index + 1) % MASK_BITS) as u8;
             if let Err(error) = self
                 .bdb
                 .zdo_mut()
@@ -334,3 +334,12 @@ impl<M: MacDriver, R: ParentRole> ZigbeeDevice<M, R> {
         }
     }
 }
+
+/// One delivery bit per neighbor-table child position: a `u32` for router
+/// images, a `u128` for the 96-entry coordinator NCP table (`ncp-capacity`).
+#[cfg(not(feature = "ncp-capacity"))]
+type DeliveredMask = u32;
+#[cfg(feature = "ncp-capacity")]
+type DeliveredMask = u128;
+const MASK_BITS: usize = DeliveredMask::BITS as usize;
+const _: () = assert!(MASK_BITS <= u8::MAX as usize + 1);

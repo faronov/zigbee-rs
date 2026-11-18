@@ -27,6 +27,7 @@ zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, feat
     "trust-center",
     "global-aps-counter",
     "host-passthrough",
+    "ncp-capacity",
 ] }
 ncp-coordinator-app = { path = "../../apps/ncp-coordinator" }
 
@@ -52,7 +53,7 @@ esp-radio = { version = "=0.17.0", default-features = false, features = [
 ], optional = true }
 esp-serial-stream = { path = "../../esp-serial-stream" }
 esp-hal = { version = "=1.0.0", features = ["unstable"] }
-router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter"] }
+router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity"] }
 
 [features]
 default = []

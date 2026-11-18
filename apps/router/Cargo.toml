@@ -17,6 +17,10 @@ router = ["zigbee-runtime/router", "application-link-key-installation"]
 trust-center = ["router", "zigbee-runtime/trust-center"]
 # One reserved outgoing APS counter for every APS-secured frame (ZRHP NCP).
 global-aps-counter = ["trust-center", "zigbee-runtime/global-aps-counter"]
+# Coordinator network co-processor table capacities (ZRHP spec 8.9; see
+# zigbee-runtime `ncp-capacity`). Off by default: images without it are
+# unchanged.
+ncp-capacity = ["global-aps-counter", "zigbee-runtime/ncp-capacity"]
 # Maintenance rejoin requests through `RouterObserver::take_rejoin_request`.
 # Off by default so products that never request one carry no request path.
 rejoin-request = []

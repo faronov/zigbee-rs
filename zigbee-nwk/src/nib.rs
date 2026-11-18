@@ -178,7 +178,7 @@ impl Nib {
             depth: 0,
             max_depth: 15,
             max_routers: 5,
-            max_children: 20,
+            max_children: const { crate::ncp_capacity(20, 64) as u8 },
             update_id: 0,
             // Factory-new: no authoritative network update state is held.
             update_id_valid: false,

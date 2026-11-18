@@ -234,8 +234,8 @@ fn identity() -> NcpIdentity {
         product: "test",
         reset_reason: 1,
         key_export: true,
-        max_children: 32,
-        max_tc_devices: 32,
+        max_children: 64,
+        max_tc_devices: 256,
         stack_allowed: true,
     }
 }
@@ -340,6 +340,11 @@ fn host_negotiates_forms_reads_counters_and_sends_data() {
     assert_eq!(negotiated.ncp_caps & caps::BACKUP_RESTORE, 0);
     assert_eq!(negotiated.capacity(1), Some(16), "max_aps_inflight");
     assert_eq!(negotiated.capacity(7), Some(0x400), "fc_stride");
+    // `ncp-capacity` table sizes (spec 8.9).
+    assert_eq!(negotiated.capacity(3), Some(256), "link_key_cache");
+    assert_eq!(negotiated.capacity(4), Some(512), "address_map_cache");
+    assert_eq!(negotiated.capacity(5), Some(128), "source_route_cache");
+    assert_eq!(negotiated.capacity(11), Some(96), "neighbor_table");
 
     // NWK_INIT on a factory-new NCP: NOT_FORMED.
     let init = host.request(&NwkInit {

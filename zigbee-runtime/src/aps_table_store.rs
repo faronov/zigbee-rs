@@ -27,7 +27,7 @@ pub const MAX_ENCODED_APS_TABLES_LEN: usize = 8
     + 1
     + MAX_GROUPS * GROUP_ENTRY_MAX_LEN
     + 1
-    + MAX_KEY_TABLE_ENTRIES * APPLICATION_KEY_ENTRY_LEN;
+    + MAX_PERSISTED_APPLICATION_KEYS * APPLICATION_KEY_ENTRY_LEN;
 
 /// Stable fingerprint of the live APS tables and their Zigbee network.
 ///
@@ -128,7 +128,7 @@ pub struct PersistentApsTables {
     extended_pan_id: IeeeAddress,
     bindings: BindingTable,
     groups: GroupTable,
-    application_keys: Vec<PersistentApplicationLinkKey, MAX_KEY_TABLE_ENTRIES>,
+    application_keys: Vec<PersistentApplicationLinkKey, MAX_PERSISTED_APPLICATION_KEYS>,
 }
 
 impl Clone for PersistentApsTables {
@@ -503,7 +503,7 @@ impl PersistentApsTables {
         let application_key_count =
             usize::from(*bytes.get(offset).ok_or(ApsTableStoreError::Corrupt)?);
         offset += 1;
-        if application_key_count > MAX_KEY_TABLE_ENTRIES {
+        if application_key_count > MAX_PERSISTED_APPLICATION_KEYS {
             return Err(ApsTableStoreError::Corrupt);
         }
         for _ in 0..application_key_count {
@@ -1055,6 +1055,15 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> ApsTableStore for ApsTableJournal<S,
     }
 }
 
+/// Application link keys one APS-table snapshot persists: the APS key-table
+/// capacity, except on the coordinator NCP (`ncp-capacity`), whose 256-entry
+/// key table exists for Trust Center link keys. Its application keys keep the
+/// previous Trust Center bound of 32 so the snapshot still fits a 2 KiB slot;
+/// a capture with more application keys fails with
+/// [`ApsTableStoreError::Full`] (declared after the code above: keeps its line
+/// numbers, which panic locations embed, unchanged).
+pub const MAX_PERSISTED_APPLICATION_KEYS: usize = crate::ncp_capacity(MAX_KEY_TABLE_ENTRIES, 32);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,7 +1517,7 @@ mod tests {
                 );
             }
         }
-        for index in 0..MAX_KEY_TABLE_ENTRIES {
+        for index in 0..MAX_PERSISTED_APPLICATION_KEYS {
             let mut partner_address = [0x40; 8];
             partner_address[7] = index as u8 + 1;
             tables

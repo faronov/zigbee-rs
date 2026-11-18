@@ -2309,3 +2309,79 @@ impl<M: MacDriver> NwkLayer<M> {
         Ok(assigned_address)
     }
 }
+
+/// Coordinator NCP table sizes (`ncp-capacity`, ZRHP spec 8.2/8.9).
+#[cfg(all(test, feature = "ncp-capacity"))]
+mod ncp_capacity_tests {
+    use super::*;
+    use crate::neighbor::{NeighborEntry, NeighborTable, Relationship};
+
+    #[test]
+    fn tables_have_the_coordinator_ncp_capacities() {
+        assert_eq!(neighbor::MAX_NEIGHBORS, 96);
+        assert_eq!(address_map::MAX_ADDRESS_MAP_ENTRIES, 512);
+        assert_eq!(routing::MAX_SOURCE_ROUTES, 128);
+        assert_eq!(indirect::MAX_INDIRECT, 16);
+        assert_eq!(security::MAX_FRAME_COUNTER_ENTRIES, 128);
+        // 64 children plus room for router neighbors; every neighbor (and a
+        // margin) has an NWK replay floor that is never displaced.
+        assert_eq!(nib::Nib::new().max_children, 64);
+        const { assert!(neighbor::MAX_NEIGHBORS >= 64 + 32) };
+        const { assert!(security::MAX_FRAME_COUNTER_ENTRIES > neighbor::MAX_NEIGHBORS) };
+    }
+
+    #[test]
+    fn the_neighbor_table_holds_64_children_and_32_routers() {
+        let mut table = NeighborTable::new();
+        for index in 0..neighbor::MAX_NEIGHBORS as u16 {
+            let [lo, hi] = index.to_le_bytes();
+            let mut entry = NeighborEntry::new_from_annce(
+                ShortAddress(0x1000 + index),
+                [lo, hi, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5],
+            );
+            entry.relationship = if index < 64 {
+                Relationship::Child
+            } else {
+                Relationship::Sibling
+            };
+            assert!(table.add_or_update(entry).is_ok(), "slot {index}");
+        }
+        assert_eq!(table.len(), neighbor::MAX_NEIGHBORS);
+        assert_eq!(table.children().count(), 64);
+        assert!(table.find_by_short(ShortAddress(0x1000 + 95)).is_some());
+    }
+
+    #[test]
+    fn the_source_route_cache_keeps_128_destinations() {
+        let mut table = routing::SourceRouteTable::new();
+        for index in 0..routing::MAX_SOURCE_ROUTES as u16 {
+            table.insert(ShortAddress(0x2000 + index), &[ShortAddress(index + 1)]);
+        }
+        for index in 0..routing::MAX_SOURCE_ROUTES as u16 {
+            assert_eq!(
+                table.lookup(ShortAddress(0x2000 + index)),
+                Some(&[ShortAddress(index + 1)][..])
+            );
+        }
+    }
+
+    #[test]
+    fn the_indirect_queue_buffers_16_frames() {
+        let mut queue = indirect::IndirectQueue::new();
+        for index in 0..indirect::MAX_INDIRECT as u16 {
+            assert!(queue.enqueue(ShortAddress(0x3000 + index), &[0x41, 0x88]));
+        }
+        assert!(!queue.enqueue(ShortAddress(0x4000), &[0x41, 0x88]));
+    }
+}
+
+/// Table capacity selection: `ncp` with the `ncp-capacity` feature (the
+/// coordinator NCP, ZRHP spec 8.2/8.9), otherwise `default`. Only evaluated
+/// in constant contexts.
+pub(crate) const fn ncp_capacity(default: usize, ncp: usize) -> usize {
+    if cfg!(feature = "ncp-capacity") {
+        ncp
+    } else {
+        default
+    }
+}
