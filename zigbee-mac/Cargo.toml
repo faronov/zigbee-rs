@@ -101,6 +101,10 @@ esp-parent = ["esp-radio?/ieee802154-ack-pending"]
 # MLME-START (short address 0x0000) and report `coordinator` capability.
 # Only coordinator/NCP images enable it; router images stay unchanged.
 pan-coordinator = []
+# Coordinator network co-processor capacity (ZRHP spec 8.9): the ESP parent
+# Frame Pending source table grows 16 -> 64 (one entry per sleepy child with
+# a queued indirect frame). Off by default: images without it are unchanged.
+ncp-capacity = []
 # ESP32-C6/H2 hardware energy-detect scan (local esp-radio patch
 # `ieee802154-energy-detect`): NWK formation channel selection and
 # Mgmt_NWK_Update ED scans. Off by default; images without it are unchanged.
