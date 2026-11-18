@@ -26,7 +26,10 @@ esp32-zigbee-ncp-product = { path = "../../products/esp32-zigbee-ncp" }
 # Executor and SYSTIMER embassy time driver (layout-independent glue).
 esp32-zigbee-devkit-product = { path = "../../products/esp32-zigbee-devkit" }
 ncp-coordinator-app = { path = "../../apps/ncp-coordinator" }
-router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity"] }
+# GP combo (spec 7.11): Proxy Basic, the sink (`green-power-ncp`, 16-entry
+# Sink Table) and the TempMaster (`green-power-bidirectional`: the H2/C6
+# radio arms the reply and sends it gpTxOffset after the GPD's frame).
+router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity", "green-power-sink", "green-power-bidirectional"] }
 # `ncp-capacity`: NCP table sizes (spec 8.9), incl. the 64-entry Frame
 # Pending table of the ESP parent MAC.
 zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = [
@@ -35,6 +38,8 @@ zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, feat
     "global-aps-counter",
     "host-passthrough",
     "ncp-capacity",
+    "green-power-ncp",
+    "green-power-bidirectional",
 ] }
 zigbee-mac = { path = "../../zigbee-mac", features = ["esp-parent", "pan-coordinator", "energy-detect", "ncp-capacity"] }
 zigbee-aps = { path = "../../zigbee-aps" }

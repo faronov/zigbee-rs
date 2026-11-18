@@ -139,8 +139,8 @@ pub const fn is_fw_writable(address: u32, len: u32) -> bool {
 /// `zbnv`-relative journal windows (136 KiB used, 56 KiB spare).
 ///
 /// Each window holds two logical sectors (A at the window start, B at its
-/// middle). The GP journal still uses smaller sectors than its window half;
-/// the rest is reserved for its planned 1 KiB slots (spec 8.9).
+/// middle). The GP journal (`stores::GreenPowerStore`) uses 1 KiB slots in
+/// 8 KiB logical sectors (spec 8.9).
 pub struct Nv;
 
 impl Nv {

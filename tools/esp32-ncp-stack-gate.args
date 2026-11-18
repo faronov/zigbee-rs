@@ -14,8 +14,12 @@
 # H2 USJ fix build (ncp-capacity, 256 TC devices): 56 096 B usable; static
 # worst case 34 112 B task (boot composition: device assembly) + 512 B log
 # sink + 864 B interrupts = 35 488 B, a 20 608 B gap. H2 Thread-BR: 53 512 B
-# usable, 1 104 B interrupts, a 17 784 B gap. C6: 245 440 B usable. Not
-# measured on hardware.
+# usable, 1 104 B interrupts, a 17 784 B gap. C6: 245 440 B usable.
+# With the GP combo (2026-11-19; +~6.9 KiB tables and report queue, radio
+# interrupt +368 B for the TempMaster) and the 32 KiB esp-alloc heap moved to
+# the reclaimed bootloader RAM (`dram2_seg`): H2 USJ 81 964 B usable, a
+# 45 676 B gap; H2 Thread-BR 79 348 B usable, 1 472 B interrupts, a 42 820 B
+# gap; C6 271 316 B usable. Not measured on hardware.
 --min-gap
 16384
 

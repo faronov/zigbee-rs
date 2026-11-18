@@ -4,6 +4,7 @@
 use crate::flash::FlashWindow;
 use zigbee_runtime::aps_table_store::ApsTableJournal;
 use zigbee_runtime::child_store::ChildTableJournal;
+use zigbee_runtime::gp_store::GpProxyJournal;
 use zigbee_runtime::security_journal::SecurityStateJournal;
 use zigbee_runtime::settings_journal::SettingsJournal;
 use zigbee_runtime::trust_center_stream::{
@@ -40,8 +41,10 @@ pub type ChildStore = ChildTableJournal<ChildFlash, SECTOR>;
 const _: () = assert!(SecurityStore::NCP_SECTOR_FITS);
 const _: () = assert!(TRUST_CENTER_STREAM_MIN_SECTOR_SIZE <= Nv::TRUST_CENTER_SECTOR);
 const _: () = assert!(2 * Nv::TRUST_CENTER_SECTOR == Nv::TRUST_CENTER.1 as usize);
-// The GP journal window (`GreenPowerFlash`, 2 × 8 KiB) is reserved for the
-// GP combo sink; this NCP build does not run Green Power yet.
+/// GP combo journal (Proxy Table 8 + Sink Table 16, spec 7.11/8.9): full
+/// records in 1 KiB slots (the sink record precedes its paired proxy
+/// record) and 32-byte counter records, in 2 × 8 KiB logical sectors.
+pub type GreenPowerStore = GpProxyJournal<GreenPowerFlash, { Nv::GREEN_POWER_SECTOR }>;
 pub type ApsTableStore = ApsTableJournal<ApsTableFlash, SECTOR>;
 /// IEEE override and persisted settings.
 pub type IdentityStore = SettingsJournal<IdentityFlash, SECTOR>;
@@ -56,6 +59,10 @@ pub fn trust_center_store() -> TrustCenterStore {
 
 pub fn child_store() -> ChildStore {
     ChildStore::new_with_sector_size(ChildFlash::new(), 0, SECTOR as u32)
+}
+
+pub fn green_power_store() -> GreenPowerStore {
+    GreenPowerStore::new(GreenPowerFlash::new(), 0, Nv::GREEN_POWER_SECTOR as u32)
 }
 
 pub fn aps_table_store() -> ApsTableStore {
