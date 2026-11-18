@@ -70,6 +70,11 @@ impl Host {
     pub fn new(stream: esp_serial_stream::uart::UartDmaStream) -> Self {
         Self { stream }
     }
+
+    /// Transport counters (lab diagnostics).
+    pub fn counters(&self) -> esp_serial_stream::uart::UartCounters {
+        self.stream.counters()
+    }
 }
 
 #[cfg(feature = "transport-uart")]

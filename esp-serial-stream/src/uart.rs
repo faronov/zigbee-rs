@@ -13,10 +13,12 @@
 //!   [`UART_RX_DESCRIPTORS`] descriptors of [`UART_RX_CHUNK`] bytes. UHCI
 //!   closes a descriptor at UART idle, so bytes become visible within one
 //!   idle period. A small frame uses a whole descriptor, which is why there
-//!   are many small ones. If every descriptor fills before the main loop
-//!   drains them, the DMA stops and the UART FIFO overflows; the stream
-//!   then counts `rx_overflow`, restarts the transfer and lets the ARQ
-//!   above recover the lost frames.
+//!   are many small ones. Every idle EOF raises the channel's "done"
+//!   (`in_suc_eof`) flag, so that flag says nothing about the stream; only
+//!   `in_dscr_empty`/`in_dscr_err` (every descriptor full, or a broken
+//!   chain) stop the DMA. Then the UART FIFO overflows; the stream counts
+//!   `rx_overflow`, restarts the transfer and lets the ARQ above recover
+//!   the lost frames.
 //! * **Line errors.** Framing, parity and glitch errors and FIFO overflows
 //!   are polled from the UART and counted; the protocol above treats each as
 //!   a corrupted frame.
@@ -89,6 +91,10 @@ pub struct UartCounters {
     /// UART FIFO overflows and DMA restarts (bytes lost).
     pub rx_overflow: u32,
     pub tx_transfers: u32,
+    /// Transfers the DMA refused to start (the bytes were not taken).
+    pub tx_refused: u32,
+    /// Transfers that ended (DMA done and the UART transmitter idle).
+    pub tx_completed: u32,
 }
 
 /// Which UART the stream drives (for polling its line-error flags while
@@ -119,6 +125,7 @@ pub struct UartDmaStream {
     rx: Option<UhciDmaRxTransfer<'static, Blocking, DmaRxStreamBuf>>,
     tx: Tx,
     port: UartPort,
+    dma_channel: usize,
     line: LineConfig,
     counters: UartCounters,
     pending_line_faults: u32,
@@ -126,12 +133,14 @@ pub struct UartDmaStream {
 
 impl UartDmaStream {
     /// Start the stream on a configured `uart` (pins already routed);
-    /// `port` must name the same UART instance.
+    /// `port` must name the same UART instance and `dma_channel` the GDMA
+    /// channel number of `dma` (its receive-stop flags are polled).
     pub fn new(
         uart: Uart<'static, Blocking>,
         port: UartPort,
         uhci0: UHCI0<'static>,
         dma: impl DmaChannelFor<AnyUhci<'static>>,
+        dma_channel: u8,
         memory: &'static mut UartDmaMemory,
         line: LineConfig,
     ) -> Result<Self, UartStreamError> {
@@ -157,6 +166,7 @@ impl UartDmaStream {
             rx: Some(rx),
             tx: Tx::Idle(tx, tx_buf),
             port,
+            dma_channel: usize::from(dma_channel),
             line,
             counters: UartCounters::default(),
             pending_line_faults: 0,
@@ -182,7 +192,14 @@ impl UartDmaStream {
         let Some(transfer) = self.rx.as_mut() else {
             return 0;
         };
-        let count = transfer.pop(buf);
+        // `DmaRxStreamBufView::pop` (esp-hal 1.0) loops until the whole
+        // destination is filled; bound it by what the DMA has completed so
+        // a read never blocks (found on the Thread BR H2, 2026-11-18).
+        let available = transfer.available_bytes().min(buf.len());
+        if available == 0 {
+            return 0;
+        }
+        let count = transfer.pop(&mut buf[..available]);
         self.counters.rx_bytes = self.counters.rx_bytes.saturating_add(count as u32);
         count
     }
@@ -200,8 +217,13 @@ impl UartDmaStream {
         if data.is_empty() {
             return 0;
         }
-        let Tx::Idle(tx, mut buf) = core::mem::replace(&mut self.tx, Tx::Lost) else {
+        // Only an idle buffer may be taken: replacing a running transfer
+        // would drop it (and lose the transmitter for good).
+        if !matches!(self.tx, Tx::Idle(..)) {
             return 0;
+        }
+        let Tx::Idle(tx, mut buf) = core::mem::replace(&mut self.tx, Tx::Lost) else {
+            unreachable!("checked above")
         };
         let count = data.len().min(UART_TX_BUFFER);
         buf.as_mut_slice()[..count].copy_from_slice(&data[..count]);
@@ -215,6 +237,7 @@ impl UartDmaStream {
             }
             Err((_, tx, buf)) => {
                 self.tx = Tx::Idle(tx, buf);
+                self.counters.tx_refused = self.counters.tx_refused.saturating_add(1);
                 0
             }
         }
@@ -246,23 +269,29 @@ impl UartDmaStream {
     }
 
     fn service_tx(&mut self) {
+        // The GDMA "total EOF" only says the DMA has read the buffer; UHCI
+        // and the UART FIFO still hold the tail. Stopping the channel then
+        // truncates the frame and can wedge UHCI (seen on the Thread BR H2,
+        // 2026-11-18), so the transfer ends only once the UART transmitter
+        // is idle as well (empty FIFO, transmit FSM idle) — the checks of
+        // esp-hal's blocking `wait()`/`flush()`, without waiting.
         if let Tx::Busy(transfer) = &self.tx
             && transfer.is_done()
+            && uart_tx_idle(self.port)
         {
             let Tx::Busy(transfer) = core::mem::replace(&mut self.tx, Tx::Lost) else {
                 unreachable!()
             };
-            // The DMA has handed every byte to the UART FIFO; stopping the
-            // channel here never waits for the FIFO to drain.
             let (tx, buf) = transfer.cancel();
             self.tx = Tx::Idle(tx, buf);
+            self.counters.tx_completed = self.counters.tx_completed.saturating_add(1);
         }
     }
 
     fn service_rx(&mut self) {
-        let Some(transfer) = self.rx.as_mut() else {
+        if self.rx.is_none() {
             return;
-        };
+        }
         let faults = take_line_faults(self.port);
         if faults.line_error {
             self.counters.rx_line_errors = self.counters.rx_line_errors.saturating_add(1);
@@ -273,9 +302,10 @@ impl UartDmaStream {
             self.counters.rx_overflow = self.counters.rx_overflow.saturating_add(1);
             self.pending_line_faults = self.pending_line_faults.saturating_add(1);
         }
-        // A finished receive transfer means the DMA ran out of descriptors
-        // (or failed): restart it, the bytes it could not take are lost.
-        if restart || transfer.is_done() {
+        // Only a stopped DMA (every descriptor full, or a descriptor error)
+        // needs a restart; the bytes it could not take are lost.
+        let stopped = take_rx_stopped(self.dma_channel);
+        if restart || stopped {
             if !restart {
                 self.counters.rx_overflow = self.counters.rx_overflow.saturating_add(1);
                 self.pending_line_faults = self.pending_line_faults.saturating_add(1);
@@ -285,6 +315,38 @@ impl UartDmaStream {
             self.rx = rx.read(buf).ok();
         }
     }
+}
+
+/// The UART has shifted out every byte: empty TX FIFO and an idle
+/// transmit state machine (esp-hal `UartTx::flush`).
+fn uart_tx_idle(port: UartPort) -> bool {
+    macro_rules! idle {
+        ($uart:ident) => {{
+            let regs = esp_hal::peripherals::$uart::regs();
+            regs.status().read().txfifo_cnt().bits() == 0
+                && regs.fsm_status().read().st_utx_out().bits() == 0
+        }};
+    }
+    match port {
+        UartPort::Uart0 => idle!(UART0),
+        UartPort::Uart1 => idle!(UART1),
+    }
+}
+
+/// Read and clear the GDMA receive-stop flags of `channel`
+/// (`in_dscr_empty`, `in_dscr_err`). The successful-EOF flag, set by every
+/// UART idle EOF, is cleared too so it never accumulates meaning.
+fn take_rx_stopped(channel: usize) -> bool {
+    let regs = esp_hal::peripherals::DMA::regs();
+    let int = regs.in_int_ch(channel);
+    let raw = int.raw().read();
+    let stopped = raw.in_dscr_empty().bit_is_set() || raw.in_dscr_err().bit_is_set();
+    int.clr().write(|w| {
+        w.in_dscr_empty().clear_bit_by_one();
+        w.in_dscr_err().clear_bit_by_one();
+        w.in_suc_eof().clear_bit_by_one()
+    });
+    stopped
 }
 
 struct LineFaults {
