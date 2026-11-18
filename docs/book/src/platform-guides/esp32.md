@@ -713,9 +713,13 @@ board yet (`status-led-selftest` does that).
 
 ### ESP32-C5 and the C6/H2 images
 
-Rebuilt with `--locked` before and after the change, with the source path
-prefix remapped so that only code is compared: see the branch report for the
-per-image result. The C6/H2 lockfiles are unchanged.
+The C6/H2 lockfiles are unchanged. Eight C6/H2 images (C6 sensor/ED/router,
+H2 sensor/ED/router/combo-light/thermometer) were built with `--locked` from
+`e07de1c` and from the C5 commit in the same directory (the crate hashes,
+and with them the RISC-V link order and relaxation, depend on the path):
+every application image has the same size, `.text`, `.data`, `.rwtext` and
+`.trap` are byte-identical, and `.rodata` differs only in 11–16 panic-location
+line numbers of edited source files. The thermometer image is byte-identical.
 
 ### ESP32-C5 hardware results
 
