@@ -1,12 +1,14 @@
 # Host ↔ Coordinator Protocol (ZRHP v1, design draft)
 
 > **Status: design specification. The user's decisions of 2026-11-18 are
-> applied (section 16). Nothing in this chapter is implemented yet.** The
-> zigbee-rs coordinator and Trust Center are host-tested only (see
+> applied (section 16).** The shared crate `zigbee-zrhp` (step 1 of section
+> 15) implements the framing, the link layer and every message and record
+> codec, and passes all vectors; it is host-tested only. The zigbee-rs
+> coordinator and Trust Center are host-tested only (see
 > [Coordinator & Router](coordinator-router.md)), and no backend advertises a
-> hardware coordinator. The link crate, NCP application, zigpy library, Go
-> adapter, zigbee-herdsman adapter and embedded hub described here do not
-> exist yet. Byte layouts are normative for v1. The golden vectors in
+> hardware coordinator. The NCP application, zigpy library, Go adapter,
+> zigbee-herdsman adapter and embedded hub described here do not exist yet.
+> Byte layouts are normative for v1. The golden vectors in
 > [`host-protocol-vectors/`](host-protocol-vectors/generate.py) are generated
 > from these layouts by a small Python script. The script is a vector
 > generator, not an implementation.
@@ -468,6 +470,21 @@ local status `LINK_REJECTED` and must not retransmit the frame. The peer is
 told explicitly, the counter `tx_rejected` increases, and the link keeps
 making progress. Rejection is never silent.
 
+Only the rejections a receiver can record consume the `seq`: `NO_CREDIT`,
+`TOO_LONG` and `UNKNOWN_ENDPOINT` (the latter consumes no `ep_seq`, because
+the endpoint is unknown). The other reasons do not concern a frame the
+receiver recorded:
+
+- `WINDOW_VIOLATION` (R5): the `seq` lies outside the receiver's bitmap, so
+  the receiver cannot mark it and its `ack` could never pass it. The sender
+  reports the frame's messages with `LINK_REJECTED`, reports `LINK_FAILED`
+  and resets the session with reason 2 (protocol error). Only a peer bug
+  causes this.
+- `STALE_EPOCH` and `UNSUPPORTED` refer to frames of another session or of
+  an unknown version/type. They are counted and change no ARQ state.
+- `NOT_IN_SESSION` is reserved: a side in `RESETTING` discards non-RESET
+  frames silently and counts them (5.5).
+
 ### 5.4 Example (from `link_frames.json`)
 
 Host `RESET_REQ` (cookie `0x1A2B3C4D`, window 32, MTU 640, ack delay
@@ -525,6 +542,11 @@ States are `UNSYNCED`, `RESETTING` and `ESTABLISHED`.
    - In both cases the side resets all ARQ and endpoint state. Every unacked
      message fails locally with `LINK_RESET` (subject to 6.5). The side
      replies `RESET_ACK{cookie=own, peer_cookie=C}` and enters `RESETTING`.
+     Frames that were already accepted for delivery before the reset are
+     still delivered to the upper layer.
+   - A repeated `RESET_REQ{cookie=C}` that arrives while the side is still
+     `RESETTING` and has already answered `C` means the answer was lost: the
+     side sends `RESET_ACK` again, without another reset or report.
 4. A side that receives `RESET_ACK{peer_cookie == own cookie}` enters
    `ESTABLISHED`. If it has not yet answered the peer's request, it sends one
    `RESET_ACK` (with the cookie from the received `RESET_ACK`) so that both
@@ -532,6 +554,15 @@ States are `UNSYNCED`, `RESETTING` and `ESTABLISHED`.
    ignored and counted (`rx_stale_reset`).
 5. Simultaneous `RESET_REQ`s are allowed. Each side answers the other's, and
    both establish when the matching `RESET_ACK` arrives.
+6. **Retries and lost `RESET_ACK`s.** While `RESETTING`, a side repeats its
+   last handshake frame every `reset_retry` (200 ms doubling to 2 s): the
+   `RESET_ACK` if it has answered a request in this handshake, otherwise its
+   `RESET_REQ`. A side that is already `ESTABLISHED` and receives a
+   duplicate `RESET_ACK` of the current session (same cookies) answers it
+   with one `RESET_ACK`, but only while it has not yet received any
+   in-session frame from the peer and at most once per `reset_retry`. This
+   repairs a lost final `RESET_ACK` without a ping-pong between two
+   established sides.
 
 **Negotiated parameters (per direction):**
 
@@ -595,8 +626,9 @@ Rules:
   (capped at `RTO_max`), and do not take RTT samples from retransmitted
   frames (Karn). After an RTT sample, recompute
   `RTO = clamp(SRTT + 4·RTTVAR, RTO_min, RTO_max)` as in RFC 6298.
-- **S4 (failure).** A frame retransmitted `N_retx_max` (10) times declares
-  the link failed. The sender reports `LINK_FAILED` and starts a reset with
+- **S4 (failure).** When a frame that was already retransmitted
+  `N_retx_max` (10) times needs another retransmission, the link is
+  declared failed. The sender reports `LINK_FAILED` and starts a reset with
   reason 3.
 - **S5 (blocked sender).** A sender that is blocked on credit or window for
   more than `keepalive_ms` sends `ACK | POLL` to elicit a fresh credit and
@@ -633,8 +665,8 @@ On a valid DATA frame with seq `s` (`d = (s − ack) mod 256`):
   frame, send REJECT `WINDOW_VIOLATION` and count it.
 - **R6 (error).** On a COBS/length/CRC/UART error, increment `nbad` and send
   NAK immediately. CRC-triggered NAKs are rate-limited to one per
-  `ack_delay`; when the hold-off ends, one more NAK is sent if `nbad` has
-  changed. `nbad` resets to 0 on the next valid frame.
+  `ack_delay`; when the hold-off ends, one more NAK is sent if `nbad`
+  differs from the value carried by the last ACK or NAK sent. `nbad` resets to 0 on the next valid frame.
 - **R7 (POLL).** Any frame with `POLL` gets an ACK immediately after it is
   processed.
 - **R8 (credits).** When a consumer frees a buffer, advance that endpoint's
@@ -692,8 +724,9 @@ fill, sender reaction to the gap, a CRC error with `nbad`, sender reaction to
 `nbad`, tail loss recovered by RTO, a duplicate after a lost ACK, and credit
 unblocking. Every implementation must drive its state machine with a virtual
 clock and emit exactly the listed frames (type, `ack`, `sack`, `nbad`,
-retransmitted seq, flags) at exactly the listed times. Section 14 lists the
-remaining conformance cases.
+retransmitted seq, flags) at exactly the listed times. In the sender traces,
+`final.unacked` lists the frames acknowledged neither cumulatively nor by
+SACK. Section 14 lists the remaining conformance cases.
 
 ### 5.10 Endpoints, priorities and credits
 
@@ -1900,7 +1933,7 @@ Each record is a TLV: `u8 type, u16 len, value[len]`.
 | `0x08` | `SOURCE_ROUTE` | `u16 dst, u8 n, n×u16 relays` (path order from the coordinator) | 3+2n |
 | `0x09` | `GP_PROXY` | `u8 format_version, entry[]` (zigbee-rs `gp_store` entry encoding) | var |
 | `0x0A` | `RS_PARAMS` | `u32 fc_stride, u32 table_epoch, u32 nwk_fc_limit, u32 aps_fc_limit, u8 flags (bit0 host-backed tables)` | 17 |
-| `0x0B` | `GP_SINK` | `gpd_id` (`u8 app_id`; then `u32 src_id`, or `[8] ieee, u8 endpoint`), `u8 device_id, u8 communication_mode, u16 group (FFFF none), u16 assigned_alias (FFFF derived), u8 flags (bit0 MAC seq capable, bit1 rx-on capable, bit2 fixed location, bit3 key present), u8 security_level, u8 key_type, [16] key (if bit3), u32 frame_counter, u8 groupcast_radius` | 19..39 |
+| `0x0B` | `GP_SINK` | `gpd_id` (`u8 app_id`; then `u32 src_id`, or `[8] ieee, u8 endpoint`), `u8 device_id, u8 communication_mode, u16 group (FFFF none), u16 assigned_alias (FFFF derived), u8 flags (bit0 MAC seq capable, bit1 rx-on capable, bit2 fixed location, bit3 key present), u8 security_level, u8 key_type, [16] key (if bit3), u32 frame_counter, u8 groupcast_radius` | 19..40 |
 | `0xFF` | `END` | `u32 record_count, u32 crc32c` over the concatenated TLV bytes of all preceding records in the stream | 8 |
 
 `DEVICE.flags`:
@@ -2900,9 +2933,9 @@ Controls:
 | `ezsp_hashed_tclk.json` | **Candidate** EZSP hashed-TCLK keys for both EUI64 byte orders | NCP derivation; one candidate is promoted to normative by gate H5 |
 
 `generate.py --check` fails if a committed JSON file differs from the
-generator output. It is not wired into CI yet; the plan is to add it with the
-first link-layer crate (step 1 in section 15). Implementations load the JSON
-files directly; they do not copy values.
+generator output; CI runs it. Implementations load the JSON files directly;
+they do not copy values. The Rust reference (`zigbee-zrhp/tests/`) drives
+every file byte-exact.
 
 ### 14.2 Link conformance and property tests (Rust reference first)
 
