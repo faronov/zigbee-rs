@@ -1,0 +1,360 @@
+{
+  "assumptions": {
+    "rx_window": 8,
+    "ack_delay_us": 1000,
+    "rto_initial_us": 100000,
+    "processing_time_us": 0,
+    "rto_adaptive": false,
+    "ack_every_frames": 4,
+    "note": "ack/sack/nbad as in link frames; RTO stays at rto_initial_us until a timeout doubles it (no RTT samples in these traces)"
+  },
+  "scenarios": [
+    {
+      "name": "in_order_delayed_ack",
+      "role": "receiver",
+      "inputs": [
+        {
+          "t": 0,
+          "data": 0
+        },
+        {
+          "t": 100,
+          "data": 1
+        },
+        {
+          "t": 200,
+          "data": 2
+        }
+      ],
+      "expect": [
+        {
+          "t": 1000,
+          "send": "ACK",
+          "ack": 3,
+          "sack": 0
+        }
+      ],
+      "delivered": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "gap_then_fill",
+      "role": "receiver",
+      "inputs": [
+        {
+          "t": 0,
+          "data": 0
+        },
+        {
+          "t": 100,
+          "data": 1
+        },
+        {
+          "t": 300,
+          "data": 3
+        },
+        {
+          "t": 400,
+          "data": 4
+        },
+        {
+          "t": 600,
+          "data": 2,
+          "retx": true
+        }
+      ],
+      "expect": [
+        {
+          "t": 300,
+          "send": "NAK",
+          "ack": 2,
+          "sack": 1
+        },
+        {
+          "t": 400,
+          "send": "NAK",
+          "ack": 2,
+          "sack": 3
+        },
+        {
+          "t": 600,
+          "send": "ACK",
+          "ack": 5,
+          "sack": 0
+        }
+      ],
+      "delivered": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "name": "gap_sender_reaction",
+      "role": "sender",
+      "inputs": [
+        {
+          "t": 0,
+          "send_new": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        {
+          "t": 300,
+          "recv": "NAK",
+          "ack": 2,
+          "sack": 1
+        },
+        {
+          "t": 400,
+          "recv": "NAK",
+          "ack": 2,
+          "sack": 3
+        },
+        {
+          "t": 600,
+          "recv": "ACK",
+          "ack": 5,
+          "sack": 0
+        }
+      ],
+      "expect": [
+        {
+          "t": 300,
+          "retransmit": 2,
+          "flags": [
+            "RETX"
+          ]
+        }
+      ],
+      "final": {
+        "base": 5,
+        "unacked": []
+      }
+    },
+    {
+      "name": "crc_error_nbad",
+      "role": "receiver",
+      "inputs": [
+        {
+          "t": 0,
+          "data": 0
+        },
+        {
+          "t": 100,
+          "crc_error": true
+        },
+        {
+          "t": 200,
+          "data": 2
+        },
+        {
+          "t": 400,
+          "data": 1,
+          "retx": true
+        }
+      ],
+      "expect": [
+        {
+          "t": 100,
+          "send": "NAK",
+          "ack": 1,
+          "sack": 0,
+          "nbad": 1
+        },
+        {
+          "t": 200,
+          "send": "NAK",
+          "ack": 1,
+          "sack": 1,
+          "nbad": 0
+        },
+        {
+          "t": 400,
+          "send": "ACK",
+          "ack": 3,
+          "sack": 0
+        }
+      ],
+      "delivered": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "crc_error_sender_reaction",
+      "role": "sender",
+      "inputs": [
+        {
+          "t": 0,
+          "send_new": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "t": 100,
+          "recv": "NAK",
+          "ack": 1,
+          "sack": 0,
+          "nbad": 1
+        },
+        {
+          "t": 200,
+          "recv": "NAK",
+          "ack": 1,
+          "sack": 1,
+          "nbad": 0
+        }
+      ],
+      "expect": [
+        {
+          "t": 100,
+          "retransmit": 1,
+          "flags": [
+            "RETX"
+          ]
+        }
+      ],
+      "final": {
+        "base": 1,
+        "unacked": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "tail_loss_rto",
+      "role": "sender",
+      "inputs": [
+        {
+          "t": 0,
+          "send_new": [
+            0
+          ]
+        },
+        {
+          "t": 100,
+          "send_new": [
+            1
+          ]
+        },
+        {
+          "t": 1000,
+          "recv": "ACK",
+          "ack": 1,
+          "sack": 0
+        }
+      ],
+      "expect": [
+        {
+          "t": 100100,
+          "retransmit": 1,
+          "flags": [
+            "RETX",
+            "POLL"
+          ]
+        }
+      ],
+      "final": {
+        "base": 1,
+        "unacked": [
+          1
+        ],
+        "rto_us": 200000
+      }
+    },
+    {
+      "name": "duplicate_after_lost_ack",
+      "role": "receiver",
+      "inputs": [
+        {
+          "t": 0,
+          "data": 0
+        },
+        {
+          "t": 100500,
+          "data": 0,
+          "retx": true,
+          "poll": true
+        }
+      ],
+      "expect": [
+        {
+          "t": 1000,
+          "send": "ACK",
+          "ack": 1,
+          "sack": 0
+        },
+        {
+          "t": 100500,
+          "send": "ACK",
+          "ack": 1,
+          "sack": 0
+        }
+      ],
+      "delivered": [
+        0
+      ],
+      "counters": {
+        "rx_duplicate": 1
+      }
+    },
+    {
+      "name": "credit_unblock",
+      "role": "receiver",
+      "inputs": [
+        {
+          "t": 0,
+          "data": 0,
+          "endpoint": 4,
+          "ep_seq": 0
+        },
+        {
+          "t": 100,
+          "data": 1,
+          "endpoint": 4,
+          "ep_seq": 1
+        },
+        {
+          "t": 5000,
+          "consumer_frees": {
+            "endpoint": 4,
+            "frames": 1
+          }
+        }
+      ],
+      "initial_credit_edge": {
+        "4": 2
+      },
+      "expect": [
+        {
+          "t": 1000,
+          "send": "ACK",
+          "ack": 2,
+          "sack": 0
+        },
+        {
+          "t": 5000,
+          "send": "ACK",
+          "ack": 2,
+          "sack": 0,
+          "credits": {
+            "4": 3
+          }
+        }
+      ]
+    }
+  ]
+}

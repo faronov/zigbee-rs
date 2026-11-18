@@ -1,0 +1,370 @@
+[
+  {
+    "name": "sys_negotiate_req",
+    "endpoint": 1,
+    "kind": 0,
+    "msg_id": "0x0001",
+    "tid": 1,
+    "note": "host supports major 1 only, no host capability bits",
+    "fields": {
+      "major_min": 1,
+      "major_max": 1,
+      "host_caps": 0,
+      "name": "zigpy-zrs/0.1"
+    },
+    "payload_hex": "010100000000000000000d7a696770792d7a72732f302e31",
+    "message_hex": "00010001001800010100000000000000000d7a696770792d7a72732f302e31"
+  },
+  {
+    "name": "sys_negotiate_rsp",
+    "endpoint": 1,
+    "kind": 1,
+    "msg_id": "0x0001",
+    "tid": 1,
+    "note": "v1.0 selected",
+    "fields": {
+      "status": 0,
+      "major": 1,
+      "minor": 0,
+      "ncp_caps": "0x00000000001787fb",
+      "capacities": {
+        "1": 16,
+        "2": 64,
+        "3": 256,
+        "4": 512,
+        "5": 128,
+        "6": 100,
+        "7": 1024,
+        "8": 8,
+        "13": 16,
+        "14": 8,
+        "15": 16,
+        "16": 8,
+        "17": 8,
+        "18": 256
+      },
+      "fw": "0.1.0",
+      "chip": 1
+    },
+    "payload_hex": "000100fb871700000000000e011000000002400000000300010000040002000005800000000664000000070004000008080000000d100000000e080000000f1000000010080000001108000000120001000005302e312e300123456789abcdef01",
+    "message_hex": "40010001006100000100fb871700000000000e011000000002400000000300010000040002000005800000000664000000070004000008080000000d100000000e080000000f1000000010080000001108000000120001000005302e312e300123456789abcdef01"
+  },
+  {
+    "name": "evt_ncp_ready",
+    "endpoint": 1,
+    "kind": 2,
+    "msg_id": "0x0080",
+    "tid": 1,
+    "note": "power-on reset, network formed and up",
+    "fields": {
+      "ncp_cookie": "c0ffee01",
+      "reset_reason": 1,
+      "network_state": 2,
+      "table_epoch": 7,
+      "nwk_fc_limit": 2011024,
+      "aps_fc_limit": 14024,
+      "dirty_writebacks": 0,
+      "dropped_indications": 0
+    },
+    "payload_hex": "01eeffc001020700000090af1e00c8360000000000000000",
+    "message_hex": "8080000100180001eeffc001020700000090af1e00c8360000000000000000"
+  },
+  {
+    "name": "aps_data_request_unicast",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0201",
+    "tid": 258,
+    "note": "Basic cluster read attributes, APS ACK, NWK address mode",
+    "fields": {
+      "dst_mode": 2,
+      "dst": "0x1a2b",
+      "dst_ep": 1,
+      "src_ep": 1,
+      "profile": "0x0104",
+      "cluster": "0x0000",
+      "tx_options": 1,
+      "radius": 0,
+      "priority": 1
+    },
+    "payload_hex": "022b1a010104010000010000010700002a0004000500",
+    "message_hex": "00010202011600022b1a010104010000010000010700002a0004000500"
+  },
+  {
+    "name": "aps_data_request_source_routed",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0201",
+    "tid": 259,
+    "note": "On/Off Toggle via relays 0x1a2b then 0x3c4d (path order from the coordinator)",
+    "fields": {
+      "relays": [
+        "0x1a2b",
+        "0x3c4d"
+      ]
+    },
+    "payload_hex": "023e8f01010401060041000001022b1a4d3c0300012b02",
+    "message_hex": "00010203011700023e8f01010401060041000001022b1a4d3c0300012b02"
+  },
+  {
+    "name": "aps_data_request_rsp_accepted",
+    "endpoint": 2,
+    "kind": 1,
+    "msg_id": "0x0201",
+    "tid": 258,
+    "note": "accepted into the APS queue; confirm follows",
+    "fields": {},
+    "payload_hex": "00",
+    "message_hex": "4001020201010000"
+  },
+  {
+    "name": "aps_data_request_rsp_busy",
+    "endpoint": 2,
+    "kind": 1,
+    "msg_id": "0x0201",
+    "tid": 259,
+    "note": "queue full: BUSY, nothing was sent",
+    "fields": {},
+    "payload_hex": "02",
+    "message_hex": "4001020301010002"
+  },
+  {
+    "name": "evt_aps_data_confirm",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0281",
+    "tid": 17,
+    "note": "APS ACK received after 23 ms",
+    "fields": {
+      "req_tid": "0x0102",
+      "zb_status": 0,
+      "aps_counter": 55
+    },
+    "payload_hex": "02010000372b1a011700",
+    "message_hex": "80810211000a0002010000372b1a011700"
+  },
+  {
+    "name": "evt_aps_data_indication",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0280",
+    "tid": 18,
+    "note": "attribute report, NWK secured, source IEEE known",
+    "fields": {
+      "src_nwk": "0x8f3e",
+      "src_ieee": "00158d0004c5d6e7",
+      "lqi": 180,
+      "rssi": -61,
+      "last_hop": "0x1a2b",
+      "flags": 6,
+      "key_source": 0
+    },
+    "payload_hex": "020000013e8fe7d6c504008d1500010401020406b4c32b1a5c0040e20100080018050a0000293409",
+    "message_hex": "80800212002800020000013e8fe7d6c504008d1500010401020406b4c32b1a5c0040e20100080018050a0000293409"
+  },
+  {
+    "name": "nwk_permit_join",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0105",
+    "tid": 260,
+    "note": "254 s on all routers with TC significance",
+    "fields": {},
+    "payload_hex": "fefcff01",
+    "message_hex": "00050104010400fefcff01"
+  },
+  {
+    "name": "evt_device_joined",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0181",
+    "tid": 19,
+    "note": "association through router 0x1a2b, admitted",
+    "fields": {},
+    "payload_hex": "214f0c0b0afeff142e842b1a008000",
+    "message_hex": "80810113000f00214f0c0b0afeff142e842b1a008000"
+  },
+  {
+    "name": "evt_route_record",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0185",
+    "tid": 20,
+    "note": "relays in Route Record order (first entry nearest the originator)",
+    "fields": {},
+    "payload_hex": "3e8fe7d6c504008d1500024d3c2b1a",
+    "message_hex": "80850114000f003e8fe7d6c504008d1500024d3c2b1a"
+  },
+  {
+    "name": "sec_add_install_code",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0403",
+    "tid": 261,
+    "note": "16-byte install code + CRC (little-endian 0x90D4)",
+    "fields": {},
+    "payload_hex": "0c0b0afeff142e841288776655443322111122334455667788d490",
+    "message_hex": "00030405011b000c0b0afeff142e841288776655443322111122334455667788d490"
+  },
+  {
+    "name": "sec_add_install_code_rsp",
+    "endpoint": 2,
+    "kind": 1,
+    "msg_id": "0x0403",
+    "tid": 261,
+    "note": "derived key returned for the host link-key store",
+    "fields": {
+      "derived_key": "fa8081caaa41d5ade9b5658799268b88"
+    },
+    "payload_hex": "00fa8081caaa41d5ade9b5658799268b88",
+    "message_hex": "4003040501110000fa8081caaa41d5ade9b5658799268b88"
+  },
+  {
+    "name": "evt_fc_checkpoint",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0483",
+    "tid": 21,
+    "note": "NWK domain, key seq 1, new durable limit",
+    "fields": {},
+    "payload_hex": "010190b31e0007000000",
+    "message_hex": "80830415000a00010190b31e0007000000"
+  },
+  {
+    "name": "tbl_lookup_req",
+    "endpoint": 3,
+    "kind": 0,
+    "msg_id": "0x0501",
+    "tid": 1,
+    "note": "NCP->host: DEVICE table (0x05) by NWK 0x4f21",
+    "fields": {},
+    "payload_hex": "0502214f",
+    "message_hex": "000105010004000502214f"
+  },
+  {
+    "name": "tbl_lookup_rsp",
+    "endpoint": 3,
+    "kind": 1,
+    "msg_id": "0x0501",
+    "tid": 1,
+    "note": "host returns rev 41 device record with link key",
+    "fields": {},
+    "payload_hex": "00290000000526000c0b0afeff142e84214f0aa0a1a2a3a4a5a6a7a8a9aaabacadaeaf000203c836000003000000",
+    "message_hex": "40010501002e0000290000000526000c0b0afeff142e84214f0aa0a1a2a3a4a5a6a7a8a9aaabacadaeaf000203c836000003000000"
+  },
+  {
+    "name": "tbl_writeback_evict",
+    "endpoint": 3,
+    "kind": 0,
+    "msg_id": "0x0502",
+    "tid": 2,
+    "note": "NCP evicts a dirty entry; host must fsync first",
+    "fields": {},
+    "payload_hex": "0503390000000526000c0b0afeff142e84214f0aa0a1a2a3a4a5a6a7a8a9aaabacadaeaf000203c836000003000000",
+    "message_hex": "00020502002f000503390000000526000c0b0afeff142e84214f0aa0a1a2a3a4a5a6a7a8a9aaabacadaeaf000203c836000003000000"
+  },
+  {
+    "name": "sec_lock_key_export",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x040a",
+    "tid": 262,
+    "note": "confirm word 'LOCK'; key export refused until reboot",
+    "fields": {},
+    "payload_hex": "4c4f434b",
+    "message_hex": "000a04060104004c4f434b"
+  },
+  {
+    "name": "sec_lock_key_export_rsp",
+    "endpoint": 2,
+    "kind": 1,
+    "msg_id": "0x040a",
+    "tid": 262,
+    "note": "locked",
+    "fields": {},
+    "payload_hex": "00",
+    "message_hex": "400a040601010000"
+  },
+  {
+    "name": "sys_set_uart",
+    "endpoint": 1,
+    "kind": 0,
+    "msg_id": "0x0009",
+    "tid": 5,
+    "note": "switch to 921600, no RTS/CTS, after 50 ms",
+    "fields": {},
+    "payload_hex": "00100e00003200",
+    "message_hex": "0009000500070000100e00003200"
+  },
+  {
+    "name": "evt_log_record",
+    "endpoint": 5,
+    "kind": 2,
+    "msg_id": "0x0980",
+    "tid": 1,
+    "note": "UTF-8 text record (level 3 info)",
+    "fields": {
+      "time_ms": 5321,
+      "level": 3,
+      "module": 2,
+      "seq": 17,
+      "text": "zrhp: session up, window 16"
+    },
+    "payload_hex": "c9140000030211007a7268703a2073657373696f6e2075702c2077696e646f77203136",
+    "message_hex": "80800901002300c9140000030211007a7268703a2073657373696f6e2075702c2077696e646f77203136"
+  },
+  {
+    "name": "gp_sink_config_zigpy",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0a01",
+    "tid": 263,
+    "note": "NCP sink authoritative; pre-commissioned groupcast to 0x0B84 and security level 0 like zigpy (decision N1)",
+    "fields": {
+      "mode": 1,
+      "communication_mode": 2,
+      "group": "0x0b84",
+      "exit_mode": 5,
+      "window_s": 180,
+      "security_level": 0,
+      "groupcast_radius": 0
+    },
+    "payload_hex": "0102840b05b4000000",
+    "message_hex": "00010a070109000102840b05b4000000"
+  },
+  {
+    "name": "gp_sink_commissioning_enter",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0a03",
+    "tid": 264,
+    "note": "enter, involve proxies, 254 s (zigpy permit)",
+    "fields": {},
+    "payload_hex": "0101fe00",
+    "message_hex": "00030a080104000101fe00"
+  },
+  {
+    "name": "evt_gp_commissioned",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0a82",
+    "tid": 22,
+    "note": "SrcID 0x293c9879 commissioned; R_GP_SINK record (key present: export allowed)",
+    "fields": {
+      "record_hex": "0b23000079983c290202840bffff090304c0c1c2c3c4c5c6c7c8c9cacbcccdcecf6011000000"
+    },
+    "payload_hex": "0079983c2902020b23000079983c290202840bffff090304c0c1c2c3c4c5c6c7c8c9cacbcccdcecf6011000000",
+    "message_hex": "80820a16002d000079983c2902020b23000079983c290202840bffff090304c0c1c2c3c4c5c6c7c8c9cacbcccdcecf6011000000"
+  },
+  {
+    "name": "evt_gp_frame_toggle",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0a80",
+    "tid": 23,
+    "note": "direct GPDF accepted by the NCP sink: Toggle, decrypted, passed through",
+    "fields": {},
+    "payload_hex": "01010079983c29022261110000030402ffffffd0dc00",
+    "message_hex": "80800a1700160001010079983c29022261110000030402ffffffd0dc00"
+  }
+]

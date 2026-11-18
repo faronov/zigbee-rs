@@ -60,6 +60,7 @@
 - [Firmware Size](./advanced/firmware-size.md)
 - [Porting a Radio to SoftMacCore](./advanced/soft-mac-porting.md)
 - [Coordinator & Router](./advanced/coordinator-router.md)
+- [Host ↔ Coordinator Protocol (ZRHP design)](./advanced/host-protocol.md)
 - [Green Power (design draft)](./advanced/green-power.md)
 - [Sniffing & Frame Injection](./advanced/radio-lab.md)
 

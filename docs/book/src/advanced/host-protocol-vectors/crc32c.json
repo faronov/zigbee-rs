@@ -1,0 +1,21 @@
+{
+  "algorithm": "CRC-32C (Castagnoli) reflected poly 0x82F63B78, init 0xFFFFFFFF, xorout 0xFFFFFFFF, stored little-endian",
+  "vectors": [
+    {
+      "input_ascii": "123456789",
+      "crc32c": "e3069283"
+    },
+    {
+      "input_hex": "",
+      "crc32c": "00000000"
+    },
+    {
+      "input_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "crc32c": "8a9136aa"
+    },
+    {
+      "input_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "crc32c": "62a8ab43"
+    }
+  ]
+}

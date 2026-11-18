@@ -1,0 +1,288 @@
+{
+  "note": "Synthetic EZSP-origin backup restored into a zigbee-rs NCP and exported again. Keys and addresses are made up; do not use them on a real network.",
+  "input_ocb": {
+    "metadata": {
+      "version": 1,
+      "format": "zigpy/open-coordinator-backup",
+      "source": "bellows@0.0.0-synthetic",
+      "internal": {
+        "creation_time": "2026-11-01T10:00:00+00:00",
+        "node": {
+          "ieee": "f4b3b1fffe1a2b3c",
+          "nwk": "0000",
+          "type": "coordinator"
+        },
+        "network": {
+          "tc_link_key": {
+            "key": "5a6967426565416c6c69616e63653039",
+            "frame_counter": 3000
+          },
+          "tc_address": "f4b3b1fffe1a2b3c",
+          "nwk_manager": "0000"
+        },
+        "link_key_seqs": {
+          "0017880102a1b2c3": 0,
+          "842e14fffe0a0b0c": 0
+        },
+        "tx_power": 8,
+        "ezspVersion": 13
+      }
+    },
+    "stack_specific": {
+      "ezsp": {
+        "hashed_tclk": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+      }
+    },
+    "coordinator_ieee": "f4b3b1fffe1a2b3c",
+    "pan_id": "4c2a",
+    "extended_pan_id": "a1b2c3d4e5f60718",
+    "nwk_update_id": 2,
+    "security_level": 5,
+    "channel": 20,
+    "channel_mask": [
+      15,
+      20,
+      25
+    ],
+    "network_key": {
+      "key": "8b5d1f3c6a7e9d2b4f0a1c3e5d7f9b2a",
+      "sequence_number": 1,
+      "frame_counter": 2000000
+    },
+    "devices": [
+      {
+        "ieee_address": "0017880102a1b2c3",
+        "nwk_address": "1a2b",
+        "is_child": false,
+        "link_key": {
+          "key": "11223344556677881122334455667788",
+          "tx_counter": 0,
+          "rx_counter": 57
+        }
+      },
+      {
+        "ieee_address": "00158d0004c5d6e7",
+        "nwk_address": "8f3e",
+        "is_child": true
+      },
+      {
+        "ieee_address": "842e14fffe0a0b0c",
+        "nwk_address": null,
+        "is_child": false,
+        "link_key": {
+          "key": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+          "tx_counter": 12,
+          "rx_counter": 3
+        }
+      },
+      {
+        "ieee_address": "000d6f000e1f2a3b",
+        "nwk_address": "abc"
+      }
+    ]
+  },
+  "restore": {
+    "nwk_margin": 10000,
+    "aps_margin": 10000,
+    "allow_ieee_change": true,
+    "records": [
+      {
+        "type": "NODE",
+        "hex": "010c003c2b1afeffb1b3f400000001"
+      },
+      {
+        "type": "NETWORK",
+        "hex": "0214002a4c1807f6e5d4c3b2a114008010020200000508"
+      },
+      {
+        "type": "NETWORK_KEY",
+        "hex": "0316008b5d1f3c6a7e9d2b4f0a1c3e5d7f9b2a0180841e0001"
+      },
+      {
+        "type": "TC_LINK_KEY",
+        "hex": "041d005a6967426565416c6c69616e636530393c2b1afeffb1b3f4b80b000001"
+      },
+      {
+        "type": "EZSP_HASHED_TCLK",
+        "hex": "0610000f1e2d3c4b5a69788796a5b4c3d2e1f0"
+      },
+      {
+        "type": "DEVICE",
+        "hex": "050d003b2a1f0e006f0d00bc0a0d8008"
+      },
+      {
+        "type": "DEVICE",
+        "hex": "050d00e7d6c504008d15003e8f0d8008"
+      },
+      {
+        "type": "DEVICE",
+        "hex": "052600c3b2a102018817002b1a0a112233445566778811223344556677880002030000000039000000"
+      },
+      {
+        "type": "DEVICE",
+        "hex": "0526000c0b0afeff142e84ffff02a0a1a2a3a4a5a6a7a8a9aaabacadaeaf0002030c00000003000000"
+      },
+      {
+        "type": "END",
+        "hex": "ff080009000000e4c2ac7a"
+      }
+    ],
+    "messages": {
+      "begin": "00110601020d000110270000102700000a000000",
+      "begin_rsp": "401106010205000001001000",
+      "put": "0012060202f1000100010c003c2b1afeffb1b3f4000000010214002a4c1807f6e5d4c3b2a1140080100202000005080316008b5d1f3c6a7e9d2b4f0a1c3e5d7f9b2a0180841e0001041d005a6967426565416c6c69616e636530393c2b1afeffb1b3f4b80b0000010610000f1e2d3c4b5a69788796a5b4c3d2e1f0050d003b2a1f0e006f0d00bc0a0d8008050d00e7d6c504008d15003e8f0d8008052600c3b2a102018817002b1a0a1122334455667788112233445566778800020300000000390000000526000c0b0afeff142e84ffff02a0a1a2a3a4a5a6a7a8a9aaabacadaeaf0002030c00000003000000ff080009000000e4c2ac7a",
+      "put_rsp": "40120602020400000a0000",
+      "commit": "001306030202000100",
+      "commit_rsp": "40130603020f000090ab1e00c8320000020000000200"
+    },
+    "ncp_state": {
+      "nwk_fc_start": 2010000,
+      "nwk_fc_limit": 2011024,
+      "aps_fc_start": 13000,
+      "aps_fc_limit": 14024,
+      "children": 2,
+      "link_keys_on_ncp": 2,
+      "link_keys_host_backed": 0
+    }
+  },
+  "export": {
+    "table_epoch": 7,
+    "records": [
+      {
+        "type": "NODE",
+        "hex": "010c003c2b1afeffb1b3f400000001"
+      },
+      {
+        "type": "NETWORK",
+        "hex": "0214002a4c1807f6e5d4c3b2a114008010020200000508"
+      },
+      {
+        "type": "NETWORK_KEY",
+        "hex": "0316008b5d1f3c6a7e9d2b4f0a1c3e5d7f9b2a0190af1e0001"
+      },
+      {
+        "type": "TC_LINK_KEY",
+        "hex": "041d005a6967426565416c6c69616e636530393c2b1afeffb1b3f4c836000001"
+      },
+      {
+        "type": "EZSP_HASHED_TCLK",
+        "hex": "0610000f1e2d3c4b5a69788796a5b4c3d2e1f0"
+      },
+      {
+        "type": "RS_PARAMS",
+        "hex": "0a1100000400000700000090af1e00c836000001"
+      },
+      {
+        "type": "DEVICE",
+        "hex": "050d003b2a1f0e006f0d00bc0a0d8008"
+      },
+      {
+        "type": "DEVICE",
+        "hex": "050d00e7d6c504008d15003e8f0d8008"
+      },
+      {
+        "type": "DEVICE",
+        "hex": "052600c3b2a102018817002b1a0a11223344556677881122334455667788000203c836000039000000"
+      },
+      {
+        "type": "DEVICE",
+        "hex": "0526000c0b0afeff142e84ffff02a0a1a2a3a4a5a6a7a8a9aaabacadaeaf000203c836000003000000"
+      },
+      {
+        "type": "END",
+        "hex": "ff08000a000000cc08908d"
+      }
+    ]
+  },
+  "output_ocb": {
+    "metadata": {
+      "version": 1,
+      "format": "zigpy/open-coordinator-backup",
+      "source": "zigbee-rs-reference@spec-v1",
+      "internal": {
+        "creation_time": "2026-11-15T12:00:00+00:00",
+        "node": {
+          "ieee": "f4b3b1fffe1a2b3c",
+          "nwk": "0000",
+          "type": "coordinator"
+        },
+        "network": {
+          "tc_link_key": {
+            "key": "5a6967426565416c6c69616e63653039",
+            "frame_counter": 14024
+          },
+          "tc_address": "f4b3b1fffe1a2b3c",
+          "nwk_manager": "0000"
+        },
+        "link_key_seqs": {
+          "0017880102a1b2c3": 0,
+          "842e14fffe0a0b0c": 0
+        },
+        "tx_power": 8
+      }
+    },
+    "stack_specific": {
+      "ezsp": {
+        "hashed_tclk": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+      },
+      "zigbee_rs": {
+        "version": 1,
+        "frame_counter_stride": 1024,
+        "table_epoch": 7,
+        "nwk_frame_counter_limit": 2011024,
+        "aps_frame_counter_limit": 14024,
+        "host_backed_tables": true,
+        "gp_proxy_table": [],
+        "gp_sink_table": []
+      }
+    },
+    "coordinator_ieee": "f4b3b1fffe1a2b3c",
+    "pan_id": "4c2a",
+    "extended_pan_id": "a1b2c3d4e5f60718",
+    "nwk_update_id": 2,
+    "security_level": 5,
+    "channel": 20,
+    "channel_mask": [
+      15,
+      20,
+      25
+    ],
+    "network_key": {
+      "key": "8b5d1f3c6a7e9d2b4f0a1c3e5d7f9b2a",
+      "sequence_number": 1,
+      "frame_counter": 2011024
+    },
+    "devices": [
+      {
+        "ieee_address": "000d6f000e1f2a3b",
+        "nwk_address": "0abc",
+        "is_child": true
+      },
+      {
+        "ieee_address": "00158d0004c5d6e7",
+        "nwk_address": "8f3e",
+        "is_child": true
+      },
+      {
+        "ieee_address": "0017880102a1b2c3",
+        "nwk_address": "1a2b",
+        "is_child": false,
+        "link_key": {
+          "key": "11223344556677881122334455667788",
+          "tx_counter": 14024,
+          "rx_counter": 57
+        }
+      },
+      {
+        "ieee_address": "842e14fffe0a0b0c",
+        "nwk_address": null,
+        "is_child": false,
+        "link_key": {
+          "key": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+          "tx_counter": 14024,
+          "rx_counter": 3
+        }
+      }
+    ]
+  }
+}
