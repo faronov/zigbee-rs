@@ -451,3 +451,42 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         Ok(())
     }
 }
+
+/// A borrowed coordinator app, so the app can live in its own static
+/// storage (constructed in place) and [`TcPort`] holds only a reference.
+impl<T: TcApp + ?Sized> TcApp for &mut T {
+    type Mac = T::Mac;
+    type Store = T::Store;
+
+    fn device(&self) -> &ZigbeeDevice<Self::Mac, Router> {
+        (**self).device()
+    }
+
+    fn device_mut(&mut self) -> &mut ZigbeeDevice<Self::Mac, Router> {
+        (**self).device_mut()
+    }
+
+    fn device_and_store_mut(&mut self) -> (&mut ZigbeeDevice<Self::Mac, Router>, &mut Self::Store) {
+        (**self).device_and_store_mut()
+    }
+
+    async fn initialize(&mut self) -> Result<(), RouterAppError> {
+        (**self).initialize().await
+    }
+
+    async fn step(&mut self) -> Result<StepEvents, RouterAppError> {
+        (**self).step().await
+    }
+
+    async fn wipe(&mut self) -> Result<(), RouterAppError> {
+        (**self).wipe().await
+    }
+
+    fn global_aps(&self) -> Option<GlobalApsCheckpoint> {
+        (**self).global_aps()
+    }
+
+    fn raise_aps_floor(&mut self, floor: u32) -> Result<(), OpError> {
+        (**self).raise_aps_floor(floor)
+    }
+}

@@ -39,6 +39,8 @@ use router_app::{
     NoDiagnostics, NoStatus, NoSupervisor, PersistentApsTables, PersistentChildren, RouterParts,
     TrustCenterCoordinatorApp,
 };
+#[cfg(feature = "transport-uart")]
+use static_cell::ConstStaticCell;
 use static_cell::StaticCell;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::esp::EspRouterMac;
@@ -67,6 +69,9 @@ type App = TrustCenterCoordinatorApp<
     router_app::NoObserver,
     PersistentApsTables<stores::ApsTableStore>,
 >;
+/// The app lives in its own static storage, constructed in place; the port
+/// only borrows it (no app-sized value ever crosses the stack).
+type Port = TcPort<&'static mut App>;
 
 const LOG_RECORDS: usize = 16;
 static LOG: LogRing<LOG_RECORDS> = LogRing::new();
@@ -170,9 +175,9 @@ fn main() -> ! {
     };
 
     #[cfg(feature = "transport-usj")]
-    let mut host = product::host::Host::new(peripherals.USB_DEVICE).unwrap_or_else(|| halt());
+    let host = usj_host(peripherals.USB_DEVICE);
     #[cfg(feature = "transport-uart")]
-    let mut host = uart_host(
+    let host = uart_host(
         peripherals.UART0,
         peripherals.GPIO24,
         peripherals.GPIO23,
@@ -212,19 +217,42 @@ fn main() -> ! {
         );
     }
     static NCP: StaticCell<Ncp<LOG_RECORDS>> = StaticCell::new();
-    static PORT: StaticCell<TcPort<App>> = StaticCell::new();
-    let ncp = NCP.init(Ncp::new(identity, cookie, now_us()));
-    block_on(run(ncp, &mut host, PORT.init(port), platform))
+    static PORT: StaticCell<Port> = StaticCell::new();
+    let ncp = Ncp::new_into(NCP.uninit(), identity, cookie, now_us());
+    serve(ncp, host, PORT.init(port), platform)
 }
 
+/// Run the NCP loop. A separate frame: the root future (moved into the
+/// executor) is not part of `main`'s frame under the composition steps.
+#[inline(never)]
+fn serve(
+    ncp: &'static mut Ncp<LOG_RECORDS>,
+    host: &'static mut product::host::Host,
+    port: &'static mut Port,
+    platform: &'static mut EspPlatform,
+) -> ! {
+    block_on(run(ncp, host, port, platform))
+}
+
+/// The USB-Serial-JTAG host link in static storage (its own frame).
+#[cfg(feature = "transport-usj")]
+#[inline(never)]
+fn usj_host(usb: esp_hal::peripherals::USB_DEVICE<'static>) -> &'static mut product::host::Host {
+    static HOST: StaticCell<product::host::Host> = StaticCell::new();
+    HOST.init(product::host::Host::new(usb).unwrap_or_else(|| halt()))
+}
+
+/// The UART host link with DMA receive in static storage (its own frame;
+/// the DMA memory is a zero-initialized static, never a stack value).
 #[cfg(feature = "transport-uart")]
+#[inline(never)]
 fn uart_host(
     uart0: esp_hal::peripherals::UART0<'static>,
     tx: esp_hal::peripherals::GPIO24<'static>,
     rx: esp_hal::peripherals::GPIO23<'static>,
     uhci: esp_hal::peripherals::UHCI0<'static>,
     dma: esp_hal::peripherals::DMA_CH0<'static>,
-) -> product::host::Host {
+) -> &'static mut product::host::Host {
     use esp_serial_stream::uart::{LineConfig, UartDmaMemory, UartDmaStream, UartPort};
     let line = LineConfig {
         baud: product::transport::UART_DEFAULT_BAUD,
@@ -233,28 +261,65 @@ fn uart_host(
     let config = esp_hal::uart::Config::default().with_baudrate(line.baud);
     let uart =
         esp_thread_br_h2::thread_br_h2_uart(uart0, tx, rx, config).unwrap_or_else(|_| halt());
-    static MEMORY: StaticCell<UartDmaMemory> = StaticCell::new();
-    let stream = UartDmaStream::new(
-        uart,
-        UartPort::Uart0,
-        uhci,
-        dma,
-        MEMORY.init(UartDmaMemory::new()),
-        line,
-    )
-    .unwrap_or_else(|_| halt());
-    product::host::Host::new(stream)
+    static MEMORY: ConstStaticCell<UartDmaMemory> = ConstStaticCell::new(UartDmaMemory::new());
+    let stream = UartDmaStream::new(uart, UartPort::Uart0, uhci, dma, MEMORY.take(), line)
+        .unwrap_or_else(|_| halt());
+    static HOST: StaticCell<product::host::Host> = StaticCell::new();
+    HOST.init(product::host::Host::new(stream))
 }
 
 /// Radio, stores, device and Trust Center coordinator in static storage.
 /// `ieee_override` (the persisted identity item) replaces the factory
 /// EUI-64 before anything reads the MAC's extended address.
+///
+/// Each large object is constructed in its own non-inlined step, directly
+/// in static storage where its constructor allows it (the device, the app),
+/// so no step's temporaries stack on another's and no app-sized value ever
+/// crosses the stack (boot stack budget, see `tools/esp32-ncp-stack-gate.py`).
 #[inline(never)]
 fn compose(
     radio: esp_hal::peripherals::IEEE802154<'static>,
     aes: esp_hal::peripherals::AES<'static>,
     ieee_override: Option<[u8; 8]>,
-) -> TcPort<App> {
+) -> Port {
+    static PROFILE: StaticCell<Profile> = StaticCell::new();
+    let profile = PROFILE.init(DeviceProfile::new(
+        1,
+        PROFILE_HOME_AUTOMATION,
+        DeviceId::COMBINED_INTERFACE,
+        RangeExtender,
+    ));
+    let (device, ieee) = compose_device(radio, aes, ieee_override, profile);
+    let security = compose_security(device, ieee);
+    let app = compose_app(ZigbeeNode::new(device, security, profile));
+    TcPort::new(app, ieee, clock_ms)
+}
+
+/// The coordinator device, built in place around the parent MAC, and the
+/// active IEEE.
+#[inline(never)]
+fn compose_device(
+    radio: esp_hal::peripherals::IEEE802154<'static>,
+    aes: esp_hal::peripherals::AES<'static>,
+    ieee_override: Option<[u8; 8]>,
+    profile: &Profile,
+) -> (&'static mut ZigbeeDevice<Mac, Router>, [u8; 8]) {
+    static DEVICE: StaticCell<ZigbeeDevice<Mac, Router>> = StaticCell::new();
+    let mut ieee = [0; 8];
+    let device = device_builder(radio, aes, ieee_override, profile, &mut ieee)
+        .build_coordinator_into(DEVICE.uninit());
+    (device, ieee)
+}
+
+/// The radio as a parent MAC with the AES engine and the IEEE override.
+/// A separate frame: the PHY and MAC temporaries of the conversion are
+/// released before the device is assembled.
+#[inline(never)]
+fn radio_mac(
+    radio: esp_hal::peripherals::IEEE802154<'static>,
+    aes: esp_hal::peripherals::AES<'static>,
+    ieee_override: Option<[u8; 8]>,
+) -> Mac {
     let ieee802154 = esp_radio::ieee802154::Ieee802154::new(radio);
     let mut phy =
         zigbee_mac::esp::EspRadioPhy::new(ieee802154, esp_radio::ieee802154::Config::default());
@@ -274,23 +339,27 @@ fn compose(
     {
         halt()
     }
+    mac
+}
+
+/// The configured device builder around the parent MAC; `ieee` receives the
+/// active IEEE. A separate frame: the MAC and the by-value builder chain's
+/// temporaries are released before the device is assembled.
+#[inline(never)]
+fn device_builder(
+    radio: esp_hal::peripherals::IEEE802154<'static>,
+    aes: esp_hal::peripherals::AES<'static>,
+    ieee_override: Option<[u8; 8]>,
+    profile: &Profile,
+    ieee: &mut [u8; 8],
+) -> zigbee_runtime::builder::DeviceBuilder<Mac> {
+    let mac = radio_mac(radio, aes, ieee_override);
     // The active IEEE: the override, else the factory eFuse EUI-64.
-    let ieee = mac.pib().extended_address();
-    if ieee == [0; 8] || ieee == [0xFF; 8] {
+    *ieee = mac.pib().extended_address();
+    if *ieee == [0; 8] || *ieee == [0xFF; 8] {
         halt()
     }
-
-    static SECURITY: StaticCell<stores::SecurityStore> = StaticCell::new();
-    static PROFILE: StaticCell<Profile> = StaticCell::new();
-    static DEVICE: StaticCell<ZigbeeDevice<Mac, Router>> = StaticCell::new();
-
-    let profile = PROFILE.init(DeviceProfile::new(
-        1,
-        PROFILE_HOME_AUTOMATION,
-        DeviceId::COMBINED_INTERFACE,
-        RangeExtender,
-    ));
-    let device = ZigbeeDevice::builder(mac)
+    ZigbeeDevice::builder(mac)
         .power_mode(PowerMode::AlwaysOn)
         .manufacturer(product::MANUFACTURER)
         .model(product::MODEL)
@@ -302,7 +371,15 @@ fn compose(
             profile.device_id(),
             |endpoint| profile.configure_endpoint(endpoint),
         )
-        .build_coordinator_into(DEVICE.uninit());
+}
+
+/// The security journal, guarded against another EUI-64 or role image.
+#[inline(never)]
+fn compose_security(
+    device: &mut ZigbeeDevice<Mac, Router>,
+    ieee: [u8; 8],
+) -> &'static mut stores::SecurityStore {
+    static SECURITY: StaticCell<stores::SecurityStore> = StaticCell::new();
     let security = SECURITY.init(stores::security_store());
     // Persisted keys/counters may never be resumed under another EUI-64 or
     // by another role image.
@@ -314,8 +391,17 @@ fn compose(
         log::error!("security journal guard failed");
         halt()
     }
-    let node = ZigbeeNode::new(device, security, profile);
-    let app = TrustCenterCoordinatorApp::new_with_aps_tables(
+    security
+}
+
+/// The Trust Center coordinator app, constructed in its static storage.
+#[inline(never)]
+fn compose_app(
+    node: ZigbeeNode<'static, Mac, stores::SecurityStore, Profile, Router>,
+) -> &'static mut App {
+    static APP: StaticCell<App> = StaticCell::new();
+    TrustCenterCoordinatorApp::new_with_aps_tables_into(
+        APP.uninit(),
         node,
         PersistentChildren::new(stores::child_store()),
         PersistentApsTables::new(stores::aps_table_store()),
@@ -323,14 +409,13 @@ fn compose(
         &product::POLICY,
         RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
     )
-    .unwrap_or_else(|_| halt());
-    TcPort::new(app, ieee, clock_ms)
+    .unwrap_or_else(|_| halt())
 }
 
 async fn run(
     ncp: &mut Ncp<LOG_RECORDS>,
     host: &mut product::host::Host,
-    port: &mut TcPort<App>,
+    port: &mut Port,
     platform: &mut EspPlatform,
 ) -> ! {
     loop {

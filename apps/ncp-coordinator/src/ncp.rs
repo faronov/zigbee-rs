@@ -1338,3 +1338,82 @@ fn push_event<'a, T: zigbee_zrhp::codec::Wire<'a> + zigbee_zrhp::msg::MessageDef
     let seq = next_seq(seqs, endpoint);
     queues.event(seq, body).is_ok()
 }
+
+impl<const LOG_N: usize> Ncp<LOG_N> {
+    /// [`Self::new`] directly into caller-provided (normally static)
+    /// storage, field by field: neither the NCP (about 33 KiB) nor its link
+    /// engine (about 22 KiB) is built on the stack and moved.
+    pub fn new_into(
+        dst: &mut core::mem::MaybeUninit<Self>,
+        identity: NcpIdentity,
+        cookie: u32,
+        now_us: u64,
+    ) -> &mut Self {
+        // Every field is written below, with the value `new` gives it; a
+        // new field must be added to both.
+        let _exhaustive = |ncp: &Self| {
+            let Self {
+                link: _,
+                queues: _,
+                tx: _,
+                tx_len: _,
+                tx_off: _,
+                tx_progress_us: _,
+                need_delimiter: _,
+                identity: _,
+                negotiated: _,
+                event_seq: _,
+                ops: _,
+                data_inflight: _,
+                key_export_locked: _,
+                pending_reset: _,
+                uart_switch: _,
+                counters: _,
+                pending_diag: _,
+                reported_nwk_limit: _,
+                reported_aps_limit: _,
+                nwk_checkpoints: _,
+                indication_drops_unreported: _,
+                boot_us: _,
+            } = ncp;
+        };
+        let reason = match identity.reset_reason {
+            3 => ResetReason::Watchdog,
+            5 => ResetReason::FirmwareUpdate,
+            _ => ResetReason::PowerOn,
+        };
+        let slot = dst.as_mut_ptr();
+        // SAFETY: `slot` is valid, aligned, uninitialized storage for `Self`
+        // and every field is written exactly once before the reference is
+        // created.
+        unsafe {
+            use core::ptr::addr_of_mut;
+            addr_of_mut!((*slot).link).write(Link::new(LinkConfig::ncp(), cookie.max(1)));
+            addr_of_mut!((*slot).queues).write(EndpointQueues::new());
+            // An all-zero byte array is a valid value.
+            addr_of_mut!((*slot).tx).write_bytes(0, 1);
+            addr_of_mut!((*slot).tx_len).write(0);
+            addr_of_mut!((*slot).tx_off).write(0);
+            addr_of_mut!((*slot).tx_progress_us).write(now_us);
+            addr_of_mut!((*slot).need_delimiter).write(false);
+            addr_of_mut!((*slot).identity).write(identity);
+            addr_of_mut!((*slot).negotiated).write(false);
+            addr_of_mut!((*slot).event_seq).write([0; Endpoint::COUNT]);
+            addr_of_mut!((*slot).ops).write(Deque::new());
+            addr_of_mut!((*slot).data_inflight).write(0);
+            addr_of_mut!((*slot).key_export_locked).write(false);
+            addr_of_mut!((*slot).pending_reset).write(None);
+            addr_of_mut!((*slot).uart_switch).write(None);
+            addr_of_mut!((*slot).counters).write(QueueCounters::default());
+            addr_of_mut!((*slot).pending_diag).write(Deque::new());
+            addr_of_mut!((*slot).reported_nwk_limit).write(0);
+            addr_of_mut!((*slot).reported_aps_limit).write(0);
+            addr_of_mut!((*slot).nwk_checkpoints).write(0);
+            addr_of_mut!((*slot).indication_drops_unreported).write(0);
+            addr_of_mut!((*slot).boot_us).write(now_us);
+            let ncp = &mut *slot;
+            ncp.link.open(now_us, reason);
+            ncp
+        }
+    }
+}

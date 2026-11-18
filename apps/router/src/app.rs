@@ -2856,6 +2856,46 @@ where
         })
     }
 
+    /// [`Self::new_observed_with_aps_tables`] directly into caller-provided
+    /// (normally static) storage. The Trust Center runtime (about 40 KiB
+    /// with `ncp-capacity`) is initialized in place instead of being built
+    /// on the stack and moved; only the coordinator frontend is moved.
+    /// On an error `dst` stays uninitialized.
+    pub fn new_observed_with_aps_tables_into<'s>(
+        dst: &'s mut core::mem::MaybeUninit<Self>,
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        aps_tables: A,
+        trust_center_store: T,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<&'s mut Self, RouterAppError> {
+        // Every field is written below; a new field must be added there.
+        let _exhaustive = |app: &Self| {
+            let Self {
+                coordinator: _,
+                trust_center: _,
+                pending_local_child_departure_completion: _,
+            } = app;
+        };
+        let coordinator = CoordinatorApp::new_observed_with_aps_tables(
+            node, children, aps_tables, policy, parts,
+        )?;
+        let slot = dst.as_mut_ptr();
+        // SAFETY: `slot` is valid, aligned, uninitialized storage for `Self`
+        // and every field is written exactly once before the reference is
+        // created.
+        unsafe {
+            core::ptr::addr_of_mut!((*slot).coordinator).write(coordinator);
+            TrustCenterRuntime::write_into(
+                core::ptr::addr_of_mut!((*slot).trust_center),
+                trust_center_store,
+            );
+            core::ptr::addr_of_mut!((*slot).pending_local_child_departure_completion).write(None);
+            Ok(&mut *slot)
+        }
+    }
+
     pub const fn coordinator(&self) -> &CoordinatorApp<'a, M, S, P, C, St, Sv, D, O, A> {
         &self.coordinator
     }
@@ -3322,6 +3362,28 @@ where
         parts: RouterParts<St, Sv, D>,
     ) -> Result<Self, RouterAppError> {
         Self::new_observed_with_aps_tables(
+            node,
+            children,
+            aps_tables,
+            trust_center_store,
+            policy,
+            parts,
+        )
+    }
+
+    /// [`Self::new_with_aps_tables`] directly into caller-provided storage
+    /// (see [`Self::new_observed_with_aps_tables_into`]).
+    pub fn new_with_aps_tables_into<'s>(
+        dst: &'s mut core::mem::MaybeUninit<Self>,
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        aps_tables: A,
+        trust_center_store: T,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<&'s mut Self, RouterAppError> {
+        Self::new_observed_with_aps_tables_into(
+            dst,
             node,
             children,
             aps_tables,

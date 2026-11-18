@@ -4653,6 +4653,51 @@ fn coordinator_frontend_forms_then_restarts_the_same_persisted_pan() {
 
 #[cfg(feature = "trust-center")]
 #[test]
+fn trust_center_coordinator_constructed_in_place_initializes_and_persists() {
+    let mut security = RamSecurityStateStore::new();
+    let mut profile = profile();
+    let mut device = coordinator_device(&mut profile);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    // Poison: every field must be written by the in-place constructor.
+    fn poisoned<T>(slot: &mut core::mem::MaybeUninit<T>) -> &mut core::mem::MaybeUninit<T> {
+        unsafe { slot.as_mut_ptr().write_bytes(0xA5, 1) };
+        slot
+    }
+    let mut storage = Box::new(core::mem::MaybeUninit::uninit());
+    let app = TrustCenterCoordinatorApp::new_with_aps_tables_into(
+        poisoned(&mut storage),
+        node,
+        PersistentChildren::new(CountingChildStore::default()),
+        router_app::NoApsTables,
+        RamTrustCenterDeviceStore::new(),
+        &POLICY,
+        RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
+    )
+    .unwrap();
+    #[cfg(feature = "green-power")]
+    app.set_green_power_store(leaked_gp_store());
+    assert!(!app.trust_center().is_initialized());
+
+    block_on(app.initialize()).unwrap();
+    assert!(app.node().device().is_joined());
+    assert!(app.trust_center().is_initialized());
+    let epid = app.node().device().bdb().zdo().nwk().nib().extended_pan_id;
+    assert!(
+        app.trust_center_mut()
+            .store_mut()
+            .load()
+            .unwrap()
+            .unwrap()
+            .matches_network(&epid)
+    );
+    block_on(app.step()).unwrap();
+    assert!(app.trust_center().is_initialized());
+    // The app owns stores and borrows the device: drop it in place.
+    unsafe { storage.assume_init_drop() };
+}
+
+#[cfg(feature = "trust-center")]
+#[test]
 fn trust_center_factory_reset_is_cross_journal_crash_safe() {
     let mut security = RamSecurityStateStore::new();
     let mut trust_center_store = RamTrustCenterDeviceStore::new();
