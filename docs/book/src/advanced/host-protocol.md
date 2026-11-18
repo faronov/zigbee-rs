@@ -224,7 +224,7 @@ is not part of ZRHP and is not specified here.
 
 | Aspect | Desktop host (D) | Embedded host (E) |
 |---|---|---|
-| Examples | zigpy (HA), Go hub, zigbee-herdsman (Z2M) on Linux/macOS/Windows | `zigbee-rs-hub` on ESP32-S3-WROOM-1 (8 MB flash, 2 MB PSRAM) |
+| Examples | zigpy (HA), Go hub, zigbee-herdsman (Z2M) on Linux/macOS/Windows | `zigbee-rs-hub` on ESP32-S3-WROOM-1 (8 MB flash, or 4 MB on early boards; 2 MB PSRAM) |
 | Transport | USB-Serial-JTAG CDC (H2/C6 native USB), or UART through a USB-UART bridge with RTS/CTS (default 921 600) | Board UART to the H2 (Thread BR board: 460 800 default, RTS/CTS optional on the reserved lines, 11.5) |
 | NCP reset / update | USJ DTR/RTS reset (11.3); firmware update via `FW_*` over BULK | `FW_*` over BULK (normal path); H2 ROM bootloader through host-driven EN/BOOT GPIOs (recovery and provisioning, 11.5) |
 | Host store | SQLite (zigpy sidecar, Go hub DB) or a sidecar file (herdsman) | Raw-flash log-structured journal partition. No filesystem assumed. |
@@ -273,10 +273,43 @@ is not part of ZRHP and is not specified here.
 Application data such as names, clusters and attribute caches is hub-level,
 outside ZRHP.
 
-**Flash store.** Use a dedicated raw partition journal (proposed 128 KiB, 32
-× 4 KiB sectors) with the same commit discipline as the NCP journals: CRC +
-commit marker, two-generation snapshot plus append records. ESP-IDF NVS is
-acceptable if it meets the durability rule of 8.8. No filesystem is assumed.
+**Flash store.** A 128 KiB journal (32 × 4 KiB) with the same commit
+discipline as the NCP journals: CRC + commit marker, two-generation snapshot
+plus append records. It lives in the hub's data partition (below): a raw
+region, or a preallocated file pair in a power-loss-safe filesystem
+(LittleFS). ESP-IDF NVS is acceptable if it meets the durability rule of 8.8.
+
+**S3 flash layout** (decision N9). Retail Thread BR boards carry 8 MB; early
+samples carry 4 MB (the hwlab board: Zbit 5e4016). The hub detects the size
+at boot and uses the matching partition table; a table that does not match
+the detected size is a fatal configuration error. **The S3 stores no NCP
+images** (decision N6, amended 2026-11-18): NCP rollback is on the H2 (8.9).
+
+| Partition | 4 MB | 8 MB |
+|---|---|---|
+| Bootloader | 0x000000, 32 KiB | same |
+| Partition table | 0x008000, 4 KiB | same |
+| `nvs` (Wi-Fi, PHY calibration, small settings) | 0x009000, 24 KiB | same |
+| `otadata` | 0x00F000, 8 KiB | same |
+| `phy_init` | 0x011000, 4 KiB | same |
+| Reserved (optional core dump) | 0x012000, 56 KiB | same |
+| Hub app `ota_0` | 0x020000, **1.5 MiB** | 0x020000, 3 MiB |
+| Hub app `ota_1` | 0x1A0000, **1.5 MiB** | 0x320000, 3 MiB |
+| `hubdata` (LittleFS or log-structured store) | 0x320000, **896 KiB** | 0x620000, 1 920 KiB |
+
+- **Hub app ≤ 1.5 MiB** on 4 MB boards. The hub CI enforces the limit.
+  The stock `esp_ot_br` (Wi-Fi, OpenThread, web server) is 1.6 MB; the hub
+  has no OpenThread.
+- **`hubdata` (4 MB)**: host store journal 128 KiB, configuration 32 KiB,
+  device-converter database 2 × 256 KiB (active + staged, swapped
+  atomically), the rest (224 KiB, 25 %) free for copy-on-write and wear
+  levelling.
+- **Converter database.** Device definitions are **declarative data**
+  (compact CBOR records: model and manufacturer ids, exposes, cluster and
+  attribute mappings, reporting, references to generic handlers built into
+  the app). They are updated without an app OTA. Converter logic stays in
+  the app as a fixed set of generic handlers; the database contains no code.
+  This is hub-level and outside ZRHP.
 
 **Write-rate estimate** (one 32-byte append per event):
 
@@ -1355,12 +1388,17 @@ Rules:
   network (`NWK_INIT` succeeds) and receive `FW_CONFIRM` from the host
   within the product's trial window (default 10 minutes). Otherwise the
   bootloader rolls back.
+- **Slot size.** `FW_BEGIN` with an `image_size` larger than the inactive
+  application slot of the NCP's layout (8.9) fails with `TOO_LARGE` before
+  anything is erased.
 - **Protected regions.** Staging never touches the NV journals, the identity
   item or the bootloader.
 - **Recovery path.** `FW_*` is the normal update path for every host. An
   embedded host that controls the H2's EN and BOOT lines (Thread BR board)
   also has a recovery path: the H2 ROM serial bootloader, for an NCP that
-  cannot establish a ZRHP session or for first provisioning (11.5).
+  cannot establish a ZRHP session or for first provisioning. It is a
+  manual/development path with an operator-supplied image (11.5); firmware
+  rollback itself is the NCP's A/B slots (8.9).
 
 ### 7.10 LOG (`0x09xx`, endpoint 5)
 
@@ -1823,16 +1861,22 @@ defines both layouts.
 | **Total** | | **136 KiB** | — |
 
 Partition tables (proposal; the product's post-link layout check must
-enforce them):
+enforce them). Both have **two application slots**: they carry the NCP's
+firmware rollback (decision N6, amended 2026-11-18). `FW_*` writes the
+inactive slot, `FW_ACTIVATE` starts a trial boot, the host confirms with
+`FW_CONFIRM`, and the H2 bootloader returns to the previous slot if the new
+image is not confirmed (7.9).
 
-| Flash | otadata | ota_0 | ota_1 | NV (`zbnv`) |
-|---|---|---|---|---|
-| 4 MB | 0x9000 (8 KiB) | 0x10000, 0x1E0000 (1.875 MiB) | 0x1F0000, 0x1E0000 | 0x3D0000–0x400000 (192 KiB: 136 used + 56 spare) |
-| 2 MB | 0x9000 (8 KiB) | 0x10000, 0xE0000 (896 KiB) | 0xF0000, 0xE0000 | 0x1D0000–0x200000 (192 KiB) |
+| Flash | Bootloader | Partition table | otadata | ota_0 | ota_1 | NV (`zbnv`) |
+|---|---|---|---|---|---|---|
+| 4 MB | 0x0 (32 KiB) | 0x8000 (4 KiB) | 0x9000 (8 KiB) | 0x10000, 0x1E0000 (1.875 MiB) | 0x1F0000, 0x1E0000 | 0x3D0000–0x400000 (192 KiB: 136 used + 56 spare) |
+| 2 MB | 0x0 (32 KiB) | 0x8000 (4 KiB) | 0x9000 (8 KiB) | 0x10000, 0xE0000 (896 KiB) | 0xF0000, 0xE0000 | 0x1D0000–0x200000 (192 KiB) |
 
 - The NCP image is estimated at 650–700 KB: today's combo light is 562 960
-  B, plus the ZRHP link, the app and the caches. That fits the 2 MB layout's
-  896 KiB slot.
+  B, plus the ZRHP link, the app and the caches. Both slots of the 2 MB
+  layout hold such an image (917 504 B each, ≥ 200 KiB headroom).
+- The hwlab Thread BR board's H2 has 4 MB (GigaDevice c84016, measured
+  2026-11-18).
 - This is an NCP-product layout. It does not move the existing devkit
   product's `zbnv` at 0x3F0000.
 - `SYS_GET_INFO.flash_size` lets hosts and the ROM recovery path pick the
@@ -2424,7 +2468,7 @@ Sources: [ESP-TBR-HW] and the board schematic v1.3 [ESP-TBR-SCH].
 
 | Part | Details |
 |---|---|
-| Host | ESP32-S3-WROOM-1 (8 MB flash, 2 MB PSRAM) |
+| Host | ESP32-S3-WROOM-1 (8 MB flash, 2 MB PSRAM). Early samples have **4 MB** flash (Espressif's ordering table; the hwlab board, measured); see 3.4. |
 | NCP | ESP32-H2-MINI-1 (2 MB `-H2S` or 4 MB `-H4S` flash). The variant on the user's board is **unknown**; see "Flash size" below. |
 | USB | Two USB-C ports, each wired to its SoC's USB-Serial-JTAG |
 | Ethernet | Optional W5500 daughter board on S3 SPI2 (hub-level, irrelevant to ZRHP) |
@@ -2496,21 +2540,23 @@ are kept, and the size is detected at runtime:
      running until `FW_ACTIVATE`.
    - Trial boot, then `FW_CONFIRM` from the hub after a successful
      `NWK_INIT`, with bootloader rollback otherwise.
-   - The hub keeps **two NCP images** in its own flash (decision N6): the
-     **known-good** image and a **candidate**, about 0.7–0.9 MB each in a
-     dedicated S3 partition. This mirrors Espressif's RCP update rules
-     [ESP-TBR-RCP].
-   - A candidate becomes known-good only after `FW_CONFIRM`, which follows
-     a successful session and `NWK_INIT` on the new image.
-   - If the candidate fails, the hub restores the known-good image through
-     the ROM path (2). Failure means any of: the trial window expires
-     without confirmation; the H2 bootloader's own rollback does not bring
-     back a working session; or the NCP is unreachable after activation
-     beyond the resume budget.
-2. **Recovery and provisioning path: H2 ROM serial bootloader.** Used when
-   no ZRHP session is possible: blank or corrupt NCP, major-version
-   mismatch, layout mismatch, or a failed candidate (rollback to the
-   known-good image).
+   - **Rollback lives on the H2** (decision N6, amended 2026-11-18): A/B
+     application slots (8.9). The previous image stays in its slot until a
+     new image is confirmed; an unconfirmed image (trial window expired,
+     crash or no session) makes the H2 bootloader boot the previous slot,
+     and the hub sees `EVT_NCP_READY` with the old version and reports the
+     failed update.
+   - **The S3 stores no NCP images.** The hub streams an image from its
+     source (hub API upload or download) straight into `FW_WRITE` chunks.
+     Interrupted transfers resume at `next_offset` (idempotent writes) or
+     end with `FW_ABORT`. Images larger than the H2 slot are refused
+     (`TOO_LARGE`, 7.9).
+2. **Recovery path: H2 ROM serial bootloader — manual / development
+   only.** Used when no ZRHP session is possible (blank or corrupt NCP,
+   major-version mismatch, layout mismatch) and an operator supplies the
+   image: through a host or user action, for example the hub API or a
+   desktop over the phase-0 USB bridge. The hub never runs it on its own and
+   keeps no image for it.
    1. Drive BOOT (S3 GPIO8) low.
    2. Pulse RESET (S3 GPIO7) low for at least 10 ms and release it.
    3. Wait 50 ms, then release BOOT.
@@ -2529,6 +2575,8 @@ are kept, and the size is detected at runtime:
    - **Downgrades.** An image below the NV format version fails closed (8.4).
    - After a ROM-path boot the hub runs the normal resume. `EVT_NCP_READY`
      carries `reset_reason = 8`.
+   - The NCP's own A/B rollback does not cover the ROM path: it writes a
+     slot and `otadata` directly.
 3. **ROM boot log.** The ROM prints a boot log on U0TXD at 115 200 after
    every reset. The hub ignores it; it is not valid COBS/CRC framing.
    Production images may suppress it with the `UART_PRINT_CONTROL` eFuse
@@ -2832,14 +2880,22 @@ N2).
 - Its user-facing interface is the hub's own WebSocket JSON API, a
   hub-level interface outside ZRHP.
 
-**Partitions** (S3, 8 MB; proposal for the hub repo):
+**Partitions** (decision N9; full tables in 3.4). The hub detects the S3
+flash size at boot:
 
-| Partition | Size |
-|---|---|
-| Hub app ×2 (OTA) | 2.5 MiB each |
-| NCP images ×2 | 1 MiB each |
-| ZRHP host store journal | 128 KiB |
-| Hub configuration | 64 KiB |
+- **4 MB:** hub app ×2 at **1.5 MiB**; one 896 KiB `hubdata` partition with
+  the host store journal (128 KiB), configuration (32 KiB) and the
+  declarative converter database (2 × 256 KiB, active + staged).
+- **8 MB:** hub app ×2 at 3 MiB; `hubdata` 1 920 KiB.
+- **No NCP image partition.** NCP rollback is on the H2's A/B slots
+  (8.9, decision N6 amended 2026-11-18).
+
+**H2 layouts** (8.9): two application slots + `zbnv`.
+
+| H2 flash | ota_0 | ota_1 | `zbnv` |
+|---|---|---|---|
+| 4 MB | 0x10000, 1.875 MiB | 0x1F0000, 1.875 MiB | 0x3D0000, 192 KiB |
+| 2 MB | 0x10000, 896 KiB | 0xF0000, 896 KiB | 0x1D0000, 192 KiB |
 
 **Behaviour.**
 
@@ -2849,8 +2905,8 @@ N2).
 | Paging | `HOST_TABLES` set; standalone until the NCP cache fills (8.1) |
 | GP | `NCP_SINK` with the hub as GP shadow (`host_caps` bit3), security level 0x00 |
 | PTA | `coex_enable` follows the hub's Wi-Fi state (decision N7), re-applied in resume |
-| NCP images | Known-good + candidate, rollback through the ROM path (decision N6); flash size detected at provisioning (decision N4) |
-| Resume | Seamless (12.1 steps). The hub owns EN/BOOT, so after the resume budget it can reset the NCP itself, and reflash it through the ROM path. |
+| NCP images | None on the S3. Updates are streamed into `FW_*`; rollback is the H2's A/B slots and bootloader (decision N6, amended 2026-11-18). H2 flash size from `SYS_GET_INFO.flash_size` (decision N4). |
+| Resume | Seamless (12.1 steps). The hub owns EN/BOOT, so after the resume budget it can reset the NCP itself. A ROM-path reflash happens only on an explicit operator request with a supplied image (11.5). |
 | Backup | Binary records (9.3) in the hub store. OCB JSON is optional: streamed on request through the hub API, or converted by a desktop tool. |
 
 ---
@@ -3080,7 +3136,7 @@ This is simulation-level evidence, not hardware evidence.
 | H9 | **PTA coexistence:** Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on. The hub's automatic enable/disable follows Wi-Fi up/down, including Ethernet-only. GP TempMaster reply behaviour with grant denied. |
 | H10 | **GP combo on the NCP:** direct and proxy-tunnelled commissioning into the NCP sink with zigpy as shadow, including an unsecured (level-0) FlowerX GP / BGT1 GP; a bidirectional GPD with the NCP as its own TempMaster; Sink Table across an NCP reboot (seamless resume) and across backup/restore. |
 | H11 | **Z2M end to end:** zigbee-herdsman adapter with 10+ real devices; Z2M backup → restore on a fresh NCP. |
-| H12 | **Embedded hub:** S3 hub with a synthetic 2 000-device store (PSRAM budget of 3.4), paging forced by a reduced NCP cache, power cuts during writebacks, store journal recovery. Candidate NCP image that fails its trial → automatic rollback to the known-good image through the ROM path, with network state retained. |
+| H12 | **Embedded hub:** S3 hub with a synthetic 2 000-device store (PSRAM budget of 3.4), paging forced by a reduced NCP cache, power cuts during writebacks, store journal recovery. Candidate NCP image that fails its trial (no `FW_CONFIRM`) → the H2 bootloader returns to the previous slot, network state retained; an image larger than the H2 slot refused with `TOO_LARGE` before any erase. Hub app within 1.5 MiB on a 4 MB S3. |
 
 ---
 
@@ -3140,9 +3196,10 @@ two requirements. Each decision is applied in the sections listed.
 | N3 | **No derived TCLKs** for new networks: random per-device TCLKs only. Hashed mode exists only for EZSP migration. | 7.5 |
 | N4 | BR board UART: **460 800 without flow control** by default, DMA/IRAM RX mandatory; RTS/CTS via R19/R20 documented as an optional board mod. H2 module flash size unknown: both 2 MB/4 MB partition tables kept, size detected at runtime (checked when the board is on hwlab). | 11.5, 8.9, H8 |
 | N5 | zigbee-herdsman: **maintained fork**, no upstream PR plan for v1. | 3, 12.3, 15 |
-| N6 | The S3 stores **known-good + candidate** NCP images, with rollback through the H2 ROM bootloader. | 11.5, 12.4, H12 |
+| N6 | ~~The S3 stores known-good + candidate NCP images, with rollback through the H2 ROM bootloader.~~ **Amended 2026-11-18:** rollback lives on the **H2**: A/B application slots on the H2 flash, `FW_*` writes the inactive slot, trial boot, host `FW_CONFIRM`, H2 bootloader rollback of an unconfirmed image. The S3 stores **no** NCP images. The H2 ROM-bootloader path is a manual/development recovery path with an operator-supplied image. | 7.9, 8.9, 11.5, 12.4, H12 |
 | N7 | PTA **disabled by default**; the hub enables it automatically while Wi-Fi is active (off with Ethernet-only). | 7.1, 11.5, 12.4, H9 |
 | N8 | USB identity: **keep Espressif's VID/PID**. | 4.3, 11.3, H1 |
+| N9 | (2026-11-18) S3 flash: **detect 4 MB / 8 MB at boot, one partition table per size.** 4 MB: hub app ×2 at 1.5 MiB + one 896 KiB data partition (host store, configuration, declarative converter database); no NCP image partition. | 3.4, 12.4, H12 |
 
 **Open questions.** None block the start of implementation. The remaining
 unknowns are hardware facts tracked as gates:
