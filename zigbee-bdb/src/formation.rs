@@ -318,6 +318,20 @@ impl<M: MacDriver> BdbLayer<M> {
     }
 }
 
+/// Joining window opened by a successful formation.
+///
+/// `bdbcMinCommissioningTime`, capped to the 254 s a Mgmt_Permit_Joining_req
+/// can carry without meaning "forever". With `formation-joining-closed` the
+/// formed network stays closed (0 s, also broadcast to routers): on a network
+/// co-processor only the host decides when joining opens.
+const FORMATION_PERMIT_JOIN_S: u8 = if cfg!(feature = "formation-joining-closed") {
+    0
+} else if BDB_MIN_COMMISSIONING_TIME > 254 {
+    254
+} else {
+    BDB_MIN_COMMISSIONING_TIME as u8
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,17 +443,3 @@ mod tests {
         );
     }
 }
-
-/// Joining window opened by a successful formation (declared last).
-///
-/// `bdbcMinCommissioningTime`, capped to the 254 s a Mgmt_Permit_Joining_req
-/// can carry without meaning "forever". With `formation-joining-closed` the
-/// formed network stays closed (0 s, also broadcast to routers): on a network
-/// co-processor only the host decides when joining opens.
-const FORMATION_PERMIT_JOIN_S: u8 = if cfg!(feature = "formation-joining-closed") {
-    0
-} else if BDB_MIN_COMMISSIONING_TIME > 254 {
-    254
-} else {
-    BDB_MIN_COMMISSIONING_TIME as u8
-};

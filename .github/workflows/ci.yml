@@ -114,7 +114,6 @@ jobs:
       # from the workspace so its runtime features do not unify).
       - run: cargo test -p zigbee-mac --features pan-coordinator --lib --locked
       - run: cargo test --manifest-path apps/ncp-coordinator/Cargo.toml --locked
-      - run: cargo clippy --manifest-path apps/ncp-coordinator/Cargo.toml --all-targets --locked -- -D warnings
       # nRF product crates are excluded from the root workspace (they pull in
       # `embassy-nrf`), but their battery-curve and profile logic is
       # host-testable because the hardware dependencies are
@@ -467,6 +466,8 @@ jobs:
       - run: cargo clippy -p sensor-sed-app --all-targets --no-default-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-aps --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-bdb --all-targets --all-features --locked -- -D warnings
+      - run: cargo clippy -p zigbee-mac --features pan-coordinator --all-targets --locked -- -D warnings
+      - run: cargo clippy --manifest-path apps/ncp-coordinator/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo clippy -p router-app --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p router-app --no-default-features --locked -- -D warnings
       - run: cargo clippy -p sensor-sed-app --all-targets --features ota --locked -- -D warnings
