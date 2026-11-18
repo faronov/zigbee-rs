@@ -67,6 +67,9 @@ transport-uart = ["esp32-zigbee-ncp-product/transport-uart"]
 thread-br-h2 = ["esp32-zigbee-ncp-product/thread-br-h2", "dep:esp-thread-br-h2"]
 rtscts-reserved-lines = ["thread-br-h2", "esp32-zigbee-ncp-product/rtscts-reserved-lines"]
 flash-2mb = ["esp32-zigbee-ncp-product/flash-2mb"]
+# Development firmware policy (never in shipped images): FW_* accepts
+# unsigned images and, with FW_BEGIN flags bit0, downgrades.
+dev-unsigned-fw = ["esp32-zigbee-ncp-product/dev-unsigned-fw"]
 
 [profile.release]
 opt-level = "s"

@@ -8,6 +8,12 @@
 //!
 //! Logs go only to the ZRHP LOG endpoint: when USB-Serial-JTAG carries
 //! ZRHP no console may share it (spec 11.2). A panic resets the chip.
+//!
+//! Before the stack is composed, the product platform reads the identity
+//! item and runs the `otadata` boot check: a persisted IEEE override
+//! (`SYS_SET_IEEE`, spec 9.4 rule 7) becomes `MacExtendedAddress` and the
+//! active IEEE everywhere; an image on trial (`FW_ACTIVATE`, spec 7.9) must
+//! get `FW_CONFIRM` within the trial window or is rolled back.
 
 #![no_std]
 #![no_main]
@@ -27,6 +33,7 @@ use ncp_coordinator_app::log_ring::level_code;
 use ncp_coordinator_app::tc::TcPort;
 use ncp_coordinator_app::{LogRing, Ncp, NcpIdentity, PlatformRequest};
 use product::flash_size::FlashVerdict;
+use product::platform::{BootOutcome, EspPlatform, TrialPoll};
 use product::stores;
 use router_app::{
     NoDiagnostics, NoStatus, NoSupervisor, PersistentApsTables, PersistentChildren, RouterParts,
@@ -35,6 +42,7 @@ use router_app::{
 use static_cell::StaticCell;
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_mac::esp::EspRouterMac;
+use zigbee_mac::{PibAttribute, PibValue};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::power::PowerMode;
@@ -77,6 +85,11 @@ impl log::Log for RingLogger {
 
 static LOGGER: RingLogger = RingLogger;
 
+/// Version word `0xMMmmrrrr` of this image (`FW_*` downgrade policy and
+/// `FW_GET_SLOTS`), from the same `CARGO_PKG_VERSION` the app descriptor
+/// and `SYS_GET_INFO.fw_version` carry.
+const FW_VERSION: u32 = product::fw::parse_version(env!("CARGO_PKG_VERSION").as_bytes());
+
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     esp_hal::system::software_reset()
@@ -88,6 +101,10 @@ fn clock_ms() -> u32 {
 
 fn now_us() -> u64 {
     Instant::now().as_micros()
+}
+
+fn now_ms() -> u64 {
+    Instant::now().as_millis()
 }
 
 fn halt() -> ! {
@@ -128,6 +145,20 @@ fn main() -> ! {
     log::set_max_level(log::LevelFilter::Info);
     esp32_zigbee_devkit_product::time_driver::init(peripherals.SYSTIMER);
 
+    // Identity item and otadata boot check, before the radio and the
+    // stack exist (the check may program otadata).
+    static PLATFORM: StaticCell<EspPlatform> = StaticCell::new();
+    let (platform, boot) = product::platform::boot(FW_VERSION, now_ms());
+    match boot {
+        BootOutcome::RolledBack { slot } => {
+            log::error!("unconfirmed image rolled back to slot {}", slot);
+            esp_hal::system::software_reset()
+        }
+        BootOutcome::Trial { slot } => log::warn!("slot {} on trial: FW_CONFIRM required", slot),
+        _ => {}
+    }
+    let platform = PLATFORM.init(platform);
+
     let verdict =
         FlashVerdict::from_jedec(product::flash::read_jedec_id(), &product::layout::ACTIVE);
     let rng = esp_hal::rng::Rng::new();
@@ -149,7 +180,11 @@ fn main() -> ! {
         peripherals.DMA_CH0,
     );
 
-    let port = compose(peripherals.IEEE802154, peripherals.AES);
+    let port = compose(
+        peripherals.IEEE802154,
+        peripherals.AES,
+        platform.boot_ieee_override(),
+    );
     let identity = NcpIdentity {
         fw_version: env!("CARGO_PKG_VERSION"),
         build_id: [0; 8],
@@ -179,7 +214,7 @@ fn main() -> ! {
     static NCP: StaticCell<Ncp<LOG_RECORDS>> = StaticCell::new();
     static PORT: StaticCell<TcPort<App>> = StaticCell::new();
     let ncp = NCP.init(Ncp::new(identity, cookie, now_us()));
-    block_on(run(ncp, &mut host, PORT.init(port)))
+    block_on(run(ncp, &mut host, PORT.init(port), platform))
 }
 
 #[cfg(feature = "transport-uart")]
@@ -212,10 +247,13 @@ fn uart_host(
 }
 
 /// Radio, stores, device and Trust Center coordinator in static storage.
+/// `ieee_override` (the persisted identity item) replaces the factory
+/// EUI-64 before anything reads the MAC's extended address.
 #[inline(never)]
 fn compose(
     radio: esp_hal::peripherals::IEEE802154<'static>,
     aes: esp_hal::peripherals::AES<'static>,
+    ieee_override: Option<[u8; 8]>,
 ) -> TcPort<App> {
     let ieee802154 = esp_radio::ieee802154::Ieee802154::new(radio);
     let mut phy =
@@ -223,9 +261,20 @@ fn compose(
     if phy.install_aes_engine(aes).is_err() {
         halt()
     }
-    let Ok(mac) = phy.into_parent_mac() else {
+    let Ok(mut mac) = phy.into_parent_mac() else {
         halt()
     };
+    if let Some(ieee) = ieee_override
+        && mac
+            .set_pib(
+                PibAttribute::MacExtendedAddress,
+                PibValue::ExtendedAddress(ieee),
+            )
+            .is_err()
+    {
+        halt()
+    }
+    // The active IEEE: the override, else the factory eFuse EUI-64.
     let ieee = mac.pib().extended_address();
     if ieee == [0; 8] || ieee == [0xFF; 8] {
         halt()
@@ -282,8 +331,14 @@ async fn run(
     ncp: &mut Ncp<LOG_RECORDS>,
     host: &mut product::host::Host,
     port: &mut TcPort<App>,
+    platform: &mut EspPlatform,
 ) -> ! {
     loop {
+        // Trial window without FW_CONFIRM: the previous image is selected
+        // (or the next boot's check selects it); restart into it.
+        if let TrialPoll::Expired { .. } = platform.poll_trial(now_ms()) {
+            esp_hal::system::software_reset();
+        }
         if let Some(PlatformRequest::Reset { .. }) = ncp.service(now_us(), host, port, &LOG) {
             // Mode 1 (ROM download) is entered by the host through the USJ
             // DTR/RTS lines or the board's BOOT line; both modes reboot.
