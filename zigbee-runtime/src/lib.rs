@@ -9253,7 +9253,7 @@ impl<M: MacDriver, R: crate::role::ParentRole> ZigbeeDevice<M, R> {
 /// role-specific [`ParentState`](crate::role::ParentState) through the
 /// [`ParentRole`](crate::role::ParentRole) accessors rather than a common
 /// field (which no longer exists on a leaf/relay device).
-#[cfg(all(test, feature = "router"))]
+#[cfg(all(test, feature = "router", not(feature = "global-aps-counter")))]
 impl<M: MacDriver, R: crate::role::ParentRole> ZigbeeDevice<M, R> {
     /// Whether a R22 Parent Announce is currently scheduled
     /// (`apsParentAnnounceTimer` running).
@@ -15929,7 +15929,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 }
 
-#[cfg(all(test, feature = "router"))]
+// Parent-router (non-Trust-Center) scenarios; with `global-aps-counter` no
+// TC runtime installs the APS reservation, so their APS-secured sends are
+// refused by design.
+#[cfg(all(test, feature = "router", not(feature = "global-aps-counter")))]
 mod parent_router_tests {
     use super::child_store::{
         ChildStoreError, ChildTableStore, PersistentChildTable, RamChildTableStore,

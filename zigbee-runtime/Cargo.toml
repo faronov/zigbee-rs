@@ -56,6 +56,12 @@ router = [
     "zigbee-zdo/router",
 ]
 trust-center = ["router", "zigbee-aps/trust-center", "zigbee-bdb/trust-center"]
+# One durably reserved outgoing APS frame counter for every APS-secured frame
+# the coordinator sends (ZRHP decision 2). Kept in the Trust Center journal
+# (record version 5); a version-4 journal migrates on the first start with
+# start = max(every per-key limit, the NWK limit). Off by default: images
+# without it are unchanged.
+global-aps-counter = ["trust-center", "zigbee-aps/global-aps-counter"]
 ota = []
 # Green Power Proxy Basic (GP 1.1) for routers: GPDF reception, Proxy Table,
 # GP Notification / Commissioning Notification tunnelling with NWK aliasing.

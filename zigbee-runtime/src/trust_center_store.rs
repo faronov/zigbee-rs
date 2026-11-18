@@ -15,13 +15,20 @@ const ROTATION_TRAILER_LEN: usize = 3;
 const UNKNOWN_REMOVAL_ENTRY_LEN: usize = 16;
 const UNKNOWN_REMOVAL_HEADER_LEN: usize = 1;
 pub const MAX_APPLICATION_KEY_REQUESTS: usize = 8;
+/// Durable global outgoing APS counter limit, appended by record version 5
+/// (`global-aps-counter`).
+#[cfg(feature = "global-aps-counter")]
+const GLOBAL_APS_TRAILER_LEN: usize = 4;
+#[cfg(not(feature = "global-aps-counter"))]
+const GLOBAL_APS_TRAILER_LEN: usize = 0;
 pub const MAX_ENCODED_TRUST_CENTER_STATE_LEN: usize = STATE_HEADER_LEN
     + MAX_TRUST_CENTER_DEVICES * DEVICE_ENCODED_LEN
     + 1
     + MAX_APPLICATION_KEY_REQUESTS * APPLICATION_KEY_REQUEST_ENTRY_LEN
     + ROTATION_TRAILER_LEN
     + UNKNOWN_REMOVAL_HEADER_LEN
-    + MAX_TRUST_CENTER_DEVICES * UNKNOWN_REMOVAL_ENTRY_LEN;
+    + MAX_TRUST_CENTER_DEVICES * UNKNOWN_REMOVAL_ENTRY_LEN
+    + GLOBAL_APS_TRAILER_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -114,6 +121,11 @@ pub struct PersistentTrustCenterState {
     application_key_requests: Vec<ApplicationKeyRequestEntry, MAX_APPLICATION_KEY_REQUESTS>,
     devices: Vec<PersistentTrustCenterDevice, MAX_TRUST_CENTER_DEVICES>,
     pending_unknown_removals: Vec<PendingUnknownRemoval, MAX_TRUST_CENTER_DEVICES>,
+    /// Exclusive, durably reserved limit of the global outgoing APS counter
+    /// (`global-aps-counter`); 0 = never reserved (a record written before
+    /// the migration, version <= 4).
+    #[cfg(feature = "global-aps-counter")]
+    global_aps_limit: u32,
 }
 
 impl PersistentTrustCenterState {
@@ -125,7 +137,25 @@ impl PersistentTrustCenterState {
             application_key_requests: Vec::new(),
             devices: Vec::new(),
             pending_unknown_removals: Vec::new(),
+            #[cfg(feature = "global-aps-counter")]
+            global_aps_limit: 0,
         }
+    }
+
+    /// Durable limit of the global outgoing APS counter (0 = none yet).
+    #[cfg(feature = "global-aps-counter")]
+    pub const fn global_aps_limit(&self) -> u32 {
+        self.global_aps_limit
+    }
+
+    /// Record a new durable global APS limit; it never moves backwards.
+    #[cfg(feature = "global-aps-counter")]
+    pub fn set_global_aps_limit(&mut self, limit: u32) -> bool {
+        if limit < self.global_aps_limit {
+            return false;
+        }
+        self.global_aps_limit = limit;
+        true
     }
 
     pub const fn extended_pan_id(&self) -> IeeeAddress {
@@ -474,10 +504,43 @@ impl PersistentTrustCenterState {
             output[offset + 8..offset + 16].copy_from_slice(&pending.device_address);
             offset += UNKNOWN_REMOVAL_ENTRY_LEN;
         }
+        #[cfg(feature = "global-aps-counter")]
+        {
+            output[offset..offset + GLOBAL_APS_TRAILER_LEN]
+                .copy_from_slice(&self.global_aps_limit.to_le_bytes());
+            offset += GLOBAL_APS_TRAILER_LEN;
+        }
         offset
     }
 
+    /// Decode the current record version's encoding.
+    #[cfg(not(feature = "global-aps-counter"))]
     pub fn decode(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
+        Self::decode_version(bytes, true, true, true)
+    }
+
+    /// Decode the current record version's encoding (version 5: the
+    /// version-4 encoding plus the global APS limit trailer).
+    #[cfg(feature = "global-aps-counter")]
+    pub fn decode(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
+        let split = bytes
+            .len()
+            .checked_sub(GLOBAL_APS_TRAILER_LEN)
+            .ok_or(TrustCenterStoreError::Corrupt)?;
+        let mut state = Self::decode_v4(&bytes[..split])?;
+        state.global_aps_limit = u32::from_le_bytes([
+            bytes[split],
+            bytes[split + 1],
+            bytes[split + 2],
+            bytes[split + 3],
+        ]);
+        Ok(state)
+    }
+
+    /// Version 4: no global APS limit (migrated on the first global-mode
+    /// start).
+    #[cfg(feature = "global-aps-counter")]
+    fn decode_v4(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
         Self::decode_version(bytes, true, true, true)
     }
 
@@ -804,7 +867,15 @@ const ROTATION_RECORD_VERSION: u8 = 2;
 const UNKNOWN_REMOVAL_RECORD_VERSION: u8 = 3;
 /// Trust Center journal epoch that production Coordinator rollback policy
 /// must not cross after committing this format.
+#[cfg(not(feature = "global-aps-counter"))]
 pub const TRUST_CENTER_JOURNAL_FORMAT_VERSION: u8 = 4;
+/// Version 5 (`global-aps-counter`) appends the global outgoing APS limit.
+/// Firmware without the feature does not recognize it and starts with an
+/// empty Trust Center table rather than reusing a counter (spec 8.4).
+#[cfg(feature = "global-aps-counter")]
+pub const TRUST_CENTER_JOURNAL_FORMAT_VERSION: u8 = 5;
+#[cfg(feature = "global-aps-counter")]
+const GLOBAL_APS_RECORD_VERSION_PREDECESSOR: u8 = 4;
 const RECORD_VERSION: u8 = TRUST_CENTER_JOURNAL_FORMAT_VERSION;
 const RECORD_ENCODED_OFFSET: usize = 12;
 const RECORD_CRC_OFFSET: usize = TRUST_CENTER_JOURNAL_SLOT_SIZE - 12;
@@ -887,14 +958,25 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
     fn decode_record(
         record: &[u8; TRUST_CENTER_JOURNAL_SLOT_SIZE],
     ) -> Option<(u32, PersistentTrustCenterState)> {
+        #[cfg(feature = "global-aps-counter")]
+        let known_version = matches!(
+            record[4],
+            LEGACY_RECORD_VERSION
+                | ROTATION_RECORD_VERSION
+                | UNKNOWN_REMOVAL_RECORD_VERSION
+                | GLOBAL_APS_RECORD_VERSION_PREDECESSOR
+                | RECORD_VERSION
+        );
+        #[cfg(not(feature = "global-aps-counter"))]
+        let known_version = matches!(
+            record[4],
+            LEGACY_RECORD_VERSION
+                | ROTATION_RECORD_VERSION
+                | UNKNOWN_REMOVAL_RECORD_VERSION
+                | RECORD_VERSION
+        );
         if record[0..4] != RECORD_MAGIC
-            || !matches!(
-                record[4],
-                LEGACY_RECORD_VERSION
-                    | ROTATION_RECORD_VERSION
-                    | UNKNOWN_REMOVAL_RECORD_VERSION
-                    | RECORD_VERSION
-            )
+            || !known_version
             || record[RECORD_COMMIT_OFFSET..RECORD_COMMIT_OFFSET + 4] != RECORD_COMMIT
         {
             return None;
@@ -918,6 +1000,8 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
         let encoded = &record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len];
         let state = match record[4] {
             RECORD_VERSION => PersistentTrustCenterState::decode(encoded),
+            #[cfg(feature = "global-aps-counter")]
+            GLOBAL_APS_RECORD_VERSION_PREDECESSOR => PersistentTrustCenterState::decode_v4(encoded),
             UNKNOWN_REMOVAL_RECORD_VERSION => PersistentTrustCenterState::decode_v3(encoded),
             ROTATION_RECORD_VERSION => PersistentTrustCenterState::decode_v2(encoded),
             LEGACY_RECORD_VERSION => PersistentTrustCenterState::decode_v1(encoded),
@@ -1173,7 +1257,10 @@ mod tests {
         );
         assert_eq!(
             PersistentTrustCenterState::decode_v1(
-                &encoded[..len - ROTATION_TRAILER_LEN - UNKNOWN_REMOVAL_HEADER_LEN]
+                &encoded[..len
+                    - GLOBAL_APS_TRAILER_LEN
+                    - ROTATION_TRAILER_LEN
+                    - UNKNOWN_REMOVAL_HEADER_LEN]
             )
             .unwrap(),
             state,
@@ -1204,11 +1291,13 @@ mod tests {
         let state = state();
         let mut encoded = [0; MAX_ENCODED_TRUST_CENTER_STATE_LEN];
         let len = state.encode(&mut encoded);
-        let decoded = PersistentTrustCenterState::decode_v3(&encoded[..len]).unwrap();
+        let decoded =
+            PersistentTrustCenterState::decode_v3(&encoded[..len - GLOBAL_APS_TRAILER_LEN])
+                .unwrap();
         assert_eq!(decoded.device(&DEVICE).unwrap().is_router, None);
         encoded[STATE_HEADER_LEN + 37] |= 0x80;
         assert_eq!(
-            PersistentTrustCenterState::decode_v3(&encoded[..len]),
+            PersistentTrustCenterState::decode_v3(&encoded[..len - GLOBAL_APS_TRAILER_LEN]),
             Err(TrustCenterStoreError::Corrupt)
         );
     }
@@ -1246,7 +1335,10 @@ mod tests {
         encoded[STATE_HEADER_LEN + 37] &= !0x40;
         assert!(
             !PersistentTrustCenterState::decode_v1(
-                &encoded[..len - ROTATION_TRAILER_LEN - UNKNOWN_REMOVAL_HEADER_LEN]
+                &encoded[..len
+                    - GLOBAL_APS_TRAILER_LEN
+                    - ROTATION_TRAILER_LEN
+                    - UNKNOWN_REMOVAL_HEADER_LEN]
             )
             .unwrap()
             .device(&DEVICE)
@@ -1316,6 +1408,11 @@ mod tests {
             let mut encoded = [0u8; MAX_ENCODED_TRUST_CENTER_STATE_LEN];
             let current_len = state.encode(&mut encoded);
             let encoded_len = current_len
+                - if version < RECORD_VERSION {
+                    GLOBAL_APS_TRAILER_LEN
+                } else {
+                    0
+                }
                 - if version < UNKNOWN_REMOVAL_RECORD_VERSION {
                     UNKNOWN_REMOVAL_HEADER_LEN
                 } else {
@@ -1418,6 +1515,8 @@ mod tests {
             LEGACY_RECORD_VERSION,
             ROTATION_RECORD_VERSION,
             UNKNOWN_REMOVAL_RECORD_VERSION,
+            #[cfg(feature = "global-aps-counter")]
+            GLOBAL_APS_RECORD_VERSION_PREDECESSOR,
         ] {
             let expected = state();
             let mut flash = MockFlash::new();
@@ -1535,7 +1634,10 @@ mod tests {
         }
         let mut bytes = [0; MAX_ENCODED_TRUST_CENTER_STATE_LEN];
         let len = state.encode(&mut bytes);
-        let count_offset = len - UNKNOWN_REMOVAL_HEADER_LEN - 2 * UNKNOWN_REMOVAL_ENTRY_LEN;
+        let count_offset = len
+            - GLOBAL_APS_TRAILER_LEN
+            - UNKNOWN_REMOVAL_HEADER_LEN
+            - 2 * UNKNOWN_REMOVAL_ENTRY_LEN;
         let first = count_offset + UNKNOWN_REMOVAL_HEADER_LEN;
         assert_eq!(
             PersistentTrustCenterState::decode(&bytes[..len - 1]),
@@ -1665,5 +1767,42 @@ mod tests {
         journal.store(&expected).unwrap();
         assert_eq!(journal.storage().rejected, 0);
         assert_eq!(journal.load(), Ok(Some(expected)));
+    }
+
+    #[cfg(feature = "global-aps-counter")]
+    #[test]
+    fn version_5_carries_the_global_aps_limit_and_version_4_reads_as_unmigrated() {
+        let mut state = state();
+        assert_eq!(state.global_aps_limit(), 0);
+        assert!(state.set_global_aps_limit(0x0012_3400));
+        assert!(
+            !state.set_global_aps_limit(0x0012_3000),
+            "the limit never moves back"
+        );
+        let mut encoded = [0u8; MAX_ENCODED_TRUST_CENTER_STATE_LEN];
+        let len = state.encode(&mut encoded);
+        assert_eq!(&encoded[len - 4..len], &0x0012_3400u32.to_le_bytes());
+        assert_eq!(
+            PersistentTrustCenterState::decode(&encoded[..len]),
+            Ok(state.clone())
+        );
+        let v4 = PersistentTrustCenterState::decode_v4(&encoded[..len - GLOBAL_APS_TRAILER_LEN])
+            .unwrap();
+        assert_eq!(v4.global_aps_limit(), 0);
+
+        let mut journal = TrustCenterDeviceJournal::new(
+            MockFlash::new(),
+            0,
+            TRUST_CENTER_JOURNAL_SECTOR_SIZE as u32,
+        );
+        journal.store(&state).unwrap();
+        let flash = journal.into_storage();
+        assert_eq!(flash.bytes[4], 5);
+        let mut reopened =
+            TrustCenterDeviceJournal::new(flash, 0, TRUST_CENTER_JOURNAL_SECTOR_SIZE as u32);
+        assert_eq!(
+            reopened.load().unwrap().unwrap().global_aps_limit(),
+            0x0012_3400
+        );
     }
 }

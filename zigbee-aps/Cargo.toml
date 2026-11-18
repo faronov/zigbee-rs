@@ -22,6 +22,12 @@ sleepy-end-device = []
 fragmentation = []
 router = ["zigbee-nwk/router", "fragmentation"]
 trust-center = ["router"]
+# One reserved outgoing APS frame counter for every APS-secured frame this
+# node sends, under any link key (ZRHP decision 2, EmberZNet-style): the
+# coordinator NCP. Until the owner installs a durable reservation with
+# `ApsSecurity::set_global_outgoing_counter`, every APS-secured send is
+# refused. Off by default: images without it are unchanged.
+global-aps-counter = ["trust-center"]
 trace = ["zigbee-nwk/trace"]
 # Green Power alias transmission for GP Notification tunnelling. Off by default.
 green-power = ["zigbee-nwk/green-power"]

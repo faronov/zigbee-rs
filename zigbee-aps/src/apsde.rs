@@ -3076,9 +3076,17 @@ impl<M: MacDriver> ApsLayer<M> {
     }
 
     fn next_default_tc_link_key_frame_counter(&mut self) -> Option<u32> {
+        // With `global-aps-counter` every APS-secured frame, including those
+        // under the preconfigured global keys, takes the one reserved APS
+        // counter.
+        #[cfg(feature = "global-aps-counter")]
+        {
+            self.security.next_global_frame_counter()
+        }
         // The preconfigured global TC link key uses the same persistent
         // outgoing security counter as NWK security. This matches the Telink
         // stack and prevents Request-Key from restarting at zero after boot.
+        #[cfg(not(feature = "global-aps-counter"))]
         self.nwk.nib_mut().next_frame_counter()
     }
 
@@ -4298,6 +4306,114 @@ mod tests {
             trust_center_link_key(&security, &[0xBB; 8]),
             *security.default_tc_link_key()
         );
+    }
+
+    #[cfg(feature = "global-aps-counter")]
+    fn global_test_entry(partner: [u8; 8], key: [u8; 16]) -> crate::security::ApsLinkKeyEntry {
+        crate::security::ApsLinkKeyEntry {
+            partner_address: partner,
+            key,
+            key_type: crate::security::ApsKeyType::TrustCenterLinkKey,
+            outgoing_frame_counter: 0x100,
+            outgoing_frame_counter_limit: 0x500,
+            incoming_frame_counter: 0,
+            incoming_frame_counter_valid: false,
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "global-aps-counter")]
+    fn global_aps_counter_refuses_every_secured_send_until_installed() {
+        let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        aps.nwk_mut()
+            .nib_mut()
+            .set_frame_counter_reservation(0x2000, 0x2400);
+        aps.security_mut()
+            .add_key(global_test_entry([0x11; 8], [0xA1; 16]))
+            .unwrap();
+        // Neither a unique key nor the preconfigured global key may fall back
+        // to a per-key or the NWK counter.
+        assert!(
+            aps.next_key_pair_material(&[0x11; 8], crate::security::ApsKeyType::TrustCenterLinkKey)
+                .is_none()
+        );
+        assert!(aps.next_default_tc_link_key_frame_counter().is_none());
+        assert_eq!(aps.nwk().nib().outgoing_frame_counter, 0x2000);
+    }
+
+    #[test]
+    #[cfg(feature = "global-aps-counter")]
+    fn global_aps_counter_is_shared_by_every_key_and_leaves_per_key_counters_alone() {
+        let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        aps.nwk_mut()
+            .nib_mut()
+            .set_frame_counter_reservation(0x2000, 0x2400);
+        let default_key = *aps.security().default_tc_link_key();
+        aps.security_mut()
+            .add_key(global_test_entry([0x11; 8], [0xA1; 16]))
+            .unwrap();
+        aps.security_mut()
+            .add_key(global_test_entry([0x22; 8], default_key))
+            .unwrap();
+        assert!(
+            aps.security_mut()
+                .set_global_outgoing_counter(0x9000, 0x9400)
+        );
+
+        let unique = aps
+            .next_key_pair_material(&[0x11; 8], crate::security::ApsKeyType::TrustCenterLinkKey)
+            .unwrap();
+        let global = aps
+            .next_key_pair_material(&[0x22; 8], crate::security::ApsKeyType::TrustCenterLinkKey)
+            .unwrap();
+        let preconfigured = aps.next_default_tc_link_key_frame_counter().unwrap();
+        assert_eq!(
+            (unique.frame_counter, global.frame_counter, preconfigured),
+            (0x9000, 0x9001, 0x9002)
+        );
+        // The NWK counter and the per-key entries are untouched.
+        assert_eq!(aps.nwk().nib().outgoing_frame_counter, 0x2000);
+        let entry = aps
+            .security()
+            .find_key(&[0x11; 8], crate::security::ApsKeyType::TrustCenterLinkKey)
+            .unwrap();
+        assert_eq!(entry.outgoing_frame_counter, 0x100);
+        // A key-pair entry that does not exist still gets no counter.
+        assert!(
+            aps.next_key_pair_material(&[0x33; 8], crate::security::ApsKeyType::TrustCenterLinkKey)
+                .is_none()
+        );
+        assert_eq!(
+            aps.security().global_outgoing_counter(),
+            Some(crate::security::GlobalApsCounter {
+                current: 0x9003,
+                limit: 0x9400
+            })
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "global-aps-counter")]
+    fn global_aps_counter_never_reaches_its_limit_and_only_moves_forward() {
+        let mut security = crate::security::ApsSecurity::new();
+        security
+            .add_key(global_test_entry([0x11; 8], [0xA1; 16]))
+            .unwrap();
+        assert!(security.set_global_outgoing_counter(10, 12));
+        let tclk = crate::security::ApsKeyType::TrustCenterLinkKey;
+        assert_eq!(security.next_frame_counter(&[0x11; 8], tclk), Some(10));
+        assert_eq!(security.next_frame_counter(&[0x11; 8], tclk), Some(11));
+        assert_eq!(security.next_frame_counter(&[0x11; 8], tclk), None);
+        // Lowering either bound is refused; extending works.
+        assert!(!security.set_global_outgoing_counter(11, 0x500));
+        assert!(!security.set_global_outgoing_counter(12, 11));
+        assert!(!security.set_global_outgoing_counter(13, 12));
+        assert!(security.set_global_outgoing_counter(12, 0x40C));
+        assert_eq!(security.next_frame_counter(&[0x11; 8], tclk), Some(12));
+        // Leaving the network drops the reservation.
+        security.clear_keys();
+        assert_eq!(security.global_outgoing_counter(), None);
+        assert_eq!(security.next_global_frame_counter(), None);
     }
 
     #[test]

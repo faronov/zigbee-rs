@@ -103,6 +103,29 @@ pub struct TrustCenterRuntime<S> {
     initialization_pending: bool,
     initial_key_attempts: heapless::Vec<(IeeeAddress, u32), MAX_TRUST_CENTER_DEVICES>,
     network_key_propagation_started: Option<u32>,
+    /// Durable global APS reservations committed since construction.
+    #[cfg(feature = "global-aps-counter")]
+    global_aps_commits: u32,
+}
+
+/// Remaining values below which the global APS reservation is extended
+/// (`global-aps-counter`): half a reservation, so a burst between two polls
+/// never reaches the limit in practice. If it does, sends are refused, never
+/// a counter reused.
+#[cfg(feature = "global-aps-counter")]
+pub const GLOBAL_APS_LOW_WATER: u32 = APS_COUNTER_RESERVATION / 2;
+
+/// State of the global outgoing APS counter for host checkpoints
+/// (`EVT_FC_CHECKPOINT{domain = 2}`, `SEC_GET_FRAME_COUNTERS`).
+#[cfg(feature = "global-aps-counter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalApsCheckpoint {
+    /// Next value to use.
+    pub current: u32,
+    /// Durable, exclusive limit; no value at or above it was ever used.
+    pub durable_limit: u32,
+    /// Reservation commits since start (changes with every new limit).
+    pub commits: u32,
 }
 
 impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
@@ -121,7 +144,103 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             initialization_pending: false,
             initial_key_attempts: heapless::Vec::new(),
             network_key_propagation_started: None,
+            #[cfg(feature = "global-aps-counter")]
+            global_aps_commits: 0,
         }
+    }
+
+    /// The global outgoing APS counter, once a reservation is installed.
+    #[cfg(feature = "global-aps-counter")]
+    pub fn global_aps_counter<M: MacDriver>(
+        &self,
+        device: &ZigbeeDevice<M>,
+    ) -> Option<GlobalApsCheckpoint> {
+        let live = device.aps().security().global_outgoing_counter()?;
+        let durable_limit = self.state.as_ref()?.global_aps_limit();
+        Some(GlobalApsCheckpoint {
+            current: live.current,
+            durable_limit,
+            commits: self.global_aps_commits,
+        })
+    }
+
+    /// Raise the global outgoing APS counter to at least `floor` (a host
+    /// checkpoint floor or a restore start) and durably reserve a range
+    /// above it before any further APS-secured transmission.
+    #[cfg(feature = "global-aps-counter")]
+    pub fn raise_global_aps_floor<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        floor: u32,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        self.require_initialized_network(device)?;
+        let live = device.aps().security().global_outgoing_counter();
+        let current = live.map_or(0, |counter| counter.current);
+        if live.is_some() && floor <= current {
+            return Ok(());
+        }
+        let state = self
+            .state
+            .as_ref()
+            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let start = floor.max(current).max(state.global_aps_limit());
+        self.commit_global_aps(device, start, reserve_end(start)?)
+    }
+
+    /// Keep a global APS reservation installed and ahead of use: re-install
+    /// one from the durable limit if it was dropped, extend it when fewer
+    /// than [`GLOBAL_APS_LOW_WATER`] values remain.
+    #[cfg(feature = "global-aps-counter")]
+    fn maintain_global_aps_reservation<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        let state = self
+            .state
+            .as_ref()
+            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        match device.aps().security().global_outgoing_counter() {
+            None => {
+                let start = global_aps_start(state, device);
+                self.commit_global_aps(device, start, reserve_end(start)?)
+            }
+            Some(counter)
+                if counter.limit.saturating_sub(counter.current) <= GLOBAL_APS_LOW_WATER =>
+            {
+                let limit = reserve_end(counter.current)?.max(counter.limit);
+                self.commit_global_aps(device, counter.current, limit)
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Durably commit `limit`, then install `start..limit` as the live
+    /// reservation. Nothing is installed if the commit fails.
+    #[cfg(feature = "global-aps-counter")]
+    fn commit_global_aps<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        start: u32,
+        limit: u32,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        let mut state = self
+            .state
+            .clone()
+            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        if !state.set_global_aps_limit(limit) {
+            return Err(TrustCenterRuntimeError::CounterExhausted);
+        }
+        self.store.store(&state)?;
+        self.state = Some(state);
+        self.global_aps_commits = self.global_aps_commits.wrapping_add(1);
+        if !device
+            .aps_mut()
+            .security_mut()
+            .set_global_outgoing_counter(start, limit)
+        {
+            return Err(TrustCenterRuntimeError::CounterExhausted);
+        }
+        Ok(())
     }
 
     pub const fn is_initialized(&self) -> bool {
@@ -302,9 +421,31 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             }
         }
         reserve_restored_ranges(&mut state)?;
+        // Global APS counter: resume at (or migrate to) the highest value any
+        // key could have used, reserved in the same atomic journal write as
+        // the restored per-key ranges.
+        #[cfg(feature = "global-aps-counter")]
+        let global_start = {
+            let start = global_aps_start(&state, device);
+            if !state.set_global_aps_limit(reserve_end(start)?) {
+                return Err(TrustCenterRuntimeError::CounterExhausted);
+            }
+            start
+        };
         self.store.store(&state)?;
         for stored in state.devices() {
             install_key(device, stored)?;
+        }
+        #[cfg(feature = "global-aps-counter")]
+        {
+            self.global_aps_commits = self.global_aps_commits.wrapping_add(1);
+            if !device
+                .aps_mut()
+                .security_mut()
+                .set_global_outgoing_counter(global_start, state.global_aps_limit())
+            {
+                return Err(TrustCenterRuntimeError::CounterExhausted);
+            }
         }
         self.state = Some(state);
         self.last_poll_us = device.mac().monotonic_micros();
@@ -416,6 +557,8 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         indication: ApsmeSecurityIndication,
     ) -> Result<(), TrustCenterRuntimeError> {
         self.require_initialized_network(device)?;
+        #[cfg(feature = "global-aps-counter")]
+        self.maintain_global_aps_reservation(device)?;
         self.checkpoint_live_counters(device)?;
         let mut policy = TrustCenterPolicy::from_attributes(device.bdb().attributes());
         policy.allow_joins &= device.aps().nwk().nib().permit_joining;
@@ -449,6 +592,8 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
     ) -> Result<(), TrustCenterRuntimeError> {
         self.require_initialized_network(device)?;
+        #[cfg(feature = "global-aps-counter")]
+        self.maintain_global_aps_reservation(device)?;
         self.resume_pending(device, true).await?;
         let now = device.mac().monotonic_micros();
         let delta = u64::from(now.wrapping_sub(self.last_poll_us));
@@ -1663,6 +1808,17 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         Ok(())
     }
 
+    /// One global reservation covers every key: per-key counters are unused.
+    #[cfg(feature = "global-aps-counter")]
+    fn ensure_counter_available<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        _address: &IeeeAddress,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        self.maintain_global_aps_reservation(device)
+    }
+
+    #[cfg(not(feature = "global-aps-counter"))]
     fn ensure_counter_available<M: MacDriver>(
         &mut self,
         device: &mut ZigbeeDevice<M>,
@@ -2212,6 +2368,32 @@ fn reserve_restored_ranges(
         }
     }
     Ok(())
+}
+
+/// Lowest safe value of the global APS counter: at or above every value any
+/// key could have used — the durable global limit, every per-key
+/// reservation in the journal and in the live APS key table (the per-key
+/// counters before migration), the live global counter, and the NWK limit
+/// (the preconfigured global keys used the NWK counter before migration).
+#[cfg(feature = "global-aps-counter")]
+fn global_aps_start<M: MacDriver>(
+    state: &PersistentTrustCenterState,
+    device: &ZigbeeDevice<M>,
+) -> u32 {
+    let mut start = state.global_aps_limit();
+    for stored in state.devices() {
+        start = start.max(stored.outgoing_frame_counter_limit);
+        if let Some(pending) = stored.pending_link_key {
+            start = start.max(pending.outgoing_frame_counter_limit);
+        }
+    }
+    for entry in device.aps().security().key_table() {
+        start = start.max(entry.outgoing_frame_counter_limit);
+    }
+    if let Some(live) = device.aps().security().global_outgoing_counter() {
+        start = start.max(live.current);
+    }
+    start.max(device.aps().nwk().nib().outgoing_frame_counter_limit)
 }
 
 fn reserve_end(start: u32) -> Result<u32, TrustCenterRuntimeError> {
@@ -3059,6 +3241,9 @@ mod tests {
     }
 
     #[test]
+    // Asserts a per-key reservation commit before Confirm-Key; with
+    // `global-aps-counter` the global reservation covers it.
+    #[cfg(not(feature = "global-aps-counter"))]
     fn confirm_key_send_intent_survives_reboot_and_completes_without_aps_ack() {
         let (mut device, mut security_store) = coordinator_with_security_store();
         let child_short = add_child(&mut device, CHILD_A);
@@ -4437,5 +4622,179 @@ mod tests {
                 .pending_unknown_removals()
                 .is_empty()
         );
+    }
+
+    #[cfg(feature = "global-aps-counter")]
+    mod global_aps {
+        use super::*;
+        use crate::trust_center_store::PersistentTrustCenterDevice;
+        use zigbee_bdb::trust_center::TrustCenterDevice;
+
+        fn initialized<S: TrustCenterDeviceStore>(
+            store: S,
+            device: &mut ZigbeeDevice<MockMac>,
+        ) -> TrustCenterRuntime<S> {
+            let mut runtime = TrustCenterRuntime::new(store);
+            block_on(runtime.initialize(device)).unwrap();
+            runtime
+        }
+
+        fn take(device: &mut ZigbeeDevice<MockMac>, count: u32) -> u32 {
+            let mut last = 0;
+            for _ in 0..count {
+                last = device
+                    .aps_mut()
+                    .security_mut()
+                    .next_global_frame_counter()
+                    .unwrap();
+            }
+            last
+        }
+
+        #[test]
+        fn fresh_coordinator_reserves_above_the_nwk_limit_before_any_aps_send() {
+            let mut device = coordinator();
+            let nwk_limit = device.aps().nwk().nib().outgoing_frame_counter_limit;
+            // Composed but not initialized: every APS-secured send is refused.
+            assert_eq!(device.aps().security().global_outgoing_counter(), None);
+            let mut runtime = initialized(RamTrustCenterDeviceStore::new(), &mut device);
+            let checkpoint = runtime.global_aps_counter(&device).unwrap();
+            assert_eq!(checkpoint.current, nwk_limit);
+            assert_eq!(
+                checkpoint.durable_limit,
+                nwk_limit + APS_COUNTER_RESERVATION
+            );
+            assert_eq!(
+                runtime
+                    .store_mut()
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .global_aps_limit(),
+                checkpoint.durable_limit
+            );
+        }
+
+        #[test]
+        fn restart_resumes_at_the_durable_limit_and_never_reuses_a_value() {
+            let (mut device, mut security_store) = coordinator_with_security_store();
+            let mut runtime = initialized(RamTrustCenterDeviceStore::new(), &mut device);
+            let used = take(&mut device, 10);
+            let limit = runtime.global_aps_counter(&device).unwrap().durable_limit;
+            let saved = runtime.store_mut().load().unwrap().unwrap();
+            drop(runtime);
+            let mut store = RamTrustCenterDeviceStore::new();
+            store.store(&saved).unwrap();
+
+            let mut rebooted = restored_coordinator(&mut security_store);
+            let runtime = initialized(store, &mut rebooted);
+            let checkpoint = runtime.global_aps_counter(&rebooted).unwrap();
+            assert!(checkpoint.current >= limit && checkpoint.current > used);
+            assert_eq!(
+                checkpoint.durable_limit,
+                checkpoint.current + APS_COUNTER_RESERVATION
+            );
+        }
+
+        #[test]
+        fn version_4_state_migrates_above_every_per_key_reservation() {
+            let mut device = coordinator();
+            let extended_pan_id = device.aps().nwk().nib().extended_pan_id;
+            let mut state = PersistentTrustCenterState::new(extended_pan_id);
+            state
+                .upsert(PersistentTrustCenterDevice {
+                    device: TrustCenterDevice {
+                        ieee_address: CHILD_A,
+                        parent_address: TC,
+                        short_address: ShortAddress(0x1234),
+                        link_key: [0x5A; 16],
+                        key_origin: TrustCenterKeyOrigin::GeneratedUnique,
+                        key_attributes: TrustCenterKeyAttributes::Verified,
+                        join_timeout_remaining_secs: 0,
+                        active: true,
+                    },
+                    outgoing_frame_counter: 0x7_0000,
+                    outgoing_frame_counter_limit: 0x7_0400,
+                    incoming_frame_counter: 3,
+                    incoming_frame_counter_valid: true,
+                    pending_link_key: None,
+                    network_key_pending: false,
+                    confirm_key_pending: None,
+                    removal_pending: false,
+                    new_network_key_delivered: false,
+                    is_router: Some(false),
+                })
+                .unwrap();
+            assert_eq!(state.global_aps_limit(), 0);
+            let mut store = RamTrustCenterDeviceStore::new();
+            store.store(&state).unwrap();
+
+            let runtime = initialized(store, &mut device);
+            let checkpoint = runtime.global_aps_counter(&device).unwrap();
+            // The restore reserved a fresh per-key range above 0x70400; the
+            // global counter starts above that too.
+            assert!(checkpoint.current >= 0x7_0400 + APS_COUNTER_RESERVATION);
+            let next = device
+                .aps_mut()
+                .security_mut()
+                .next_frame_counter(&CHILD_A, ApsKeyType::TrustCenterLinkKey)
+                .unwrap();
+            assert_eq!(next, checkpoint.current);
+        }
+
+        #[test]
+        fn a_failed_reservation_commit_leaves_aps_sends_refused() {
+            let mut device = coordinator();
+            let mut runtime = TrustCenterRuntime::new(FailingStore {
+                fail_next_store: true,
+                ..FailingStore::default()
+            });
+            assert!(block_on(runtime.initialize(&mut device)).is_err());
+            assert_eq!(device.aps().security().global_outgoing_counter(), None);
+            assert_eq!(
+                device.aps_mut().security_mut().next_global_frame_counter(),
+                None
+            );
+        }
+
+        #[test]
+        fn poll_extends_the_reservation_before_it_runs_out() {
+            let mut device = coordinator();
+            let mut runtime = initialized(RamTrustCenterDeviceStore::new(), &mut device);
+            let first = runtime.global_aps_counter(&device).unwrap();
+            take(&mut device, APS_COUNTER_RESERVATION - GLOBAL_APS_LOW_WATER);
+            block_on(runtime.poll(&mut device)).unwrap();
+            let second = runtime.global_aps_counter(&device).unwrap();
+            assert!(second.durable_limit > first.durable_limit);
+            assert_eq!(second.commits, first.commits + 1);
+            assert_eq!(
+                second.durable_limit,
+                second.current + APS_COUNTER_RESERVATION
+            );
+            // A dropped reservation (leave/clear of the key table) is
+            // re-installed from the durable limit, never below it.
+            device
+                .aps_mut()
+                .security_mut()
+                .clear_global_outgoing_counter();
+            block_on(runtime.poll(&mut device)).unwrap();
+            let third = runtime.global_aps_counter(&device).unwrap();
+            assert!(third.current >= second.durable_limit);
+        }
+
+        #[test]
+        fn host_floors_only_raise_the_counter() {
+            let mut device = coordinator();
+            let mut runtime = initialized(RamTrustCenterDeviceStore::new(), &mut device);
+            let before = runtime.global_aps_counter(&device).unwrap();
+            runtime.raise_global_aps_floor(&mut device, 5).unwrap();
+            assert_eq!(runtime.global_aps_counter(&device).unwrap(), before);
+            runtime
+                .raise_global_aps_floor(&mut device, 0x0100_0000)
+                .unwrap();
+            let raised = runtime.global_aps_counter(&device).unwrap();
+            assert_eq!(raised.current, 0x0100_0000);
+            assert_eq!(raised.durable_limit, 0x0100_0000 + APS_COUNTER_RESERVATION);
+        }
     }
 }

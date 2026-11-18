@@ -374,6 +374,22 @@ pub struct ApsSecurity {
     /// carrying a committed incoming floor: that floor was established under
     /// the previous key and no frame has yet been verified with the new one.
     stale_incoming_floors: heapless::Vec<(IeeeAddress, ApsKeyType), MAX_KEY_TABLE_ENTRIES>,
+    /// The single outgoing APS counter (`global-aps-counter`); `None` until
+    /// the owner installs a durable reservation, and every APS-secured send
+    /// is refused meanwhile.
+    #[cfg(feature = "global-aps-counter")]
+    global_outgoing: Option<GlobalApsCounter>,
+}
+
+/// The reserved global outgoing APS frame counter (`global-aps-counter`).
+///
+/// `current` is the next value to use; `limit` is the exclusive, durably
+/// reserved upper bound. Values at or beyond `limit` are never used.
+#[cfg(feature = "global-aps-counter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalApsCounter {
+    pub current: u32,
+    pub limit: u32,
 }
 
 impl ApsSecurity {
@@ -384,7 +400,58 @@ impl ApsSecurity {
             distributed_security_link_key: None,
             global_replay_table: heapless::Vec::new(),
             stale_incoming_floors: heapless::Vec::new(),
+            #[cfg(feature = "global-aps-counter")]
+            global_outgoing: None,
         }
+    }
+
+    /// Install (or advance) the global outgoing counter reservation.
+    ///
+    /// Only moves forward: `current` and `limit` may not fall below the
+    /// installed values, and `current <= limit`. Returns `false` (nothing
+    /// changed) otherwise.
+    #[cfg(feature = "global-aps-counter")]
+    pub fn set_global_outgoing_counter(&mut self, current: u32, limit: u32) -> bool {
+        if current > limit {
+            return false;
+        }
+        if let Some(installed) = self.global_outgoing
+            && (current < installed.current || limit < installed.limit)
+        {
+            return false;
+        }
+        self.global_outgoing = Some(GlobalApsCounter { current, limit });
+        true
+    }
+
+    /// The installed global outgoing counter, if any.
+    #[cfg(feature = "global-aps-counter")]
+    pub const fn global_outgoing_counter(&self) -> Option<GlobalApsCounter> {
+        self.global_outgoing
+    }
+
+    /// Drop the reservation: APS-secured sends are refused until a new one
+    /// is installed (network left, Trust Center state cleared).
+    #[cfg(feature = "global-aps-counter")]
+    pub fn clear_global_outgoing_counter(&mut self) {
+        self.global_outgoing = None;
+    }
+
+    /// Next value of the global outgoing counter; `None` (send refused) when
+    /// none is installed or the reservation is exhausted.
+    #[cfg(feature = "global-aps-counter")]
+    pub fn next_global_frame_counter(&mut self) -> Option<u32> {
+        let Some(counter) = self.global_outgoing.as_mut() else {
+            log::error!("[APS] No global outgoing counter reservation");
+            return None;
+        };
+        if counter.current >= counter.limit {
+            log::error!("[APS] Global frame counter reservation exhausted");
+            return None;
+        }
+        let value = counter.current;
+        counter.current += 1;
+        Some(value)
     }
 
     fn set_stale_incoming_floor(
@@ -560,6 +627,10 @@ impl ApsSecurity {
         self.key_table.clear();
         self.global_replay_table.clear();
         self.stale_incoming_floors.clear();
+        #[cfg(feature = "global-aps-counter")]
+        {
+            self.global_outgoing = None;
+        }
     }
 
     /// Remove application link keys while retaining Trust Center link keys.
@@ -795,11 +866,20 @@ impl ApsSecurity {
 
     /// Increment outgoing frame counter for a partner key.
     /// Returns the pre-increment value.
+    ///
+    /// With `global-aps-counter` the key-pair entry must exist, but the value
+    /// comes from the global counter; the entry's own counter is unused.
     pub fn next_frame_counter(
         &mut self,
         partner: &IeeeAddress,
         key_type: ApsKeyType,
     ) -> Option<u32> {
+        #[cfg(feature = "global-aps-counter")]
+        {
+            self.find_key(partner, key_type)?;
+            self.next_global_frame_counter()
+        }
+        #[cfg(not(feature = "global-aps-counter"))]
         if let Some(entry) = self.find_key_mut(partner, key_type) {
             if entry.outgoing_frame_counter >= entry.outgoing_frame_counter_limit {
                 log::error!("[APS] Link-key frame counter reservation exhausted");

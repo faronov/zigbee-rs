@@ -15,6 +15,8 @@ distributed-security = ["zigbee-runtime/distributed-security"]
 groups = ["zigbee-runtime/groups"]
 router = ["zigbee-runtime/router", "application-link-key-installation"]
 trust-center = ["router", "zigbee-runtime/trust-center"]
+# One reserved outgoing APS counter for every APS-secured frame (ZRHP NCP).
+global-aps-counter = ["trust-center", "zigbee-runtime/global-aps-counter"]
 # Maintenance rejoin requests through `RouterObserver::take_rejoin_request`.
 # Off by default so products that never request one carry no request path.
 rejoin-request = []
