@@ -43,6 +43,13 @@ esp-storage = { version = "0.7", default-features = false, features = [
     "critical-section",
 ] }
 esp-thread-br-h2 = { path = "../../boards/esp-thread-br-h2", optional = true }
+# PTA (`pta`): the radio's external-coexistence hooks and per-scene
+# priorities (local patch `ieee802154-extcoex`, vendor/esp-radio/LOCAL-PATCHES.md).
+esp-radio = { version = "=0.17.0", default-features = false, features = [
+    "ieee802154",
+    "ieee802154-extcoex",
+    "unstable",
+], optional = true }
 esp-serial-stream = { path = "../../esp-serial-stream" }
 esp-hal = { version = "=1.0.0", features = ["unstable"] }
 router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter"] }
@@ -54,6 +61,7 @@ esp32h2 = [
     "esp32-zigbee-devkit-product/esp32h2",
     "esp-serial-stream/esp32h2",
     "esp-hal/esp32h2",
+    "esp-radio?/esp32h2",
 ]
 # ESP32-C6 variant (same 802.15.4 block; USB-Serial-JTAG transport). Lab
 # bring-up target with the 4 MB layout.
@@ -62,6 +70,7 @@ esp32c6 = [
     "esp32-zigbee-devkit-product/esp32c6",
     "esp-serial-stream/esp32c6",
     "esp-hal/esp32c6",
+    "esp-radio?/esp32c6",
 ]
 # Host transport, exactly one per image (spec 11.4).
 transport-usj = []
@@ -78,6 +87,11 @@ waveshare-h2-zero = []
 # Development firmware policy (never in shipped images): FW_FINISH accepts
 # unsigned (plain ESP) images, and FW_BEGIN flags bit0 allows downgrades.
 dev-unsigned-fw = []
+# PTA coexistence follower on the Thread BR board (`pta::Pta`, spec 11.5):
+# off by default and disabled at boot; adds the radio's external-coexistence
+# hooks to the image.
+pta = ["thread-br-h2", "dep:esp-radio"]
 
 [patch.crates-io]
 esp-hal = { path = "../../vendor/esp-hal" }
+esp-radio = { path = "../../vendor/esp-radio" }

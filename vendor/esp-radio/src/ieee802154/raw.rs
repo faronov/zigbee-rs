@@ -319,7 +319,7 @@ fn triggered_fire() {
                     notify = Some(Ieee802154State::Receive);
                 }
                 tx_init(core::ptr::addr_of!(TRIGGERED_BUFFER).cast());
-                ieee802154_set_txrx_pti(Ieee802154TxRxScene::Tx);
+                #[cfg(not(feature = "ieee802154-extcoex"))] ieee802154_set_txrx_pti(Ieee802154TxRxScene::Tx); #[cfg(feature = "ieee802154-extcoex")] ieee802154_set_txrx_pti(Ieee802154TxRxScene::TxAt);
                 set_cmd(Command::TxStart);
                 state.state = Ieee802154State::Transmit;
                 t.outcome = Some(TriggeredOutcome::Sent { fired_after_us });
@@ -399,7 +399,7 @@ fn ieee802154_mac_init() {
 
     set_ed_sample_mode(EdSampleMode::Avg);
 
-    unsafe { esp_coex_ieee802154_ack_pti_set(ieee802154_coex_event_t_IEEE802154_MIDDLE) };
+    #[cfg(not(feature = "ieee802154-extcoex"))] unsafe { esp_coex_ieee802154_ack_pti_set(ieee802154_coex_event_t_IEEE802154_MIDDLE) }; #[cfg(feature = "ieee802154-extcoex")] extcoex::apply_ack_pti();
     ieee802154_set_txrx_pti(Ieee802154TxRxScene::Idle);
 
     unsafe {
@@ -423,7 +423,7 @@ fn ieee802154_mac_init() {
     .unwrap();
 }
 
-fn ieee802154_set_txrx_pti(txrx_scene: Ieee802154TxRxScene) {
+#[cfg(not(feature = "ieee802154-extcoex"))] fn ieee802154_set_txrx_pti(txrx_scene: Ieee802154TxRxScene) {
     match txrx_scene {
         Ieee802154TxRxScene::Idle => {
             unsafe { esp_coex_ieee802154_txrx_pti_set(ieee802154_coex_event_t_IEEE802154_IDLE) };
@@ -449,7 +449,7 @@ pub fn tx_init(frame: *const u8) {
     // ieee802154_frame_is_ack_required(frame)
     {
         // set rx pointer for ack frame
-        set_next_rx_buffer();
+        set_next_rx_buffer(); #[cfg(feature = "ieee802154-extcoex")] extcoex::tx_stage();
     }
 }
 
@@ -519,7 +519,7 @@ fn transmit_inner(
         }
         tx_init(frame);
 
-        ieee802154_set_txrx_pti(Ieee802154TxRxScene::Tx);
+        #[cfg(not(feature = "ieee802154-extcoex"))] ieee802154_set_txrx_pti(Ieee802154TxRxScene::Tx); #[cfg(feature = "ieee802154-extcoex")] ieee802154_set_txrx_pti(if preempt_rx { Ieee802154TxRxScene::TxAt } else { Ieee802154TxRxScene::Tx });
 
         if cca {
             // disable_events(IEEE802154_EVENT_ED_DONE);
@@ -735,7 +735,7 @@ fn rx_init() {
 }
 
 fn enable_rx() {
-    set_next_rx_buffer();
+    #[cfg(feature = "ieee802154-extcoex")] extcoex::rx_stage(); set_next_rx_buffer();
     ieee802154_set_txrx_pti(Ieee802154TxRxScene::Rx);
 
     set_cmd(Command::RxStart);
@@ -965,7 +965,7 @@ fn zb_mac_handler() {
                     &RX_BUFFER[1..][..RX_BUFFER[0] as usize]
                 };
                 if will_auto_send_ack(frm) {
-                    state.state = Ieee802154State::TxAck;
+                    state.state = Ieee802154State::TxAck; #[cfg(feature = "ieee802154-extcoex")] extcoex::tx_stage();
                 } else if should_send_enhanced_ack(frm) {
                     // TODO
                 } else {
@@ -992,7 +992,7 @@ fn zb_mac_handler() {
     }
 
     if events & Event::AckTxDone != 0 {
-        trace!("EventAckTxDone");
+        trace!("EventAckTxDone"); #[cfg(feature = "ieee802154-extcoex")] extcoex::rx_stage();
         next_operation();
     }
 
@@ -1080,5 +1080,163 @@ pub(crate) mod energy_detect {
                 next_operation_inner(state);
             });
         }
+    }
+}
+
+/// Scene priority with configurable PTIs (local patch `ieee802154-extcoex`;
+/// replaces the fixed-PTI function above, which is compiled out).
+#[cfg(feature = "ieee802154-extcoex")]
+fn ieee802154_set_txrx_pti(txrx_scene: Ieee802154TxRxScene) {
+    let pti = extcoex::coex_pti();
+    let priority = match txrx_scene {
+        Ieee802154TxRxScene::Idle => pti.idle,
+        Ieee802154TxRxScene::Tx => pti.tx,
+        Ieee802154TxRxScene::Rx => pti.rx,
+        Ieee802154TxRxScene::TxAt | Ieee802154TxRxScene::RxAt => pti.timed,
+    };
+    unsafe { esp_coex_ieee802154_txrx_pti_set(priority.event()) };
+}
+
+/// External (PTA) coexistence support of the 802.15.4 driver (local patch
+/// `ieee802154-extcoex`, declared last so earlier line numbers are kept).
+///
+/// ESP-IDF **v5.5.1** reference: `components/ieee802154/driver/
+/// esp_ieee802154_dev.c` (`extcoex_tx_stage_start`/`extcoex_rx_stage_start`
+/// call sites, `CONFIG_ESP_COEX_EXTERNAL_COEXIST_ENABLE`) and
+/// `esp_ieee802154_util.c` (`s_coex_config`, `ieee802154_set_txrx_pti`).
+/// The functions are in the ESP32-H2/C6 `libcoexist.a` that `esp-wifi-sys`
+/// already links (the H2 archive is byte-identical to ESP-IDF v5.5.1's).
+/// Enabling the external arbiter itself (GPIO matrix, `esp_coex_external_*`)
+/// is the application's job; this module only gives the radio the same
+/// per-operation hooks and priorities as the ESP-IDF driver.
+#[cfg(feature = "ieee802154-extcoex")]
+pub(crate) mod extcoex {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use esp_wifi_sys::include::{
+        ieee802154_coex_event_t, ieee802154_coex_event_t_IEEE802154_HIGH,
+        ieee802154_coex_event_t_IEEE802154_IDLE, ieee802154_coex_event_t_IEEE802154_LOW,
+        ieee802154_coex_event_t_IEEE802154_MIDDLE,
+    };
+
+    unsafe extern "C" {
+        // libcoexist.a (coexist_api.o): PTI offset 0 / 0xF of the external
+        // arbiter for the coming TX / RX stage.
+        fn esp_coex_ieee802154_extcoex_tx_stage();
+        fn esp_coex_ieee802154_extcoex_rx_stage();
+    }
+
+    /// Coexistence priority of a radio operation
+    /// (`ieee802154_coex_event_t`). The blob maps it through `coex_pti_tab`
+    /// to the PTI the 802.15.4 MAC presents to the arbiter.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CoexPriority {
+        High,
+        Middle,
+        Low,
+        Idle,
+    }
+
+    impl CoexPriority {
+        pub(crate) const fn event(self) -> ieee802154_coex_event_t {
+            match self {
+                Self::High => ieee802154_coex_event_t_IEEE802154_HIGH,
+                Self::Middle => ieee802154_coex_event_t_IEEE802154_MIDDLE,
+                Self::Low => ieee802154_coex_event_t_IEEE802154_LOW,
+                Self::Idle => ieee802154_coex_event_t_IEEE802154_IDLE,
+            }
+        }
+
+        const fn bits(self) -> u32 {
+            match self {
+                Self::High => 0,
+                Self::Middle => 1,
+                Self::Low => 2,
+                Self::Idle => 3,
+            }
+        }
+
+        const fn from_bits(bits: u32) -> Self {
+            match bits & 3 {
+                0 => Self::High,
+                1 => Self::Middle,
+                2 => Self::Low,
+                _ => Self::Idle,
+            }
+        }
+    }
+
+    /// Priorities per radio scene. `timed` covers transmissions started at
+    /// an instant (`transmit_raw_preempting_rx` and the triggered reply,
+    /// ESP-IDF's `TX_AT` scene); `ack` is the hardware automatic ACK.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CoexPti {
+        pub idle: CoexPriority,
+        pub rx: CoexPriority,
+        pub tx: CoexPriority,
+        pub timed: CoexPriority,
+        pub ack: CoexPriority,
+    }
+
+    impl CoexPti {
+        /// ESP-IDF v5.5.1 defaults (`s_coex_config` and the MAC-init ACK
+        /// PTI); also what the driver uses without this feature, except
+        /// that timed transmissions there use the `tx` priority.
+        pub const DEFAULT: Self = Self {
+            idle: CoexPriority::Idle,
+            rx: CoexPriority::Low,
+            tx: CoexPriority::Low,
+            timed: CoexPriority::Middle,
+            ack: CoexPriority::Middle,
+        };
+
+        const fn pack(self) -> u32 {
+            self.idle.bits()
+                | self.rx.bits() << 2
+                | self.tx.bits() << 4
+                | self.timed.bits() << 6
+                | self.ack.bits() << 8
+        }
+
+        const fn unpack(bits: u32) -> Self {
+            Self {
+                idle: CoexPriority::from_bits(bits),
+                rx: CoexPriority::from_bits(bits >> 2),
+                tx: CoexPriority::from_bits(bits >> 4),
+                timed: CoexPriority::from_bits(bits >> 6),
+                ack: CoexPriority::from_bits(bits >> 8),
+            }
+        }
+    }
+
+    static PTI: AtomicU32 = AtomicU32::new(CoexPti::DEFAULT.pack());
+
+    /// The configured priorities.
+    pub fn coex_pti() -> CoexPti {
+        CoexPti::unpack(PTI.load(Ordering::Relaxed))
+    }
+
+    /// Set the priorities. The ACK PTI is written at once; the scene PTIs
+    /// take effect at the next scene change (every TX start and receiver
+    /// restart). Must not be called from the ZB_MAC interrupt.
+    pub fn set_coex_pti(pti: CoexPti) {
+        PTI.store(pti.pack(), Ordering::Relaxed);
+        // The ACK and TX/RX PTIs share one register; the interrupt rewrites
+        // the TX/RX field, so the read-modify-write runs with it masked.
+        super::STATE.with(|_| apply_ack_pti());
+    }
+
+    pub(crate) fn apply_ack_pti() {
+        unsafe { super::esp_coex_ieee802154_ack_pti_set(coex_pti().ack.event()) };
+    }
+
+    #[inline(always)]
+    pub(crate) fn tx_stage() {
+        unsafe { esp_coex_ieee802154_extcoex_tx_stage() };
+    }
+
+    #[inline(always)]
+    pub(crate) fn rx_stage() {
+        unsafe { esp_coex_ieee802154_extcoex_rx_stage() };
     }
 }

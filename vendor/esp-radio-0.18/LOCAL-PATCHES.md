@@ -84,3 +84,11 @@ Same patch as `vendor/esp-radio/LOCAL-PATCHES.md` (shared `hal.rs`; the
 `mod.rs`/`raw.rs` additions are identical and outside the recorded port
 diff). Off by default; no C5 image enables it yet, and it has not run on a
 C5.
+
+## External (PTA) coexistence hooks (`ieee802154-extcoex`)
+
+Same patch as `vendor/esp-radio/LOCAL-PATCHES.md`; the `mod.rs`/`raw.rs`
+additions are identical except the bindings path (`crate::sys`, recorded in
+the port diff). The C5 `libcoexist.a` (`esp-wifi-sys-esp32c5` 0.2.0) defines
+`esp_coex_ieee802154_extcoex_{tx,rx}_stage`. Off by default; no C5 image
+enables it and it has not run on a C5.

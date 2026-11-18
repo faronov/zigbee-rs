@@ -15,6 +15,7 @@
 //! * the product platform services behind ZRHP ([`platform`]): firmware
 //!   update into the inactive OTA slot ([`fw`], spec 7.9), the trial boot
 //!   window, and the persisted IEEE override ([`identity`], spec 9.4).
+//! * PTA coexistence on the Thread BR board (`pta`, feature `pta`).
 //!
 //! The coordinator stack, the ZRHP protocol and the NCP command dispatch
 //! live in the shared crates; the composition root is
@@ -52,6 +53,8 @@ pub mod platform;
 #[allow(dead_code, unexpected_cfgs)]
 #[path = "../../esp32-zigbee-devkit/src/running_image.rs"]
 mod running_image;
+#[cfg(feature = "pta")]
+pub mod pta;
 #[cfg(target_os = "none")]
 pub mod stores;
 #[cfg(test)]

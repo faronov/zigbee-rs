@@ -561,6 +561,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-build"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b94a4b8d74e7cc7baabcca5b2277b41877e039ad9cd49959d48ef94dac7eab4b"
+dependencies = [
+ "quote",
+ "syn 2.0.119",
+ "termcolor",
+]
+
+[[package]]
 name = "esp-config"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -663,6 +674,18 @@ dependencies = [
  "esp-metadata-generated 0.3.0",
  "esp-sync",
  "esp-wifi-sys",
+]
+
+[[package]]
+name = "esp-println"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee38e87bc7e303c299047c0e9bcd0f8ccca7c7e70d1fd78bbb565db14f33beb6"
+dependencies = [
+ "critical-section",
+ "esp-build",
+ "log",
+ "portable-atomic",
 ]
 
 [[package]]
@@ -793,6 +816,7 @@ dependencies = [
  "esp-alloc",
  "esp-bootloader-esp-idf",
  "esp-hal",
+ "esp-println",
  "esp-radio",
  "esp-serial-stream",
  "esp-thread-br-h2",
@@ -850,6 +874,7 @@ dependencies = [
  "critical-section",
  "embedded-storage",
  "esp-hal",
+ "esp-radio",
  "esp-serial-stream",
  "esp-storage",
  "esp-thread-br-h2",
