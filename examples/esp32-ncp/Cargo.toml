@@ -1,0 +1,77 @@
+[package]
+name = "esp32-ncp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# zigbee-rs ZRHP v1 network co-processor (coordinator + Trust Center) for
+# the ESP32-H2, with an ESP32-C6 lab variant:
+#   cargo build --release                                            # H2, USJ
+#   cargo build --release --no-default-features --features esp32c6,transport-usj
+#   cargo build --release --no-default-features --features esp32h2,transport-uart,thread-br-h2
+[[bin]]
+name = "esp32-ncp"
+path = "src/main.rs"
+
+[dependencies]
+esp32-zigbee-ncp-product = { path = "../../products/esp32-zigbee-ncp" }
+# Executor and SYSTIMER embassy time driver (layout-independent glue).
+esp32-zigbee-devkit-product = { path = "../../products/esp32-zigbee-devkit" }
+ncp-coordinator-app = { path = "../../apps/ncp-coordinator" }
+router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = [
+    "centralized-tclk",
+    "trust-center",
+    "global-aps-counter",
+    "host-passthrough",
+] }
+zigbee-mac = { path = "../../zigbee-mac", features = ["esp-parent", "pan-coordinator", "energy-detect"] }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+esp-serial-stream = { path = "../../esp-serial-stream" }
+esp-thread-br-h2 = { path = "../../boards/esp-thread-br-h2", optional = true }
+
+esp-bootloader-esp-idf = { version = "0.4.0", default-features = false }
+esp-hal = { version = "=1.0.0", features = ["unstable"] }
+esp-radio = { version = "=0.17.0", features = ["ieee802154", "unstable"] }
+esp-alloc = "0.9"
+static_cell = "2"
+log = "0.4"
+embassy-time = "0.4"
+portable-atomic = { version = "1", features = ["unsafe-assume-single-core"] }
+
+[features]
+default = ["esp32h2", "transport-usj"]
+esp32h2 = [
+    "esp32-zigbee-ncp-product/esp32h2",
+    "esp32-zigbee-devkit-product/esp32h2",
+    "zigbee-mac/esp32h2",
+    "esp-bootloader-esp-idf/esp32h2",
+    "esp-hal/esp32h2",
+    "esp-radio/esp32h2",
+    "esp-serial-stream/esp32h2",
+]
+esp32c6 = [
+    "esp32-zigbee-ncp-product/esp32c6",
+    "esp32-zigbee-devkit-product/esp32c6",
+    "zigbee-mac/esp32c6",
+    "esp-bootloader-esp-idf/esp32c6",
+    "esp-hal/esp32c6",
+    "esp-radio/esp32c6",
+    "esp-serial-stream/esp32c6",
+]
+transport-usj = ["esp32-zigbee-ncp-product/transport-usj"]
+transport-uart = ["esp32-zigbee-ncp-product/transport-uart"]
+thread-br-h2 = ["esp32-zigbee-ncp-product/thread-br-h2", "dep:esp-thread-br-h2"]
+rtscts-reserved-lines = ["thread-br-h2", "esp32-zigbee-ncp-product/rtscts-reserved-lines"]
+flash-2mb = ["esp32-zigbee-ncp-product/flash-2mb"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[patch.crates-io]
+esp-hal = { path = "../../vendor/esp-hal" }
+esp-radio = { path = "../../vendor/esp-radio" }
