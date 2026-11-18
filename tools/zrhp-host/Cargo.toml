@@ -3,9 +3,11 @@ name = "zrhp-host"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Minimal ZRHP v1 host for NCP bring-up (serial through hwlab)"
+description = "Minimal ZRHP v1 host for NCP bring-up (serial directly or through hwlab)"
 publish = false
 
 [dependencies]
 zigbee-zrhp = { path = "../../zigbee-zrhp", features = ["std"] }
 serde_json = "1"
+# Direct serial access (no libudev: enumeration is not used).
+serialport = { version = "4", default-features = false }

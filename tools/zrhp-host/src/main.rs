@@ -8,7 +8,12 @@
 //! ```text
 //! zrhp-host --hwlab uart/cu.usbmodem14601 smoke          # handshake + read-only commands
 //! zrhp-host --hwlab uart/cu.usbmodem14601 smoke --form   # also NWK_FORM / NWK_INIT
+//! zrhp-host --serial /dev/cu.usbmodem7CDFA1FE67F01 --baud 460800 smoke
 //! ```
+//!
+//! `--serial` opens the port directly with DTR and RTS asserted (the Thread
+//! BR bridge maps the esptool DTR/RTS reset; both asserted keeps the H2
+//! running).
 //!
 //! `smoke` never opens the network for joining and never transmits user
 //! frames on air except what formation itself sends.
@@ -101,6 +106,76 @@ impl ByteStream for Hwlab {
                 return Ok(out);
             }
         }
+    }
+}
+
+/// A serial port opened directly (DTR = RTS = 1, no reset).
+struct Serial {
+    port: Box<dyn serialport::SerialPort>,
+}
+
+impl Serial {
+    fn open(path: &str, baud: u32) -> Result<Self, String> {
+        let mut port = serialport::new(path, baud)
+            .timeout(Duration::from_millis(20))
+            .open()
+            .map_err(|e| e.to_string())?;
+        port.write_data_terminal_ready(true)
+            .map_err(|e| e.to_string())?;
+        port.write_request_to_send(true)
+            .map_err(|e| e.to_string())?;
+        Ok(Self { port })
+    }
+}
+
+impl ByteStream for Serial {
+    fn write(&mut self, data: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        self.port.write_all(data).map_err(|e| e.to_string())
+    }
+
+    fn read(&mut self, timeout: Duration) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let deadline = Instant::now() + timeout;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match self.port.read(&mut buf) {
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            if !out.is_empty() && self.port.bytes_to_read().unwrap_or(0) == 0 {
+                return Ok(out);
+            }
+            if Instant::now() >= deadline {
+                return Ok(out);
+            }
+        }
+    }
+}
+
+impl ByteStream for Box<dyn ByteStream> {
+    fn write(&mut self, data: &[u8]) -> Result<(), String> {
+        if std::env::var_os("ZRHP_TRACE").is_some() {
+            eprintln!(
+                "tx {:>4} B {}",
+                data.len(),
+                hex(&data[..data.len().min(24)])
+            );
+        }
+        (**self).write(data)
+    }
+    fn read(&mut self, timeout: Duration) -> Result<Vec<u8>, String> {
+        let data = (**self).read(timeout)?;
+        if std::env::var_os("ZRHP_TRACE").is_some() && !data.is_empty() {
+            eprintln!(
+                "rx {:>4} B {}",
+                data.len(),
+                hex(&data[..data.len().min(24)])
+            );
+        }
+        Ok(data)
     }
 }
 
@@ -439,17 +514,31 @@ fn smoke<S: ByteStream>(host: &mut Host<S>, form: bool) -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let device = args
-        .iter()
-        .position(|a| a == "--hwlab")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| {
-            eprintln!("usage: zrhp-host --hwlab uart/<port> smoke [--form]");
-            std::process::exit(2)
-        });
+    let value = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let stream: Box<dyn ByteStream> = if let Some(device) = value("--hwlab") {
+        Box::new(Hwlab { device })
+    } else if let Some(path) = value("--serial") {
+        let baud = value("--baud").map_or(460_800, |b| b.parse().unwrap_or(460_800));
+        match Serial::open(&path, baud) {
+            Ok(serial) => Box::new(serial),
+            Err(error) => {
+                eprintln!("{path}: {error}");
+                std::process::exit(2)
+            }
+        }
+    } else {
+        eprintln!(
+            "usage: zrhp-host (--hwlab uart/<port> | --serial <path> [--baud N]) smoke [--form]"
+        );
+        std::process::exit(2)
+    };
     let form = args.iter().any(|a| a == "--form");
-    let mut host = Host::new(Hwlab { device });
+    let mut host = Host::new(stream);
     match smoke(&mut host, form) {
         Ok(()) => println!("smoke: PASS"),
         Err(error) => {
