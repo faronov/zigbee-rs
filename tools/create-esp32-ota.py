@@ -147,6 +147,13 @@ CHIPS = {
         header_string="zigbee-rs ESP32-H2 sensor",
         example_name="esp32h2-sensor",
     ),
+    "esp32c5": ChipConfig(
+        chip_id=CHIP_IDS["esp32c5"],
+        image_type=0x0003,
+        model_name="ESP32-C5-Sensor",
+        header_string="zigbee-rs ESP32-C5 sensor",
+        example_name="esp32c5-sensor",
+    ),
 }
 VARIANTS = {"sensor": None, "thermometer": ("esp32h2", thermometer_config)}
 

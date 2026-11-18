@@ -39,7 +39,7 @@
 
 # Platform Guides
 
-- [ESP32-C6 / ESP32-H2](./platform-guides/esp32.md)
+- [ESP32-C6 / ESP32-H2 / ESP32-C5](./platform-guides/esp32.md)
 - [nRF52840 / nRF52833](./platform-guides/nrf.md)
 - [BL702](./platform-guides/bl702.md)
 - [CC2340](./platform-guides/cc2340.md)

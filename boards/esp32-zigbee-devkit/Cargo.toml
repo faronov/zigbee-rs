@@ -3,7 +3,7 @@ name = "esp32-zigbee-devkit"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Physical chip flash and WS2812 status LED for the ESP32-C6 and ESP32-H2 Zigbee devkits"
+description = "Physical chip flash and WS2812 status LED for the ESP32-C6, ESP32-H2 and ESP32-C5 Zigbee devkits"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
@@ -23,18 +23,28 @@ zigbee-ws2812 = { git = "https://github.com/faronov/zigbee-rs-drivers", rev = "2
 # interrupt handler that is still executing from XIP flash while the flash chip
 # is busy (radio ISR, systimer ISR, ...) reads garbage and faults. The critical
 # section keeps interrupts masked for the duration of the flash operation.
+#
+# Version ranges: the C6/H2 images lock esp-storage 0.7 / esp-hal 1.0.0, the
+# ESP32-C5 image locks esp-storage 0.9 / esp-hal 1.1.x (the first releases
+# with C5 support). The C5 image enables the `esp32c5` chip features of
+# these crates itself (examples/esp32c5-sensor), because the releases the
+# other lockfiles pin have no such feature.
 [target.'cfg(target_os = "none")'.dependencies]
-esp-storage = { version = "0.7", default-features = false, features = [
+esp-storage = { version = ">=0.7, <0.10", default-features = false, features = [
     "bytewise-read",
     "critical-section",
 ] }
 # RMT driver for the WS2812 status LED (feature `status-led` only).
-esp-hal = { version = "=1.0.0", features = ["unstable"], optional = true }
+# Also the FLASH peripheral token esp-storage 0.9 takes (feature `esp32c5`).
+esp-hal = { version = ">=1.0.0, <1.2", features = ["unstable"], optional = true }
 
 [features]
 default = []
 esp32c6 = ["esp-storage/esp32c6", "esp-hal?/esp32c6"]
 esp32h2 = ["esp-storage/esp32h2", "esp-hal?/esp32h2"]
+# ESP32-C5-DevKitC-1. Selects the esp-storage 0.9 / esp-hal 1.1 code paths;
+# the image enables `esp-storage/esp32c5` and `esp-hal/esp32c5`.
+esp32c5 = ["dep:esp-hal"]
 # The board is a Waveshare ESP32-H2-Zero instead of the ESP32-H2-DevKitM-1
 # (`BOARD`): its status LED takes RGB byte order. Requires esp32h2.
 waveshare-h2-zero = []

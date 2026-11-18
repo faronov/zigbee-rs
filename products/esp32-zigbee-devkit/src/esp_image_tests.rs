@@ -285,10 +285,11 @@ fn flash_read_errors_are_not_hidden() {
 #[ignore = "requires the shared Python preflight corpus, including real generated images"]
 fn python_preflight_corpus() {
     let root = std::env::var("ESP_OTA_PREFLIGHT_CORPUS").expect("set ESP_OTA_PREFLIGHT_CORPUS");
-    let chip = if EXPECTED_CHIP_ID == CHIP_ID_ESP32C6 {
-        "esp32c6"
-    } else {
-        "esp32h2"
+    let chip = match EXPECTED_CHIP_ID {
+        CHIP_ID_ESP32C6 => "esp32c6",
+        CHIP_ID_ESP32H2 => "esp32h2",
+        CHIP_ID_ESP32C5 => "esp32c5",
+        other => panic!("no corpus for chip ID 0x{other:04X}"),
     };
     let directory = std::path::Path::new(&root).join(chip);
     let manifest =

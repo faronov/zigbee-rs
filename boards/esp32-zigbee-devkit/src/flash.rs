@@ -1,4 +1,4 @@
-//! Raw physical NOR flash access for the ESP32-C6/H2 Zigbee devkits.
+//! Raw physical NOR flash access for the ESP32-C6/H2/C5 Zigbee devkits.
 //!
 //! Wraps `esp_storage::FlashStorage`, the ROM SPI flash driver for this
 //! module's on-die 4 MiB flash. [`RawFlash`] is unbounded, partition-unaware
@@ -21,14 +21,38 @@ pub const WORD_SIZE: u32 = 4;
 /// Whole-chip raw flash access. No partition, NV, or OTA policy: callers pass
 /// absolute chip addresses and get back exactly what the ROM SPI flash
 /// routines return.
+/// esp-storage 0.7 (C6/H2) or 0.9 (C5, borrows the FLASH token).
+#[cfg(not(feature = "esp32c5"))]
+type Storage = FlashStorage;
+#[cfg(feature = "esp32c5")]
+type Storage = FlashStorage<'static>;
+
 pub struct RawFlash {
-    flash: FlashStorage,
+    flash: Storage,
 }
 
 impl RawFlash {
+    #[cfg(not(feature = "esp32c5"))]
     pub fn new() -> Self {
         Self {
             flash: FlashStorage::new(),
+        }
+    }
+
+    /// esp-storage 0.9 (the ESP32-C5 release train) takes the FLASH
+    /// peripheral token; 0.7 took none. The product opens several
+    /// `RawFlash` views (journal, OTA writer, otadata) exactly as it did with
+    /// 0.7, so the token is conjured per view: every operation is a blocking
+    /// ROM SPI-flash call inside esp-storage's critical section, and the
+    /// views are never used concurrently (single-core, no flash access from
+    /// interrupts).
+    #[cfg(feature = "esp32c5")]
+    pub fn new() -> Self {
+        // SAFETY: see above; the token carries no state, and nothing else
+        // in these images owns FLASH.
+        let token = unsafe { esp_hal::peripherals::FLASH::steal() };
+        Self {
+            flash: FlashStorage::new(token),
         }
     }
 }
@@ -40,11 +64,11 @@ impl Default for RawFlash {
 }
 
 impl ErrorType for RawFlash {
-    type Error = <FlashStorage as ErrorType>::Error;
+    type Error = <Storage as ErrorType>::Error;
 }
 
 impl ReadNorFlash for RawFlash {
-    const READ_SIZE: usize = FlashStorage::READ_SIZE;
+    const READ_SIZE: usize = Storage::READ_SIZE;
 
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
         self.flash.read(offset, bytes)
@@ -56,8 +80,8 @@ impl ReadNorFlash for RawFlash {
 }
 
 impl NorFlash for RawFlash {
-    const WRITE_SIZE: usize = FlashStorage::WRITE_SIZE;
-    const ERASE_SIZE: usize = FlashStorage::ERASE_SIZE;
+    const WRITE_SIZE: usize = Storage::WRITE_SIZE;
+    const ERASE_SIZE: usize = Storage::ERASE_SIZE;
 
     fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
         self.flash.erase(from, to)

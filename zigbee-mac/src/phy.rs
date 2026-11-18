@@ -392,7 +392,7 @@ pub trait RadioPhy {
 
 #[cfg(all(
     feature = "timed-tx",
-    any(test, feature = "esp32c6", feature = "esp32h2")
+    any(test, feature = "esp32c6", feature = "esp32h2", feature = "esp32c5")
 ))]
 #[inline(always)]
 pub(crate) fn transmit_with_deadline(

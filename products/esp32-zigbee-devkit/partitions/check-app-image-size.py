@@ -13,7 +13,12 @@ import struct
 import sys
 from dataclasses import dataclass
 
-from esp_app_image import CHIP_IDS, IMAGE_MAGIC as ESP_IMAGE_MAGIC, validate_application
+from esp_app_image import (
+    BOOTLOADER_OFFSETS,
+    CHIP_IDS,
+    IMAGE_MAGIC as ESP_IMAGE_MAGIC,
+    validate_application,
+)
 
 FLASH_SIZE = 0x0040_0000
 PARTITION_TABLE_OFFSET = 0x0000_8000
@@ -130,9 +135,14 @@ def check_merged_image(
             f"{path}: merged image is {len(merged)} bytes, expected exactly "
             f"0x{slot.offset:06X} + {len(application)} = {expected_bytes}"
         )
-    if merged[0] != ESP_IMAGE_MAGIC:
-        raise SystemExit(f"{path}: merged image is missing the ESP bootloader")
-    bootloader_chip_id = struct.unpack_from("<H", merged, 12)[0]
+    bootloader = BOOTLOADER_OFFSETS[chip]
+    if merged[bootloader] != ESP_IMAGE_MAGIC:
+        raise SystemExit(
+            f"{path}: merged image is missing the ESP bootloader at 0x{bootloader:04X}"
+        )
+    if bootloader and any(byte != 0xFF for byte in merged[:bootloader]):
+        raise SystemExit(f"{path}: flash below the bootloader at 0x{bootloader:04X} is not erased")
+    bootloader_chip_id = struct.unpack_from("<H", merged, bootloader + 12)[0]
     if bootloader_chip_id != CHIP_IDS[chip]:
         raise SystemExit(
             f"{path}: bootloader chip id 0x{bootloader_chip_id:04X}, "

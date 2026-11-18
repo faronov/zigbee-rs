@@ -1,0 +1,14 @@
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+runner = "espflash flash --chip esp32c5 --partition-table ../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv --target-app-partition ota_0 --erase-parts otadata --monitor"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+]
+
+[unstable]
+build-std = ["core", "alloc"]
+
+[env]
+ESP_LOG = "info"
