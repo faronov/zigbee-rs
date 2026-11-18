@@ -1,0 +1,20 @@
+[package]
+name = "zigbee-zrhp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ZRHP v1 (zigbee-rs host <-> NCP protocol): COBS/CRC-32C framing, selective-repeat link layer and message/record codecs"
+publish = false
+
+[dependencies]
+# Intentionally empty: the crate is `no_std`, allocation-free and depends on
+# nothing (the spec allows heapless and zigbee-types; neither is needed yet).
+
+[features]
+default = []
+# Growable host-side helpers (none yet; reserved so hosts can depend on the
+# feature name without a semver break).
+alloc = []
+# Desktop/embedded-std helpers: `std::error::Error` impls.
+std = ["alloc"]

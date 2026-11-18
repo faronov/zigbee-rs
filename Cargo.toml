@@ -12,6 +12,7 @@ members = [
     "zigbee-runtime",
     "zigbee",
     "zigbee-gp",
+    "zigbee-zrhp",
     "apps/router",
     "apps/sensor-sed",
     "apps/gpd",
