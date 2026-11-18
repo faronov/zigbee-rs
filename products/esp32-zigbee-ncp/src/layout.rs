@@ -238,14 +238,13 @@ mod tests {
         // rewinds the devkit image's counters. The rest of the old `zbnv`
         // and ota_1 contents are foreign data to the NCP journals: NCP
         // provisioning erases the NCP `zbnv` once (README).
-        let used_end = LAYOUT_4MB.nv(Nv::USED);
-        assert!(used_end <= 0x3F_E000);
+        const { assert!(LAYOUT_4MB.nv(Nv::USED) <= 0x3F_E000) };
         assert_eq!(LAYOUT_4MB.flash_end(), 0x40_0000);
     }
 
     #[test]
     fn the_app_slots_hold_the_estimated_image() {
         // Spec 8.9: the NCP image is estimated at 650–700 KB.
-        assert!(LAYOUT_2MB.ota_slot_size >= 700 * 1000);
+        const { assert!(LAYOUT_2MB.ota_slot_size >= 700 * 1000) };
     }
 }

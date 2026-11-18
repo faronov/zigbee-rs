@@ -69,8 +69,8 @@ mod tests {
     use crate::layout::{LAYOUT_2MB, LAYOUT_4MB};
 
     // Capacity codes of parts used in ESP32-H2 modules.
-    const ID_4MB: u32 = 0x00_20_40_16;
-    const ID_2MB: u32 = 0x00_20_40_15;
+    const ID_4MB: u32 = 0x0020_4016;
+    const ID_2MB: u32 = 0x0020_4015;
 
     #[test]
     fn decodes_power_of_two_capacities() {

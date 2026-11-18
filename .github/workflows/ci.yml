@@ -109,6 +109,12 @@ jobs:
       - run: cargo test -p zigbee-zcl --no-default-features --features float64 --locked
       - run: cargo test -p zigbee-zcl --features green-power --locked
       - run: cargo test -p zigbee-nwk --features router,green-power --locked
+      # ZRHP NCP: coordinator start, ED scan and closed formation (features
+      # that only the NCP image enables), and the NCP application (excluded
+      # from the workspace so its runtime features do not unify).
+      - run: cargo test -p zigbee-mac --features pan-coordinator --lib --locked
+      - run: cargo test --manifest-path apps/ncp-coordinator/Cargo.toml --locked
+      - run: cargo clippy --manifest-path apps/ncp-coordinator/Cargo.toml --all-targets --locked -- -D warnings
       # nRF product crates are excluded from the root workspace (they pull in
       # `embassy-nrf`), but their battery-curve and profile logic is
       # host-testable because the hardware dependencies are
@@ -219,6 +225,26 @@ jobs:
             manifest: boards/esp32-zigbee-devkit/Cargo.toml
             workspace: boards/esp32-zigbee-devkit
             features: esp32h2,status-led
+          - name: ESP serial stream (USJ/UART transports)
+            manifest: esp-serial-stream/Cargo.toml
+            workspace: esp-serial-stream
+            features: ""
+          - name: ESP Thread Border Router H2 board
+            manifest: boards/esp-thread-br-h2/Cargo.toml
+            workspace: boards/esp-thread-br-h2
+            features: ""
+          - name: ESP32-H2 NCP product (USB-Serial-JTAG)
+            manifest: products/esp32-zigbee-ncp/Cargo.toml
+            workspace: products/esp32-zigbee-ncp
+            features: esp32h2,transport-usj
+          - name: ESP32-H2 NCP product (Thread BR UART, 2 MB)
+            manifest: products/esp32-zigbee-ncp/Cargo.toml
+            workspace: products/esp32-zigbee-ncp
+            features: esp32h2,transport-uart,thread-br-h2,flash-2mb
+          - name: ESP32-C6 NCP product (USB-Serial-JTAG)
+            manifest: products/esp32-zigbee-ncp/Cargo.toml
+            workspace: products/esp32-zigbee-ncp
+            features: esp32c6,transport-usj
           - name: nRF52840 always-on End Device product
             manifest: products/nrf52840-router/Cargo.toml
             workspace: products/nrf52840-router
@@ -538,6 +564,11 @@ jobs:
           cargo fmt --manifest-path products/efr32mg1-tradfri/Cargo.toml -- --check
           cargo fmt --manifest-path boards/esp32-zigbee-devkit/Cargo.toml -- --check
           cargo fmt --manifest-path products/esp32-zigbee-devkit/Cargo.toml -- --check
+          cargo fmt --manifest-path esp-serial-stream/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/esp-thread-br-h2/Cargo.toml -- --check
+          cargo fmt --manifest-path products/esp32-zigbee-ncp/Cargo.toml -- --check
+          cargo fmt --manifest-path apps/ncp-coordinator/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/esp32-ncp/Cargo.toml -- --check
           cargo fmt --manifest-path boards/phy62x2-evk/Cargo.toml -- --check
           cargo fmt --manifest-path boards/pb03f-kit/Cargo.toml -- --check
           cargo fmt --manifest-path products/pb03f-kit/Cargo.toml -- --check
@@ -1562,6 +1593,73 @@ jobs:
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.bin
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.app.bin
             examples/esp32h2-sensor/target/riscv32imac-unknown-none-elf/release/esp32h2-sensor.size.json
+          if-no-files-found: error
+
+  build-esp32-ncp:
+    name: Build ESP32 ZRHP NCP (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: h2-usj
+            chip: esp32h2
+            features: esp32h2,transport-usj
+            csv: esp32h2-ncp-4mb.csv
+          - name: h2-thread-br
+            chip: esp32h2
+            features: esp32h2,transport-uart,thread-br-h2
+            csv: esp32h2-ncp-4mb.csv
+          - name: h2-thread-br-2mb
+            chip: esp32h2
+            features: esp32h2,transport-uart,thread-br-h2,flash-2mb
+            csv: esp32h2-ncp-2mb.csv
+          - name: c6-usj
+            chip: esp32c6
+            features: esp32c6,transport-usj
+            csv: esp32h2-ncp-4mb.csv
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.ESP_PHY_RUST_TOOLCHAIN }}
+          targets: riscv32imac-unknown-none-elf
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: examples/esp32-ncp
+          key: riscv32imac-esp32-ncp-${{ matrix.name }}-${{ env.ESP_PHY_RUST_TOOLCHAIN }}-${{ hashFiles('examples/esp32-ncp/Cargo.lock') }}
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: espflash@${{ env.ESPFLASH_VERSION }}
+      - name: Build, lint and size-check the NCP image
+        working-directory: examples/esp32-ncp
+        env:
+          CHIP: ${{ matrix.chip }}
+          FEATURES: ${{ matrix.features }}
+          CSV: ../../products/esp32-zigbee-ncp/partitions/${{ matrix.csv }}
+          NAME: ${{ matrix.name }}
+        run: |
+          ARGS=(--release --locked -Z build-std=core,alloc --no-default-features --features "$FEATURES")
+          cargo build "${ARGS[@]}"
+          cargo clippy "${ARGS[@]}" -- -D warnings
+          ELF=target/riscv32imac-unknown-none-elf/release/esp32-ncp
+          # Fails when the image does not fit the NCP ota_0 slot.
+          espflash save-image --skip-update-check --chip "$CHIP" \
+            --partition-table "$CSV" --target-app-partition ota_0 \
+            "$ELF" "$ELF-$NAME.app.bin"
+          # The host link owns the serial port: no console printing may link.
+          NM="$(find "$(rustc --print sysroot)" -name llvm-nm -type f | head -n1)"
+          if "$NM" -C "$ELF" | grep -q 'esp_println'; then
+            echo "::error::esp-println is linked into the NCP image"
+            exit 1
+          fi
+          "$NM" -S --size-sort -C "$ELF" | tail -n 12
+      - name: Upload NCP image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: esp32-ncp-${{ matrix.name }}
+          path: examples/esp32-ncp/target/riscv32imac-unknown-none-elf/release/esp32-ncp-${{ matrix.name }}.app.bin
           if-no-files-found: error
 
   build-esp-light-sleep:
