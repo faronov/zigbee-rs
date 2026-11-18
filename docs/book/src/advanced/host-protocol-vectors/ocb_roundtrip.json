@@ -232,7 +232,8 @@
         "nwk_frame_counter_limit": 2011024,
         "aps_frame_counter_limit": 14024,
         "host_backed_tables": true,
-        "gp_proxy_table": []
+        "gp_proxy_table": [],
+        "gp_sink_table": []
       }
     },
     "coordinator_ieee": "f4b3b1fffe1a2b3c",

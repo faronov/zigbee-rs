@@ -1,0 +1,18 @@
+{
+  "status": "CANDIDATES - unverified until hardware gate H5 (real ZBT-1 key readout)",
+  "algorithm": "HMAC with AES-MMO (Zigbee keyed hash), key = hashed_tclk, message = device EUI64; byte order of the EUI64 is the open point",
+  "vectors": [
+    {
+      "hashed_tclk": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "ieee": "0017880102a1b2c3",
+      "candidate_eui64_on_air_order": "894db23b28a48c5663391d7dff11055c",
+      "candidate_eui64_big_endian": "f5ba978c2fab156eb934806578305a8e"
+    },
+    {
+      "hashed_tclk": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "ieee": "842e14fffe0a0b0c",
+      "candidate_eui64_on_air_order": "ff5b2360293d501e7c14126481c50cbd",
+      "candidate_eui64_big_endian": "b7bbefa7cc4de8e90859e621104025bb"
+    }
+  ]
+}

@@ -1,25 +1,37 @@
 # Host ↔ Coordinator Protocol (ZRHP v1, design draft)
 
-> **Status: design specification for review. Nothing in this chapter is
-> implemented.** The zigbee-rs coordinator and Trust Center are host-tested
-> only (see [Coordinator & Router](coordinator-router.md)), no backend
-> advertises a hardware coordinator, and the link layer, NCP application,
-> zigpy library and Go adapter described here do not exist yet. Byte layouts
-> are normative for v1 once accepted. The golden vectors in
+> **Status: design specification. The user's decisions of 2026-11-18 are
+> applied (section 16). Nothing in this chapter is implemented yet.** The
+> zigbee-rs coordinator and Trust Center are host-tested only (see
+> [Coordinator & Router](coordinator-router.md)), and no backend advertises a
+> hardware coordinator. The link crate, NCP application, zigpy library, Go
+> adapter, zigbee-herdsman adapter and embedded hub described here do not
+> exist yet. Byte layouts are normative for v1. The golden vectors in
 > [`host-protocol-vectors/`](host-protocol-vectors/generate.py) are generated
 > from these layouts by a small Python script. The script is a vector
 > generator, not an implementation.
 
-ZRHP (zigbee-rs Host Protocol) connects a host (Home Assistant through
-zigpy, or the Go Zigbee hub) to a zigbee-rs Network Co-Processor (NCP). The
-NCP runs a complete Zigbee PRO coordinator and Trust Center. The host keeps
-the large tables.
+ZRHP (zigbee-rs Host Protocol) connects a host to a zigbee-rs Network
+Co-Processor (NCP). The NCP runs a complete Zigbee PRO coordinator, Trust
+Center and Green Power combo (proxy + sink). The host keeps the large tables.
+
+Supported hosts:
+
+- **Desktop-class hosts:** Home Assistant through zigpy, the Go Zigbee hub,
+  and Zigbee2MQTT through zigbee-herdsman.
+- **Embedded host:** the Rust hub `faronov/zigbee-rs-hub`, running on the
+  ESP32-S3 of the Espressif Thread Border Router / Zigbee Gateway board.
+
+**Transport scope.** ZRHP is defined only over USB-Serial-JTAG (CDC-ACM) and
+UART, including the S3↔H2 UART of that board. There is no network transport
+in ZRHP. A hub that offers a network API, such as the embedded hub's
+WebSocket JSON API, does so at the hub level, outside this specification.
 
 Contents:
 
 1. [Goals and non-goals](#1-goals-and-non-goals)
 2. [Prior art and what we take](#2-prior-art-and-what-we-take)
-3. [Architecture and state ownership](#3-architecture-and-state-ownership)
+3. [Architecture, state ownership and host profiles](#3-architecture-state-ownership-and-host-profiles)
 4. [Transports](#4-transports)
 5. [Link layer](#5-link-layer)
 6. [Message layer](#6-message-layer)
@@ -28,11 +40,11 @@ Contents:
 9. [Backup, restore and Open Coordinator Backup](#9-backup-restore-and-open-coordinator-backup)
 10. [Performance model](#10-performance-model)
 11. [First target: ESP32-H2 / ESP32-C6](#11-first-target-esp32-h2--esp32-c6)
-12. [Host integration (zigpy, Go hub)](#12-host-integration)
+12. [Host integration](#12-host-integration)
 13. [Security of the host link](#13-security-of-the-host-link)
 14. [Test plan](#14-test-plan)
 15. [Implementation work and validation gates](#15-implementation-work-and-validation-gates)
-16. [Open questions](#16-open-questions)
+16. [Decisions (2026-11-18) and new open questions](#16-decisions-2026-11-18-and-new-open-questions)
 17. [References](#17-references)
 
 All multi-byte integers are **little-endian**. IEEE addresses travel in
@@ -56,7 +68,8 @@ two's complement and `[N]` is a fixed byte array.
 | G5 | Either side may reboot at any time | Boot cookies and a session epoch. Idempotent retransmission. The network is resumed without frame-counter reuse. |
 | G6 | 1000+ devices on a chip with tens of KiB of RAM | Hybrid split: the stack runs on the chip and the host owns the large tables, with a paging protocol between them. |
 | G7 | HA backups and migrations work | Full Open ZigBee Coordinator Backup (OCB) v1 export and import, plus migration in both directions with EZSP, ZNP, ZBOSS and deCONZ. |
-| G8 | One reference implementation | A shared `no_std` + `std` Rust link layer is used by the firmware and by the host tooling. Rust, Go and Python implementations must pass the same JSON vectors. |
+| G8 | One reference implementation | The shared crate `zigbee-zrhp` (`no_std`, optional `alloc`/`std`) is used by the NCP firmware, by the embedded hub on esp-idf-svc, and by desktop tooling. Rust, Go, Python and TypeScript implementations must pass the same JSON vectors. |
+| G9 | Embedded hosts are first-class | No layout, buffer or behaviour assumes a desktop-class host: bounded buffers, bounded TID tables, no JSON on any protocol path, and stated minimum host resources (3.3). |
 
 ### Non-goals (v1)
 
@@ -65,7 +78,13 @@ two's complement and `[N]` is a fixed byte array.
 - No compatibility with EZSP, ZNP, ZBOSS NCP or deCONZ on the wire.
   Compatibility is provided at the *backup* level (OCB) and by new host
   drivers.
+- No network transport (TCP, TLS, WebSocket, ser2net framing). ZRHP is
+  defined over USB-Serial-JTAG and UART only. Tunnelling the byte stream
+  across a network is outside this specification and unsupported.
 - No link encryption in v1. Section 13 reserves the hooks for it.
+- No ZDO loopback. Requests to the NCP's own address are refused; hosts use
+  `NWK_*`/`DIAG_*` commands instead (7.4).
+- No Touchlink or inter-PAN in v1 (capability bit 19 stays reserved).
 - No multi-network or multi-PAN NCP.
 - No sleepy NCP. The NCP is mains-powered and its receiver is always on.
 - No router or end-device NCP. The NCP is always a centralized-security
@@ -75,8 +94,9 @@ two's complement and `[N]` is a fixed byte array.
 
 | Term | Meaning |
 |---|---|
-| NCP | The chip running zigbee-rs as coordinator and Trust Center. |
-| Host | zigpy (Python) or the Go hub, connected over one byte stream. |
+| NCP | The chip running zigbee-rs as coordinator, Trust Center and GP combo. |
+| Host | zigpy (Python), the Go hub, zigbee-herdsman (TypeScript) or the embedded Rust hub, connected over one byte stream. |
+| Desktop host / embedded host | The two host profiles of 3.3. |
 | Frame | One COBS-delimited link-layer unit. |
 | Message | One request, response or event inside a DATA frame. |
 | Endpoint (link) | A multiplexed lane (`SYSTEM`, `ZIGBEE`, …). Not a Zigbee endpoint. |
@@ -127,37 +147,39 @@ Hamming distance 6 up to 655 data bytes. Section 5.14 has the analysis.
 
 ---
 
-## 3. Architecture and state ownership
+## 3. Architecture, state ownership and host profiles
 
 ```text
- Host (zigpy / Go hub)                          NCP (zigbee-rs)
+ Host (zigpy / Go hub / herdsman / zigbee-rs-hub)   NCP (zigbee-rs)
 +--------------------------------+            +--------------------------------------+
 | ControllerApplication / Adapter|            | ncp-coordinator app (new)            |
 |   device DB (authoritative)    |            |   command dispatch, host-endpoint    |
 |   link-key store (all devices) |  ZRHP msgs |   table, indication/confirm queues   |
-|   FC checkpoint log            |<==========>| TrustCenterCoordinatorApp            |
+|   FC checkpoint log            |<==========>| TrustCenterCoordinatorApp + GP combo |
 |   group/binding mirrors        |            |   zigbee-runtime (ZigbeeNode)        |
 |   OCB export/import            |            |   BDB -> ZDO/APS -> NWK -> MAC       |
 +--------------------------------+            |   host-backed caches (new)           |
-| zrhp link (Rust ref / Go / Py) |  bytes     | zrhp link (shared Rust, no_std)      |
-| serial: CDC-ACM / UART         |<==========>| transport: USB-Serial-JTAG / UART    |
+| zigbee-zrhp (Rust) or a Go/Py/ |  bytes     | zigbee-zrhp (shared Rust, no_std)    |
+| TS port; serial: USJ / UART    |<==========>| transport: USB-Serial-JTAG / UART    |
 +--------------------------------+            +--------------------------------------+
 ```
 
-Planned placement in the repository, following the repository layering rules:
+Planned placement, following the repository layering rules:
 
 | Piece | Location (new) | Depends on |
 |---|---|---|
-| Link layer (COBS, CRC-32C, ARQ, sessions, credits) | `zigbee-hostlink/` (`no_std`, optional `std`) | `heapless` only |
-| Message codecs and record types | `zigbee-hostproto/` (`no_std`) | `zigbee-types`, `heapless` |
-| NCP application (command dispatch, caches) | `apps/ncp-coordinator/` | `zigbee-runtime`, `zigbee-hostproto`, `zigbee-hostlink` |
-| ESP32-H2 NCP product (layout, NV partitions, identity, OTA policy, transport choice) | `products/esp32-zigbee-ncp/` | app, chip HAL, board |
-| Byte-stream transport over USB-Serial-JTAG / UART | chip HAL / platform glue exposing `embedded-io(-async)` `Read + Write` | `esp-hal` |
-| Host tools and reference host | `tools/zrhp/` (std): vector runner, noise bench, CLI | `zigbee-hostlink` (`std`) |
+| `zigbee-zrhp`: COBS, CRC-32C, frames, sessions, ARQ, credits, scheduler (`link`); message, command and record codecs (`msg`, `records`); optional host helpers (resume, retry cache, TID map) | `zigbee-zrhp/` in the zigbee-rs workspace. `no_std` by default; features `alloc` (growable host queues) and `std` (blocking/async serial adapters, desktop tools). The embedded hub uses it from esp-idf-svc `std` on the ESP32-S3. | `heapless`, `zigbee-types` only. No runtime, board, product or vendor SDK. |
+| NCP application (command dispatch, caches, GP sink events) | `apps/ncp-coordinator/` | `zigbee-runtime`, `zigbee-zrhp` |
+| ESP32-H2 NCP product (layout, NV partitions, identity, signed update, transport choice) | `products/esp32-zigbee-ncp/` | app, chip HAL, board |
+| Boards | ESP32-H2 devkit (USJ, or UART through an external bridge with RTS/CTS); Espressif Thread BR / Zigbee GW board, H2 side (UART0 to the S3, PTA, BOOT/EN driven by the host) | chip HAL |
+| Byte-stream transports (USJ, UART + optional RTS/CTS, UHCI DMA RX) | chip HAL / platform glue exposing `embedded-io(-async)` `Read + Write` | `esp-hal` |
+| Desktop host tools (vector runner, noise bench, CLI, reference host) | `tools/zrhp/` (`std`) | `zigbee-zrhp` (`std`) |
+| Embedded hub | separate public repository `faronov/zigbee-rs-hub` (ESP32-S3, esp-idf-svc) | `zigbee-zrhp` (git dependency, `std`) |
+| zigpy library / Go adapter / zigbee-herdsman adapter | `zigpy-zrhp` (Python), `~/go_zboss-ncp/adapter/zrhp`, zigbee-herdsman `src/adapter/zrhp` | Ports of `zigbee-zrhp`, checked against the shared vectors |
 
-The protocol crates must not depend on boards, products, vendor SDKs or
-logging transports. The ESP32 transport adapter is the only
-platform-specific part of the link.
+The protocol crate must not depend on boards, products, vendor SDKs or
+logging transports. The transport adapters are the only platform-specific
+parts of the link.
 
 ### 3.1 State ownership (summary)
 
@@ -168,18 +190,102 @@ Section 8 defines the paging protocol and section 9 maps every backup field.
 | NIB: PAN ID, EPID, channel, mask, update ID, manager, short address | NCP | Host (backup) | NCP NV journal |
 | Coordinator IEEE (factory or override) | NCP | Host | NCP identity NV item |
 | Active and alternate network key, key sequence | NCP | Host (backup, export-gated) | `SecurityStateJournal` |
-| Outgoing NWK frame counter | NCP | Host (checkpoint log) | NCP reservation journal; host log is a floor |
-| Global outgoing APS frame counter (all link keys, see 8.4) | NCP | Host (checkpoint log) | NCP reservation journal |
-| Global TCLK, TC policy | NCP | Host | NCP NV |
+| Outgoing NWK frame counter | NCP | Host (checkpoint log) | NCP reservation journal; the host log is a floor |
+| **Global outgoing APS frame counter** (one counter for all link keys, 8.4) | NCP | Host (checkpoint log) | NCP reservation journal |
+| Global TCLK, EZSP hashed-TCLK seed, TC policy | NCP | Host (backup) | NCP NV |
 | Incoming NWK replay floors | NCP (RAM-only, as today) | — | — |
 | Neighbor, routing, route-discovery and broadcast-transaction tables | NCP | Host reads for diagnostics | RAM |
 | Child table (coordinator's own children) | NCP | Host (backup) | `ChildTableJournal` |
 | Indirect queue, APS duplicate/fragment state | NCP | — | RAM |
-| **Device database** (IEEE ↔ NWK, type, capability) | **Host** | NCP address-map cache | Host DB |
-| **Per-device link keys + incoming APS floor** | **Host** | NCP TC-device cache | Host DB; NCP journal while cached |
-| **Source routes for all devices** | **Host** | NCP source-route cache | Host DB |
+| **Device database** (IEEE ↔ NWK, type, capability) | **Host** | NCP address-map cache (clean, rebuildable) | Host store |
+| **Per-device link keys + incoming APS floor** | **Host** | NCP TC-device cache | Host store; NCP journal while cached |
+| **Source routes for all devices** | **Host** | NCP source-route cache | Host store |
 | Bindings and groups whose source is the coordinator | Host | NCP binding/group tables | Both |
-| GP proxy/sink tables | NCP (proxy) / host (sink) | Other side (backup) | `GpTableJournal` |
+| GP Proxy Table | NCP | Host (backup) | GP journal |
+| **GP Sink Table** (the NCP is the sink, 7.11) | NCP | Host (event mirror, backup) | GP journal (`ZBGS`) |
+
+### 3.2 Repository and naming
+
+- **Protocol name:** ZRHP.
+- **Shared Rust crate:** `zigbee-zrhp`.
+- **Python package:** `zigpy-zrhp`; the zigpy radio type is `zrhp`.
+- **Go adapter:** `adapter/zrhp`.
+- **zigbee-herdsman adapter:** `zrhp`.
+- **Embedded hub:** `faronov/zigbee-rs-hub`.
+
+The hub's own API and UI (a WebSocket JSON API) is a hub-level interface. It
+is not part of ZRHP and is not specified here.
+
+### 3.3 Host profiles
+
+| Aspect | Desktop host (D) | Embedded host (E) |
+|---|---|---|
+| Examples | zigpy (HA), Go hub, zigbee-herdsman (Z2M) on Linux/macOS/Windows | `zigbee-rs-hub` on ESP32-S3-WROOM-1 (8 MB flash, 2 MB PSRAM) |
+| Transport | USB-Serial-JTAG CDC (H2/C6 native USB), or UART through a USB-UART bridge with RTS/CTS (default 921 600) | Board UART to the H2 (Thread BR board: 460 800 default, RTS/CTS optional on the reserved lines, 11.5) |
+| NCP reset / update | USJ DTR/RTS reset (11.3); firmware update via `FW_*` over BULK | `FW_*` over BULK (normal path); H2 ROM bootloader through host-driven EN/BOOT GPIOs (recovery and provisioning, 11.5) |
+| Host store | SQLite (zigpy sidecar, Go hub DB) or a sidecar file (herdsman) | Raw-flash log-structured journal partition. No filesystem assumed. |
+| Store sizing for 1000+ devices | Unbounded | ≈ 64 B/device in PSRAM: 2 000 devices ≈ 128 KiB (3.4) |
+| RX window advertised | 32 | 8 (16 when PSRAM-backed) |
+| Paging (`HOST_TABLES`) | Optional; auto-enabled above NCP capacity (8.1) | Same |
+| OCB JSON export/import | Required (zigpy, herdsman) or optional (Go hub) | Optional. The hub may stream binary records to a desktop client that converts them. |
+| LOG endpoint | Subscribed (credit > 0) | Optional (grant 0 credit to disable, 5.10) |
+| Seamless NCP-reboot resume | zigpy: required (decision 5); others: recommended | Required |
+| GP sink mode | NCP sink (zigpy); host sink (Go, herdsman v1, 7.11) | NCP sink |
+
+**Rules for every host.** Nothing in ZRHP may require more than these:
+
+- **Receive.** One COBS accumulation buffer of 656 B, plus `rx_window` ×
+  652 B decoded frames. The minimum `rx_window` is **4**, giving ≈ 3.3 KB.
+  Hosts may decode in place.
+- **MTU.** `rx_mtu` is fixed at **640** in v1. Every message fits one frame,
+  so no host needs reassembly.
+- **Transmit.** Up to `min(peer rx_window, local TX buffers)` stored frames
+  for byte-identical retransmission. With a window of 4 that is ≈ 2.6 KB.
+- **Pending host requests.** A host-chosen bound. The NCP never requires
+  more than one host request to be in flight.
+- **NCP-originated requests** (`TBL_LOOKUP`, `TBL_WRITEBACK`) are bounded by
+  `max_ncp_requests` (capacity 17, default 8). A host must be able to hold
+  that many.
+- **Batching.** Optional for senders. Receivers parse batches in place,
+  without an extra buffer.
+- **No JSON or text parsing on any protocol path.** OCB JSON is a host-side
+  export format built from binary records (9.3). The only strings are short
+  bounded UTF-8 names (≤ 32 B), versions (≤ 32 B) and log text (≤ 200 B).
+- **Clock.** A monotonic millisecond clock (`esp_timer` on the S3).
+- **Responses.** `TBL_LOOKUP` must be answered within 250 ms, from RAM or
+  PSRAM. A store that needs longer must preload.
+
+### 3.4 Embedded host budget (ESP32-S3 on the Thread BR board)
+
+| Item | Size | Placement |
+|---|---:|---|
+| ZRHP link: COBS buffer + RX window 8 × 652 + TX window 8 × 652 | 11.1 KB | Internal SRAM (DMA- and ISR-accessible) |
+| Pending request map (64 × 16 B) + NCP request slots (8 × 32 B) | 1.3 KB | SRAM |
+| Link-key store record (IEEE 8, key 16, rx floor 4, rev 4, attrs/origin/seq 4, NWK 2, flags 2) | 40 B/device | PSRAM |
+| Minimal device registry for ZRHP purposes (IEEE, NWK, capability, rx-on, last seen) | 24 B/device | PSRAM |
+| **2 000 devices** | **≈ 128 KiB** | PSRAM (2 MB) |
+| GP sink mirror (16 × 40 B), FC checkpoint ring in RAM (16 × 16 B) | < 1 KB | SRAM |
+
+Application data such as names, clusters and attribute caches is hub-level,
+outside ZRHP.
+
+**Flash store.** Use a dedicated raw partition journal (proposed 128 KiB, 32
+× 4 KiB sectors) with the same commit discipline as the NCP journals: CRC +
+commit marker, two-generation snapshot plus append records. ESP-IDF NVS is
+acceptable if it meets the durability rule of 8.8. No filesystem is assumed.
+
+**Write-rate estimate** (one 32-byte append per event):
+
+- **FC checkpoints.** The host must persist one record per ≤ 8 checkpoints
+  (8.4).
+  - At an air-limited 200 frames/s that is one record per 41 s, or ≈ 67 KB
+    per day.
+  - A 128 KiB ring is therefore rewritten every ≈ 1.9 days. Each sector sees
+    about 190 erases per year, so 100 k-cycle NOR flash outlasts the product
+    by orders of magnitude.
+  - A typical home at 20 frames/s writes 10 × less.
+- **Writebacks.** NEW keys (joins), attribute changes and evictions are all
+  rare.
 
 ---
 
@@ -188,37 +294,69 @@ Section 8 defines the paging protocol and section 9 maps every backup field.
 ZRHP v1 needs one full-duplex, ordered, unreliable byte stream. "Unreliable"
 means bytes may be corrupted, dropped or inserted by noise, but the stream
 never reorders bytes. The link layer relies on this FIFO property for
-loss inference (section 5.6).
+loss inference (section 5.6). Exactly two transports are defined:
+USB-Serial-JTAG CDC-ACM and UART.
 
-### 4.1 UART with RTS/CTS
+### 4.1 UART
 
-- 8N1, 921 600 / 2 000 000 / 3 000 000 baud. The configured rate is a
-  product setting. The NCP does not autobaud.
-- Hardware RTS/CTS is **required** for UART above 115 200 baud. It protects
-  the RX FIFO during flash erase and interrupt latency. Credits make sure
-  that RTS/CTS only ever pauses a frame and never loses one.
-- A UART framing, parity or overrun error is handled exactly like a CRC
-  failure. The receiver aborts the current frame, discards bytes until the
-  next `0x00`, increments `nbad` and sends a NAK (5.7).
-- On a C6 the UART supports up to 5 Mbaud from an 80 MHz source, with
-  128-byte FIFOs, RTS/CTS, an RX-timeout interrupt and UHCI GDMA [ESP-TRM].
-  On the H2 the 80 MHz UART clock source does not exist, so the maximum
-  usable baud rate there is **unverified** and must be measured.
+- **Format.** 8N1. Defaults:
+  - **921 600 baud** with RTS/CTS for desktop hosts behind a USB-UART bridge;
+  - **460 800 baud** on the Espressif Thread BR board (11.5).
 
-### 4.2 USB CDC-ACM
+  Supported rates are 460 800, 921 600, 2 000 000 and 3 000 000 (C6 only),
+  subject to 4.4. The NCP does not autobaud.
+- **Changing the rate.** A host may change the rate at runtime with
+  `SYS_SET_UART` (7.1). The new rate is volatile; the product default is
+  restored on reboot.
+- **With RTS/CTS.** Credits make sure RTS/CTS only ever pauses a frame and
+  never loses one.
+- **Without RTS/CTS.** Credits are the flow control for whole frames: each
+  direction has at most `window × 656` bytes outstanding, and the receiver
+  has buffer space for all of them. Credits cannot pause the hardware FIFO
+  in the middle of a frame. Both sides must therefore receive through DMA
+  (ESP UHCI/GDMA) or an IRAM-resident RX interrupt into a ring of at least
+  `rx_window × 656` bytes. The receiver must keep running while the same
+  chip erases or writes flash.
+- **No XON/XOFF.** Software XON/XOFF is not used: `0x11`/`0x13` occur in
+  COBS data.
+- **Line errors.** A UART framing, parity or overrun error is handled
+  exactly like a CRC failure. The receiver aborts the current frame,
+  discards bytes until the next `0x00`, increments `nbad` and sends a NAK
+  (5.7). It also increments `rx_overflow` (5.12) when the error is a FIFO
+  overrun.
+- **C6 UART.** Up to 5 Mbaud from an 80 MHz source, with 128-byte FIFOs,
+  RTS/CTS, an RX-timeout interrupt and UHCI GDMA [ESP-TRM].
+- **H2 UART.** The clock sources are 48 MHz PLL, 32 MHz XTAL and RC. With
+  the ESP UART divider this caps the H2 at about 3 Mbaud (48 MHz / 16).
+  The **measured** maximum is still open (gate H2).
+
+### 4.2 USB CDC-ACM (USB-Serial-JTAG)
 
 The host sees a normal CDC-ACM serial port. On the ESP32-H2/C6
 USB-Serial-JTAG peripheral, line coding is ignored, there is no RTS/CTS, and
-flow control is USB NAK only. See section 11 for the constraints this
-imposes.
+flow control is USB NAK only. Section 11 lists the constraints this imposes.
 
 ### 4.3 Later transports (extensions, not v1)
 
 | Transport | Framing difference | Notes |
 |---|---|---|
 | USB vendor bulk | No COBS. Each frame is one USB bulk transfer terminated by a short packet or ZLP. CRC-32C is kept because USB CRC does not cover host-stack bugs. | Higher throughput on chips with a USB-OTG controller. Needs a VID/PID decision. |
-| SPI + INT (embedded host is the SPI master) | No COBS. Each transaction carries a 4-byte prefix `{u16 len, u16 ~len}` followed by the frame. The NCP raises INT while it has TX data or new credits. | ARQ, sessions and messages are unchanged. Clock rate and turnaround are set by the host. |
-| TCP (ser2net, remote adapters) | Same byte stream as UART. | The link timeout must cover WAN jitter (`link_timeout_ms` ≥ 10 s). |
+| SPI + INT (embedded host is the SPI master) | No COBS. Each transaction carries a 4-byte prefix `{u16 len, u16 ~len}` followed by the frame. The NCP raises INT while it has TX data or new credits. | ARQ, sessions and messages are unchanged. |
+
+No network transport is planned (decision 2026-11-18).
+
+### 4.4 Maximum safe UART rate
+
+| Configuration | Maximum rate | Condition |
+|---|---|---|
+| RTS/CTS on both sides | 2 000 000 on the H2 (3 M if gate H2 passes); 3 000 000 on the C6 | Bridge supports the rate (for example CP2102N up to 3 M) |
+| No RTS/CTS, both sides DMA or IRAM-ISR RX into a ring ≥ `rx_window × 656` | 921 600 | Gate H8: `rx_overflow = 0` under host and NCP flash-write load |
+| No RTS/CTS, any side without DMA/IRAM RX | 460 800, ARQ recovers losses at a goodput cost | Espressif's own RCP link default on the BR board |
+
+The worst-case FIFO-free time at 921 600 with a 128-byte FIFO and an RX
+threshold of 64 bytes is 64 × 10.85 µs ≈ 0.69 ms. An IRAM ISR meets this.
+A flash-cache-dependent ISR does not, because ESP32 flash erase stalls the
+cache for milliseconds.
 
 ---
 
@@ -302,9 +440,9 @@ rather than noise.
 | 4 | 4 | `peer_cookie` | The peer cookie being acknowledged (RESET_ACK) or last known (RESET_REQ); 0 = none |
 | 8 | 1 | `role` | 0 = host, 1 = NCP |
 | 9 | 1 | `link_version` | Highest link version supported (1) |
-| 10 | 1 | `rx_window` | Out-of-order frames the sender can buffer, 1..32 |
+| 10 | 1 | `rx_window` | Out-of-order frames the sender can buffer, 4..32 (embedded hosts may use 4–8, 3.3) |
 | 11 | 1 | `reason` | 0 power-on, 1 peer timeout, 2 protocol error, 3 retry exhausted, 4 host open, 5 peer requested, 6 watchdog, 7 firmware update |
-| 12 | 2 | `rx_mtu` | Largest payload accepted, 256..640 |
+| 12 | 2 | `rx_mtu` | Largest payload accepted; must be 640 in v1 (reserved for later versions) |
 | 14 | 2 | `ack_delay_us` | Delayed-ack timer of the sender's receiver |
 | 16 | 2 | `keepalive_ms` | Proposed idle keepalive interval |
 | 18 | 2 | `link_timeout_ms` | Proposed silence that declares the link down |
@@ -522,21 +660,22 @@ keepalive.
 host's scheduling slack. Its default is 10 ms, and it should be raised to
 30 ms for Python on busy hosts.
 
-| Timer / constant | Formula | 921 600 | 2 M | 3 M | USB-Serial-JTAG | Range |
-|---|---|---:|---:|---:|---:|---|
-| `T_frame_max` | 656·T_byte | 7.1 ms | 3.3 ms | 2.2 ms | ≤ 11 ms (11 × 64 B packets at 1 packet per 1 ms frame, worst case) | — |
-| `ack_delay` | ≤ T_frame_max/2, ≤ 1 ms | 1 ms | 1 ms | 0.5 ms | 1 ms | 0.2–5 ms |
-| `RTO_min` | max(10 ms, 2·T_frame_max + ack_delay + T_host) | 25 ms | 18 ms | 16 ms | 33 ms | — |
-| `RTO_initial` | — | 100 ms | 100 ms | 100 ms | 100 ms | 20–1000 ms |
-| `RTO_max` | — | 1000 ms | 1000 ms | 1000 ms | 1000 ms | — |
-| `N_retx_max` | — | 10 | 10 | 10 | 10 | 4–16 |
-| `keepalive_ms` | idle time before `ACK\|POLL` | 500 | 500 | 500 | 500 | 100–5000 |
-| `link_timeout_ms` | silence ⇒ link down | 3000 | 3000 | 3000 | 3000 | ≥ 3·keepalive |
-| `reset_retry` | doubling | 200 ms → 2 s | ← | ← | ← | — |
-| Window `W` (each direction) | peer `rx_window` | 16 (NCP rx), 32 (host rx) | ← | ← | ← | 8–32 |
+| Timer / constant | Formula | 460 800 (BR board) | 921 600 | 2 M | 3 M | USB-Serial-JTAG | Range |
+|---|---|---:|---:|---:|---:|---:|---|
+| `T_frame_max` | 656·T_byte | 14.2 ms | 7.1 ms | 3.3 ms | 2.2 ms | ≤ 11 ms (11 × 64 B packets at 1 packet per 1 ms frame, worst case) | — |
+| `ack_delay` | ≤ T_frame_max/2, ≤ 2 ms | 2 ms | 1 ms | 1 ms | 0.5 ms | 1 ms | 0.2–5 ms |
+| `RTO_min` | max(10 ms, 2·T_frame_max + ack_delay + T_host) | 41 ms | 25 ms | 18 ms | 16 ms | 33 ms | — |
+| `RTO_initial` | — | 100 ms | 100 ms | 100 ms | 100 ms | 100 ms | 20–1000 ms |
+| `RTO_max` | — | 1000 ms | 1000 ms | 1000 ms | 1000 ms | 1000 ms | — |
+| `N_retx_max` | — | 10 | 10 | 10 | 10 | 10 | 4–16 |
+| `keepalive_ms` | idle time before `ACK\|POLL` | 500 | 500 | 500 | 500 | 500 | 100–5000 |
+| `link_timeout_ms` | silence ⇒ link down | 3000 | 3000 | 3000 | 3000 | 3000 | ≥ 3·keepalive |
+| `reset_retry` | doubling | 200 ms → 2 s | ← | ← | ← | ← | — |
+| Window `W` (each direction) | min(peer `rx_window`, local TX buffers) | 16 (NCP rx), 8 (S3 host rx) | 16 (NCP rx), 32 (desktop host rx) | ← | ← | ← | 4–32 (8–32 recommended) |
 
 Every timer runs on a real monotonic clock: the embassy time driver on the
-NCP, a monotonic OS clock on hosts. A platform without one cannot run ZRHP.
+NCP, a monotonic OS clock or `esp_timer` on hosts. A platform without one
+cannot run ZRHP.
 
 ### 5.9 Normative traces
 
@@ -564,6 +703,12 @@ remaining conformance cases.
 
 `TABLES` ranks above `ZIGBEE` because a table miss can block an inbound
 secured frame or a join (section 8).
+
+Credit numbers in the table are defaults. A host advertises what its buffers
+allow. An embedded host can grant `LOG` 0 credits to disable log delivery;
+the NCP then counts the records it drops. A host can grant `BULK` 1 credit
+when it has no firmware-update or backup traffic. The allocation of endpoint
+IDs and message-ID groups is final for v1 (decision 1).
 
 **Scheduler.**
 
@@ -605,6 +750,9 @@ message-level status `BUSY` and advertised in advance as a capacity
   `EVT_INDICATIONS_DROPPED` after the next session.
 - On USB-Serial-JTAG with no reader, the NCP must never block. Section 11
   covers this.
+- **Which cookie identifies the NCP.** For resume decisions, hosts identify
+  the NCP instance by `EVT_NCP_READY.ncp_cookie`, `table_epoch` and the NIB,
+  not by link timing. Section 12.1 describes seamless resume.
 
 ### 5.12 Link counters
 
@@ -801,7 +949,7 @@ Capability bits (`u64`, NCP → host):
 | Bit | Capability | Bit | Capability |
 |---:|---|---:|---|
 | 0 | `HOST_SOURCE_ROUTES` (APS request may carry relays) | 10 | `NETWORK_KEY_ROTATION` |
-| 1 | `CONCENTRATOR` (MTORR origination) | 11 | `ZDO_LOOPBACK` |
+| 1 | `CONCENTRATOR` (MTORR origination) | 11 | reserved (was `ZDO_LOOPBACK`; dropped from v1, never set) |
 | 2 | `APS_FRAGMENTATION` | 12 | `PACKET_CAPTURE` (reserved) |
 | 3 | `INSTALL_CODES` | 13 | `LINK_AUTH` (reserved, section 13) |
 | 4 | `KEY_EXPORT` (network/link keys readable) | 14 | `EZSP_HASHED_TCLK` |
@@ -810,6 +958,8 @@ Capability bits (`u64`, NCP → host):
 | 7 | `NCP_FW_UPDATE` | 17 | `GROUP_MEMBERSHIP` |
 | 8 | `GREEN_POWER_PROXY` | 18 | `TX_POWER` |
 | 9 | `ENERGY_SCAN` | 19 | `INTERPAN` (reserved) |
+| 20 | `GREEN_POWER_SINK` (combo sink, 7.11) | 21 | `PTA_COEX` (external 802.15.4/Wi-Fi coexistence wired and supported, 11.5) |
+| 22 | `UART_FLOW_CONTROL` (RTS/CTS active on this link) | 23–63 | reserved |
 
 Capacities (`{u8 id, u32 value}` list):
 
@@ -822,11 +972,14 @@ Capacities (`{u8 id, u32 value}` list):
 | 5 | `source_route_cache` | 12 | `route_table` |
 | 6 | `max_asdu` (unfragmented) | 13 | `max_restore_records_per_put` |
 | 7 | `fc_stride` (reservation size) | 14 | `max_source_route_relays` |
+| 15 | `gp_sink_table` | 16 | `gp_proxy_table` |
+| 17 | `max_ncp_requests` (outstanding NCP → host requests, default 8) | 18 | `max_tc_devices` (TC-device cache incl. pinned) |
 
 ### 6.7 Endpoint assignment
 
 Each `msg_id` group has one home endpoint. The NCP rejects requests on any
-other endpoint with `WRONG_ENDPOINT`.
+other endpoint with `WRONG_ENDPOINT`. **This allocation is final for v1**
+(decision 1).
 
 | Group | IDs | Endpoint |
 |---|---|---|
@@ -866,13 +1019,14 @@ fields after it are shown as "→ …". Events list their full payload.
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
 | `0x0001` | `SYS_NEGOTIATE` | `u8 major_min, u8 major_max, u64 host_caps, u8 name_len, name[]` | `u8 major, u8 minor, u64 ncp_caps, u8 n, n×{u8 id, u32 value}, u8 fw_len, fw[], [8] build_id, u8 chip` | N |
-| `0x0002` | `SYS_GET_INFO` | — | `[8] ieee_factory, [8] ieee_active, u8 ieee_source (0 factory, 1 override), u16 chip_rev, u32 flash_size, u8 board_len, board[], u8 product_len, product[]` | N |
+| `0x0002` | `SYS_GET_INFO` | — | `[8] ieee_factory, [8] ieee_active, u8 ieee_source (0 factory, 1 override), u16 chip_rev, u32 flash_size, u8 transport (1 USJ, 2 UART), u32 uart_baud (0 for USJ), u8 uart_flow (0 none, 1 RTS/CTS), u8 board_len, board[], u8 product_len, product[]` | N |
 | `0x0003` | `SYS_RESET` | `u8 mode (0 reboot, 1 reboot to bootloader, 2 factory reset), u32 confirm` (`0x46524553` "FRES" for mode 2) | — (the response is sent before reset) | P (factory reset of stores exists) |
-| `0x0004` | `SYS_GET_STATUS` | — | `u8 network_state, u32 uptime_s, u16 free_aps_slots, u16 host_absent_queue, u16 dirty_writebacks, u8 restore_in_progress` | N |
+| `0x0004` | `SYS_GET_STATUS` | — | `u8 network_state, u32 uptime_s, u16 free_aps_slots, u16 host_absent_queue, u16 dirty_writebacks, u8 restore_in_progress, u8 flags (bit0 key export locked, bit1 paging active, bit2 PTA coex enabled, bit3 GP sink commissioning open, bit4 permit join open)` | N |
 | `0x0005` | `SYS_SET_CONFIG` | `u8 n, n×{u16 id, u8 len, value[]}` | `u8 n, n×{u16 id, u8 status}` | N |
 | `0x0006` | `SYS_GET_CONFIG` | `u8 n, n×u16 id` | `u8 n, n×{u16 id, u8 status, u8 len, value[]}` | N |
 | `0x0007` | `SYS_ECHO` | `data[]` (≤ 64) | `data[]` | N |
 | `0x0008` | `SYS_SET_IEEE` | `[8] ieee` (all `FF` = revert to factory) | — | P (MAC PIB `MacExtendedAddress` is settable; persistence and boot application are N) |
+| `0x0009` | `SYS_SET_UART` | `u32 baud, u8 flow (0 none, 1 RTS/CTS), u16 apply_delay_ms` | — (sent at the old rate; see the rule below) | N |
 | `0x0080` | `EVT_NCP_READY` | `u32 ncp_cookie, u8 reset_reason, u8 network_state (0 none, 1 formed-down, 2 up), u32 table_epoch, u32 nwk_fc_limit, u32 aps_fc_limit, u16 dirty_writebacks, u32 dropped_indications` | event | N |
 | `0x0081` | `EVT_INDICATIONS_DROPPED` | `u8 endpoint, u8 reason (1 host absent, 2 no credit, 3 queue full), u32 count, u32 first_ms, u32 last_ms` | event | N |
 | `0x0082` | `EVT_FATAL` | `u8 kind, u32 code, u8 len, text[]` (sent just before a deliberate reset) | event | N |
@@ -888,11 +1042,28 @@ Config IDs (v1):
 | `0x0004` | `zdo_forward_handled` (default 1) |
 | `0x0005` | `aps_ack_timeout_ms` |
 | `0x0006` | `indirect_timeout_ms` |
-| `0x0007` | `key_export_lock` (write 1 = lock until reboot) |
+| `0x0007` | reserved (key-export locking is the command `SEC_LOCK_KEY_EXPORT`, 7.5) |
 | `0x0008` | `log_level` |
+| `0x0009` | `coex_enable` (0/1; only when `PTA_COEX`, 11.5) |
+| `0x000A` | `coex_tx_priority_mask` (bit0 MAC ACK frames, bit1 GP timed TX, bit2 TC/key transport, bit3 all) |
 
 `reset_reason` values: 0 unknown, 1 power-on, 2 software, 3 watchdog, 4
-brown-out, 5 firmware update, 6 fatal, 7 host request.
+brown-out, 5 firmware update, 6 fatal, 7 host request, 8 host EN/BOOT line
+(embedded host).
+
+**`SYS_SET_UART` rule.**
+
+1. The NCP answers `SUCCESS` at the old rate.
+2. Both sides switch after `apply_delay_ms`.
+3. The host then sends `RESET_REQ` at the new rate. The link session is
+   re-established; the NCP cookie is unchanged, so this is a `PEER_RESYNC`.
+4. If the NCP receives no valid frame within 3 s at the new rate, it reverts
+   to the previous rate and flow-control setting. A host that gets no
+   `RESET_ACK` within 2 s also reverts.
+
+The setting is volatile: the product default is restored on reboot.
+Enabling `flow = 1` is refused with `UNSUPPORTED_COMMAND` unless the board
+has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 
 `chip` values: 1 ESP32-H2, 2 ESP32-C6, 3 nRF52840, 4 EFR32MG21, 5 EFR32MG22,
 6 TLSR8258, 7 BL702, 8 STM32WB55, 9 CC2340R5.
@@ -943,7 +1114,7 @@ brown-out, 5 firmware update, 6 fatal, 7 host request.
 | `radius` | 1 | 0 = default (2 × max depth) |
 | `non_member_radius` | 1 | groups only (zigpy default 0; EZSP uses 3) |
 | `priority` | 1 | 0 low, 1 normal, 2 high, 3 critical. Orders the NCP APS queue only. |
-| `relay_count`, `relays[]` | 1 + 2n | only if bit6. **Path order from the coordinator** (entry 0 = first hop). n ≤ `max_source_route_relays` (8). |
+| `relay_count`, `relays[]` | 1 + 2n | only if bit6. **Path order from the coordinator** (entry 0 = first hop). n ≤ `max_source_route_relays` (8). n = 0 means "direct, no source-route subframe". Since master fd3bc03 the NWK layer also *accepts* inbound source-routed frames with an empty relay list, which some coordinators send. |
 | `alias_src`, `alias_seq` | 2 + 1 | only if bit4 (GP proxy, broadcast/groupcast) |
 | `asdu_len`, `asdu` | 2 + n | n ≤ `max_asdu`, or larger with fragmentation |
 
@@ -1007,10 +1178,20 @@ Go hub's generic interviewer already do.
   NCP request on `(cluster, src, tsn)`, and it is still forwarded with
   `handled by NCP`. A TSN collision therefore costs one ignored response,
   never a lost one.
-- **Loopback (capability bit 11, optional).** A ZDP request to `0x0000` is
-  executed locally and its response is delivered as an indication with bit7
-  set. hosts should use `NWK_ENERGY_SCAN` and `NWK_CHANGE_CHANNEL` instead
-  of the loopback form.
+- **No loopback** (decision 10). An `APS_DATA_REQUEST` with profile 0
+  addressed to the NCP's own NWK address or IEEE fails with
+  `INVALID_PARAMETER`. Hosts get the same information from dedicated
+  commands, and their libraries synthesize ZDO responses locally where the
+  host framework expects them:
+
+  | Host-side need | ZRHP replacement |
+  |---|---|
+  | Energy scan | `NWK_ENERGY_SCAN` |
+  | Channel change | `NWK_CHANGE_CHANNEL` |
+  | Coordinator node descriptor | `NWK_GET_INFO` + constant descriptor |
+  | Mgmt_Lqi / Mgmt_Rtg of the coordinator (zigpy topology scan, Z2M network map) | `DIAG_GET_NEIGHBORS` / `DIAG_GET_ROUTES` |
+  | Mgmt_Bind of the coordinator | Host binding mirror |
+  | Permit join on the coordinator | `NWK_PERMIT_JOIN{target 0x0000}` |
 
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
@@ -1028,14 +1209,46 @@ Go hub's generic interviewer already do.
 | `0x0406` | `SEC_ROTATE_NETWORK_KEY` | `[16] key (0 = random), u8 mode (0 broadcast, 1 unicast to routers), u16 switch_delay_s` | accepted; `EVT_NETWORK_KEY_SWITCHED` follows | E (`prepare/commit/activate/complete_network_key_rotation`) |
 | `0x0407` | `SEC_GET_LINK_KEY` | `[8] ieee` | `[16] key, u8 type, u8 attrs, u32 tx (global limit), u32 rx_floor` | P |
 | `0x0408` | `SEC_GET_FRAME_COUNTERS` | — | `u32 nwk_current, u32 nwk_limit, u32 aps_current, u32 aps_limit, u32 stride` | P (reservation exists; global APS counter is N, see 8.4) |
-| `0x0409` | `SEC_DERIVE_EZSP_KEY` | `[8] ieee` | `[16] key` (diagnostic, capability bit 14) | N |
+| `0x0409` | `SEC_DERIVE_EZSP_KEY` | `[8] ieee` | `[16] key` (capability bit 14; export-gated like other keys) | N |
+| `0x040A` | `SEC_LOCK_KEY_EXPORT` | `u32 confirm` = `0x4B434F4C` ("LOCK") | — (idempotent; lasts until the next NCP reboot) | N |
 | `0x0480` | `EVT_LINK_KEY_UPDATED` | `[8] ieee, u16 nwk, u8 key_type, u8 attrs (0 provisional, 1 unverified, 2 verified), u8 origin` | event (the host then reads the key with `TBL_WRITEBACK`) | P |
 | `0x0481` | `EVT_KEY_FAILURE` | `[8] ieee, u16 nwk, u8 reason (1 verify failed, 2 request denied, 3 no key, 4 MIC failure burst)` | event | P |
 | `0x0482` | `EVT_NETWORK_KEY_SWITCHED` | `u8 new_seq, u16 req_tid` | event | P |
 | `0x0483` | `EVT_FC_CHECKPOINT` | `u8 domain (1 NWK, 2 APS), u8 key_seq, u32 durable_limit, u32 generation` | event, emitted after every durable reservation commit | N |
 
-Key-material commands require capability bit 4 and are refused with
-`ACCESS_DENIED` after `key_export_lock` (section 13).
+**Key export** (decision 3).
+
+- **Default.** `KEY_EXPORT` is **enabled by default** in the ESP32 NCP
+  product.
+- **Locking.** `SEC_LOCK_KEY_EXPORT` locks it until the next reboot. After
+  that, every key-revealing response is refused with `ACCESS_DENIED`:
+  - `SEC_GET_NETWORK_KEY`, `SEC_GET_LINK_KEY` and `SEC_DERIVE_EZSP_KEY`;
+  - key-bearing records in `BKP_EXPORT_*`, `TBL_*` and `GP_*` (keys are
+    omitted; flags mark them absent).
+
+  `SYS_GET_STATUS.flags` bit0 reports the lock.
+- **Reboot.** The lock does not survive a reboot. A host that wants it
+  permanently re-applies it during resume (12.1).
+- **Paging is unaffected.** NCP-originated `TBL_WRITEBACK` of NEW keys still
+  carries the key, because the host store must stay complete.
+- **Periodic HA backups.** zigpy takes periodic backups that need keys, so
+  the zigpy library does not lock by default.
+
+**EZSP hashed TCLK in v1** (decision 8).
+
+- **Input.** When a restore carries `EZSP_HASHED_TCLK` (from
+  `stack_specific.ezsp.hashed_tclk`), the NCP keeps the seed and sets
+  `TC_LINK_KEY.flags` bit0.
+- **Derivation.** For every device that has no explicit link key, the NCP
+  derives the unique TCLK on demand: Silicon Labs' "AES HMAC" of the device
+  EUI64 keyed with the seed [Silabs-HLK]. We implement it as the Zigbee
+  keyed hash, HMAC with the AES-MMO hash and a 16-byte block. The derived
+  key is cached like any other key, with origin 4.
+- **Unverified.** The EUI64 byte order fed to the hash is not confirmed.
+  `ezsp_hashed_tclk.json` lists both candidates. The capability bit stays
+  clear until gate H5 (14.6) has matched a key read from a real ZBT-1.
+- **Not used for new networks.** A network formed by zigbee-rs generates
+  random unique TCLKs and does not use hashed mode (Q-N3).
 
 ### 7.6 TABLES (`0x05xx`, endpoint 3)
 
@@ -1102,159 +1315,299 @@ Rules:
   bootloader rolls back.
 - **Protected regions.** Staging never touches the NV journals, the identity
   item or the bootloader.
+- **Recovery path.** `FW_*` is the normal update path for every host. An
+  embedded host that controls the H2's EN and BOOT lines (Thread BR board)
+  also has a recovery path: the H2 ROM serial bootloader, for an NCP that
+  cannot establish a ZRHP session or for first provisioning (11.5).
 
 ### 7.10 LOG (`0x09xx`, endpoint 5)
 
 | ID | Name | Payload | Map |
 |---|---|---|---|
 | `0x0901` | `LOG_CONFIG` (request) | `u8 level (0 off … 5 trace), u32 module_mask` → `status` | N |
-| `0x0980` | `EVT_LOG_RECORD` | `u32 time_ms, u8 level, u8 module, u16 seq, u8 encoding (0 UTF-8, 1 defmt), data[]` | N |
+| `0x0980` | `EVT_LOG_RECORD` | `u32 time_ms, u8 level (1 error … 5 trace), u8 module, u16 seq, text[]` (UTF-8, ≤ 200 B, no terminator; decision 12) | N |
 | `0x0981` | `EVT_LOG_DROPPED` | `u32 count, u16 first_seq` | N |
 
 The NCP keeps logs in a bounded ring. When the LOG endpoint has no credit,
 records are dropped and counted, then reported. Logs never take credit,
-window slots or CPU priority away from other endpoints. The NCP firmware must
-not print to the same USB-Serial-JTAG through `esp-println` (section 11).
+window slots or CPU priority away from other endpoints. A record that is not
+valid UTF-8 is a firmware bug; hosts replace the bad sequences and count
+them. When USB-Serial-JTAG carries ZRHP, the NCP firmware must not print to
+it through `esp-println` (section 11).
 
 ### 7.11 GREEN POWER (`0x0Axx`, endpoint 2)
 
+**What the NCP runs** (decision 11). The NCP runs the zigbee-rs GP
+**combo**: the proxy (Proxy Basic, default in every zigbee-rs router since
+2026-11-13), the sink (`green-power-sink`), and, on the ESP32-H2, the
+TempMaster (`green-power-bidirectional`).
+
+State on master 184b82d (see [Green Power](green-power.md)):
+
+| Piece | Validation |
+|---|---|
+| Sink (`Sink<8, 4>`; Sink Table persisted in the GP journal as `ZBGS` records paired with the Proxy Table; adaptive per-GPD counter persistence) | Host-tested and lab-tested on the ESP32-H2-Zero combo light |
+| Bidirectional commissioning with the combo as its own TempMaster (reply armed in the radio and started from its interrupts, `MacDriver::arm_gp_reply`, ESP32 only) | Proven 3 of 3 on the H2 combo light on 2026-11-17 |
+
+None of this is validated **as a coordinator NCP** yet; gate H10 covers
+that. Since fd3bc03 the NWK layer also accepts the empty source-route relay
+lists that some coordinators send (section 7.3).
+
+**Sink modes.** There is exactly **one sink authority** per network on the
+coordinator, chosen with `GP_SINK_CONFIG.mode`:
+
+| Mode | Sink | What the host sees | Default for |
+|---|---|---|---|
+| 1 `NCP_SINK` | The NCP sink commissions, pairs, verifies security and counters, de-duplicates and keeps the Sink Table | `EVT_GP_*` events (below); no raw GP cluster frames | zigpy library, embedded hub |
+| 0 `HOST_SINK` | The host (its own GP sink) | GP Notification and Commissioning Notification frames from proxies, and the NCP's local proxy output, as `EVT_APS_DATA_INDICATION` on EP 242 (flag bit7 for local) | Go hub and zigbee-herdsman in v1 |
+
+Behaviour in `HOST_SINK` mode:
+
+- A host-originated GP Response that appoints the coordinator as TempMaster
+  (`temp_master` = own NWK address) is also handed to the NCP's local proxy
+  gpTxQueue. A broadcast is not looped back to its sender, so without this
+  the NCP's proxy would never see it.
+- The NCP sink is disabled. The proxy behaves as on a router.
+
+**Commands.**
+
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
-| `0x0A01` | `GP_COMMISSIONING_MODE` | `u8 enable, u16 window_s, u8 flags (bit0 exit on first pairing, bit1 unicast)` | — | P (`zigbee-gp` proxy commissioning mode) |
+| `0x0A01` | `GP_SINK_CONFIG` | `u8 mode (0 host sink, 1 NCP sink), u8 communication_mode (0 full unicast, 1 derived groupcast, 2 pre-commissioned groupcast, 3 lightweight unicast), u16 group (for mode 2), u8 exit_mode (gpsCommissioningExitMode bits), u16 window_s, u8 security_level (gpsSecurityLevel), u8 groupcast_radius` | — | P (`SinkConfig`; runtime switch between modes is N) |
 | `0x0A02` | `GP_SET_SHARED_KEY` | `u8 key_type, [16] key` | — | P |
+| `0x0A03` | `GP_SINK_COMMISSIONING` | `u8 action (1 enter, 0 exit), u8 flags (bit0 involve proxies, bit1 exit on first pairing), u16 window_s` | — | E (`gp_sink_enter_commissioning`, `gp_sink_exit_commissioning`) |
+| `0x0A04` | `GP_SINK_TABLE_READ` | `u8 start` | `u8 total, u8 n, n×R_GP_SINK record` (keys omitted when export is locked) | P |
+| `0x0A05` | `GP_SINK_TABLE_PUT` | `u8 flags (bit0 send GP Pairing AddSink), u8 n, n×R_GP_SINK record` | `u8 n, n×u8 status` (`NO_SPACE`, `ALREADY_EXISTS`, `INVALID_PARAMETER`) | N (import API) |
+| `0x0A06` | `GP_SINK_REMOVE` | `gpd_id, u8 flags (bit0 send GP Pairing RemoveGPD)` | — (`NOT_FOUND`) | E (`gp_sink_remove`) |
+| `0x0A07` | `GP_PROXY_TABLE_READ` | `u8 start` | `u8 total, u8 n, n×R_GP_PROXY record` | P |
+| `0x0A80` | `EVT_GP_FRAME` | `u8 origin (1 direct GPDF, 2 GP Notification, 3 GP Commissioning Notification), u8 result (0 translated, 1 passed through, 2 commissioned, 3 Commissioning Reply sent, 4 decommissioned, 5 commissioning step accepted), gpd_id, u8 device_id, u8 command_id, u32 frame_counter, u8 security_level, u8 key_type, u8 flags (bit0 rxAfterTx, bit1 payload decrypted, bit2 key in payload was TC-LK wrapped), u16 proxy_nwk (FFFF = direct), u8 gpp_gpd_link, i8 rssi, u8 lqi, u8 len, payload[]` | event | P (`SinkOutcome`, `SinkEvent::GpdCommand`; the surface is N) |
+| `0x0A81` | `EVT_GP_COMMISSIONING` | `u8 state (1 entered, 0 left), u16 window_s (FFFF none), u8 involve_proxies, u8 exit_reason (1 explicit, 2 first pairing, 3 timeout)` | event | E (`SinkEvent::CommissioningEntered/Left`) |
+| `0x0A82` | `EVT_GP_COMMISSIONED` | `gpd_id, u8 device_id, u8 flags (bit0 bidirectional, bit1 key present), R_GP_SINK record` | event | E (`SinkEvent::Commissioned`) + N |
+| `0x0A83` | `EVT_GP_COMMISSIONING_FAILED` | `gpd_id, u8 reason` (`SinkDrop`: 1 Invalid, 2 NotCommissioning, 3 NoEntry, 4 SecurityMismatch, 5 AuthFailed, 6 Stale, 7 Duplicate, 8 SecurityPolicy, 9 NoKey, 10 NoTempMaster, 11 TableFull, 12 Unsupported, 13 QueueFull) | event | E |
+| `0x0A84` | `EVT_GP_DECOMMISSIONED` | `gpd_id` | event | E |
 
-The NCP's embedded GP proxy delivers GP Notifications and Commissioning
-Notifications to the host as `EVT_APS_DATA_INDICATION`. These have `src_nwk`
-equal to the NCP's own address, `src_ep = dst_ep = 242`, profile `0xA1E0`,
-cluster `0x0021`, flag bit7 set, and the standard ZCL GP payload. This is
-the shape the Go hub (`processGPNotification`) already consumes. zigpy's GP
-sink support is still under review upstream (zigpy PR #1970), so the zigpy
-side of this path is unverified. GP proxy tables appear in backups as
-`R_GP_PROXY` records (9.3).
+- `gpd_id` is `u8 app_id` (0 SrcID, 2 IEEE), followed by `u32 src_id`, or by
+  `[8] ieee, u8 endpoint`.
+- `R_GP_SINK` (record type `0x0B`, 9.3) is defined by ZRHP, not as the
+  runtime's journal encoding, so that hosts can mirror and back it up.
+- `EVT_GP_FRAME` is emitted **only for frames the sink accepted**:
+  authenticated, fresh and not a duplicate. Duplicates from several proxies,
+  replays and unknown GPDs are counted (DIAG group `0x08xx`) and never
+  forwarded.
+- `payload` is the decrypted GPD command payload. For commissioning
+  frames it is the Commissioning command payload exactly as received,
+  including the TC-LK-wrapped key and its MIC, so that a host-side sink
+  shadow can process it byte-identically.
+
+**Coexistence with zigpy's own GP sink (normative).** zigpy (current `dev`)
+has a complete sink in `zigpy.zgp.GreenPowerManager`:
+
+- `permit_join` broadcasts GP Proxy Commissioning Mode;
+- `_process_commissioning` sends a GP Response, a `Device_annce` for the
+  alias, and a GP Pairing to pre-commissioned groupcast 0x0B84;
+- `gp_packet_received` feeds `GreenPowerDevice` objects, which carry the
+  quirks and entities;
+- it subscribes the coordinator to group 0x0B84.
+
+Both sinks must never pair, so in `NCP_SINK` mode the zigpy library (12.1)
+makes zigpy a **shadow sink**:
+
+1. **Same pairing semantics.** The library configures the NCP sink with
+   `communication_mode = 2`, `group = 0x0B84`. Pairings the NCP sends are
+   then identical in semantics to zigpy's, so a later move back to a zigpy
+   sink (for example EZSP) keeps every proxy's pairing valid.
+2. **Permit join.** `permit(time_s)` → `NWK_PERMIT_JOIN` plus
+   `GP_SINK_COMMISSIONING{enter, involve proxies, time_s}`. zigpy's
+   `GreenPowerManager.permit_join` still runs and enters its commissioning
+   window, but its transmissions are swallowed (step 4).
+3. **Feeding zigpy.** Every `EVT_GP_FRAME` becomes a
+   `zigpy.types.ZigbeeGpPacket` passed to `app.gp_packet_received()`:
+   - commissioning frames with `result` 2 or 5, so zigpy creates the
+     `GreenPowerDevice` with the same key and counter;
+   - operational frames with `result` 1, so quirk entities update.
+
+   zigpy's own counter and duplicate checks then see a strictly increasing
+   counter, because the NCP already removed duplicates.
+4. **Swallowed transmissions.** The library **does not transmit**, and
+   reports success to zigpy for, every zigpy-originated packet that belongs
+   to sink behaviour: GP cluster `0x0021` server → client commands from
+   EP 242 (Pairing 0x01, Proxy Commissioning Mode 0x02, Response 0x06,
+   Translation Table Update/Request) and zigpy's alias `Device_annce` for a
+   GPD. The NCP sink already sent its own.
+5. **Defence in depth.** As a second guard, the NCP rejects such frames from
+   the host with `CONFLICT` in `NCP_SINK` mode and counts them.
+6. **Unpair.** `zigpy.green_power.unpair()` / `force_remove` of a GP device
+   → `GP_SINK_REMOVE{send RemoveGPD}`.
+7. **Migration and resume.** GP devices that zigpy already knows (from an
+   EZSP era) are pushed once with `GP_SINK_TABLE_PUT` (flags 0, no Pairing
+   on air). The proxies are already paired to 0x0B84. The library compares
+   `GP_SINK_TABLE_READ` with zigpy's GP devices at every start and resume.
+   Import is not commissioning, so `gpsSecurityLevel` does not block
+   imported level-0 GPDs (Q-N1).
+
+Whether zigpy's internal sink path accepts NCP-decrypted packets
+(`security_status` already processed) and swallowed Pairings without
+retries must be proven by a zigpy-level test (14.3). An upstream zigpy hook
+for "radio-owned sink" would remove steps 2 and 4 (Q-N2).
+
+**Translation.** The NCP has no local application endpoint, so
+`SinkConfig.endpoint = None`: no built-in GPD → ZCL translation runs on the
+coordinator, and every accepted GPD command reaches the host as
+`EVT_GP_FRAME`.
+
+**Capacity.** `gp_sink_table` = 16 and `gp_proxy_table` = 8 on the H2 NCP
+(8.9). Today `GP_SINK_TABLE_ENTRIES` is a runtime constant (8), so making it
+a product parameter is runtime work (N).
+
+**Backup.** Sink entries go to `stack_specific.zigbee_rs.gp_sink_table` as
+hex `R_GP_SINK` values, and proxy entries to `gp_proxy_table` (9.2). OCB
+itself has no GP fields.
 
 ---
 
 ## 8. Hybrid table protocol
 
-### 8.1 Principle
+### 8.1 Principle, standalone mode and automatic paging
 
 The NCP runs the complete stack with **bounded caches**. The host stores
-the **complete tables** in its database and serves entries to the NCP on
-demand.
+the **complete tables** and can serve entries to the NCP on demand.
 
 The protocol is designed so that host data loss can cost availability but
 never safety. If the host loses data, some devices may have to rejoin, but
 no frame counter is ever reused and no key is ever silently replaced. That
 guarantee rests on two decisions:
 
-1. Every outgoing frame counter lives only on the NCP and is reserved
-   durably there. The host only ever supplies *floors* (8.4).
+1. Every outgoing frame counter lives only on the NCP, as one NWK counter
+   and **one global APS counter**, and is reserved durably there. The host
+   only ever supplies *floors* (8.4).
 2. A cached entry that holds state the host has not yet durably stored
    (*dirty*) cannot be evicted (I1).
+
+**Modes** (decision 4). The NCP decides; the host does not have to
+configure anything.
+
+| Mode | When | Behaviour |
+|---|---|---|
+| **Standalone** (default) | All TC-device entries fit the NCP cache (`max_tc_devices`, 256 on the H2) | No lookups and no evictions. The NCP still writes back `NEW`/`UPDATE` entries if the host set `HOST_TABLES`, so the host store stays complete and paging can start at any time without a bulk transfer. |
+| **Paging** (automatic) | A new keyed device must be admitted while the cache is full of clean, unpinned entries, and the host set `HOST_TABLES` | The LRU clean entry is evicted (it is already on the host). Later misses use `TBL_LOOKUP` (8.6). `SYS_GET_STATUS.flags` bit1 and counters report paging. |
+| **Full without host tables** | Cache full and the host did not set `HOST_TABLES` (small embedded hosts without a store, or a misconfigured host) | The joiner is refused with `EVT_DEVICE_JOINED{decision=denied}` and a counter. The network keeps working for existing devices. |
+
+The **address-map cache** is never a "mode". Its entries are clean, derived
+data (IEEE ↔ NWK learned from frames, announces and the host). They are
+evicted freely and re-learned, and they are only looked up on the security
+paths of 8.6.
 
 ### 8.2 Detailed placement
 
 | Data | NCP | Host | Paging |
 |---|---|---|---|
-| Device identity (IEEE, NWK, capability) | Address-map cache (proposed 512) + child table + neighbor table | Device DB (all devices) | `TBL_LOOKUP` by NWK or IEEE when needed for security (8.6); `TBL_PUSH` preload |
-| Per-device unique TCLK / application key + incoming APS floor + attributes | TC-device cache (proposed 256), journaled | Link-key store (all) | Pull on demand, write back on NEW/UPDATE/EVICT |
-| Children of the coordinator | Child table + `ChildTableJournal` (authoritative) | Mirror (backup) | Not paged; capacity `max_children` |
-| Source routes | Cache of the latest route records (proposed 128) | Relays per device (zigpy `device.relays`) | Host sends relays in `APS_DATA_REQUEST`, or `TBL_PUSH` |
+| Device identity (IEEE, NWK, capability) | Address-map cache (512) + child table + neighbor table | Device registry (all devices) | `TBL_LOOKUP` only on the security paths (8.6); `TBL_PUSH` preload |
+| Per-device unique TCLK / application key + incoming APS floor + attributes | TC-device cache (256), journaled | Link-key store (all) | Standalone, or pull on demand in paging mode; write back on NEW/UPDATE/EVICT |
+| EZSP-hashed devices without an explicit key | Derived on demand from the seed (7.5), then cached like other keys | Nothing beyond the floor | Floors written back on eviction only |
+| Children of the coordinator | Child table + `ChildTableJournal` (authoritative, 64) | Mirror (backup) | Not paged; capacity `max_children` |
+| Source routes | Cache of the latest route records (128) | Relays per device (zigpy `device.relays`) | Host sends relays in `APS_DATA_REQUEST`, or `TBL_PUSH` |
 | Neighbor / routing / discovery tables | Authoritative, RAM | — (read via DIAG) | None; rebuilt by Link Status and MTORR |
 | Bindings / groups with the coordinator as source | APS tables (32 bindings, 16 groups × 8 endpoints) | Mirror | `NWK_GROUP_MEMBERSHIP`; resynced at start |
-| Network key, NIB, TCLK, TC policy | Authoritative | Backup copy | None |
-| Outgoing NWK / APS counters | Authoritative, reserved | Checkpoint log (floors) | `EVT_FC_CHECKPOINT`, floors in `NWK_INIT` |
-| GP proxy table | Authoritative (`GpTableJournal`) | Backup copy | `TBL_READ`, `R_GP_PROXY` records |
+| Network key, NIB, TCLK, hashed-TCLK seed, TC policy | Authoritative | Backup copy | None |
+| Outgoing NWK counter and global APS counter | Authoritative, reserved | Checkpoint log (floors) | `EVT_FC_CHECKPOINT`, floors in `NWK_INIT` |
+| GP Proxy Table / GP Sink Table | Authoritative (GP journal) | Mirror via `EVT_GP_*` and backup | `GP_*_TABLE_READ`, `GP_SINK_TABLE_PUT` (7.11) |
 
 ### 8.3 Cache model and invariants
 
-Each cached entry has:
+Each cached TC-device entry has:
 
 - the record (9.3);
 - `rev`, a `u32` from an NCP-wide, NV-persisted counter, incremented on
   every NCP-side modification;
 - `dirty`: changed since the host last acknowledged it;
-- `pinned`: host-requested, children, or keys of in-progress TC
-  transactions.
+- `pinned`: children, keys of in-progress TC transactions, or
+  host-requested.
 
 Eviction is LRU among clean, unpinned entries.
+
+With the global APS counter, an entry carries **no outgoing-counter state**.
+Only these changes make it dirty:
+
+- a new key;
+- an attribute change (provisional → verified);
+- a key-sequence change;
+- the incoming APS floor, but only for the writeback that accompanies an
+  eviction.
 
 | Invariant | Statement |
 |---|---|
 | **I1** key durability | Every link key a device may be using is durable in an NCP journal, or acknowledged durable by the host, at every instant. A NEW key is journaled on the NCP before Transport-Key/Verify-Key, which the existing TC journal already does. A dirty entry is evicted only after a `TBL_WRITEBACK(EVICT)` has been acknowledged. |
-| **I2** counter monotonicity | NWK and APS outgoing counters are allocated only below an NCP-durable reservation limit. Every input (restore, floors) can only raise them. |
-| **I3** replay floors | An inbound APS floor is durable on the NCP before the frame is accepted (existing two-phase commit). Writebacks carry the floor, and the host stores `max(stored, received)`. |
+| **I2** counter monotonicity | The NWK counter and the global APS counter are allocated only below an NCP-durable reservation limit. Every input (restore, floors) can only raise them. |
+| **I3** replay floors | An inbound APS floor is durable on the NCP before the frame is accepted (existing two-phase commit). The eviction writeback carries the floor, and the host stores `max(stored, received)`. |
 | **I4** stale updates | The host ignores a writeback whose `rev` ≤ its stored `rev` for that key. The NCP refuses a host push to a dirty entry with `CONFLICT` unless `force` is set. |
 | **I5** host deletion | When the host deletes a device, it sends `TBL_INVALIDATE` (and `NWK_REMOVE_DEVICE` if the device must leave). The NCP drops the cached entry even if it is dirty, because deletion is the host's decision. |
 
 ### 8.4 Frame counters and keys
 
-**NWK outgoing counter.**
+**NWK outgoing counter** (existing).
 
 - There is one counter for the active network key. Before use, the NCP
   commits a reservation of `fc_stride = FRAME_COUNTER_RESERVATION_SIZE =
-  0x400` values to `SecurityStateJournal` (existing).
+  0x400` values to `SecurityStateJournal`.
 - After every commit it emits `EVT_FC_CHECKPOINT{domain=1, key_seq,
   durable_limit, generation}`. At 200 frames/s that is about one event every
   5 s.
-- After a reboot the NCP resumes at the durable limit (existing).
+- After a reboot the NCP resumes at the durable limit.
 
-**APS outgoing counter.** This is a proposed runtime change.
+**Global APS outgoing counter** (decision 2; runtime change **N**).
 
-- One **global** counter is used for every APS-secured frame the NCP sends,
-  under any link key, and it is reserved like the NWK counter.
-- Per-key nonces stay unique, because a value is never reused under any key.
-  The counter seen by each partner is strictly increasing, with gaps, which
-  is all a receiver's replay check requires.
-- This is what EmberZNet does: bellows reads and writes a single "APS frame
-  counter" next to the NWK counter.
-- It removes every per-key outgoing counter from the paging protocol, so
-  host-backed keys carry no outgoing counter state at all.
-- Today zigbee-rs keeps `outgoing_frame_counter` and
-  `outgoing_frame_counter_limit` per `ApsLinkKeyEntry`, with TC counter
-  reservations in `TrustCenterDeviceJournal`. Switching to a global
-  reservation is **N** (runtime work).
-- If this is rejected (Q2), per-key counters must be written back with the
-  key, and I1 also covers their reservation limits.
+| Aspect | Specification |
+|---|---|
+| Semantics | One `u32` counter is used for **every** APS-secured frame the NCP sends, under any link key: global TCLK, unique TCLKs, EZSP-derived keys, application keys, key-transport and key-load keys. Each partner sees a strictly increasing counter with gaps, which is all the receiver's replay check requires. No `(key, counter)` pair can ever repeat. This matches EmberZNet, which keeps one APS frame counter next to the NWK counter (bellows `write_aps_frame_counter`). |
+| Scope | Selected by the coordinator/TC app (`TrustCenterCoordinatorApp` in global mode, the NCP product). End-device and router images keep their current per-key counters; their single TCLK makes the two schemes equivalent. |
+| Allocation | `next()` returns `c` and increments it. If `c ≥ limit`, the runtime first commits `limit' = c + fc_stride` to `SecurityStateJournal` as a new `ApsOutgoingReservation` record (beside the NWK reservation, same CRC/commit discipline), then emits `EVT_FC_CHECKPOINT{domain=2}`. A failed commit fails the send with `SECURITY_ERROR`, and nothing is transmitted. At `0xFFFF_FFFF` APS-secured sends are refused and `EVT_FATAL` is raised; this is unreachable in practice. |
+| Reboot | Resume at the durable limit, as for NWK. |
+| Data structures | `ApsLinkKeyEntry.outgoing_frame_counter` / `outgoing_frame_counter_limit` are not used in global mode. The TC-device journal record drops its per-key reservation fields (new record version), which also shrinks each entry. `ApsSecurity` obtains outgoing counters from an `ApsOutgoingCounter` provider owned by the runtime. |
+| Migration from per-key counters | On the first boot of firmware in global mode over an existing per-key journal: `start = max(every per-key outgoing_frame_counter_limit in the TC-device journal and the APS key table, every TC APS reservation)`. The runtime commits the global reservation, then writes the new journal format version. Until that commit completes, no APS-secured frame is sent. |
+| Downgrade | Firmware that predates the format version must not run on migrated NV. Signed updates refuse it: the image carries a minimum NV format, and `FW_BEGIN` checks it. If old firmware is forced on through the ROM recovery path, the journal version check fails closed: the old firmware treats the NV as unknown, starts factory-new, and the host restores with floors (8.7). It never reuses a counter. |
+| Host-visible | `SEC_GET_FRAME_COUNTERS` (`aps_current`, `aps_limit`), `EVT_FC_CHECKPOINT{domain=2}`, `NWK_INIT.aps_fc_floor`, `EVT_NCP_READY.aps_fc_limit`. |
+| Backup mapping | Export: OCB `tc_link_key.frame_counter` and **every** `devices[].link_key.tx_counter` = the durable APS limit. Import: `aps start = max(all tx counters, TCLK counter, RS_PARAMS limit) + aps_margin` (9.4). |
 
 **Floors from the host.**
 
 - The host appends every `EVT_FC_CHECKPOINT` to a durable checkpoint log.
-  fsync is batched, but must happen at least once per 8 checkpoints, so the
-  log lags the NCP by at most `8 × fc_stride`.
+  It must persist at least once per 8 checkpoints per domain, so the log
+  lags the NCP by at most `8 × fc_stride`.
 - `NWK_INIT{nwk_fc_floor, aps_fc_floor}` passes `last_logged_limit +
-  9 × fc_stride` (≤ 9 216, below zigpy's restore margin of 10 000).
+  9 × fc_stride` (≤ 9 216 above the logged value).
 - The NCP sets `counter = max(own durable limit, floor)` and commits a new
   reservation before the first transmission.
 - This protects against an NCP whose NV was rolled back, for example by
-  reflashing an old NV image or swapping a chip with a stale backup.
+  reflashing an old NV image, a ROM-path recovery, or swapping a chip with a
+  stale backup.
 
-**Proof sketch (no reuse).** Let L be the NCP's last durable limit.
+**Proof sketch (no reuse).** Let L be the NCP's last durable limit in either
+domain.
 
 - The NCP transmits only values below L.
 - After a reboot it continues at ≥ L.
 - Restore sets the start to ≥ the backup value + margin (9.4).
 - Floors only raise the value.
+- With one global APS counter, the argument covers every APS key at once.
 
-The only remaining hazard is two NCPs active at once with the same key, for
+The only remaining hazard is two NCPs active at once with the same keys, for
 example an old adapter still powered during a migration. Hosts must refuse
-to restore while another adapter for the same network is connected. The
-zigpy migration flow and section 9.6 require unplugging the old adapter.
+to restore while another adapter for the same network is connected. Section
+9.6 requires unplugging the old adapter.
 
 **Keys.**
 
-- The network key, TCLK and hashed-TCLK seed stay on the NCP and are copied
-  into backups.
+- The network key, global TCLK and hashed-TCLK seed stay on the NCP and are
+  copied into backups.
 - Unique link keys are created on the NCP (TC generated, or derived from an
-  install code) and are immediately written back with `NEW` while pinned
-  (I1).
+  install code) and are written back with `NEW` while pinned (I1).
 - Keys pushed by the host (`SEC_ADD_LINK_KEY`, `TBL_PUSH`, restore) are
   stored as provided.
 
 ### 8.5 TABLES commands (`0x05xx`, endpoint 3)
 
 Table IDs equal record types (9.3): `0x05` DEVICE, `0x08` SOURCE_ROUTE,
-`0x09` GP_PROXY.
+`0x09` GP_PROXY, `0x0B` GP_SINK (read-only here; written with `GP_*`).
 
 | ID | Name | Direction | Request payload | Response after `status` |
 |---|---|---|---|---|
@@ -1262,20 +1615,29 @@ Table IDs equal record types (9.3): `0x05` DEVICE, `0x08` SOURCE_ROUTE,
 | `0x0502` | `TBL_WRITEBACK` | NCP → host | `u8 table, u8 reason (1 NEW, 2 UPDATE, 3 EVICT, 4 DELETE), u32 rev, record` | — (`SUCCESS` only after a durable host commit; otherwise `STORAGE_ERROR`, and the NCP retries with backoff while keeping the entry dirty) |
 | `0x0503` | `TBL_PUSH` | host → NCP | `u8 table, u8 flags (bit0 pin, bit1 force, bit2 only if free space), u8 n, n×record` | `u8 n, n×{u8 status, u32 rev}` |
 | `0x0504` | `TBL_INVALIDATE` | host → NCP | `u8 table, u8 key_type, key[]` | — (`NOT_FOUND` is not an error) |
-| `0x0505` | `TBL_SYNC` | host → NCP | `u32 host_db_epoch, u32 last_ncp_table_epoch, u8 flags (bit0 host DB rolled back)` | `u32 ncp_table_epoch, u16 dirty, u16 cached_devices, u16 cached_routes`; the NCP then re-sends every dirty writeback, or with bit0 set, every cached entry as `UPDATE` |
+| `0x0505` | `TBL_SYNC` | host → NCP | `u32 host_db_epoch, u32 last_ncp_table_epoch, u32 host_max_rev, u8 flags (bit0 host store rolled back)` | `u32 ncp_table_epoch, u32 host_acked_rev, u16 dirty, u16 cached_devices, u16 cached_routes, u8 paging_active` |
 | `0x0506` | `TBL_READ` | host → NCP | `u8 table, u16 cursor, u8 max` | `u16 next_cursor (FFFF = end), u8 n, n×{u32 rev, u8 state (bit0 dirty, bit1 pinned), record}` |
 | `0x0507` | `TBL_STATS` | host → NCP | `u8 table` | `u16 capacity, u16 used, u16 dirty, u16 pinned, u32 hits, u32 misses, u32 evictions, u32 lookup_timeouts` |
 | `0x0580` | `EVT_TBL_EPOCH_CHANGED` | NCP → host | `u32 new_epoch, u8 reason (1 factory reset, 2 restore, 3 NV re-initialized)` | event |
+| `0x0581` | `EVT_TBL_PAGING` | NCP → host | `u8 active, u16 cached, u16 capacity` | event (paging started or stopped) |
+
+**`TBL_SYNC` handling.**
+
+- After `TBL_SYNC` the NCP re-sends every dirty writeback.
+- With bit0, or when `host_max_rev < host_acked_rev`, it re-sends **every**
+  cached entry as `UPDATE`.
+- `host_acked_rev` is the highest `rev` the host ever acknowledged. The NCP
+  persists it in the TC journal append that clears the dirty bit. A host
+  whose store was restored from an older snapshot (for example an HA backup
+  restore) is detected automatically, because its `host_max_rev` is smaller.
 
 `table_epoch` is NCP-persisted. It changes whenever the NCP's tables are
 wiped or replaced. The host stores `(ncp_ieee, table_epoch)`, and a mismatch
-in `EVT_NCP_READY` means "the NCP no longer holds what you think". Because
-lookups pull entries on demand, the host only needs to preload hot entries
-(routers, recently active devices).
+in `EVT_NCP_READY` means "the NCP no longer holds what you think".
 
 Example (`messages.json`): the NCP looks up NWK `0x4F21`, and the host
-returns rev 41 with a link key whose global tx counter is 14 024 and whose
-rx floor is 3:
+returns rev 41 with a link key whose `tx_counter` (informational: the
+global APS limit) is 14 024 and whose rx floor is 3:
 
 ```text
 req: 00 0105 0100 0400 | 05 02 214f
@@ -1283,76 +1645,130 @@ rsp: 40 0105 0100 2e00 | 00 29000000 | 05 2600 0c0b0afeff142e84 214f 0a
      a0a1a2a3a4a5a6a7a8a9aaabacadaeaf 00 02 03 c8360000 03000000
 ```
 
-### 8.6 Miss handling
+### 8.6 Miss handling (paging mode only)
 
 | Situation | NCP action | Bound |
 |---|---|---|
-| Inbound APS-secured frame, key not cached | Resolve the source IEEE (APS auxiliary header extended nonce, NWK header extended source, or address-map cache). If unknown, or the key is not cached, send `TBL_LOOKUP`. Park the frame in the miss queue. When the key arrives, run the normal replay and MIC checks with the record's floor. | Miss queue `tbl_miss_queue_len` (8) × 128 B. Timeout `tbl_lookup_timeout_ms` (250). On overflow or timeout the frame is dropped and counted (no APS ACK, so the sender retries). |
+| Inbound APS-secured frame, key not cached | Resolve the source IEEE (APS auxiliary header extended nonce, NWK header extended source, or address-map cache). If unknown, or the key is not cached, send `TBL_LOOKUP`. Park the frame in the miss queue. When the key arrives, run the normal replay and MIC checks with the record's floor. EZSP-hashed devices need no lookup for the key itself, only for the floor of an evicted entry. | Miss queue `tbl_miss_queue_len` (8) × 128 B. Timeout `tbl_lookup_timeout_ms` (250). On overflow or timeout the frame is dropped and counted (no APS ACK, so the sender retries). |
 | Join or rejoin of an IEEE not cached (Update-Device or association) | Lookup by IEEE for a preconfigured key or install code. `NOT_FOUND` ⇒ apply the TC policy (global TCLK allowed or not). | Joins tolerate seconds; lookup bounded by the timeout. Host absent ⇒ policy-only decision, counted. |
-| Request-Key / TCLK update | Generate the key, journal it (pinned), transport it, write back `NEW`. | — |
+| Request-Key / TCLK update | Generate the key, journal it (pinned), transport it, write back `NEW`. | At most `max_ncp_requests` (8) outstanding NCP → host requests |
 | Outbound APS-secured unicast, key not cached | Lookup, then send. Without a key: confirm `FAILURE` with `zb_status` = APS security fail, counted. | Same timeout |
 | Outbound IEEE-mode unicast, NWK unknown | Lookup by IEEE. | Same timeout |
 | Outbound unicast without relays | Use the cached source route, else NWK route discovery. **No lookup in v1.** | — |
 | Indication source IEEE | Caches only, **no lookup**. Flag bit2 tells the host whether it was filled. | — |
 | Cache full of dirty or pinned entries | Admission of a new joiner is refused (TC denies) with counter + `EVT_DEVICE_JOINED{decision=denied}`. Lookups still work through one temporary slot. | — |
 
-Lookups are only on the security and admission paths. In a typical home
-network almost all traffic is NWK-secured only, so lookups are rare: mostly
-TCLK exchanges, joins and the occasional APS-secured cluster.
+In standalone mode none of these lookups happen.
 
 ### 8.7 Consistency after reboots
 
 | Event | NCP | Host |
 |---|---|---|
-| NCP reboot, NV intact | Restores the network, children, cached keys and floors from its journals. Address-map and source-route caches start empty. Keeps `table_epoch`. Re-sends dirty writebacks after the session. | Sees `PEER_RESTARTED` (zigpy: `connection_lost` → re-initialize). Sends `NWK_INIT` with floors, `TBL_SYNC`, optional `TBL_PUSH` preload, then re-registers endpoints, groups and TC policy. |
+| NCP reboot, NV intact | Restores the network, children, cached keys, floors and both counters from its journals. Address-map and source-route caches start empty. Keeps `table_epoch`. Re-sends dirty writebacks after the session. | Sees a new `ncp_cookie`. Runs **seamless resume** (12.1): `NWK_INIT` with floors, `TBL_SYNC`, replay of endpoints, groups, TC policy, GP sink configuration, permit-join remainder and key-export lock. It falls back to a full re-initialization only if the state cannot be reconciled. |
 | Host restart, NCP running | Network keeps running. Indications are queued, then counted. Dirty writebacks wait. | Handshake, `SYS_NEGOTIATE`, `EVT_NCP_READY(network up)`. `NWK_INIT` is idempotent (applies floors only). `TBL_SYNC`. |
-| Host DB restored from an older snapshot | `TBL_SYNC{bit0}` ⇒ writes back **all** cached entries. | Merges by `max(rev)` and `max(floor)`. Keys created and evicted after the snapshot are lost: those devices raise `EVT_KEY_FAILURE` and must rejoin (I1 still prevents silent key replacement). |
+| Host store restored from an older snapshot | Detected by `TBL_SYNC` (`host_max_rev < host_acked_rev`) ⇒ writes back **all** cached entries. | Merges by `max(rev)` and `max(floor)`. Keys created **and evicted** after the snapshot are lost: those devices raise `EVT_KEY_FAILURE` and must rejoin (I1 still prevents silent key replacement). In standalone mode nothing is lost, because every key is still on the NCP. |
 | NCP NV wiped, chip replaced, or `table_epoch` mismatch | `EVT_NCP_READY{network_state=0}` or a new epoch. | Restore from the latest backup (9.4) with checkpoint-log floors. |
 | Power cut of both | Each side recovers as above. | — |
 | Restore interrupted | Staging is discarded at boot (atomic commit); the old state remains. | Retry the restore. |
 
 ### 8.8 Host persistence duties
 
-A host that enables `HOST_BACKED_TABLES` must:
+A host that sets `HOST_TABLES` (host capability bit0) must:
 
-- commit a writeback durably (SQLite transaction with `synchronous=FULL`, or
-  equivalent) before answering `SUCCESS`;
+- commit a writeback durably before answering `SUCCESS`:
+  - SQLite: a transaction with `synchronous=FULL`;
+  - embedded raw-flash journal: a record written and read back with a valid
+    CRC and commit marker;
 - keep the FC checkpoint log as in 8.4;
-- keep `(ncp_ieee, table_epoch, host_db_epoch)`;
-- answer `TBL_LOOKUP` within the timeout, from memory;
+- keep `(ncp_ieee, table_epoch, host_db_epoch, host_max_rev)`;
+- answer `TBL_LOOKUP` within the timeout, from RAM or PSRAM;
 - never block the TABLES endpoint behind ZIGBEE traffic.
 
-A host that cannot meet these duties runs the NCP in **standalone mode**: it
-does not set host capability bit 0, and the NCP never pages. The network is
-then limited to the NCP's cache capacities.
+Per-host store:
 
-Host capability bits (`host_caps`): bit0 `HOST_TABLES` (the host serves 8.5),
-bit1 `FC_CHECKPOINTS` (the host keeps the checkpoint log), bit2
-`RETRY_CACHE` (the host uses 6.5).
+- **zigpy library:** a sidecar SQLite database next to zigpy's
+  `zigbee.db` (12.1).
+- **Go hub:** its own SQLite database.
+- **zigbee-herdsman:** a sidecar file (12.3).
+- **Embedded hub:** a raw-flash journal (3.4).
 
-### 8.9 Sizing on ESP32-H2 (proposal, to be measured from the linker map)
+A host that does not set `HOST_TABLES` gets standalone behaviour only, and
+new keyed devices beyond the NCP cache are refused (8.1).
 
-| Item | Entries | Approx. bytes |
-|---|---:|---:|
-| TC-device / link-key cache (IEEE 8, NWK 2, key 16, floor 4, rev 4, attrs 4) | 256 | 10 KiB |
-| Address-map cache (IEEE 8, NWK 2, age 2) | 512 | 6 KiB |
-| Source-route cache (dst 2, n 1, 8 × 2) | 128 | 2.4 KiB |
-| Link RX reorder buffers (`rx_window` 16 × 656) | 16 | 10.3 KiB |
-| Link TX buffers (local TX window 16 × 656) | 16 | 10.3 KiB |
-| Miss queue (8 × 128) + host-absent queue (32 × ~64) | — | 3 KiB |
-| **Total new RAM** | | **≈ 42 KiB** |
+Host capability bits (`host_caps`):
 
-A sender may use a smaller window than the peer's `rx_window` if its own TX
-buffer is smaller. The window is `min(peer rx_window, local TX buffers)`.
+| Bit | Meaning |
+|---:|---|
+| 0 | `HOST_TABLES`: the host serves 8.5 |
+| 1 | `FC_CHECKPOINTS`: the host keeps the checkpoint log |
+| 2 | `RETRY_CACHE`: the host uses 6.5 |
+| 3 | `GP_SHADOW`: the host mirrors NCP-sink GPDs into its own GP layer (7.11) |
 
-The TC-device journal must hold snapshots of the whole cache. The product
-must size its sectors (for example 2 × 32 KiB), assert
-`FULL_TABLE_APPEND_CAPACITY`, and qualify erase endurance, as the
-[coordinator guide](coordinator-router.md#persistence) already requires.
-These numbers are proposals. The product's linker output and the usable
-SRAM must confirm them.
+### 8.9 ESP32-H2 NCP budget (decision 9)
 
----
+**RAM.** The H2 application RAM region in the vendored esp-hal linker
+script is `RAM: ORIGIN 0x40800000, LENGTH 0x3EFD0` = **258 000 B**
+(`vendor/esp-hal/ld/esp32h2/memory.x`). `.data`, `.bss` and the stacks
+share it.
+
+| Item | Bytes | Basis |
+|---|---:|---|
+| Today's H2 combo-light router (`.bss` 70 684 + `.data` ≈ 3 300) | ≈ 74 000 | [Green Power §3.7](green-power.md) size table; includes the 32 KiB `esp-alloc` heap that the H2 example declares |
+| ZRHP link: RX 16 × 652 + COBS 656 + TX 16 × 652 | 21 520 | 5.8 |
+| TC-device / link-key cache: 256 × 48 B (IEEE 8, NWK 2, key 16, rx floor 4, rev 4, attrs/origin/seq/flags 4, LRU and index 8, padding 2) | 12 288 | decision 9 |
+| Address-map cache: 512 × 12 B | 6 144 | decision 9 |
+| Source-route cache: 128 × 20 B | 2 560 | 8 relays |
+| Children 64 (see below): neighbor table 32 → 96 (+64 × 32 B), child records 64 × 24 B, source-match table 16 → 64 (+48 × 10 B), indirect queue 8 → 16 frames (+8 × 128 B) | 5 088 | — |
+| APS request queue: `max_aps_inflight` 16 × 160 B | 2 560 | — |
+| Host-absent queue 32 × 80 B + miss queue 8 × 128 B + retry cache 64 × 24 B | 5 120 | — |
+| GP Sink Table 8 → 16 entries (+8 × ~80 B) | 640 | — |
+| **Total static** | **≈ 130 000** | about 50 % of the region |
+| Remaining for stacks and margin | ≈ 128 000 | Must be confirmed by the product's post-link check and stack painting |
+
+**`max_children = 64`.**
+
+- RAM is not the limit: about 80 B per child, including its neighbor slot,
+  source-match entry and its share of the indirect queue.
+- The binding limit is the child journal record: `8 + 2 + C × 14` bytes
+  (`CHILD_ENTRY_LEN` = 14) must fit a slot minus its 16-byte CRC and
+  commit trailer.
+  - Today's slots are 512 B, so C ≤ 34 (`MAX_PERSISTED_CHILDREN` = 32).
+  - With **1 024-byte slots**, C ≤ 71. 64 children need 906 B.
+- 64 is the first power of two that is ≥ 32 and fits. A restore whose child
+  list exceeds 64 demotes the extras (note `CHILD_DEMOTED`), and they
+  rejoin.
+- Concurrent delivery to sleepy children is bounded separately, by the
+  16-frame indirect queue and the 64-entry source-match table.
+
+**Flash** (NV journals, both module variants). The ESP32-H2-MINI-1 on the
+BR board exists with 2 MB (`-H2S`) and 4 MB (`-H4S`) flash, so the product
+defines both layouts.
+
+| Journal | Geometry | Size | Calculation |
+|---|---|---:|---|
+| `SecurityStateJournal` (NWK and global APS reservations, keys, APS replay floors) | 2 × 16 KiB logical sectors | 32 KiB | Coordinator guide: 16 KiB sectors for the full 64-entry replay table |
+| `TrustCenterDeviceJournal` (256 cached entries) | 2 × 32 KiB | 64 KiB | Snapshot: 43 B header + 256 × 72 B (75 B today − 8 B per-key counter fields + 5 B rev/host-ack) + 32 removal intents × 16 B = 18 987 B ≈ 18.5 KiB. A logical sector holds one 20 KiB snapshot + 12 KiB of appends (≈ 128 × 96 B). The snapshot must be **streamed across slots** (new runtime work); today's single 4 KiB slot holds only 32 devices. |
+| `ChildTableJournal` (64 children) | 2 × 4 KiB, 1 024 B slots | 8 KiB | 906 B record + trailer |
+| GP journal (Proxy 8 + Sink 16) | 2 × 8 KiB, 1 024 B slots | 16 KiB | Sink snapshot 1 + 16 × (1 + 45) = 737 B fits a slot. The proxy+sink pair uses 2 slots. 8 KiB sectors give room for adaptive counter records (32 B). |
+| APS tables (bindings, groups, application keys) | 2 × 4 KiB | 8 KiB | as on routers |
+| Identity and settings (IEEE override, UART default, coex enable) | 2 × 4 KiB | 8 KiB | — |
+| **Total** | | **136 KiB** | — |
+
+Partition tables (proposal; the product's post-link layout check must
+enforce them):
+
+| Flash | otadata | ota_0 | ota_1 | NV (`zbnv`) |
+|---|---|---|---|---|
+| 4 MB | 0x9000 (8 KiB) | 0x10000, 0x1E0000 (1.875 MiB) | 0x1F0000, 0x1E0000 | 0x3D0000–0x400000 (192 KiB: 136 used + 56 spare) |
+| 2 MB | 0x9000 (8 KiB) | 0x10000, 0xE0000 (896 KiB) | 0xF0000, 0xE0000 | 0x1D0000–0x200000 (192 KiB) |
+
+- The NCP image is estimated at 650–700 KB: today's combo light is 562 960
+  B, plus the ZRHP link, the app and the caches. That fits the 2 MB layout's
+  896 KiB slot.
+- This is an NCP-product layout. It does not move the existing devkit
+  product's `zbnv` at 0x3F0000.
+- `SYS_GET_INFO.flash_size` lets hosts and the ROM recovery path pick the
+  right images.
 
 ## 9. Backup, restore and Open Coordinator Backup
 
@@ -1377,8 +1793,10 @@ Real files deviate from the specification in ways an importer must tolerate:
 
 | Source | Quirk | Handling |
 |---|---|---|
-| Z2M | `nwk_address` without leading zeros (`"abc"`) | Left-pad to 4 hex digits (zigpy does `zfill(4)`) |
-| Z2M | `metadata.internal.date` instead of `creation_time` | Accept either |
+| Z2M (herdsman `toUnifiedBackup`) | `pan_id` and `nwk_address` written with `toString(16)`, i.e. without leading zeros (`"a62"`, `"abc"`) | Left-pad to 4 hex digits (zigpy does `zfill(4)` for NWK only; ZRHP hosts pad both) |
+| Z2M | `metadata.internal.date` instead of `creation_time`; `znpVersion` / `ezspVersion` in `internal` | Accept either date key; pass the version keys through |
+| Z2M | **No** `internal.network`: no TCLK, TCLK counter or TC address | Default `ZigBeeAlliance09`; the APS counter is unknown, so the host uses `aps_margin = 2²⁰` (9.4) |
+| Z2M | `stack_specific` carries only `zstack.tclk_seed` or `ezsp.hashed_tclk`; other stacks' sections are dropped on re-export | A ZRHP-aware herdsman must preserve `stack_specific.zigbee_rs` (12.3) |
 | Z2M ember adapter | Needs `metadata.internal.ezspVersion` for EZSP-origin backups (bellows comment) | Pass through unknown `internal` keys unchanged on re-export |
 | zigpy | TCLK only in `metadata.internal.network.tc_link_key {key, frame_counter}` and `tc_address` | Read there; default `ZigBeeAlliance09`, counter 0, TC address = coordinator IEEE |
 | zigpy | `internal.link_key_seqs`, `internal.tx_power`, `internal.route_table` | Map as below |
@@ -1409,9 +1827,9 @@ Real files deviate from the specification in ways an importer must tolerate:
 | `devices[].link_key.rx_counter` | `DEVICE.link.rx_floor` | Host store / NCP cache | Floor | Stored as the incoming floor (no margin) | P |
 | `internal.link_key_seqs[ieee]` | `DEVICE.link.key_seq` | Host | Stored | Stored | N |
 | `internal.route_table` | — | NCP (RAM) | Optional from `DIAG_GET_ROUTES` | **Ignored**: routes are rediscovered (MTORR at start) | — |
-| `stack_specific.ezsp.hashed_tclk` | `EZSP_HASHED_TCLK` | NCP | Stored value | Stored; used if capability bit 14 | N |
+| `stack_specific.ezsp.hashed_tclk` | `EZSP_HASHED_TCLK` | NCP | Stored value | Stored; devices without an explicit key get derived keys (7.5, decision 8) | N |
 | `stack_specific.zstack.*`, `.zboss.*`, other unknown keys | — | Host (pass-through) | Re-emitted unchanged | Not sent to the NCP | — |
-| `stack_specific.zigbee_rs.*` | `RS_PARAMS`, `GP_PROXY` | NCP | See below | Limits become floors; GP entries restored | N |
+| `stack_specific.zigbee_rs.*` | `RS_PARAMS`, `GP_PROXY`, `GP_SINK` | NCP | See below | Limits become floors; GP Proxy and Sink entries restored (no GP Pairing sent) | N |
 | `metadata.*` (except the above) | — | Host | Host | Host | — |
 
 The `stack_specific.zigbee_rs` object, written by ZRHP hosts:
@@ -1424,7 +1842,8 @@ The `stack_specific.zigbee_rs` object, written by ZRHP hosts:
   "nwk_frame_counter_limit": 2011024,
   "aps_frame_counter_limit": 14024,
   "host_backed_tables": true,
-  "gp_proxy_table": ["<hex R_GP_PROXY value>", "..."]
+  "gp_proxy_table": ["<hex R_GP_PROXY value>", "..."],
+  "gp_sink_table": ["<hex R_GP_SINK value>", "..."]
 }
 ```
 
@@ -1447,6 +1866,7 @@ Each record is a TLV: `u8 type, u16 len, value[len]`.
 | `0x08` | `SOURCE_ROUTE` | `u16 dst, u8 n, n×u16 relays` (path order from the coordinator) | 3+2n |
 | `0x09` | `GP_PROXY` | `u8 format_version, entry[]` (zigbee-rs `gp_store` entry encoding) | var |
 | `0x0A` | `RS_PARAMS` | `u32 fc_stride, u32 table_epoch, u32 nwk_fc_limit, u32 aps_fc_limit, u8 flags (bit0 host-backed tables)` | 17 |
+| `0x0B` | `GP_SINK` | `gpd_id` (`u8 app_id`; then `u32 src_id`, or `[8] ieee, u8 endpoint`), `u8 device_id, u8 communication_mode, u16 group (FFFF none), u16 assigned_alias (FFFF derived), u8 flags (bit0 MAC seq capable, bit1 rx-on capable, bit2 fixed location, bit3 key present), u8 security_level, u8 key_type, [16] key (if bit3), u32 frame_counter, u8 groupcast_radius` | 19..39 |
 | `0xFF` | `END` | `u32 record_count, u32 crc32c` over the concatenated TLV bytes of all preceding records in the stream | 8 |
 
 `DEVICE.flags`:
@@ -1468,6 +1888,15 @@ Child info: `u8 capability, u8 timeout_exp`.
 Link block: `[16] key, u8 key_seq, u8 attrs (0 provisional, 1 unverified,
 2 verified), u8 origin (0 global, 1 install code, 2 TC generated, 3
 imported/host, 4 EZSP-hashed derived), u32 tx_counter, u32 rx_floor`.
+
+`tx_counter` is **informational**, because outgoing APS counters are global
+(8.4):
+
+- On export and in `TBL_*` the NCP writes the global durable APS limit.
+- On import it only contributes to the global start, through the `max` in
+  9.4.
+
+The field keeps OCB's per-device `tx_counter` round-trippable.
 
 Unknown record types are skipped on import, reported as an `IGNORED` note,
 and preserved by hosts. Within a major version, records may grow by
@@ -1513,7 +1942,14 @@ Rules:
    - The zigpy library passes `nwk_margin = 0`, because zigpy's
      `restore_backup()` already adds 10 000 to the network-key counter, and
      `aps_margin = 10 000`, because zigpy adds nothing to APS counters.
-   - The Go hub should pass 10 000 / 10 000 instead of its current 2 500.
+   - **Go hub (decision 13):** the adapter must pass 10 000 / 10 000, and
+     the hub's `FrameCounterRestoreMargin` must change from 2 500 to
+     10 000. This is a required change in `~/go_zboss-ncp`, to be made in
+     that repository.
+   - **Unknown TCLK counter.** If the backup has no TCLK frame counter (Z2M
+     backups, 9.1), every host passes `aps_margin = 2²⁰` (1 048 576). Its
+     APS counter is unknown, and a megaframe margin costs nothing in a
+     32-bit space (`ocb_z2m_import.json`).
    - A backup produced by a zigbee-rs NCP already carries durable limits,
      so its margins only need to cover "the old NCP kept running after the
      backup". Hosts must still not restore while it runs (8.4).
@@ -1555,7 +1991,8 @@ radio actually uses.
 
 1. Flash the zigbee-rs NCP firmware on the ESP32-H2. Check
    `SYS_NEGOTIATE`: `BACKUP_RESTORE`, `KEY_EXPORT` and `IEEE_REWRITABLE`
-   must be present, and `EZSP_HASHED_TCLK` is strongly recommended.
+   must be present. `EZSP_HASHED_TCLK` is implemented in v1, but it is
+   advertised only after gate H5 has verified it.
 2. In ZHA, start *Migrate radio → keep network*. bellows creates a fresh
    backup with `load_network_info(load_devices=True)`. This includes the
    NWK counter, the TCLK, the key table, the child table and the address
@@ -1576,19 +2013,23 @@ radio actually uses.
      `max_children` fall back to rejoin; the secured rejoin uses the same
      key.
    - Routes are rebuilt by MTORR and route records within minutes.
-7. **Hashed-TCLK caveat.** With hashed mode, devices that completed a TCLK
-   update hold a key derived from `hashed_tclk` and their EUI64. EmberZNet
-   does not list that key in the key table.
-   - Without `EZSP_HASHED_TCLK` support, those devices lose APS-level
-     security with the TC. This affects future network-key rotation, TCLK
-     verification and APS-encrypted commands until they rejoin. NWK traffic
-     is unaffected.
-   - From their source, zigpy-znp, zigpy-deconz and zigpy-zboss ignore
-     `stack_specific.ezsp`, so migrations to those radios lose these keys
-     the same way today.
-   - The derivation algorithm must be implemented bit-exactly and validated
-     against a key read from a real ZBT-1 before the capability is
-     advertised. **Unverified; hardware gate.**
+7. **Hashed TCLK** (decision 8).
+   - **Why it matters.** With hashed mode, devices that completed a TCLK
+     update hold a key derived from `hashed_tclk` and their EUI64.
+     EmberZNet does not list that key in the key table [Silabs-HLK].
+   - **What v1 does.** The zigbee-rs NCP derives these keys on demand
+     (7.5), so the devices keep APS-level security with the TC: network-key
+     rotation, TCLK verification and APS-encrypted commands keep working.
+   - **Other radios.** From their source, zigpy-znp, zigpy-deconz and
+     zigpy-zboss ignore `stack_specific.ezsp`, so migrations to those radios
+     lose these keys.
+   - **Verification.** Gate H5 (14.6) proves the derivation against a key
+     read from the user's real ZBT-1 before the capability bit is set.
+     Until then the NCP still stores the seed, so a later firmware update
+     enables derivation without another migration.
+8. **Green Power.** zigpy's GP devices from the EZSP era are imported into
+   the NCP Sink Table with `GP_SINK_TABLE_PUT` (7.11, step 7). No GP
+   Pairing is sent, and the proxies keep their group-0x0B84 pairings.
 
 #### zigbee-rs → EZSP (ZBT-1)
 
@@ -1615,7 +2056,8 @@ radio actually uses.
 | ZNP (zigpy-znp) | Keys are already explicit in `devices[].link_key`; `tclk_seed` is passed through. For the reverse migration, zigpy-znp recomputes an optimal seed from the key table. |
 | deCONZ | Older firmware reports a NWK counter of 2³⁰; restore starts above it, leaving about 3·2³⁰ counters. Link keys are usually absent. |
 | ZBOSS (zigpy-zboss) | Key table and NIB counter are supported. TC policies in `stack_specific.zboss` are host pass-through. |
-| Z2M / zigbee-herdsman | Same OCB file (`coordinator_backup.json`). A zigbee-herdsman ZRHP adapter is out of scope. The JSON round trip with Z2M quirks is part of the conformance tests (14.3). |
+| Z2M / zigbee-herdsman | Same OCB file (`coordinator_backup.json`), with the Z2M quirks of 9.1. A zigbee-herdsman ZRHP adapter is in scope (12.3). Import from a Z2M backup uses the unknown-TCLK-counter margin. Export through herdsman loses `stack_specific.zigbee_rs` unless herdsman's backup utilities are extended (12.3). |
+| ZRHP embedded hub | Stores the same binary records. It can export OCB JSON through a streaming writer, or hand the records to a desktop tool that converts them with the same rules (`ocb_roundtrip.json`). |
 
 ### 9.7 Round-trip vector
 
@@ -1653,6 +2095,14 @@ The generator asserts four properties:
 3. The `END` CRC matches.
 4. The install-code key derivation matches the zigbee-crypto vector.
 
+`ocb_z2m_import.json` covers a Z2M-style backup:
+
+- `pan_id` `"a62"` and NWK `"abc"`, which the host pads;
+- `internal.date` and `ezspVersion`;
+- no TCLK counter, so the host uses `aps_margin = 2²⁰`;
+- NWK counter 77 000 + 10 000 → start 87 000;
+- APS start = max(0, 5) + 1 048 576 = 1 048 581.
+
 ---
 
 ## 10. Performance model
@@ -1673,6 +2123,7 @@ UART (10 bits/byte):
 
 | Link | Bytes/s | Indications/s unbatched | Indications/s batched |
 |---|---:|---:|---:|
+| 460 800 baud (Thread BR board default) | 46 080 | 731 | 917 |
 | 921 600 baud | 92 160 | 1 463 | 1 835 |
 | 2 000 000 baud | 200 000 | 3 175 | 3 982 |
 | 3 000 000 baud | 300 000 | 4 762 | 5 972 |
@@ -1711,23 +2162,23 @@ broadcasts (three transmissions each) cut this substantially.
 
 A 1000-device network therefore produces the following load:
 
-| Load | Reports/s | Air utilisation near the coordinator | Link utilisation at 921 600 (63 B frames) | at USJ worst case |
-|---|---:|---:|---:|---:|
-| 1 report / 5 min / device | 3.3 | 1.5 % | 0.2 % | 0.3 % |
-| 1 report / 60 s / device | 16.7 | 7.3 % | 1.1 % | 1.6 % |
-| 1 report / 10 s / device | 100 | 44 % (saturating in practice) | 6.8 % | 9.8 % |
-| Air-limit burst | ~228 | 100 % | 15.6 % | 22 % |
+| Load | Reports/s | Air utilisation near the coordinator | Link utilisation at 460 800 (BR board) | at 921 600 (63 B frames) | at USJ worst case |
+|---|---:|---:|---:|---:|---:|
+| 1 report / 5 min / device | 3.3 | 1.5 % | 0.5 % | 0.2 % | 0.3 % |
+| 1 report / 60 s / device | 16.7 | 7.3 % | 2.3 % | 1.1 % | 1.6 % |
+| 1 report / 10 s / device | 100 | 44 % (saturating in practice) | 13.7 % | 6.8 % | 9.8 % |
+| Air-limit burst | ~228 | 100 % | 31 % | 15.6 % | 22 % |
 
-Even the slowest configuration has 4–6 times more serial capacity than the
-radio can produce. ZRHP's speed requirement is therefore about:
+Even the slowest configuration, the BR board's 460 800 baud without flow
+control, has more than 3 times the serial capacity the radio can produce. ZRHP's speed requirement is therefore about:
 
 - **latency under concurrency**: many requests in flight, no lock-step;
 - **burst absorption**: after a power outage, every device rejoins,
   announces and reports at once;
 - **bulk transfers** that do not disturb the data plane:
   - backups: 1000 devices with keys ≈ 41 KB, 0.45 s at 921 600;
-  - NCP firmware: 1 MiB ≈ 11.6 s at 921 600, 3.6 s at 3 Mbaud, up to 17 s
-    at the USJ worst case;
+  - NCP firmware: 1 MiB ≈ 23 s at 460 800, 11.6 s at 921 600, 3.6 s at
+    3 Mbaud, up to 17 s at the USJ worst case;
 - **table paging** on the critical path of secured traffic (8.6).
 
 ### 10.4 Latency budget (host request → NCP → first transmission)
@@ -1831,9 +2282,11 @@ Sources: [ESP-TRM], [IDF-USJ], [esptool], [esp-hal].
 5. **Logs.**
    - Firmware logs go only to the `LOG` endpoint.
    - `esp-println` on USJ, which the sensor examples use today, must be
-     compiled out of NCP images.
+     compiled out of NCP images that use USJ as the ZRHP transport.
    - A product build check must fail if both the ZRHP USJ transport and
      `esp-println`'s jtag-serial backend are linked.
+   - A UART-transport image (for example on the Thread BR board) may keep a
+     USJ debug console, because USJ then carries no ZRHP.
 6. **Credits replace RTS/CTS.**
    - Host → NCP: the NCP drains the 64 B OUT buffer from the
      `SERIAL_OUT_RECV_PKT` ISR into an RX ring of at least `rx_window × 656`
@@ -1860,42 +2313,179 @@ Sources: [ESP-TRM], [IDF-USJ], [esptool], [esp-hal].
     pyserial's separate `dtr`/`rts` setters can pass through a transient
     state, so the zigpy library must set both lines with one ioctl.
   - The Windows behaviour differs (esptool notes) and must be tested.
-- **Hard reset.** A deliberate hard reset of the NCP is `(0,0) → (1,0) for
-  ≥ 10 ms → (0,0)`. The library exposes it as a recovery step when the link
-  stays down. The NCP product may disable it with
-  `USB_SERIAL_JTAG_USB_UART_CHIP_RST_DIS` (product policy, Q6).
+- **Hard reset** (decision 6).
+  - The USJ DTR/RTS reset logic stays **enabled** in production NCP images:
+    `USB_SERIAL_JTAG_USB_UART_CHIP_RST_DIS` is not set.
+  - A deliberate hard reset of the NCP is `(0,0) → (1,0) for ≥ 10 ms →
+    (0,0)`.
+  - Host libraries use it as a recovery step when the link stays down past
+    the resume budget (12.1).
+  - Because any host-side tool that toggles the lines can reset the NCP,
+    hosts must follow the DTR/RTS rules above. The NCP reports the resulting
+    reset as `reset_reason` 2/7 in `EVT_NCP_READY`.
 - **Flow control settings.** Disable `rtscts` and `dsrdtr`. Flow control is
   ZRHP credits and USB NAK.
 
-### 11.4 UART alternative on the same chips
+### 11.4 UART variant (v1, decision 7)
 
-- **ESP32-C6:** UART up to 5 Mbaud with RTS/CTS, behind an external USB-UART
-  bridge or directly to an embedded host.
-- **ESP32-H2:** the maximum baud rate must be measured, because there is no
-  80 MHz UART clock. 2 Mbaud from the 48 MHz PLL clock is the working
-  assumption.
-- **Board crate:** describes the UART pins and flow-control lines.
-- **Product:** selects USJ or UART at build time.
+The UART transport ships in v1 next to USJ:
+
+- **ESP32-C6:** UART with RTS/CTS up to 3 Mbaud (5 Mbaud hardware limit),
+  behind an external USB-UART bridge or directly to an embedded host.
+- **ESP32-H2:** about 3 Mbaud ceiling from the 48 MHz clock; the measured
+  maximum is gate H2.
+- **Defaults:** **921 600 baud** with RTS/CTS behind a USB-UART bridge (for
+  example CP2102N or CH343). The ESP32-H2 devkit's on-board bridge serves
+  programming; its DTR/RTS drive EN/BOOT through the auto-program circuit,
+  not UART flow control. A flow-controlled UART link therefore uses
+  dedicated pins described by the board crate.
+- **RX path:** UHCI GDMA, or an IRAM interrupt, into a ring of at least
+  `rx_window × 656` bytes. This is required without RTS/CTS (4.1) and
+  recommended with it.
+- **Product:** selects USJ or UART at build time (`transport-usj`,
+  `transport-uart`). Only one ZRHP transport is active per image.
+- **Board crate:** describes the UART pins and whether RTS/CTS are wired.
+  This drives `SYS_GET_INFO.uart_flow` and capability 22.
+
+### 11.5 Espressif Thread Border Router / Zigbee Gateway board
+
+Sources: [ESP-TBR-HW] and the board schematic v1.3 [ESP-TBR-SCH].
+
+**The board.**
+
+| Part | Details |
+|---|---|
+| Host | ESP32-S3-WROOM-1 (8 MB flash, 2 MB PSRAM) |
+| NCP | ESP32-H2-MINI-1 (2 MB `-H2S` or 4 MB `-H4S` flash; which one is fitted must be read from the board, `SYS_GET_INFO.flash_size`) |
+| USB | Two USB-C ports, each wired to its SoC's USB-Serial-JTAG |
+| Ethernet | Optional W5500 daughter board on S3 SPI2 (hub-level, irrelevant to ZRHP) |
+
+**Host ↔ NCP wiring** (S3 side ↔ H2 side):
+
+| Signal | ESP32-S3 | ESP32-H2 | Use in ZRHP |
+|---|---|---|---|
+| UART TX → RX | GPIO18 | GPIO23 (U0RXD) | ZRHP byte stream, host → NCP |
+| UART RX ← TX | GPIO17 | GPIO24 (U0TXD) | ZRHP byte stream, NCP → host. Also carries the H2 ROM boot log at 115 200 after every reset; the framing resynchronizes. |
+| RCP RESET | GPIO7 | EN | Host-controlled NCP reset |
+| RCP BOOT | GPIO8 | GPIO9 (strapping) | Host-controlled ROM download mode |
+| PTA request | GPIO12 | GPIO0 | Coexistence (optional) |
+| PTA priority | GPIO10 | GPIO2 | Coexistence (optional) |
+| PTA grant | GPIO13 | GPIO1 | Coexistence (optional) |
+| PTA tx_line | GPIO11 | GPIO3 | Coexistence; the S3 needs the 4th wire |
+| Reserved (R18, 0 Ω) | GPIO6 | GPIO12 | Unused by ZRHP v1 |
+| Reserved (R19, 0 Ω) | GPIO5 | GPIO4 | **Optional H2 RTS → S3 CTS** |
+| Reserved (R20, 0 Ω) | GPIO4 | GPIO5 | **Optional S3 RTS → H2 CTS** |
+
+**Flow control on this board.**
+
+- **No dedicated RTS/CTS lines.** The documentation lists none, and the
+  board's default RCP link runs TX/RX only at 460 800.
+- **ZRHP default:** 460 800 baud, no hardware flow control. Credits bound
+  each direction to `window × 656` bytes.
+- **Required on both sides:** a DMA or IRAM RX path (4.1).
+  - NCP: zigbee-rs UART driver with UHCI RX (new HAL work).
+  - S3 hub: ESP-IDF UART driver with `CONFIG_UART_ISR_IN_IRAM` or UHCI,
+    with the ring buffer in internal RAM.
+- **921 600 without flow control** is allowed after gate H8 shows no
+  overflow while both chips write flash.
+- **Hardware flow control (optional).** The schematic's three populated
+  "Reserved" 0 Ω links can carry RTS/CTS, routed through both chips' GPIO
+  matrices:
+  - H2 `U0RTS` → GPIO4 → S3 GPIO5 as `U1CTS`;
+  - S3 `U1RTS` → GPIO4 → H2 GPIO5 as `U0CTS`.
+
+  This is enabled only when **both** images are built for it (board
+  feature `rtscts-reserved-lines`), and up to 2 Mbaud then applies (4.4).
+  Points to verify on the physical board (gate H8): R18–R20 are fitted on
+  the delivered revision; H2 GPIO4/5 are the pad-JTAG MTMS/MTDI pins, and
+  using them as GPIO disables pad JTAG while USB-JTAG still works.
+- **Mismatch handling.** A misconfigured pair (only one side using CTS) can
+  stall. The hub checks `SYS_GET_INFO.uart_flow` at session start and
+  disables its CTS if the NCP reports none.
+
+**NCP firmware update by the S3 host.**
+
+1. **Normal path: ZRHP `FW_*` over BULK.**
+   - The signed image is staged in the passive slot, while the network keeps
+     running until `FW_ACTIVATE`.
+   - Trial boot, then `FW_CONFIRM` from the hub after a successful
+     `NWK_INIT`, with bootloader rollback otherwise.
+   - The hub keeps two NCP images in its own flash: current and previous,
+     about 0.7–0.9 MB each in a dedicated S3 partition. This mirrors
+     Espressif's RCP update rules [ESP-TBR-RCP].
+2. **Recovery and provisioning path: H2 ROM serial bootloader.** Used when
+   no ZRHP session is possible: blank or corrupt NCP, major-version
+   mismatch, or a failed trial with no usable fallback.
+   1. Drive BOOT (S3 GPIO8) low.
+   2. Pulse RESET (S3 GPIO7) low for at least 10 ms and release it.
+   3. Wait 50 ms, then release BOOT.
+   4. Speak the ESP ROM serial protocol on the same UART: SLIP frames,
+      `SYNC` at 115 200, `CHANGE_BAUDRATE` to 460 800, `FLASH_BEGIN/DATA/END`
+      with MD5 verification. This is what `esp-serial-flasher` does.
+   5. Release BOOT high and pulse RESET for a normal boot.
+
+   Rules for the ROM path:
+   - **Write only:** the bootloader, the partition table (first provisioning
+     only), an application slot and `otadata`.
+   - **Never write** the `zbnv` range (9.4 layout), so network state, keys
+     and counters survive.
+   - **Secure boot.** With secure boot enabled, the ROM path writes only
+     images signed for that key.
+   - **Downgrades.** An image below the NV format version fails closed (8.4).
+   - After a ROM-path boot the hub runs the normal resume. `EVT_NCP_READY`
+     carries `reset_reason = 8`.
+3. **ROM boot log.** The ROM prints a boot log on U0TXD at 115 200 after
+   every reset. The hub ignores it; it is not valid COBS/CRC framing.
+   Production images may suppress it with the `UART_PRINT_CONTROL` eFuse
+   (product decision).
+
+**PTA coexistence (Wi-Fi ↔ 802.15.4).**
+
+- **Hardware.** The S3 Wi-Fi and the H2 radio share 2.4 GHz. The board wires
+  4-wire PTA. The S3 is the coexistence leader: its Wi-Fi arbitrates,
+  configured on the S3 with ESP-IDF's external-coexistence GPIO API. The H2
+  is the follower. Espressif disables it by default
+  (`EXTERNAL_COEX_ENABLE`).
+- **NCP follower behaviour (new MAC work, N).** The zigbee-rs ESP MAC has no
+  external-coexistence support today. In v1 it implements:
+  - assert *request*, and *priority* when the frame class is in
+    `coex_tx_priority_mask`, before every CSMA-CA attempt;
+  - transmit only on *grant*, otherwise back off as a busy channel and count
+    `coex_denied`;
+  - drive *tx_line* for the duration of each TX.
+- **Frames that cannot wait for grant.**
+  - MAC ACKs are sent by the radio's automatic ACK path; priority is
+    asserted around expected ACK windows.
+  - The GP TempMaster reply, a timed TX at +20 ms armed in the radio,
+    requests early with high priority. If grant is denied at the
+    transmission instant, the reply is reported `Missed` and counted. The
+    GPD retries commissioning.
+- **Enabling it.** `coex_enable` (config `0x0009`) is persisted. Capability
+  21 is set only when the board crate declares the PTA wiring. Recommended:
+  enable when the hub uses Wi-Fi; leave it off with W5500 Ethernet and Wi-Fi
+  disabled.
+- **Validation.** Gate H9 (14.6) measures PER and latency with Wi-Fi load,
+  with coexistence on and off.
 
 ---
 
 ## 12. Host integration
 
-### 12.1 zigpy radio library (working name `zigpy-zrs`)
+### 12.1 zigpy radio library (`zigpy-zrhp`, radio type `zrhp`)
 
 | zigpy `ControllerApplication` | ZRHP |
 |---|---|
 | `connect()` | Open the port (stable identity, 11.3), link handshake, `SYS_NEGOTIATE`, wait for `EVT_NCP_READY`. Must be side-effect free on failure (used by `probe()`). |
 | `disconnect()` | Close the port. No NCP reset. |
-| `start_network()` | `NWK_INIT{floors from the checkpoint log}`, `TBL_SYNC`, register endpoints (`NWK_ADD_ENDPOINT` for each `add_endpoint`), `NWK_GROUP_MEMBERSHIP` resync, `SEC_SET_TC_POLICY`, create the coordinator device. Set `_concurrent_requests_semaphore.max_concurrency = max_aps_inflight`. |
+| `start_network()` | `NWK_INIT{floors from the checkpoint log}`, `TBL_SYNC`, register endpoints (`NWK_ADD_ENDPOINT` for each `add_endpoint`), `NWK_GROUP_MEMBERSHIP` resync, `SEC_SET_TC_POLICY`, `GP_SINK_CONFIG{NCP sink, pre-commissioned groupcast 0x0B84}` and the GP shadow reconciliation (7.11 step 7), create the coordinator device. Set `_concurrent_requests_semaphore.max_concurrency = max_aps_inflight`. |
 | `load_network_info(load_devices)` | `NWK_GET_INFO` + `SEC_GET_NETWORK_KEY`. With `load_devices`: `BKP_EXPORT_*` merged with the host store, filling `network_info.children`, `nwk_addresses`, `key_table` (with `tx_counter = aps limit`, `rx_counter = floor`, `seq`), `tc_link_key`, `stack_specific.zigbee_rs` and `ezsp.hashed_tclk`, `metadata.zigbee_rs`. `NOT_FORMED` ⇒ `NetworkNotFormed`. |
 | `write_network_info(network_info, node_info)` | `BKP_RESTORE_*` (9.4) with `nwk_margin = 0`, `aps_margin = 10000`, `allow_ieee_change = IEEE_REWRITABLE`. `form_quickly` / new networks produce the same records with zero counters. |
 | `reset_network_info()` | `NWK_LEAVE_RESET`. |
-| `send_packet(packet)` | `APS_DATA_REQUEST`; `BUSY` ⇒ retry with backoff inside the concurrency limit. Wait for `EVT_APS_DATA_CONFIRM` (timeout 3 s mains / 8 s with `extended_timeout`, same as bellows). Non-success ⇒ `DeliveryError`. `packet.source_route` ⇒ relays (zigpy already reverses `device.relays`). |
+| `send_packet(packet)` | `APS_DATA_REQUEST`; `BUSY` ⇒ retry with backoff inside the concurrency limit. Wait for `EVT_APS_DATA_CONFIRM` (timeout 3 s mains / 8 s with `extended_timeout`, same as bellows). Non-success ⇒ `DeliveryError`. `packet.source_route` ⇒ relays (zigpy already reverses `device.relays`). ZDO requests to the coordinator itself are answered locally from `DIAG_*`/`NWK_GET_INFO` (7.4). GP sink transmissions are swallowed in NCP-sink mode (7.11 step 4). |
 | `permit_ncp(time_s)` | `NWK_PERMIT_JOIN{target 0x0000}` |
-| `permit(time_s, node)` | `NWK_PERMIT_JOIN{target 0xFFFC or the router}` |
+| `permit(time_s, node)` | `NWK_PERMIT_JOIN{target 0xFFFC or the router}` + `GP_SINK_COMMISSIONING{enter, involve proxies, time_s}` |
 | `permit_with_link_key(node, key, time_s)` | `SEC_ADD_LINK_KEY{temporary}` + permit; or `SEC_ADD_INSTALL_CODE` when the host has a code |
-| `force_remove(dev)` | `NWK_REMOVE_DEVICE` + `TBL_INVALIDATE` |
+| `force_remove(dev)` | `NWK_REMOVE_DEVICE` + `TBL_INVALIDATE`; for a GP device `GP_SINK_REMOVE{send RemoveGPD}` |
 | `add_endpoint(desc)` | `NWK_ADD_ENDPOINT` |
 | `energy_scan(channels, duration_exp, count)` | `NWK_ENERGY_SCAN` → `EVT_ENERGY_SCAN_RESULT` |
 | `_move_network_to_channel(ch, update_id)` | `NWK_CHANGE_CHANNEL` |
@@ -1912,25 +2502,49 @@ Callbacks into zigpy:
 | `EVT_DEVICE_JOINED` (admitted) | `handle_join(nwk, ieee, parent_nwk)` |
 | `EVT_DEVICE_LEFT` | `handle_leave(nwk, ieee)` |
 | `EVT_ROUTE_RECORD` | `handle_relays(nwk, relays)` (same order as zigpy's `relays`) |
-| `PEER_RESTARTED`, `LINK_DOWN` beyond the recovery budget | `connection_lost(exc)`. zigpy's normal reconnect then re-runs `initialize()`, as bellows and zigpy-zboss do on NCP reset. |
+| `EVT_GP_FRAME` | `gp_packet_received(ZigbeeGpPacket{...})` (7.11 step 3) |
+| NCP restart or link loss | **Seamless resume** (below). `connection_lost(exc)` only if reconciliation fails. |
 
-**Host-backed persistence in zigpy.** zigpy's database has no
-radio-specific table API. The library keeps a small sidecar SQLite file next
-to `zigbee.db` with:
+**Seamless resume** (decision 5). The library hides an NCP reboot or a
+transient link loss from zigpy whenever the NCP state can be reconciled:
 
-- the link-key store with floors and revs;
-- the FC checkpoint log;
-- `(ncp_ieee, table_epoch, host_db_epoch)`.
+| Step | Action | Failure ⇒ |
+|---|---|---|
+| 1. Detect | One of: `PEER_RESTARTED` (new NCP link cookie); `LINK_DOWN`; the serial port disappearing (USJ re-enumeration). | — |
+| 2. Hold | New `send_packet` calls wait, bounded by zigpy's concurrency limit, within the **resume budget** (default 20 s; 60 s while an NCP firmware update is activating). In-flight requests: after `PEER_RESYNC` they are re-sent with `RETRY` (6.5); after a restart they fail with `DeliveryError("NCP restarted, delivery unknown")`. | — |
+| 3. Reconnect | Reopen the port by stable identity (11.3). Handshake, then `SYS_NEGOTIATE`. A newer firmware is fine; a different major version is not. | `connection_lost` |
+| 4. Reconcile | `EVT_NCP_READY` and `NWK_GET_INFO` must match zigpy's `state.node_info` / `state.network_info`: IEEE, PAN ID, EPID, channel, security level, `nwk_update_id` ≥ known, key sequence ≥ known. `network_state` must be formed (1/2) and `table_epoch` must equal the sidecar's. A higher key sequence or update ID (rotation or channel change that completed during the outage) is accepted and copied into zigpy's state. | `connection_lost` (zigpy re-initializes and may restore from backup) |
+| 5. Replay | `NWK_INIT` with checkpoint floors (if not up). Then: `SEC_SET_TC_POLICY`, `NWK_ADD_ENDPOINT` ×n, `NWK_GROUP_MEMBERSHIP`, `NWK_SET_TX_POWER`, `NWK_CONCENTRATOR`, `NWK_SET_MANUFACTURER_CODE`, `GP_SINK_CONFIG`, the open permit-join and GP-commissioning remainders, `SEC_LOCK_KEY_EXPORT` if the user configured the lock, `TBL_SYNC`, and the GP shadow check. | `connection_lost` |
+| 6. Release | Resume queued calls. Log the event and increment `state.counters["zrhp"]["ncp_resumed"]`. If the port did not come back within the budget, try the USJ hard reset (11.3) once before giving up. | `connection_lost` |
 
-zigpy backups still carry everything needed for disaster recovery. Where
-this file lives is an open question (Q4).
+**Sidecar store** (decision 4).
+
+- **Location:** SQLite file `zigbee_zrhp.db` in the same directory as
+  zigpy's `database_path` (`zigbee.db`). It is opened with WAL and
+  `synchronous=FULL`. HA backups of the configuration directory include it.
+- **Tables:**
+
+  | Table | Contents |
+  |---|---|
+  | `link_keys` | `ieee` PK, key, type, attrs, origin, key_seq, rx_floor, rev, updated |
+  | `fc_checkpoints` | domain, key_seq, limit, generation, time |
+  | `meta` | ncp_ieee, table_epoch, host_db_epoch, host_max_rev, last_ncp_cookie |
+  | `gp_shadow` | R_GP_SINK records last seen |
+
+- **Rollback detection.** Restoring an older HA backup rolls the sidecar
+  back. `TBL_SYNC` detects this through `host_max_rev` (8.5).
+- **Paging.** The library always sets `HOST_TABLES`. Standalone versus
+  paging is decided by the NCP (8.1), so small networks never page.
+- **Key export.** The library does not lock it by default, because HA's
+  periodic backups need keys (7.5). A configuration option enables
+  `SEC_LOCK_KEY_EXPORT` after each successful backup.
 
 ### 12.2 Go hub adapter (`adapter/zrhp`, adapter #8)
 
 The ZRHP adapter has the same layers as the existing adapters:
 
 ```text
-transport (serial) → link (port of zigbee-hostlink) → message layer → adapter
+transport (serial) → link (port of zigbee-zrhp) → message layer → adapter
 ```
 
 Differences from the existing adapters:
@@ -1967,7 +2581,7 @@ Optional interfaces:
 | `NeighborTableProvider`, `RouteTableProvider` | `DIAG_GET_NEIGHBORS`, `DIAG_GET_ROUTES` |
 | `TxPowerProvider` | `NWK_SET_TX_POWER` |
 | `LinkHealthReporter`, `TransportCounterReporter` | Link counters (5.12) |
-| `GreenPowerAdapter` | `GP_*` |
+| `GreenPowerAdapter` | v1 uses `HOST_SINK` mode (7.11): `GPCommissioningMode` sends the hub's own GP Proxy Commissioning Mode broadcast, which the NCP's local proxy also receives. `GPSetSharedKey` → `GP_SET_SHARED_KEY`. `NCP_SINK` mode needs hub work (Q-N2). |
 | `RuntimeCapabilityReporter` | `RuntimeCapabilityStatus{Negotiated, ProtocolMajor/Minor, BuildID, CapabilityBits = ncp_caps, MaxPayload = max_asdu}`, which matches `SYS_NEGOTIATE` one-to-one |
 | `InterviewableAdapter` | Not needed: ZDP passes through raw, so the generic interviewer works |
 
@@ -1994,6 +2608,143 @@ Auto-detect: add `zrhp` to the probe order. The probe sends `00` +
 `RESET_REQ` and expects a valid `RESET_ACK` within 500 ms. Other NCPs ignore
 the bytes, because they contain no valid frame of their protocol.
 
+**Required hub-side changes** (to be made in `~/go_zboss-ncp`, not here):
+
+1. **Restore margin (decision 13).** `FrameCounterRestoreMargin` changes
+   from 2 500 to **10 000**, and the adapter passes `nwk_margin = aps_margin
+   = 10 000` (2²⁰ for APS when the backup has no TCLK counter).
+2. **Resume.** The adapter implements the same seamless resume as zigpy
+   (12.1). It raises `IndicationNCPReset` (→ `restartNetwork`) only when
+   reconciliation fails.
+3. **Richer indications.** Carrying RSSI, group, security flags and source
+   IEEE requires extending `zigbee.Indication`.
+
+### 12.3 zigbee-herdsman / Zigbee2MQTT adapter (decision 14)
+
+**Placement.** A new in-tree herdsman adapter `src/adapter/zrhp/`
+(TypeScript), proposed upstream:
+
+- adapter type `zrhp` in `TsType.Adapter`;
+- USB discovery by the USJ VID/PID and product string once they are
+  verified (11.3);
+- a TypeScript port of `zigbee-zrhp`'s link and message layers, checked
+  against the shared vectors;
+- serial options: `path`, `baudRate` (UART: default 921 600), `rtscts`.
+
+There is no network path (decision of 2026-11-18).
+
+| herdsman `Adapter` | ZRHP |
+|---|---|
+| `start(): StartResult` | Handshake, `SYS_NEGOTIATE`, `NWK_INIT`, `NWK_GET_INFO`. See the start-result rules below. |
+| `stop()` | Close the port (no NCP reset) |
+| `getCoordinatorIEEE()` | `NWK_GET_INFO.ieee` (big-endian `0x…` string) |
+| `getCoordinatorVersion()` | `{type: "zigbee-rs ZRHP", meta: {fw, build, chip, major, minor}}` from `SYS_NEGOTIATE` |
+| `reset("soft")` / `reset("hard")` | `SYS_RESET{mode 0}` / USJ DTR/RTS hard reset (11.3); on UART-only links, `SYS_RESET` |
+| `supportsBackup()` | `BACKUP_RESTORE && KEY_EXPORT && !locked` |
+| `backup(ieeeAddressesInDatabase)` | `BKP_EXPORT_*` merged with the sidecar store, filtered to the IEEE list herdsman passes, converted to herdsman's internal `Models.Backup` |
+| `getNetworkParameters()` | `NWK_GET_INFO` → `{panID, extendedPanID, channel, nwkUpdateID}` |
+| `addInstallCode(ieee, key, hashed)` | `hashed=false` → `SEC_ADD_INSTALL_CODE`; `hashed=true` → `SEC_ADD_LINK_KEY` |
+| `waitFor(...)` | Host-side matcher on `zclPayload` events |
+| `sendZdo(ieee, nwk, clusterId, payload, disableResponse)` | `APS_DATA_REQUEST` (profile 0, EP 0, payload with the TSN; `hasZdoMessageOverhead = true`), then wait for the `0x8000 \| cluster` indication with the same TSN. Requests to the coordinator itself are answered locally (7.4). |
+| `permitJoin(seconds, networkAddress?)` | `NWK_PERMIT_JOIN{target networkAddress ?? 0xFFFC}` |
+| `sendZclFrameToEndpoint(...)` | `APS_DATA_REQUEST` (NWK mode, APS ACK unless `disableResponse`), then `EVT_APS_DATA_CONFIRM`, then optionally `waitFor` the response. `disableRecovery = false` → one retry with `FORCE_ROUTE_DISCOVERY`. |
+| `sendZclFrameToGroup(groupID, …)` | `APS_DATA_REQUEST{dst_mode 0x01}` |
+| `sendZclFrameToAll(endpoint, …, destination)` | `APS_DATA_REQUEST{dst_mode 0x0F, dst 0xFFFF/0xFFFD/0xFFFC}` |
+| `setChannelInterPAN`, `sendZclFrameInterPAN*`, `restoreChannelInterPAN` | Throw "not supported": no inter-PAN or Touchlink in v1 |
+
+Events:
+
+| ZRHP | herdsman event |
+|---|---|
+| `EVT_DEVICE_JOINED{admitted}` | `deviceJoined{networkAddress, ieeeAddr}` |
+| `EVT_DEVICE_LEFT` | `deviceLeave{networkAddress, ieeeAddr}` |
+| `EVT_APS_DATA_INDICATION` (profile ≠ 0) | `zclPayload{clusterID, address: src_nwk, header, data, endpoint: src_ep, linkquality: lqi, groupID, wasBroadcast, destinationEndpoint}` |
+| `EVT_APS_DATA_INDICATION` (ZDO responses) | `zdoResponse(clusterId, parsed response)` |
+| Link failure beyond the resume budget | `disconnected` |
+
+The adapter performs seamless resume internally, as in 12.1.
+
+**`start()` result rules.** herdsman passes `networkOptions` (`panID`,
+`extendedPanID`, `channelList`, `networkKey`) and `backupPath`
+(`coordinator_backup.json`).
+
+| Situation | Action | Result |
+|---|---|---|
+| NCP formed and its parameters match `networkOptions` | — | `"resumed"` |
+| NCP not formed, or parameters mismatch, and the backup file matches `networkOptions` | `BKP_RESTORE_*` from the backup (margins 10 000, or 2²⁰ for an unknown TCLK counter), then `NWK_INIT` | `"restored"` |
+| Otherwise | `NWK_FORM` with `networkOptions` | `"reset"` |
+| Mismatch while `forceStartWithInconsistentAdapterConfiguration` is unset | herdsman's usual refusal | — |
+
+**Concurrency.** `AdapterOptions.concurrent` is capped at
+`max_aps_inflight`.
+
+**Host store.** herdsman has no SQLite. The adapter keeps a sidecar
+append-only file `zrhp_store.jsonl` next to `database.db`. Each line is a
+writeback or checkpoint record with fsync before ack. It is compacted on
+start.
+
+**Z2M OCB quirks.** herdsman's `toUnifiedBackup` writes:
+
+- `pan_id` and `nwk_address` without zero padding;
+- `metadata.internal.date`, `znpVersion` / `ezspVersion`;
+- no TCLK, TC counter or TC address;
+- `stack_specific` only for `zstack` / `ezsp`.
+
+The adapter's import applies 9.1 and 9.4 (padding, `aps_margin = 2²⁰`).
+
+**Required upstream change.** To keep `stack_specific.zigbee_rs` (FC limits,
+GP tables) in `coordinator_backup.json`, herdsman's
+`toUnifiedBackup`/`fromUnifiedBackup` and `Models.Backup` need a pass-through
+for unknown `stack_specific` sections. Without it, a Z2M backup restores the
+network with margins, but GP sink entries are lost and the GPDs must
+re-commission.
+
+**GP.** herdsman's controller implements its own GP sink (proxy
+commissioning, pairing). v1 runs the NCP in `HOST_SINK` mode for herdsman.
+`NCP_SINK` mode with a herdsman shadow is Q-N2.
+
+**Tests.**
+
+- herdsman-style unit tests: the adapter against the Rust reference NCP
+  simulator over a PTY;
+- shared vectors;
+- `ocb_z2m_import.json`;
+- a Z2M round trip: Z2M backup → zigbee-rs → Z2M `coordinator_backup.json`
+  → zigpy import (14.3);
+- hardware gate H11 (14.6).
+
+### 12.4 Embedded hub (`faronov/zigbee-rs-hub`, ESP32-S3)
+
+**Placement and stack.**
+
+- The hub is a **standalone host**. It runs on the S3 of the Thread BR board
+  and speaks ZRHP over the board UART (11.5).
+- It uses `zigbee-zrhp` with `std` on esp-idf-svc (FreeRTOS threads,
+  `esp_timer`, UART driver with IRAM ISR or UHCI).
+- It holds the ZCL/device logic and the host store. Store: raw-flash
+  journal partition (3.4).
+- Its user-facing interface is the hub's own WebSocket JSON API, a
+  hub-level interface outside ZRHP.
+
+**Partitions** (S3, 8 MB; proposal for the hub repo):
+
+| Partition | Size |
+|---|---|
+| Hub app ×2 (OTA) | 2.5 MiB each |
+| NCP images ×2 | 1 MiB each |
+| ZRHP host store journal | 128 KiB |
+| Hub configuration | 64 KiB |
+
+**Behaviour.**
+
+| Area | Behaviour |
+|---|---|
+| Profile | Embedded (3.3): RX window 8, LOG credit 0 by default |
+| Paging | `HOST_TABLES` set; standalone until the NCP cache fills (8.1) |
+| GP | `NCP_SINK` with the hub as GP shadow (`host_caps` bit3) |
+| Resume | Seamless (12.1 steps). The hub owns EN/BOOT, so after the resume budget it can reset the NCP itself, and reflash it through the ROM path. |
+| Backup | Binary records (9.3) in the hub store. OCB JSON is optional: streamed on request through the hub API, or converted by a desktop tool. |
+
 ---
 
 ## 13. Security of the host link
@@ -2001,7 +2752,11 @@ the bytes, because they contain no valid frame of their protocol.
 **Threat model (v1).**
 
 - The serial link and the host are **trusted**, as with EZSP, ZNP, ZBOSS
-  and deCONZ.
+  and deCONZ. ZRHP has no network transport, so its attack surface is
+  physical (USB/UART access).
+- **Embedded hub.** On the Thread BR board, the S3 hub's network exposure
+  (Wi-Fi/Ethernet, its WebSocket JSON API) is a hub-level concern. A
+  compromised hub has the full power of a ZRHP host.
 - An attacker with access to the USB/UART link or the host already
   controls the network. They can read keys through backup, send any frame
   and reflash the NCP.
@@ -2013,19 +2768,24 @@ the bytes, because they contain no valid frame of their protocol.
 
 Controls:
 
-- **Key export.** Network and link keys are readable only with capability
-  bit 4. A product may build it out entirely; HA backups then become
-  incomplete (9.5). `key_export_lock` (`SYS_SET_CONFIG 0x0007`) locks
-  export until the next reboot, so a host can drop the privilege after its
-  startup backup.
+- **Key export** (decision 3).
+  - Network and link keys are readable only with capability bit 4. It is
+    **on by default** in the ESP32 NCP product, so HA backups are complete.
+  - `SEC_LOCK_KEY_EXPORT` locks it until the next reboot (7.5). A host can
+    drop the privilege after its backup and re-apply the lock on every
+    resume.
+  - A product may still build the capability out; backups then become
+    incomplete (9.5).
 - **NCP firmware updates** must pass the product's signature policy (MCUboot
   TLV verification, reused from the ESP32 product's signed OTA). Downgrades
   are refused unless the build is a development build.
 - **Factory reset** (`SYS_RESET` mode 2) needs the confirm word. Restore
   needs an explicit `BEGIN`/`COMMIT` and keeps the old state until the
   commit.
-- **DTR/RTS reset** on USJ is a physical-access-equivalent capability.
-  Products may disable it (11.3).
+- **Reset lines.** The USJ DTR/RTS reset (kept enabled, decision 6) and
+  the BR board's EN/BOOT lines are physical-access-equivalent capabilities.
+  The ROM path writes only signed images when secure boot is on, and never
+  touches `zbnv` (11.5).
 - **Never logged:** keys, install codes and frame counters above debug
   level. `EVT_LOG_RECORD` must not contain key material at any level.
 
@@ -2051,12 +2811,14 @@ Controls:
 
 | File | Contents | Must pass |
 |---|---|---|
-| `crc32c.json` | Check value + edge inputs | Rust, Go, Python |
+| `crc32c.json` | Check value + edge inputs | Rust, Go, Python, TypeScript |
 | `cobs.json` | Empty, zeros, 254/255 runs, max frame | Encode **and** decode |
 | `link_frames.json` | RESET_REQ/ACK, DATA (single, batched, RETX\|POLL), ACK, NAK (gap, CRC), credits, keepalive, REJECT, max payload; epoch derivation | Build byte-exact and parse back to fields |
-| `messages.json` | NEGOTIATE, NCP_READY, APS request (plain, source-routed), accept/BUSY, confirm, indication, permit join, joined, route record, install code (+ derived key), FC checkpoint, TBL lookup/writeback | Build and parse |
+| `messages.json` | NEGOTIATE, NCP_READY, APS request (plain, source-routed), accept/BUSY, confirm, indication, permit join, joined, route record, install code (+ derived key), FC checkpoint, TBL lookup/writeback, `SEC_LOCK_KEY_EXPORT`, `SYS_SET_UART`, UTF-8 `EVT_LOG_RECORD`, `GP_SINK_CONFIG` (zigpy profile), `GP_SINK_COMMISSIONING`, `EVT_GP_COMMISSIONED` with `R_GP_SINK`, `EVT_GP_FRAME` | Build and parse |
 | `arq_scenarios.json` | Timed receiver and sender traces (5.9) | State machine with a virtual clock emits exactly the expected frames |
-| `ocb_roundtrip.json` | OCB → records → NCP model → export → OCB, restore message bytes | Host converters (Go, Python) byte- and JSON-equal |
+| `ocb_roundtrip.json` | OCB → records → NCP model (global APS counter) → export → OCB, restore message bytes | Host converters (Go, Python, TypeScript, Rust hub) byte- and JSON-equal |
+| `ocb_z2m_import.json` | Z2M-style backup (unpadded hex, `date`, no TCLK counter) → records with `aps_margin = 2²⁰` | Same |
+| `ezsp_hashed_tclk.json` | **Candidate** EZSP hashed-TCLK keys for both EUI64 byte orders | NCP derivation; one candidate is promoted to normative by gate H5 |
 
 `generate.py --check` fails if a committed JSON file differs from the
 generator output. It is not wired into CI yet; the plan is to add it with the
@@ -2078,7 +2840,10 @@ files directly; they do not copy values.
    - peer restarted vs resync;
    - BULK loss not delaying ZIGBEE delivery (HOL test);
    - anti-starvation;
-   - keepalive credit repair.
+   - keepalive credit repair;
+   - a minimum host (`rx_window` 4, LOG credit 0, BULK credit 1) receiving
+     a storm of 1 000 indications with no loss beyond explicit counters;
+   - `SYS_SET_UART` switch and automatic revert after 3 s without frames.
 3. Property tests with seeded randomness, run in both directions:
    - for any interleaving of bit flips, byte drops, inserted `0x00`,
      duplicated chunks and stalls up to `link_timeout_ms`, every accepted
@@ -2107,7 +2872,26 @@ files directly; they do not copy values.
   `zigpy.backups.NetworkBackup.from_dict` with `is_compatible_with(original)`
   true.
 - A zigpy-level test runs `zigpy.application` tests against a simulated
-  NCP: the Rust host reference compiled as `std`, behind a PTY.
+  NCP: the Rust reference NCP model (`std`) behind a PTY. It covers:
+  - **Seamless resume** (12.1): an NCP restart with an unchanged NIB
+    resumes without `connection_lost`; a changed EPID or `table_epoch`
+    raises it; a raised key sequence is adopted.
+  - **GP shadow** (7.11): an NCP-commissioned GPD becomes a zigpy
+    `GreenPowerDevice` with one pairing on air. zigpy's Pairing, Proxy
+    Commissioning Mode, Response and alias `Device_annce` are swallowed.
+    `EVT_GP_FRAME` packets pass zigpy's counter checks. Import of
+    existing zigpy GP devices sends nothing on air.
+  - **Sidecar rollback:** restoring an older `zigbee_zrhp.db` triggers the
+    full writeback through `host_max_rev`.
+  - **Key-export lock:** with the lock set, a backup is reported
+    incomplete.
+  - **ZDO to the coordinator itself:** answered locally, never sent.
+- **zigbee-herdsman** (12.3): adapter unit tests against the same simulator;
+  the start-result rules (resumed / restored / reset); a Z2M
+  `coordinator_backup.json` round trip including `stack_specific.zigbee_rs`
+  pass-through once the upstream change exists.
+- **Embedded host:** the hub's ZRHP layer runs the vectors and the ARQ traces
+  on the host (`std`). The same code on the S3 is exercised by gate H12.
 
 ### 14.4 Noise-injection bench (todo `coord-proto-bench`)
 
@@ -2121,7 +2905,10 @@ UART loopback through a USB-UART bridge, and injects:
 - chunk duplication;
 - RTS stalls;
 - USB disconnect/reconnect;
-- host process kill and restart.
+- host process kill and restart;
+- **UART without flow control** with a simulated receiver stall (flash
+  erase of 15–400 ms on either side), to prove the DMA/IRAM RX requirement
+  of 4.1.
 
 It drives 1000 simulated devices of traffic (reports at 1/10 s and 1/60 s,
 plus join/announce storms) and reports:
@@ -2147,7 +2934,8 @@ and its EFR32MG21 model runs zigbee-rs images. The protocol and NCP app are
 platform-independent, so the simulation plan is:
 
 1. Build the NCP app for the nRF52840 mcuemu target with a UARTE transport.
-2. Attach its UART to the host reference through `tcp:` sinks.
+2. Attach its UART to the host reference through mcuemu `tcp:` sinks. This
+   is simulator plumbing, not a ZRHP transport.
 3. Put zigbee-rs and vendor end devices (TLSR8258, EFR32MG21) on the shared
    radio medium.
 4. Script these scenarios:
@@ -2169,9 +2957,14 @@ This is simulation-level evidence, not hardware evidence.
 | H2 | H2 UART maximum stable baud with RTS/CTS through a USB-UART bridge. |
 | H3 | Formation, then 30+ real devices joining, interviewing and reporting via zigpy (HA) and the Go hub, with sniffer captures. |
 | H4 | NCP reboot under load: no frame-counter reuse (sniffer: NWK counter strictly increasing across the reboot). Host reboot: network keeps running and queued indications are reported. |
-| H5 | Migration ZBT-1 → H2 → ZBT-1 with real devices, including the hashed-TCLK derivation check against a real ZBT-1 key. |
+| H5 | **ZBT-1 hashed-TCLK verification** (decision 8): read a device's derived TCLK from the user's ZBT-1 (EZSP key export of a device that completed a TCLK update) and compare it with both candidates in `ezsp_hashed_tclk.json` computed from that network's `hashed_tclk`. The match becomes the normative vector and enables capability bit 14. Then migrate ZBT-1 → H2 → ZBT-1 with real devices, checking APS-secured exchanges (Verify-Key, network-key rotation) with a hashed-key device after each move. |
 | H6 | NCP firmware update with trial boot, confirm, rollback and retained network state. |
-| H7 | 24 h soak with noise injection on the UART variant. |
+| H7 | 24 h soak with noise injection on the UART variant (921 600, RTS/CTS). |
+| H8 | **Thread BR board UART:** 460 800 and 921 600 without flow control, with both chips writing flash (`rx_overflow = 0`). RTS/CTS on the reserved lines (R19/R20 fitted? H2 GPIO4/5 usable?) up to 2 Mbaud. ROM-path recovery via S3 GPIO7/8 with `zbnv` preserved. |
+| H9 | **PTA coexistence:** Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on; GP TempMaster reply behaviour with grant denied. |
+| H10 | **GP combo on the NCP:** direct and proxy-tunnelled commissioning into the NCP sink with zigpy as shadow; a bidirectional GPD with the NCP as its own TempMaster; Sink Table across an NCP reboot (seamless resume) and across backup/restore. |
+| H11 | **Z2M end to end:** zigbee-herdsman adapter with 10+ real devices; Z2M backup → restore on a fresh NCP. |
+| H12 | **Embedded hub:** S3 hub with a synthetic 2 000-device store (PSRAM budget of 3.4), paging forced by a reduced NCP cache, power cuts during writebacks, store journal recovery. |
 
 ---
 
@@ -2179,14 +2972,18 @@ This is simulation-level evidence, not hardware evidence.
 
 | Step | Work | Depends on | Validation level reachable without hardware |
 |---|---|---|---|
-| 1 | `zigbee-hostlink`: COBS, CRC-32C, frame codec, sessions, ARQ, credits, scheduler (`no_std` + `std`) | this spec | Host-tested, vectors, fuzz, property tests |
-| 2 | `zigbee-hostproto`: message and record codecs | 1 | Host-tested, vectors |
-| 3 | Runtime work (N items from section 7). Coordinator/TC: event surface (`DEVICE_JOINED/LEFT/AUTHORIZED`, route record, address change); raw APS passthrough for host endpoints; dynamic host endpoints; RSSI/last hop in indications; APS queue with confirms; source routes injected per send; ZDO forwarding and TSN rules. Persistence: frame-counter checkpoint hook and floors; global APS counter (Q2); IEEE override persistence. Backup and tables: atomic restore transaction; snapshot export; host-backed TC-device and address-map caches with writeback/eviction; energy scan and channel change orchestration. Optional: EZSP hashed-TCLK derivation. | existing runtime | Host-tested with `MockMac` and `examples/mock-coordinator` |
-| 4 | `apps/ncp-coordinator` over `TrustCenterCoordinatorApp` | 1–3 | Host-tested against the Rust host reference over an in-memory pipe |
-| 5 | `products/esp32-zigbee-ncp`: layout, NV partitions (journal sizing), identity, USJ/UART transport, signed update, size report | 4 | Builds, layout/linker checks, size budget |
-| 6 | Python `zigpy-zrs` and Go `adapter/zrhp` | 1–2 vectors | Host-tested vs vectors and the simulated NCP |
-| 7 | Noise bench (14.4), mcuemu scenario (14.5) | 1, 4 | Simulation |
-| 8 | Hardware gates H1–H7 | 5, 6 | Lab, then production-path evidence |
+| 1 | `zigbee-zrhp`: COBS, CRC-32C, frame codec, sessions, ARQ, credits, scheduler, message/record codecs (`no_std`; `alloc`/`std` features); wire `generate.py --check` into CI | this spec | Host-tested, vectors, fuzz, property tests |
+| 2 | Runtime: **global APS outgoing counter** with reservation, journal format version and migration (8.4) | existing runtime | Host-tested, including migration and power-cut tests |
+| 3 | Runtime: coordinator event surface, raw APS passthrough for host endpoints, dynamic host endpoints, RSSI/last hop, APS queue with confirms, per-send source routes, ZDO forwarding/TSN rules, no-loopback guard | existing runtime | Host-tested with `MockMac` and `examples/mock-coordinator` |
+| 4 | Runtime/persistence: FC checkpoint hook and floors; IEEE override; atomic restore transaction; snapshot export; TC-device cache with writeback/eviction, `host_acked_rev`, streamed TC-journal snapshots (256 entries); child journal with 1 024-byte slots (64 children); key-export lock | 2 | Host-tested with journal fault injection |
+| 5 | Runtime: EZSP hashed-TCLK derivation (HMAC-MMO), cached with origin 4 | 4 | Host-tested against the candidate vectors; normative after H5 |
+| 6 | GP: NCP-sink mode surface (`EVT_GP_*`, `GP_*` commands, `R_GP_SINK` codec), sink table size as a product parameter (16), host-sink mode local-proxy hand-off | GP sink on master | Host-tested with zigpy golden vectors |
+| 7 | MAC/HAL: H2/C6 UART transport with UHCI RX DMA and optional RTS/CTS; USJ non-blocking pump; PTA follower in the ESP MAC | — | Host/unit tests, builds; hardware gates H1, H2, H8, H9 |
+| 8 | `apps/ncp-coordinator` over `TrustCenterCoordinatorApp` + GP combo | 1–6 | Host-tested against the Rust reference host over an in-memory pipe |
+| 9 | `products/esp32-zigbee-ncp`: 2 MB and 4 MB layouts (8.9), NV journals, identity, transport features (`transport-usj`, `transport-uart`), boards (H2 devkit, Thread BR H2 side), signed update, size report | 7, 8 | Builds, post-link layout checks, size budget |
+| 10 | Hosts: `zigpy-zrhp` (Python), Go `adapter/zrhp` (+ margin 10 000), zigbee-herdsman `zrhp` (TypeScript, plus the upstream backup pass-through), embedded `faronov/zigbee-rs-hub` (Rust, S3) | 1 vectors | Host-tested vs vectors and the simulated NCP |
+| 11 | Noise bench (14.4), mcuemu scenario (14.5) | 1, 8 | Simulation |
+| 12 | Hardware gates H1–H12 | 9, 10 | Lab, then production-path evidence |
 
 Nothing beyond step 1 should claim more than "host-tested" until gates H1–H4
 pass. The coordinator remains documented as host-tested in
@@ -2194,42 +2991,62 @@ pass. The coordinator remains documented as host-tested in
 
 ---
 
-## 16. Open questions
+## 16. Decisions (2026-11-18) and new open questions
 
-1. **Name and IDs.** Is "ZRHP" acceptable? Is the endpoint and ID
-   allocation in 6.7 final?
-2. **Global APS outgoing counter** (8.4). Accept replacing per-key
-   outgoing APS counters with one reserved global counter, as EmberZNet
-   does? Rejecting it means paging per-key counter reservations with the
-   keys.
-3. **Key export default.** Should `KEY_EXPORT` be enabled by default in the
-   ESP32 NCP product? HA backups need it. It could be locked after the
-   startup backup, or require a build feature.
-4. **Host-backed store in zigpy.** A sidecar SQLite file next to
-   `zigbee.db`, or stuffing the data into zigpy's backup JSON? Is
-   standalone mode (no paging) acceptable as the zigpy default for small
-   networks?
-5. **NCP reboot handling in zigpy.** Raise `connection_lost` (simple,
-   like bellows and zigpy-zboss), or resume seamlessly inside the library?
-6. **USJ DTR/RTS reset.** Keep host-triggered reset enabled (recovery
-   without touching the device), or disable it in production NCP images?
-7. **First transport.** USJ only, or also a UART variant on the C6 through
-   an external bridge, from the start? Which default baud rate?
-8. **EZSP hashed-TCLK support.** Implement it in v1 for ZBT-1 migrations?
-   Needs a bit-exact algorithm and a real-device check.
-9. **ESP32-H2 capacities.** `max_children`, link-key cache (256?),
-   address-map cache (512?), and journal sector sizes.
-10. **ZDO loopback** (capability 11). Drop it from v1, since the dedicated
-    energy-scan and channel-change commands cover zigpy?
-11. **GP placement.** NCP proxy only, with zigpy or the hub as sink (v1
-    proposal), or a combo sink on the NCP?
-12. **Log encoding.** UTF-8 text or defmt on the LOG endpoint?
-13. **Go hub margin.** Change `FrameCounterRestoreMargin` from 2 500 to
-    10 000 to match zigpy and this spec?
-14. **zigbee-herdsman.** Is a Z2M adapter in scope later? It affects how
-    strictly Z2M OCB quirks must be tested now.
+The user answered all 14 open questions of the 2026-11-15 draft and added
+two requirements. Each decision is applied in the sections listed.
 
----
+| # | Decision | Applied in |
+|---:|---|---|
+| 1 | Name **ZRHP**; the endpoint and message-ID allocation of 6.7 is **final**. | 3.2, 5.10, 6.7 |
+| 2 | **One reserved global outgoing APS counter**, as in EmberZNet. Includes the runtime change, migration from per-key counters and backup mapping. Host table paging carries no outgoing-counter state. | 3.1, 8.3, 8.4, 9.2, 9.3, 15 |
+| 3 | **`KEY_EXPORT` on by default** in the ESP32 NCP product, with `SEC_LOCK_KEY_EXPORT` locking it until the next reboot. | 7.1, 7.5, 12.1, 13 |
+| 4 | zigpy host store is a **sidecar SQLite** next to `zigbee.db`. **Standalone by default**; paging starts automatically above the NCP cache capacity. | 8.1, 8.8, 12.1 |
+| 5 | NCP reboot in zigpy: **seamless resume** inside the library, with `connection_lost` only when the state cannot be reconciled. | 5.11, 8.7, 12.1 |
+| 6 | USJ DTR/RTS reset **stays enabled**. | 11.3, 13 |
+| 7 | Transports: **USB-Serial-JTAG and UART with RTS/CTS** from the start, UART default **921 600**. | 4.1, 4.4, 11.4 |
+| 8 | **EZSP hashed TCLK in v1**, with a real ZBT-1 verification step. | 7.5, 9.6, 14.1, gate H5 |
+| 9 | H2 capacities: link-key cache **256**, address-map cache **512**. `max_children` = 64 and journal sizes calculated from the H2 RAM/flash budget. | 8.9 |
+| 10 | **ZDO loopback dropped** from v1 (capability 11 reserved). | 1, 6.6, 7.4 |
+| 11 | **GP combo sink on the NCP** in v1, with sink events, Sink Table exposure and zigpy shadow-sink rules (no double pairing). | 3.1, 7.11, 9.2, 9.3, 12 |
+| 12 | LOG endpoint carries **UTF-8 text**. | 7.10 |
+| 13 | Go hub `FrameCounterRestoreMargin` **2 500 → 10 000**. This is a required change in the Go repository; this document does not edit it. | 9.4, 12.2 |
+| 14 | **zigbee-herdsman / Z2M adapter in scope.** | 9.1, 9.6, 12.3, 14.3, gate H11 |
+| R1 | **Embedded host** from the start: Rust hub `faronov/zigbee-rs-hub` on the ESP32-S3 of the Espressif Thread BR / Zigbee GW board, using the shared crate `zigbee-zrhp`. Covers host profiles, minimum host buffers, BR-board UART, ROM-path NCP update and PTA. | 1 (G9), 3.2–3.4, 4.1, 4.4, 11.5, 12.4, gates H8, H9, H12 |
+| R2 | **No network transport in ZRHP** (USJ and UART only). The S3 hub's WebSocket JSON API is hub-level and out of scope. | Header, 1, 3.2, 4, 13 |
+
+**New open questions.**
+
+1. **Q-N1: NCP sink security level for zigpy.** The zigbee-rs sink defaults
+   to `gpsSecurityLevel` 0x01 (user decision 2026-11-15), so new level-0
+   (unsecured) GPDs are refused. zigpy accepts level 0, and the user's
+   FlowerX GP / BGT1 GP sensors are unsecured. Imported entries keep
+   working (7.11 step 7), but re-commissioning one would be refused. Keep
+   0x01 for zigpy, or have the library set 0x00?
+2. **Q-N2: Upstream hooks for GP.** Propose a zigpy "radio-owned GP sink"
+   hook upstream, which would remove the library's swallowing of zigpy's
+   GP transmissions? Also, should the Go hub and herdsman move to
+   `NCP_SINK` mode later? v1 keeps them in `HOST_SINK`.
+3. **Q-N3: Derived TCLKs for new networks.** Should a network formed by
+   zigbee-rs use a hashed-TCLK-style scheme (root key + EUI64) instead of
+   random unique TCLKs? It would remove almost all per-device key storage
+   and paging, at the cost that the root key compromises every derived key.
+   Install-code and application keys stay stored either way.
+4. **Q-N4: Thread BR board flow control and flash.**
+   - Use the schematic's reserved lines (R19/R20) for RTS/CTS? That needs
+     both images and a check on the physical board.
+   - Or stay at 460 800 without flow control (Espressif's default)?
+   - Which ESP32-H2-MINI-1 variant (2 MB or 4 MB) is on the user's board?
+5. **Q-N5: zigbee-herdsman delivery.** Upstream PRs (adapter +
+   `stack_specific` pass-through) or a maintained fork until accepted?
+6. **Q-N6: S3 flash budget for NCP images.** The hub keeps the current and
+   previous NCP image, about 2 MiB of the S3's 8 MB. Acceptable?
+7. **Q-N7: PTA default on the BR product.** Keep it off by default, as
+   Espressif does, and let the hub enable it whenever its Wi-Fi is up? Or
+   leave it to user configuration?
+8. **Q-N8: USB identity.** Keep Espressif's USJ VID/PID (H2/C6 values to be
+   verified), or plan our own descriptors for the later USB vendor-bulk
+   transport?
 
 ## 17. References
 
@@ -2276,6 +3093,23 @@ pass. The coordinator remains documented as host-tested in
 - [asukiaaa] Throughput measurement of the C3/S3 built-in USB,
   <https://asukiaaa.blogspot.com/2023/02/esp32-c3-s3-builtin-usb-can-send-700kbps.html>
   (single source, different chips).
+- [ESP-TBR-HW] Espressif, ESP Thread Border Router SDK, *Hardware
+  Platforms* (board features, host-to-RCP GPIO allocation, PTA, USB ports),
+  <https://docs.espressif.com/projects/esp-thread-br/en/latest/hardware_platforms.html>.
+- [ESP-TBR-SCH] Espressif, *ESP Thread Border Router/Zigbee Gateway Board
+  schematic* v1.3 ("Interface" sheet: R14–R20, PTA R21–R24),
+  <https://dl.espressif.com/dl/schematics/esp_thread_br_zigbee_gw_schematics_v1.3.pdf>.
+- [ESP-TBR-RCP] Espressif, *RCP Update Mechanism*,
+  <https://docs.espressif.com/projects/esp-thread-br/en/latest/dev-guide/rcp_update.html>.
+- [Silabs-HLK] Silicon Labs community, *Hashed Link Keys* (AES HMAC of the
+  EUI64 with the TC master key), <https://community.silabs.com/s/article/hashed-link-keys>.
+- [herdsman] zigbee-herdsman `src/adapter/adapter.ts`, `src/adapter/events.ts`,
+  `src/adapter/tstype.ts`, `src/utils/backup.ts`,
+  <https://github.com/Koenkk/zigbee-herdsman>.
+- [zigpy-zgp] zigpy `zigpy/zgp/manager.py` and `application.py`
+  (`gp_packet_received`), <https://github.com/zigpy/zigpy> (branch `dev`).
+- [ESP32-H2-MINI-1] Espressif module datasheet (2 MB / 4 MB in-package flash
+  variants).
 - [mcuemu] Local emulator `~/mcuemu`, `docs/esp32-riscv.md`,
   `docs/system-config.md`.
 - zigbee-rs: `zigbee-bdb/src/security_persistence.rs`
@@ -2283,5 +3117,8 @@ pass. The coordinator remains documented as host-tested in
   `zigbee-runtime/src/trust_center_runtime.rs`,
   `zigbee-aps/src/apsde.rs`, `zigbee-nwk/src/routing.rs`,
   `zigbee-mac/src/esp/radio_phy.rs`, `vendor/esp-hal/src/usb_serial_jtag.rs`,
+  `vendor/esp-hal/ld/esp32h2/memory.x`, `zigbee-runtime/src/child_store.rs`,
+  `zigbee-runtime/src/trust_center_store.rs`, `zigbee-runtime/src/gp_store.rs`,
+  `zigbee-gp/src/sink.rs`, [Green Power](green-power.md),
   [Coordinator & Router](coordinator-router.md), [Security](security.md).
 

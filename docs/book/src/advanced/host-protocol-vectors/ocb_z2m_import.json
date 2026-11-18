@@ -1,0 +1,90 @@
+{
+  "note": "Z2M-style backup: unpadded pan_id/nwk, internal.date, no TCLK counter. The host pads hex fields and, because the TCLK counter is unknown, uses aps_margin = 2^20.",
+  "input_ocb": {
+    "metadata": {
+      "format": "zigpy/open-coordinator-backup",
+      "version": 1,
+      "source": "zigbee-herdsman@0.0.0-synthetic",
+      "internal": {
+        "date": "2026-11-02T08:00:00.000Z",
+        "ezspVersion": 13
+      }
+    },
+    "stack_specific": {
+      "ezsp": {
+        "hashed_tclk": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+      }
+    },
+    "coordinator_ieee": "f4b3b1fffe1a2b3c",
+    "pan_id": "a62",
+    "extended_pan_id": "a1b2c3d4e5f60718",
+    "nwk_update_id": 0,
+    "security_level": 5,
+    "channel": 25,
+    "channel_mask": [
+      25
+    ],
+    "network_key": {
+      "key": "8b5d1f3c6a7e9d2b4f0a1c3e5d7f9b2a",
+      "sequence_number": 0,
+      "frame_counter": 77000
+    },
+    "devices": [
+      {
+        "nwk_address": "abc",
+        "ieee_address": "000d6f000e1f2a3b",
+        "is_child": true
+      },
+      {
+        "nwk_address": "1a2b",
+        "ieee_address": "0017880102a1b2c3",
+        "is_child": false,
+        "link_key": {
+          "key": "11223344556677881122334455667788",
+          "rx_counter": 7,
+          "tx_counter": 5
+        }
+      }
+    ]
+  },
+  "nwk_margin": 10000,
+  "aps_margin": 1048576,
+  "records": [
+    {
+      "type": "NODE",
+      "hex": "010c003c2b1afeffb1b3f400000001"
+    },
+    {
+      "type": "NETWORK",
+      "hex": "021400620a1807f6e5d4c3b2a11900000002000000057f"
+    },
+    {
+      "type": "NETWORK_KEY",
+      "hex": "0316008b5d1f3c6a7e9d2b4f0a1c3e5d7f9b2a00c82c010001"
+    },
+    {
+      "type": "TC_LINK_KEY",
+      "hex": "041d005a6967426565416c6c69616e636530393c2b1afeffb1b3f40000000001"
+    },
+    {
+      "type": "EZSP_HASHED_TCLK",
+      "hex": "0610000f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    },
+    {
+      "type": "DEVICE",
+      "hex": "050d003b2a1f0e006f0d00bc0a0d8008"
+    },
+    {
+      "type": "DEVICE",
+      "hex": "052600c3b2a102018817002b1a0a112233445566778811223344556677880002030500000007000000"
+    },
+    {
+      "type": "END",
+      "hex": "ff080007000000961178f3"
+    }
+  ],
+  "ncp_state": {
+    "nwk_fc_start": 87000,
+    "aps_fc_start": 1048581
+  }
+}

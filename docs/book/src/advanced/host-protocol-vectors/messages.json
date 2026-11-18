@@ -26,23 +26,28 @@
       "status": 0,
       "major": 1,
       "minor": 0,
-      "ncp_caps": "0x00000000000686fb",
+      "ncp_caps": "0x00000000001787fb",
       "capacities": {
         "1": 16,
-        "2": 32,
+        "2": 64,
         "3": 256,
         "4": 512,
         "5": 128,
         "6": 100,
         "7": 1024,
         "8": 8,
-        "13": 16
+        "13": 16,
+        "14": 8,
+        "15": 16,
+        "16": 8,
+        "17": 8,
+        "18": 256
       },
       "fw": "0.1.0",
       "chip": 1
     },
-    "payload_hex": "000100fb8606000000000009011000000002200000000300010000040002000005800000000664000000070004000008080000000d1000000005302e312e300123456789abcdef01",
-    "message_hex": "40010001004800000100fb8606000000000009011000000002200000000300010000040002000005800000000664000000070004000008080000000d1000000005302e312e300123456789abcdef01"
+    "payload_hex": "000100fb871700000000000e011000000002400000000300010000040002000005800000000664000000070004000008080000000d100000000e080000000f1000000010080000001108000000120001000005302e312e300123456789abcdef01",
+    "message_hex": "40010001006100000100fb871700000000000e011000000002400000000300010000040002000005800000000664000000070004000008080000000d100000000e080000000f1000000010080000001108000000120001000005302e312e300123456789abcdef01"
   },
   {
     "name": "evt_ncp_ready",
@@ -257,5 +262,109 @@
     "fields": {},
     "payload_hex": "0503390000000526000c0b0afeff142e84214f0aa0a1a2a3a4a5a6a7a8a9aaabacadaeaf000203c836000003000000",
     "message_hex": "00020502002f000503390000000526000c0b0afeff142e84214f0aa0a1a2a3a4a5a6a7a8a9aaabacadaeaf000203c836000003000000"
+  },
+  {
+    "name": "sec_lock_key_export",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x040a",
+    "tid": 262,
+    "note": "confirm word 'LOCK'; key export refused until reboot",
+    "fields": {},
+    "payload_hex": "4c4f434b",
+    "message_hex": "000a04060104004c4f434b"
+  },
+  {
+    "name": "sec_lock_key_export_rsp",
+    "endpoint": 2,
+    "kind": 1,
+    "msg_id": "0x040a",
+    "tid": 262,
+    "note": "locked",
+    "fields": {},
+    "payload_hex": "00",
+    "message_hex": "400a040601010000"
+  },
+  {
+    "name": "sys_set_uart",
+    "endpoint": 1,
+    "kind": 0,
+    "msg_id": "0x0009",
+    "tid": 5,
+    "note": "switch to 921600, no RTS/CTS, after 50 ms",
+    "fields": {},
+    "payload_hex": "00100e00003200",
+    "message_hex": "0009000500070000100e00003200"
+  },
+  {
+    "name": "evt_log_record",
+    "endpoint": 5,
+    "kind": 2,
+    "msg_id": "0x0980",
+    "tid": 1,
+    "note": "UTF-8 text record (level 3 info)",
+    "fields": {
+      "time_ms": 5321,
+      "level": 3,
+      "module": 2,
+      "seq": 17,
+      "text": "zrhp: session up, window 16"
+    },
+    "payload_hex": "c9140000030211007a7268703a2073657373696f6e2075702c2077696e646f77203136",
+    "message_hex": "80800901002300c9140000030211007a7268703a2073657373696f6e2075702c2077696e646f77203136"
+  },
+  {
+    "name": "gp_sink_config_zigpy",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0a01",
+    "tid": 263,
+    "note": "NCP sink authoritative; pre-commissioned groupcast to 0x0B84 like zigpy",
+    "fields": {
+      "mode": 1,
+      "communication_mode": 2,
+      "group": "0x0b84",
+      "exit_mode": 5,
+      "window_s": 180,
+      "security_level": 1,
+      "groupcast_radius": 0
+    },
+    "payload_hex": "0102840b05b4000100",
+    "message_hex": "00010a070109000102840b05b4000100"
+  },
+  {
+    "name": "gp_sink_commissioning_enter",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0a03",
+    "tid": 264,
+    "note": "enter, involve proxies, 254 s (zigpy permit)",
+    "fields": {},
+    "payload_hex": "0101fe00",
+    "message_hex": "00030a080104000101fe00"
+  },
+  {
+    "name": "evt_gp_commissioned",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0a82",
+    "tid": 22,
+    "note": "SrcID 0x293c9879 commissioned; R_GP_SINK record (key present: export allowed)",
+    "fields": {
+      "record_hex": "0b23000079983c290202840bffff090304c0c1c2c3c4c5c6c7c8c9cacbcccdcecf6011000000"
+    },
+    "payload_hex": "0079983c2902020b23000079983c290202840bffff090304c0c1c2c3c4c5c6c7c8c9cacbcccdcecf6011000000",
+    "message_hex": "80820a16002d000079983c2902020b23000079983c290202840bffff090304c0c1c2c3c4c5c6c7c8c9cacbcccdcecf6011000000"
+  },
+  {
+    "name": "evt_gp_frame_toggle",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0a80",
+    "tid": 23,
+    "note": "direct GPDF accepted by the NCP sink: Toggle, decrypted, passed through",
+    "fields": {},
+    "payload_hex": "01010079983c29022261110000030402ffffffd0dc00",
+    "message_hex": "80800a1700160001010079983c29022261110000030402ffffffd0dc00"
   }
 ]

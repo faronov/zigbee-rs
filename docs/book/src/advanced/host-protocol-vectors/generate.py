@@ -140,10 +140,14 @@ def ieee_text(raw: bytes) -> str:
 
 EP_LINK, EP_SYSTEM, EP_ZIGBEE, EP_TABLES, EP_BULK, EP_LOG = 0, 1, 2, 3, 4, 5
 
-SYS_NEGOTIATE, SYS_GET_STATUS, SYS_ECHO, EVT_NCP_READY = 0x0001, 0x0004, 0x0007, 0x0080
+SYS_NEGOTIATE, SYS_GET_STATUS, SYS_ECHO, SYS_SET_UART = 0x0001, 0x0004, 0x0007, 0x0009
+EVT_NCP_READY = 0x0080
 NWK_PERMIT_JOIN, EVT_DEVICE_JOINED, EVT_ROUTE_RECORD = 0x0105, 0x0181, 0x0185
 APS_DATA_REQUEST, EVT_APS_DATA_INDICATION, EVT_APS_DATA_CONFIRM = 0x0201, 0x0280, 0x0281
-SEC_ADD_INSTALL_CODE, EVT_FC_CHECKPOINT = 0x0403, 0x0483
+SEC_ADD_INSTALL_CODE, SEC_LOCK_KEY_EXPORT, EVT_FC_CHECKPOINT = 0x0403, 0x040A, 0x0483
+GP_SINK_CONFIG, GP_SINK_COMMISSIONING = 0x0A01, 0x0A03
+EVT_GP_FRAME, EVT_GP_COMMISSIONED = 0x0A80, 0x0A82
+LOG_RECORD = 0x0980
 TBL_LOOKUP, TBL_WRITEBACK = 0x0501, 0x0502
 BKP_RESTORE_BEGIN, BKP_RESTORE_PUT, BKP_RESTORE_COMMIT = 0x0611, 0x0612, 0x0613
 BKP_EXPORT_BEGIN, BKP_EXPORT_READ = 0x0601, 0x0602
@@ -158,10 +162,12 @@ def sys_negotiate_req():
 
 
 def sys_negotiate_rsp():
+    # Bit 14 (EZSP hashed TCLK) stays clear until gate H5; bit 11 is reserved.
     caps = (1 << 0) | (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) \
-        | (1 << 9) | (1 << 10) | (1 << 15) | (1 << 17) | (1 << 18)
-    capacities = [(1, 16), (2, 32), (3, 256), (4, 512), (5, 128), (6, 100), (7, 1024),
-                  (8, 8), (13, 16)]
+        | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 15) | (1 << 16) | (1 << 17) | (1 << 18) \
+        | (1 << 20)
+    capacities = [(1, 16), (2, 64), (3, 256), (4, 512), (5, 128), (6, 100), (7, 1024),
+                  (8, 8), (13, 16), (14, 8), (15, 16), (16, 8), (17, 8), (18, 256)]
     out = struct.pack("<BBBQB", 0x00, 1, 0, caps, len(capacities))
     for cid, value in capacities:
         out += struct.pack("<BI", cid, value)
@@ -242,12 +248,23 @@ def aes_mmo(data: bytes) -> bytes | None:
     return digest
 
 
+def hmac_mmo(key: bytes, message: bytes) -> bytes | None:
+    """Zigbee keyed hash (HMAC with the AES-MMO hash, block size 16)."""
+    assert len(key) == 16
+    inner = aes_mmo(bytes(k ^ 0x36 for k in key) + message)
+    if inner is None:
+        return None
+    return aes_mmo(bytes(k ^ 0x5C for k in key) + inner)
+
+
 # --------------------------------------------------------------------------
 # Backup records (BKP_* and TBL_* share them)
 # --------------------------------------------------------------------------
 
 R_NODE, R_NETWORK, R_NETWORK_KEY, R_TC_LINK_KEY, R_DEVICE = 0x01, 0x02, 0x03, 0x04, 0x05
 R_EZSP_HASHED_TCLK, R_SOURCE_ROUTE, R_GP_PROXY, R_RS_PARAMS, R_END = 0x06, 0x08, 0x09, 0x0A, 0xFF
+R_GP_SINK = 0x0B
+APS_UNKNOWN_TCLK_MARGIN = 1 << 20  # host rule when a backup has no TCLK counter (9.4)
 DEV_IS_CHILD, DEV_HAS_LINK_KEY, DEV_HAS_CHILD_INFO, DEV_NWK_VALID = 0x01, 0x02, 0x04, 0x08
 KEY_ATTR_VERIFIED, KEY_ORIGIN_IMPORTED = 2, 3
 FC_STRIDE = 0x400
@@ -256,6 +273,13 @@ TCLK_DEFAULT = b"ZigBeeAlliance09"
 
 def record(rtype: int, value: bytes) -> bytes:
     return struct.pack("<BH", rtype, len(value)) + value
+
+
+def gp_sink_record(src_id, device_id, group, key, frame_counter, security_level=3, key_type=4):
+    value = struct.pack("<BIBBHHBBB", 0, src_id, device_id, 2, group, 0xFFFF,
+                        0x01 | (0x08 if key else 0), security_level, key_type)
+    value += (key or b"") + struct.pack("<IB", frame_counter, 0)
+    return record(R_GP_SINK, value)
 
 
 def end_record(records: list[bytes]) -> bytes:
@@ -438,7 +462,8 @@ def records_to_ocb(recs: list[bytes], *, source: str, creation_time: str,
             stack_specific["zigbee_rs"] = {
                 "version": 1, "frame_counter_stride": stride, "table_epoch": epoch,
                 "nwk_frame_counter_limit": nwk_limit, "aps_frame_counter_limit": aps_limit,
-                "host_backed_tables": bool(flags & 0x01), "gp_proxy_table": []}
+                "host_backed_tables": bool(flags & 0x01), "gp_proxy_table": [],
+                "gp_sink_table": []}
         elif rtype == R_DEVICE:
             ieee = ieee_text(value[:8])
             nwk, flags = struct.unpack_from("<HB", value, 8)
@@ -630,6 +655,33 @@ def build_messages():
         b"\x00" + struct.pack("<I", 41) + dev, "host returns rev 41 device record with link key")
     add("tbl_writeback_evict", EP_TABLES, K_REQUEST, TBL_WRITEBACK, 0x0002,
         struct.pack("<BBI", R_DEVICE, 3, 57) + dev, "NCP evicts a dirty entry; host must fsync first")
+    add("sec_lock_key_export", EP_ZIGBEE, K_REQUEST, SEC_LOCK_KEY_EXPORT, 0x0106,
+        struct.pack("<I", 0x4B434F4C), "confirm word 'LOCK'; key export refused until reboot")
+    add("sec_lock_key_export_rsp", EP_ZIGBEE, K_RESPONSE, SEC_LOCK_KEY_EXPORT, 0x0106, b"\x00",
+        "locked")
+    add("sys_set_uart", EP_SYSTEM, K_REQUEST, SYS_SET_UART, 0x0005,
+        struct.pack("<IBH", 921600, 0, 50), "switch to 921600, no RTS/CTS, after 50 ms")
+    text = "zrhp: session up, window 16".encode()
+    add("evt_log_record", EP_LOG, K_EVENT, LOG_RECORD, 0x0001,
+        struct.pack("<IBBH", 5321, 3, 2, 17) + text, "UTF-8 text record (level 3 info)",
+        {"time_ms": 5321, "level": 3, "module": 2, "seq": 17, "text": text.decode()})
+    add("gp_sink_config_zigpy", EP_ZIGBEE, K_REQUEST, GP_SINK_CONFIG, 0x0107,
+        struct.pack("<BBHBHBB", 1, 2, 0x0B84, 0x05, 180, 0x01, 0),
+        "NCP sink authoritative; pre-commissioned groupcast to 0x0B84 like zigpy",
+        {"mode": 1, "communication_mode": 2, "group": "0x0b84", "exit_mode": 5,
+         "window_s": 180, "security_level": 1, "groupcast_radius": 0})
+    add("gp_sink_commissioning_enter", EP_ZIGBEE, K_REQUEST, GP_SINK_COMMISSIONING, 0x0108,
+        struct.pack("<BBH", 1, 0x01, 254), "enter, involve proxies, 254 s (zigpy permit)")
+    gpd_key = bytes.fromhex("c0c1c2c3c4c5c6c7c8c9cacbcccdcecf")
+    sink_rec = gp_sink_record(0x293C9879, 0x02, 0x0B84, gpd_key, 4448)
+    add("evt_gp_commissioned", EP_ZIGBEE, K_EVENT, EVT_GP_COMMISSIONED, 0x0016,
+        struct.pack("<BIBB", 0, 0x293C9879, 0x02, 0x02) + sink_rec,
+        "SrcID 0x293c9879 commissioned; R_GP_SINK record (key present: export allowed)",
+        {"record_hex": hx(sink_rec)})
+    add("evt_gp_frame_toggle", EP_ZIGBEE, K_EVENT, EVT_GP_FRAME, 0x0017,
+        struct.pack("<BBBIBBIBBBHBbBB", 1, 1, 0, 0x293C9879, 0x02, 0x22, 4449, 3, 4, 0x02,
+                    0xFFFF, 0xFF, -48, 220, 0),
+        "direct GPDF accepted by the NCP sink: Toggle, decrypted, passed through")
     return out
 
 
@@ -773,11 +825,69 @@ def build_backup():
     }
 
 
+def build_ezsp_hashed():
+    seed = bytes.fromhex("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+    out = {"status": "CANDIDATES - unverified until hardware gate H5 (real ZBT-1 key readout)",
+           "algorithm": "HMAC with AES-MMO (Zigbee keyed hash), key = hashed_tclk, "
+                        "message = device EUI64; byte order of the EUI64 is the open point",
+           "vectors": []}
+    for ieee in ("0017880102a1b2c3", "842e14fffe0a0b0c"):
+        le = hmac_mmo(seed, ieee_wire(ieee))
+        be = hmac_mmo(seed, bytes.fromhex(ieee))
+        out["vectors"].append({"hashed_tclk": seed.hex(), "ieee": ieee,
+                               "candidate_eui64_on_air_order": le.hex() if le else None,
+                               "candidate_eui64_big_endian": be.hex() if be else None})
+    return out
+
+
+def build_z2m_import():
+    ocb = {
+        "metadata": {"format": "zigpy/open-coordinator-backup", "version": 1,
+                     "source": "zigbee-herdsman@0.0.0-synthetic",
+                     "internal": {"date": "2026-11-02T08:00:00.000Z", "ezspVersion": 13}},
+        "stack_specific": {"ezsp": {"hashed_tclk": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"}},
+        "coordinator_ieee": "f4b3b1fffe1a2b3c",
+        "pan_id": "a62",
+        "extended_pan_id": "a1b2c3d4e5f60718",
+        "nwk_update_id": 0,
+        "security_level": 5,
+        "channel": 25,
+        "channel_mask": [25],
+        "network_key": {"key": "8b5d1f3c6a7e9d2b4f0a1c3e5d7f9b2a", "sequence_number": 0,
+                        "frame_counter": 77000},
+        "devices": [
+            {"nwk_address": "abc", "ieee_address": "000d6f000e1f2a3b", "is_child": True},
+            {"nwk_address": "1a2b", "ieee_address": "0017880102a1b2c3", "is_child": False,
+             "link_key": {"key": "11223344556677881122334455667788", "rx_counter": 7,
+                          "tx_counter": 5}},
+        ],
+    }
+    normalized = json.loads(json.dumps(ocb))
+    normalized["pan_id"] = normalized["pan_id"].zfill(4)
+    recs = ocb_to_records(normalized)
+    has_tc_counter = "tc_link_key" in ocb["metadata"]["internal"].get("network", {})
+    aps_margin = 10000 if has_tc_counter else APS_UNKNOWN_TCLK_MARGIN
+    state = ncp_apply_restore(recs, 10000, aps_margin)
+    names = {R_NODE: "NODE", R_NETWORK: "NETWORK", R_NETWORK_KEY: "NETWORK_KEY",
+             R_TC_LINK_KEY: "TC_LINK_KEY", R_DEVICE: "DEVICE", R_EZSP_HASHED_TCLK: "EZSP_HASHED_TCLK",
+             R_END: "END"}
+    return {
+        "note": "Z2M-style backup: unpadded pan_id/nwk, internal.date, no TCLK counter. "
+                "The host pads hex fields and, because the TCLK counter is unknown, uses "
+                "aps_margin = 2^20.",
+        "input_ocb": ocb,
+        "nwk_margin": 10000, "aps_margin": aps_margin,
+        "records": [{"type": names[r[0]], "hex": hx(r)} for r in recs],
+        "ncp_state": {"nwk_fc_start": state["nwk_fc_start"], "aps_fc_start": state["aps_fc_start"]},
+    }
+
+
 def outputs() -> dict[str, object]:
     crc, cobs = build_crc_cobs()
     return {"crc32c.json": crc, "cobs.json": cobs, "link_frames.json": build_link(),
             "messages.json": build_messages(), "arq_scenarios.json": build_arq(),
-            "ocb_roundtrip.json": build_backup()}
+            "ocb_roundtrip.json": build_backup(), "ocb_z2m_import.json": build_z2m_import(),
+            "ezsp_hashed_tclk.json": build_ezsp_hashed()}
 
 
 def main() -> int:
