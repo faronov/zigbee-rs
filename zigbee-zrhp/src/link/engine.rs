@@ -304,8 +304,19 @@ impl<const TXW: usize, const RXW: usize> Link<TXW, RXW> {
         self.core.next_seq
     }
 
-    /// Sequence numbers of unacknowledged (in-flight) frames, unordered.
+    /// Sequence numbers of frames acknowledged neither cumulatively nor by
+    /// SACK, unordered (the "unacked" set of the ARQ traces).
     pub fn tx_unacked(&self) -> impl Iterator<Item = u8> + '_ {
+        self.core
+            .tx
+            .iter()
+            .filter(|s| s.state == TxState::InFlight && !s.sacked)
+            .map(|s| s.seq)
+    }
+
+    /// Sequence numbers of every frame still occupying a window slot
+    /// (including SACKed frames above the cumulative ack), unordered.
+    pub fn tx_in_flight(&self) -> impl Iterator<Item = u8> + '_ {
         self.core
             .tx
             .iter()
@@ -327,8 +338,8 @@ impl<const TXW: usize, const RXW: usize> Link<TXW, RXW> {
     }
 
     /// Feed received bytes. Returns how many bytes were consumed; it stops
-    /// early while delivered frames are waiting in [`poll_event`]
-    /// (Self::poll_event), so call it again with the remainder after
+    /// early while delivered frames are waiting in
+    /// [`poll_event`](Self::poll_event), so call it again with the remainder after
     /// draining events.
     pub fn push_rx(&mut self, data: &[u8], now: Instant) -> usize {
         self.core.release_lent();
