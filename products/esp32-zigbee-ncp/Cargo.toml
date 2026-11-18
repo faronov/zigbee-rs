@@ -12,10 +12,30 @@ publish = false
 # host transport the image uses. The board crate only describes the chip
 # flash and the host UART wiring; the ZRHP stack lives in the shared crates.
 [dependencies]
+embedded-storage = "0.3"
+log = "0.4"
+# Platform services (host-testable): the devkit product's ESP OTA pieces
+# (otadata rules, ESP image validation, SHA-256, `signed-ota` trusted keys),
+# the MCUboot envelope check, the identity journal and the platform trait.
+# The devkit product also provides the single-future executor and SYSTIMER
+# embassy time driver (layout-independent platform glue; candidates for a
+# shared ESP platform crate).
+esp32-zigbee-devkit-product = { path = "../esp32-zigbee-devkit", features = ["signed-ota"] }
+mcuboot-image = { path = "../../mcuboot-image" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = [
+    "centralized-tclk",
+    "trust-center",
+    "global-aps-counter",
+    "host-passthrough",
+] }
+ncp-coordinator-app = { path = "../../apps/ncp-coordinator" }
+
+[dev-dependencies]
+# Signs test envelopes (host tests of the FW_* signature policy).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 
 [target.'cfg(target_os = "none")'.dependencies]
 critical-section = "1.2"
-embedded-storage = "0.3"
 # Same configuration as the board crates: the ROM flash routines run with
 # interrupts masked (see boards/esp32-zigbee-devkit/Cargo.toml).
 esp-storage = { version = "0.7", default-features = false, features = [
@@ -23,20 +43,9 @@ esp-storage = { version = "0.7", default-features = false, features = [
     "critical-section",
 ] }
 esp-thread-br-h2 = { path = "../../boards/esp-thread-br-h2", optional = true }
-# Single-future executor and SYSTIMER embassy time driver of the ESP32
-# devkit product (layout-independent platform glue; candidates for a shared
-# ESP platform crate).
-esp32-zigbee-devkit-product = { path = "../esp32-zigbee-devkit" }
 esp-serial-stream = { path = "../../esp-serial-stream" }
 esp-hal = { version = "=1.0.0", features = ["unstable"] }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = [
-    "centralized-tclk",
-    "trust-center",
-    "global-aps-counter",
-    "host-passthrough",
-] }
 router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter"] }
-ncp-coordinator-app = { path = "../../apps/ncp-coordinator" }
 
 [features]
 default = []
@@ -66,6 +75,9 @@ thread-br-h2 = ["dep:esp-thread-br-h2"]
 rtscts-reserved-lines = ["thread-br-h2", "esp-thread-br-h2/rtscts-reserved-lines"]
 # Board: Waveshare ESP32-H2-Zero (USB-Serial-JTAG only; identity string).
 waveshare-h2-zero = []
+# Development firmware policy (never in shipped images): FW_FINISH accepts
+# unsigned (plain ESP) images, and FW_BEGIN flags bit0 allows downgrades.
+dev-unsigned-fw = []
 
 [patch.crates-io]
 esp-hal = { path = "../../vendor/esp-hal" }

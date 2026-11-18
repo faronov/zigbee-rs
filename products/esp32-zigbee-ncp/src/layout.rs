@@ -70,6 +70,72 @@ pub const ACTIVE: Layout = LAYOUT_4MB;
 #[cfg(feature = "flash-2mb")]
 pub const ACTIVE: Layout = LAYOUT_2MB;
 
+// ── Firmware update view of [`ACTIVE`] (spec 7.9) ──────────────────────
+//
+// The names below are the ones `products/esp32-zigbee-devkit/src/
+// running_image.rs` expects from `crate::layout`; this crate compiles that
+// file against the NCP layout (see `crate::fw_flash`).
+
+/// Address of the ESP-IDF partition table.
+pub const PARTITION_TABLE_OFFSET: u32 = 0x8000;
+/// Flash program granularity of the staging writer.
+pub const WORD_SIZE: u32 = 4;
+/// Physical flash size the active partition table is made for.
+pub const FLASH_SIZE: u32 = ACTIVE.flash_size;
+/// Application slots the ESP-IDF bootloader alternates between.
+pub const OTA_SLOT_COUNT: u8 = 2;
+/// Size of each application slot of the active layout.
+pub const OTA_SLOT_SIZE: u32 = ACTIVE.ota_slot_size;
+
+/// Base address of application slot `slot` (0 = `ota_0`, else `ota_1`).
+pub const fn ota_slot_offset(slot: u8) -> u32 {
+    match slot {
+        0 => ACTIVE.ota_0_offset,
+        _ => ACTIVE.ota_1_offset,
+    }
+}
+
+/// Base address of `otadata` sector `sector` (0 or 1).
+pub const fn otadata_sector_offset(sector: u8) -> u32 {
+    ACTIVE.otadata_offset + sector as u32 * SECTOR_SIZE
+}
+
+/// Whether firmware staging may erase or program `[address, address +
+/// len)`: only `otadata` and the two application slots. The bootloader,
+/// the partition table and every `zbnv` journal (including the identity
+/// item) are outside, and this is checked on every flash operation of the
+/// staging path rather than trusting the offset arithmetic above it.
+pub const fn is_fw_writable(address: u32, len: u32) -> bool {
+    let Some(end) = address.checked_add(len) else {
+        return false;
+    };
+    if len == 0 {
+        return false;
+    }
+    let windows = [
+        (
+            ACTIVE.otadata_offset,
+            ACTIVE.otadata_offset + ACTIVE.otadata_size,
+        ),
+        (
+            ACTIVE.ota_0_offset,
+            ACTIVE.ota_0_offset + ACTIVE.ota_slot_size,
+        ),
+        (
+            ACTIVE.ota_1_offset,
+            ACTIVE.ota_1_offset + ACTIVE.ota_slot_size,
+        ),
+    ];
+    let mut index = 0;
+    while index < windows.len() {
+        if address >= windows[index].0 && end <= windows[index].1 {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 /// `zbnv`-relative journal windows (136 KiB used, 56 KiB spare).
 ///
 /// Each window holds two logical sectors (A at the window start, B at its
@@ -240,6 +306,34 @@ mod tests {
         // provisioning erases the NCP `zbnv` once (README).
         const { assert!(LAYOUT_4MB.nv(Nv::USED) <= 0x3F_E000) };
         assert_eq!(LAYOUT_4MB.flash_end(), 0x40_0000);
+    }
+
+    #[test]
+    fn staging_never_reaches_the_journals_the_identity_item_or_the_bootloader() {
+        // Spec 7.9 "Protected regions".
+        assert!(!is_fw_writable(0, SECTOR_SIZE));
+        assert!(!is_fw_writable(PARTITION_TABLE_OFFSET, SECTOR_SIZE));
+        assert!(!is_fw_writable(ACTIVE.zbnv_offset, SECTOR_SIZE));
+        assert!(!is_fw_writable(ACTIVE.nv(Nv::IDENTITY.0), SECTOR_SIZE));
+        assert!(!is_fw_writable(
+            ACTIVE.nv(Nv::IDENTITY.0 + SECTOR_SIZE),
+            SECTOR_SIZE
+        ));
+        // A range straddling the end of ota_1 into zbnv.
+        assert!(!is_fw_writable(ACTIVE.zbnv_offset - 4, 8));
+        assert!(!is_fw_writable(u32::MAX - 3, 8));
+        assert!(!is_fw_writable(ota_slot_offset(0), 0));
+        for slot in 0..OTA_SLOT_COUNT {
+            let base = ota_slot_offset(slot);
+            assert!(is_fw_writable(base, SECTOR_SIZE));
+            assert!(is_fw_writable(
+                base + OTA_SLOT_SIZE - SECTOR_SIZE,
+                SECTOR_SIZE
+            ));
+        }
+        assert!(is_fw_writable(otadata_sector_offset(0), SECTOR_SIZE));
+        assert!(is_fw_writable(otadata_sector_offset(1), SECTOR_SIZE));
+        assert!(!is_fw_writable(otadata_sector_offset(2), SECTOR_SIZE));
     }
 
     #[test]

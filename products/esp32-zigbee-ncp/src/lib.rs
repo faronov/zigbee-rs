@@ -11,7 +11,10 @@
 //! * the fitted-flash check ([`flash_size`]) and the flash windows
 //!   (`flash`, target only);
 //! * the host transport and its UART policy ([`transport`]);
-//! * the NV journals bound to their windows (`stores`, target only).
+//! * the NV journals bound to their windows (`stores`, target only);
+//! * the product platform services behind ZRHP ([`platform`]): firmware
+//!   update into the inactive OTA slot ([`fw`], spec 7.9), the trial boot
+//!   window, and the persisted IEEE override ([`identity`], spec 9.4).
 //!
 //! The coordinator stack, the ZRHP protocol and the NCP command dispatch
 //! live in the shared crates; the composition root is
@@ -34,11 +37,25 @@ compile_error!("select one board");
 #[cfg(target_os = "none")]
 pub mod flash;
 pub mod flash_size;
+pub mod fw;
+#[cfg(target_os = "none")]
+pub mod fw_flash;
 #[cfg(target_os = "none")]
 pub mod host;
+pub mod identity;
 pub mod layout;
+pub mod platform;
+// The devkit product's MMU running-slot evidence, compiled against this
+// product's `crate::layout` (the NCP slot addresses). The file also carries
+// ESP32-C5 paths behind a feature this product does not have.
+#[cfg(any(target_os = "none", test))]
+#[allow(dead_code, unexpected_cfgs)]
+#[path = "../../esp32-zigbee-devkit/src/running_image.rs"]
+mod running_image;
 #[cfg(target_os = "none")]
 pub mod stores;
+#[cfg(test)]
+mod test_support;
 pub mod transport;
 
 pub const MANUFACTURER: &str = "Zigbee-RS";
