@@ -180,6 +180,33 @@ impl TrustCenterTable {
         }
     }
 
+    /// [`Self::new`] directly into caller-provided storage, slot by slot:
+    /// no whole-table temporary (about 17 KiB with `ncp-capacity`) on the
+    /// stack.
+    ///
+    /// # Safety
+    /// `slot` must point to valid, properly aligned, uninitialized storage for `Self`.
+    pub unsafe fn write_into(slot: *mut Self) {
+        // Every field is written below; a new field must be added there.
+        let _exhaustive = |table: &Self| {
+            let Self {
+                devices: _,
+                pending_link_keys: _,
+                pending_link_key_mask: _,
+            } = table;
+        };
+        unsafe {
+            let devices =
+                core::ptr::addr_of_mut!((*slot).devices).cast::<Option<TrustCenterDevice>>();
+            for index in 0..MAX_TRUST_CENTER_DEVICES {
+                devices.add(index).write(None);
+            }
+            // All-zero byte arrays are valid values.
+            core::ptr::addr_of_mut!((*slot).pending_link_keys).write_bytes(0, 1);
+            core::ptr::addr_of_mut!((*slot).pending_link_key_mask).write_bytes(0, 1);
+        }
+    }
+
     pub fn devices(&self) -> impl Iterator<Item = &TrustCenterDevice> {
         self.devices.iter().flatten().filter(|device| device.active)
     }
@@ -656,6 +683,32 @@ mod tests {
             device_short_address: ShortAddress(0x1234),
             status,
         }
+    }
+
+    #[test]
+    fn write_into_builds_an_empty_table_in_place() {
+        let mut storage = core::mem::MaybeUninit::<TrustCenterTable>::uninit();
+        // Poison: every slot must be written, nothing read first.
+        unsafe {
+            storage.as_mut_ptr().write_bytes(0xA5, 1);
+            TrustCenterTable::write_into(storage.as_mut_ptr());
+        }
+        let table = unsafe { storage.assume_init_mut() };
+        let fresh = TrustCenterTable::new();
+        assert_eq!(table.devices().count(), 0);
+        assert!(table.devices.iter().all(Option::is_none));
+        assert_eq!(table.pending_link_keys, fresh.pending_link_keys);
+        assert_eq!(table.pending_link_key_mask, fresh.pending_link_key_mask);
+        let address = [0x21; 8];
+        assert!(!table.has_pending_link_key_for(&address));
+        table
+            .provision_link_key(
+                address,
+                [0x42; 16],
+                TrustCenterKeyOrigin::ApplicationProvisioned,
+            )
+            .unwrap();
+        assert_eq!(table.device(&address).unwrap().link_key, [0x42; 16]);
     }
 
     #[test]

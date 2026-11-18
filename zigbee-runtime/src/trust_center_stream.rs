@@ -226,30 +226,27 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_S
         Ok(0)
     }
 
-    /// Validate and decode the snapshot starting at `(sector, slot)`.
-    /// `Ok(None)` for anything that is not a complete, committed, decodable
-    /// snapshot; `Err` only for a storage failure.
-    fn read_snapshot(
+    /// Validate the framing and CRCs of the snapshot starting at
+    /// `(sector, slot)` without decoding it: every chunk's framing and CRC,
+    /// the commit marker and the whole-snapshot CRC (a single-slot record:
+    /// its framing and CRC). `Ok(None)` for anything that is not a complete,
+    /// committed snapshot; `Err` only for a storage failure.
+    fn frame_snapshot(
         &mut self,
         sector: usize,
         slot: usize,
-    ) -> Result<Option<(Located, PersistentTrustCenterState)>, TrustCenterStoreError> {
+    ) -> Result<Option<Located>, TrustCenterStoreError> {
         let mut buffer = [0u8; SLOT];
         self.read_slot(sector, slot, &mut buffer)?;
         if buffer[0..4] == RECORD_MAGIC {
-            return Ok(TrustCenterDeviceJournal::<S>::decode_record(&buffer).map(
-                |(generation, state)| {
-                    (
-                        Located {
-                            generation,
-                            sector,
-                            slot,
-                            slots: 1,
-                        },
-                        state,
-                    )
-                },
-            ));
+            return Ok(
+                TrustCenterDeviceJournal::<S>::frame_record(&buffer).map(|generation| Located {
+                    generation,
+                    sector,
+                    slot,
+                    slots: 1,
+                }),
+            );
         }
         let Some(stream) = chunk_header(&buffer, 0) else {
             return Ok(None);
@@ -257,8 +254,6 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_S
         if slot + stream.chunks > Self::SLOTS_PER_SECTOR {
             return Ok(None);
         }
-        // First pass: every chunk's framing and CRC, the commit marker and
-        // the whole-snapshot CRC, before any decoding.
         let mut crc = CRC_INIT;
         for chunk in 0..stream.chunks {
             if chunk != 0 {
@@ -275,48 +270,75 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_S
         if !crc != stream.crc {
             return Ok(None);
         }
-        // Second pass: decode straight from flash.
-        let mut source = ChunkSource {
-            journal: self,
+        Ok(Some(Located {
+            generation: stream.generation,
             sector,
             slot,
-            stream,
-            position: 0,
-            loaded: None,
-            buffer,
-            error: None,
-        };
-        let decoded = PersistentTrustCenterState::decode_from(&mut source);
-        if let Some(error) = source.error {
-            return Err(error);
-        }
-        Ok(decoded.ok().map(|state| {
-            (
-                Located {
-                    generation: stream.generation,
-                    sector,
-                    slot,
-                    slots: stream.chunks,
-                },
-                state,
-            )
+            slots: stream.chunks,
         }))
     }
 
-    /// Newest complete snapshot. Candidates are tried newest first, so at
-    /// most the snapshots newer than the current one are decoded twice.
-    fn newest(&mut self) -> Result<Option<Located>, TrustCenterStoreError> {
-        let mut best: Option<Located> = None;
+    /// Decode the framed snapshot at `located` into `state` in place,
+    /// straight from flash. `Ok(false)` (with `state` unspecified) when it
+    /// does not decode to a valid state or no longer matches `located`.
+    fn decode_snapshot(
+        &mut self,
+        located: Located,
+        state: &mut PersistentTrustCenterState,
+    ) -> Result<bool, TrustCenterStoreError> {
         let mut buffer = [0u8; SLOT];
+        self.read_slot(located.sector, located.slot, &mut buffer)?;
+        if buffer[0..4] == RECORD_MAGIC {
+            return Ok(located.slots == 1
+                && TrustCenterDeviceJournal::<S>::decode_record_into(&buffer, state)
+                    == Some(located.generation));
+        }
+        let Some(stream) = chunk_header(&buffer, 0) else {
+            return Ok(false);
+        };
+        if stream.generation != located.generation || stream.chunks != located.slots {
+            return Ok(false);
+        }
+        let mut source = ChunkSource {
+            journal: self,
+            sector: located.sector,
+            slot: located.slot,
+            stream,
+            position: 0,
+            loaded: None,
+            buffer: &mut buffer,
+            error: None,
+        };
+        let decoded = state.decode_from_into(&mut source);
+        if let Some(error) = source.error {
+            return Err(error);
+        }
+        Ok(decoded.is_ok())
+    }
+
+    /// Newest complete snapshot by framing and CRCs (no decode), with a
+    /// generation below `below` when given. Only candidates newer than the
+    /// best so far are validated; a slot's header alone selects candidates.
+    fn newest_framed(
+        &mut self,
+        below: Option<u32>,
+    ) -> Result<Option<Located>, TrustCenterStoreError> {
+        let mut best: Option<Located> = None;
+        let mut header = [0u8; READBACK];
         for sector in 0..2 {
             let mut slot = 0;
             while slot < Self::SLOTS_PER_SECTOR {
-                self.read_slot(sector, slot, &mut buffer)?;
-                let generation = candidate_generation(&buffer);
-                let newer = generation.is_some_and(|generation| {
-                    best.is_none_or(|current| generation > current.generation)
+                let address = self.slot_address(sector, slot);
+                self.storage
+                    .read(address, &mut header)
+                    .map_err(|_| TrustCenterStoreError::Hardware)?;
+                let candidate = candidate_generation(&header).filter(|generation| {
+                    below.is_none_or(|bound| *generation < bound)
+                        && best.is_none_or(|current| *generation > current.generation)
                 });
-                if newer && let Some((located, _)) = self.read_snapshot(sector, slot)? {
+                if candidate.is_some()
+                    && let Some(located) = self.frame_snapshot(sector, slot)?
+                {
                     best = Some(located);
                     slot += located.slots;
                     continue;
@@ -327,12 +349,17 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_S
         Ok(best)
     }
 
+    /// The current snapshot for a store. Without a prior
+    /// [`TrustCenterDeviceStore::load_into`] scan, the newest complete
+    /// snapshot by framing and CRCs: its generation is at least that of the
+    /// newest decodable one, so the next snapshot is still ordered after
+    /// every survivor.
     fn current(&mut self) -> Result<Option<Located>, TrustCenterStoreError> {
         if !self.geometry_ok() {
             return Err(TrustCenterStoreError::Hardware);
         }
         if !self.scanned {
-            self.current = self.newest()?;
+            self.current = self.newest_framed(None)?;
             self.scanned = true;
         }
         Ok(self.current)
@@ -408,18 +435,43 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_S
 impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterDeviceStore
     for TrustCenterStreamJournal<S, SECTOR_SIZE>
 {
-    fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
-        let Some(located) = self.current()? else {
-            return Ok(None);
-        };
-        match self.read_snapshot(located.sector, located.slot)? {
-            Some((found, state)) if found == located => Ok(Some(state)),
-            // The flash changed under the cache: rescan on the next call.
-            _ => {
-                self.current = None;
-                self.scanned = false;
-                Err(TrustCenterStoreError::Corrupt)
+    fn load_into(
+        &mut self,
+        state: &mut PersistentTrustCenterState,
+    ) -> Result<bool, TrustCenterStoreError> {
+        if !self.geometry_ok() {
+            return Err(TrustCenterStoreError::Hardware);
+        }
+        if self.scanned {
+            let Some(located) = self.current else {
+                return Ok(false);
+            };
+            if self.frame_snapshot(located.sector, located.slot)? == Some(located)
+                && self.decode_snapshot(located, state)?
+            {
+                return Ok(true);
             }
+            // The flash changed under the cache: rescan on the next call.
+            self.current = None;
+            self.scanned = false;
+            return Err(TrustCenterStoreError::Corrupt);
+        }
+        // Newest decodable snapshot: complete snapshots newest first, with
+        // `state` as the decode scratch; one that does not decode falls back
+        // to the next older one.
+        let mut below = None;
+        loop {
+            let Some(located) = self.newest_framed(below)? else {
+                self.current = None;
+                self.scanned = true;
+                return Ok(false);
+            };
+            if self.decode_snapshot(located, state)? {
+                self.current = Some(located);
+                self.scanned = true;
+                return Ok(true);
+            }
+            below = Some(located.generation);
         }
     }
 
@@ -491,7 +543,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterDeviceStore
 
 /// Generation of a slot that may start a snapshot (a legacy record or chunk
 /// 0), from its header only; full validation follows.
-fn candidate_generation(slot: &[u8; SLOT]) -> Option<u32> {
+fn candidate_generation(slot: &[u8]) -> Option<u32> {
     if slot[0..4] == RECORD_MAGIC
         || (slot[0..4] == CHUNK_MAGIC && slot[4] == RECORD_VERSION && slot[5] == 0)
     {
@@ -669,7 +721,7 @@ struct ChunkSource<'a, S, const SECTOR_SIZE: usize> {
     stream: Stream,
     position: usize,
     loaded: Option<usize>,
-    buffer: [u8; SLOT],
+    buffer: &'a mut [u8; SLOT],
     /// A storage error is reported as `Hardware`, never as corruption.
     error: Option<TrustCenterStoreError>,
 }
@@ -683,15 +735,15 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> ChunkSource<'_, S, SECTOR_SIZE> {
         let chunk = index / TRUST_CENTER_STREAM_PAYLOAD_PER_CHUNK;
         if self.loaded != Some(chunk) {
             self.loaded = None;
-            if let Err(error) =
-                self.journal
-                    .read_slot(self.sector, self.slot + chunk, &mut self.buffer)
+            if let Err(error) = self
+                .journal
+                .read_slot(self.sector, self.slot + chunk, self.buffer)
             {
                 self.error = Some(error);
                 return Err(error);
             }
             // Re-validate: the flash must not have changed since the scan.
-            if !chunk_matches(&self.buffer, &self.stream, chunk) {
+            if !chunk_matches(self.buffer, &self.stream, chunk) {
                 return Err(TrustCenterStoreError::Corrupt);
             }
             self.loaded = Some(chunk);
@@ -1077,6 +1129,46 @@ mod tests {
         assert_eq!(journal_load(spliced), Some(older.clone()));
         // Intact flash loads the newest.
         assert_eq!(journal_load(flash), Some(newer));
+    }
+
+    #[test]
+    fn a_committed_snapshot_that_does_not_decode_falls_back_and_is_superseded() {
+        let older = state(3, 1, false);
+        let mut journal = journal(MockFlash::new());
+        journal.store(&older).unwrap();
+        // Generation 1: complete and CRC-valid, but its payload fails
+        // validation (no extended PAN ID), so it never decodes.
+        let invalid = PersistentTrustCenterState::new([0; 8]);
+        let located = journal.current.unwrap();
+        let stream = Journal::stream_for(&invalid, 1).unwrap();
+        journal
+            .write_snapshot(
+                located.sector,
+                located.slot + located.slots,
+                stream,
+                &invalid,
+            )
+            .unwrap();
+        // The load decodes in place into a non-empty destination and falls
+        // back to the older snapshot.
+        let mut journal = reopen(journal);
+        let mut loaded = state(MAX_TRUST_CENTER_DEVICES, 7, true);
+        assert_eq!(journal.load_into(&mut loaded), Ok(true));
+        assert_eq!(loaded, older);
+        // A store without a prior load (framing-only scan) is still ordered
+        // after the undecodable snapshot.
+        let mut journal = reopen(journal);
+        let newer = state(4, 2, false);
+        journal.store(&newer).unwrap();
+        assert!(journal.current.unwrap().generation > 1);
+        assert_eq!(reopen(journal).load(), Ok(Some(newer)));
+    }
+
+    #[test]
+    fn an_empty_journal_loads_nothing() {
+        let mut journal = journal(MockFlash::new());
+        let mut loaded = state(5, 3, false);
+        assert_eq!(journal.load_into(&mut loaded), Ok(false));
     }
 
     fn journal_load(flash: MockFlash) -> Option<PersistentTrustCenterState> {

@@ -1639,8 +1639,17 @@ impl FaultTrustCenterStore {
 
 #[cfg(feature = "trust-center")]
 impl TrustCenterDeviceStore for FaultTrustCenterStore {
-    fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
-        Ok(self.state.borrow().state.clone())
+    fn load_into(
+        &mut self,
+        state: &mut PersistentTrustCenterState,
+    ) -> Result<bool, TrustCenterStoreError> {
+        match &self.state.borrow().state {
+            Some(stored) => {
+                state.copy_from(stored);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     fn store(&mut self, state: &PersistentTrustCenterState) -> Result<(), TrustCenterStoreError> {
@@ -4760,11 +4769,14 @@ fn trust_center_replay_floor_is_reapplied_after_restoring_device_keys() {
         armed: bool,
     }
     impl TrustCenterDeviceStore for ArmReplayFailure {
-        fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
+        fn load_into(
+            &mut self,
+            state: &mut PersistentTrustCenterState,
+        ) -> Result<bool, TrustCenterStoreError> {
             if self.armed {
                 self.fail.set(true);
             }
-            self.inner.load()
+            self.inner.load_into(state)
         }
         fn store(
             &mut self,
@@ -6060,8 +6072,11 @@ mod key_power_cuts {
     }
 
     impl<S: TrustCenterDeviceStore> TrustCenterDeviceStore for CutStore<S> {
-        fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
-            self.inner.load()
+        fn load_into(
+            &mut self,
+            state: &mut PersistentTrustCenterState,
+        ) -> Result<bool, TrustCenterStoreError> {
+            self.inner.load_into(state)
         }
 
         fn store(

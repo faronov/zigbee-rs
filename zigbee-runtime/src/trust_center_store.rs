@@ -159,6 +159,37 @@ impl PersistentTrustCenterState {
         }
     }
 
+    /// [`Self::new`] directly into caller-provided storage (no whole-state
+    /// temporary on the stack).
+    ///
+    /// # Safety
+    /// `slot` must point to valid, properly aligned, uninitialized storage for `Self`.
+    pub unsafe fn write_into(slot: *mut Self, extended_pan_id: IeeeAddress) {
+        // Every field is written below; a new field must be added there.
+        let _exhaustive = |state: &Self| {
+            let Self {
+                extended_pan_id: _,
+                pending_application_key: _,
+                rotation: _,
+                application_key_requests: _,
+                devices: _,
+                pending_unknown_removals: _,
+                #[cfg(feature = "global-aps-counter")]
+                    global_aps_limit: _,
+            } = state;
+        };
+        unsafe {
+            core::ptr::addr_of_mut!((*slot).extended_pan_id).write(extended_pan_id);
+            core::ptr::addr_of_mut!((*slot).pending_application_key).write(None);
+            core::ptr::addr_of_mut!((*slot).rotation).write(None);
+            core::ptr::addr_of_mut!((*slot).application_key_requests).write(Vec::new());
+            core::ptr::addr_of_mut!((*slot).devices).write(Vec::new());
+            core::ptr::addr_of_mut!((*slot).pending_unknown_removals).write(Vec::new());
+            #[cfg(feature = "global-aps-counter")]
+            core::ptr::addr_of_mut!((*slot).global_aps_limit).write(0);
+        }
+    }
+
     /// Durable limit of the global outgoing APS counter (0 = none yet).
     #[cfg(feature = "global-aps-counter")]
     pub const fn global_aps_limit(&self) -> u32 {
@@ -521,47 +552,116 @@ impl PersistentTrustCenterState {
         Ok(self.encoded_len())
     }
 
-    /// Decode the current record version's encoding.
+    /// Decode the current record version's encoding (by value; host and
+    /// test convenience; embedded paths use [`Self::decode_into`]).
     pub fn decode(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_from(&mut SliceSource::new(bytes))
+        let mut state = Self::new([0; 8]);
+        state.decode_into(bytes)?;
+        Ok(state)
     }
 
-    /// Decode the current record version's encoding from `source`.
-    pub(crate) fn decode_from(
+    /// Decode the current record version's encoding into `self` in place,
+    /// without a whole-state temporary. On error `self` holds an
+    /// unspecified (partially decoded) state.
+    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), TrustCenterStoreError> {
+        self.decode_from_into(&mut SliceSource::new(bytes))
+    }
+
+    /// Decode the current record version's encoding from `source` into
+    /// `self` in place (see [`Self::decode_into`]).
+    pub(crate) fn decode_from_into(
+        &mut self,
         source: &mut impl SnapshotSource,
-    ) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_version(source, Layout::CURRENT)
+    ) -> Result<(), TrustCenterStoreError> {
+        self.decode_version_into(source, Layout::CURRENT)
     }
 
-    /// Version 5: the version-4 encoding plus the global APS limit.
-    #[cfg(feature = "ncp-capacity")]
-    fn decode_v5(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_version(&mut SliceSource::new(bytes), Layout::V5)
+    /// Decode a record of `version`'s layout into `self` in place; `None`
+    /// for a version this build cannot read.
+    pub(crate) fn decode_record_version_into(
+        &mut self,
+        version: u8,
+        bytes: &[u8],
+    ) -> Option<Result<(), TrustCenterStoreError>> {
+        let layout = match version {
+            RECORD_VERSION => Layout::CURRENT,
+            #[cfg(feature = "ncp-capacity")]
+            GLOBAL_APS_RECORD_VERSION => Layout::V5,
+            #[cfg(feature = "global-aps-counter")]
+            GLOBAL_APS_RECORD_VERSION_PREDECESSOR => Layout::V4,
+            UNKNOWN_REMOVAL_RECORD_VERSION => Layout::V3,
+            ROTATION_RECORD_VERSION => Layout::V2,
+            LEGACY_RECORD_VERSION => Layout::V1,
+            _ => return None,
+        };
+        Some(self.decode_version_into(&mut SliceSource::new(bytes), layout))
+    }
+
+    #[cfg(test)]
+    fn decode_layout(bytes: &[u8], layout: Layout) -> Result<Self, TrustCenterStoreError> {
+        let mut state = Self::new([0; 8]);
+        state.decode_version_into(&mut SliceSource::new(bytes), layout)?;
+        Ok(state)
     }
 
     /// Version 4: no global APS limit (migrated on the first global-mode
     /// start).
-    #[cfg(feature = "global-aps-counter")]
+    #[cfg(all(test, feature = "global-aps-counter"))]
     fn decode_v4(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_version(&mut SliceSource::new(bytes), Layout::V4)
+        Self::decode_layout(bytes, Layout::V4)
     }
 
+    #[cfg(test)]
     fn decode_v3(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_version(&mut SliceSource::new(bytes), Layout::V3)
+        Self::decode_layout(bytes, Layout::V3)
     }
 
-    fn decode_v2(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_version(&mut SliceSource::new(bytes), Layout::V2)
-    }
-
+    #[cfg(test)]
     fn decode_v1(bytes: &[u8]) -> Result<Self, TrustCenterStoreError> {
-        Self::decode_version(&mut SliceSource::new(bytes), Layout::V1)
+        Self::decode_layout(bytes, Layout::V1)
     }
 
-    fn decode_version(
+    /// Reset `self` in place to the empty state of `extended_pan_id`.
+    pub fn reset(&mut self, extended_pan_id: IeeeAddress) {
+        self.extended_pan_id = extended_pan_id;
+        self.pending_application_key = None;
+        self.rotation = None;
+        self.application_key_requests.clear();
+        self.devices.clear();
+        self.pending_unknown_removals.clear();
+        #[cfg(feature = "global-aps-counter")]
+        {
+            self.global_aps_limit = 0;
+        }
+    }
+
+    /// Overwrite `self` with `other` element by element (no whole-state
+    /// temporary, unlike `*self = other.clone()`).
+    pub fn copy_from(&mut self, other: &Self) {
+        self.reset(other.extended_pan_id);
+        self.pending_application_key = other.pending_application_key;
+        self.rotation = other.rotation;
+        // Same capacities: these cannot fail.
+        let _ = self
+            .application_key_requests
+            .extend_from_slice(&other.application_key_requests);
+        let _ = self.devices.extend_from_slice(&other.devices);
+        let _ = self
+            .pending_unknown_removals
+            .extend_from_slice(&other.pending_unknown_removals);
+        #[cfg(feature = "global-aps-counter")]
+        {
+            self.global_aps_limit = other.global_aps_limit;
+        }
+    }
+
+    /// Decode into `self` in place: every field is overwritten, nothing of
+    /// the previous contents survives a successful decode.
+    fn decode_version_into(
+        &mut self,
         source: &mut impl SnapshotSource,
         layout: Layout,
-    ) -> Result<Self, TrustCenterStoreError> {
+    ) -> Result<(), TrustCenterStoreError> {
         let total = source.remaining();
         let trailer_len = usize::from(layout.count_high) + if layout.global_limit { 4 } else { 0 };
         let body_len = total
@@ -584,7 +684,8 @@ impl PersistentTrustCenterState {
         if count > MAX_TRUST_CENTER_DEVICES || body_len < device_bytes_len {
             return Err(TrustCenterStoreError::Corrupt);
         }
-        let mut state = Self::new(extended_pan_id);
+        self.reset(extended_pan_id);
+        let state = self;
         state.pending_application_key = match header[9] {
             0 => {
                 if header[10..43].iter().any(|byte| *byte != 0) {
@@ -705,8 +806,7 @@ impl PersistentTrustCenterState {
         if source.remaining() != 0 {
             return Err(TrustCenterStoreError::Corrupt);
         }
-        state.validate()?;
-        Ok(state)
+        state.validate()
     }
 
     fn decode_application_key_requests(
@@ -742,10 +842,29 @@ pub enum TrustCenterStoreError {
     CounterExhausted,
 }
 
+/// Durable backend of the Trust Center state.
+///
+/// The state is large (about 23 KiB with `ncp-capacity`), so the backend
+/// decodes into caller-owned storage instead of returning it by value.
 pub trait TrustCenterDeviceStore {
-    fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError>;
+    /// Decode the newest committed state into `state` in place. `Ok(false)`
+    /// when nothing is committed. Unless `Ok(true)` is returned, `state`
+    /// holds unspecified contents (a backend may use it as decode scratch)
+    /// and the caller must reset or discard it.
+    fn load_into(
+        &mut self,
+        state: &mut PersistentTrustCenterState,
+    ) -> Result<bool, TrustCenterStoreError>;
     fn store(&mut self, state: &PersistentTrustCenterState) -> Result<(), TrustCenterStoreError>;
     fn clear(&mut self) -> Result<(), TrustCenterStoreError>;
+
+    /// By-value [`Self::load_into`] for hosts and tests. Embedded stack
+    /// paths must use [`Self::load_into`]: this returns the whole state on
+    /// the stack.
+    fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
+        let mut state = PersistentTrustCenterState::new([0; 8]);
+        Ok(self.load_into(&mut state)?.then_some(state))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -760,8 +879,17 @@ impl RamTrustCenterDeviceStore {
 }
 
 impl TrustCenterDeviceStore for RamTrustCenterDeviceStore {
-    fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
-        Ok(self.state.clone())
+    fn load_into(
+        &mut self,
+        state: &mut PersistentTrustCenterState,
+    ) -> Result<bool, TrustCenterStoreError> {
+        match &self.state {
+            Some(stored) => {
+                state.copy_from(stored);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     fn store(&mut self, state: &PersistentTrustCenterState) -> Result<(), TrustCenterStoreError> {
@@ -823,23 +951,28 @@ const _: () = assert!(MAX_ENCODED_TRUST_CENTER_STATE_LEN <= RECORD_ENCODED_CAPAC
 pub struct TrustCenterDeviceJournal<S> {
     storage: S,
     sectors: [u32; 2],
-    cached: Option<LocatedState>,
+    /// Location of the current record (the state itself is not cached).
+    current: Option<LocatedRecord>,
     scanned: bool,
 }
 
-#[derive(Clone)]
-struct LocatedState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocatedRecord {
     generation: u32,
     sector: usize,
-    state: PersistentTrustCenterState,
+    slot: usize,
 }
+
+/// Read-back granularity of the write verification.
+const RECORD_READBACK: usize = 128;
+const _: () = assert!(TRUST_CENTER_JOURNAL_SLOT_SIZE.is_multiple_of(RECORD_READBACK));
 
 impl<S: NorFlash> TrustCenterDeviceJournal<S> {
     pub const fn new(storage: S, first_sector: u32, second_sector: u32) -> Self {
         Self {
             storage,
             sectors: [first_sector, second_sector],
-            cached: None,
+            current: None,
             scanned: false,
         }
     }
@@ -859,6 +992,7 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
             && S::WRITE_SIZE != 0
             && S::ERASE_SIZE != 0
             && TRUST_CENTER_JOURNAL_SLOT_SIZE.is_multiple_of(S::READ_SIZE)
+            && RECORD_READBACK.is_multiple_of(S::READ_SIZE)
             && TRUST_CENTER_JOURNAL_SLOT_SIZE.is_multiple_of(S::WRITE_SIZE)
             && TRUST_CENTER_JOURNAL_SECTOR_SIZE.is_multiple_of(S::ERASE_SIZE)
             && RECORD_PREFIX_LEN.is_multiple_of(S::WRITE_SIZE)
@@ -875,23 +1009,25 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
             })
     }
 
+    fn slot_address(&self, sector: usize, slot: usize) -> u32 {
+        self.sectors[sector] + (slot * TRUST_CENTER_JOURNAL_SLOT_SIZE) as u32
+    }
+
     fn read_slot(
         &mut self,
         sector: usize,
         slot: usize,
         output: &mut [u8; TRUST_CENTER_JOURNAL_SLOT_SIZE],
     ) -> Result<(), TrustCenterStoreError> {
+        let address = self.slot_address(sector, slot);
         self.storage
-            .read(
-                self.sectors[sector] + (slot * TRUST_CENTER_JOURNAL_SLOT_SIZE) as u32,
-                output,
-            )
+            .read(address, output)
             .map_err(|_| TrustCenterStoreError::Hardware)
     }
 
-    pub(crate) fn decode_record(
-        record: &[u8; TRUST_CENTER_JOURNAL_SLOT_SIZE],
-    ) -> Option<(u32, PersistentTrustCenterState)> {
+    /// Generation of a committed record whose framing (magic, known version,
+    /// commit marker, length) and CRC are valid, without decoding the state.
+    pub(crate) fn frame_record(record: &[u8; TRUST_CENTER_JOURNAL_SLOT_SIZE]) -> Option<u32> {
         #[cfg(feature = "ncp-capacity")]
         let known_version = matches!(
             record[4],
@@ -939,40 +1075,46 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
         if crate::security_journal::crc32(&record[..RECORD_CRC_OFFSET]) != expected_crc {
             return None;
         }
-        let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-        let encoded = &record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len];
-        let state = match record[4] {
-            RECORD_VERSION => PersistentTrustCenterState::decode(encoded),
-            #[cfg(feature = "ncp-capacity")]
-            GLOBAL_APS_RECORD_VERSION => PersistentTrustCenterState::decode_v5(encoded),
-            #[cfg(feature = "global-aps-counter")]
-            GLOBAL_APS_RECORD_VERSION_PREDECESSOR => PersistentTrustCenterState::decode_v4(encoded),
-            UNKNOWN_REMOVAL_RECORD_VERSION => PersistentTrustCenterState::decode_v3(encoded),
-            ROTATION_RECORD_VERSION => PersistentTrustCenterState::decode_v2(encoded),
-            LEGACY_RECORD_VERSION => PersistentTrustCenterState::decode_v1(encoded),
-            _ => return None,
-        }
-        .ok()?;
-        Some((generation, state))
+        Some(u32::from_le_bytes([
+            record[8], record[9], record[10], record[11],
+        ]))
     }
 
-    fn newest(&mut self) -> Result<Option<LocatedState>, TrustCenterStoreError> {
-        let mut newest: Option<LocatedState> = None;
+    /// Validate and decode one record into `state` in place; its generation,
+    /// or `None` (with `state` unspecified) if it is not a complete,
+    /// committed, decodable record.
+    pub(crate) fn decode_record_into(
+        record: &[u8; TRUST_CENTER_JOURNAL_SLOT_SIZE],
+        state: &mut PersistentTrustCenterState,
+    ) -> Option<u32> {
+        let generation = Self::frame_record(record)?;
+        let encoded_len = u16::from_le_bytes([record[5], record[6]]) as usize;
+        let encoded = &record[RECORD_ENCODED_OFFSET..RECORD_ENCODED_OFFSET + encoded_len];
+        state.decode_record_version_into(record[4], encoded)?.ok()?;
+        Some(generation)
+    }
+
+    /// Newest committed record by framing and CRC only (no decode), with a
+    /// generation below `below` when given.
+    fn newest_framed(
+        &mut self,
+        below: Option<u32>,
+    ) -> Result<Option<LocatedRecord>, TrustCenterStoreError> {
+        let mut newest: Option<LocatedRecord> = None;
         let mut record = [0u8; TRUST_CENTER_JOURNAL_SLOT_SIZE];
         for sector in 0..2 {
             for slot in 0..TRUST_CENTER_JOURNAL_SLOTS_PER_SECTOR {
                 self.read_slot(sector, slot, &mut record)?;
-                let Some((generation, state)) = Self::decode_record(&record) else {
+                let Some(generation) = Self::frame_record(&record) else {
                     continue;
                 };
-                if newest
-                    .as_ref()
-                    .is_none_or(|current| generation > current.generation)
+                if below.is_none_or(|bound| generation < bound)
+                    && newest.is_none_or(|current| generation > current.generation)
                 {
-                    newest = Some(LocatedState {
+                    newest = Some(LocatedRecord {
                         generation,
                         sector,
-                        state,
+                        slot,
                     });
                 }
             }
@@ -980,24 +1122,46 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
         Ok(newest)
     }
 
-    fn current(&mut self) -> Result<Option<LocatedState>, TrustCenterStoreError> {
+    /// Decode the record at `located` into `state`; `false` if it no longer
+    /// decodes.
+    fn decode_at(
+        &mut self,
+        located: LocatedRecord,
+        state: &mut PersistentTrustCenterState,
+    ) -> Result<bool, TrustCenterStoreError> {
+        let mut record = [0u8; TRUST_CENTER_JOURNAL_SLOT_SIZE];
+        self.read_slot(located.sector, located.slot, &mut record)?;
+        Ok(Self::decode_record_into(&record, state) == Some(located.generation))
+    }
+
+    /// The current record for a store. Without a prior [`Self::load_into`]
+    /// scan, the newest committed record by framing and CRC: its generation
+    /// is at least that of the newest decodable one, so the next record is
+    /// still ordered after every survivor.
+    fn current(&mut self) -> Result<Option<LocatedRecord>, TrustCenterStoreError> {
         if !self.geometry_ok() {
             return Err(TrustCenterStoreError::Hardware);
         }
         if !self.scanned {
-            self.cached = self.newest()?;
+            self.current = self.newest_framed(None)?;
             self.scanned = true;
         }
-        Ok(self.cached.clone())
+        Ok(self.current)
     }
 
     fn first_erased_slot(&mut self, sector: usize) -> Result<Option<usize>, TrustCenterStoreError> {
-        let mut record = [0u8; TRUST_CENTER_JOURNAL_SLOT_SIZE];
-        for slot in 0..TRUST_CENTER_JOURNAL_SLOTS_PER_SECTOR {
-            self.read_slot(sector, slot, &mut record)?;
-            if record.iter().all(|byte| *byte == 0xFF) {
-                return Ok(Some(slot));
+        let mut chunk = [0u8; RECORD_READBACK];
+        'slots: for slot in 0..TRUST_CENTER_JOURNAL_SLOTS_PER_SECTOR {
+            let base = self.slot_address(sector, slot);
+            for offset in (0..TRUST_CENTER_JOURNAL_SLOT_SIZE).step_by(RECORD_READBACK) {
+                self.storage
+                    .read(base + offset as u32, &mut chunk)
+                    .map_err(|_| TrustCenterStoreError::Hardware)?;
+                if chunk.iter().any(|byte| *byte != 0xFF) {
+                    continue 'slots;
+                }
             }
+            return Ok(Some(slot));
         }
         Ok(None)
     }
@@ -1023,7 +1187,7 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
         let crc = crate::security_journal::crc32(&record[..RECORD_CRC_OFFSET]);
         record[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 
-        let address = self.sectors[sector] + (slot * TRUST_CENTER_JOURNAL_SLOT_SIZE) as u32;
+        let address = self.slot_address(sector, slot);
         self.storage
             .write(address, &record[..RECORD_PREFIX_LEN])
             .map_err(|_| TrustCenterStoreError::Hardware)?;
@@ -1036,41 +1200,66 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
             )
             .map_err(|_| TrustCenterStoreError::Hardware)?;
 
-        let mut verify = [0u8; TRUST_CENTER_JOURNAL_SLOT_SIZE];
-        self.read_slot(sector, slot, &mut verify)?;
-        match Self::decode_record(&verify) {
-            Some((stored_generation, stored_state))
-                if stored_generation == generation && stored_state == *state =>
-            {
-                Ok(())
+        // Byte-compare the whole programmed slot with the record: identical
+        // bytes decode to the identical state.
+        let mut chunk = [0u8; RECORD_READBACK];
+        for offset in (0..TRUST_CENTER_JOURNAL_SLOT_SIZE).step_by(RECORD_READBACK) {
+            self.storage
+                .read(address + offset as u32, &mut chunk)
+                .map_err(|_| TrustCenterStoreError::Hardware)?;
+            if chunk[..] != record[offset..offset + RECORD_READBACK] {
+                return Err(TrustCenterStoreError::Hardware);
             }
-            _ => Err(TrustCenterStoreError::Hardware),
         }
+        Ok(())
     }
 
-    fn cache_result(
-        &mut self,
-        result: &Result<(), TrustCenterStoreError>,
-        generation: u32,
-        sector: usize,
-        state: &PersistentTrustCenterState,
-    ) {
+    fn cache_result(&mut self, result: &Result<(), TrustCenterStoreError>, located: LocatedRecord) {
         if result.is_ok() {
-            self.cached = Some(LocatedState {
-                generation,
-                sector,
-                state: state.clone(),
-            });
+            self.current = Some(located);
         } else {
-            self.cached = None;
+            self.current = None;
             self.scanned = false;
         }
     }
 }
 
 impl<S: NorFlash> TrustCenterDeviceStore for TrustCenterDeviceJournal<S> {
-    fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
-        Ok(self.current()?.map(|located| located.state))
+    fn load_into(
+        &mut self,
+        state: &mut PersistentTrustCenterState,
+    ) -> Result<bool, TrustCenterStoreError> {
+        if !self.geometry_ok() {
+            return Err(TrustCenterStoreError::Hardware);
+        }
+        if self.scanned {
+            let Some(located) = self.current else {
+                return Ok(false);
+            };
+            if self.decode_at(located, state)? {
+                return Ok(true);
+            }
+            // The flash changed under the cache: rescan on the next call.
+            self.current = None;
+            self.scanned = false;
+            return Err(TrustCenterStoreError::Corrupt);
+        }
+        // Newest decodable record: candidates newest first, `state` is the
+        // decode scratch.
+        let mut below = None;
+        loop {
+            let Some(located) = self.newest_framed(below)? else {
+                self.current = None;
+                self.scanned = true;
+                return Ok(false);
+            };
+            if self.decode_at(located, state)? {
+                self.current = Some(located);
+                self.scanned = true;
+                return Ok(true);
+            }
+            below = Some(located.generation);
+        }
     }
 
     fn store(&mut self, state: &PersistentTrustCenterState) -> Result<(), TrustCenterStoreError> {
@@ -1091,7 +1280,14 @@ impl<S: NorFlash> TrustCenterDeviceStore for TrustCenterDeviceJournal<S> {
         if let Some(located) = current {
             if let Some(slot) = self.first_erased_slot(located.sector)? {
                 let result = self.write_record(located.sector, slot, generation, state);
-                self.cache_result(&result, generation, located.sector, state);
+                self.cache_result(
+                    &result,
+                    LocatedRecord {
+                        generation,
+                        sector: located.sector,
+                        slot,
+                    },
+                );
                 return result;
             }
             let target = 1 - located.sector;
@@ -1101,7 +1297,14 @@ impl<S: NorFlash> TrustCenterDeviceStore for TrustCenterDeviceJournal<S> {
                 .erase(sector, sector + TRUST_CENTER_JOURNAL_SECTOR_SIZE as u32)
                 .map_err(|_| TrustCenterStoreError::Hardware)
                 .and_then(|()| self.write_record(target, 0, generation, state));
-            self.cache_result(&result, generation, target, state);
+            self.cache_result(
+                &result,
+                LocatedRecord {
+                    generation,
+                    sector: target,
+                    slot: 0,
+                },
+            );
             return result;
         }
 
@@ -1111,7 +1314,14 @@ impl<S: NorFlash> TrustCenterDeviceStore for TrustCenterDeviceJournal<S> {
             .erase(sector, sector + TRUST_CENTER_JOURNAL_SECTOR_SIZE as u32)
             .map_err(|_| TrustCenterStoreError::Hardware)
             .and_then(|()| self.write_record(0, 0, generation, state));
-        self.cache_result(&result, generation, 0, state);
+        self.cache_result(
+            &result,
+            LocatedRecord {
+                generation,
+                sector: 0,
+                slot: 0,
+            },
+        );
         result
     }
 
@@ -1124,7 +1334,7 @@ impl<S: NorFlash> TrustCenterDeviceStore for TrustCenterDeviceJournal<S> {
                 .erase(sector, sector + TRUST_CENTER_JOURNAL_SECTOR_SIZE as u32)
                 .map_err(|_| TrustCenterStoreError::Hardware)?;
         }
-        self.cached = None;
+        self.current = None;
         self.scanned = true;
         Ok(())
     }
@@ -1452,6 +1662,57 @@ mod tests {
             })
             .unwrap();
         state
+    }
+
+    /// `state()` plus every optional section, so in-place copies and decodes
+    /// are checked field by field.
+    fn rich_state() -> PersistentTrustCenterState {
+        let mut state = state();
+        state.set_rotation(Some(NetworkKeyRotation {
+            phase: NetworkKeyRotationPhase::Distributing,
+            method: NetworkKeyUpdateMethod::Broadcast,
+            target_sequence: 3,
+        }));
+        state.allow_application_key_request(DEVICE, PARENT).unwrap();
+        state
+            .stage_unknown_removal(PendingUnknownRemoval {
+                parent_address: PARENT,
+                device_address: [0x55; 8],
+            })
+            .unwrap();
+        #[cfg(feature = "global-aps-counter")]
+        assert!(state.set_global_aps_limit(0x8000));
+        state
+    }
+
+    #[test]
+    fn in_place_construction_copy_reset_and_decode_match_the_by_value_forms() {
+        let mut storage = core::mem::MaybeUninit::<PersistentTrustCenterState>::uninit();
+        // Poison: every field must be written, nothing read first.
+        unsafe {
+            storage.as_mut_ptr().write_bytes(0xA5, 1);
+            PersistentTrustCenterState::write_into(storage.as_mut_ptr(), EPID);
+        }
+        let in_place = unsafe { storage.assume_init_mut() };
+        assert_eq!(*in_place, PersistentTrustCenterState::new(EPID));
+
+        let rich = rich_state();
+        in_place.copy_from(&rich);
+        assert_eq!(*in_place, rich);
+        in_place.reset([0x66; 8]);
+        assert_eq!(*in_place, PersistentTrustCenterState::new([0x66; 8]));
+
+        // Decoding overwrites every field of a non-empty destination.
+        let plain = state();
+        let mut encoded = [0u8; MAX_ENCODED_TRUST_CENTER_STATE_LEN];
+        let len = plain.encode(&mut encoded);
+        let mut destination = rich_state();
+        destination.decode_into(&encoded[..len]).unwrap();
+        assert_eq!(destination, plain);
+        let len = rich.encode(&mut encoded);
+        destination.decode_into(&encoded[..len]).unwrap();
+        assert_eq!(destination, rich);
+        unsafe { storage.assume_init_drop() };
     }
 
     #[test]
