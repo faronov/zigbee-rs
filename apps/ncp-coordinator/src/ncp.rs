@@ -14,8 +14,8 @@
 //! |---|---|
 //! | SYSTEM | `SYS_NEGOTIATE`, `SYS_GET_INFO`, `SYS_RESET`, `SYS_GET_STATUS`, `SYS_SET_CONFIG`/`SYS_GET_CONFIG` (`log_level`), `SYS_ECHO`, `SYS_SET_UART` |
 //! | DIAG | `DIAG_GET_COUNTERS`/`DIAG_RESET_COUNTERS` (link and queue groups) |
-//! | NETWORK | `NWK_INIT`, `NWK_FORM` (NCP-chosen identity), `NWK_LEAVE_RESET`, `NWK_GET_INFO`, `NWK_PERMIT_JOIN` (NCP or all routers) |
-//! | DATA | `APS_DATA_REQUEST` → `EVT_APS_DATA_CONFIRM`; `EVT_APS_DATA_INDICATION` |
+//! | NETWORK | `NWK_INIT`, `NWK_FORM` (NCP-chosen identity), `NWK_LEAVE_RESET`, `NWK_GET_INFO`, `NWK_PERMIT_JOIN` (NCP or all routers), `NWK_ADD_ENDPOINT`; `EVT_DEVICE_JOINED`, `EVT_DEVICE_LEFT` |
+//! | DATA | `APS_DATA_REQUEST` → `EVT_APS_DATA_CONFIRM` (after the APS ACK outcome with `ack_request`); `EVT_APS_DATA_INDICATION` |
 //! | SECURITY | `SEC_GET_NETWORK_KEY`, `SEC_GET_FRAME_COUNTERS`, `SEC_LOCK_KEY_EXPORT`; `EVT_FC_CHECKPOINT` |
 //! | LOG | `LOG_CONFIG`; `EVT_LOG_RECORD`, `EVT_LOG_DROPPED` |
 
@@ -27,8 +27,8 @@ use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataConfirm, EvtApsDa
 use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagGetCountersRsp, DiagResetCounters};
 use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord, LogConfig};
 use zigbee_zrhp::msg::network::{
-    EvtDeviceJoined, EvtDeviceLeft, EvtNetworkState, NwkForm, NwkGetInfoRsp, NwkInit, NwkInitRsp,
-    NwkPermitJoin,
+    EvtDeviceJoined, EvtDeviceLeft, EvtNetworkState, NwkAddEndpoint, NwkForm, NwkGetInfoRsp,
+    NwkInit, NwkInitRsp, NwkLeaveReset, NwkPermitJoin,
 };
 use zigbee_zrhp::msg::security::{
     EvtFcCheckpoint, SecGetFrameCountersRsp, SecGetNetworkKey, SecGetNetworkKeyRsp,
@@ -45,8 +45,8 @@ use zigbee_zrhp::types::{Endpoint, Ieee, Status};
 
 use crate::log_ring::LogRing;
 use crate::port::{
-    CoordinatorPort, DataRequest, Destination, DeviceEvent, FormParams, MAX_ASDU, NetworkState, Op,
-    OpError,
+    CoordinatorPort, DataRequest, Destination, DeviceEvent, EndpointError, FormParams,
+    HostEndpoint, MAX_ASDU, NetworkState, Op, OpError,
 };
 use crate::transport::{HostTransport, UartChangeError};
 
@@ -271,8 +271,12 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 let status = op_status(port.permit_join(duration_s, target).await);
                 self.respond_status(ids::NWK_PERMIT_JOIN, accepted_tid(accepted_us), status);
             }
-            Op::LeaveReset => {
-                let status = op_status(port.leave_reset().await);
+            Op::LeaveReset { flags } => {
+                let result = port.leave_reset().await;
+                if result.is_ok() && flags & 0x02 == 0 {
+                    port.clear_endpoints();
+                }
+                let status = op_status(result);
                 self.respond_status(ids::NWK_LEAVE_RESET, accepted_tid(accepted_us), status);
                 if let Some((2, _)) = self.pending_reset {
                     // Factory reset: reboot once the wipe completed.
@@ -282,6 +286,11 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             Op::Data(request) => {
                 let result = port.send(&request).await;
                 self.data_inflight = self.data_inflight.saturating_sub(1);
+                if matches!(&result, Ok(confirm) if confirm.deferred()) {
+                    // Awaiting the APS ACK: `emit_stack_events` sends the
+                    // confirm from `take_data_confirm`.
+                    return true;
+                }
                 let elapsed_ms = now_us().saturating_sub(accepted_us) / 1000;
                 let (status, confirm) = match result {
                     Ok(confirm) if confirm.zb_status == 0 => (0, confirm),
@@ -515,7 +524,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     },
                     Capacity {
                         id: capacity::MAX_HOST_ENDPOINTS,
-                        value: 0,
+                        value: u32::from(port.max_host_endpoints()),
                     },
                     Capacity {
                         id: capacity::MAX_NCP_REQUESTS,
@@ -582,7 +591,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     2 if request.confirm == zigbee_zrhp::msg::system::FACTORY_RESET_CONFIRM => {
                         if state
                             .ops
-                            .push_back((Op::LeaveReset, u64::from(tid)))
+                            .push_back((Op::LeaveReset { flags: 0 }, u64::from(tid)))
                             .is_err()
                         {
                             status_only(queues, Status::Busy);
@@ -783,14 +792,29 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 status_only(queues, Status::Success);
             }
             ids::NWK_LEAVE_RESET => {
+                // Older hosts send no flags: clear the host endpoints.
+                let flags = message.decode::<NwkLeaveReset>().map_or(0, |r| r.flags);
                 if state
                     .ops
-                    .push_back((Op::LeaveReset, u64::from(tid)))
+                    .push_back((Op::LeaveReset { flags }, u64::from(tid)))
                     .is_err()
                 {
                     status_only(queues, Status::Busy);
                 }
                 // Responded by `drive` after the wipe.
+            }
+            ids::NWK_ADD_ENDPOINT => {
+                let request = decode!(NwkAddEndpoint);
+                let status = match host_endpoint(&request) {
+                    Some(endpoint) => match port.add_endpoint(&endpoint) {
+                        Ok(()) => Status::Success,
+                        Err(EndpointError::InvalidParameter) => Status::InvalidParameter,
+                        Err(EndpointError::NoSpace) => Status::NoSpace,
+                        Err(EndpointError::Unsupported) => Status::UnsupportedCommand,
+                    },
+                    None => Status::InvalidParameter,
+                };
+                status_only(queues, status);
             }
             ids::NWK_GET_INFO => {
                 let info = port.info();
@@ -1037,6 +1061,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     parent_nwk,
                     join_type,
                     capability,
+                    decision,
                 } => {
                     self.event(
                         Endpoint::Zigbee,
@@ -1046,22 +1071,44 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                             parent_nwk,
                             join_type,
                             capability,
-                            decision: 0,
+                            decision,
                         },
                     );
                 }
-                DeviceEvent::Left { nwk, ieee, flags } => {
+                DeviceEvent::Left {
+                    nwk,
+                    ieee,
+                    flags,
+                    reason,
+                } => {
                     self.event(
                         Endpoint::Zigbee,
                         &EvtDeviceLeft {
                             nwk,
                             ieee: Ieee(ieee),
                             flags,
-                            reason: 0,
+                            reason,
                         },
                     );
                 }
             }
+        }
+        // Confirms that waited for their APS ACK.
+        while self.queues.queue(Endpoint::Zigbee).free() >= 32 {
+            let Some(deferred) = port.take_data_confirm() else {
+                break;
+            };
+            let confirm = deferred.confirm;
+            let event = EvtApsDataConfirm {
+                req_tid: deferred.req_tid,
+                status: u8::from(confirm.zb_status != 0),
+                zb_status: confirm.zb_status,
+                aps_counter: confirm.aps_counter,
+                dst_nwk: confirm.dst_nwk,
+                flags: confirm.flags,
+                elapsed_ms: deferred.elapsed_ms,
+            };
+            self.event(Endpoint::Zigbee, &event);
         }
         // Indications only while the queue can take a full-size one; the
         // stack's bounded queue absorbs (and counts) the rest.
@@ -1103,7 +1150,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 rssi: indication.rssi,
                 last_hop_nwk: indication.last_hop_nwk,
                 aps_counter: indication.aps_counter,
-                key_source: 0,
+                key_source: indication.key_source,
                 rx_time_ms: indication.rx_time_ms,
                 asdu: Bytes16(&indication.asdu),
             };
@@ -1294,6 +1341,26 @@ fn next_seq(seqs: &mut [u16; Endpoint::COUNT], endpoint: Endpoint) -> u16 {
 /// Ops answered after completion carry the request TID in the time slot.
 fn accepted_tid(slot: u64) -> u16 {
     slot as u16
+}
+
+/// `NWK_ADD_ENDPOINT` as a [`HostEndpoint`]; `None` when a cluster list is
+/// longer than [`crate::port::MAX_ENDPOINT_CLUSTERS`].
+fn host_endpoint(request: &NwkAddEndpoint<'_>) -> Option<HostEndpoint> {
+    let mut endpoint = HostEndpoint {
+        endpoint: request.ep,
+        profile: request.profile,
+        device_id: request.device_id,
+        version: request.version,
+        in_clusters: Vec::new(),
+        out_clusters: Vec::new(),
+    };
+    for cluster in request.in_clusters.iter() {
+        endpoint.in_clusters.push(cluster).ok()?;
+    }
+    for cluster in request.out_clusters.iter() {
+        endpoint.out_clusters.push(cluster).ok()?;
+    }
+    Some(endpoint)
 }
 
 fn op_status(result: Result<(), OpError>) -> Status {

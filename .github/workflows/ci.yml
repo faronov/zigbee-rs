@@ -115,6 +115,11 @@ jobs:
       # that only the NCP image enables), and the NCP application (excluded
       # from the workspace so its runtime features do not unify).
       - run: cargo test -p zigbee-mac --features pan-coordinator --lib --locked
+      # NCP receive metadata and host events (RSSI, departures, host
+      # endpoints); APS and runtime are covered by their --all-features runs.
+      - run: cargo test -p zigbee-mac --features rx-rssi,mock --lib --locked
+      - run: cargo test -p zigbee-nwk --features router,host-passthrough --locked
+      - run: cargo test -p zigbee-zdo --features router,host-passthrough --locked
       - run: cargo test --manifest-path apps/ncp-coordinator/Cargo.toml --locked
       # nRF product crates are excluded from the root workspace (they pull in
       # `embassy-nrf`), but their battery-curve and profile logic is

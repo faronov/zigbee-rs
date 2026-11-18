@@ -105,9 +105,12 @@ pub struct Indication {
     pub cluster: u16,
     pub aps_secured: bool,
     pub nwk_secured: bool,
+    /// Link key of an APS-secured frame ([`key_source`]).
+    pub key_source: u8,
     /// ZDO request already answered by the NCP.
     pub handled_by_ncp: bool,
     pub lqi: u8,
+    /// Last hop RSSI in dBm; -128 when the radio does not measure it.
     pub rssi: i8,
     pub last_hop_nwk: u16,
     pub aps_counter: u8,
@@ -118,17 +121,29 @@ pub struct Indication {
 /// A device event for the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceEvent {
+    /// `EVT_DEVICE_JOINED`: a Trust Center join decision.
     Joined {
         nwk: u16,
         ieee: [u8; 8],
+        /// `0xFFFF` when the parent's short address is unknown.
         parent_nwk: u16,
+        /// [`joined`]`::JOIN_*`.
         join_type: u8,
+        /// MAC capability of a child of the NCP; 0 when the device joined
+        /// through another parent (its `Device_annce` carries it).
         capability: u8,
+        /// [`joined`]`::ADMITTED` or [`joined`]`::DENIED`.
+        decision: u8,
     },
+    /// `EVT_DEVICE_LEFT`.
     Left {
         nwk: u16,
+        /// All zero when unknown.
         ieee: [u8; 8],
+        /// [`left`]`::FLAG_*`.
         flags: u8,
+        /// [`left`]`::REASON_*`.
+        reason: u8,
     },
 }
 
@@ -175,7 +190,10 @@ pub enum Op {
         target: u16,
     },
     Data(DataRequest),
-    LeaveReset,
+    /// `flags`: `NWK_LEAVE_RESET` flags (bit1 keep host endpoints).
+    LeaveReset {
+        flags: u8,
+    },
 }
 
 /// Why an operation failed.
@@ -217,4 +235,120 @@ pub trait CoordinatorPort {
     async fn send(&mut self, request: &DataRequest) -> Result<DataConfirm, OpError>;
     /// Leave and wipe the network state (`NWK_LEAVE_RESET`).
     async fn leave_reset(&mut self) -> Result<(), OpError>;
+
+    /// The final confirm of a [`Self::send`] whose confirm was
+    /// [`DataConfirm::deferred`] (APS ACK received, or not), if one is ready.
+    fn take_data_confirm(&mut self) -> Option<DeferredConfirm> {
+        None
+    }
+    /// `max_host_endpoints`; 0 when [`Self::add_endpoint`] is unsupported.
+    fn max_host_endpoints(&self) -> u8 {
+        0
+    }
+    /// Register (or replace) a host endpoint (`NWK_ADD_ENDPOINT`): the NCP's
+    /// ZDO server answers `Active_EP`, `Simple_Desc` and `Match_Desc` with it.
+    fn add_endpoint(&mut self, endpoint: &HostEndpoint) -> Result<(), EndpointError> {
+        let _ = endpoint;
+        Err(EndpointError::Unsupported)
+    }
+    /// Forget every host endpoint (`NWK_LEAVE_RESET` without flags bit1).
+    fn clear_endpoints(&mut self) {}
+}
+
+/// `EVT_DEVICE_JOINED` values.
+pub mod joined {
+    /// MAC association (Update-Device "standard device unsecured join").
+    pub const JOIN_ASSOCIATION: u8 = 0;
+    /// NWK rejoin secured with the network key.
+    pub const JOIN_SECURED_REJOIN: u8 = 1;
+    /// Unsecured (Trust Center) rejoin.
+    pub const JOIN_UNSECURED_REJOIN: u8 = 2;
+    /// Admitted by the Trust Center.
+    pub const ADMITTED: u8 = 0;
+    /// Rejected or removed by Trust Center policy.
+    pub const DENIED: u8 = 1;
+}
+
+/// `EVT_DEVICE_LEFT` values.
+pub mod left {
+    /// The device announced a Leave with the rejoin bit set.
+    pub const FLAG_REJOIN: u8 = 0x01;
+    /// The Trust Center removed it.
+    pub const FLAG_REMOVED_BY_TC: u8 = 0x02;
+    /// Its parent router reported the departure (Update-Device).
+    pub const FLAG_REPORTED_BY_PARENT: u8 = 0x04;
+    /// It announced its departure with a NWK Leave heard by the NCP.
+    pub const REASON_LEAVE: u8 = 1;
+    /// Its parent router reported it with Update-Device "device left".
+    pub const REASON_PARENT_REPORT: u8 = 2;
+    /// Trust Center removal: a rejected rejoin, an expired join timeout or
+    /// a failed key exchange.
+    pub const REASON_TC_REMOVAL: u8 = 3;
+    /// A child of the NCP aged out: an end device missed its End Device
+    /// Timeout, or a router child stopped sending Link Status.
+    pub const REASON_CHILD_TIMEOUT: u8 = 4;
+}
+
+/// `EVT_APS_DATA_INDICATION.key_source` values.
+pub mod key_source {
+    pub const NONE: u8 = 0;
+    pub const GLOBAL_TRUST_CENTER: u8 = 1;
+    pub const UNIQUE_TRUST_CENTER: u8 = 2;
+    pub const APPLICATION: u8 = 3;
+}
+
+impl DataConfirm {
+    /// `flags` bit0: the APS ACK was received.
+    pub const FLAG_ACK_RECEIVED: u8 = 0x01;
+    /// Port-internal `flags` marker, never sent to the host: the frame went
+    /// out with `ack_request` and its final confirm follows from
+    /// [`CoordinatorPort::take_data_confirm`].
+    pub const DEFERRED: u8 = 0x80;
+
+    /// Whether the final confirm follows from
+    /// [`CoordinatorPort::take_data_confirm`].
+    pub const fn deferred(&self) -> bool {
+        self.flags & Self::DEFERRED != 0
+    }
+}
+
+/// The final `EVT_APS_DATA_CONFIRM` of an acknowledged send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferredConfirm {
+    pub req_tid: u16,
+    /// `zb_status` 0 with [`DataConfirm::FLAG_ACK_RECEIVED`] once the APS ACK
+    /// arrived; `0xA7` (APS `NO_ACK`) when the retries were exhausted, ACK
+    /// tracking was lost, or the network was reset.
+    pub confirm: DataConfirm,
+    /// From the transmission to the outcome.
+    pub elapsed_ms: u16,
+}
+
+/// Most host endpoints the NCP registers (`max_host_endpoints`).
+pub const MAX_HOST_ENDPOINTS: usize = 8;
+/// Most input (or output) clusters of one host endpoint.
+pub const MAX_ENDPOINT_CLUSTERS: usize = 16;
+
+/// A host endpoint (`NWK_ADD_ENDPOINT`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEndpoint {
+    /// 1..=240.
+    pub endpoint: u8,
+    pub profile: u16,
+    pub device_id: u16,
+    pub version: u8,
+    pub in_clusters: Vec<u16, MAX_ENDPOINT_CLUSTERS>,
+    pub out_clusters: Vec<u16, MAX_ENDPOINT_CLUSTERS>,
+}
+
+/// Why `NWK_ADD_ENDPOINT` failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointError {
+    /// Endpoint outside 1..=240, or too many clusters (`INVALID_PARAMETER`).
+    InvalidParameter,
+    /// `max_host_endpoints` reached, or the ZDO registry is full
+    /// (`NO_SPACE`).
+    NoSpace,
+    /// Not supported by this port (`UNSUPPORTED_COMMAND`).
+    Unsupported,
 }

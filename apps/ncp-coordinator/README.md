@@ -27,10 +27,16 @@ composition; this crate has no board, product or vendor dependency.
   `DIAG_RESET_COUNTERS`.
 * NWK: `NWK_INIT` (resume; host frame-counter floors raise the durable
   reservations first), `NWK_FORM` (NCP-chosen identity only; joining stays
-  closed), `NWK_LEAVE_RESET`, `NWK_GET_INFO`, `NWK_PERMIT_JOIN`,
-  `EVT_NETWORK_STATE`, `EVT_DEVICE_JOINED` (from Device_annce).
-* DATA: `APS_DATA_REQUEST` → `EVT_APS_DATA_CONFIRM` (MAC/NWK delivery only),
-  `EVT_APS_DATA_INDICATION` for host endpoints (runtime `host-passthrough`).
+  closed), `NWK_LEAVE_RESET` (flags bit1 keeps host endpoints),
+  `NWK_GET_INFO`, `NWK_PERMIT_JOIN`, `NWK_ADD_ENDPOINT` (8 endpoints, ≤ 16 +
+  16 clusters, served by the ZDO server's Active_EP/Simple_Desc/Match_Desc),
+  `EVT_NETWORK_STATE`, `EVT_DEVICE_JOINED` (Trust Center decisions: join type,
+  admitted/denied), `EVT_DEVICE_LEFT` (NWK Leave with the rejoin bit, aged-out
+  children, parent reports, Trust Center removals).
+* DATA: `APS_DATA_REQUEST` → `EVT_APS_DATA_CONFIRM` (after the APS ACK
+  outcome for `ack_request` unicasts, else after the MAC/NWK transmission),
+  `EVT_APS_DATA_INDICATION` for host endpoints with last-hop RSSI, APS
+  security and key source (runtime `host-passthrough`).
 * SEC: `SEC_GET_NETWORK_KEY` (until `SEC_LOCK_KEY_EXPORT`),
   `SEC_GET_FRAME_COUNTERS`; one global outgoing APS counter with durable
   reservation (runtime `global-aps-counter`).
@@ -40,8 +46,8 @@ composition; this crate has no board, product or vendor dependency.
 
 TABLES (host paging), BULK backup/restore (OCB records), FW_* update, GP
 sink events/commands, host-supplied formation parameters (PAN/EPID/key/
-channel), `NWK_ADD_ENDPOINT` registry, retry cache, APS-ACK outcome in the
-confirm, `EVT_DEVICE_LEFT`, RSSI in indications, PTA, IEEE override, the
+channel), retry cache, `src_ep` validation against registered endpoints,
+`EVT_DEVICE_AUTHORIZED`, `EVT_ADDRESS_CHANGED`, PTA, IEEE override, the
 256-entry link-key / 512-entry address caches, 64 children and streamed TC
 snapshots.
 

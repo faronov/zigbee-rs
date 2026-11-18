@@ -1127,14 +1127,14 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | `0x0108` | `NWK_SET_TX_POWER` | `i8 dbm` | `i8 applied_dbm` | E (MAC PIB `PhyTransmitPower`) |
 | `0x0109` | `NWK_CONCENTRATOR` | `u8 mode (0 off, 1 low-RAM, 2 high-RAM), u16 min_s, u16 max_s, u8 radius` | — | P (NWK concentrator state exists) |
 | `0x010A` | `NWK_ACTIVE_SCAN` | `u32 channel_mask, u8 duration_exp` | `u8 n, n×{u8 channel, u16 pan, [8] epid, u16 src, u8 lqi, i8 rssi, u8 permit, u8 stack_profile, u8 update_id}` | P (`nlme_network_discovery`) |
-| `0x010B` | `NWK_ADD_ENDPOINT` | `u8 ep, u16 profile, u16 device_id, u8 version, u8 n_in, n_in×u16, u8 n_out, n_out×u16` | — (`NO_SPACE` beyond `max_host_endpoints`) | N (dynamic host-endpoint simple descriptors) |
+| `0x010B` | `NWK_ADD_ENDPOINT` | `u8 ep, u16 profile, u16 device_id, u8 version, u8 n_in, n_in×u16, u8 n_out, n_out×u16` | — (`NO_SPACE` beyond `max_host_endpoints`; `INVALID_PARAMETER` for `ep` outside 1..=240 or more than 16 clusters in a list) | E (`ZigbeeDevice::register_host_endpoint`: the ZDO registry the server answers from; `max_host_endpoints` = 8; registering an endpoint again replaces it, including the product profile's endpoint with that number; registrations are RAM only and cleared by `NWK_LEAVE_RESET` without flags bit1) |
 | `0x010C` | `NWK_SET_MANUFACTURER_CODE` | `u16 code` | — | P (node descriptor field) |
 | `0x010D` | `NWK_GROUP_MEMBERSHIP` | `u8 op (1 add, 2 remove, 3 clear), u16 group, u8 ep` | — | E (APS group table, 16 groups × 8 endpoints) |
 | `0x010E` | `NWK_REMOVE_DEVICE` | `u16 nwk, [8] ieee, u8 flags (bit0 rejoin, bit1 remove children, bit2 TC remove via parent)` | — | E (TC Remove-Device/leave journal) + P |
 | `0x0180` | `EVT_NETWORK_STATE` | `u8 state (0 down, 1 forming, 2 up, 3 leaving), u8 reason, u8 zb_status, u16 req_tid` | event | N |
-| `0x0181` | `EVT_DEVICE_JOINED` | `u16 nwk, [8] ieee, u16 parent_nwk, u8 join_type (0 association, 1 secured rejoin, 2 unsecured/TC rejoin, 3 direct), u8 capability, u8 decision (0 admitted, 1 denied)` | event | P (TC `handle_update_device` and association exist; the event surface is N) |
+| `0x0181` | `EVT_DEVICE_JOINED` | `u16 nwk, [8] ieee, u16 parent_nwk, u8 join_type (0 association, 1 secured rejoin, 2 unsecured/TC rejoin, 3 direct), u8 capability, u8 decision (0 admitted, 1 denied)` | event | E (`TrustCenterHostEvent::Joined`: one event per Trust Center Update-Device join decision, through any parent including the NCP itself; `capability` is reconstructed from the neighbour entry for a child of the NCP and 0 for a device that joined through another parent; `parent_nwk` `0xFFFF` when unknown. `Device_annce` is forwarded as an indication, not as this event) |
 | `0x0182` | `EVT_DEVICE_AUTHORIZED` | `u16 nwk, [8] ieee, u8 result (0 key delivered, 1 TCLK verified, 2 failed), u8 link_key_type` | event | P |
-| `0x0183` | `EVT_DEVICE_LEFT` | `u16 nwk, [8] ieee, u8 flags (bit0 rejoin, bit1 removed by TC, bit2 reported by parent), u8 reason` | event | P |
+| `0x0183` | `EVT_DEVICE_LEFT` | `u16 nwk, [8] ieee, u8 flags (bit0 rejoin, bit1 removed by TC, bit2 reported by parent), u8 reason (0 unknown, 1 NWK Leave heard by the NCP, 2 parent's Update-Device "device left", 3 Trust Center removal, 4 child of the NCP aged out)` | event | E (NWK Leave indications of neighbours with the rejoin bit and aged-out children: `NwkLayer::take_host_departure`; parent reports and removals: `TrustCenterHostEvent`; `ieee` all zero when unknown. A child of the NCP is reported once, from its Leave) |
 | `0x0184` | `EVT_ADDRESS_CHANGED` | `[8] ieee, u16 old_nwk, u16 new_nwk, u8 cause (0 announce, 1 conflict)` | event | P |
 | `0x0185` | `EVT_ROUTE_RECORD` | `u16 src_nwk, [8] src_ieee (0 if unknown), u8 n, n×u16 relays` (Route Record order: entry 0 is nearest the originator) | event | P (route-record receive exists) |
 | `0x0186` | `EVT_NWK_STATUS` | `u16 dst, u8 nwk_status, u16 reporter` | event | P |
@@ -1178,6 +1178,14 @@ u8 aps_counter, u16 dst_nwk, u8 flags (bit0 APS ACK received, bit1 via source
 route, bit2 route discovery done), u16 elapsed_ms`. `status` is `SUCCESS` or
 `FAILURE`. `zb_status` carries the Zigbee reason.
 
+For a unicast with `tx_options` bit0 the confirm waits for the APS ACK: it
+follows once the ACK arrives (`SUCCESS`, flags bit0) or once the APS retries
+are exhausted, the ACK tracking was evicted by newer acknowledged sends, or
+the network was reset (`FAILURE`, `zb_status` `0xA7` NO_ACK). The NCP keeps
+running the stack meanwhile (`ApsLayer::last_ack_handle` + `ack_status`).
+`elapsed_ms` then counts from the transmission. Group and broadcast frames,
+and frames without bit0, are confirmed after the MAC/NWK transmission.
+
 `EVT_APS_DATA_INDICATION` (`0x0280`):
 
 | Offset | Size | Field |
@@ -1200,10 +1208,11 @@ route, bit2 route discovery done), u16 elapsed_ms`. `status` is `SUCCESS` or
 | 30 | 2 | `asdu_len` |
 | 32 | n | `asdu` |
 
-Map: **E** for most fields (`ApsdeDataIndication`). **N** for `rssi`,
-`last_hop_nwk`, the IEEE lookup and the host-endpoint passthrough:
-indications for host endpoints currently go to the compile-time ZCL
-dispatcher, and a raw passthrough sink is new runtime work.
+Map: **E** (runtime `host-passthrough`). `rssi` is the received signal
+strength of the last hop as measured by the radio (`zigbee-mac` `rx-rssi`:
+the ESP32-H2/C6/C5 PHY; `-128` on backends that do not measure it). Flags
+bit0 and `key_source` come from the APS layer's verification of the frame
+(`ApsLayer::last_rx_security`), independently of bit1.
 
 ### 7.4 ZDO (`0x03xx`, endpoint 2)
 
