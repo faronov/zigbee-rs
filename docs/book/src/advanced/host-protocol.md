@@ -379,6 +379,11 @@ cache for milliseconds.
   - a COBS code byte pointing past the end of the frame;
   - a decoded length different from `8 + len + 4`;
   - a CRC mismatch.
+- **Canonical encoding.** Encoders emit the *minimal* COBS form: when the
+  data ends exactly after a full 254-byte block, that block's `0xFF` code
+  closes the frame and no empty `0x01` block follows (254 non-zero bytes
+  encode to 255 bytes, not 256). Decoders must also accept the non-minimal
+  form with that trailing `0x01` code (`cobs.json`, `decode_only`).
 - Worst-case overhead: for a decoded frame of `n` bytes the encoding is at
   most `n + ⌈n/254⌉` bytes, plus 1 delimiter. With the maximum `n = 652`
   (8 header + 640 payload + 4 CRC) the maximum wire size is **656 bytes**
