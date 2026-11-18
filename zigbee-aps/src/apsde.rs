@@ -3955,7 +3955,13 @@ mod tests {
             nib.outgoing_frame_counter_limit = 0x1000;
         }
         nwk.security_mut().set_network_key(TEST_NETWORK_KEY, 0);
-        ApsLayer::new(nwk)
+        #[allow(unused_mut)]
+        let mut aps = ApsLayer::new(nwk);
+        // With `global-aps-counter` APS security needs the coordinator's
+        // durable reservation; tests stand in for it.
+        #[cfg(feature = "global-aps-counter")]
+        assert!(aps.security_mut().set_global_outgoing_counter(0, 0x1000));
+        aps
     }
 
     #[cfg(feature = "router")]
@@ -4317,6 +4323,7 @@ mod tests {
     #[cfg(feature = "global-aps-counter")]
     fn global_aps_counter_refuses_every_secured_send_until_installed() {
         let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        aps.security_mut().clear_global_outgoing_counter();
         aps.nwk_mut()
             .nib_mut()
             .set_frame_counter_reservation(0x2000, 0x2400);
@@ -4337,6 +4344,7 @@ mod tests {
     #[cfg(feature = "global-aps-counter")]
     fn global_aps_counter_is_shared_by_every_key_and_leaves_per_key_counters_alone() {
         let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
+        aps.security_mut().clear_global_outgoing_counter();
         aps.nwk_mut()
             .nib_mut()
             .set_frame_counter_reservation(0x2000, 0x2400);
@@ -4409,7 +4417,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "router")]
+    // Per-key / NWK-shared counter semantics; `global-aps-counter` replaces
+    // them (see the `global_aps_counter_*` tests).
+    #[cfg(all(feature = "router", not(feature = "global-aps-counter")))]
     fn installed_default_tc_keys_share_the_durable_global_counter() {
         let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
         let first = [0x11; 8];
@@ -5056,7 +5066,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "router")]
+    // Per-key / NWK-shared counter semantics; `global-aps-counter` replaces
+    // them (see the `global_aps_counter_*` tests).
+    #[cfg(all(feature = "router", not(feature = "global-aps-counter")))]
     fn confirm_key_success_uses_the_candidate_key_and_resets_only_a_stale_floor() {
         let mut aps = aps_node(DeviceType::Coordinator, ShortAddress::COORDINATOR);
         aps.aib_mut().aps_trust_center_address = LOCAL_IEEE;
@@ -8271,7 +8283,9 @@ mod tests {
     /// degrade into replaying the previous ciphertext: the retry is dropped
     /// and the transaction released instead.
     #[test]
-    #[cfg(feature = "router")]
+    // Per-key / NWK-shared counter semantics; `global-aps-counter` replaces
+    // them (see the `global_aps_counter_*` tests).
+    #[cfg(all(feature = "router", not(feature = "global-aps-counter")))]
     fn a_retransmission_is_dropped_when_no_fresh_counter_can_be_reserved() {
         // Reservation of exactly one counter: the original send consumes it.
         let (mut aps, _link_key) = secured_unicast_node(1);

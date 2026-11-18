@@ -528,7 +528,12 @@ mod tests {
             nib.outgoing_frame_counter_limit = 0x1000;
         }
         nwk.security_mut().set_network_key(NETWORK_KEY, 0);
-        ApsLayer::new(nwk)
+        #[allow(unused_mut)]
+        let mut aps = ApsLayer::new(nwk);
+        // `global-aps-counter`: stand in for the coordinator's reservation.
+        #[cfg(feature = "global-aps-counter")]
+        assert!(aps.security_mut().set_global_outgoing_counter(0, 0x1000));
+        aps
     }
 
     fn options(security_enabled: bool, ack_request: bool) -> ApsTxOptions {
