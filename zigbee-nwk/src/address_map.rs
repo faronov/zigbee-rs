@@ -24,7 +24,7 @@ use zigbee_types::{IeeeAddress, ShortAddress};
 /// cache exactly as before and the address map has zero capacity — keeping
 /// the sleepy end-device image lean.
 #[cfg(feature = "router")]
-pub const MAX_ADDRESS_MAP_ENTRIES: usize = 32;
+pub const MAX_ADDRESS_MAP_ENTRIES: usize = crate::ncp_capacity(32, 512);
 #[cfg(not(feature = "router"))]
 pub const MAX_ADDRESS_MAP_ENTRIES: usize = 0;
 
@@ -170,14 +170,20 @@ mod tests {
     #[test]
     fn a_full_map_evicts_the_least_recently_updated_pair() {
         let mut map = AddressMap::new();
+        // Distinct IEEE per entry even when the map holds more than 255.
+        let ieee = |i: u16| {
+            let [lo, hi] = (i + 1).to_le_bytes();
+            [lo, hi, 1, 1, 1, 1, 1, 1]
+        };
         for i in 0..MAX_ADDRESS_MAP_ENTRIES as u16 {
-            map.update(ShortAddress(i + 1), [i as u8 + 1; 8]);
+            map.update(ShortAddress(i + 1), ieee(i));
         }
+        assert_eq!(map.len(), MAX_ADDRESS_MAP_ENTRIES);
         // Refresh the oldest pair so the second one becomes the oldest.
-        map.update(ShortAddress(1), [1; 8]);
+        map.update(ShortAddress(1), ieee(0));
         map.update(ShortAddress(0x7777), [0x77; 8]);
         assert_eq!(map.len(), MAX_ADDRESS_MAP_ENTRIES);
-        assert_eq!(map.ieee_of(ShortAddress(1)), Some([1; 8]));
+        assert_eq!(map.ieee_of(ShortAddress(1)), Some(ieee(0)));
         assert_eq!(map.ieee_of(ShortAddress(2)), None);
         assert_eq!(map.ieee_of(ShortAddress(0x7777)), Some([0x77; 8]));
     }

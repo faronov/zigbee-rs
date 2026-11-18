@@ -18,6 +18,11 @@ router = []
 trace = []
 # Green Power alias transmission (GP 1.1 A.3.6.3.3). Off by default.
 green-power = []
+# Coordinator network co-processor table sizes (ZRHP spec 8.2/8.9):
+# neighbor table 96 (64 children), address map 512, source-route cache 128,
+# indirect queue 16 frames, NWK replay-floor table 128 and a NIB default of
+# `max_children = 64`. Off by default: images without it are unchanged.
+ncp-capacity = ["router"]
 
 [dev-dependencies]
 zigbee-mac = { version = "0.1.0", path = "../zigbee-mac", features = ["mock"] }
