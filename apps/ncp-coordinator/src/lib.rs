@@ -18,11 +18,13 @@
 
 pub mod log_ring;
 pub mod ncp;
+pub mod platform;
 pub mod port;
 pub mod tc;
 pub mod transport;
 
 pub use log_ring::LogRing;
 pub use ncp::{Ncp, NcpIdentity, PlatformRequest};
+pub use platform::{NcpPlatform, NoPlatform};
 pub use port::CoordinatorPort;
 pub use transport::HostTransport;
