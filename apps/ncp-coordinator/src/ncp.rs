@@ -92,6 +92,10 @@ pub struct NcpIdentity {
     pub max_children: u32,
     /// TC device table size (`max_tc_devices`).
     pub max_tc_devices: u32,
+    /// `false` when the partition table does not fit the fitted flash: the
+    /// NCP answers `SYS_*` but refuses to start the stack (spec 11.5) and
+    /// reports `EVT_FATAL` after every handshake.
+    pub stack_allowed: bool,
 }
 
 /// What the platform must do after [`Ncp::service`].
@@ -360,6 +364,14 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                         port,
                     );
                     push_event(&mut self.queues, &mut self.event_seq, &ready);
+                    if !self.identity.stack_allowed {
+                        let fatal = zigbee_zrhp::msg::system::EvtFatal {
+                            kind: 1,
+                            code: self.identity.flash_size,
+                            text: Bytes8(b"layout mismatch"),
+                        };
+                        push_event(&mut self.queues, &mut self.event_seq, &fatal);
+                    }
                 }
                 LinkEvent::PeerReset { .. } | LinkEvent::LinkDown | LinkEvent::LinkFailed => {
                     self.negotiated = false;
@@ -451,6 +463,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             return;
         }
         if !*state.negotiated && id != ids::SYS_NEGOTIATE {
+            status_only(queues, Status::InvalidState);
+            return;
+        }
+        if !state.identity.stack_allowed && matches!(id, ids::NWK_INIT | ids::NWK_FORM) {
             status_only(queues, Status::InvalidState);
             return;
         }

@@ -126,6 +126,7 @@ dependencies = [
  "pollster",
  "router-app",
  "zigbee-aps",
+ "zigbee-bdb",
  "zigbee-mac",
  "zigbee-runtime",
  "zigbee-types",

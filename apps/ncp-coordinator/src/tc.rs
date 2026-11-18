@@ -118,11 +118,13 @@ pub struct TcPort<A: TcApp> {
     formed: bool,
     events: Deque<DeviceEvent, 8>,
     clock_ms: fn() -> u32,
+    ieee: [u8; 8],
 }
 
 impl<A: TcApp> TcPort<A> {
+    /// `ieee`: the radio's EUI-64 (the NIB only learns it at start);
     /// `clock_ms`: monotonic milliseconds for indication timestamps.
-    pub fn new(mut app: A, clock_ms: fn() -> u32) -> Self {
+    pub fn new(mut app: A, ieee: [u8; 8], clock_ms: fn() -> u32) -> Self {
         let formed = commissioned(&mut app);
         Self {
             app,
@@ -130,6 +132,7 @@ impl<A: TcApp> TcPort<A> {
             formed,
             events: Deque::new(),
             clock_ms,
+            ieee,
         }
     }
 
@@ -217,7 +220,7 @@ fn commissioned<A: TcApp>(app: &mut A) -> bool {
 
 impl<A: TcApp> CoordinatorPort for TcPort<A> {
     fn ieee(&self) -> [u8; 8] {
-        self.app.device().aps().nwk().nib().ieee_address
+        self.ieee
     }
 
     fn state(&self) -> NetworkState {
@@ -241,7 +244,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             channel: nib.logical_channel,
             channel_mask: device.bdb().attributes().primary_channel_set.0,
             short: nib.network_address.0,
-            ieee: nib.ieee_address,
+            ieee: self.ieee,
             nwk_update_id: nib.update_id,
             nwk_manager: nib.nwk_manager_addr.0,
             key_seq: nwk.security().active_key().map_or(0, |key| key.seq_number),
@@ -346,13 +349,20 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             .initialize()
             .await
             .map_err(|_| OpError::Zigbee(0x01))?;
-        self.running = true;
         self.formed = commissioned(&mut self.app);
-        if self.app.device().is_joined() {
-            Ok(())
-        } else {
-            Err(OpError::Zigbee(0x01))
+        if !self.app.device().is_joined() {
+            // Formation failed: no stack to step; the host may retry.
+            return Err(OpError::Zigbee(0x01));
         }
+        self.running = true;
+        // BDB formation opens permit joining; on an NCP only the host opens
+        // it (NWK_PERMIT_JOIN). Closed before the first receive step.
+        self.app
+            .device_mut()
+            .permit_joining(0)
+            .await
+            .map_err(|status| OpError::Zigbee(status as u8))?;
+        Ok(())
     }
 
     async fn permit_join(&mut self, duration_s: u8, target: u16) -> Result<(), OpError> {

@@ -236,6 +236,7 @@ fn identity() -> NcpIdentity {
         key_export: true,
         max_children: 32,
         max_tc_devices: 32,
+        stack_allowed: true,
     }
 }
 
@@ -299,7 +300,7 @@ fn host_negotiates_forms_reads_counters_and_sends_data() {
         RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
     )
     .unwrap();
-    let mut port = TcPort::new(app, clock_ms);
+    let mut port = TcPort::new(app, IEEE, clock_ms);
     let log = LogRing::<8>::new();
     let mut pipe = Pipe::default();
     let mut now = 1_000u64;
@@ -364,6 +365,11 @@ fn host_negotiates_forms_reads_counters_and_sends_data() {
     let state: EvtNetworkState = host.event(ids::EVT_NETWORK_STATE).unwrap().event();
     assert_eq!((state.state, state.req_tid), (2, form));
     assert_eq!(port.state() as u8, 2);
+    assert_eq!(
+        port.permit_join_remaining_s(),
+        0,
+        "formation leaves joining closed"
+    );
 
     // Forming again while a network exists: INVALID_STATE.
     let again = host.request(&NwkForm {
