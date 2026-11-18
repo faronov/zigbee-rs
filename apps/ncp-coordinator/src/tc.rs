@@ -126,6 +126,7 @@ impl<A: TcApp> TcPort<A> {
     /// `clock_ms`: monotonic milliseconds for indication timestamps.
     pub fn new(mut app: A, ieee: [u8; 8], clock_ms: fn() -> u32) -> Self {
         let formed = commissioned(&mut app);
+        crate::gp::reset_defaults(&mut app);
         Self {
             app,
             running: false,
@@ -449,6 +450,10 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         self.running = false;
         self.formed = false;
         Ok(())
+    }
+
+    fn gp(&mut self) -> Option<&mut dyn crate::gp::GpPort> {
+        Some(self)
     }
 }
 

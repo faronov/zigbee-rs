@@ -9,6 +9,8 @@
 //! * [`transport::HostTransport`] — the non-blocking byte stream the
 //!   product provides (ESP32-H2: USB-Serial-JTAG or UART with DMA receive).
 //! * [`log_ring::LogRing`] — UTF-8 records for the LOG endpoint.
+//! * [`gp`] — the GREEN POWER group over the runtime's GP combo (sink mode
+//!   switch, Sink/Proxy Table access, `EVT_GP_*`).
 //!
 //! Validation: host-tested against the zigbee-zrhp host link over an
 //! in-memory pipe with a mock MAC (`tests/`). Nothing here has run on
@@ -16,6 +18,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod gp;
 pub mod log_ring;
 pub mod ncp;
 pub mod platform;

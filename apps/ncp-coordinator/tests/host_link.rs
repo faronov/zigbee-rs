@@ -289,10 +289,11 @@ fn aps_request(
 #[test]
 fn host_negotiates_forms_reads_counters_and_sends_data() {
     let mut security = RamSecurityStateStore::new();
+    let mut gp_store = zigbee_runtime::gp_store::RamGpProxyStore::new();
     let mut profile = profile();
     let mut device = device(&profile);
     let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
-    let app = TrustCenterCoordinatorApp::new(
+    let mut app = TrustCenterCoordinatorApp::new(
         node,
         PersistentChildren::new(RamChildTableStore::new()),
         RamTrustCenterDeviceStore::new(),
@@ -300,6 +301,8 @@ fn host_negotiates_forms_reads_counters_and_sends_data() {
         RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
     )
     .unwrap();
+    // The NCP runs the GP combo; its tables need a store.
+    app.set_green_power_store(&mut gp_store);
     let mut port = TcPort::new(app, IEEE, clock_ms);
     let log = LogRing::<8>::new();
     let mut pipe = Pipe::default();

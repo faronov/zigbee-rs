@@ -217,4 +217,10 @@ pub trait CoordinatorPort {
     async fn send(&mut self, request: &DataRequest) -> Result<DataConfirm, OpError>;
     /// Leave and wipe the network state (`NWK_LEAVE_RESET`).
     async fn leave_reset(&mut self) -> Result<(), OpError>;
+
+    /// The Green Power combo (spec 7.11), `None` when this stack runs none
+    /// (the GREEN POWER commands are then `UNSUPPORTED_COMMAND`).
+    fn gp(&mut self) -> Option<&mut dyn crate::gp::GpPort> {
+        None
+    }
 }
