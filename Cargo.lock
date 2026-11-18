@@ -2187,6 +2187,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-zrhp"
+version = "0.1.0"
+
+[[package]]
 name = "zrs-boot-core"
 version = "0.1.0"
 dependencies = [
