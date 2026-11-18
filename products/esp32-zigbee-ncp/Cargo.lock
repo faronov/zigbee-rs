@@ -499,7 +499,7 @@ dependencies = [
  "esp32",
  "esp32c2",
  "esp32c3",
- "esp32c6",
+ "esp32c6 0.22.0",
  "esp32h2 0.18.0",
  "esp32s2",
  "esp32s3",
@@ -524,6 +524,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e025a7a7a0affdb4ff913b5c4494aef96ee03d085bf83c27453ae3a71d50da6"
 dependencies = [
  "document-features",
+ "object",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -562,6 +563,7 @@ checksum = "e933ff78374b763b65998b64ad671b4890ed4ba13a80deff9f53afe95ede289d"
 dependencies = [
  "document-features",
  "esp-metadata-generated 0.5.3",
+ "esp32c6 0.24.0",
  "esp32h2 0.20.0",
 ]
 
@@ -659,6 +661,8 @@ dependencies = [
  "esp-storage",
  "esp-thread-br-h2",
  "esp32-zigbee-devkit-product",
+ "ncp-coordinator-app",
+ "router-app",
  "zigbee-runtime",
 ]
 
@@ -689,6 +693,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f5e511df672d79cd63365c92045135e01ba952b6bddd25b660baff5e1110f6b"
 dependencies = [
  "critical-section",
+ "vcell",
+]
+
+[[package]]
+name = "esp32c6"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a207a5d6886ca89b4f220606dcf3779ca869803df192508314939186ae8de1ee"
+dependencies = [
  "vcell",
 ]
 
@@ -932,12 +945,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d5439c4ad607c3c23abf66de8c8bf57ba8adcd1f129e699851a6e43935d339d"
 
 [[package]]
+name = "ncp-coordinator-app"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "heapless 0.9.4",
+ "log",
+ "router-app",
+ "zigbee-aps",
+ "zigbee-bdb",
+ "zigbee-mac",
+ "zigbee-runtime",
+ "zigbee-types",
+ "zigbee-zrhp",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "object"
+version = "0.37.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -1055,6 +1093,16 @@ name = "riscv-target-parser"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1376b15f3ff160e9b1e8ea564ce427f2f6fcf77528cc0a8bf405cb476f9cea7"
+
+[[package]]
+name = "router-app"
+version = "0.1.0"
+dependencies = [
+ "zigbee-aps",
+ "zigbee-mac",
+ "zigbee-nwk",
+ "zigbee-runtime",
+]
 
 [[package]]
 name = "rustversion"
@@ -1362,15 +1410,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zigbee-gp"
-version = "0.1.0"
-dependencies = [
- "heapless 0.9.4",
- "zigbee-crypto",
- "zigbee-types",
-]
-
-[[package]]
 name = "zigbee-mac"
 version = "0.1.0"
 dependencies = [
@@ -1395,12 +1434,12 @@ dependencies = [
 name = "zigbee-runtime"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
  "embedded-storage",
  "heapless 0.9.4",
  "log",
  "zigbee-aps",
  "zigbee-bdb",
- "zigbee-gp",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-types",
@@ -1432,3 +1471,7 @@ dependencies = [
  "zigbee-nwk",
  "zigbee-types",
 ]
+
+[[package]]
+name = "zigbee-zrhp"
+version = "0.1.0"

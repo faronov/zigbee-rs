@@ -19,33 +19,57 @@
 
 #![cfg_attr(not(test), no_std)]
 
-#[cfg(all(target_os = "none", not(feature = "esp32h2")))]
-compile_error!("the ZRHP NCP product supports the ESP32-H2 only (enable esp32h2)");
+#[cfg(all(target_os = "none", not(any(feature = "esp32h2", feature = "esp32c6"))))]
+compile_error!("select the chip: esp32h2 or esp32c6");
+#[cfg(all(feature = "esp32h2", feature = "esp32c6"))]
+compile_error!("select exactly one chip: esp32h2 or esp32c6");
+#[cfg(all(
+    feature = "esp32c6",
+    any(feature = "thread-br-h2", feature = "waveshare-h2-zero")
+))]
+compile_error!("the selected board carries an ESP32-H2");
 #[cfg(all(feature = "thread-br-h2", feature = "waveshare-h2-zero"))]
 compile_error!("select one board");
 
 #[cfg(target_os = "none")]
 pub mod flash;
 pub mod flash_size;
+#[cfg(target_os = "none")]
+pub mod host;
 pub mod layout;
 #[cfg(target_os = "none")]
 pub mod stores;
 pub mod transport;
 
 pub const MANUFACTURER: &str = "Zigbee-RS";
+#[cfg(not(feature = "esp32c6"))]
 pub const MODEL: &str = "ESP32-H2-NCP";
-/// `SYS_NEGOTIATE.chip`: 1 = ESP32-H2.
-pub const CHIP: u8 = 1;
+#[cfg(feature = "esp32c6")]
+pub const MODEL: &str = "ESP32-C6-NCP";
+/// `SYS_NEGOTIATE.chip`: 1 = ESP32-H2, 2 = ESP32-C6.
+pub const CHIP: u8 = if cfg!(feature = "esp32c6") { 2 } else { 1 };
 /// `SYS_GET_INFO.board`.
 pub const BOARD_NAME: &str = if cfg!(feature = "thread-br-h2") {
     "esp-thread-br-zigbee-gw"
 } else if cfg!(feature = "waveshare-h2-zero") {
     "waveshare-esp32-h2-zero"
+} else if cfg!(feature = "esp32c6") {
+    "esp32-c6-devkit"
 } else {
     "esp32-h2-devkitm-1"
 };
 /// `SYS_GET_INFO.product`.
 pub const PRODUCT_NAME: &str = "zigbee-rs-ncp";
+
+/// Coordinator lifecycle policy: 2 ms receive slices so the host link is
+/// serviced at least every ~2 ms (ZRHP `ack_delay` 1 ms, spec 5.8).
+#[cfg(target_os = "none")]
+pub static POLICY: router_app::RouterPolicy = router_app::RouterPolicy {
+    max_receive_slice_us: 2_000,
+    join_retry_initial_ms: 5_000,
+    join_retry_max_ms: 60_000,
+    secure_rejoin_failure_limit: 0,
+};
 
 /// Security-journal role tag of the coordinator NCP. The devkit images use
 /// 0x5201 (router) and 0x5202 (end device); the NCP journal lives in its own

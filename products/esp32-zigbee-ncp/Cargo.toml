@@ -29,7 +29,14 @@ esp-thread-br-h2 = { path = "../../boards/esp-thread-br-h2", optional = true }
 esp32-zigbee-devkit-product = { path = "../esp32-zigbee-devkit" }
 esp-serial-stream = { path = "../../esp-serial-stream" }
 esp-hal = { version = "=1.0.0", features = ["unstable"] }
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["trust-center", "green-power"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = [
+    "centralized-tclk",
+    "trust-center",
+    "global-aps-counter",
+    "host-passthrough",
+] }
+router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter"] }
+ncp-coordinator-app = { path = "../../apps/ncp-coordinator" }
 
 [features]
 default = []
@@ -38,6 +45,14 @@ esp32h2 = [
     "esp32-zigbee-devkit-product/esp32h2",
     "esp-serial-stream/esp32h2",
     "esp-hal/esp32h2",
+]
+# ESP32-C6 variant (same 802.15.4 block; USB-Serial-JTAG transport). Lab
+# bring-up target with the 4 MB layout.
+esp32c6 = [
+    "esp-storage/esp32c6",
+    "esp32-zigbee-devkit-product/esp32c6",
+    "esp-serial-stream/esp32c6",
+    "esp-hal/esp32c6",
 ]
 # Host transport, exactly one per image (spec 11.4).
 transport-usj = []
