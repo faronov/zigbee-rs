@@ -210,8 +210,11 @@ impl NwkHeader {
             let relay_index = data[offset + 1];
             offset += 2;
             let relay_count_usize = relay_count as usize;
-            if relay_count == 0
-                || relay_index >= relay_count
+            // An empty relay list (count 0, index 0) is sent by some
+            // coordinators (Telink zb_sdk sample gateway) for a destination
+            // one hop away; it is a direct delivery and is accepted.
+            let empty = relay_count == 0 && relay_index == 0;
+            if (!empty && relay_index >= relay_count)
                 || relay_count_usize > 16
                 || data.len() < offset + relay_count_usize * 2
             {
@@ -1006,8 +1009,8 @@ mod tests {
             &[0x08, 0x04, 1, 0, 2, 0, 5, 1],
             // Missing relay index.
             &[0x08, 0x04, 1, 0, 2, 0, 5, 1, 1],
-            // Empty relay list.
-            &[0x08, 0x04, 1, 0, 2, 0, 5, 1, 0, 0],
+            // Empty relay list with a non-zero index.
+            &[0x08, 0x04, 1, 0, 2, 0, 5, 1, 0, 1],
             // Relay index outside the list.
             &[0x08, 0x04, 1, 0, 2, 0, 5, 1, 1, 1, 3, 0],
             // Truncated relay list.
@@ -1017,6 +1020,21 @@ mod tests {
         for frame in malformed {
             assert!(NwkHeader::parse(frame).is_none(), "{frame:02X?}");
         }
+    }
+
+    #[test]
+    fn accepts_an_empty_source_route_as_direct_delivery() {
+        // Telink zb_sdk gateway: source-route flag, relay count 0, index 0,
+        // followed by the payload.
+        let frame: &[u8] = &[0x48, 0x04, 0x74, 0xF3, 0x00, 0x00, 0x1E, 0x28, 0, 0, 0xAA];
+        let (hdr, consumed) = NwkHeader::parse(frame).unwrap();
+        let sr = hdr.source_route.as_ref().unwrap();
+        assert_eq!((sr.relay_count, sr.relay_index), (0, 0));
+        assert!(sr.relay_list.is_empty());
+        assert_eq!(consumed, frame.len() - 1);
+        let mut out = [0u8; 16];
+        let n = hdr.serialize(&mut out);
+        assert_eq!(&out[..n], &frame[..consumed]);
     }
 
     #[test]

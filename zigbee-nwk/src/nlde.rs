@@ -4535,6 +4535,12 @@ fn process_source_route(
 ) -> Result<(ShortAddress, u8), NwkStatus> {
     let idx = sr.relay_index as usize;
 
+    // An empty relay list (accepted by the parser only with index 0) names
+    // no relay: the destination is the next hop.
+    if sr.relay_list.is_empty() {
+        return Ok((dst_addr, 0));
+    }
+
     // An index past the end cannot name a relay in this subframe.
     if idx >= sr.relay_list.len() {
         log::warn!(
@@ -4592,6 +4598,19 @@ mod tests {
     use zigbee_types::{MacAddress, PanId, ShortAddress};
 
     const OUR_ADDR: ShortAddress = ShortAddress(0x1111);
+
+    #[test]
+    fn empty_source_route_delivers_directly_to_the_destination() {
+        let sr = crate::frames::SourceRoute {
+            relay_count: 0,
+            relay_index: 0,
+            relay_list: heapless::Vec::new(),
+        };
+        assert_eq!(
+            process_source_route(&sr, OUR_ADDR, ShortAddress(0x2222)),
+            Ok((ShortAddress(0x2222), 0))
+        );
+    }
     const PEER: ShortAddress = ShortAddress(0x3333);
     const FAR: ShortAddress = ShortAddress(0x2222);
     const NEXT_HOP: ShortAddress = ShortAddress(0x4444);
