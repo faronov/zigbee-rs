@@ -63,6 +63,9 @@ jobs:
         run: python3 -m unittest discover -s tools -p 'test_bl702_stack_gate.py' -v
       - name: Test BL702 loader soak monitor
         run: python3 -m unittest discover -s tools -p 'test_bl702_soak_monitor.py' -v
+      # ZRHP golden vectors must match their generator (spec 14.1).
+      - name: Check ZRHP vectors are up to date
+        run: python3 docs/book/src/advanced/host-protocol-vectors/generate.py --check
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -457,6 +460,7 @@ jobs:
       - run: cargo clippy -p zigbee-zcl --no-default-features --features float64 --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --all-targets --features green-power --locked -- -D warnings
       - run: cargo clippy -p zigbee-nwk --all-targets --features router,green-power --locked -- -D warnings
+      - run: cargo clippy -p zigbee-zrhp --all-targets --all-features --locked -- -D warnings
 
   fmt:
     name: Format
@@ -538,6 +542,28 @@ jobs:
           cargo fmt --manifest-path boards/pb03f-kit/Cargo.toml -- --check
           cargo fmt --manifest-path products/pb03f-kit/Cargo.toml -- --check
           cargo fmt --manifest-path examples/pb03f-kit/Cargo.toml -- --check
+
+  # The shared ZRHP crate must stay no_std/allocation-free on the NCP
+  # (ESP32-H2, riscv32imac) and on small Cortex-M parts.
+  zrhp-no-std:
+    name: ZRHP no_std (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [riscv32imac-unknown-none-elf, thumbv6m-none-eabi]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}-zrhp-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo build -p zigbee-zrhp --target ${{ matrix.target }} --release --locked
+      - run: cargo clippy -p zigbee-zrhp --target ${{ matrix.target }} --locked -- -D warnings
 
   doc:
     name: Doc
