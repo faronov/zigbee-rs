@@ -49,6 +49,8 @@ pub mod platform;
 // The devkit product's MMU running-slot evidence, compiled against this
 // product's `crate::layout` (the NCP slot addresses). The file also carries
 // ESP32-C5 paths behind a feature this product does not have.
+#[cfg(test)]
+mod gp_journal_tests;
 #[cfg(feature = "pta")]
 pub mod pta;
 #[cfg(any(target_os = "none", test))]

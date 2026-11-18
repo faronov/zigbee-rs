@@ -28,10 +28,14 @@ zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, feat
     "global-aps-counter",
     "host-passthrough",
     "ncp-capacity",
+    # GP combo: Sink Table 16 / Proxy Table 8 in the `zbnv` GP journal.
+    "green-power-ncp",
 ] }
 ncp-coordinator-app = { path = "../../apps/ncp-coordinator" }
 
 [dev-dependencies]
+# GP journal geometry tests (`gp_journal_tests`).
+zigbee-gp = { path = "../../zigbee-gp", features = ["sink"] }
 # Signs test envelopes (host tests of the FW_* signature policy).
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 

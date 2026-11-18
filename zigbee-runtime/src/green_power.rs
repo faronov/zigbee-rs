@@ -59,9 +59,9 @@ pub const GP_TX_QUEUE_DEPTH: usize = 4;
 /// The router's Green Power proxy.
 pub type GpProxy = Proxy<GP_PROXY_TABLE_ENTRIES, GP_TX_QUEUE_DEPTH>;
 
-/// Sink Table capacity of a combo built with `green-power-sink`.
+/// Sink Table capacity of a combo (`green-power-sink`): 8, or 16 with `ncp-capacity`.
 #[cfg(feature = "green-power-sink")]
-pub const GP_SINK_TABLE_ENTRIES: usize = 8;
+pub const GP_SINK_TABLE_ENTRIES: usize = crate::ncp_capacity(8, 16);
 /// Queued sink transmissions (GP Pairing, Proxy Commissioning Mode, GP
 /// Response, responses, alias `Device_annce`).
 #[cfg(feature = "green-power-sink")]
@@ -577,14 +577,14 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             }
             _ => log::info!("[GP] GPDF {:?}: {:?}", frame.header.gpd_id, outcome),
         }
-        // Combo: the sink processes the GPDF itself; it is not tunnelled to
-        // this node.
+        // Combo: the sink processes the GPDF itself (never tunnelled to us).
         #[cfg(feature = "green-power-sink")]
-        {
+        if self.gp_sink_enabled() {
             self.gp_sink_sync();
             let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
             let outcome = self.green_power.sink.on_gpdf(mac, &frame, now_ms);
             gp_log_sink_outcome(frame.header.gpd_id, outcome);
+            self.gp_sink_report_gpdf(&frame, outcome, indication.lqi);
             self.gp_sink_apply_groups();
         }
     }
@@ -920,7 +920,7 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                 Some(frame) => frame,
                 None => {
                     let now_ms = self.gp_now_ms();
-                    let tx = self.green_power.proxy.poll(now_ms);
+                    let tx = self.gp_proxy_poll(now_ms);
                     self.gp_log_commissioning_timeout();
                     let Some(tx) = tx else {
                         break;
@@ -1353,7 +1353,7 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         {
             Ok((status, outcome)) => {
                 if let Some(outcome) = outcome {
-                    gp_log_sink_command(src_addr, command, outcome);
+                    self.gp_sink_command_outcome(src_addr, command, payload, outcome);
                 }
                 status
             }
@@ -1622,6 +1622,54 @@ fn gp_write_attributes_response(
     let _ = payload.extend_from_slice(&encoded[..len]);
     (ZCL_WRITE_ATTRIBUTES_RESPONSE, payload)
 }
+
+// Network co-processor seams, declared after all other non-test code so
+// that every line above keeps its number. Without `green-power-ncp` each one is the plain
+// behaviour it replaced; `ncp` provides them for the ZRHP NCP (sink mode
+// switch, sink frame reports, local proxy output for a host sink).
+
+#[cfg(not(feature = "green-power-ncp"))]
+impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
+    /// The proxy's next due frame.
+    #[inline(always)]
+    fn gp_proxy_poll(&mut self, now_ms: u32) -> Option<GpTx> {
+        self.green_power.proxy.poll(now_ms)
+    }
+}
+
+#[cfg(all(feature = "green-power-sink", not(feature = "green-power-ncp")))]
+impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
+    /// Whether the combo's sink processes GP traffic (always).
+    #[inline(always)]
+    fn gp_sink_enabled(&self) -> bool {
+        true
+    }
+
+    /// What the sink made of a GPDF heard directly (logged only).
+    #[inline(always)]
+    fn gp_sink_report_gpdf(
+        &mut self,
+        _frame: &zigbee_gp::frame::Gpdf<'_>,
+        _outcome: zigbee_gp::sink::SinkOutcome,
+        _lqi: u8,
+    ) {
+    }
+
+    /// What the sink made of a GP server command.
+    #[inline(always)]
+    fn gp_sink_command_outcome(
+        &mut self,
+        src: u16,
+        command: u8,
+        _payload: &[u8],
+        outcome: zigbee_gp::sink::SinkOutcome,
+    ) {
+        gp_log_sink_command(src, command, outcome);
+    }
+}
+
+#[cfg(feature = "green-power-ncp")]
+pub mod ncp;
 
 #[cfg(test)]
 mod tests {

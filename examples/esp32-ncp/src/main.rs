@@ -6,6 +6,10 @@
 //! runs the NCP loop: service the host link, run queued stack operations,
 //! step the stack once the host has started it (`NWK_INIT`/`NWK_FORM`).
 //!
+//! The coordinator runs the Green Power combo (Proxy Basic, sink and
+//! TempMaster; spec 7.11) with its tables in the `zbnv` GP journal; the
+//! host selects the sink authority (`GP_SINK_CONFIG`).
+//!
 //! Logs go only to the ZRHP LOG endpoint: when USB-Serial-JTAG carries
 //! ZRHP no console may share it (spec 11.2). A panic resets the chip.
 //!
@@ -148,8 +152,12 @@ mod lab;
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     lab::boot();
-    // zigbee-mac's esp-radio driver allocates its receive queue.
-    esp_alloc::heap_allocator!(size: 32768);
+    // zigbee-mac's esp-radio driver allocates its receive queue. The heap
+    // lives in the RAM the 2nd-stage bootloader used (`dram2_seg`: H2
+    // 0x4083EFD0..0x4084FEE0, C6 0x4086E610..0x4087E610), free once the app
+    // runs, so the main stack keeps the room the GP combo's tables took
+    // (`tools/esp32-ncp-stack-gate.py`). Not yet booted on hardware.
+    esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 32768);
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);
     esp32_zigbee_devkit_product::time_driver::init(peripherals.SYSTIMER);
@@ -297,6 +305,9 @@ fn compose(
     let (device, ieee) = compose_device(radio, aes, ieee_override, profile);
     let security = compose_security(device, ieee);
     let app = compose_app(ZigbeeNode::new(device, security, profile));
+    // GP combo: Proxy and Sink Tables in the `zbnv` GP journal.
+    static GP_STORE: StaticCell<stores::GreenPowerStore> = StaticCell::new();
+    app.set_green_power_store(GP_STORE.init(stores::green_power_store()));
     TcPort::new(app, ieee, clock_ms)
 }
 

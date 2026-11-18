@@ -18,6 +18,7 @@
 //! | DATA | `APS_DATA_REQUEST` → `EVT_APS_DATA_CONFIRM` (after the APS ACK outcome with `ack_request`); `EVT_APS_DATA_INDICATION` |
 //! | SECURITY | `SEC_GET_NETWORK_KEY`, `SEC_GET_FRAME_COUNTERS`, `SEC_LOCK_KEY_EXPORT`; `EVT_FC_CHECKPOINT` |
 //! | LOG | `LOG_CONFIG`; `EVT_LOG_RECORD`, `EVT_LOG_DROPPED` |
+//! | GREEN POWER | all of spec 7.11, in [`crate::gp`] |
 
 use heapless::{Deque, Vec};
 use zigbee_zrhp::codec::{Bytes8, Bytes16, List, Rest};
@@ -505,6 +506,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 if info.kind == 2 && info.flow_control {
                     ncp_caps |= caps::UART_FLOW_CONTROL;
                 }
+                // Green Power combo (spec 7.11).
+                let (gp_caps, gp_sink_table, gp_proxy_table) = crate::gp::negotiate_facts(port);
+                ncp_caps |= gp_caps;
                 let capacities = [
                     Capacity {
                         id: capacity::MAX_APS_INFLIGHT,
@@ -550,6 +554,14 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     Capacity {
                         id: capacity::NEIGHBOR_TABLE,
                         value: zigbee_nwk::neighbor::MAX_NEIGHBORS as u32,
+                    },
+                    Capacity {
+                        id: capacity::GP_SINK_TABLE,
+                        value: gp_sink_table,
+                    },
+                    Capacity {
+                        id: capacity::GP_PROXY_TABLE,
+                        value: gp_proxy_table,
                     },
                 ];
                 let response = SysNegotiateRsp {
@@ -727,7 +739,8 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 }
             }
             ids::DIAG_RESET_COUNTERS => {
-                let _ = decode!(DiagResetCounters);
+                let request = decode!(DiagResetCounters);
+                crate::gp::reset_counters(request.group_mask);
                 *state.counters = QueueCounters::default();
                 status_only(queues, Status::Success);
             }
@@ -858,6 +871,12 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             }
             ids::APS_DATA_REQUEST => {
                 let request = decode!(ApsDataRequest);
+                // Green Power sink ownership (spec 7.11): CONFLICT in
+                // NCP_SINK mode, local proxy loopback in HOST_SINK mode.
+                if let Some(status) = crate::gp::screen_data_request(port, &request) {
+                    status_only(queues, status);
+                    return;
+                }
                 let status = Self::accept_data(state, port, tid, now_us, &request);
                 if status == Status::Busy {
                     state.counters.busy_responses = state.counters.busy_responses.saturating_add(1);
@@ -914,7 +933,14 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 log.set_level(request.level);
                 status_only(queues, Status::Success);
             }
-            _ => status_only(queues, Status::UnsupportedCommand),
+            // GREEN POWER (`0x0Axx`, spec 7.11) and unknown IDs.
+            _ => crate::gp::dispatch_gp(
+                queues,
+                endpoint,
+                message,
+                state.identity.key_export && !*state.key_export_locked,
+                port,
+            ),
         }
     }
 
@@ -1156,6 +1182,13 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             };
             self.event(Endpoint::Zigbee, &event);
         }
+        // Green Power reports and events (spec 7.11).
+        crate::gp::emit_gp_events(
+            &mut self.queues,
+            &mut self.event_seq,
+            self.identity.key_export && !self.key_export_locked,
+            port,
+        );
         let _ = now_us;
         if self.indication_drops_unreported != 0 && self.queues.queue(Endpoint::System).free() >= 32
         {
@@ -1292,7 +1325,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     /// Answer `DIAG_GET_COUNTERS` (link group from the link, queue group
     /// from the NCP). Called from `dispatch` through `service` because the
     /// link is borrowed while frames are delivered.
-    fn counters_response(&self, group_mask: u8) -> Vec<Counter, 40> {
+    fn counters_response(&self, group_mask: u8) -> Vec<Counter, 48> {
         let mut out = Vec::new();
         if group_mask & 0x01 != 0 {
             for (id, value) in self.link.counters().entries() {
@@ -1310,6 +1343,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 let _ = out.push(Counter { id, value });
             }
         }
+        crate::gp::append_counters(group_mask, &mut out);
         out
     }
 }
@@ -1394,7 +1428,7 @@ fn ncp_ready<C: CoordinatorPort>(
 }
 
 /// Queue an event on its home endpoint with that endpoint's next sequence.
-fn push_event<'a, T: zigbee_zrhp::codec::Wire<'a> + zigbee_zrhp::msg::MessageDef>(
+pub(crate) fn push_event<'a, T: zigbee_zrhp::codec::Wire<'a> + zigbee_zrhp::msg::MessageDef>(
     queues: &mut EndpointQueues<QUEUE_BYTES>,
     seqs: &mut [u16; Endpoint::COUNT],
     body: &T,

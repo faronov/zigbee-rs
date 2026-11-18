@@ -862,6 +862,7 @@ dependencies = [
  "ncp-coordinator-app",
  "p256",
  "router-app",
+ "zigbee-gp",
  "zigbee-runtime",
 ]
 
@@ -1226,6 +1227,7 @@ dependencies = [
  "router-app",
  "zigbee-aps",
  "zigbee-bdb",
+ "zigbee-gp",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-runtime",
@@ -1803,6 +1805,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zigbee-gp"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.9.4",
+ "zigbee-crypto",
+ "zigbee-types",
+]
+
+[[package]]
 name = "zigbee-mac"
 version = "0.1.0"
 dependencies = [
@@ -1833,6 +1844,7 @@ dependencies = [
  "log",
  "zigbee-aps",
  "zigbee-bdb",
+ "zigbee-gp",
  "zigbee-mac",
  "zigbee-nwk",
  "zigbee-types",

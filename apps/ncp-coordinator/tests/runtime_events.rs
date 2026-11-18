@@ -116,10 +116,11 @@ fn ncp_chosen() -> FormParams {
 macro_rules! formed_port {
     ($port:ident) => {
         let mut security = RamSecurityStateStore::new();
+        let mut gp_store = zigbee_runtime::gp_store::RamGpProxyStore::new();
         let mut profile = profile();
         let mut device = device(&profile);
         let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
-        let app = TrustCenterCoordinatorApp::new(
+        let mut app = TrustCenterCoordinatorApp::new(
             node,
             PersistentChildren::new(RamChildTableStore::new()),
             RamTrustCenterDeviceStore::new(),
@@ -127,6 +128,8 @@ macro_rules! formed_port {
             RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
         )
         .unwrap();
+        // The NCP's Green Power sink journals its table (spec 7.11).
+        app.set_green_power_store(&mut gp_store);
         let mut $port = TcPort::new(app, IEEE, clock_ms);
         pollster::block_on($port.form(ncp_chosen())).unwrap();
         while $port.take_device_event().is_some() {}
