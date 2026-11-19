@@ -170,6 +170,17 @@ pub enum TrustCenterHostEvent {
         short_address: ShortAddress,
         parent_address: IeeeAddress,
     },
+    /// Key establishment progressed: the device proved it holds the
+    /// network key (its first Request-Key; `result` 0), or answered the
+    /// unique Trust Center link key's Verify-Key (`result` 1 verified, 2
+    /// failed).
+    Authorized {
+        device_address: IeeeAddress,
+        short_address: ShortAddress,
+        result: u8,
+        /// The unique TCLK (`true`) or the global default TCLK.
+        unique_link_key: bool,
+    },
 }
 
 /// Trust Center host events held until the owner drains them.
@@ -1648,6 +1659,20 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         } else {
             self.device_short(&stored.device.parent_address)?
         };
+        // Paced before the attempt: a failed send (the child expired, no
+        // route) is retried after the same interval as an unanswered one,
+        // not on every step.
+        if let Some((_, sent)) = self
+            .initial_key_attempts
+            .iter_mut()
+            .find(|(peer, _)| *peer == address)
+        {
+            *sent = now;
+        } else {
+            self.initial_key_attempts
+                .push((address, now))
+                .map_err(|_| TrustCenterRuntimeError::Store(TrustCenterStoreError::Full))?;
+        }
         device
             .aps_mut()
             .send_initial_network_key_to(
@@ -1661,17 +1686,6 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             .await
             .map_err(TrustCenterRuntimeError::Aps)?;
         self.checkpoint_live_counters(device)?;
-        if let Some((_, sent)) = self
-            .initial_key_attempts
-            .iter_mut()
-            .find(|(peer, _)| *peer == address)
-        {
-            *sent = now;
-        } else {
-            self.initial_key_attempts
-                .push((address, now))
-                .map_err(|_| TrustCenterRuntimeError::Store(TrustCenterStoreError::Full))?;
-        }
         Ok(())
     }
 
@@ -1686,7 +1700,16 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             && stored.network_key_pending
         {
             stored.network_key_pending = false;
+            #[cfg(feature = "host-passthrough")]
+            let short_address = stored.device.short_address;
             self.commit()?;
+            #[cfg(feature = "host-passthrough")]
+            self.host_events.push(TrustCenterHostEvent::Authorized {
+                device_address: address,
+                short_address,
+                result: 0,
+                unique_link_key: false,
+            });
         }
         self.initial_key_attempts
             .retain(|(peer, _)| *peer != address);
@@ -2173,6 +2196,13 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             self.initial_key_attempts
                 .retain(|(peer, _)| *peer != address);
         }
+        #[cfg(feature = "host-passthrough")]
+        self.host_events.push(TrustCenterHostEvent::Authorized {
+            device_address: address,
+            short_address: table_device.short_address,
+            result: if status == 0 { 1 } else { 2 },
+            unique_link_key: true,
+        });
         Ok(())
     }
 
