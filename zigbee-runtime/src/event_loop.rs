@@ -1547,6 +1547,105 @@ mod commissioning_tick_tests {
         assert!(!store.load().unwrap().unwrap().commissioned);
     }
 
+    /// Device joined with a durable store and parked in the unique-TCLK
+    /// window: the staged record is persisted but uncommissioned.
+    fn durable_commissioning_device(
+        store: &mut crate::security_store::RamSecurityStateStore,
+    ) -> ZigbeeDevice<MockMac, EndDevice> {
+        use crate::security_store::SecurityStateStore;
+
+        let mut device = joinable_device();
+        {
+            let mut persistence =
+                crate::CommissioningSecurityPersistence::new(&mut *store).expect("persistence");
+            block_on(
+                device
+                    .bdb_mut()
+                    .network_steering_with_persistence(&mut persistence),
+            )
+            .expect("network steering");
+            assert!(persistence.take_error().is_none());
+        }
+        assert_eq!(block_on(device.finish_join()).ok(), Some(SHORT));
+        assert!(device.bdb().tclk_exchange_active());
+        assert!(!store.load().unwrap().unwrap().commissioned);
+        device
+    }
+
+    /// A secure-rejoin retry that becomes due inside the TCLK window has no
+    /// commissioned network to rejoin. It used to fail the durable tick with
+    /// `Corrupt` — which a sleepy sensor treats as a fatal persistence
+    /// failure and halts on (seen on an ESP32-C6 whose TC briefly stopped
+    /// acknowledging polls). The join is abandoned instead and steering can
+    /// start again.
+    #[test]
+    fn a_rejoin_retry_inside_the_tclk_window_abandons_the_join() {
+        use crate::UserAction;
+        use crate::security_store::{RamSecurityStateStore, SecurityStateStore};
+
+        for keepalive in [false, true] {
+            let mut store = RamSecurityStateStore::new();
+            let mut device = durable_commissioning_device(&mut store);
+            if keepalive {
+                // Three unacknowledged keepalive polls arm the timed retry.
+                device.mac_mut().set_poll_failures(3);
+                for _ in 0..3 {
+                    let _ = block_on(device.poll());
+                }
+                assert!(device.secure_rejoin_pending());
+                advance_time(&mut device, 5_000_000);
+                device.mac_mut().set_tx_failures(u32::MAX);
+                device.mac_mut().set_poll_failures(u32::MAX);
+            } else {
+                device.user_action(UserAction::Rejoin);
+            }
+            let result = block_on(device.tick_with_security_store(1, &mut [], &mut store))
+                .expect("an uncommitted join is abandoned, not a persistence failure");
+            assert!(
+                matches!(
+                    result,
+                    TickResult::Event(StackEvent::CommissioningComplete { success: false })
+                ),
+                "{result:?}"
+            );
+            assert!(!device.is_joined());
+            assert!(!device.bdb().tclk_exchange_active());
+            assert!(!device.secure_rejoin_pending());
+            assert!(
+                store
+                    .load()
+                    .unwrap()
+                    .is_none_or(|state| !state.commissioned)
+            );
+        }
+    }
+
+    /// The abandon path only trusts a record that loads: a commissioned
+    /// record the end device cannot rejoin (a formed-network record) still
+    /// fails closed with `Corrupt`.
+    #[test]
+    fn an_unrejoinable_commissioned_record_still_fails_closed() {
+        use crate::UserAction;
+        use crate::security_store::{
+            RamSecurityStateStore, SecurityStateStore, SecurityStoreError,
+        };
+
+        let mut store = RamSecurityStateStore::new();
+        let mut device = durable_commissioning_device(&mut store);
+        let mut state = store.load().unwrap().unwrap();
+        state.commissioned = true;
+        state.short_address = 0x0000;
+        state.parent_address = 0xFFFF;
+        state.depth = 0;
+        assert!(state.is_formed_network());
+        store.store(&state).unwrap();
+        device.user_action(UserAction::Rejoin);
+        assert_eq!(
+            block_on(device.tick_with_security_store(1, &mut [], &mut store)).err(),
+            Some(SecurityStoreError::Corrupt)
+        );
+    }
+
     /// The durable tick path must behave exactly like the plain one: one
     /// bounded handshake step per tick, terminal transition reported at once.
     #[test]

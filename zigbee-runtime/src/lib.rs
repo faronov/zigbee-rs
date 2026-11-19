@@ -8038,6 +8038,10 @@ pub struct EndDeviceTimeoutState {
     /// Seconds the initial request has been deferred so far. Bounds how long
     /// a still-running unique-TCLK exchange may hold the request back.
     pub(crate) deferred_secs: u16,
+    /// Deadline of the secure-rejoin retry armed by consecutive keepalive
+    /// failures. A parent that acknowledges a poll before it is due
+    /// disproves the evidence and cancels exactly that retry.
+    pub(crate) keepalive_rejoin_at: Option<u32>,
 }
 
 impl EndDeviceTimeoutState {
@@ -8050,6 +8054,7 @@ impl EndDeviceTimeoutState {
             forced_poll: false,
             start_deferred: false,
             deferred_secs: 0,
+            keepalive_rejoin_at: None,
         }
     }
 
@@ -10636,6 +10641,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// Drop an initial join that lost its network before commissioning
     /// committed, keeping the outgoing NWK counter as an exhausted floor
     /// (the same rule as [`factory_reset_stack`](Self::factory_reset_stack)).
+    /// Whether the persisted record proves that no network was committed yet:
+    /// none at all, or the staged record of an initial commissioning whose
+    /// unique-TCLK exchange has not confirmed. A load error is not such
+    /// proof (the caller keeps failing closed on it).
+    fn commissioning_uncommitted<S: SecurityStateStore>(store: &mut S) -> bool {
+        store
+            .load()
+            .is_ok_and(|state| state.is_none_or(|state| !state.commissioned))
+    }
+
     fn abandon_uncommitted_commissioning(&mut self) {
         let counter_floor = self.bdb.zdo().nwk().nib().outgoing_frame_counter;
         self.bdb.abandon_initial_commissioning();
@@ -12658,10 +12673,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 event.as_ref(),
                 Some(event_loop::StackEvent::RejoinRequested)
             )
-            && (self.bdb.tclk_exchange_active()
-                || store
-                    .load()
-                    .is_ok_and(|state| state.is_none_or(|s| !s.commissioned)));
+            && (self.bdb.tclk_exchange_active() || Self::commissioning_uncommitted(store));
         let event = if commissioning_abandoned {
             log::warn!(
                 "[Runtime] Rejoin requested before commissioning committed — abandoning the join"
@@ -13295,6 +13307,23 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         &mut self,
         store: &mut S,
     ) -> Result<event_loop::TickResult, SecurityStoreError> {
+        if Self::commissioning_uncommitted(store) {
+            // A retry armed while the initial commissioning was still staged
+            // (keepalive failures or a user action inside the unique-TCLK
+            // window): no commissioned network exists to rejoin, so the join
+            // is abandoned and steering restarts, exactly as for a rejoin
+            // request in that window. A record that fails to load is not
+            // "uncommitted" and still fails closed below.
+            log::warn!(
+                "[Runtime] Secure-rejoin retry before commissioning committed — abandoning the join"
+            );
+            self.secure_rejoin_retry_at = None;
+            self.abandon_uncommitted_commissioning();
+            self.factory_reset_security_state(store)?;
+            return Ok(event_loop::TickResult::Event(
+                event_loop::StackEvent::CommissioningComplete { success: false },
+            ));
+        }
         log::info!("[Runtime] Retrying persisted rejoin policy");
         match await_in_place!(self.rejoin_with_security_store(store)) {
             Ok(addr) => Ok(event_loop::TickResult::Event(
@@ -15670,13 +15699,28 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         self.ed_timeout_mut().failures = 0;
         log::warn!("[Runtime] Polls to parent failing — scheduling secure rejoin");
         self.schedule_secure_rejoin_retry();
+        if let Some(SecureRejoinRetry::At(deadline)) = self.secure_rejoin_retry_at {
+            self.ed_timeout_mut().keepalive_rejoin_at = Some(deadline);
+        }
     }
 
     pub(crate) fn record_end_device_keepalive_success(&mut self)
     where
         R: crate::role::EndDeviceRole,
     {
-        self.ed_timeout_mut().failures = 0;
+        let state = self.ed_timeout_mut();
+        state.failures = 0;
+        // The parent acknowledged again before the keepalive retry it caused
+        // became due (e.g. a Trust Center that stopped acknowledging for a
+        // few hundred milliseconds while writing flash): the evidence is
+        // gone, so that retry — and only that one — is cancelled. A retry
+        // already collapsed to `Due`, or re-armed by another cause, stays.
+        if let Some(deadline) = state.keepalive_rejoin_at.take()
+            && self.secure_rejoin_retry_at == Some(SecureRejoinRetry::At(deadline))
+        {
+            log::info!("[Runtime] Parent answered again — keepalive secure rejoin cancelled");
+            self.secure_rejoin_retry_at = None;
+        }
     }
 
     /// Transmit an End Device Timeout Request and arm the response handling.
