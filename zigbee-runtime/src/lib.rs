@@ -10644,7 +10644,9 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// Whether the persisted record proves that no network was committed yet:
     /// none at all, or the staged record of an initial commissioning whose
     /// unique-TCLK exchange has not confirmed. A load error is not such
-    /// proof (the caller keeps failing closed on it).
+    /// proof (the caller keeps failing closed on it). Out of line: the loaded
+    /// record stays in this frame.
+    #[inline(never)]
     fn commissioning_uncommitted<S: SecurityStateStore>(store: &mut S) -> bool {
         store
             .load()
@@ -13303,23 +13305,37 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         }
     }
 
+    /// A retry armed while the initial commissioning was still staged
+    /// (keepalive failures or a user action inside the unique-TCLK window):
+    /// no commissioned network exists to rejoin, so the join is abandoned and
+    /// steering restarts, exactly as for a rejoin request in that window.
+    /// Returns whether it was abandoned. A record that fails to load is not
+    /// "uncommitted" and still fails closed in the caller.
+    ///
+    /// Out of line so the loaded record stays out of the rejoin chain's
+    /// async frames (stack-gated on BL702).
+    #[inline(never)]
+    fn abandon_uncommitted_rejoin_retry<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<bool, SecurityStoreError> {
+        if !Self::commissioning_uncommitted(store) {
+            return Ok(false);
+        }
+        log::warn!(
+            "[Runtime] Secure-rejoin retry before commissioning committed — abandoning the join"
+        );
+        self.secure_rejoin_retry_at = None;
+        self.abandon_uncommitted_commissioning();
+        self.factory_reset_security_state(store)?;
+        Ok(true)
+    }
+
     async fn retry_secure_rejoin_with_security_store<S: SecurityStateStore>(
         &mut self,
         store: &mut S,
     ) -> Result<event_loop::TickResult, SecurityStoreError> {
-        if Self::commissioning_uncommitted(store) {
-            // A retry armed while the initial commissioning was still staged
-            // (keepalive failures or a user action inside the unique-TCLK
-            // window): no commissioned network exists to rejoin, so the join
-            // is abandoned and steering restarts, exactly as for a rejoin
-            // request in that window. A record that fails to load is not
-            // "uncommitted" and still fails closed below.
-            log::warn!(
-                "[Runtime] Secure-rejoin retry before commissioning committed — abandoning the join"
-            );
-            self.secure_rejoin_retry_at = None;
-            self.abandon_uncommitted_commissioning();
-            self.factory_reset_security_state(store)?;
+        if self.abandon_uncommitted_rejoin_retry(store)? {
             return Ok(event_loop::TickResult::Event(
                 event_loop::StackEvent::CommissioningComplete { success: false },
             ));
