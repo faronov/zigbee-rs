@@ -54,11 +54,25 @@ type App = ParentRouterApp<
 >;
 
 const ARCHETYPE: NodeArchetype = NodeArchetype::ParentRouter;
-#[cfg(not(feature = "bench-isolated"))]
-const CHANNELS: ChannelMask = ChannelMask::ALL_2_4GHZ;
-/// TEST-ONLY: channel 26 only (`bench-isolated`).
-#[cfg(feature = "bench-isolated")]
-const CHANNELS: ChannelMask = ChannelMask(1 << 26);
+/// Channels network steering scans: all 2.4 GHz channels, or the single
+/// channel given at build time in `CC26X2_ROUTER_CHANNEL` (TEST-ONLY lab
+/// images: keeps a bench router off every other network, e.g. an isolated
+/// channel while unattended, or the lab coordinator's channel for a join).
+const CHANNELS: ChannelMask = match option_env!("CC26X2_ROUTER_CHANNEL") {
+    None => ChannelMask::ALL_2_4GHZ,
+    Some(text) => ChannelMask(1 << parse_channel(text)),
+};
+
+const fn parse_channel(text: &str) -> u32 {
+    let b = text.as_bytes();
+    assert!(b.len() == 2, "CC26X2_ROUTER_CHANNEL must be 11..=26");
+    let channel = ((b[0] - b'0') * 10 + (b[1] - b'0')) as u32;
+    assert!(
+        channel >= 11 && channel <= 26,
+        "CC26X2_ROUTER_CHANNEL must be 11..=26"
+    );
+    channel
+}
 /// Period of the neighbour/child summary on the log.
 const SUMMARY_PERIOD: Duration = Duration::from_secs(60);
 
@@ -67,6 +81,9 @@ async fn main(_spawner: Spawner) {
     // Keep the product CCFG in the image.
     let _ = unsafe { core::ptr::read_volatile(&product::ccfg::CCFG[0]) };
     let started = platform::start(product::ROUTER_MODEL);
+    if CHANNELS.0 != ChannelMask::ALL_2_4GHZ.0 {
+        log::warn!("[CC26X2] TEST-ONLY channel mask 0x{:08X}", CHANNELS.0);
+    }
     let app = compose(started);
     if let Err(error) = app.initialize().await {
         fatal(app.parts_mut(), error);

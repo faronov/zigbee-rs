@@ -22,9 +22,6 @@ path = "src/lab.rs"
 default = ["zbdongle-p"]
 zbdongle-p = ["cc26x2-dongle-product/zbdongle-p", "cc26x2-dongle/zbdongle-p"]
 cc2652p7-dongle = ["cc26x2-dongle-product/cc2652p7-dongle", "cc26x2-dongle/cc2652p7-dongle"]
-# TEST-ONLY bench image: the router scans channel 26 only, so it can be run
-# unattended without ever joining a production network on another channel.
-bench-isolated = []
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
