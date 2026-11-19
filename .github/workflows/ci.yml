@@ -394,6 +394,36 @@ jobs:
             manifest: efr32s2-hal/Cargo.toml
             workspace: efr32s2-hal
             features: "efr32mg22,isr-ack"
+          # CC26x2/CC13x2: CCFG builder, identity decode, RF core command
+          # layouts, PA tables and override lists, flash/UART/RTC logic.
+          - name: CC26x2 HAL (CC2652P)
+            manifest: cc26x2-hal/Cargo.toml
+            workspace: cc26x2-hal
+            features: "cc2652p"
+          - name: CC26x2 HAL (CC2652P7)
+            manifest: cc26x2-hal/Cargo.toml
+            workspace: cc26x2-hal
+            features: "cc2652p7"
+          - name: CC26x2 HAL (CC2652R)
+            manifest: cc26x2-hal/Cargo.toml
+            workspace: cc26x2-hal
+            features: "cc2652r"
+          - name: CC26x2 dongle board (ZBDongle-P)
+            manifest: boards/cc26x2-dongle/Cargo.toml
+            workspace: boards/cc26x2-dongle
+            features: "zbdongle-p"
+          - name: CC26x2 dongle board (CC2652P7)
+            manifest: boards/cc26x2-dongle/Cargo.toml
+            workspace: boards/cc26x2-dongle
+            features: "cc2652p7-dongle"
+          - name: CC26x2 dongle product (ZBDongle-P)
+            manifest: products/cc26x2-dongle/Cargo.toml
+            workspace: products/cc26x2-dongle
+            features: "zbdongle-p"
+          - name: CC26x2 dongle product (CC2652P7)
+            manifest: products/cc26x2-dongle/Cargo.toml
+            workspace: products/cc26x2-dongle
+            features: "cc2652p7-dongle"
           # Chip-independent logic (word flash, MAC address/confirm mapping);
           # the chip feature only builds for the target.
           - name: STM32WB HAL
@@ -566,6 +596,10 @@ jobs:
           cargo fmt --manifest-path examples/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path efr32mg1-hal/Cargo.toml -- --check
           cargo fmt --manifest-path efr32s2-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path cc26x2-hal/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/cc26x2-dongle/Cargo.toml -- --check
+          cargo fmt --manifest-path products/cc26x2-dongle/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/cc26x2-router/Cargo.toml -- --check
           cargo fmt --manifest-path stm32wb-hal/Cargo.toml -- --check
           cargo fmt --manifest-path boards/stm32wb5mm-dk/Cargo.toml -- --check
           cargo fmt --manifest-path products/stm32wb5mm-dk-router/Cargo.toml -- --check
@@ -2662,6 +2696,58 @@ jobs:
             examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-*.bin
             examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-*.hex
             examples/ha-connect-zbt1/target/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-*.size.json
+          if-no-files-found: error
+
+  build-cc26x2-dongle:
+    name: Build CC26x2 dongle router and lab images (CC2652P, CC2652P7)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv7em-none-eabihf
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: examples/cc26x2-router
+          key: thumbv7em-cc26x2-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('examples/cc26x2-router/Cargo.lock', 'products/cc26x2-dongle/link/**', 'cc26x2-hal/link/**') }}
+      # The vendored TI CPE patch and its generated Rust must stay in sync.
+      - name: Check generated RF core patch
+        run: python3 cc26x2-hal/tools/gen_rf_patch.py --check
+      - name: Build CC2652P (ZBDongle-P) and CC2652P7 images (release)
+        working-directory: examples/cc26x2-router
+        run: |
+          cargo build --release --locked
+          cargo build --release --locked --no-default-features --features cc2652p7-dongle --target-dir target/p7
+      - name: Clippy CC26x2 images
+        working-directory: examples/cc26x2-router
+        run: |
+          cargo clippy --release --locked --target thumbv7em-none-eabihf -- -D warnings
+          cargo clippy --release --locked --target thumbv7em-none-eabihf \
+            --no-default-features --features cc2652p7-dongle --target-dir target/p7 -- -D warnings
+      - name: Layout, CCFG and role-symbol gates
+        run: |
+          DIR=examples/cc26x2-router/target
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          for bin in cc26x2-router cc26x2-lab; do
+            python3 examples/cc26x2-router/tools/verify-layout.py --chip cc2652p "$DIR/thumbv7em-none-eabihf/release/$bin"
+            python3 examples/cc26x2-router/tools/verify-layout.py --chip cc2652p7 "$DIR/p7/thumbv7em-none-eabihf/release/$bin"
+          done
+          NM="$NM" ./tools/check-role-symbols.sh parent "$DIR/thumbv7em-none-eabihf/release/cc26x2-router" "$DIR/p7/thumbv7em-none-eabihf/release/cc26x2-router"
+          for variant in "zbdongle-p:$DIR/thumbv7em-none-eabihf/release" "cc2652p7:$DIR/p7/thumbv7em-none-eabihf/release"; do
+            name=${variant%%:*}; path=${variant#*:}
+            "$OBJCOPY" -O ihex "$path/cc26x2-router" "$DIR/cc26x2-router-$name.hex"
+            ./tools/firmware-size-report.sh "cc26x2-router-$name" "$path/cc26x2-router" "$DIR/cc26x2-router-$name.size.json"
+          done
+      - name: Upload CC26x2 firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cc26x2-dongle-router-firmware
+          path: |
+            examples/cc26x2-router/target/cc26x2-router-*.hex
+            examples/cc26x2-router/target/cc26x2-router-*.size.json
           if-no-files-found: error
 
   build-efr32mg22:

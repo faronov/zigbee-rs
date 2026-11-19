@@ -1,0 +1,18 @@
+[package]
+name = "cc26x2-dongle"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for CC2652P / CC2652P7 USB-UART Zigbee dongles (Sonoff ZBDongle-P class)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Exactly one board variant.
+[features]
+# Sonoff ZBDongle-P: CC2652P (352 KiB flash, 80 KiB SRAM) behind a CP2102.
+zbdongle-p = ["cc26x2-hal/cc2652p"]
+# CC2652P7 dongle with the same UART/BSL wiring (704 KiB, 144 KiB).
+cc2652p7-dongle = ["cc26x2-hal/cc2652p7"]
+
+[dependencies]
+cc26x2-hal = { path = "../../cc26x2-hal" }

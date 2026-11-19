@@ -15,6 +15,7 @@ tlsr8258-hal = { path = "../tlsr8258-hal", optional = true }
 bl702-hal = { path = "../bl702-hal", optional = true }
 efr32mg1-hal = { path = "../efr32mg1-hal", optional = true }
 efr32s2-hal = { path = "../efr32s2-hal", optional = true }
+cc26x2-hal = { path = "../cc26x2-hal", optional = true }
 
 # ── ESP32-C6 / H2 / C5 backend ───────────────────────────────
 # Version ranges, not pins: C6/H2 images resolve (and lock) esp-hal 1.0.0 /
@@ -227,6 +228,11 @@ efr32mg22 = [
     "dep:efr32s2-hal", "efr32s2-hal/efr32mg22",
     "dep:embassy-time", "dep:embassy-futures",
 ]
+
+# TI CC26x2/CC13x2 `Cc26x2RadioPhy` on `SoftMacCore` (pure-Rust RF core
+# driver in `cc26x2-hal`). The image selects the chip feature of
+# `cc26x2-hal` (e.g. `cc2652p`, `cc2652p7`).
+cc26x2 = ["dep:cc26x2-hal", "dep:embassy-time", "dep:embassy-futures"]
 
 # STM32WB coprocessor MAC mapping (`stm32wb::Stm32wbMac`). Dependency-free:
 # the IPCC/mailbox transport lives in `stm32wb-hal`, so enabling this adds no

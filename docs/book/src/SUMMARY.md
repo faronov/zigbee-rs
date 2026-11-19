@@ -43,6 +43,7 @@
 - [nRF52840 / nRF52833](./platform-guides/nrf.md)
 - [BL702](./platform-guides/bl702.md)
 - [CC2340](./platform-guides/cc2340.md)
+- [CC26x2 / CC13x2 (CC2652P, CC2652P7)](./platform-guides/cc26x2.md)
 - [Telink TLSR8258](./platform-guides/telink.md)
 - [PHY6222](./platform-guides/phy6222.md)
 - [EFR32 (MG1, MG21 & MG22)](./platform-guides/efr32.md)

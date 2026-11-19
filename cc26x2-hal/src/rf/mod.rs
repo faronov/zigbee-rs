@@ -1,0 +1,956 @@
+//! RF core driver for IEEE 802.15.4 (2.4 GHz O-QPSK).
+//!
+//! The RF core is a separate Cortex-M0 running TI's ROM firmware (CPE); the
+//! system CPU talks to it through the doorbell (`RFC_DBELL`): radio
+//! operations are structures in system RAM whose `status` word the RF core
+//! updates, immediate and direct commands complete synchronously. The
+//! sequences mirror the TI-authored OpenThread CC2652 platform
+//! (`openthread/ot-cc13x2-cc26x2`, `src/cc2652/radio.c`, BSD-3-Clause) and,
+//! for the P parts' PA switching, the SDK RF driver
+//! (`RFCC26X2_multiMode.c` `RF_updatePaConfiguration`):
+//!
+//! - power-up: `RFCMODESEL` = auto, RFC power domain and clock, CPE clocks,
+//!   `CMD_PING`, CPE patch ([`patch_ieee`]), `CMD_SYNC_START_RAT` chained
+//!   with `CMD_RADIO_SETUP` (PA variant with standard/+20 dBm override lists);
+//! - receive: one background `CMD_IEEE_RX` into an [`RX_ENTRIES`]-entry
+//!   circular data queue with frame filtering, **auto-ACK in the RF core**
+//!   and auto-pend from the source-match tables ([`FP_TABLE_LEN`] short and
+//!   extended entries, `CMD_IEEE_MOD_SRC_MATCH` while running);
+//! - transmit: `CMD_IEEE_CSMA` (unslotted, MAC PIB parameters) chained
+//!   with `CMD_IEEE_TX` and, for an ACK request, `CMD_IEEE_RX_ACK`
+//!   (macAckWaitDuration = 54 symbols); the RF core suspends and resumes the
+//!   background receiver around it;
+//! - energy detect: background `CMD_IEEE_ED_SCAN` with the receiver stopped.
+//!
+//! Completion is polled from the command status words, never from inside an
+//! interrupt; every wait is bounded. The RF core acknowledges frames itself
+//! whatever the system CPU is doing, so a busy stack never delays an ACK;
+//! frames only queue up in the data entries until [`Radio::receive`].
+
+pub mod cmd;
+pub mod patch_ieee;
+pub mod settings;
+
+use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
+
+use cmd::*;
+use settings::{Pa, TxPower};
+
+use crate::mmio::{self, AON_RTC_BASE, RFC_DBELL_BASE, RFC_PWR_BASE};
+use crate::prcm::{self, Domain};
+
+const CMDR: u32 = RFC_DBELL_BASE;
+const CMDSTA: u32 = RFC_DBELL_BASE + 0x04;
+const RFCPEIFG: u32 = RFC_DBELL_BASE + 0x10;
+const RFCPEIEN: u32 = RFC_DBELL_BASE + 0x14;
+const RFCPEISL: u32 = RFC_DBELL_BASE + 0x18;
+const RFACKIFG: u32 = RFC_DBELL_BASE + 0x1C;
+const PWMCLKEN: u32 = RFC_PWR_BASE;
+const PWMCLKEN_RFC: u32 = 1 << 0;
+const PWMCLKEN_CPE: u32 = 1 << 1;
+const PWMCLKEN_CPERAM: u32 = 1 << 2;
+const PWMCLKEN_MDMRAM: u16 = 1 << 4;
+const PWMCLKEN_RFERAM: u16 = 1 << 6;
+const IRQ_INTERNAL_ERROR: u32 = 1 << 31;
+
+/// Largest MAC frame without FCS.
+pub const MAX_FRAME: usize = 125;
+/// Receive data entries (each holds one frame).
+pub const RX_ENTRIES: usize = 8;
+/// Source-match entries per address type (Frame Pending owners).
+pub const FP_TABLE_LEN: usize = 16;
+/// RAT ticks per microsecond (4 MHz radio timer).
+pub const RAT_TICKS_PER_US: u32 = 4;
+/// macAckWaitDuration: 54 symbols x 16 us.
+pub const ACK_WAIT_US: u32 = 864;
+/// CCA energy threshold in dBm.
+pub const CCA_THRESHOLD_DBM: i8 = -75;
+
+/// 8-byte entry header + length byte + frame + RSSI + correlation/CRC.
+const ENTRY_DATA: usize = 1 + MAX_FRAME + 2;
+const ENTRY_SIZE: usize = (8 + ENTRY_DATA + 3) & !3;
+
+/// Ownership token for the RF core.
+pub struct RadioToken(pub(crate) ());
+
+/// RF core failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RadioError {
+    /// The RFC power domain did not come up.
+    Power,
+    /// A doorbell write was rejected (`CMDSTA`).
+    Doorbell(u8),
+    /// A radio operation ended with this status.
+    Op(u16),
+    /// A radio operation did not finish within its bound.
+    Timeout,
+    InvalidChannel,
+    FrameTooLong,
+    /// The radio is not set up.
+    Off,
+}
+
+/// Address filter and auto-ACK identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Filter {
+    pub pan_id: u16,
+    pub short_address: u16,
+    /// EUI-64 in over-the-air (little-endian) byte order.
+    pub extended_address: [u8; 8],
+    /// Accept frames without a destination address (PAN coordinator).
+    pub pan_coordinator: bool,
+}
+
+/// CSMA-CA parameters (MAC PIB).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Csma {
+    pub min_be: u8,
+    pub max_be: u8,
+    pub max_backoffs: u8,
+}
+
+impl Csma {
+    /// A single CCA without backoff.
+    pub const SINGLE_CCA: Self = Self {
+        min_be: 0,
+        max_be: 0,
+        max_backoffs: 0,
+    };
+}
+
+/// Outcome of a transmission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxOutcome {
+    /// Sent; no ACK was requested.
+    Sent,
+    /// The matching Imm-Ack arrived (`frame_pending` = its FP bit).
+    Acked { frame_pending: bool },
+    /// No ACK within macAckWaitDuration.
+    NoAck,
+    /// CSMA-CA found the channel busy.
+    ChannelBusy,
+}
+
+/// One received frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RxInfo {
+    pub len: usize,
+    pub rssi_dbm: i8,
+    /// Correlation value 0..63 (higher is better).
+    pub correlation: u8,
+}
+
+/// Frame Pending table address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FpAddress {
+    Short { pan_id: u16, address: u16 },
+    Extended([u8; 8]),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FpError {
+    TableFull,
+    Radio(RadioError),
+}
+
+/// Counters for diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RadioStats {
+    pub rx_frames: u32,
+    pub rx_restarts: u32,
+    pub tx_frames: u32,
+    pub tx_no_ack: u32,
+    pub tx_busy: u32,
+    pub tx_errors: u32,
+    /// `rfc_ieeeRxOutput_t` counters of the running receiver.
+    pub auto_acks: u8,
+    pub rx_buf_full: u8,
+    pub rx_nok: u8,
+}
+
+#[repr(C, align(4))]
+struct Entry([u8; ENTRY_SIZE]);
+
+#[repr(C, align(4))]
+struct ShortTable {
+    enable: u32,
+    pending: u32,
+    entries: [u32; FP_TABLE_LEN],
+}
+
+#[repr(C, align(4))]
+struct ExtTable {
+    enable: u32,
+    pending: u32,
+    entries: [[u32; 2]; FP_TABLE_LEN],
+}
+
+const _: () = assert!(FP_TABLE_LEN <= 32);
+
+/// Everything the RF core reads or writes. One static instance; only the
+/// [`Radio`] created from the unique [`RadioToken`] touches it.
+#[repr(C, align(4))]
+struct RfMem {
+    start_rat: CmdSyncRat,
+    setup: CmdRadioSetupPa,
+    base_overrides: [u32; settings::BASE_LEN],
+    tx_std_overrides: [u32; settings::TX_LEN],
+    tx20_overrides: [u32; settings::TX_LEN],
+    rx: CmdIeeeRx,
+    rx_output: IeeeRxOutput,
+    queue: DataQueue,
+    entries: [Entry; RX_ENTRIES],
+    short_fp: ShortTable,
+    ext_fp: ExtTable,
+    csma: CmdIeeeCsma,
+    tx: CmdIeeeTx,
+    rx_ack: CmdIeeeRxAck,
+    ed: CmdIeeeEdScan,
+    src_match: CmdIeeeModSrcMatch,
+    set_power: CmdSetTxPower,
+    change_pa: CmdChangePa,
+    tx_buf: [u8; 128],
+}
+
+static mut RF_MEM: RfMem = RfMem {
+    start_rat: CmdSyncRat::with_header(id::CMD_SYNC_START_RAT, COND_STOP_ON_FALSE),
+    setup: CmdRadioSetupPa::with_header(id::CMD_RADIO_SETUP, COND_NEVER),
+    base_overrides: settings::base_overrides(),
+    tx_std_overrides: settings::tx_std_overrides(0),
+    tx20_overrides: settings::tx20_overrides(0),
+    rx: CmdIeeeRx::with_header(id::CMD_IEEE_RX, COND_NEVER),
+    rx_output: IeeeRxOutput {
+        n_tx_ack: 0,
+        n_rx_beacon: 0,
+        n_rx_data: 0,
+        n_rx_ack: 0,
+        n_rx_mac_cmd: 0,
+        n_rx_reserved: 0,
+        n_rx_nok: 0,
+        n_rx_ignored: 0,
+        n_rx_buf_full: 0,
+        last_rssi: 0,
+        max_rssi: 0,
+        _dummy0: 0,
+        beacon_time_stamp: 0,
+    },
+    queue: DataQueue {
+        curr_entry: 0,
+        last_entry: 0,
+    },
+    entries: [const { Entry([0; ENTRY_SIZE]) }; RX_ENTRIES],
+    short_fp: ShortTable {
+        enable: 0,
+        pending: 0,
+        entries: [0; FP_TABLE_LEN],
+    },
+    ext_fp: ExtTable {
+        enable: 0,
+        pending: 0,
+        entries: [[0; 2]; FP_TABLE_LEN],
+    },
+    csma: CmdIeeeCsma::with_header(id::CMD_IEEE_CSMA, COND_STOP_ON_FALSE),
+    tx: CmdIeeeTx::with_header(id::CMD_IEEE_TX, COND_NEVER),
+    rx_ack: CmdIeeeRxAck::with_header(id::CMD_IEEE_RX_ACK, COND_NEVER),
+    ed: CmdIeeeEdScan::with_header(id::CMD_IEEE_ED_SCAN, COND_NEVER),
+    src_match: CmdIeeeModSrcMatch {
+        command_no: id::CMD_IEEE_MOD_SRC_MATCH,
+        options: 0,
+        entry_no: 0,
+    },
+    set_power: CmdSetTxPower {
+        command_no: id::CMD_SET_TX_POWER,
+        tx_power: 0,
+    },
+    change_pa: CmdChangePa {
+        command_no: id::CMD_CHANGE_PA,
+        _dummy0: 0,
+        reg_override: 0,
+    },
+    tx_buf: [0; 128],
+};
+
+fn addr<T>(p: *const T) -> u32 {
+    p as usize as u32
+}
+
+/// Doorbell write (driverlib `RFCDoorbellSendTo`); returns `CMDSTA[7:0]`.
+fn doorbell(word: u32) -> u8 {
+    if !prcm::wait(|| mmio::read(CMDR) == 0) {
+        return 0xFF;
+    }
+    mmio::write(RFACKIFG, 0);
+    mmio::write(CMDR, word);
+    if !prcm::wait(|| mmio::read(RFACKIFG) != 0) {
+        return 0xFF;
+    }
+    mmio::write(RFACKIFG, 0);
+    (mmio::read(CMDSTA) & 0xFF) as u8
+}
+
+fn submit(word: u32) -> Result<(), RadioError> {
+    match doorbell(word) {
+        CMDSTA_DONE => Ok(()),
+        other => Err(RadioError::Doorbell(other)),
+    }
+}
+
+/// Volatile read of a command status word.
+fn op_status(p: *const u16) -> u16 {
+    unsafe { read_volatile(p) }
+}
+
+/// The IEEE 802.15.4 radio.
+pub struct Radio {
+    mem: *mut RfMem,
+    channel: u8,
+    filter: Option<Filter>,
+    rx_wanted: bool,
+    read_index: usize,
+    power: TxPower,
+    random_state: u16,
+    stats: RadioStats,
+    tx_pending: bool,
+}
+
+impl RadioToken {
+    /// Power the RF core, patch it and run the IEEE 802.15.4 setup. SCLK_HF
+    /// must already run from XOSC_HF ([`crate::setup::start_xosc_hf`]).
+    pub fn init(self, tx_power_dbm: i8) -> Result<Radio, RadioError> {
+        let mem = addr_of_mut!(RF_MEM);
+        let mut radio = Radio {
+            mem,
+            channel: 11,
+            filter: None,
+            rx_wanted: false,
+            read_index: 0,
+            power: settings::select(tx_power_dbm, crate::chip::HIGH_PA),
+            random_state: 0xACE1,
+            stats: RadioStats::default(),
+            tx_pending: false,
+        };
+        radio.init_queue();
+        radio.power_up()?;
+        Ok(radio)
+    }
+}
+
+impl Radio {
+    fn m(&mut self) -> &mut RfMem {
+        // SAFETY: `mem` is the unique RF_MEM; the RF core only writes status
+        // words, queue entries and output counters, which are read volatile.
+        unsafe { &mut *self.mem }
+    }
+
+    fn init_queue(&mut self) {
+        let m = self.m();
+        for i in 0..RX_ENTRIES {
+            let next = addr(m.entries[(i + 1) % RX_ENTRIES].0.as_ptr());
+            let e = &mut m.entries[i].0;
+            e[0..4].copy_from_slice(&next.to_le_bytes());
+            e[4] = DATA_ENTRY_PENDING;
+            e[5] = DATA_ENTRY_CONFIG_GEN_LEN1;
+            e[6..8].copy_from_slice(&(ENTRY_DATA as u16).to_le_bytes());
+        }
+        m.queue.curr_entry = addr(m.entries[0].0.as_ptr());
+        m.queue.last_entry = 0;
+        self.read_index = 0;
+    }
+
+    fn power_up(&mut self) -> Result<(), RadioError> {
+        prcm::rfc_mode_auto();
+        if !prcm::power_on(Domain::Rfc) {
+            return Err(RadioError::Power);
+        }
+        prcm::rfc_clock(true);
+        if !prcm::load() {
+            return Err(RadioError::Power);
+        }
+        // Route only the internal error to CPE1; nothing is enabled (polled).
+        mmio::write(RFCPEISL, IRQ_INTERNAL_ERROR);
+        mmio::write(RFCPEIEN, 0);
+        mmio::write(RFCPEIFG, 0);
+        // Let the CPE boot, with its RAM clocked for the patch.
+        mmio::write(PWMCLKEN, PWMCLKEN_CPERAM | PWMCLKEN_CPE | PWMCLKEN_RFC);
+        submit(dir_cmd_2byte(id::CMD0, PWMCLKEN_MDMRAM | PWMCLKEN_RFERAM))?;
+        submit(dir_cmd(id::CMD_PING))?;
+        apply_patch();
+        submit(dir_cmd_2byte(id::CMD0, 0))?;
+        // RTC -> RAT synchronisation, then start the RAT and set up the PHY.
+        mmio::modify(AON_RTC_BASE, 0, 1 << 1);
+        mmio::aon_sync();
+        self.prepare_setup();
+        let m = self.m();
+        m.start_rat.status = status::IDLE;
+        m.start_rat.rat0 = 0;
+        m.start_rat.next_op = addr(addr_of!(m.setup));
+        m.setup.status = status::IDLE;
+        let start = addr(addr_of!(m.start_rat));
+        let setup_status = addr_of!(m.setup.status);
+        submit(start)?;
+        self.wait_op(setup_status)?;
+        match op_status(setup_status) {
+            status::DONE_OK => Ok(()),
+            other => Err(RadioError::Op(other)),
+        }
+    }
+
+    /// Fill `CMD_RADIO_SETUP(_PA)` and the override lists for the current
+    /// TX power (`RF_updatePaConfiguration`).
+    fn prepare_setup(&mut self) {
+        let power = self.power;
+        let m = self.m();
+        m.setup.mode = 1; // IEEE 802.15.4
+        m.setup.lo_divider = 0;
+        m.setup.config = 0; // differential front end, internal bias
+        m.base_overrides = settings::base_overrides();
+        m.setup.reg_override = addr(m.base_overrides.as_ptr());
+        if crate::chip::HIGH_PA {
+            m.tx_std_overrides = settings::tx_std_overrides(match power.pa {
+                Pa::Standard => power.raw as u16,
+                Pa::High => settings::STD_PA[0].raw as u16,
+            });
+            m.tx20_overrides = settings::tx20_overrides(match power.pa {
+                Pa::High => power.raw,
+                Pa::Standard => settings::HIGH_PA[settings::HIGH_PA.len() - 1].raw,
+            });
+            m.setup.reg_override_tx_std = addr(m.tx_std_overrides.as_ptr());
+            m.setup.reg_override_tx20 = addr(m.tx20_overrides.as_ptr());
+            match power.pa {
+                Pa::Standard => m.setup.tx_power = power.raw as u16,
+                Pa::High => {
+                    m.setup.tx_power = settings::TX20_ENABLED;
+                    m.base_overrides[settings::BASE_END_INDEX] =
+                        new_override_segment(addr(m.tx20_overrides.as_ptr()));
+                }
+            }
+        } else {
+            m.setup.reg_override_tx_std = 0;
+            m.setup.reg_override_tx20 = 0;
+            m.setup.tx_power = power.raw as u16;
+        }
+    }
+
+    /// Bounded wait for a radio operation to reach a terminal status.
+    fn wait_op(&self, status_word: *const u16) -> Result<(), RadioError> {
+        if prcm::wait(|| status::is_terminal(op_status(status_word))) {
+            Ok(())
+        } else {
+            Err(RadioError::Timeout)
+        }
+    }
+
+    pub fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    pub fn tx_power(&self) -> TxPower {
+        self.power
+    }
+
+    pub fn is_rx_on(&self) -> bool {
+        let m = unsafe { &*self.mem };
+        let s = op_status(addr_of!(m.rx.status));
+        s == status::ACTIVE || s == status::IEEE_SUSPENDED
+    }
+
+    /// Start (or restart) the background receiver with the current channel,
+    /// filter and Frame Pending tables.
+    pub fn rx_on(&mut self) -> Result<(), RadioError> {
+        self.rx_wanted = true;
+        if self.is_rx_on() {
+            return Ok(());
+        }
+        self.start_rx()
+    }
+
+    /// Stop the background receiver.
+    pub fn rx_off(&mut self) {
+        self.rx_wanted = false;
+        self.stop_rx();
+    }
+
+    fn stop_rx(&mut self) {
+        if self.is_rx_on() {
+            let _ = doorbell(dir_cmd(id::CMD_ABORT));
+            let m = unsafe { &*self.mem };
+            let _ = self.wait_op(addr_of!(m.rx.status));
+        }
+        self.tx_pending = false;
+    }
+
+    fn start_rx(&mut self) -> Result<(), RadioError> {
+        let channel = self.channel;
+        let filter = self.filter;
+        let m = self.m();
+        let rx = &mut m.rx;
+        rx.status = status::IDLE;
+        rx.next_op = 0;
+        rx.start_trigger = TRIG_NOW;
+        rx.condition = COND_NEVER;
+        rx.channel = channel;
+        rx.rx_config = rx_config::AUTO_FLUSH_CRC
+            | rx_config::AUTO_FLUSH_IGN
+            | rx_config::APPEND_RSSI
+            | rx_config::APPEND_CORR_CRC;
+        rx.rx_queue = addr(addr_of!(m.queue));
+        rx.output = addr(addr_of!(m.rx_output));
+        rx.frame_types = ft::BEACON | ft::DATA | ft::MAC_CMD;
+        rx.cca_opt = CCA_OPT;
+        rx.cca_rssi_thr = CCA_THRESHOLD_DBM;
+        rx.num_ext_entries = FP_TABLE_LEN as u8;
+        rx.num_short_entries = FP_TABLE_LEN as u8;
+        rx.ext_entry_list = addr(addr_of!(m.ext_fp));
+        rx.short_entry_list = addr(addr_of!(m.short_fp));
+        match filter {
+            Some(f) => {
+                rx.frame_filt_opt = filt::FRAME_FILT_EN
+                    | filt::FRAME_FILT_STOP
+                    | filt::AUTO_ACK_EN
+                    | filt::AUTO_PEND_EN
+                    | filt::PEND_DATA_REQ_ONLY
+                    | filt::MAX_FRAME_VERSION_3
+                    | filt::STRICT_LEN_FILTER
+                    | if f.pan_coordinator {
+                        filt::PAN_COORD
+                    } else {
+                        0
+                    };
+                let ext = u64::from_le_bytes(f.extended_address);
+                rx.local_ext_addr = [ext as u32, (ext >> 32) as u32];
+                rx.local_short_addr = f.short_address;
+                rx.local_pan_id = f.pan_id;
+            }
+            None => {
+                // Promiscuous (scans): no filtering, no ACKs.
+                rx.frame_filt_opt = filt::MAX_FRAME_VERSION_3;
+                rx.local_ext_addr = [0; 2];
+                rx.local_short_addr = 0xFFFF;
+                rx.local_pan_id = 0xFFFF;
+            }
+        }
+        rx.end_trigger = TRIG_NEVER;
+        rx.end_time = 0;
+        let word = addr(addr_of!(m.rx));
+        let rx_status = addr_of!(m.rx.status);
+        submit(word)?;
+        // Wait until the receiver runs (or failed to start).
+        prcm::wait(|| {
+            op_status(rx_status) != status::IDLE && op_status(rx_status) != status::PENDING
+        });
+        match op_status(rx_status) {
+            status::ACTIVE | status::IEEE_SUSPENDED => Ok(()),
+            other => Err(RadioError::Op(other)),
+        }
+    }
+
+    fn restart_rx_if_wanted(&mut self) -> Result<(), RadioError> {
+        self.stop_rx();
+        if self.rx_wanted {
+            self.start_rx()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Tune to an IEEE 802.15.4 channel (11..=26).
+    pub fn set_channel(&mut self, channel: u8) -> Result<(), RadioError> {
+        if !(11..=26).contains(&channel) {
+            return Err(RadioError::InvalidChannel);
+        }
+        if channel == self.channel {
+            return Ok(());
+        }
+        self.channel = channel;
+        self.restart_rx_if_wanted()
+    }
+
+    /// Program the address filter (`None`: promiscuous, no auto-ACK).
+    pub fn set_filter(&mut self, filter: Option<Filter>) -> Result<(), RadioError> {
+        if filter == self.filter {
+            return Ok(());
+        }
+        self.filter = filter;
+        self.restart_rx_if_wanted()
+    }
+
+    /// Select the TX power; returns the setting actually used (the highest
+    /// table entry not above `dbm`).
+    pub fn set_tx_power(&mut self, dbm: i8) -> Result<TxPower, RadioError> {
+        let new = settings::select(dbm, crate::chip::HIGH_PA);
+        if new == self.power {
+            return Ok(new);
+        }
+        self.power = new;
+        self.prepare_setup();
+        let m = self.m();
+        if crate::chip::HIGH_PA {
+            m.change_pa.reg_override = match new.pa {
+                Pa::Standard => addr(m.tx_std_overrides.as_ptr()),
+                Pa::High => addr(m.tx20_overrides.as_ptr()),
+            };
+            let word = addr(addr_of!(m.change_pa));
+            submit(word)?;
+        } else {
+            m.set_power.tx_power = new.raw as u16;
+            let word = addr(addr_of!(m.set_power));
+            submit(word)?;
+        }
+        Ok(new)
+    }
+
+    /// Take the next received frame into `out`.
+    pub fn receive(&mut self, out: &mut [u8; MAX_FRAME]) -> Option<RxInfo> {
+        // A receiver that ended (queue overflow, synth error) is restarted.
+        if self.rx_wanted && !self.tx_pending && !self.is_rx_on() {
+            self.stats.rx_restarts += 1;
+            let _ = self.start_rx();
+        }
+        for _ in 0..RX_ENTRIES {
+            let index = self.read_index;
+            let m = self.m();
+            let entry = m.entries[index].0.as_mut_ptr();
+            let state = unsafe { read_volatile(entry.add(4)) };
+            match state {
+                DATA_ENTRY_FINISHED => {
+                    let data = unsafe { entry.add(8) };
+                    let n = usize::from(unsafe { read_volatile(data) });
+                    let result = if (2..=MAX_FRAME + 2).contains(&n) {
+                        let len = n - 2;
+                        for (i, b) in out.iter_mut().take(len).enumerate() {
+                            *b = unsafe { read_volatile(data.add(1 + i)) };
+                        }
+                        let rssi = unsafe { read_volatile(data.add(n - 1)) } as i8;
+                        let corr = unsafe { read_volatile(data.add(n)) };
+                        (corr & 0x80 == 0).then_some(RxInfo {
+                            len,
+                            rssi_dbm: rssi,
+                            correlation: corr & 0x3F,
+                        })
+                    } else {
+                        None
+                    };
+                    unsafe { write_volatile(entry.add(4), DATA_ENTRY_PENDING) };
+                    self.read_index = (index + 1) % RX_ENTRIES;
+                    if let Some(info) = result {
+                        self.stats.rx_frames += 1;
+                        return Some(info);
+                    }
+                }
+                DATA_ENTRY_UNFINISHED => {
+                    unsafe { write_volatile(entry.add(4), DATA_ENTRY_PENDING) };
+                    self.read_index = (index + 1) % RX_ENTRIES;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Submit CSMA-CA + TX (+ ACK wait when `frame` requests one). Requires
+    /// the receiver to be running (CSMA uses it for CCA).
+    pub fn start_tx(&mut self, frame: &[u8], csma: Csma) -> Result<(), RadioError> {
+        if frame.len() > MAX_FRAME || frame.len() < 3 {
+            return Err(RadioError::FrameTooLong);
+        }
+        if !self.is_rx_on() {
+            self.start_rx()?;
+        }
+        self.random_state = self
+            .random_state
+            .wrapping_mul(25173)
+            .wrapping_add(13849)
+            .max(1);
+        let ack = frame[0] & 0x20 != 0;
+        let random = self.random_state;
+        let m = self.m();
+        m.tx_buf[..frame.len()].copy_from_slice(frame);
+        let c = &mut m.csma;
+        c.status = status::IDLE;
+        c.next_op = addr(addr_of!(m.tx));
+        c.start_trigger = TRIG_NOW;
+        c.condition = COND_STOP_ON_FALSE;
+        c.random_state = random;
+        c.mac_max_be = csma.max_be;
+        c.mac_max_csma_backoffs = csma.max_backoffs;
+        c.csma_config = CSMA_CONFIG;
+        c.nb = 0;
+        c.be = csma.min_be;
+        c.remaining_periods = 0;
+        c.end_trigger = TRIG_NEVER;
+        c.end_time = 0;
+        let t = &mut m.tx;
+        t.status = status::IDLE;
+        t.start_trigger = TRIG_NOW;
+        t.tx_opt = 0;
+        t.payload_len = frame.len() as u8;
+        t.payload = addr(m.tx_buf.as_ptr());
+        if ack {
+            t.condition = COND_STOP_ON_FALSE;
+            t.next_op = addr(addr_of!(m.rx_ack));
+            let a = &mut m.rx_ack;
+            a.status = status::IDLE;
+            a.next_op = 0;
+            a.start_trigger = TRIG_NOW;
+            a.condition = COND_NEVER;
+            a.seq_no = frame[2];
+            a.end_trigger = TRIG_REL_START | TRIG_PAST;
+            a.end_time = ACK_WAIT_US * RAT_TICKS_PER_US;
+        } else {
+            t.condition = COND_NEVER;
+            t.next_op = 0;
+            m.rx_ack.status = status::IDLE;
+        }
+        let word = addr(addr_of!(m.csma));
+        submit(word)?;
+        self.tx_pending = true;
+        Ok(())
+    }
+
+    /// Poll the transmission submitted by [`Radio::start_tx`]: `None` while
+    /// it runs.
+    pub fn poll_tx(&mut self) -> Option<Result<TxOutcome, RadioError>> {
+        if !self.tx_pending {
+            return Some(Err(RadioError::Off));
+        }
+        let m = unsafe { &*self.mem };
+        let csma = op_status(addr_of!(m.csma.status));
+        if !status::is_terminal(csma) {
+            return None;
+        }
+        let result = if csma == status::IEEE_DONE_BUSY {
+            Ok(TxOutcome::ChannelBusy)
+        } else if csma != status::IEEE_DONE_OK {
+            Err(RadioError::Op(csma))
+        } else {
+            let tx = op_status(addr_of!(m.tx.status));
+            if !status::is_terminal(tx) {
+                return None;
+            }
+            if tx != status::IEEE_DONE_OK {
+                Err(RadioError::Op(tx))
+            } else if m.tx.condition == COND_NEVER {
+                Ok(TxOutcome::Sent)
+            } else {
+                let ack = op_status(addr_of!(m.rx_ack.status));
+                if !status::is_terminal(ack) {
+                    return None;
+                }
+                match ack {
+                    status::IEEE_DONE_ACK => Ok(TxOutcome::Acked {
+                        frame_pending: false,
+                    }),
+                    status::IEEE_DONE_ACKPEND => Ok(TxOutcome::Acked {
+                        frame_pending: true,
+                    }),
+                    status::IEEE_DONE_TIMEOUT => Ok(TxOutcome::NoAck),
+                    other => Err(RadioError::Op(other)),
+                }
+            }
+        };
+        self.tx_pending = false;
+        match result {
+            Ok(TxOutcome::ChannelBusy) => self.stats.tx_busy += 1,
+            Ok(TxOutcome::NoAck) => self.stats.tx_no_ack += 1,
+            Ok(_) => self.stats.tx_frames += 1,
+            Err(_) => self.stats.tx_errors += 1,
+        }
+        Some(result)
+    }
+
+    /// Abort a running transmission (the receiver keeps running).
+    pub fn abort_tx(&mut self) {
+        if self.tx_pending {
+            let _ = doorbell(dir_cmd(id::CMD_IEEE_ABORT_FG));
+            let m = unsafe { &*self.mem };
+            let _ = self.wait_op(addr_of!(m.csma.status));
+            self.tx_pending = false;
+        }
+    }
+
+    /// Start an energy-detect scan of `duration_us` on `channel` (the
+    /// receiver is stopped meanwhile).
+    pub fn start_energy_detect(&mut self, channel: u8, duration_us: u32) -> Result<(), RadioError> {
+        if !(11..=26).contains(&channel) {
+            return Err(RadioError::InvalidChannel);
+        }
+        self.stop_rx();
+        let m = self.m();
+        let ed = &mut m.ed;
+        ed.status = status::IDLE;
+        ed.next_op = 0;
+        ed.start_trigger = TRIG_NOW;
+        ed.condition = COND_NEVER;
+        ed.channel = channel;
+        ed.cca_opt = CCA_OPT;
+        ed.cca_rssi_thr = CCA_THRESHOLD_DBM;
+        ed.max_rssi = -128;
+        ed.end_trigger = TRIG_REL_START | TRIG_PAST;
+        ed.end_time = duration_us.saturating_mul(RAT_TICKS_PER_US);
+        let word = addr(addr_of!(m.ed));
+        submit(word)
+    }
+
+    /// Poll the ED scan: `Some(max RSSI dBm)` when done; restores the
+    /// receiver when it was wanted.
+    pub fn poll_energy_detect(&mut self) -> Option<Result<i8, RadioError>> {
+        let m = unsafe { &*self.mem };
+        let s = op_status(addr_of!(m.ed.status));
+        if !status::is_terminal(s) {
+            return None;
+        }
+        let max = unsafe { read_volatile(addr_of!(m.ed.max_rssi)) };
+        let result = match s {
+            status::IEEE_DONE_OK | status::IEEE_DONE_TIMEOUT | status::IEEE_DONE_STOPPED => Ok(max),
+            other => Err(RadioError::Op(other)),
+        };
+        if self.rx_wanted
+            && let Err(e) = self.start_rx()
+        {
+            return Some(Err(e));
+        }
+        Some(result)
+    }
+
+    /// Arm (`pending`) or clear the Frame Pending bit the RF core's auto-ACK
+    /// sends to a Data Request from `address`.
+    pub fn set_frame_pending(&mut self, address: FpAddress, pending: bool) -> Result<(), FpError> {
+        let running = self.is_rx_on();
+        let m = self.m();
+        let (enable, pend, slot, short) = match address {
+            FpAddress::Short { pan_id, address } => {
+                let value = u32::from(address) | u32::from(pan_id) << 16;
+                let t = &mut m.short_fp;
+                let found =
+                    (0..FP_TABLE_LEN).find(|&i| t.enable & (1 << i) != 0 && t.entries[i] == value);
+                match (found, pending) {
+                    (Some(i), _) => (
+                        &mut t.enable as *mut u32,
+                        &mut t.pending as *mut u32,
+                        i,
+                        true,
+                    ),
+                    (None, false) => return Ok(()),
+                    (None, true) => {
+                        let free = (0..FP_TABLE_LEN)
+                            .find(|&i| t.enable & (1 << i) == 0)
+                            .ok_or(FpError::TableFull)?;
+                        t.entries[free] = value;
+                        (
+                            &mut t.enable as *mut u32,
+                            &mut t.pending as *mut u32,
+                            free,
+                            true,
+                        )
+                    }
+                }
+            }
+            FpAddress::Extended(bytes) => {
+                let v = u64::from_le_bytes(bytes);
+                let value = [v as u32, (v >> 32) as u32];
+                let t = &mut m.ext_fp;
+                let found =
+                    (0..FP_TABLE_LEN).find(|&i| t.enable & (1 << i) != 0 && t.entries[i] == value);
+                match (found, pending) {
+                    (Some(i), _) => (
+                        &mut t.enable as *mut u32,
+                        &mut t.pending as *mut u32,
+                        i,
+                        false,
+                    ),
+                    (None, false) => return Ok(()),
+                    (None, true) => {
+                        let free = (0..FP_TABLE_LEN)
+                            .find(|&i| t.enable & (1 << i) == 0)
+                            .ok_or(FpError::TableFull)?;
+                        t.entries[free] = value;
+                        (
+                            &mut t.enable as *mut u32,
+                            &mut t.pending as *mut u32,
+                            free,
+                            false,
+                        )
+                    }
+                }
+            }
+        };
+        if running {
+            m.src_match.command_no = id::CMD_IEEE_MOD_SRC_MATCH;
+            m.src_match.options = (pending as u8) | ((pending as u8) << 1) | ((short as u8) << 2);
+            m.src_match.entry_no = slot as u8;
+            let word = addr(addr_of!(m.src_match));
+            submit(word).map_err(FpError::Radio)?;
+        } else {
+            let bit = 1u32 << slot;
+            unsafe {
+                let (e, p) = (read_volatile(enable), read_volatile(pend));
+                if pending {
+                    write_volatile(enable, e | bit);
+                    write_volatile(pend, p | bit);
+                } else {
+                    write_volatile(enable, e & !bit);
+                    write_volatile(pend, p & !bit);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear both Frame Pending tables.
+    pub fn clear_frame_pending(&mut self) {
+        let running = self.is_rx_on();
+        if running {
+            self.stop_rx();
+        }
+        let m = self.m();
+        m.short_fp.enable = 0;
+        m.short_fp.pending = 0;
+        m.ext_fp.enable = 0;
+        m.ext_fp.pending = 0;
+        if running {
+            let _ = self.start_rx();
+        }
+    }
+
+    pub fn stats(&self) -> RadioStats {
+        let m = unsafe { &*self.mem };
+        let out = addr_of!(m.rx_output);
+        let mut s = self.stats;
+        unsafe {
+            s.auto_acks = read_volatile(addr_of!((*out).n_tx_ack));
+            s.rx_buf_full = read_volatile(addr_of!((*out).n_rx_buf_full));
+            s.rx_nok = read_volatile(addr_of!((*out).n_rx_nok));
+        }
+        s
+    }
+
+    /// Raw receiver status word (diagnostics).
+    pub fn rx_status(&self) -> u16 {
+        let m = unsafe { &*self.mem };
+        op_status(addr_of!(m.rx.status))
+    }
+}
+
+/// Copy the CPE patch into RF core RAM (`rf_patch_cpe_ieee_802_15_4()`,
+/// patch-entered state not tracked: the image is always copied).
+fn apply_patch() {
+    let base = patch_ieee::CPERAM_START + patch_ieee::PATCH_VEC_OFFSET;
+    for (i, word) in patch_ieee::PATCH_IMAGE.iter().enumerate() {
+        mmio::write(base + 4 * i as u32, *word);
+    }
+    let tab = patch_ieee::CPERAM_START + patch_ieee::PATCH_TAB_OFFSET;
+    for (index, value) in patch_ieee::PATCH_TAB_WRITES {
+        mmio::write8(tab + u32::from(index), value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_fits_the_largest_frame() {
+        const { assert!(ENTRY_SIZE >= 8 + 1 + MAX_FRAME + 2) };
+        const { assert!(ENTRY_SIZE.is_multiple_of(4)) };
+    }
+}

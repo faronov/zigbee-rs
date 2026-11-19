@@ -31,6 +31,10 @@ members = [
     "esp32h2-sleep",
 ]
 exclude = [
+    "cc26x2-hal",
+    "boards/cc26x2-dongle",
+    "products/cc26x2-dongle",
+    "examples/cc26x2-router",
     "vendor/esp-hal",
     "vendor/esp-radio",
     "vendor/esp-radio-0.18",
