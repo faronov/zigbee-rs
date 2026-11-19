@@ -455,6 +455,7 @@ async fn run(
 ) -> ! {
     loop {
         lab::tick(host);
+        radio_watch(now_us());
         // Trial window without FW_CONFIRM: the previous image is selected
         // (or the next boot's check selects it); restart into it.
         if let TrialPoll::Expired { .. } = platform.poll_trial(now_ms()) {
@@ -547,4 +548,50 @@ fn attach_pta(
 ) {
     static PTA: StaticCell<product::pta::Pta<'static>> = StaticCell::new();
     platform.attach_coex(PTA.init(product::pta::Pta::new(request, grant, priority, tx_line)));
+}
+
+/// Reports a radio driver that stays out of "receiving, nothing pending"
+/// (a stalled state machine refuses every transmission as busy) and the
+/// stalled automatic ACKs the driver's watchdog left. State in statics, so
+/// the root future does not carry it. Its own frame: the log formatting
+/// stays out of the root future's poll frame (stack gate `serve` chain).
+#[inline(never)]
+fn radio_watch(now_us: u64) {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+    use portable_atomic::AtomicU64;
+    const STALL_US: u64 = 200_000;
+    static SINCE_US: AtomicU64 = AtomicU64::new(0);
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    static RECOVERIES: AtomicU32 = AtomicU32::new(0);
+    let recoveries = esp_radio::ieee802154::tx_ack_recoveries();
+    if recoveries != RECOVERIES.swap(recoveries, Relaxed) {
+        log::warn!(
+            "[RADIO] stalled automatic ACK left ({} since boot)",
+            recoveries
+        );
+    }
+    let state = esp_radio::ieee802154::debug_state();
+    let (driver, events, _, _) = state;
+    if driver == 1 && events == 0 {
+        if REPORTED.swap(false, Relaxed) {
+            log::warn!("[RADIO] receiving again: {:?}", state);
+        }
+        SINCE_US.store(0, Relaxed);
+        return;
+    }
+    let since = match SINCE_US.load(Relaxed) {
+        0 => {
+            SINCE_US.store(now_us.max(1), Relaxed);
+            now_us
+        }
+        since => since,
+    };
+    if !REPORTED.load(Relaxed) && now_us.saturating_sub(since) > STALL_US {
+        REPORTED.store(true, Relaxed);
+        log::error!(
+            "[RADIO] stalled {} ms: (state, events, rx_state, queued) = {:?}",
+            (now_us - since) / 1000,
+            state
+        );
+    }
 }
