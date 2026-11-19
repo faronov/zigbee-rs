@@ -1393,9 +1393,15 @@ impl DmaRxStreamBufView {
                 // No data available.
                 (&[], false)
             } else {
+                // zigbee-rs local patch `dma-rx-stream-last-chunk`: the last
+                // descriptor's data starts at its chunk, not `length` bytes
+                // before the end of the buffer (wrong for a partly filled
+                // chunk, e.g. closed by a UART idle EOF).
                 let length = last_descriptor.len() - self.descriptor_offset;
+                let start =
+                    self.buf.buffer.len() - last_descriptor.size() + self.descriptor_offset;
                 (
-                    &self.buf.buffer[self.buf.buffer.len() - length..],
+                    &self.buf.buffer[start..][..length],
                     last_descriptor.flags.suc_eof(),
                 )
             }
