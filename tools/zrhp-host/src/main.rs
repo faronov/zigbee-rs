@@ -25,6 +25,10 @@
 //!                  after a reset, without --form); margins 10 000/10 000
 //! --tables         TBL_STATS / TBL_READ / TBL_SYNC of the DEVICE table
 //! --fw-slots       FW_GET_SLOTS
+//! --fw-update FILE --fw-version 0xMMmmrrrr
+//!                  FW_BEGIN/WRITE/FINISH/ACTIVATE of FILE (format 1); the
+//!                  NCP reboots into the trial image
+//! --fw-confirm     FW_CONFIRM (after the trial image resumed: use --form)
 //! ```
 
 use std::process::Command;
@@ -38,7 +42,9 @@ use zigbee_zrhp::msg::backup::{
     BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, BkpRestorePutRsp,
 };
 use zigbee_zrhp::msg::diag::{DiagGetCounters, DiagGetCountersRsp};
-use zigbee_zrhp::msg::firmware::FwGetSlotsRsp;
+use zigbee_zrhp::msg::firmware::{
+    FwActivate, FwBegin, FwBeginRsp, FwFinishRsp, FwGetSlotsRsp, FwWrite, FwWriteRsp,
+};
 use zigbee_zrhp::msg::network::{EvtNetworkState, NwkForm, NwkGetInfoRsp, NwkInit, NwkInitRsp};
 use zigbee_zrhp::msg::security::SecGetFrameCountersRsp;
 use zigbee_zrhp::msg::system::{
@@ -704,6 +710,61 @@ fn fw_slots<S: ByteStream>(host: &mut Host<S>) -> Result<(), String> {
     Ok(())
 }
 
+/// Stage `path` in the inactive slot and activate it.
+fn fw_update<S: ByteStream>(host: &mut Host<S>, path: &str, version: u32) -> Result<(), String> {
+    let image = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let digest = Command::new("shasum")
+        .args(["-a", "256", path])
+        .output()
+        .map_err(|e| format!("shasum: {e}"))?;
+    let hex = String::from_utf8_lossy(&digest.stdout);
+    let hex = hex.split_whitespace().next().unwrap_or_default();
+    let mut sha256 = [0u8; 32];
+    for (index, byte) in sha256.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(index * 2..index * 2 + 2).unwrap_or("zz"), 16)
+            .map_err(|_| "bad shasum output".to_string())?;
+    }
+    let started = Instant::now();
+    let tid = host.request(&FwBegin {
+        image_size: image.len() as u32,
+        format: 1,
+        sha256,
+        version,
+        flags: 0,
+    });
+    let rsp = host.response(tid)?;
+    let begin: FwBeginRsp = body(&rsp)?;
+    println!(
+        "FW_BEGIN: {} bytes version 0x{version:08X} -> slot {} (max_chunk {})",
+        image.len(),
+        begin.slot,
+        begin.max_chunk
+    );
+    let mut offset = 0u32;
+    for chunk in image.chunks(usize::from(begin.max_chunk.max(1))) {
+        let tid = host.request(&FwWrite {
+            offset,
+            data: Rest(chunk),
+        });
+        let rsp = host.response(tid)?;
+        let write: FwWriteRsp = body(&rsp)?;
+        offset = write.next_offset;
+    }
+    println!("FW_WRITE: {offset} bytes in {:?}", started.elapsed());
+    let tid = host.request_empty(ids::FW_FINISH);
+    let rsp = host.response_within(tid, Duration::from_secs(30))?;
+    let finish: FwFinishRsp = body(&rsp)?;
+    println!("FW_FINISH: verify_result {}", finish.verify_result);
+    fw_slots(host)?;
+    let tid = host.request(&FwActivate { delay_ms: 200 });
+    let rsp = host.response(tid)?;
+    if !rsp.status().is_success() {
+        return Err(format!("FW_ACTIVATE {:?}", rsp.status()));
+    }
+    println!("FW_ACTIVATE: rebooting into the trial image");
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let value = |flag: &str| {
@@ -743,6 +804,18 @@ fn main() {
         }
         if args.iter().any(|a| a == "--fw-slots") {
             fw_slots(&mut host)?;
+        }
+        if args.iter().any(|a| a == "--fw-confirm") {
+            let tid = host.request_empty(ids::FW_CONFIRM);
+            let rsp = host.response(tid)?;
+            println!("FW_CONFIRM: {:?}", rsp.status());
+            fw_slots(&mut host)?;
+        }
+        if let Some(path) = value("--fw-update") {
+            let version = value("--fw-version")
+                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .ok_or("--fw-version 0xMMmmrrrr required")?;
+            fw_update(&mut host, &path, version)?;
         }
         Ok(())
     });
