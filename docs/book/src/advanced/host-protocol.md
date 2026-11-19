@@ -2701,6 +2701,44 @@ Sources: [ESP-TBR-HW] and the board schematic v1.3 [ESP-TBR-SCH].
 - **Mismatch handling.** The hub checks `SYS_GET_INFO.uart_flow` at session
   start. If the NCP reports no flow control, the hub turns its own off
   (RTS held low, CTS ignored) and uses 460 800.
+- **ESP32-H2 NCP implementation** (`examples/esp32-ncp`, branch
+  `ncp-br-flow`, 2026-11-20):
+  - The board crate routes `U0RTS` to GPIO4 and `U0CTS` from GPIO5 through
+    the GPIO matrix. The CTS pad gets its pull-down before `with_cts`
+    freezes the signal.
+  - `esp-serial-stream` enables RTS (threshold 96) and CTS together.
+  - With flow control off, the UART would hold RTS high from its reset
+    `CONF0.SW_RTS` value and block a peer whose flow control is on. This
+    was seen on the board: the host's frames stopped after
+    `SYS_SET_UART(921 600, flow 0)`. The stream now asserts RTS ("ready")
+    whenever flow control is off.
+  - A `SYS_SET_UART` switch that finds the DMA transmitter busy is retried
+    instead of dropped (host test).
+- **Measured with the real NCP** (S3 bridge 0.2.2, flow on; host echo flood
+  of 64-byte `SYS_ECHO`s, 16 in flight; NCP and host link counters):
+
+  | Image / line | Run | Echoes ok | Bad frames (NCP) | RX overflows (NCP) |
+  |---|---|---:|---:|---:|
+  | RTS/CTS, 921 600 | 70 s flood | 68 328 | 0 | 0 |
+  | RTS/CTS, 2 000 000 (`SYS_SET_UART`) | 60 s flood | 101 840 | 0 | 0 |
+  | RTS/CTS, 460 800 (`SYS_SET_UART`) | 60 s flood | 31 832 | 0 | 0 |
+  | flow off, 921 600 (`SYS_SET_UART`) | 60 s flood | 58 744 | 0 | 0 |
+  | RTS/CTS, 921 600 | 3 C6 join/leave cycles (2 factory-new; 17 and 9 sector erases of 26–40 ms during the flood) | 285 472 | 0 | 0 |
+  | RTS/CTS, 2 000 000 | 1 factory-new join (17 erases) and a leave session | 159 760 | 0 | 0 |
+  | fallback image (no flow control), 460 800 | 2 × 30 s flood (bridge flow control on, then off) | 27 936 | 0 | 0 |
+  | fallback image (no flow control), 460 800 | 2 factory-new C6 join/leave cycles | 101 744 | 0 | 0 |
+
+  Echo throughput was about 61 KiB/s each way at 921 600 and 106 KiB/s at
+  2 Mbaud. Retransmissions remained (up to 45 per run near line
+  saturation, `rx_duplicate` on the receiver): ARQ timeouts while the
+  peer was slow to acknowledge. They were not data loss. The UHCI DMA
+  receive keeps running through a flash erase, so the H2 never needed
+  to deassert RTS in these runs. RTS/CTS covers longer stalls.
+- **Found on the way:** esp-hal 1.0/1.1's `DmaRxStreamBuf` read a partly
+  filled *last* descriptor from the wrong offset. About one host frame in
+  a few hundred arrived CRC-bad (130 in 70 s at 921 600). There was no UART
+  line error or overflow. Fixed in the vendored esp-hal
+  (`vendor/esp-hal/LOCAL-PATCHES.md`); 0 since.
 
 **Flash size** (decision N4). Both partition tables of 8.9 (2 MB and 4 MB)
 are kept, and the size is detected at runtime:
@@ -3315,7 +3353,7 @@ This is simulation-level evidence, not hardware evidence.
 | H5 | **ZBT-1 hashed-TCLK verification** (decision 8): read a device's derived TCLK from the user's ZBT-1 (EZSP key export of a device that completed a TCLK update) and compare it with both candidates in `ezsp_hashed_tclk.json` computed from that network's `hashed_tclk`. The match becomes the normative vector and enables capability bit 14. Then migrate ZBT-1 → H2 → ZBT-1 with real devices, checking APS-secured exchanges (Verify-Key, network-key rotation) with a hashed-key device after each move. |
 | H6 | NCP firmware update with trial boot, confirm, rollback and retained network state. |
 | H7 | 24 h soak with noise injection on the UART variant (921 600, RTS/CTS). |
-| H8 | **Thread BR board UART:** 921 600 (default) and 2 000 000 with RTS/CTS on R19/R20, and the 460 800 fallback without flow control, with both chips writing flash (`rx_overflow = 0`) under the real NCP and hub (R18–R20 fitting and an RX-stall test through the phase-0 bridge passed on 2026-11-19, 11.5). Identify the H2 module's flash size (2 MB or 4 MB) via JEDEC ID, and check the NCP's layout-mismatch refusal. ROM-path recovery via S3 GPIO7/8 with `zbnv` preserved. |
+| H8 | **Thread BR board UART:** 921 600 (default) and 2 000 000 with RTS/CTS on R19/R20, and the 460 800 fallback without flow control, with both chips writing flash (`rx_overflow = 0`) under the real NCP and hub (R18–R20 fitting and an RX-stall test through the phase-0 bridge passed on 2026-11-19, 11.5; the real NCP with the H2 writing flash through the phase-0 bridge passed on 2026-11-20, 11.5; the real hub with the S3 writing flash is still open). Identify the H2 module's flash size (2 MB or 4 MB) via JEDEC ID, and check the NCP's layout-mismatch refusal. ROM-path recovery via S3 GPIO7/8 with `zbnv` preserved. |
 | H9 | **PTA coexistence:** Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on. The hub's automatic enable/disable follows Wi-Fi up/down, including Ethernet-only. GP TempMaster reply behaviour with grant denied. |
 | H10 | **GP combo on the NCP:** direct and proxy-tunnelled commissioning into the NCP sink with zigpy as shadow, including an unsecured (level-0) FlowerX GP / BGT1 GP; a bidirectional GPD with the NCP as its own TempMaster; Sink Table across an NCP reboot (seamless resume) and across backup/restore. |
 | H11 | **Z2M end to end:** zigbee-herdsman adapter with 10+ real devices; Z2M backup → restore on a fresh NCP. |
