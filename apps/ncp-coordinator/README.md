@@ -38,6 +38,7 @@ composition; this crate has no board, product or vendor dependency.
   (flags bit1 keeps host endpoints; a new network can be formed or restored
   in the same session), `NWK_GET_INFO`, `NWK_PERMIT_JOIN`,
   `NWK_ADD_ENDPOINT`, `EVT_NETWORK_STATE`, `EVT_DEVICE_JOINED`,
+  `EVT_DEVICE_AUTHORIZED` (network key used / unique TCLK verified),
   `EVT_DEVICE_LEFT`.
 * DATA: `APS_DATA_REQUEST` → `EVT_APS_DATA_CONFIRM` (after the APS ACK
   outcome for `ack_request` unicasts), `EVT_APS_DATA_INDICATION` with
@@ -50,9 +51,11 @@ composition; this crate has no board, product or vendor dependency.
   after a wipe (reason 1) and a restore (reason 2).
 * BACKUP: export (`NODE`, `NETWORK`, keys, `DEVICE` records, `RS_PARAMS`,
   `END` with CRC-32C, generated per read) and restore (records validated per
-  9.4 rule 2, staged in RAM with up to 64 link keys, `END` checked at
-  commit, counter rules 4/6 including the 2²⁰ unknown-TCLK margin, IEEE
-  override with flags bit0).
+  9.4 rule 2, staged in RAM with up to 64 link keys and 64 children, `END`
+  checked at commit, counter rules 4/6 including the 2²⁰ unknown-TCLK
+  margin, IEEE override with flags bit0; children are written to the
+  durable child table before the resume and keep their parent and short
+  address).
 * FW (product platform): `FW_BEGIN`/`WRITE`/`FINISH`/`ACTIVATE`/`CONFIRM`/
   `ABORT`/`GET_SLOTS`: inactive A/B slot, SHA-256 and signature policy,
   pending-verify trial with host confirmation, rollback by the IDF
@@ -66,7 +69,9 @@ composition; this crate has no board, product or vendor dependency.
 
 Host paging (`TBL_LOOKUP` misses, eviction `TBL_WRITEBACK`, `HOST_TABLES`
 mode), per-entry `rev` and dirty tracking (always 0), SOURCE_ROUTE tables,
-child-table import on restore (children are `CHILD_DEMOTED` and rejoin),
+children beyond 64 on restore (`CHILD_DEMOTED`, they rejoin), an APS ACK
+timeout longer than ~6 s for sleepy destinations that long-poll slower
+(`tx_options` bit5 is accepted but not yet honoured),
 `BKP_RESTORE_BEGIN` while the network runs (the host restores after a reset,
 before `NWK_INIT`), restore commit marker (a power cut during
 `BKP_RESTORE_COMMIT` leaves the previous network wiped or the new one
@@ -98,9 +103,24 @@ rotation commands.
   counters kept); a second update with `FW_CONFIRM` stayed on 0.1.1 across a
   reset. Signed (envelope) images and the 10-minute trial-window expiry were
   not run on hardware.
+* Device join on the same H2 (2026-11-19, ESP32-C6 `esp32c6-sensor` SED,
+  NCP-only permit join closed at the first join, sniffer on channel 17):
+  association, Transport-Key (default TCLK), Request-Key → unique TCLK →
+  Verify-Key → Confirm-Key, `EVT_DEVICE_JOINED`/`EVT_DEVICE_AUTHORIZED`
+  (result 1, unique key); Active_EP, Basic read (`Zigbee-RS`,
+  `ESP32-C6-Sensor`), three Bind_req and Configure Reporting; temperature,
+  humidity and battery reports every 10–60 s as indications with LQI 184–188
+  / RSSI −41…−42 dBm. Backup with the device (child + unique key) → NCP
+  reset → `BKP_RESTORE` (1 child, 1 key) → reports continued with the next
+  ZCL sequence numbers and no rejoin, association or beacon on air.
+  Fixed on the way: host APS data went out NWK-unsecured on its first
+  transmission; a factory-new device re-associating was sent the network key
+  under its old unique TCLK; network-key retries without pacing after a
+  child expired; a stalled automatic-ACK state of the H2 radio
+  (`ieee802154-tx-ack-watchdog`).
 * Not run on hardware: SYS_SET_IEEE, PTA (`pta` image), GP sink commissioning,
-  restore of a foreign backup (other IEEE, z2m/OCB with device keys), any
-  device join and the remaining gates.
+  restore of a foreign backup (other IEEE, z2m/OCB), joins through a router,
+  more than one device, and the remaining gates.
 
 ## Sizes (release, nightly-2026-08-01, 2026-11-19)
 

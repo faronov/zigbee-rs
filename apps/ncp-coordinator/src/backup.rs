@@ -16,10 +16,12 @@
 //! 2) and applies them at `BKP_RESTORE_COMMIT` after checking `END`:
 //! counters by the 9.4 rule 4, the IEEE override when allowed (rule 7), the
 //! network (the previous one is wiped only at commit), then the link keys.
-//! Deviations, reported as notes: link keys beyond the staging capacity
-//! (`HOST_BACKED`), children (`CHILD_DEMOTED`: they rejoin; the child table
-//! is not imported), GP records, the EZSP hashed TCLK and unknown records
-//! (`IGNORED`). The network is started at commit (flags bit1 is implied);
+//! Children of the NCP (`DEVICE` with a child block, up to
+//! [`MAX_STAGED_CHILDREN`]) are written to the durable child table before
+//! the resume, so they keep their parent and short address. Deviations,
+//! reported as notes: link keys beyond the staging capacity
+//! (`HOST_BACKED`), children beyond it (`CHILD_DEMOTED`: they rejoin), GP
+//! records, the EZSP hashed TCLK and unknown records (`IGNORED`). The network is started at commit (flags bit1 is implied);
 //! a later `NWK_INIT` only applies floors. Restore needs the stack stopped
 //! (after a reboot, before `NWK_INIT`).
 
@@ -40,9 +42,12 @@ use zigbee_zrhp::types::{Endpoint, Ieee, Status};
 
 use crate::ncp::{FC_STRIDE, QUEUE_BYTES};
 use crate::platform::NcpPlatform;
-use crate::port::{CoordinatorPort, NetworkImage, NetworkState, OpError};
+use crate::port::{CoordinatorPort, NetworkImage, NetworkState, OpError, RestoredChild};
 use crate::tables::device_record;
 
+/// NCP children staged by a restore; more are `CHILD_DEMOTED` (they
+/// rejoin).
+pub const MAX_STAGED_CHILDREN: usize = 64;
 /// Device link keys staged by a restore; more are `HOST_BACKED`.
 pub const MAX_STAGED_KEYS: usize = 64;
 /// `max_records_per_put` advertised by `BKP_RESTORE_BEGIN`.
@@ -92,7 +97,7 @@ pub struct Restore {
     tclk_counter_known: bool,
     keys: Vec<([u8; 8], [u8; 16]), MAX_STAGED_KEYS>,
     host_backed: u16,
-    children: u16,
+    children: Vec<RestoredChild, MAX_STAGED_CHILDREN>,
     end: Option<EndRecord>,
     put_index: u16,
 }
@@ -336,7 +341,7 @@ pub(crate) fn dispatch_backup<C: CoordinatorPort>(
                 tclk_counter_known: false,
                 keys: Vec::new(),
                 host_backed: 0,
-                children: 0,
+                children: Vec::new(),
                 end: None,
                 put_index: 0,
             });
@@ -504,9 +509,21 @@ fn stage(restore: &mut Restore, record: &Record<'_>, own_ieee: [u8; 8]) -> Resul
         }
         Record::Device(device) => {
             let mut result = None;
-            if device.child.is_some() || device.flags & 0x01 != 0 {
-                restore.children = restore.children.saturating_add(1);
-                result = Some(note::CHILD_DEMOTED);
+            match &device.child {
+                // A child of the NCP keeps its short address and parent.
+                Some(child)
+                    if (0x0001..=0xFFF7).contains(&device.nwk)
+                        && restore
+                            .children
+                            .push(RestoredChild {
+                                ieee: device.ieee.0,
+                                nwk: device.nwk,
+                                capability: child.capability,
+                                timeout: child.timeout_exp.min(14),
+                            })
+                            .is_ok() => {}
+                Some(_) => result = Some(note::CHILD_DEMOTED),
+                None => {}
             }
             if let Some(link) = &device.link
                 && restore.keys.push((device.ieee.0, link.key)).is_err()
@@ -579,7 +596,9 @@ async fn commit<C: CoordinatorPort, P: NcpPlatform>(
         nwk_fc_start,
         aps_fc_start,
     };
-    port.install_network(&image).await.map_err(op_status)?;
+    port.install_network(&image, &restore.children)
+        .await
+        .map_err(op_status)?;
     let mut on_ncp = 0u16;
     let mut host_backed = restore.host_backed;
     for (ieee, link_key) in &restore.keys {
@@ -594,7 +613,7 @@ async fn commit<C: CoordinatorPort, P: NcpPlatform>(
         aps_fc_start: counters.aps_current.max(aps_fc_start),
         link_keys_on_ncp: on_ncp,
         link_keys_host_backed: host_backed,
-        children: 0,
+        children: restore.children.len() as u16,
     })
 }
 

@@ -459,6 +459,14 @@ fn host_negotiates_forms_reads_counters_and_sends_data() {
     );
     let confirm: EvtApsDataConfirm = host.event(ids::EVT_APS_DATA_CONFIRM).unwrap().event();
     assert_eq!((confirm.req_tid, confirm.status), (data, 0));
+    // The host frame went out NWK-secured (frame control bit 9).
+    let sent = ncp_coordinator_app::tc::TcApp::device(port.app())
+        .aps()
+        .nwk()
+        .mac()
+        .tx_history();
+    let nwk_frame = sent.last().expect("broadcast sent").payload.as_slice();
+    assert_ne!(nwk_frame[1] & 0x02, 0, "NWK security on host data");
 
     // Echo, an unknown ID, a wrong endpoint, and an unsupported command.
     let echo = host.request(&SysEcho {

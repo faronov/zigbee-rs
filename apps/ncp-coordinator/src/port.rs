@@ -145,6 +145,15 @@ pub enum DeviceEvent {
         /// [`left`]`::REASON_*`.
         reason: u8,
     },
+    /// `EVT_DEVICE_AUTHORIZED`: 0 network key delivered (the device used
+    /// it), 1 unique TCLK verified, 2 TCLK verification failed.
+    Authorized {
+        nwk: u16,
+        ieee: [u8; 8],
+        result: u8,
+        /// 0 global default TCLK, 1 unique TCLK.
+        link_key_type: u8,
+    },
 }
 
 /// Formation parameters from `NWK_FORM` (zero/`FFFF` = NCP chooses).
@@ -273,10 +282,15 @@ pub trait CoordinatorPort {
     // ── Network images, Trust Center devices (formation parameters,
     //    TABLES, BACKUP) ──────────────────────────────────────────────
 
-    /// Replace the network in NV with `image` and start it (host formation
-    /// parameters, `BKP_RESTORE_COMMIT`). Only while the stack is stopped.
-    async fn install_network(&mut self, image: &NetworkImage) -> Result<(), OpError> {
-        let _ = image;
+    /// Replace the network in NV with `image` (and the NCP's `children`)
+    /// and start it (host formation parameters, `BKP_RESTORE_COMMIT`). Only
+    /// while the stack is stopped.
+    async fn install_network(
+        &mut self,
+        image: &NetworkImage,
+        children: &[RestoredChild],
+    ) -> Result<(), OpError> {
+        let _ = (image, children);
         Err(OpError::Unsupported)
     }
     /// The global Trust Center link key in use.
@@ -314,6 +328,19 @@ pub trait CoordinatorPort {
     fn table_epoch(&mut self) -> u32 {
         0
     }
+}
+
+/// A child of the NCP carried by a backup (`DEVICE` record with a child
+/// block): it keeps its parent and short address across a restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoredChild {
+    pub ieee: [u8; 8],
+    pub nwk: u16,
+    /// MAC capability information (bit1 FFD, bit3 RX on when idle, bit6
+    /// security capable).
+    pub capability: u8,
+    /// R22 End Device Timeout enumeration.
+    pub timeout: u8,
 }
 
 /// A complete network to install (`NWK_FORM` with host parameters,

@@ -54,7 +54,7 @@ use crate::port::{
     EndpointError, FormParams, FrameCounters, HostEndpoint, Indication, MAX_HOST_ENDPOINTS,
     NetworkInfo, NetworkState, OpError, joined, left,
 };
-use crate::port::{DeviceView, LinkView, NetworkImage};
+use crate::port::{DeviceView, LinkView, NetworkImage, RestoredChild};
 use zigbee_mac::{MacDriver as _, PlatformServices as _};
 
 /// NWK reservation size (`FRAME_COUNTER_RESERVATION_SIZE`).
@@ -87,6 +87,11 @@ pub trait TcApp {
     fn provision_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError>;
     /// Durably drop a device's record and key; `false` when unknown.
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError>;
+    /// Replace the durable child table (restored at the next `initialize`).
+    fn store_children(
+        &mut self,
+        table: &zigbee_runtime::child_store::PersistentChildTable,
+    ) -> Result<(), OpError>;
 }
 
 impl<'a, M, S, P, C, T, St, Sv, D, O, A> TcApp
@@ -132,6 +137,17 @@ where
 
     fn rearm_initialize(&mut self) -> bool {
         TrustCenterCoordinatorApp::rearm_initialize(self)
+    }
+
+    fn store_children(
+        &mut self,
+        table: &zigbee_runtime::child_store::PersistentChildTable,
+    ) -> Result<(), OpError> {
+        self.coordinator_mut()
+            .children_mut()
+            .store_mut()
+            .store(table)
+            .map_err(|_| OpError::Storage)
     }
 
     fn global_aps(&self) -> Option<GlobalApsCheckpoint> {
@@ -338,6 +354,28 @@ impl<A: TcApp> TcPort<A> {
     fn trust_center_event(&self, event: TrustCenterHostEvent) -> Option<DeviceEvent> {
         let nwk = self.app.device().aps().nwk();
         let own = nwk.nib().ieee_address;
+        if let TrustCenterHostEvent::Authorized {
+            device_address,
+            short_address,
+            result,
+            unique_link_key,
+        } = event
+        {
+            let nwk = if short_address.0 < 0xFFF8 {
+                short_address.0
+            } else {
+                nwk.neighbor_table()
+                    .children()
+                    .find(|entry| entry.ieee_address == device_address)
+                    .map_or(0xFFFF, |entry| entry.network_address.0)
+            };
+            return Some(DeviceEvent::Authorized {
+                nwk,
+                ieee: device_address,
+                result,
+                link_key_type: u8::from(unique_link_key),
+            });
+        }
         let TrustCenterHostEvent::Joined {
             device_address,
             short_address,
@@ -449,7 +487,7 @@ fn join_type(status: ApsUpdateDeviceStatus) -> u8 {
 /// reported from its NWK Leave.
 fn left_event(event: TrustCenterHostEvent, own: [u8; 8]) -> Option<DeviceEvent> {
     match event {
-        TrustCenterHostEvent::Joined { .. } => None,
+        TrustCenterHostEvent::Joined { .. } | TrustCenterHostEvent::Authorized { .. } => None,
         TrustCenterHostEvent::Left { parent_address, .. } if parent_address == own => None,
         TrustCenterHostEvent::Left {
             device_address,
@@ -692,6 +730,9 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             payload: &request.asdu,
             tx_options: ApsTxOptions {
                 security_enabled: request.tx_options & 0x02 != 0,
+                // Every frame of a secured network carries NWK security
+                // (the APS default is off; only the APS retry path set it).
+                use_nwk_key: true,
                 ack_request: request.tx_options & 0x01 != 0,
                 ..ApsTxOptions::default()
             },
@@ -831,7 +872,11 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         Some(self)
     }
 
-    async fn install_network(&mut self, image: &NetworkImage) -> Result<(), OpError> {
+    async fn install_network(
+        &mut self,
+        image: &NetworkImage,
+        children: &[RestoredChild],
+    ) -> Result<(), OpError> {
         if self.running {
             return Err(OpError::InvalidState);
         }
@@ -871,6 +916,11 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             store.store(&state).map_err(|_| OpError::Storage)?;
         }
         self.formed = true;
+        if !children.is_empty() {
+            // Written before the resume, which restores them like after a
+            // reboot (same short address, no rejoin).
+            store_child_table(&mut self.app, image.ext_pan_id, children)?;
+        }
         let attributes = self.app.device_mut().bdb_mut().attributes_mut();
         if image.channel_mask != 0 {
             attributes.primary_channel_set = zigbee_types::ChannelMask(image.channel_mask);
@@ -922,7 +972,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             nwk.neighbor_table()
                 .children()
                 .find(|entry| entry.ieee_address == *ieee)
-                .map(|entry| (child_capability(entry), 8))
+                .map(|entry| (child_capability(entry), entry.end_device_timeout))
         };
         let known = table.devices().filter(|device| device.active).count();
         if index < known {
@@ -948,9 +998,19 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
                     },
                     rx_floor,
                 });
+            // A provisioned key has no address yet; a child's comes from the
+            // neighbor table.
+            let nwk = (device.short_address.0 < 0xFFF8)
+                .then_some(device.short_address.0)
+                .or_else(|| {
+                    nwk.neighbor_table()
+                        .children()
+                        .find(|entry| entry.ieee_address == device.ieee_address)
+                        .map(|entry| entry.network_address.0)
+                });
             return Some(DeviceView {
                 ieee: device.ieee_address,
-                nwk: (device.short_address.0 < 0xFFF8).then_some(device.short_address.0),
+                nwk,
                 child: child_of(&device.ieee_address),
                 link,
             });
@@ -964,7 +1024,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         Some(DeviceView {
             ieee: entry.ieee_address,
             nwk: Some(entry.network_address.0),
-            child: Some((child_capability(entry), 8)),
+            child: Some((child_capability(entry), entry.end_device_timeout)),
             link: None,
         })
     }
@@ -1036,6 +1096,9 @@ fn child_capability(entry: &zigbee_nwk::neighbor::NeighborEntry) -> u8 {
     if entry.rx_on_when_idle {
         capability |= 0x0C;
     }
+    if entry.security_capable {
+        capability |= 0x40;
+    }
     capability
 }
 
@@ -1085,7 +1148,7 @@ impl<A: TcApp> TcPort<A> {
             nwk_fc_start: 0,
             aps_fc_start: 0,
         };
-        self.install_network(&image).await
+        self.install_network(&image, &[]).await
     }
 
     /// The channel of `mask` with the lowest energy (a single channel is
@@ -1147,6 +1210,13 @@ impl<T: TcApp + ?Sized> TcApp for &mut T {
         (**self).rearm_initialize()
     }
 
+    fn store_children(
+        &mut self,
+        table: &zigbee_runtime::child_store::PersistentChildTable,
+    ) -> Result<(), OpError> {
+        (**self).store_children(table)
+    }
+
     fn global_aps(&self) -> Option<GlobalApsCheckpoint> {
         (**self).global_aps()
     }
@@ -1174,6 +1244,34 @@ impl<T: TcApp + ?Sized> TcApp for &mut T {
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
         (**self).forget_device(ieee)
     }
+}
+
+/// The durable child table of a restored network. Its own frame: the
+/// 64-entry table stays out of the async callers' poll frames.
+#[inline(never)]
+fn store_child_table<A: TcApp>(
+    app: &mut A,
+    ext_pan_id: [u8; 8],
+    children: &[RestoredChild],
+) -> Result<(), OpError> {
+    let mut table = zigbee_runtime::child_store::PersistentChildTable::new(ext_pan_id);
+    for child in children {
+        let entry = zigbee_runtime::child_store::PersistentChild {
+            ieee_address: child.ieee,
+            short_address: child.nwk,
+            rx_on_when_idle: child.capability & 0x08 != 0,
+            security_capable: child.capability & 0x40 != 0,
+            is_router: child.capability & 0x02 != 0,
+            end_device_timeout: child.timeout,
+            removal_pending: false,
+            removal_attempts: 0,
+            reassignment_address: None,
+            departure_pending: false,
+        };
+        table.push(entry).map_err(|_| OpError::InvalidParameter)?;
+    }
+    table.validate().map_err(|_| OpError::InvalidParameter)?;
+    app.store_children(&table)
 }
 
 #[cfg(test)]

@@ -1036,3 +1036,84 @@ fn firmware_ieee_pta_and_retry_cache() {
     let info: NwkGetInfoRsp = info.body();
     assert_eq!((info.state, info.pan_id, info.channel), (2, 0x4D95, 25));
 }
+
+#[test]
+fn restore_keeps_ncp_children_and_their_keys() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let form = host.request(&form_request(0x5EA7, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let begin = host.request(&BkpExportBegin { flags: 0x03 });
+    exchange!();
+    let begin = host.response(begin);
+    let begin: BkpExportBeginRsp = begin.body();
+    let read = host.request(&BkpExportRead {
+        txn: begin.txn,
+        max_bytes: 480,
+    });
+    exchange!();
+    let read = host.response(read);
+    let stream = read.payload[2..].to_vec();
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+
+    // The backup of an NCP with one sleepy child holding a unique TCLK.
+    let child = Record::Device(DeviceRecord {
+        ieee: Ieee(DEVICE_IEEE),
+        nwk: 0x4C21,
+        flags: 0,
+        child: Some(zigbee_zrhp::records::ChildInfo {
+            capability: 0x80,
+            timeout_exp: 9,
+        }),
+        link: Some(LinkBlock {
+            key: DEVICE_KEY,
+            key_seq: 0,
+            attrs: 0,
+            origin: 2,
+            tx_counter: 0,
+            rx_floor: 0,
+        }),
+    });
+    let mut encoded = [0u8; 64];
+    let mut w = Writer::new(&mut encoded);
+    child.write(&mut w).unwrap();
+    let len = w.len();
+    let mut with_child = Vec::new();
+    for item in RawRecords::new(&stream) {
+        let (kind, tlv) = item.unwrap();
+        if kind == record_type::RS_PARAMS {
+            with_child.extend_from_slice(&encoded[..len]);
+        }
+        with_child.extend_from_slice(tlv);
+    }
+    let with_child = resign(&with_child);
+    let restore = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 0,
+        aps_margin: 0,
+        expected_records: 7,
+    });
+    exchange!();
+    let restore = host.response(restore);
+    let txn = restore.body::<BkpRestoreBeginRsp>().txn;
+    let mut payload = txn.to_le_bytes().to_vec();
+    payload.extend_from_slice(&with_child);
+    let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+    let commit = host.request(&BkpRestoreCommit { txn });
+    exchange!();
+    let put = host.response(put);
+    let put: BkpRestorePutRsp = put.body();
+    assert_eq!(put.notes.iter().count(), 0, "the child is not demoted");
+    let commit = host.response(commit);
+    let commit: BkpRestoreCommitRsp = commit.body();
+    assert_eq!((commit.children, commit.link_keys_on_ncp), (1, 1));
+
+    // Restored as a child at its old address, with its key.
+    let view = port.device(0).expect("restored device");
+    assert_eq!(view.ieee, DEVICE_IEEE);
+    assert_eq!(view.nwk, Some(0x4C21));
+    assert_eq!(view.child, Some((0x80, 9)));
+    assert_eq!(view.link.map(|link| link.key), Some(DEVICE_KEY));
+}

@@ -1351,6 +1351,22 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                         },
                     );
                 }
+                DeviceEvent::Authorized {
+                    nwk,
+                    ieee,
+                    result,
+                    link_key_type,
+                } => {
+                    self.event(
+                        Endpoint::Zigbee,
+                        &zigbee_zrhp::msg::network::EvtDeviceAuthorized {
+                            nwk,
+                            ieee: Ieee(ieee),
+                            result,
+                            link_key_type,
+                        },
+                    );
+                }
             }
         }
         // Confirms that waited for their APS ACK.
