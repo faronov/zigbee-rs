@@ -16,7 +16,16 @@
 //! running).
 //!
 //! `smoke` never opens the network for joining and never transmits user
-//! frames on air except what formation itself sends.
+//! frames on air except what formation itself sends. Optional steps after
+//! the smoke sequence:
+//!
+//! ```text
+//! --backup FILE    BKP_EXPORT (keys + devices) into FILE (OCB record stream)
+//! --restore FILE   BKP_RESTORE of FILE (network must not be running:
+//!                  after a reset, without --form); margins 10 000/10 000
+//! --tables         TBL_STATS / TBL_READ / TBL_SYNC of the DEVICE table
+//! --fw-slots       FW_GET_SLOTS
+//! ```
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -24,14 +33,21 @@ use std::time::{Duration, Instant};
 use zigbee_zrhp::codec::{Bytes8, Rest, Wire};
 use zigbee_zrhp::frame::{ResetReason, TX_BUFFER_LEN};
 use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent, LinkState};
+use zigbee_zrhp::msg::backup::{
+    BkpExportBegin, BkpExportBeginRsp, BkpExportEnd, BkpExportRead, BkpRestoreBegin,
+    BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, BkpRestorePutRsp,
+};
 use zigbee_zrhp::msg::diag::{DiagGetCounters, DiagGetCountersRsp};
+use zigbee_zrhp::msg::firmware::FwGetSlotsRsp;
 use zigbee_zrhp::msg::network::{EvtNetworkState, NwkForm, NwkGetInfoRsp, NwkInit, NwkInitRsp};
 use zigbee_zrhp::msg::security::SecGetFrameCountersRsp;
 use zigbee_zrhp::msg::system::{
     EvtNcpReady, SysEcho, SysGetInfoRsp, SysGetStatusRsp, SysNegotiateReq, SysNegotiateRsp,
 };
+use zigbee_zrhp::msg::tables::{TblRead, TblReadRsp, TblStats, TblStatsRsp, TblSync, TblSyncRsp};
 use zigbee_zrhp::msg::{Batch, Kind, MessageDef, MsgHeader, RawMessage, ids};
 use zigbee_zrhp::queue::EndpointQueues;
+use zigbee_zrhp::records::{RawRecords, Record, record_type, verify_stream};
 use zigbee_zrhp::types::{Endpoint, Status};
 
 /// The byte stream to the NCP.
@@ -332,11 +348,23 @@ impl<S: ByteStream> Host<S> {
     }
 
     fn response(&mut self, tid: u16) -> Result<Received, String> {
-        self.wait_for(
-            &format!("response tid {tid}"),
-            Duration::from_secs(10),
-            |m| m.kind == Kind::Response && m.tid == tid,
-        )
+        self.response_within(tid, Duration::from_secs(10))
+    }
+
+    fn response_within(&mut self, tid: u16, timeout: Duration) -> Result<Received, String> {
+        self.wait_for(&format!("response tid {tid}"), timeout, |m| {
+            m.kind == Kind::Response && m.tid == tid
+        })
+    }
+
+    fn request_raw(&mut self, msg_id: u16, payload: &[u8]) -> u16 {
+        self.tid = self.tid.wrapping_add(1).max(1);
+        let endpoint = zigbee_zrhp::msg::home_endpoint(msg_id).unwrap_or(Endpoint::System);
+        self.queues
+            .queue(endpoint)
+            .raw(Kind::Request, msg_id, self.tid, payload)
+            .expect("queue");
+        self.tid
     }
 
     fn event(&mut self, msg_id: u16, timeout: Duration) -> Result<Received, String> {
@@ -512,6 +540,170 @@ fn smoke<S: ByteStream>(host: &mut Host<S>, form: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn record_name(kind: u8) -> &'static str {
+    match kind {
+        record_type::NODE => "NODE",
+        record_type::NETWORK => "NETWORK",
+        record_type::NETWORK_KEY => "NETWORK_KEY",
+        record_type::TC_LINK_KEY => "TC_LINK_KEY",
+        record_type::DEVICE => "DEVICE",
+        record_type::RS_PARAMS => "RS_PARAMS",
+        record_type::END => "END",
+        _ => "other",
+    }
+}
+
+/// `BKP_EXPORT` with keys and devices into `path`.
+fn backup_export<S: ByteStream>(host: &mut Host<S>, path: &str) -> Result<(), String> {
+    let tid = host.request(&BkpExportBegin { flags: 0x03 });
+    let rsp = host.response(tid)?;
+    let begin: BkpExportBeginRsp = body(&rsp)?;
+    let mut stream = Vec::new();
+    loop {
+        let tid = host.request(&BkpExportRead {
+            txn: begin.txn,
+            max_bytes: 400,
+        });
+        let rsp = host.response(tid)?;
+        if !rsp.status().is_success() || rsp.payload.len() < 2 {
+            return Err(format!("BKP_EXPORT_READ status {:?}", rsp.status()));
+        }
+        stream.extend_from_slice(&rsp.payload[2..]);
+        if rsp.payload[1] == 0 {
+            break;
+        }
+    }
+    let tid = host.request(&BkpExportEnd { txn: begin.txn });
+    host.response(tid)?;
+    let count = verify_stream(&stream).map_err(|e| format!("export stream: {e:?}"))?;
+    let kinds: Vec<&str> = RawRecords::new(&stream)
+        .filter_map(Result::ok)
+        .map(|(kind, _)| record_name(kind))
+        .collect();
+    std::fs::write(path, &stream).map_err(|e| format!("{path}: {e}"))?;
+    println!(
+        "BKP_EXPORT: {} records announced, {count} + END verified, {} bytes -> {path}: {}",
+        begin.record_count,
+        stream.len(),
+        kinds.join(" ")
+    );
+    Ok(())
+}
+
+/// `BKP_RESTORE` of the record stream in `path`.
+fn backup_restore<S: ByteStream>(host: &mut Host<S>, path: &str) -> Result<(), String> {
+    let stream = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    verify_stream(&stream).map_err(|e| format!("{path}: {e:?}"))?;
+    let records: Vec<&[u8]> = RawRecords::new(&stream)
+        .map(|r| r.map(|(_, tlv)| tlv))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("{e:?}"))?;
+    let tid = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 10_000,
+        aps_margin: 10_000,
+        expected_records: records.len() as u32,
+    });
+    let rsp = host.response(tid)?;
+    let begin: BkpRestoreBeginRsp = body(&rsp)?;
+    for chunk in records.chunks(usize::from(begin.max_records_per_put.max(1))) {
+        let mut payload = begin.txn.to_le_bytes().to_vec();
+        for record in chunk {
+            payload.extend_from_slice(record);
+        }
+        let tid = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+        let rsp = host.response(tid)?;
+        let put: BkpRestorePutRsp = body(&rsp)?;
+        let notes: Vec<_> = put.notes.iter().map(|n| (n.index, n.note)).collect();
+        println!("BKP_RESTORE_PUT: accepted {} notes {notes:?}", put.accepted);
+    }
+    let tid = host.request(&BkpRestoreCommit { txn: begin.txn });
+    let rsp = host.response_within(tid, Duration::from_secs(30))?;
+    let commit: BkpRestoreCommitRsp = body(&rsp)?;
+    println!(
+        "BKP_RESTORE_COMMIT: nwk_fc_start {} aps_fc_start {} keys on NCP {} host-backed {}",
+        commit.nwk_fc_start,
+        commit.aps_fc_start,
+        commit.link_keys_on_ncp,
+        commit.link_keys_host_backed
+    );
+    let tid = host.request_empty(ids::NWK_GET_INFO);
+    let rsp = host.response(tid)?;
+    let nwk: NwkGetInfoRsp = body(&rsp)?;
+    println!(
+        "NWK_GET_INFO: state {} pan 0x{:04X} epid {:02X?} channel {} key_seq {}",
+        nwk.state, nwk.pan_id, nwk.ext_pan_id, nwk.channel, nwk.key_seq
+    );
+    Ok(())
+}
+
+/// `TBL_STATS`, `TBL_SYNC` and every `TBL_READ` page of the DEVICE table.
+fn tables<S: ByteStream>(host: &mut Host<S>) -> Result<(), String> {
+    let tid = host.request(&TblStats {
+        table: record_type::DEVICE,
+    });
+    let rsp = host.response(tid)?;
+    let stats: TblStatsRsp = body(&rsp)?;
+    println!(
+        "TBL_STATS: capacity {} used {} pinned {}",
+        stats.capacity, stats.used, stats.pinned
+    );
+    let tid = host.request(&TblSync {
+        host_db_epoch: 0,
+        last_ncp_table_epoch: 0,
+        host_max_rev: 0,
+        flags: 0,
+    });
+    let rsp = host.response(tid)?;
+    let sync: TblSyncRsp = body(&rsp)?;
+    println!(
+        "TBL_SYNC: epoch 0x{:08X} cached devices {}",
+        sync.ncp_table_epoch, sync.cached_devices
+    );
+    let mut cursor = 0u16;
+    let mut total = 0usize;
+    while cursor != 0xFFFF {
+        let tid = host.request(&TblRead {
+            table: record_type::DEVICE,
+            cursor,
+            max: 8,
+        });
+        let rsp = host.response(tid)?;
+        let read: TblReadRsp = body(&rsp)?;
+        for entry in read.entries.iter() {
+            if let Record::Device(device) = &entry.record {
+                println!(
+                    "  DEVICE {:02X?} nwk 0x{:04X} child {} key {}",
+                    device.ieee.0,
+                    device.nwk,
+                    device.child.is_some(),
+                    device.link.is_some()
+                );
+            }
+            total += 1;
+        }
+        cursor = read.next_cursor;
+    }
+    println!("TBL_READ: {total} entries");
+    Ok(())
+}
+
+fn fw_slots<S: ByteStream>(host: &mut Host<S>) -> Result<(), String> {
+    let tid = host.request_empty(ids::FW_GET_SLOTS);
+    let rsp = host.response(tid)?;
+    let slots: FwGetSlotsRsp = body(&rsp)?;
+    for slot in slots.slots.iter() {
+        println!(
+            "FW slot {}: state {} version 0x{:08X} sha256 {:02X?}..",
+            slot.slot,
+            slot.state,
+            slot.version,
+            &slot.sha256[..4]
+        );
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let value = |flag: &str| {
@@ -539,7 +731,22 @@ fn main() {
     };
     let form = args.iter().any(|a| a == "--form");
     let mut host = Host::new(stream);
-    match smoke(&mut host, form) {
+    let result = smoke(&mut host, form).and_then(|()| {
+        if let Some(path) = value("--restore") {
+            backup_restore(&mut host, &path)?;
+        }
+        if let Some(path) = value("--backup") {
+            backup_export(&mut host, &path)?;
+        }
+        if args.iter().any(|a| a == "--tables") {
+            tables(&mut host)?;
+        }
+        if args.iter().any(|a| a == "--fw-slots") {
+            fw_slots(&mut host)?;
+        }
+        Ok(())
+    });
+    match result {
         Ok(()) => println!("smoke: PASS"),
         Err(error) => {
             println!("smoke: FAIL: {error}");
