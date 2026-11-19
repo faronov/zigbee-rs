@@ -78,6 +78,9 @@ ncp-capacity = [
     "zigbee-bdb/ncp-capacity",
     "zigbee-mac/ncp-capacity",
     "zigbee-nwk/ncp-capacity",
+    # The 16-entry Sink Table leaves room for 4 translations in the GP
+    # journal's sink record (only with `green-power-translation-table`).
+    "zigbee-gp?/compact-translation-table",
 ]
 # Network co-processor: APS data frames for application endpoints go to a
 # bounded host queue (`host_passthrough`) instead of the ZCL dispatcher, with
@@ -130,6 +133,12 @@ green-power-full-proxy = [
 # TempMasters it always works. Off by default: images built without it are
 # unchanged.
 green-power-sink = ["green-power", "zigbee-gp/sink"]
+# GP Pairing Configuration and the Translation Table on the combo's sink
+# (GP Translation Table Update/Request, per-GPD translations to any local
+# endpoint and ZCL command, paired endpoints); translations and paired
+# endpoints are persisted in the GP journal's sink record. Off by default:
+# images built without it are unchanged.
+green-power-translation-table = ["green-power-sink", "zigbee-gp/translation-table"]
 # ZRHP network co-processor integration of the GP combo (spec 7.11,
 # `green_power::ncp`): one sink authority switchable at runtime between the
 # runtime's sink (NCP_SINK) and the host's (HOST_SINK: GP server frames and

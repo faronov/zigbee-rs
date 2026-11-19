@@ -126,10 +126,13 @@ green-power-bidirectional = [
 # Combo sink delivers paired GPD switch commands to it, and BOOT pressed while
 # joined opens sink commissioning mode (proxies included, 180 s). Includes the
 # TempMaster (`green-power-bidirectional`) so bidirectional GPDs heard
-# directly can commission. Opt-in, not part of `router`.
+# directly can commission. GP Pairing Configuration and the Translation Table
+# let a commissioning tool pair GPDs and retarget their commands. Opt-in, not
+# part of `router`.
 combo-light = [
     "green-power-bidirectional",
     "router-app/green-power-sink",
+    "router-app/green-power-translation-table",
     "esp32-zigbee-devkit-product/combo-light",
 ]
 # Retained light sleep for the sleepy sensor only.

@@ -16,6 +16,11 @@
 //!   table;
 //! * [`sink`] and [`translation`] (feature `sink`) – the GP sink / combo
 //!   state machine, Sink Table and GPD → ZCL command translation;
+//! * [`config`] (feature `sink`) – GP Pairing Configuration and Translation
+//!   Table command codecs, and Sink/Proxy Table Response decoders, for sinks
+//!   and commissioning tools;
+//! * [`translation_table`] (feature `translation-table`) – the sink's
+//!   per-GPD Translation Table and paired endpoints;
 //! * [`gpd`] (feature `gpd`) – Green Power Device-side transmission helpers.
 //!
 //! The crate never touches a radio, a clock or flash directly. Callers feed
@@ -38,6 +43,8 @@ pub mod frame;
 pub mod security;
 pub mod types;
 
+#[cfg(feature = "sink")]
+pub mod config;
 #[cfg(feature = "proxy")]
 pub mod counter;
 #[cfg(feature = "gpd")]
@@ -48,6 +55,8 @@ pub mod proxy;
 pub mod sink;
 #[cfg(feature = "sink")]
 pub mod translation;
+#[cfg(feature = "translation-table")]
+pub mod translation_table;
 
 /// The Green Power endpoint (GPEP).
 pub const GP_ENDPOINT: u8 = 242;

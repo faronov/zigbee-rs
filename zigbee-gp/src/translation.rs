@@ -11,8 +11,9 @@
 //! other command (scenes, colour, generic switch, attribute reports, ...)
 //! is passed to the application untranslated.
 //!
-//! GP Translation Table Update/Request (0x07/0x08) and per-GPD translation
-//! entries are not implemented.
+//! Per-GPD translations written by GP Translation Table Update (0x07) take
+//! precedence over this mapping with the `translation-table` feature
+//! ([`crate::translation_table`]).
 
 /// GPD command identifiers handled here (GP spec Table 49; values from
 /// gecko_sdk `app/zcl/green-power.xml`, enum `GpGpdf`).
@@ -51,7 +52,12 @@ pub const ON_OFF_CLUSTER: u16 = 0x0006;
 pub const LEVEL_CONTROL_CLUSTER: u16 = 0x0008;
 
 /// Largest translated ZCL payload: mode, step size, transition time.
+#[cfg(not(feature = "translation-table"))]
 pub const MAX_TRANSLATED_PAYLOAD: usize = 4;
+/// Largest translated ZCL payload: a Translation Table entry's fixed or
+/// copied payload ([`crate::translation_table::MAX_TT_PAYLOAD`]).
+#[cfg(feature = "translation-table")]
+pub const MAX_TRANSLATED_PAYLOAD: usize = crate::translation_table::MAX_TT_PAYLOAD;
 
 /// A ZCL cluster-specific command (client → server) produced from a GPD
 /// command.
@@ -140,7 +146,7 @@ pub fn translate(gpd_command: u8, gpd_payload: &[u8]) -> Option<Translation> {
 mod tests {
     use super::*;
 
-    fn t(cmd: u8, payload: &[u8]) -> Option<(u16, u8, heapless::Vec<u8, 4>)> {
+    fn t(cmd: u8, payload: &[u8]) -> Option<(u16, u8, heapless::Vec<u8, MAX_TRANSLATED_PAYLOAD>)> {
         translate(cmd, payload).map(|t| (t.cluster_id, t.command_id, t.payload))
     }
 
