@@ -27,6 +27,8 @@ pub enum PlatformError {
     AccessDenied,
     /// Length/hash/image check failed (`SECURITY_ERROR`).
     VerifyFailed,
+    /// The hardware refused (`FAILURE`).
+    Hardware,
 }
 
 /// `FW_BEGIN` result.
@@ -118,6 +120,10 @@ pub trait NcpPlatform {
     /// Whether a persisted override is supported (`IEEE_REWRITABLE`).
     fn ieee_rewritable(&self) -> bool {
         false
+    }
+    /// The factory EUI-64 (eFuse), when the product knows it.
+    fn factory_ieee(&self) -> Option<[u8; 8]> {
+        None
     }
     /// Persist (`Some`) or remove (`None`) the override. It takes effect
     /// at the next boot (the composition root applies it to the MAC before

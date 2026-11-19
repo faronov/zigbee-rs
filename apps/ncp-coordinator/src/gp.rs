@@ -370,6 +370,8 @@ pub(crate) fn negotiate_facts<C: CoordinatorPort>(port: &mut C) -> (u64, u32, u3
 
 /// Answer a GREEN POWER request (or `UNSUPPORTED_COMMAND` for any other
 /// ID). `keys_exportable`: key export is built in and not locked.
+// Own frame: its buffers stay out of the root future's poll frame.
+#[inline(never)]
 pub(crate) fn dispatch_gp<C: CoordinatorPort>(
     queues: &mut EndpointQueues<QUEUE_BYTES>,
     endpoint: Endpoint,

@@ -194,6 +194,15 @@ pub enum Op {
     LeaveReset {
         flags: u8,
     },
+    /// `SYS_SET_IEEE` (`None`: back to the factory IEEE).
+    SetIeee {
+        tid: u16,
+        ieee: Option<[u8; 8]>,
+    },
+    /// `BKP_RESTORE_COMMIT` of the staged restore.
+    RestoreCommit {
+        tid: u16,
+    },
 }
 
 /// Why an operation failed.
@@ -207,6 +216,8 @@ pub enum OpError {
     Storage,
     /// Not implemented by this NCP build (`UNSUPPORTED_COMMAND`).
     Unsupported,
+    /// Malformed or out-of-range parameters (`INVALID_PARAMETER`).
+    InvalidParameter,
     /// Zigbee-level failure with its raw status.
     Zigbee(u8),
 }
@@ -258,6 +269,92 @@ pub trait CoordinatorPort {
     }
     /// Forget every host endpoint (`NWK_LEAVE_RESET` without flags bit1).
     fn clear_endpoints(&mut self) {}
+
+    // ── Network images, Trust Center devices (formation parameters,
+    //    TABLES, BACKUP) ──────────────────────────────────────────────
+
+    /// Replace the network in NV with `image` and start it (host formation
+    /// parameters, `BKP_RESTORE_COMMIT`). Only while the stack is stopped.
+    async fn install_network(&mut self, image: &NetworkImage) -> Result<(), OpError> {
+        let _ = image;
+        Err(OpError::Unsupported)
+    }
+    /// The global Trust Center link key in use.
+    fn tc_link_key(&self) -> Option<[u8; 16]> {
+        None
+    }
+    /// Trust Center device table capacity (`max_tc_devices`).
+    fn device_capacity(&self) -> usize {
+        0
+    }
+    /// The `index`-th known device (Trust Center records first, then
+    /// children without a record); `None` past the end.
+    fn device(&self, index: usize) -> Option<DeviceView> {
+        let _ = index;
+        None
+    }
+    /// Provision a unique Trust Center link key before the device joins.
+    fn put_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError> {
+        let _ = (ieee, key);
+        Err(OpError::Unsupported)
+    }
+    /// Drop a device's Trust Center record and key (host deletion).
+    fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
+        let _ = ieee;
+        Err(OpError::Unsupported)
+    }
+    /// Use `ieee` as the radio's EUI-64 from now on (the product persists
+    /// the override separately). Only while the stack is stopped.
+    async fn set_ieee(&mut self, ieee: [u8; 8]) -> Result<(), OpError> {
+        let _ = ieee;
+        Err(OpError::Unsupported)
+    }
+    /// `table_epoch` (spec 8.5): changes whenever the network in NV is
+    /// wiped or replaced; 0 without a network.
+    fn table_epoch(&mut self) -> u32 {
+        0
+    }
+}
+
+/// A complete network to install (`NWK_FORM` with host parameters,
+/// `BKP_RESTORE_COMMIT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkImage {
+    pub pan_id: u16,
+    pub ext_pan_id: [u8; 8],
+    pub channel: u8,
+    pub channel_mask: u32,
+    pub nwk_update_id: u8,
+    pub nwk_manager: u16,
+    /// dBm; `None` keeps the product default.
+    pub tx_power: Option<i8>,
+    pub network_key: [u8; 16],
+    pub key_seq: u8,
+    /// First outgoing NWK frame counter; the durable reservation starts here.
+    pub nwk_fc_start: u32,
+    /// Floor of the global outgoing APS counter (0 = none).
+    pub aps_fc_start: u32,
+}
+
+/// A device known to the Trust Center or the child table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceView {
+    pub ieee: [u8; 8],
+    pub nwk: Option<u16>,
+    /// `(capability, timeout_exp)` when it is a child of the NCP.
+    pub child: Option<(u8, u8)>,
+    pub link: Option<LinkView>,
+}
+
+/// A device's unique Trust Center link key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkView {
+    pub key: [u8; 16],
+    /// 0 provisional, 1 unverified, 2 verified.
+    pub attrs: u8,
+    /// 0 global, 1 install code, 2 TC generated, 3 imported/host.
+    pub origin: u8,
+    pub rx_floor: u32,
 }
 
 /// `EVT_DEVICE_JOINED` values.

@@ -23,7 +23,7 @@
 use heapless::{Deque, Vec};
 use zigbee_zrhp::codec::{Bytes8, Bytes16, List, Rest};
 use zigbee_zrhp::frame::{ResetReason, TX_BUFFER_LEN};
-use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent, LinkState};
+use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent, LinkState, PeerChange};
 use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataConfirm, EvtApsDataIndication};
 use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagGetCountersRsp, DiagResetCounters};
 use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord, LogConfig};
@@ -38,18 +38,20 @@ use zigbee_zrhp::msg::security::{
 use zigbee_zrhp::msg::system::{
     Capacity, ConfigReadItem, ConfigStatus, EvtIndicationsDropped, EvtNcpReady, SysGetConfig,
     SysGetConfigRsp, SysGetInfoRsp, SysGetStatusRsp, SysNegotiateReq, SysNegotiateRsp, SysReset,
-    SysSetConfig, SysSetConfigRsp, SysSetUart, capacity, caps, config,
+    SysSetConfig, SysSetConfigRsp, SysSetIeee, SysSetUart, capacity, caps, config,
 };
 use zigbee_zrhp::msg::{Batch, Kind, RawMessage, home_endpoint, ids};
 use zigbee_zrhp::queue::EndpointQueues;
 use zigbee_zrhp::types::{Endpoint, Ieee, Status};
 
 use crate::log_ring::LogRing;
+use crate::platform::{NcpPlatform, NoPlatform};
 use crate::port::{
     CoordinatorPort, DataRequest, Destination, DeviceEvent, EndpointError, FormParams,
     HostEndpoint, MAX_ASDU, NetworkState, Op, OpError,
 };
 use crate::transport::{HostTransport, UartChangeError};
+use zigbee_zrhp::msg::tables::EvtTblEpochChanged;
 
 /// Link slots (spec 8.9: 16 × 652 B each direction).
 pub const WINDOW: usize = 16;
@@ -150,6 +152,11 @@ pub struct Ncp<const LOG_N: usize> {
     nwk_checkpoints: u32,
     indication_drops_unreported: u32,
     boot_us: u64,
+    retry: crate::retry::RetryCache,
+    backup: crate::backup::BackupState,
+    /// `coex_enable`, `coex_tx_priority_mask` (volatile, spec 7.1).
+    coex: (bool, u8),
+    host_caps: u64,
 }
 
 impl<const LOG_N: usize> Ncp<LOG_N> {
@@ -185,6 +192,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             nwk_checkpoints: 0,
             indication_drops_unreported: 0,
             boot_us: now_us,
+            retry: crate::retry::RetryCache::new(),
+            backup: crate::backup::BackupState::new(),
+            coex: (false, 0),
+            host_caps: 0,
         }
     }
 
@@ -222,6 +233,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     }
 
     /// One non-blocking pass. Returns a request the platform must carry out.
+    /// A product without platform services ([`NoPlatform`]).
     pub fn service<T: HostTransport, C: CoordinatorPort>(
         &mut self,
         now_us: u64,
@@ -229,7 +241,20 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         port: &mut C,
         log: &LogRing<LOG_N>,
     ) -> Option<PlatformRequest> {
-        self.receive(now_us, transport, port, log);
+        self.service_with(now_us, transport, port, &mut NoPlatform, log)
+    }
+
+    /// [`Self::service`] with the product's platform services (`FW_*`,
+    /// `SYS_SET_IEEE`, PTA).
+    pub fn service_with<T: HostTransport, C: CoordinatorPort, P: NcpPlatform>(
+        &mut self,
+        now_us: u64,
+        transport: &mut T,
+        port: &mut C,
+        platform: &mut P,
+        log: &LogRing<LOG_N>,
+    ) -> Option<PlatformRequest> {
+        self.receive(now_us, transport, port, platform, log);
         self.service_uart_switch(now_us, transport);
         if self.host_ready() {
             self.emit_stack_events(now_us, port);
@@ -250,12 +275,52 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     pub async fn drive<C: CoordinatorPort>(
         &mut self,
         port: &mut C,
+        now_us: impl FnMut() -> u64,
+    ) -> bool {
+        self.drive_with(port, &mut NoPlatform, now_us).await
+    }
+
+    /// [`Self::drive`] with the product's platform services.
+    pub async fn drive_with<C: CoordinatorPort, P: NcpPlatform>(
+        &mut self,
+        port: &mut C,
+        platform: &mut P,
         mut now_us: impl FnMut() -> u64,
     ) -> bool {
         let Some((op, accepted_us)) = self.ops.pop_front() else {
             return false;
         };
         match op {
+            Op::SetIeee { tid, ieee } => {
+                let status = match platform.set_ieee_override(ieee) {
+                    Err(error) => crate::firmware::status_of(error),
+                    // The MAC takes the new IEEE now (the stack is down);
+                    // the composition root re-applies the override at boot.
+                    Ok(()) => match ieee.or_else(|| platform.factory_ieee()) {
+                        Some(active) => op_status(port.set_ieee(active).await),
+                        None => Status::Success,
+                    },
+                };
+                self.respond_status(ids::SYS_SET_IEEE, tid, status);
+            }
+            Op::RestoreCommit { tid } => {
+                let installed = crate::backup::commit_staged(
+                    &mut self.queues,
+                    tid,
+                    &mut self.backup,
+                    port,
+                    platform,
+                )
+                .await;
+                if installed {
+                    // 9.4 rule 5: cached host table state is stale.
+                    let event = EvtTblEpochChanged {
+                        new_epoch: port.table_epoch(),
+                        reason: 2,
+                    };
+                    self.event(Endpoint::Tables, &event);
+                }
+            }
             Op::Init {
                 tid,
                 nwk_fc_floor,
@@ -277,8 +342,16 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 if result.is_ok() && flags & 0x02 == 0 {
                     port.clear_endpoints();
                 }
+                let wiped = result.is_ok();
                 let status = op_status(result);
                 self.respond_status(ids::NWK_LEAVE_RESET, accepted_tid(accepted_us), status);
+                if wiped {
+                    let event = EvtTblEpochChanged {
+                        new_epoch: port.table_epoch(),
+                        reason: 1,
+                    };
+                    self.event(Endpoint::Tables, &event);
+                }
                 if let Some((2, _)) = self.pending_reset {
                     // Factory reset: reboot once the wipe completed.
                     self.pending_reset = Some((0, now_us() + RESET_DELAY_US));
@@ -326,11 +399,12 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
 
     // ── Receive and dispatch ────────────────────────────────────────
 
-    fn receive<T: HostTransport, C: CoordinatorPort>(
+    fn receive<T: HostTransport, C: CoordinatorPort, P: NcpPlatform>(
         &mut self,
         now_us: u64,
         transport: &mut T,
         port: &mut C,
+        platform: &mut P,
         log: &LogRing<LOG_N>,
     ) {
         let faults = transport.take_line_faults();
@@ -346,17 +420,18 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             let mut offset = 0;
             while offset < count {
                 offset += self.link.push_rx(&buf[offset..count], now_us);
-                self.drain_events(now_us, transport, port, log);
+                self.drain_events(now_us, transport, port, platform, log);
             }
         }
-        self.drain_events(now_us, transport, port, log);
+        self.drain_events(now_us, transport, port, platform, log);
     }
 
-    fn drain_events<T: HostTransport, C: CoordinatorPort>(
+    fn drain_events<T: HostTransport, C: CoordinatorPort, P: NcpPlatform>(
         &mut self,
         now_us: u64,
         transport: &mut T,
         port: &mut C,
+        platform: &mut P,
         log: &LogRing<LOG_N>,
     ) {
         let cookie = self.link.cookie();
@@ -373,6 +448,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                         self.indication_drops_unreported,
                         port,
                     );
+                    if self.backup.restore_in_progress() {
+                        // A new session discards a staged restore (9.4).
+                        self.backup.abort_all();
+                    }
                     push_event(&mut self.queues, &mut self.event_seq, &ready);
                     if !self.identity.stack_allowed {
                         let fatal = zigbee_zrhp::msg::system::EvtFatal {
@@ -383,7 +462,17 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                         push_event(&mut self.queues, &mut self.event_seq, &fatal);
                     }
                 }
-                LinkEvent::PeerReset { .. } | LinkEvent::LinkDown | LinkEvent::LinkFailed => {
+                LinkEvent::PeerReset { change, .. } => {
+                    self.negotiated = false;
+                    if change != PeerChange::Resync {
+                        // PEER_RESTARTED: cached results and staged
+                        // transfers belong to the old host session (6.5,
+                        // 9.4 rule 1).
+                        self.retry.clear();
+                        self.backup.abort_all();
+                    }
+                }
+                LinkEvent::LinkDown | LinkEvent::LinkFailed => {
                     self.negotiated = false;
                 }
                 LinkEvent::Data { endpoint, payload } => match Batch::parse(payload) {
@@ -399,8 +488,26 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                             counters: &mut self.counters,
                             identity: &self.identity,
                             boot_us: self.boot_us,
+                            backup: &mut self.backup,
+                            coex: &mut self.coex,
+                            host_caps: &mut self.host_caps,
                         };
                         for message in batch.iter() {
+                            let header = message.header;
+                            if header.kind == Kind::Request && header.retry {
+                                // 6.5: answer from the cache, or let a still
+                                // running operation answer.
+                                if let Some(cached) = self.retry.lookup(header.tid, header.msg_id) {
+                                    let _ = self.queues.queue(endpoint).raw(
+                                        Kind::Response,
+                                        header.msg_id,
+                                        header.tid,
+                                        cached,
+                                    );
+                                    continue;
+                                }
+                            }
+                            let before = self.queues.queue(endpoint).len();
                             Self::dispatch(
                                 &mut self.queues,
                                 &mut state,
@@ -409,8 +516,17 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                                 &message,
                                 transport,
                                 port,
+                                platform,
                                 log,
                             );
+                            if header.kind == Kind::Request {
+                                remember_response(
+                                    &mut self.retry,
+                                    &self.queues.queue(endpoint).queued()[before..],
+                                    header.msg_id,
+                                    header.tid,
+                                );
+                            }
                         }
                     }
                     Err(_) => {
@@ -439,8 +555,11 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         }
     }
 
+    // Own frame: the request handlers' buffers stay out of the root
+    // future's poll frame, which also holds the deepest stack operation.
     #[allow(clippy::too_many_arguments)]
-    fn dispatch<T: HostTransport, C: CoordinatorPort>(
+    #[inline(never)]
+    fn dispatch<T: HostTransport, C: CoordinatorPort, P: NcpPlatform>(
         queues: &mut EndpointQueues<QUEUE_BYTES>,
         state: &mut DispatchState<'_>,
         now_us: u64,
@@ -448,6 +567,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         message: &RawMessage<'_>,
         transport: &mut T,
         port: &mut C,
+        platform: &mut P,
         log: &LogRing<LOG_N>,
     ) {
         if message.header.kind != Kind::Request {
@@ -508,7 +628,17 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 }
                 // Green Power combo (spec 7.11).
                 let (gp_caps, gp_sink_table, gp_proxy_table) = crate::gp::negotiate_facts(port);
-                ncp_caps |= gp_caps;
+                ncp_caps |= gp_caps | caps::BACKUP_RESTORE;
+                if platform.fw_supported() {
+                    ncp_caps |= caps::NCP_FW_UPDATE;
+                }
+                if platform.ieee_rewritable() {
+                    ncp_caps |= caps::IEEE_REWRITABLE;
+                }
+                if platform.pta_supported() {
+                    ncp_caps |= caps::PTA_COEX;
+                }
+                *state.host_caps = request.host_caps;
                 let capacities = [
                     Capacity {
                         id: capacity::MAX_APS_INFLIGHT,
@@ -537,6 +667,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     Capacity {
                         id: capacity::MAX_TC_DEVICES,
                         value: state.identity.max_tc_devices,
+                    },
+                    Capacity {
+                        id: capacity::MAX_RESTORE_RECORDS_PER_PUT,
+                        value: u32::from(crate::backup::MAX_RECORDS_PER_PUT),
                     },
                     // Table sizes of the linked stack (`ncp-capacity`).
                     Capacity {
@@ -578,11 +712,12 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             }
             ids::SYS_GET_INFO => {
                 let info = transport.info();
-                let ieee = Ieee(port.ieee());
+                let active = port.ieee();
+                let factory = platform.factory_ieee().unwrap_or(active);
                 let response = SysGetInfoRsp {
-                    ieee_factory: ieee,
-                    ieee_active: ieee,
-                    ieee_source: 0,
+                    ieee_factory: Ieee(factory),
+                    ieee_active: Ieee(active),
+                    ieee_source: u8::from(active != factory),
                     chip_rev: state.identity.chip_rev,
                     flash_size: state.identity.flash_size,
                     transport: info.kind,
@@ -621,6 +756,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 if *state.key_export_locked {
                     flags |= 0x01;
                 }
+                if state.coex.0 {
+                    flags |= 0x04;
+                }
                 if port.permit_join_remaining_s() != 0 {
                     flags |= 0x10;
                 }
@@ -632,7 +770,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                         as u16,
                     host_absent_queue: 0,
                     dirty_writebacks: 0,
-                    restore_in_progress: 0,
+                    restore_in_progress: u8::from(state.backup.restore_in_progress()),
                     flags,
                 };
                 let _ = queues.response(tid, Status::Success, Some(&response));
@@ -647,6 +785,37 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                             Status::Success
                         }
                         config::LOG_LEVEL => Status::InvalidParameter,
+                        config::COEX_ENABLE | config::COEX_TX_PRIORITY_MASK
+                            if !platform.pta_supported() =>
+                        {
+                            Status::UnsupportedCommand
+                        }
+                        config::COEX_ENABLE if item.value.0.len() == 1 && item.value.0[0] <= 1 => {
+                            let enable = item.value.0[0] == 1;
+                            match platform.set_pta(enable, state.coex.1) {
+                                Ok(()) => {
+                                    state.coex.0 = enable;
+                                    Status::Success
+                                }
+                                Err(error) => crate::firmware::status_of(error),
+                            }
+                        }
+                        config::COEX_TX_PRIORITY_MASK
+                            if item.value.0.len() == 1 && item.value.0[0] <= 0x0F =>
+                        {
+                            // Validated by the platform even while disabled.
+                            let mask = item.value.0[0];
+                            match platform.set_pta(state.coex.0, mask) {
+                                Ok(()) => {
+                                    state.coex.1 = mask;
+                                    Status::Success
+                                }
+                                Err(error) => crate::firmware::status_of(error),
+                            }
+                        }
+                        config::COEX_ENABLE | config::COEX_TX_PRIORITY_MASK => {
+                            Status::InvalidParameter
+                        }
                         _ => Status::UnsupportedCommand,
                     };
                     if results
@@ -667,13 +836,22 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             ids::SYS_GET_CONFIG => {
                 let request = decode!(SysGetConfig);
                 let level = [log.level()];
+                let coex_enable = [u8::from(state.coex.0)];
+                let coex_mask = [state.coex.1];
+                let pta = platform.pta_supported();
                 let mut items: Vec<ConfigReadItem<'_>, 16> = Vec::new();
                 for config_id in request.ids.iter() {
-                    let item = if config_id == config::LOG_LEVEL {
+                    let value: Option<&[u8]> = match config_id {
+                        config::LOG_LEVEL => Some(&level),
+                        config::COEX_ENABLE if pta => Some(&coex_enable),
+                        config::COEX_TX_PRIORITY_MASK if pta => Some(&coex_mask),
+                        _ => None,
+                    };
+                    let item = if let Some(value) = value {
                         ConfigReadItem {
                             id: config_id,
                             status: Status::Success,
-                            value: Bytes8(&level),
+                            value: Bytes8(value),
                         }
                     } else {
                         ConfigReadItem {
@@ -788,10 +966,8 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     tx_power: request.tx_power,
                     nwk_manager: request.nwk_manager,
                 };
-                if !params.ncp_chosen_identity() {
-                    // Host-supplied PAN ID/EPID/key need BDB formation
-                    // parameters the runtime does not take yet.
-                    status_only(queues, Status::UnsupportedCommand);
+                if state.backup.restore_in_progress() {
+                    status_only(queues, Status::InvalidState);
                     return;
                 }
                 if state
@@ -932,6 +1108,64 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 }
                 log.set_level(request.level);
                 status_only(queues, Status::Success);
+            }
+            ids::SYS_SET_IEEE => {
+                let request = decode!(SysSetIeee);
+                if !platform.ieee_rewritable() {
+                    status_only(queues, Status::UnsupportedCommand);
+                    return;
+                }
+                if port.state() != NetworkState::None || state.backup.restore_in_progress() {
+                    status_only(queues, Status::InvalidState);
+                    return;
+                }
+                let ieee = request.ieee.0;
+                if ieee == [0; 8] {
+                    status_only(queues, Status::InvalidParameter);
+                    return;
+                }
+                let ieee = (ieee != [0xFF; 8]).then_some(ieee);
+                if state
+                    .ops
+                    .push_back((Op::SetIeee { tid, ieee }, now_us))
+                    .is_err()
+                {
+                    status_only(queues, Status::Busy);
+                }
+            }
+            _ if crate::firmware::is_fw_request(id) => crate::firmware::dispatch_fw(
+                queues,
+                endpoint,
+                message,
+                platform,
+                port,
+                state.pending_reset,
+                now_us,
+            ),
+            _ if crate::tables::is_tables_request(id) => crate::tables::dispatch_tables(
+                queues,
+                endpoint,
+                message,
+                state.identity.key_export && !*state.key_export_locked,
+                port,
+            ),
+            _ if crate::backup::is_backup_request(id) => {
+                let commit = crate::backup::dispatch_backup(
+                    queues,
+                    endpoint,
+                    message,
+                    state.identity.key_export && !*state.key_export_locked,
+                    state.backup,
+                    port,
+                );
+                if commit
+                    && state
+                        .ops
+                        .push_back((Op::RestoreCommit { tid }, now_us))
+                        .is_err()
+                {
+                    status_only(queues, Status::Busy);
+                }
             }
             // GREEN POWER (`0x0Axx`, spec 7.11) and unknown IDs.
             _ => crate::gp::dispatch_gp(
@@ -1351,6 +1585,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
 /// Mutable dispatcher state, split from the link so frames can be
 /// dispatched while the link lends their payload.
 struct DispatchState<'s> {
+    backup: &'s mut crate::backup::BackupState,
+    coex: &'s mut (bool, u8),
+    host_caps: &'s mut u64,
     negotiated: &'s mut bool,
     pending_diag: &'s mut Deque<(u16, u8), 4>,
     ops: &'s mut Deque<(Op, u64), { MAX_APS_INFLIGHT + 4 }>,
@@ -1404,6 +1641,7 @@ fn op_status(result: Result<(), OpError>) -> Status {
         Err(OpError::NotFormed) => Status::NotFormed,
         Err(OpError::Storage) => Status::StorageError,
         Err(OpError::Unsupported) => Status::UnsupportedCommand,
+        Err(OpError::InvalidParameter) => Status::InvalidParameter,
         Err(OpError::Zigbee(_)) => Status::Failure,
     }
 }
@@ -1412,14 +1650,14 @@ fn ncp_ready<C: CoordinatorPort>(
     cookie: u32,
     identity: &NcpIdentity,
     dropped_indications: u32,
-    port: &C,
+    port: &mut C,
 ) -> EvtNcpReady {
     let counters = port.frame_counters();
     EvtNcpReady {
         ncp_cookie: cookie,
         reset_reason: identity.reset_reason,
         network_state: port.state() as u8,
-        table_epoch: 0,
+        table_epoch: port.table_epoch(),
         nwk_fc_limit: counters.nwk_limit,
         aps_fc_limit: counters.aps_limit,
         dirty_writebacks: 0,
@@ -1476,6 +1714,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 nwk_checkpoints: _,
                 indication_drops_unreported: _,
                 boot_us: _,
+                retry: _,
+                backup: _,
+                coex: _,
+                host_caps: _,
             } = ncp;
         };
         let reason = match identity.reset_reason {
@@ -1512,9 +1754,33 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             addr_of_mut!((*slot).nwk_checkpoints).write(0);
             addr_of_mut!((*slot).indication_drops_unreported).write(0);
             addr_of_mut!((*slot).boot_us).write(now_us);
+            addr_of_mut!((*slot).retry).write(crate::retry::RetryCache::new());
+            addr_of_mut!((*slot).backup).write(crate::backup::BackupState::new());
+            addr_of_mut!((*slot).coex).write((false, 0));
+            addr_of_mut!((*slot).host_caps).write(0);
             let ncp = &mut *slot;
             ncp.link.open(now_us, reason);
             ncp
         }
+    }
+}
+
+/// Cache the response to `(msg_id, tid)` among the messages just queued
+/// (spec 6.5).
+fn remember_response(cache: &mut crate::retry::RetryCache, queued: &[u8], msg_id: u16, tid: u16) {
+    let mut rest = queued;
+    while rest.len() >= zigbee_zrhp::msg::HEADER_LEN {
+        let Ok(header) = zigbee_zrhp::msg::MsgHeader::parse(rest) else {
+            return;
+        };
+        let end = zigbee_zrhp::msg::HEADER_LEN + usize::from(header.len);
+        if rest.len() < end {
+            return;
+        }
+        if header.kind == Kind::Response && header.msg_id == msg_id && header.tid == tid {
+            cache.remember(tid, msg_id, &rest[zigbee_zrhp::msg::HEADER_LEN..end]);
+            return;
+        }
+        rest = &rest[end..];
     }
 }

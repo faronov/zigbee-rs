@@ -1,0 +1,1037 @@
+//! The rest of the NCP surface over the zigbee-zrhp host link: host-supplied
+//! formation, TABLES, BACKUP export → restore, FW_* and SYS_SET_IEEE/PTA on
+//! a fake platform, and the retry cache.
+
+use std::collections::VecDeque;
+
+use ncp_coordinator_app::platform::{
+    FwBegin, FwImage, FwSlot, NcpPlatform, PlatformError, slot_state,
+};
+use ncp_coordinator_app::port::CoordinatorPort;
+use ncp_coordinator_app::tc::TcPort;
+use ncp_coordinator_app::transport::{HostTransport, TransportInfo};
+use ncp_coordinator_app::{LogRing, Ncp, NcpIdentity, PlatformRequest};
+use router_app::{
+    NoDiagnostics, NoStatus, NoSupervisor, PersistentChildren, RouterParts, RouterPolicy,
+    TrustCenterCoordinatorApp,
+};
+use zigbee_aps::PROFILE_HOME_AUTOMATION;
+use zigbee_mac::mock::MockMac;
+use zigbee_runtime::ZigbeeDevice;
+use zigbee_runtime::child_store::RamChildTableStore;
+use zigbee_runtime::node::ZigbeeNode;
+use zigbee_runtime::power::PowerMode;
+use zigbee_runtime::profile::{ApplicationProfile, DeviceProfile, RangeExtender};
+use zigbee_runtime::role::Router;
+use zigbee_runtime::security_store::RamSecurityStateStore;
+use zigbee_runtime::trust_center_store::RamTrustCenterDeviceStore;
+use zigbee_types::ChannelMask;
+use zigbee_zcl::DeviceId;
+use zigbee_zrhp::codec::{Bytes8, List, Rest};
+use zigbee_zrhp::codec::{Wire, Writer};
+use zigbee_zrhp::frame::TX_BUFFER_LEN;
+use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent};
+use zigbee_zrhp::msg::backup::{
+    BkpExportBegin, BkpExportBeginRsp, BkpExportEnd, BkpExportRead, BkpRestoreBegin,
+    BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, BkpRestorePutRsp,
+};
+use zigbee_zrhp::msg::firmware::{
+    FwActivate, FwBegin as FwBeginReq, FwBeginRsp, FwFinishRsp, FwGetSlotsRsp, FwWrite, FwWriteRsp,
+};
+use zigbee_zrhp::msg::network::{NwkForm, NwkGetInfoRsp, NwkLeaveReset};
+use zigbee_zrhp::msg::security::{SecGetFrameCountersRsp, SecGetNetworkKey, SecGetNetworkKeyRsp};
+use zigbee_zrhp::msg::system::{
+    ConfigValue, SysGetConfig, SysGetConfigRsp, SysGetInfoRsp, SysGetStatusRsp, SysNegotiateReq,
+    SysNegotiateRsp, SysSetConfig, SysSetConfigRsp, SysSetIeee, caps, config,
+};
+use zigbee_zrhp::msg::tables::{
+    EvtTblEpochChanged, TableKey, TblInvalidate, TblPush, TblPushRsp, TblRead, TblReadRsp,
+    TblStats, TblStatsRsp, TblSync, TblSyncRsp,
+};
+use zigbee_zrhp::msg::{Batch, Kind, MsgHeader, RawMessage, ids};
+use zigbee_zrhp::queue::EndpointQueues;
+use zigbee_zrhp::records::{DeviceRecord, LinkBlock, RawRecords, Record, StreamCrc, record_type};
+use zigbee_zrhp::types::{Endpoint, Ieee, Status};
+
+const IEEE: [u8; 8] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
+const OTHER_IEEE: [u8; 8] = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
+const NETWORK_KEY: [u8; 16] = [
+    0x01, 0x03, 0x05, 0x07, 0x09, 0x0B, 0x0D, 0x0F, 0x00, 0x02, 0x04, 0x06, 0x08, 0x0A, 0x0C, 0x0D,
+];
+const EPID: [u8; 8] = [0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD];
+const DEVICE_IEEE: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+const DEVICE_KEY: [u8; 16] = [0x5A; 16];
+
+static POLICY: RouterPolicy = RouterPolicy {
+    max_receive_slice_us: 1_000,
+    join_retry_initial_ms: 10,
+    join_retry_max_ms: 100,
+    secure_rejoin_failure_limit: 2,
+};
+
+// ── Host side ───────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct Pipe {
+    to_ncp: VecDeque<u8>,
+    to_host: Vec<u8>,
+}
+
+impl HostTransport for Pipe {
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        let n = buf.len().min(self.to_ncp.len());
+        for slot in &mut buf[..n] {
+            *slot = self.to_ncp.pop_front().unwrap();
+        }
+        n
+    }
+    fn write(&mut self, data: &[u8]) -> usize {
+        self.to_host.extend_from_slice(data);
+        data.len()
+    }
+    fn info(&self) -> TransportInfo {
+        TransportInfo {
+            kind: 2,
+            baud: 460_800,
+            flow_control: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Received {
+    kind: Kind,
+    msg_id: u16,
+    tid: u16,
+    payload: Vec<u8>,
+}
+
+impl Received {
+    fn raw(&self) -> RawMessage<'_> {
+        RawMessage {
+            header: MsgHeader {
+                kind: self.kind,
+                retry: false,
+                msg_id: self.msg_id,
+                tid: self.tid,
+                len: self.payload.len() as u16,
+            },
+            payload: &self.payload,
+        }
+    }
+
+    fn status(&self) -> u8 {
+        self.payload[0]
+    }
+
+    fn body<'a, T: zigbee_zrhp::codec::Wire<'a>>(&'a self) -> T {
+        let response = self.raw().decode_response::<T>().unwrap();
+        assert!(
+            response.status.is_success(),
+            "{:#06x}: {:?}",
+            self.msg_id,
+            response.status
+        );
+        response.body.unwrap()
+    }
+
+    fn event<'a, T: zigbee_zrhp::codec::Wire<'a>>(&'a self) -> T {
+        self.raw().decode::<T>().unwrap()
+    }
+}
+
+struct Host {
+    link: Link<32, 32>,
+    queues: EndpointQueues<4096>,
+    tid: u16,
+    inbox: Vec<Received>,
+}
+
+impl Host {
+    fn new(now: u64) -> Self {
+        let mut link = Link::new(LinkConfig::desktop_host(), 0x1A2B_3C4D);
+        link.open(now, zigbee_zrhp::frame::ResetReason::HostOpen);
+        Self {
+            link,
+            queues: EndpointQueues::new(),
+            tid: 0,
+            inbox: Vec::new(),
+        }
+    }
+
+    fn request<'a, T: zigbee_zrhp::codec::Wire<'a> + zigbee_zrhp::msg::MessageDef>(
+        &mut self,
+        body: &T,
+    ) -> u16 {
+        self.tid += 1;
+        self.queues.request(self.tid, body).unwrap();
+        self.tid
+    }
+
+    /// The same request again with the RETRY flag (spec 6.5).
+    fn retry<'a, T: zigbee_zrhp::codec::Wire<'a> + zigbee_zrhp::msg::MessageDef>(
+        &mut self,
+        tid: u16,
+        body: &T,
+    ) {
+        let endpoint = zigbee_zrhp::msg::home_endpoint(T::ID).unwrap();
+        self.queues
+            .queue(endpoint)
+            .push_with(|w| w.request_retry(tid, body))
+            .unwrap();
+    }
+
+    fn request_raw(&mut self, msg_id: u16, payload: &[u8]) -> u16 {
+        self.tid += 1;
+        let tid = self.tid;
+        let endpoint = zigbee_zrhp::msg::home_endpoint(msg_id).unwrap();
+        self.queues
+            .queue(endpoint)
+            .raw(Kind::Request, msg_id, tid, payload)
+            .unwrap();
+        tid
+    }
+
+    fn pump(&mut self, now: u64, pipe: &mut Pipe) {
+        let bytes = std::mem::take(&mut pipe.to_host);
+        let mut offset = 0;
+        loop {
+            offset += self.link.push_rx(&bytes[offset..], now);
+            while let Some(event) = self.link.poll_event() {
+                if let LinkEvent::Data { payload, .. } = event {
+                    for message in Batch::parse(payload).unwrap().iter() {
+                        self.inbox.push(Received {
+                            kind: message.header.kind,
+                            msg_id: message.header.msg_id,
+                            tid: message.header.tid,
+                            payload: message.payload.to_vec(),
+                        });
+                    }
+                }
+            }
+            if offset >= bytes.len() {
+                break;
+            }
+        }
+        let mut tx = [0u8; TX_BUFFER_LEN];
+        while let Some(n) = self.link.poll_transmit(now, &mut self.queues, &mut tx) {
+            pipe.to_ncp.extend(&tx[..n]);
+        }
+    }
+
+    fn response(&mut self, tid: u16) -> Received {
+        let index = self
+            .inbox
+            .iter()
+            .position(|m| m.kind == Kind::Response && m.tid == tid)
+            .unwrap_or_else(|| panic!("no response to tid {tid}: {:?}", self.inbox));
+        self.inbox.remove(index)
+    }
+
+    fn responses(&self, tid: u16) -> usize {
+        self.inbox
+            .iter()
+            .filter(|m| m.kind == Kind::Response && m.tid == tid)
+            .count()
+    }
+
+    fn event(&mut self, msg_id: u16) -> Option<Received> {
+        let index = self
+            .inbox
+            .iter()
+            .position(|m| m.kind == Kind::Event && m.msg_id == msg_id)?;
+        Some(self.inbox.remove(index))
+    }
+}
+
+// ── Fake product platform ──────────────────────────────────────────
+
+#[derive(Debug, Default)]
+struct FakePlatform {
+    image: Option<FwImage>,
+    staged: Vec<u8>,
+    finished: bool,
+    activated: bool,
+    confirmed: bool,
+    ieee_override: Option<[u8; 8]>,
+    pta: Option<(bool, u8)>,
+}
+
+impl NcpPlatform for FakePlatform {
+    fn fw_begin(&mut self, image: &FwImage) -> Result<FwBegin, PlatformError> {
+        if image.image_size > 4096 {
+            return Err(PlatformError::TooLarge);
+        }
+        self.image = Some(*image);
+        self.staged.clear();
+        self.finished = false;
+        Ok(FwBegin {
+            max_chunk: 128,
+            slot: 1,
+        })
+    }
+    fn fw_write(&mut self, offset: u32, data: &[u8]) -> Result<u32, PlatformError> {
+        let image = self.image.ok_or(PlatformError::InvalidState)?;
+        if offset as usize != self.staged.len() {
+            return Err(PlatformError::InvalidParameter);
+        }
+        if self.staged.len() + data.len() > image.image_size as usize {
+            return Err(PlatformError::TooLarge);
+        }
+        self.staged.extend_from_slice(data);
+        Ok(self.staged.len() as u32)
+    }
+    fn fw_finish(&mut self) -> Result<u8, PlatformError> {
+        let image = self.image.ok_or(PlatformError::InvalidState)?;
+        if self.staged.len() != image.image_size as usize {
+            return Err(PlatformError::VerifyFailed);
+        }
+        self.finished = true;
+        Ok(0)
+    }
+    fn fw_activate(&mut self) -> Result<(), PlatformError> {
+        if !self.finished {
+            return Err(PlatformError::InvalidState);
+        }
+        self.activated = true;
+        Ok(())
+    }
+    fn fw_confirm(&mut self) -> Result<(), PlatformError> {
+        self.confirmed = true;
+        Ok(())
+    }
+    fn fw_abort(&mut self) -> Result<(), PlatformError> {
+        self.image = None;
+        self.staged.clear();
+        Ok(())
+    }
+    fn fw_slots(&mut self, out: &mut [FwSlot]) -> Result<usize, PlatformError> {
+        out[0] = FwSlot {
+            slot: 0,
+            state: slot_state::RUNNING,
+            version: 1,
+            sha256: [0; 32],
+        };
+        out[1] = FwSlot {
+            slot: 1,
+            state: if self.finished {
+                slot_state::STAGED
+            } else {
+                slot_state::EMPTY
+            },
+            version: self.image.map_or(0, |image| image.version),
+            sha256: self.image.map_or([0; 32], |image| image.sha256),
+        };
+        Ok(2)
+    }
+    fn fw_supported(&self) -> bool {
+        true
+    }
+    fn ieee_rewritable(&self) -> bool {
+        true
+    }
+    fn factory_ieee(&self) -> Option<[u8; 8]> {
+        Some(IEEE)
+    }
+    fn set_ieee_override(&mut self, ieee: Option<[u8; 8]>) -> Result<(), PlatformError> {
+        self.ieee_override = ieee;
+        Ok(())
+    }
+    fn pta_supported(&self) -> bool {
+        true
+    }
+    fn set_pta(&mut self, enable: bool, priority_mask: u8) -> Result<(), PlatformError> {
+        self.pta = Some((enable, priority_mask));
+        Ok(())
+    }
+}
+
+// ── NCP side ────────────────────────────────────────────────────────
+
+type Profile = DeviceProfile<RangeExtender>;
+
+fn profile() -> Profile {
+    DeviceProfile::new(
+        1,
+        PROFILE_HOME_AUTOMATION,
+        DeviceId::COMBINED_INTERFACE,
+        RangeExtender,
+    )
+}
+
+fn device(profile: &Profile) -> ZigbeeDevice<MockMac, Router> {
+    let mut mac = MockMac::new(IEEE);
+    mac.set_rx_delay_us(u32::MAX);
+    for (channel, energy) in [(15, 60), (20, 5), (25, 90)] {
+        mac.add_energy(zigbee_mac::EdValue { channel, energy });
+    }
+    ZigbeeDevice::builder(mac)
+        .power_mode(PowerMode::AlwaysOn)
+        .channels(ChannelMask(1 << 15))
+        .endpoint(
+            profile.endpoint(),
+            profile.profile_id(),
+            profile.device_id(),
+            |endpoint| profile.configure_endpoint(endpoint),
+        )
+        .build_coordinator()
+}
+
+fn identity() -> NcpIdentity {
+    NcpIdentity {
+        fw_version: "test",
+        build_id: [0; 8],
+        chip: 1,
+        chip_rev: 0,
+        flash_size: 4 * 1024 * 1024,
+        board: "pipe",
+        product: "test",
+        reset_reason: 1,
+        key_export: true,
+        max_children: 64,
+        max_tc_devices: 256,
+        stack_allowed: true,
+    }
+}
+
+fn clock_ms() -> u32 {
+    0
+}
+
+/// A few service/drive rounds with the host pumping in between; returns
+/// the platform requests the NCP raised.
+fn exchange<A: ncp_coordinator_app::tc::TcApp>(
+    ncp: &mut Ncp<8>,
+    host: &mut Host,
+    port: &mut TcPort<A>,
+    platform: &mut FakePlatform,
+    pipe: &mut Pipe,
+    log: &LogRing<8>,
+    now: &mut u64,
+) -> Vec<PlatformRequest> {
+    let mut requests = Vec::new();
+    for _ in 0..10 {
+        *now += 1_000;
+        host.pump(*now, pipe);
+        requests.extend(ncp.service_with(*now, pipe, port, platform, log));
+        while pollster::block_on(ncp.drive_with(port, platform, || 0)) {}
+        requests.extend(ncp.service_with(*now, pipe, port, platform, log));
+        host.pump(*now, pipe);
+    }
+    requests
+}
+
+macro_rules! setup {
+    ($ncp:ident, $host:ident, $port:ident, $platform:ident, $pipe:ident, $log:ident, $now:ident,
+     $exchange:ident) => {
+        let mut security = RamSecurityStateStore::new();
+        let mut gp_store = zigbee_runtime::gp_store::RamGpProxyStore::new();
+        let mut profile = profile();
+        let mut device = device(&profile);
+        let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+        let mut app = TrustCenterCoordinatorApp::new(
+            node,
+            PersistentChildren::new(RamChildTableStore::new()),
+            RamTrustCenterDeviceStore::new(),
+            &POLICY,
+            RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+        )
+        .unwrap();
+        app.set_green_power_store(&mut gp_store);
+        let mut $port = TcPort::new(app, IEEE, clock_ms);
+        let $log = LogRing::<8>::new();
+        let mut $pipe = Pipe::default();
+        let mut $platform = FakePlatform::default();
+        let mut $now = 1_000u64;
+        let mut $ncp = Ncp::<8>::new(identity(), 0xC0FF_EE02, $now);
+        let mut $host = Host::new($now);
+        macro_rules! $exchange {
+            () => {
+                exchange(
+                    &mut $ncp,
+                    &mut $host,
+                    &mut $port,
+                    &mut $platform,
+                    &mut $pipe,
+                    &$log,
+                    &mut $now,
+                )
+            };
+        }
+        $exchange!();
+        assert!($host.event(ids::EVT_NCP_READY).is_some());
+        let negotiate = $host.request(&SysNegotiateReq {
+            major_min: 1,
+            major_max: 1,
+            host_caps: 0,
+            name: Bytes8(b"surface"),
+        });
+        $exchange!();
+        let negotiated = $host.response(negotiate);
+        let negotiated: SysNegotiateRsp = negotiated.body();
+        for bit in [
+            caps::BACKUP_RESTORE,
+            caps::NCP_FW_UPDATE,
+            caps::IEEE_REWRITABLE,
+            caps::PTA_COEX,
+        ] {
+            assert_ne!(negotiated.ncp_caps & bit, 0, "capability {bit:#x}");
+        }
+    };
+}
+
+fn form_request(pan_id: u16, channel_mask: u32) -> NwkForm {
+    NwkForm {
+        channel_mask,
+        pan_id,
+        ext_pan_id: EPID,
+        network_key: NETWORK_KEY,
+        key_seq: 3,
+        nwk_update_id: 2,
+        tx_power: 0,
+        nwk_manager: 0x0000,
+    }
+}
+
+fn device_push(ieee: [u8; 8], key: [u8; 16]) -> Record<'static> {
+    Record::Device(DeviceRecord {
+        ieee: Ieee(ieee),
+        nwk: 0xFFFE,
+        flags: 0,
+        child: None,
+        link: Some(LinkBlock {
+            key,
+            key_seq: 0,
+            attrs: 0,
+            origin: 0,
+            tx_counter: 0,
+            rx_floor: 0,
+        }),
+    })
+}
+
+#[test]
+fn host_identity_formation_tables_and_backup_restore() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+
+    // Host-chosen PAN ID / EPID / key; the quietest channel of the mask.
+    let form = host.request(&form_request(0x1A62, (1 << 15) | (1 << 20) | (1 << 25)));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let info = host.request_raw(ids::NWK_GET_INFO, &[]);
+    exchange!();
+    let info = host.response(info);
+    let info: NwkGetInfoRsp = info.body();
+    assert_eq!(
+        (info.state, info.pan_id, info.ext_pan_id, info.channel),
+        (2, 0x1A62, EPID, 20)
+    );
+    assert_eq!((info.key_seq, info.nwk_update_id), (3, 2));
+    let key = host.request(&SecGetNetworkKey { which: 0 });
+    exchange!();
+    let key = host.response(key);
+    let key: SecGetNetworkKeyRsp = key.body();
+    assert_eq!((key.key, key.seq), (NETWORK_KEY, 3));
+
+    // TABLES: provision a unique TCLK, read it back, invalidate another.
+    let push = host.request(&TblPush {
+        table: record_type::DEVICE,
+        flags: 0,
+        records: List::new(&[device_push(DEVICE_IEEE, DEVICE_KEY)]),
+    });
+    let stats = host.request(&TblStats {
+        table: record_type::DEVICE,
+    });
+    let read = host.request(&TblRead {
+        table: record_type::DEVICE,
+        cursor: 0,
+        max: 8,
+    });
+    let unknown = host.request(&TblInvalidate {
+        table: record_type::DEVICE,
+        key: TableKey::Ieee(Ieee(OTHER_IEEE)),
+    });
+    let sync = host.request(&TblSync {
+        host_db_epoch: 1,
+        last_ncp_table_epoch: 0,
+        host_max_rev: 0,
+        flags: 0,
+    });
+    exchange!();
+    let push = host.response(push);
+    let push: TblPushRsp = push.body();
+    assert_eq!(
+        push.results.iter().map(|r| r.status).collect::<Vec<_>>(),
+        [Status::Success]
+    );
+    let stats = host.response(stats);
+    let stats: TblStatsRsp = stats.body();
+    assert_eq!((stats.used, stats.pinned), (1, 0));
+    assert!(stats.capacity >= 1);
+    let read = host.response(read);
+    let read: TblReadRsp = read.body();
+    assert_eq!(read.next_cursor, 0xFFFF);
+    let entries: Vec<_> = read.entries.iter().collect();
+    assert_eq!(entries.len(), 1);
+    let Record::Device(record) = &entries[0].record else {
+        panic!("{:?}", entries[0].record)
+    };
+    assert_eq!(record.ieee.0, DEVICE_IEEE);
+    assert_eq!(record.link.as_ref().map(|link| link.key), Some(DEVICE_KEY));
+    assert_eq!(host.response(unknown).status(), 0, "unknown device: no-op");
+    let sync = host.response(sync);
+    let sync: TblSyncRsp = sync.body();
+    assert_ne!(sync.ncp_table_epoch, 0);
+    assert_eq!(sync.cached_devices, 1);
+    let epoch = sync.ncp_table_epoch;
+
+    // Export: keys and devices.
+    let counters = host.request_raw(ids::SEC_GET_FRAME_COUNTERS, &[]);
+    let begin = host.request(&BkpExportBegin { flags: 0x03 });
+    exchange!();
+    let counters = host.response(counters);
+    let counters: SecGetFrameCountersRsp = counters.body();
+    let begin = host.response(begin);
+    let begin: BkpExportBeginRsp = begin.body();
+    assert_eq!(begin.record_count, 7, "NODE NETWORK KEY TCLK DEVICE RS END");
+    let mut stream = Vec::new();
+    loop {
+        let read = host.request(&BkpExportRead {
+            txn: begin.txn,
+            max_bytes: 64,
+        });
+        exchange!();
+        let read = host.response(read);
+        assert_eq!(read.status(), 0);
+        let more = read.payload[1];
+        stream.extend_from_slice(&read.payload[2..]);
+        if more == 0 {
+            break;
+        }
+    }
+    let end = host.request(&BkpExportEnd { txn: begin.txn });
+    exchange!();
+    assert_eq!(host.response(end).status(), 0);
+    let records: Vec<&[u8]> = RawRecords::new(&stream).map(|r| r.unwrap().1).collect();
+    assert_eq!(records.len(), 7);
+    assert_eq!(records[0][0], record_type::NODE);
+    assert_eq!(*records.last().unwrap().first().unwrap(), record_type::END);
+
+    // Restore needs the stack stopped.
+    let early = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 10_000,
+        aps_margin: 10_000,
+        expected_records: 7,
+    });
+    exchange!();
+    assert_eq!(host.response(early).status(), Status::InvalidState.to_u8());
+
+    // Factory reset of the network, then the restore.
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+    let wiped: EvtTblEpochChanged = host.event(ids::EVT_TBL_EPOCH_CHANGED).unwrap().event();
+    assert_eq!((wiped.new_epoch, wiped.reason), (0, 1));
+    assert_eq!(port.state() as u8, 0);
+
+    let begin = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 10_000,
+        aps_margin: 10_000,
+        expected_records: 7,
+    });
+    exchange!();
+    let begin = host.response(begin);
+    let begin: BkpRestoreBeginRsp = begin.body();
+    let status = host.request_raw(ids::SYS_GET_STATUS, &[]);
+    exchange!();
+    let status = host.response(status);
+    assert_eq!(status.body::<SysGetStatusRsp>().restore_in_progress, 1);
+    for chunk in records.chunks(usize::from(begin.max_records_per_put).min(3)) {
+        let mut payload = begin.txn.to_le_bytes().to_vec();
+        for record in chunk {
+            payload.extend_from_slice(record);
+        }
+        let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+        exchange!();
+        let put = host.response(put);
+        let put: BkpRestorePutRsp = put.body();
+        assert_eq!(usize::from(put.accepted), chunk.len());
+        assert_eq!(
+            put.notes.iter().count(),
+            0,
+            "a zigbee-rs backup restores as is"
+        );
+    }
+    let commit = host.request(&BkpRestoreCommit { txn: begin.txn });
+    exchange!();
+    let commit = host.response(commit);
+    let commit: BkpRestoreCommitRsp = commit.body();
+    assert!(commit.nwk_fc_start >= counters.nwk_limit + 10_000);
+    assert!(commit.aps_fc_start >= counters.aps_limit + 10_000);
+    assert_eq!(
+        (commit.link_keys_on_ncp, commit.link_keys_host_backed),
+        (1, 0)
+    );
+    let restored: EvtTblEpochChanged = host.event(ids::EVT_TBL_EPOCH_CHANGED).unwrap().event();
+    assert_eq!((restored.new_epoch, restored.reason), (epoch, 2));
+
+    // The same network, key and device link key, counters forward only.
+    let info = host.request_raw(ids::NWK_GET_INFO, &[]);
+    let key = host.request(&SecGetNetworkKey { which: 0 });
+    let read = host.request(&TblRead {
+        table: record_type::DEVICE,
+        cursor: 0,
+        max: 8,
+    });
+    exchange!();
+    let info = host.response(info);
+    let info: NwkGetInfoRsp = info.body();
+    assert_eq!(
+        (info.state, info.pan_id, info.ext_pan_id, info.channel),
+        (2, 0x1A62, EPID, 20)
+    );
+    let key = host.response(key);
+    let key: SecGetNetworkKeyRsp = key.body();
+    assert_eq!((key.key, key.seq), (NETWORK_KEY, 3));
+    let read = host.response(read);
+    let read: TblReadRsp = read.body();
+    let entries: Vec<_> = read.entries.iter().collect();
+    assert_eq!(entries.len(), 1);
+    let after = port.frame_counters();
+    assert!(after.nwk_current >= commit.nwk_fc_start);
+    assert!(after.aps_current >= commit.aps_fc_start);
+
+    // Deleting the device (I5) removes its key.
+    let invalidate = host.request(&TblInvalidate {
+        table: record_type::DEVICE,
+        key: TableKey::Ieee(Ieee(DEVICE_IEEE)),
+    });
+    exchange!();
+    assert_eq!(host.response(invalidate).status(), 0);
+    assert!(port.device(0).is_none());
+}
+
+#[test]
+fn restore_rejects_bad_records_and_crc() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let form = host.request(&form_request(0x2B73, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let begin = host.request(&BkpExportBegin { flags: 0x01 });
+    exchange!();
+    let begin = host.response(begin);
+    let begin: BkpExportBeginRsp = begin.body();
+    let read = host.request(&BkpExportRead {
+        txn: begin.txn,
+        max_bytes: 480,
+    });
+    exchange!();
+    let read = host.response(read);
+    assert_eq!(read.payload[1], 0, "one chunk");
+    let stream = read.payload[2..].to_vec();
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+
+    // A flipped byte inside the network key: END's CRC fails at commit.
+    let mut corrupt = stream.clone();
+    let records: Vec<(usize, u8)> = {
+        let mut offset = 0;
+        RawRecords::new(&stream)
+            .map(|r| {
+                let (kind, tlv) = r.unwrap();
+                let at = offset;
+                offset += tlv.len();
+                (at, kind)
+            })
+            .collect()
+    };
+    let (key_at, _) = records
+        .iter()
+        .find(|(_, kind)| *kind == record_type::NETWORK_KEY)
+        .unwrap();
+    corrupt[key_at + 3] ^= 0x01;
+    let restore = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 0,
+        aps_margin: 0,
+        expected_records: 6,
+    });
+    exchange!();
+    let restore = host.response(restore);
+    let txn = restore.body::<BkpRestoreBeginRsp>().txn;
+    let mut payload = txn.to_le_bytes().to_vec();
+    payload.extend_from_slice(&corrupt);
+    let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+    exchange!();
+    assert_eq!(host.response(put).status(), 0);
+    let commit = host.request(&BkpRestoreCommit { txn });
+    exchange!();
+    assert_eq!(
+        host.response(commit).status(),
+        Status::SecurityError.to_u8()
+    );
+    assert_eq!(port.state() as u8, 0, "nothing installed");
+
+    // A PAN ID of 0xFFFF violates 9.4 rule 2: the PUT fails and aborts.
+    let restore = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 0,
+        aps_margin: 0,
+        expected_records: 6,
+    });
+    exchange!();
+    let restore = host.response(restore);
+    let txn = restore.body::<BkpRestoreBeginRsp>().txn;
+    let mut bad = stream.clone();
+    let (network_at, _) = records
+        .iter()
+        .find(|(_, kind)| *kind == record_type::NETWORK)
+        .unwrap();
+    bad[network_at + 3] = 0xFF;
+    bad[network_at + 4] = 0xFF;
+    let mut payload = txn.to_le_bytes().to_vec();
+    payload.extend_from_slice(&bad);
+    let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+    let commit = host.request(&BkpRestoreCommit { txn });
+    exchange!();
+    assert_eq!(
+        host.response(put).status(),
+        Status::InvalidParameter.to_u8()
+    );
+    assert_eq!(host.response(commit).status(), Status::NotFound.to_u8());
+
+    // A foreign NODE IEEE without the allow-IEEE flag is refused; with it
+    // the override is stored and the radio takes the restored IEEE.
+    let mut foreign = stream.clone();
+    foreign[3..11].copy_from_slice(&OTHER_IEEE);
+    let foreign = resign(&foreign);
+    for flags in [0u8, 1] {
+        let restore = host.request(&BkpRestoreBegin {
+            flags,
+            nwk_margin: 0,
+            aps_margin: 0,
+            expected_records: 6,
+        });
+        exchange!();
+        let restore = host.response(restore);
+        let txn = restore.body::<BkpRestoreBeginRsp>().txn;
+        let mut payload = txn.to_le_bytes().to_vec();
+        payload.extend_from_slice(&foreign);
+        let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+        let commit = host.request(&BkpRestoreCommit { txn });
+        exchange!();
+        if flags == 0 {
+            assert_eq!(
+                host.response(put).status(),
+                Status::InvalidParameter.to_u8()
+            );
+            assert_eq!(host.response(commit).status(), Status::NotFound.to_u8());
+        } else {
+            assert_eq!(host.response(put).status(), 0);
+            let commit = host.response(commit);
+            let commit: BkpRestoreCommitRsp = commit.body();
+            assert_eq!(commit.link_keys_host_backed, 0);
+        }
+    }
+    assert_eq!(platform.ieee_override, Some(OTHER_IEEE));
+    assert_eq!(port.ieee(), OTHER_IEEE);
+    let info = host.request_raw(ids::NWK_GET_INFO, &[]);
+    exchange!();
+    let info = host.response(info);
+    let info: NwkGetInfoRsp = info.body();
+    assert_eq!(
+        (info.state, info.pan_id, info.ieee.0),
+        (2, 0x2B73, OTHER_IEEE)
+    );
+}
+
+/// Recompute `END` over the other records of `stream`.
+fn resign(stream: &[u8]) -> Vec<u8> {
+    let mut crc = StreamCrc::new();
+    let mut out = Vec::new();
+    for item in RawRecords::new(stream) {
+        let (kind, tlv) = item.unwrap();
+        if kind == record_type::END {
+            break;
+        }
+        crc.add(tlv);
+        out.extend_from_slice(tlv);
+    }
+    let mut end = [0u8; 16];
+    let mut w = Writer::new(&mut end);
+    Record::End(crc.end()).write(&mut w).unwrap();
+    let len = w.len();
+    out.extend_from_slice(&end[..len]);
+    out
+}
+
+#[test]
+fn firmware_ieee_pta_and_retry_cache() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+
+    // FW_*: stage, verify, activate (reboot after the delay), confirm.
+    let image: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+    let begin = host.request(&FwBeginReq {
+        image_size: image.len() as u32,
+        format: 1,
+        sha256: [0x11; 32],
+        version: 2,
+        flags: 0,
+    });
+    exchange!();
+    let begin = host.response(begin);
+    let begin: FwBeginRsp = begin.body();
+    assert_eq!((begin.max_chunk, begin.slot), (128, 1));
+    let mut offset = 0;
+    for chunk in image.chunks(usize::from(begin.max_chunk)) {
+        let write = host.request(&FwWrite {
+            offset,
+            data: Rest(chunk),
+        });
+        exchange!();
+        let write = host.response(write);
+        offset = write.body::<FwWriteRsp>().next_offset;
+    }
+    assert_eq!(offset, 300);
+    let bad = host.request(&FwWrite {
+        offset: 7,
+        data: Rest(&[0]),
+    });
+    let finish = host.request_raw(ids::FW_FINISH, &[]);
+    let slots = host.request_raw(ids::FW_GET_SLOTS, &[]);
+    exchange!();
+    assert_eq!(
+        host.response(bad).status(),
+        Status::InvalidParameter.to_u8()
+    );
+    let finish = host.response(finish);
+    assert_eq!(finish.body::<FwFinishRsp>().verify_result, 0);
+    let slots = host.response(slots);
+    let slots: FwGetSlotsRsp = slots.body();
+    let states: Vec<_> = slots
+        .slots
+        .iter()
+        .map(|s| (s.slot, s.state, s.version))
+        .collect();
+    assert_eq!(states, [(0, 1, 1), (1, 3, 2)]);
+    let activate = host.request(&FwActivate { delay_ms: 5 });
+    let requests = exchange!();
+    assert_eq!(host.response(activate).status(), 0);
+    assert!(platform.activated);
+    assert!(
+        requests.contains(&PlatformRequest::Reset { mode: 0 }),
+        "{requests:?}"
+    );
+    let confirm = host.request_raw(ids::FW_CONFIRM, &[]);
+    exchange!();
+    assert_eq!(host.response(confirm).status(), 0);
+    assert!(platform.confirmed);
+
+    // SYS_SET_IEEE before formation: stored and applied to the MAC; all-FF
+    // reverts to the factory IEEE.
+    let set = host.request(&SysSetIeee {
+        ieee: Ieee(OTHER_IEEE),
+    });
+    let zero = host.request(&SysSetIeee { ieee: Ieee([0; 8]) });
+    exchange!();
+    assert_eq!(host.response(set).status(), 0);
+    assert_eq!(
+        host.response(zero).status(),
+        Status::InvalidParameter.to_u8()
+    );
+    assert_eq!(platform.ieee_override, Some(OTHER_IEEE));
+    assert_eq!(port.ieee(), OTHER_IEEE);
+    let info = host.request_raw(ids::SYS_GET_INFO, &[]);
+    exchange!();
+    let info = host.response(info);
+    let info: SysGetInfoRsp = info.body();
+    assert_eq!(
+        (info.ieee_factory.0, info.ieee_active.0, info.ieee_source),
+        (IEEE, OTHER_IEEE, 1)
+    );
+    let revert = host.request(&SysSetIeee {
+        ieee: Ieee([0xFF; 8]),
+    });
+    exchange!();
+    assert_eq!(host.response(revert).status(), 0);
+    assert_eq!((platform.ieee_override, port.ieee()), (None, IEEE));
+
+    // PTA: off by default, enabled with a priority mask.
+    let get = host.request(&SysGetConfig {
+        ids: List::new(&[config::COEX_ENABLE, config::COEX_TX_PRIORITY_MASK]),
+    });
+    exchange!();
+    let get = host.response(get);
+    let get: SysGetConfigRsp = get.body();
+    let values: Vec<_> = get.items.iter().map(|i| i.value.0.to_vec()).collect();
+    assert_eq!(values, [vec![0], vec![0]]);
+    let set = host.request(&SysSetConfig {
+        values: List::new(&[
+            ConfigValue {
+                id: config::COEX_TX_PRIORITY_MASK,
+                value: Bytes8(&[0x05]),
+            },
+            ConfigValue {
+                id: config::COEX_ENABLE,
+                value: Bytes8(&[1]),
+            },
+            ConfigValue {
+                id: config::COEX_ENABLE,
+                value: Bytes8(&[2]),
+            },
+        ]),
+    });
+    let status = host.request_raw(ids::SYS_GET_STATUS, &[]);
+    exchange!();
+    let set = host.response(set);
+    let set: SysSetConfigRsp = set.body();
+    let results: Vec<_> = set.results.iter().map(|r| r.status).collect();
+    assert_eq!(
+        results,
+        [Status::Success, Status::Success, Status::InvalidParameter]
+    );
+    assert_eq!(platform.pta, Some((true, 0x05)));
+    let status = host.response(status);
+    assert_eq!(status.body::<SysGetStatusRsp>().flags & 0x04, 0x04);
+
+    // Retry cache: a repeated NWK_FORM is answered from the cache and the
+    // network is formed once.
+    let request = form_request(0x3C84, 1 << 15);
+    let form = host.request(&request);
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    host.retry(form, &request);
+    exchange!();
+    assert_eq!(host.responses(form), 1);
+    assert_eq!(
+        host.response(form).status(),
+        0,
+        "cached success, not INVALID_STATE"
+    );
+    // A new request with the same TID but no RETRY flag runs again.
+    host.queues
+        .queue(Endpoint::Zigbee)
+        .push_with(|w| w.request(form, &request))
+        .unwrap();
+    exchange!();
+    assert_eq!(host.response(form).status(), Status::InvalidState.to_u8());
+    // FW_CONFIRM with a formed network still answers (network is up).
+    let confirm = host.request_raw(ids::FW_CONFIRM, &[]);
+    exchange!();
+    assert_eq!(host.response(confirm).status(), 0);
+    // NWK_LEAVE_RESET, then a new network in the same session (no reboot).
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+    let form = host.request(&form_request(0x4D95, 1 << 25));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let info = host.request_raw(ids::NWK_GET_INFO, &[]);
+    exchange!();
+    let info = host.response(info);
+    let info: NwkGetInfoRsp = info.body();
+    assert_eq!((info.state, info.pan_id, info.channel), (2, 0x4D95, 25));
+}

@@ -44,7 +44,7 @@ use zigbee_runtime::child_store::ChildTableStore;
 use zigbee_runtime::host_passthrough::{self, HostEndpointError};
 use zigbee_runtime::profile::ApplicationProfile;
 use zigbee_runtime::role::Router;
-use zigbee_runtime::security_store::SecurityStateStore;
+use zigbee_runtime::security_store::{PersistentSecurityState, SecurityStateStore};
 use zigbee_runtime::trust_center_runtime::{GlobalApsCheckpoint, TrustCenterHostEvent};
 use zigbee_runtime::trust_center_store::TrustCenterDeviceStore;
 use zigbee_types::ShortAddress;
@@ -54,6 +54,8 @@ use crate::port::{
     EndpointError, FormParams, FrameCounters, HostEndpoint, Indication, MAX_HOST_ENDPOINTS,
     NetworkInfo, NetworkState, OpError, joined, left,
 };
+use crate::port::{DeviceView, LinkView, NetworkImage};
+use zigbee_mac::{MacDriver as _, PlatformServices as _};
 
 /// NWK reservation size (`FRAME_COUNTER_RESERVATION_SIZE`).
 const NWK_STRIDE: u32 = 0x400;
@@ -70,12 +72,21 @@ pub trait TcApp {
     async fn step(&mut self) -> Result<StepEvents, RouterAppError>;
     /// Clear every durable network, child, APS and Trust Center state.
     async fn wipe(&mut self) -> Result<(), RouterAppError>;
+    /// Allow `initialize` again after a wipe (see
+    /// `TrustCenterCoordinatorApp::rearm_initialize`).
+    fn rearm_initialize(&mut self) -> bool;
     fn global_aps(&self) -> Option<GlobalApsCheckpoint>;
     fn raise_aps_floor(&mut self, floor: u32) -> Result<(), OpError>;
     /// Next Trust Center decision for the host.
     fn take_tc_event(&mut self) -> Option<TrustCenterHostEvent>;
     /// IEEE of a device the Trust Center knows at `short`.
     fn tc_ieee_by_short(&self, short: u16) -> Option<[u8; 8]>;
+    /// The Trust Center device table.
+    fn tc_table(&self) -> &zigbee_bdb::trust_center::TrustCenterTable;
+    /// Provision a unique TCLK before join (durable).
+    fn provision_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError>;
+    /// Durably drop a device's record and key; `false` when unknown.
+    fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError>;
 }
 
 impl<'a, M, S, P, C, T, St, Sv, D, O, A> TcApp
@@ -119,6 +130,10 @@ where
         self.urgent_factory_reset_and_recommission().await
     }
 
+    fn rearm_initialize(&mut self) -> bool {
+        TrustCenterCoordinatorApp::rearm_initialize(self)
+    }
+
     fn global_aps(&self) -> Option<GlobalApsCheckpoint> {
         self.trust_center().global_aps_counter(self.node().device())
     }
@@ -145,6 +160,24 @@ where
             .devices()
             .find(|device| device.active && device.short_address.0 == short)
             .map(|device| device.ieee_address)
+    }
+
+    fn tc_table(&self) -> &zigbee_bdb::trust_center::TrustCenterTable {
+        self.trust_center().table()
+    }
+
+    fn provision_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError> {
+        let (trust_center, device) = self.trust_center_and_device_mut();
+        trust_center
+            .provision_link_key(device, ieee, key)
+            .map_err(|_| OpError::Storage)
+    }
+
+    fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
+        let (trust_center, device) = self.trust_center_and_device_mut();
+        trust_center
+            .forget_device(device, ieee)
+            .map_err(|_| OpError::Storage)
     }
 }
 
@@ -575,12 +608,15 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             return Err(OpError::InvalidState);
         }
         if !params.ncp_chosen_identity() {
-            return Err(OpError::Unsupported);
+            return self.form_with_identity(&params).await;
         }
         if params.channel_mask != 0 {
             let attributes = self.app.device_mut().bdb_mut().attributes_mut();
             attributes.primary_channel_set = zigbee_types::ChannelMask(params.channel_mask);
         }
+        // A wipe in this session (`NWK_LEAVE_RESET`) consumed the one
+        // initialization.
+        self.app.rearm_initialize();
         self.app
             .initialize()
             .await
@@ -794,6 +830,287 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
     fn gp(&mut self) -> Option<&mut dyn crate::gp::GpPort> {
         Some(self)
     }
+
+    async fn install_network(&mut self, image: &NetworkImage) -> Result<(), OpError> {
+        if self.running {
+            return Err(OpError::InvalidState);
+        }
+        if !(11..=26).contains(&image.channel)
+            || matches!(image.pan_id, 0x0000 | 0xFFFF)
+            || image.network_key == [0; 16]
+            || image.ext_pan_id == [0; 8]
+            || image.ext_pan_id == [0xFF; 8]
+        {
+            return Err(OpError::InvalidParameter);
+        }
+        if self.formed {
+            // The previous network's NWK, child, APS and Trust Center state.
+            self.app.wipe().await.map_err(|_| OpError::Storage)?;
+            host_passthrough::clear();
+            self.formed = false;
+        }
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.extended_pan_id = image.ext_pan_id;
+        state.pan_id = image.pan_id;
+        state.short_address = 0x0000;
+        state.ieee_address = self.ieee;
+        state.channel = image.channel;
+        state.depth = 0;
+        state.parent_address = 0xFFFF;
+        state.update_id = image.nwk_update_id;
+        state.update_id_valid = true;
+        state.network_key = image.network_key;
+        state.key_sequence = image.key_seq;
+        // The resume reserves `[limit, limit + stride)` from here (a
+        // commissioned record never holds 0).
+        state.global_counter_limit = image.nwk_fc_start.max(1);
+        state.validate().map_err(|_| OpError::InvalidParameter)?;
+        {
+            let (_, store) = self.app.device_and_store_mut();
+            store.store(&state).map_err(|_| OpError::Storage)?;
+        }
+        self.formed = true;
+        let attributes = self.app.device_mut().bdb_mut().attributes_mut();
+        if image.channel_mask != 0 {
+            attributes.primary_channel_set = zigbee_types::ChannelMask(image.channel_mask);
+        }
+        self.app.rearm_initialize();
+        self.app
+            .initialize()
+            .await
+            .map_err(|_| OpError::Zigbee(0x01))?;
+        if !self.app.device().is_joined() {
+            return Err(OpError::Zigbee(0x01));
+        }
+        self.running = true;
+        if image.aps_fc_start != 0 {
+            self.app.raise_aps_floor(image.aps_fc_start)?;
+        }
+        let device = self.app.device_mut();
+        device.aps_mut().nwk_mut().nib_mut().nwk_manager_addr = ShortAddress(image.nwk_manager);
+        if let Some(dbm) = image.tx_power {
+            let _ = device
+                .aps_mut()
+                .nwk_mut()
+                .mac_mut()
+                .mlme_set(
+                    zigbee_mac::PibAttribute::PhyTransmitPower,
+                    zigbee_mac::PibValue::I8(dbm),
+                )
+                .await;
+        }
+        device
+            .permit_joining(0)
+            .await
+            .map_err(|status| OpError::Zigbee(status as u8))?;
+        Ok(())
+    }
+
+    fn tc_link_key(&self) -> Option<[u8; 16]> {
+        Some(*self.app.device().aps().security().default_tc_link_key())
+    }
+
+    fn device_capacity(&self) -> usize {
+        zigbee_bdb::trust_center::MAX_TRUST_CENTER_DEVICES
+    }
+
+    fn device(&self, index: usize) -> Option<DeviceView> {
+        let table = self.app.tc_table();
+        let nwk = self.app.device().aps().nwk();
+        let child_of = |ieee: &[u8; 8]| {
+            nwk.neighbor_table()
+                .children()
+                .find(|entry| entry.ieee_address == *ieee)
+                .map(|entry| (child_capability(entry), 8))
+        };
+        let known = table.devices().filter(|device| device.active).count();
+        if index < known {
+            let device = table.devices().filter(|device| device.active).nth(index)?;
+            let security = self.app.device().aps().security();
+            let rx_floor = security
+                .find_key(
+                    &device.ieee_address,
+                    zigbee_aps::security::ApsKeyType::TrustCenterLinkKey,
+                )
+                .filter(|entry| entry.incoming_frame_counter_valid)
+                .map_or(0, |entry| entry.incoming_frame_counter);
+            let link = (device.key_origin
+                != zigbee_bdb::trust_center::TrustCenterKeyOrigin::DefaultGlobal)
+                .then_some(LinkView {
+                    key: device.link_key,
+                    attrs: device.key_attributes as u8,
+                    origin: match device.key_origin {
+                        zigbee_bdb::trust_center::TrustCenterKeyOrigin::DefaultGlobal => 0,
+                        zigbee_bdb::trust_center::TrustCenterKeyOrigin::InstallCode => 1,
+                        zigbee_bdb::trust_center::TrustCenterKeyOrigin::GeneratedUnique => 2,
+                        zigbee_bdb::trust_center::TrustCenterKeyOrigin::ApplicationProvisioned => 3,
+                    },
+                    rx_floor,
+                });
+            return Some(DeviceView {
+                ieee: device.ieee_address,
+                nwk: (device.short_address.0 < 0xFFF8).then_some(device.short_address.0),
+                child: child_of(&device.ieee_address),
+                link,
+            });
+        }
+        // Children without a Trust Center record.
+        let entry = nwk
+            .neighbor_table()
+            .children()
+            .filter(|entry| table.device(&entry.ieee_address).is_none_or(|d| !d.active))
+            .nth(index - known)?;
+        Some(DeviceView {
+            ieee: entry.ieee_address,
+            nwk: Some(entry.network_address.0),
+            child: Some((child_capability(entry), 8)),
+            link: None,
+        })
+    }
+
+    fn put_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError> {
+        if !self.running {
+            return Err(OpError::InvalidState);
+        }
+        self.app.provision_link_key(ieee, key)
+    }
+
+    fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
+        if !self.running {
+            return Err(OpError::InvalidState);
+        }
+        self.app.forget_device(ieee)
+    }
+
+    async fn set_ieee(&mut self, ieee: [u8; 8]) -> Result<(), OpError> {
+        if self.running {
+            return Err(OpError::InvalidState);
+        }
+        self.app
+            .device_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .mlme_set(
+                zigbee_mac::PibAttribute::MacExtendedAddress,
+                zigbee_mac::PibValue::ExtendedAddress(ieee),
+            )
+            .await
+            .map_err(|_| OpError::InvalidParameter)?;
+        // The resume refuses a NIB IEEE that differs from the MAC's.
+        let device = self.app.device_mut();
+        device.aps_mut().nwk_mut().nib_mut().ieee_address = ieee;
+        device.bdb_mut().zdo_mut().set_local_ieee_addr(ieee);
+        self.ieee = ieee;
+        Ok(())
+    }
+
+    fn table_epoch(&mut self) -> u32 {
+        let (_, store) = self.app.device_and_store_mut();
+        let Ok(Some(state)) = store.load() else {
+            return 0;
+        };
+        if !state.commissioned {
+            return 0;
+        }
+        // Identity of the network in NV: a wipe or a restore of another
+        // network changes it; a reboot does not.
+        let mut crc = zigbee_zrhp::crc::Crc32c::new();
+        crc.update(&state.extended_pan_id);
+        crc.update(&state.pan_id.to_le_bytes());
+        crc.update(&state.network_key);
+        crc.update(&[state.key_sequence, state.channel]);
+        crc.update(&state.ieee_address);
+        crc.finish().max(1)
+    }
+}
+
+/// MAC capability byte of a child neighbor: allocate address, device type
+/// and receiver-on-when-idle (the power source is approximated by it).
+fn child_capability(entry: &zigbee_nwk::neighbor::NeighborEntry) -> u8 {
+    let mut capability = 0x80;
+    if entry.device_type == NeighborDeviceType::Router {
+        capability |= 0x02;
+    }
+    if entry.rx_on_when_idle {
+        capability |= 0x0C;
+    }
+    capability
+}
+
+impl<A: TcApp> TcPort<A> {
+    /// `NWK_FORM` with host-supplied identity (spec 7.2): fill what the host
+    /// left to the NCP (PAN ID, EPID, key, channel by ED scan), then install
+    /// the network like a restore.
+    async fn form_with_identity(&mut self, params: &FormParams) -> Result<(), OpError> {
+        let mut random = [0u8; 18];
+        self.app
+            .device_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .fill_random(&mut random)
+            .map_err(|_| OpError::Zigbee(0x01))?;
+        let pan_id = if params.pan_id == 0xFFFF {
+            u16::from_le_bytes([random[0], random[1]]) & 0x3FFF | 0x0001
+        } else {
+            params.pan_id
+        };
+        let ext_pan_id = if params.ext_pan_id == [0; 8] {
+            self.ieee
+        } else {
+            params.ext_pan_id
+        };
+        let mut network_key = params.network_key;
+        if network_key == [0; 16] {
+            network_key.copy_from_slice(&random[2..18]);
+        }
+        let mask = if params.channel_mask == 0 {
+            0x07FF_F800
+        } else {
+            params.channel_mask & 0x07FF_F800
+        };
+        let channel = self.quietest_channel(mask).await?;
+        let image = NetworkImage {
+            pan_id,
+            ext_pan_id,
+            channel,
+            channel_mask: mask,
+            nwk_update_id: params.nwk_update_id,
+            nwk_manager: params.nwk_manager,
+            tx_power: (params.tx_power != 0).then_some(params.tx_power),
+            network_key,
+            key_seq: params.key_seq,
+            nwk_fc_start: 0,
+            aps_fc_start: 0,
+        };
+        self.install_network(&image).await
+    }
+
+    /// The channel of `mask` with the lowest energy (a single channel is
+    /// taken as is).
+    async fn quietest_channel(&mut self, mask: u32) -> Result<u8, OpError> {
+        if mask == 0 {
+            return Err(OpError::InvalidParameter);
+        }
+        if mask.is_power_of_two() {
+            return Ok(mask.trailing_zeros() as u8);
+        }
+        let scan = self
+            .app
+            .device_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nlme_ed_scan(zigbee_types::ChannelMask(mask), 3)
+            .await
+            .map_err(|status| OpError::Zigbee(status as u8))?;
+        scan.energy_list
+            .iter()
+            .min_by_key(|ed| ed.energy)
+            .map(|ed| ed.channel)
+            .ok_or(OpError::Zigbee(0x01))
+    }
 }
 
 /// A borrowed coordinator app, so the app can live in its own static
@@ -826,6 +1143,10 @@ impl<T: TcApp + ?Sized> TcApp for &mut T {
         (**self).wipe().await
     }
 
+    fn rearm_initialize(&mut self) -> bool {
+        (**self).rearm_initialize()
+    }
+
     fn global_aps(&self) -> Option<GlobalApsCheckpoint> {
         (**self).global_aps()
     }
@@ -840,6 +1161,18 @@ impl<T: TcApp + ?Sized> TcApp for &mut T {
 
     fn tc_ieee_by_short(&self, short: u16) -> Option<[u8; 8]> {
         (**self).tc_ieee_by_short(short)
+    }
+
+    fn tc_table(&self) -> &zigbee_bdb::trust_center::TrustCenterTable {
+        (**self).tc_table()
+    }
+
+    fn provision_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError> {
+        (**self).provision_link_key(ieee, key)
+    }
+
+    fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
+        (**self).forget_device(ieee)
     }
 }
 

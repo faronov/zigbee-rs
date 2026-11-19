@@ -340,7 +340,8 @@ fn host_negotiates_forms_reads_counters_and_sends_data() {
     let negotiated: SysNegotiateRsp = response.body();
     assert_eq!(negotiated.major, 1);
     assert_ne!(negotiated.ncp_caps & caps::KEY_EXPORT, 0);
-    assert_eq!(negotiated.ncp_caps & caps::BACKUP_RESTORE, 0);
+    assert_ne!(negotiated.ncp_caps & caps::BACKUP_RESTORE, 0);
+    assert_eq!(negotiated.ncp_caps & caps::NCP_FW_UPDATE, 0, "NoPlatform");
     assert_eq!(negotiated.capacity(1), Some(16), "max_aps_inflight");
     assert_eq!(negotiated.capacity(7), Some(0x400), "fc_stride");
     // `ncp-capacity` table sizes (spec 8.9).
@@ -465,7 +466,8 @@ fn host_negotiates_forms_reads_counters_and_sends_data() {
     });
     let unknown = host.request_empty(0x00F0, Endpoint::System);
     let wrong = host.request_empty(ids::NWK_GET_INFO, Endpoint::System);
-    let unsupported = host.request_empty(ids::BKP_EXPORT_BEGIN, Endpoint::Bulk);
+    // FW_* without platform firmware services (`NoPlatform`).
+    let unsupported = host.request_empty(ids::FW_GET_SLOTS, Endpoint::Bulk);
     exchange!();
     assert_eq!(host.response(echo).payload, b"\x00ping");
     assert_eq!(

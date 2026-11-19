@@ -18,11 +18,15 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod backup;
+pub mod firmware;
 pub mod gp;
 pub mod log_ring;
 pub mod ncp;
 pub mod platform;
 pub mod port;
+pub mod retry;
+pub mod tables;
 pub mod tc;
 pub mod transport;
 
