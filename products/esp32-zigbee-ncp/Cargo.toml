@@ -28,6 +28,9 @@ zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, feat
     "global-aps-counter",
     "host-passthrough",
     "ncp-capacity",
+    # Trust Center / child journal spare sectors erased in radio-quiet
+    # windows instead of inside a store (the ROM erase masks the radio).
+    "journal-pre-erase",
     # GP combo: Sink Table 16 / Proxy Table 8 in the `zbnv` GP journal.
     "green-power-ncp",
 ] }

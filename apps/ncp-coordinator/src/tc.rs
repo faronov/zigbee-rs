@@ -104,6 +104,18 @@ pub trait TcApp {
         &mut self,
         table: &zigbee_runtime::child_store::PersistentChildTable,
     ) -> Result<(), OpError>;
+    /// Erase one unit of a journal's spare sector ahead of its rollover
+    /// (`journal-pre-erase`). Returns whether it erased.
+    fn pre_erase_step(&mut self) -> bool {
+        false
+    }
+
+    /// Move the Trust Center snapshot into its pre-erased spare sector
+    /// when the journal asks (see `TrustCenterRuntime::compact_journal`).
+    /// Returns whether it stored.
+    fn compact_journal(&mut self) -> bool {
+        false
+    }
 }
 
 impl<'a, M, S, P, C, T, St, Sv, D, O, A> TcApp
@@ -160,6 +172,36 @@ where
             .store_mut()
             .store(table)
             .map_err(|_| OpError::Storage)
+    }
+
+    fn pre_erase_step(&mut self) -> bool {
+        // One erase unit per call: the Trust Center journal first (its
+        // 32 KiB rollover erase is the long one), then the child journal.
+        // A failed pre-erase only leaves the rollover its full erase.
+        match self.trust_center_mut().store_mut().pre_erase_step() {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(error) => log::warn!("[NCP] Trust Center pre-erase failed: {error:?}"),
+        }
+        match self
+            .coordinator_mut()
+            .children_mut()
+            .store_mut()
+            .pre_erase_step()
+        {
+            Ok(erased) => erased,
+            Err(error) => {
+                log::warn!("[NCP] child journal pre-erase failed: {error:?}");
+                false
+            }
+        }
+    }
+
+    fn compact_journal(&mut self) -> bool {
+        self.trust_center_mut()
+            .compact_journal()
+            .inspect_err(|error| log::warn!("[NCP] Trust Center compaction failed: {error:?}"))
+            .unwrap_or(false)
     }
 
     fn global_aps(&self) -> Option<GlobalApsCheckpoint> {
@@ -283,7 +325,35 @@ pub struct TcPort<A: TcApp> {
     /// a restore) floors its counters here. Not durable across a reboot.
     retained_nwk_bound: u32,
     retained_aps_bound: u32,
+    /// Journal pre-erase in radio-quiet windows (see `service_pre_erase`).
+    pre_erase: PreEraseSchedule,
 }
+
+/// When the NCP may spend a flash erase (the ROM driver masks interrupts,
+/// the 802.15.4 receiver's included, for ~30 ms per 4 KiB).
+#[derive(Debug, Clone, Copy, Default)]
+struct PreEraseSchedule {
+    /// Secured NWK frames received, as last seen.
+    secured_frames: u32,
+    /// Start of the current quiet window (ms).
+    quiet_since_ms: u32,
+    /// Last pre-erase step (ms).
+    last_step_ms: u32,
+    /// A journal may have a spare sector to erase (activity since the last
+    /// pass, or the last step erased).
+    armed: bool,
+    /// Platform check that the radio is idle-listening right now (no ACK
+    /// being sent, no interrupt work pending); `None`: always.
+    radio_idle: Option<fn() -> bool>,
+}
+
+/// No secured frame for this long before an erase (ms). Short on purpose: a
+/// join stores the Trust Center state about ten times and can roll a 32 KiB
+/// sector over twice, so the spare must be erased between its exchanges.
+const PRE_ERASE_QUIET_MS: u32 = 150;
+/// At most one ~30 ms erase per this interval (ms), so MAC retries and the
+/// next frames of a burst get through between them.
+const PRE_ERASE_SPACING_MS: u32 = 250;
 
 impl<A: TcApp> TcPort<A> {
     /// `ieee`: the radio's EUI-64 (the NIB only learns it at start);
@@ -302,11 +372,22 @@ impl<A: TcApp> TcPort<A> {
             host_endpoints: Vec::new(),
             retained_nwk_bound: 0,
             retained_aps_bound: 0,
+            pre_erase: PreEraseSchedule {
+                armed: true,
+                ..PreEraseSchedule::default()
+            },
         }
     }
 
     pub fn app(&self) -> &A {
         &self.app
+    }
+
+    /// Platform check that the radio is idle-listening, consulted before a
+    /// journal pre-erase (an erase masks interrupts; one that starts while
+    /// the radio sends an automatic ACK leaves it stuck until recovered).
+    pub fn set_radio_idle_check(&mut self, radio_idle: fn() -> bool) {
+        self.pre_erase.radio_idle = Some(radio_idle);
     }
 
     pub fn app_mut(&mut self) -> &mut A {
@@ -327,7 +408,45 @@ impl<A: TcApp> TcPort<A> {
         self.app.step().await?;
         self.collect_device_events();
         self.poll_acks();
+        self.service_pre_erase();
         Ok(())
+    }
+
+    /// Erase one unit of a journal's spare sector when the radio is quiet:
+    /// no secured frame for [`PRE_ERASE_QUIET_MS`], no APS ACK awaited, no
+    /// frame queued for a sleepy child and joining closed. The erase a
+    /// journal rollover would otherwise do inside a store — up to 8 × ~30 ms
+    /// of a deaf receiver in the middle of a join — happens here instead,
+    /// in steps at least [`PRE_ERASE_SPACING_MS`] apart.
+    #[inline(never)]
+    fn service_pre_erase(&mut self) {
+        let now = (self.clock_ms)();
+        let nwk = self.app.device().aps().nwk();
+        let secured_frames = nwk.rx_security_stats().secured_frames;
+        let busy = secured_frames != self.pre_erase.secured_frames
+            || !self.pending_acks.is_empty()
+            || nwk.indirect_queue().pending_children().next().is_some()
+            || nwk.nib().permit_joining;
+        if busy {
+            self.pre_erase.secured_frames = secured_frames;
+            self.pre_erase.quiet_since_ms = now;
+            self.pre_erase.armed = true;
+            return;
+        }
+        if !self.pre_erase.armed
+            || now.wrapping_sub(self.pre_erase.quiet_since_ms) < PRE_ERASE_QUIET_MS
+            || now.wrapping_sub(self.pre_erase.last_step_ms) < PRE_ERASE_SPACING_MS
+            || self.pre_erase.radio_idle.is_some_and(|idle| !idle())
+        {
+            return;
+        }
+        self.pre_erase.last_step_ms = now;
+        // Spare sectors first; once they are erased, a half-used Trust
+        // Center sector moves into its spare (a write, no erase), so the
+        // next join starts with a free sector and an erased spare: no
+        // erase inside its exchanges (hardware: urgent erases between a
+        // join's frames cost Transport-Key deliveries).
+        self.pre_erase.armed = self.app.pre_erase_step() || self.app.compact_journal();
     }
 
     /// Raise the durable NWK reservation to at least `floor` (journal
@@ -1297,6 +1416,14 @@ impl<T: TcApp + ?Sized> TcApp for &mut T {
 
     fn rearm_initialize(&mut self) -> bool {
         (**self).rearm_initialize()
+    }
+
+    fn pre_erase_step(&mut self) -> bool {
+        (**self).pre_erase_step()
+    }
+
+    fn compact_journal(&mut self) -> bool {
+        (**self).compact_journal()
     }
 
     fn store_children(

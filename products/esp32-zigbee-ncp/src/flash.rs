@@ -70,13 +70,59 @@ impl<const START: u32, const SIZE: usize> NorFlash for FlashWindow<START, SIZE> 
         let physical_to = physical_from
             .checked_add(to - from)
             .ok_or(FlashStorageError::OutOfBounds)?;
-        self.flash.erase(physical_from, physical_to)
+        // One sector per call (as esp-storage does internally), timed: every
+        // ROM call runs with interrupts masked, the radio's included.
+        let mut sector = physical_from;
+        while sector < physical_to {
+            let next = sector.saturating_add(FlashStorage::ERASE_SIZE as u32);
+            masked("erase", sector, FlashStorage::ERASE_SIZE, || {
+                self.flash.erase(sector, next.min(physical_to))
+            })?;
+            sector = next;
+        }
+        Ok(())
     }
 
+    /// Programs at most one 256-byte flash page per ROM call. Every call runs
+    /// with interrupts masked; a whole 4 KiB journal slot in one call kept
+    /// the 802.15.4 receiver deaf for ~5 ms (the ROM driver programs page by
+    /// page anyway). Between pages the radio interrupt runs and re-arms the
+    /// receiver. Power-loss behaviour is unchanged: the journals already
+    /// treat any prefix of a record as torn.
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
         let physical = Self::physical_offset(offset, bytes.len())?;
-        self.flash.write(physical, bytes)
+        let mut done = 0;
+        while done < bytes.len() {
+            let address = physical + done as u32;
+            let room = FLASH_PAGE - address as usize % FLASH_PAGE;
+            let length = room.min(bytes.len() - done);
+            let page = &bytes[done..done + length];
+            masked("write", address, length, || self.flash.write(address, page))?;
+            done += length;
+        }
+        Ok(())
     }
+}
+
+/// SPI NOR page: the unit a single program command writes.
+const FLASH_PAGE: usize = 256;
+const _: () = assert!(FLASH_PAGE.is_multiple_of(FlashStorage::WRITE_SIZE));
+
+/// Run one flash operation and report it when it kept interrupts (and with
+/// them the 802.15.4 receiver) masked for 2 ms or longer.
+fn masked<T>(
+    what: &str,
+    address: u32,
+    length: usize,
+    op: impl FnOnce() -> Result<T, FlashStorageError>,
+) -> Result<T, FlashStorageError> {
+    let started = esp_hal::time::Instant::now();
+    let result = op();
+    let us = started.elapsed().as_micros();
+    if us >= 2_000 {
+        log::info!("[NCP flash] {what} 0x{address:06X}+{length} {us} us");
+    }
+    result
 }
 
 /// `esp_rom_spiflash_chip_t` of the ROM SPI flash driver.

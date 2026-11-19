@@ -322,7 +322,9 @@ fn compose(
     // GP combo: Proxy and Sink Tables in the `zbnv` GP journal.
     static GP_STORE: StaticCell<stores::GreenPowerStore> = StaticCell::new();
     app.set_green_power_store(GP_STORE.init(stores::green_power_store()));
-    TcPort::new(app, ieee, clock_ms)
+    let mut port = TcPort::new(app, ieee, clock_ms);
+    port.set_radio_idle_check(radio_idle);
+    port
 }
 
 /// The coordinator device, built in place around the parent MAC, and the
@@ -456,6 +458,7 @@ async fn run(
     loop {
         lab::tick(host);
         radio_watch(now_us());
+        radio_stats(now_us());
         // Trial window without FW_CONFIRM: the previous image is selected
         // (or the next boot's check selects it); restart into it.
         if let TrialPoll::Expired { .. } = platform.poll_trial(now_ms()) {
@@ -556,6 +559,42 @@ fn attach_pta(
 /// the root future does not carry it. Its own frame: the log formatting
 /// stays out of the root future's poll frame (stack gate `serve` chain).
 #[inline(never)]
+/// The radio is receiving with no interrupt work pending: a journal
+/// pre-erase (interrupts masked for ~30 ms) cannot cut an automatic ACK.
+fn radio_idle() -> bool {
+    let (state, events, _, _) = esp_radio::ieee802154::debug_state();
+    state == 1 && events == 0
+}
+
+/// Parent radio counters once a minute when they changed (LOG endpoint):
+/// children's Data Requests (polls), Frame Pending ACKs and transmissions.
+fn radio_stats(now_us: u64) {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    use portable_atomic::AtomicU64;
+    const PERIOD_US: u64 = 60_000_000;
+    static NEXT_US: AtomicU64 = AtomicU64::new(PERIOD_US);
+    static LAST_POLLS: AtomicU32 = AtomicU32::new(0);
+    static LAST_TX: AtomicU32 = AtomicU32::new(0);
+    if now_us < NEXT_US.load(Relaxed) {
+        return;
+    }
+    NEXT_US.store(now_us + PERIOD_US, Relaxed);
+    let stats = zigbee_mac::esp::parent_stats();
+    let polls = LAST_POLLS.swap(stats.data_requests, Relaxed) != stats.data_requests;
+    let tx = LAST_TX.swap(stats.raw_tx, Relaxed) != stats.raw_tx;
+    if polls || tx {
+        log::info!(
+            "[RADIO] data-req {} fp-acks {} tx {} acked-tx {} no-ack {} tx-err {}",
+            stats.data_requests,
+            stats.frame_pending_acks,
+            stats.raw_tx,
+            stats.acked_tx,
+            stats.tx_no_ack,
+            stats.tx_errors
+        );
+    }
+}
+
 fn radio_watch(now_us: u64) {
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
     use portable_atomic::AtomicU64;
