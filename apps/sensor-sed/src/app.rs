@@ -1225,12 +1225,30 @@ where
         }
     }
 
+    /// Stop the Device_annce retries once the coordinator has reached this
+    /// device by unicast (Configure Reporting, a command or a Default
+    /// Response from `0x0000`): it evidently knows the short address, which
+    /// is all the retries exist for. Without this a cold join announced
+    /// itself up to `announce_retries` more times during the interview.
+    fn note_coordinator_contact(&mut self, event: &StackEvent) {
+        let contact = match event {
+            StackEvent::ReportingConfigured { .. } => true,
+            StackEvent::CommandReceived { src_addr, .. }
+            | StackEvent::DefaultResponse { src_addr, .. } => *src_addr == 0x0000,
+            _ => false,
+        };
+        if contact {
+            self.annce_retries_left = 0;
+        }
+    }
+
     /// Handle one control-plane [`StackEvent`], explicitly — every variant
     /// has an arm, so a new variant fails to compile here rather than
     /// silently falling through a wildcard. Returns whether the event
     /// represents coordinator/network activity that should extend the
     /// fast-poll window.
     async fn handle_control_event(&mut self, event: &StackEvent) -> bool {
+        self.note_coordinator_contact(event);
         if let Some(handled) = self.handle_ota_event(event).await {
             return handled;
         }

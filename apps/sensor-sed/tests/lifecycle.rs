@@ -4372,3 +4372,84 @@ fn a_parent_that_answers_again_cancels_the_keepalive_rejoin() {
             .any(|event| matches!(event, DiagnosticEvent::SecurityFailure(_)))
     );
 }
+
+/// Device_annce retries after a cold join, with or without the coordinator
+/// reaching the device first (a Configure Reporting from `0x0000` delivered
+/// at the first poll). Returns the retries sent.
+fn announce_retries_after_cold_join(coordinator_contact: bool) -> usize {
+    static POLICY: SensorPolicy = SensorPolicy {
+        announce_retries: 3,
+        announce_retry_ms: 50,
+        ..BASE_POLICY
+    };
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::empty(&store_calls);
+    let mut profile = test_profile();
+    let mut device = test_device(&profile, &POLICY);
+    script_cold_join(&mut device);
+    let batches = if coordinator_contact {
+        vec![vec![configure_reporting_frame(
+            ClusterId::TEMPERATURE,
+            0x0000,
+            0x29,
+            &1i16.to_le_bytes(),
+            1,
+        )]]
+    } else {
+        Vec::new()
+    };
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake = RecordingWake::new(0, batches, &waits, &poll_counts, &delay_calls);
+        let mut app = SensorApp::new(
+            node,
+            &POLICY,
+            parts(
+                wake,
+                RecordingStatus { events: &status },
+                NoOta,
+                &environment_samples,
+                &battery_samples,
+                &heartbeats,
+                &diagnostics,
+            ),
+        )
+        .expect("construct sensor app");
+        assert_eq!(block_on(app.initialize()), Ok(()));
+        let start = app.device().mac().monotonic_micros();
+        while app.device().mac().monotonic_micros().wrapping_sub(start) < 400_000 {
+            assert_eq!(block_on(app.step()), Ok(()));
+        }
+        assert!(app.device().is_joined());
+    }
+    let events = diagnostics.borrow();
+    if coordinator_contact {
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, DiagnosticEvent::ReportingConfigured { .. })),
+            "{events:?}"
+        );
+    }
+    events
+        .iter()
+        .filter(|event| matches!(event, DiagnosticEvent::DeviceAnnounceRetry { .. }))
+        .count()
+}
+
+/// The Device_annce retries only exist so the coordinator learns the short
+/// address; once it has reached the device by unicast they stop (the ESP32-C6
+/// sensor announced itself 7 times during one HA-style interview).
+#[test]
+fn coordinator_contact_stops_the_device_announce_retries() {
+    assert_eq!(announce_retries_after_cold_join(false), 3);
+    assert_eq!(announce_retries_after_cold_join(true), 0);
+}
