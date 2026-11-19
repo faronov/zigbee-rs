@@ -1049,6 +1049,34 @@ fn join<S: ByteStream>(host: &mut Host<S>, secs: u64) -> Result<(), String> {
     }
 }
 
+/// ZDO Mgmt_Leave_req (no rejoin) to a joined device, then report what
+/// arrives for `secs` (a sleepy device fetches it at its next poll).
+fn leave<S: ByteStream>(
+    host: &mut Host<S>,
+    nwk: u16,
+    ieee: [u8; 8],
+    secs: u64,
+) -> Result<(), String> {
+    let mut zdo = vec![0x5A];
+    zdo.extend_from_slice(&ieee);
+    zdo.push(0x00);
+    data_request(host, nwk, 0, 0, 0x0000, 0x0034, &zdo);
+    println!("-> ZDO Mgmt_Leave_req (no rejoin) to 0x{nwk:04X}");
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        host.round(Duration::from_millis(100))?;
+        let events: Vec<Received> = host
+            .inbox
+            .drain(..)
+            .filter(|m| m.kind == Kind::Event)
+            .collect();
+        for message in &events {
+            report_event(message);
+        }
+    }
+    Ok(())
+}
+
 /// Talk to an already joined device and print what arrives.
 fn listen<S: ByteStream>(
     host: &mut Host<S>,
@@ -1170,6 +1198,19 @@ fn main() {
                 ep,
                 bind,
             )?;
+        }
+        if let Some(hex) = value("--leave") {
+            let nwk = value("--device")
+                .and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .ok_or("--device 0xNWK required")?;
+            let mut ieee = [0u8; 8];
+            for (index, byte) in ieee.iter_mut().enumerate() {
+                *byte = hex
+                    .get(index * 2..index * 2 + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                    .ok_or("--leave IEEE: 16 hex digits")?;
+            }
+            leave(&mut host, nwk, ieee, 45)?;
         }
         if let Some(path) = value("--fw-update") {
             let version = value("--fw-version")

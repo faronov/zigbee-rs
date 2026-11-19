@@ -823,6 +823,21 @@ ESP32-H2 router (4 MiB DevKit, ZHA channel 15, joined as `0xA17F`), with the
 | Identify | a ZHA Identify (5 s) toggled `identifying` true→false | `2026-11-03T065319Z-h2assoc-fix-verify3` |
 | reset/resume | after a SoC reset the H2 resumed with 15 neighbours and child `0x9422` restored; the child stayed online without rejoining | `2026-11-03T070153Z-h2assoc-fix-resume`, `2026-11-03T070425Z-h2assoc-fix-resume2` |
 
+ESP32-C6 sensor (SED, 30 s long poll) joining the ESP32-H2 ZRHP NCP on the
+Thread BR board (PAN `0x1C06`, channel 17, 2026-11-19, branch
+`sed-join-fixes`):
+
+| check | result | hwlab sessions |
+|---|---|---|
+| halt after Confirm-Key (before) | from erased `zbnv`: the NCP stopped acknowledging for about 250 ms after Request-Key (Trust Center flash commit). Three unacknowledged polls armed the keepalive secure-rejoin retry; 5 s later, still inside the unique-TCLK window, it found the staged uncommissioned record and the sensor halted (`SecurityFailure(Corrupt)`, `app.rs:642`). Not a vendor assert | `2026-11-19T151258Z-c6-panic-repro-3-factory-new` |
+| 7 factory-new joins (after) | every join committed, no halt. In 3 joins the NCP stall still armed the keepalive retry; each time a poll was acknowledged again and the retry was cancelled (`Parent answered again — keepalive secure rejoin cancelled`) | `2026-11-19T170413Z-sed-join-fixes-c6-joins`, `2026-11-19T171833Z-sed-join-fixes-c6-5-joins` |
+| replies after an FP = 0 poll ACK | before the NWK fix the NCP sent replies queued after its auto-ACK (FP = 0) to a child that had switched off: the first Confirm-Key was lost in every join (2 Verify-Key, 2 `EVT_DEVICE_AUTHORIZED`), as were all 3 End Device Timeout Responses. After the fix, 5 of 6 joins had one Verify-Key, and every ED Timeout Request was answered at once. The remaining retransmission came during an NCP flash stall | same |
+| Device_annce | no retry once the coordinator had sent Configure Reporting (before: initial + post-auth + 5 retries) | same |
+| long-poll delivery | the Mgmt_Leave sent to the sensor in its 30 s long poll was acknowledged after 27.7 s in 5 of 5 cycles (before: `NO_ACK` after ~6 s). A ZCL Read Basic outside the fast-poll window was answered at the next poll | `2026-11-19T171833Z-sed-join-fixes-c6-5-joins` |
+
+Still open: the NCP radio stops acknowledging for 25–250 ms while it writes
+flash (Trust Center journal commits).
+
 Open hardware gates:
 
 - The C6 router uses the same patch but has not been rerun on hardware.

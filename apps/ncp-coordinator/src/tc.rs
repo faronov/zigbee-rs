@@ -252,9 +252,10 @@ const APS_TABLE_FULL: u8 = 0xAE;
 struct PendingAck {
     handle: ApsAckHandle,
     req_tid: u16,
-    /// Low 16 bits of the transmission time (ms) while pending; the elapsed
-    /// time once resolved.
-    ms: u16,
+    /// Transmission time (ms) while pending; the elapsed time once
+    /// resolved (saturated to `u16` in the confirm: a sleepy destination
+    /// can take longer than 65 s over every retry).
+    ms: u32,
     state: AckState,
 }
 
@@ -495,7 +496,7 @@ impl<A: TcApp> TcPort<A> {
                 // Retries exhausted, tracking evicted or cancelled.
                 None => AckState::NoAck,
             };
-            pending.ms = (now as u16).wrapping_sub(pending.ms);
+            pending.ms = now.wrapping_sub(pending.ms);
         }
     }
 
@@ -799,9 +800,17 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
                 .find_short_by_ieee(&ieee)
                 .map_or(0xFFFF, |short| short.0),
         };
-        let sent_ms = (self.clock_ms)() as u16;
+        let sent_ms = (self.clock_ms)();
         let aps = self.app.device_mut().aps_mut();
-        let confirm = match aps.apsde_data_request(&aps_request).await {
+        // bit5: a sleepy destination behind another parent gets that
+        // parent's indirect hold added to every ACK wait. A sleepy child of
+        // the NCP always waits for its learned hold (zigbee-aps
+        // `adaptive-indirect`).
+        aps.set_extended_timeout(track_ack && request.tx_options & 0x20 != 0);
+        let confirm = aps.apsde_data_request(&aps_request).await;
+        let aps = self.app.device_mut().aps_mut();
+        aps.set_extended_timeout(false);
+        let confirm = match confirm {
             Ok(confirm) => confirm,
             Err(status) => return Err(OpError::Zigbee(status as u8)),
         };
@@ -864,7 +873,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             AckState::Acked => (0, DataConfirm::FLAG_ACK_RECEIVED),
             _ => (APS_NO_ACK, 0),
         };
-        let elapsed_ms = pending.ms;
+        let elapsed_ms = u16::try_from(pending.ms).unwrap_or(u16::MAX);
         Some(DeferredConfirm {
             req_tid: pending.req_tid,
             confirm: DataConfirm {

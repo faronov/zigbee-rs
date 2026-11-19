@@ -39,6 +39,11 @@ green-power = ["zigbee-nwk/green-power"]
 # link-key table and the NWK `ncp-capacity` tables. Off by default: images
 # without it are unchanged.
 ncp-capacity = ["trust-center", "zigbee-nwk/ncp-capacity"]
+# Sleepy-destination ACK timing (ZRHP `tx_options` bit5): the APS ACK wait
+# covers the time the frame stays in a sleepy child's indirect queue (NWK
+# `adaptive-indirect`) or a remote parent's default 7.68 s. Off by default:
+# images without it are unchanged.
+adaptive-indirect = ["router", "zigbee-nwk/adaptive-indirect"]
 
 [dev-dependencies]
 zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }

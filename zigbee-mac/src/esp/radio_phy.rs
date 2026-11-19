@@ -168,6 +168,15 @@ pub type EspRouterMac<'a> = SoftMacCore<
 static ACK_PENDING: esp_sync::NonReentrantMutex<AckPendingTable<ESP_ACK_PENDING_SOURCES>> =
     esp_sync::NonReentrantMutex::new(AckPendingTable::new());
 
+/// Children whose latest Data Request was acknowledged with Frame Pending =
+/// 0 (they turned their receiver off): a frame queued after that ACK waits
+/// for the next poll ([`crate::MacDriver::poll_acked_without_frame_pending`]).
+/// A full table forgets the record, which only restores immediate delivery.
+#[cfg(feature = "esp-parent")]
+static ACKED_WITHOUT_PENDING: esp_sync::NonReentrantMutex<
+    AckPendingTable<ESP_ACK_PENDING_SOURCES>,
+> = esp_sync::NonReentrantMutex::new(AckPendingTable::new());
+
 /// RX_DONE-interrupt Frame Pending decision. `frame` is the received MAC
 /// frame whose two FCS bytes the radio replaced with RSSI/LQI.
 #[cfg(feature = "esp-parent")]
@@ -183,6 +192,9 @@ fn ack_pending_hook(frame: &[u8]) -> bool {
     if pending {
         PARENT_FP_ACKS.fetch_add(1, Ordering::Relaxed);
     }
+    ACKED_WITHOUT_PENDING.with(|table| {
+        let _ = table.set(source, !pending);
+    });
     pending
 }
 
@@ -1005,6 +1017,12 @@ impl RadioPhy for EspRadioPhy<'_> {
     #[cfg(feature = "esp-parent")]
     fn clear_ack_frame_pending(&mut self) {
         ACK_PENDING.with(AckPendingTable::clear);
+        ACKED_WITHOUT_PENDING.with(AckPendingTable::clear);
+    }
+
+    #[cfg(feature = "esp-parent")]
+    fn data_request_acked_without_pending(&self, source: &zigbee_types::MacAddress) -> bool {
+        ACKED_WITHOUT_PENDING.with(|table| table.contains(source))
     }
 
     /// Quiesce the radio for retained light sleep.

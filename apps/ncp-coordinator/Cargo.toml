@@ -17,7 +17,10 @@ log = "0.4"
 zigbee-zrhp = { path = "../../zigbee-zrhp" }
 zigbee-types = { path = "../../zigbee-types" }
 zigbee-mac = { path = "../../zigbee-mac" }
-zigbee-aps = { path = "../../zigbee-aps" }
+# `adaptive-indirect`: sleepy-destination timing (spec 7.3 `tx_options`
+# bit5): a sleepy child's frames stay queued until its next expected poll and
+# the APS ACK wait covers that hold.
+zigbee-aps = { path = "../../zigbee-aps", features = ["adaptive-indirect"] }
 zigbee-nwk = { path = "../../zigbee-nwk" }
 # Only the host opens joining (NWK_PERMIT_JOIN); formation leaves it closed.
 zigbee-bdb = { path = "../../zigbee-bdb", default-features = false, features = ["formation-joining-closed"] }

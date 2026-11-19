@@ -4257,3 +4257,199 @@ fn an_ended_ota_session_leaves_no_fast_poll_tail() {
     assert_eq!(aborts.get(), 0);
     assert_eq!(run.record.total, 0, "an ended session is no anomaly");
 }
+
+/// Cold-join the sensor, leave it in the unique-TCLK window (the TC never
+/// answers), make the next `poll_failures` polls and `tx_failures`
+/// transmissions to the parent go unacknowledged, then step it for about
+/// `run_ms` of simulated time.
+///
+/// Hardware reproduction (ESP32-C6 sensor joining the H2 NCP): the TC's
+/// flash commit after Request-Key stopped its MAC ACKs for ~250 ms; three
+/// unacknowledged polls armed the keepalive secure-rejoin retry, which ran
+/// 5 s later inside the TCLK window, found the deliberately uncommissioned
+/// staged record and halted the sensor with `SecurityFailure(Corrupt)`.
+fn run_tclk_window_with_parent_failures(
+    poll_failures: u32,
+    tx_failures: u32,
+    run_ms: u32,
+) -> (
+    bool,
+    bool,
+    Option<PersistentSecurityState>,
+    Vec<DiagnosticEvent>,
+) {
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::empty(&store_calls);
+    let mut profile = test_profile();
+    let mut device = test_device(&profile, &BASE_POLICY);
+    script_cold_join(&mut device);
+    let (joined, rejoin_pending) = {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake = RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+        let mut app = SensorApp::new(
+            node,
+            &BASE_POLICY,
+            parts(
+                wake,
+                RecordingStatus { events: &status },
+                NoOta,
+                &environment_samples,
+                &battery_samples,
+                &heartbeats,
+                &diagnostics,
+            ),
+        )
+        .expect("construct sensor app");
+        assert_eq!(block_on(app.initialize()), Ok(()));
+        assert!(app.device().bdb().tclk_exchange_active());
+        let mac = app.device_mut().mac_mut();
+        mac.set_poll_failures(poll_failures);
+        mac.set_tx_failures(tx_failures);
+        let start = app.device().mac().monotonic_micros();
+        while app.device().mac().monotonic_micros().wrapping_sub(start) < run_ms * 1_000 {
+            assert_eq!(block_on(app.step()), Ok(()));
+        }
+        (
+            app.device().is_joined(),
+            app.device().secure_rejoin_pending(),
+        )
+    };
+    let persisted = store.load().unwrap();
+    let events = diagnostics.borrow().clone();
+    (joined, rejoin_pending, persisted, events)
+}
+
+/// A parent that stays silent during the TCLK window abandons the
+/// uncommitted join (fresh steering follows) instead of halting the node.
+#[test]
+fn a_silent_parent_during_the_tclk_window_abandons_the_join_without_halting() {
+    let (joined, rejoin_pending, persisted, events) =
+        run_tclk_window_with_parent_failures(u32::MAX, u32::MAX, 7_000);
+    assert!(!joined, "the uncommitted join is abandoned: {events:#?}");
+    assert!(
+        !rejoin_pending,
+        "no secure rejoin of an uncommitted network"
+    );
+    assert!(
+        persisted.is_none_or(|state| !state.commissioned),
+        "nothing commissioned was left behind"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        DiagnosticEvent::CommissioningComplete { success: false }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::SecurityFailure(_)))
+    );
+}
+
+/// A parent that only briefly missed its ACKs (here: three polls) and then
+/// answers again cancels the keepalive rejoin it had armed, so the TCLK
+/// exchange keeps running on the joined network.
+#[test]
+fn a_parent_that_answers_again_cancels_the_keepalive_rejoin() {
+    let (joined, rejoin_pending, persisted, events) =
+        run_tclk_window_with_parent_failures(3, 0, 7_000);
+    assert!(joined, "the join survives a transient parent stall");
+    assert!(
+        !rejoin_pending,
+        "the parent answered: no rejoin remains armed"
+    );
+    assert!(persisted.is_some_and(|state| !state.commissioned));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::SecurityFailure(_)))
+    );
+}
+
+/// Device_annce retries after a cold join, with or without the coordinator
+/// reaching the device first (a Configure Reporting from `0x0000` delivered
+/// at the first poll). Returns the retries sent.
+fn announce_retries_after_cold_join(coordinator_contact: bool) -> usize {
+    static POLICY: SensorPolicy = SensorPolicy {
+        announce_retries: 3,
+        announce_retry_ms: 50,
+        ..BASE_POLICY
+    };
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::empty(&store_calls);
+    let mut profile = test_profile();
+    let mut device = test_device(&profile, &POLICY);
+    script_cold_join(&mut device);
+    let batches = if coordinator_contact {
+        vec![vec![configure_reporting_frame(
+            ClusterId::TEMPERATURE,
+            0x0000,
+            0x29,
+            &1i16.to_le_bytes(),
+            1,
+        )]]
+    } else {
+        Vec::new()
+    };
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake = RecordingWake::new(0, batches, &waits, &poll_counts, &delay_calls);
+        let mut app = SensorApp::new(
+            node,
+            &POLICY,
+            parts(
+                wake,
+                RecordingStatus { events: &status },
+                NoOta,
+                &environment_samples,
+                &battery_samples,
+                &heartbeats,
+                &diagnostics,
+            ),
+        )
+        .expect("construct sensor app");
+        assert_eq!(block_on(app.initialize()), Ok(()));
+        let start = app.device().mac().monotonic_micros();
+        while app.device().mac().monotonic_micros().wrapping_sub(start) < 400_000 {
+            assert_eq!(block_on(app.step()), Ok(()));
+        }
+        assert!(app.device().is_joined());
+    }
+    let events = diagnostics.borrow();
+    if coordinator_contact {
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, DiagnosticEvent::ReportingConfigured { .. })),
+            "{events:?}"
+        );
+    }
+    events
+        .iter()
+        .filter(|event| matches!(event, DiagnosticEvent::DeviceAnnounceRetry { .. }))
+        .count()
+}
+
+/// The Device_annce retries only exist so the coordinator learns the short
+/// address; once it has reached the device by unicast they stop (the ESP32-C6
+/// sensor announced itself 7 times during one HA-style interview).
+#[test]
+fn coordinator_contact_stops_the_device_announce_retries() {
+    assert_eq!(announce_retries_after_cold_join(false), 3);
+    assert_eq!(announce_retries_after_cold_join(true), 0);
+}

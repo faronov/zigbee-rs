@@ -119,6 +119,9 @@ jobs:
       # endpoints); APS and runtime are covered by their --all-features runs.
       - run: cargo test -p zigbee-mac --features rx-rssi,mock --lib --locked
       - run: cargo test -p zigbee-nwk --features router,host-passthrough --locked
+      # NCP sleepy-destination timing: adaptive indirect hold (NWK) and the
+      # matching APS ACK wait.
+      - run: cargo test -p zigbee-nwk --features router,adaptive-indirect --locked
       - run: cargo test -p zigbee-zdo --features router,host-passthrough --locked
       - run: cargo test --manifest-path apps/ncp-coordinator/Cargo.toml --locked
       # nRF product crates are excluded from the root workspace (they pull in

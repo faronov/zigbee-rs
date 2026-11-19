@@ -290,6 +290,18 @@ pub trait MacDriver: PlatformServices {
         Err(MacError::Unsupported)
     }
 
+    /// Whether the latest Data Request from `child` was acknowledged with
+    /// Frame Pending = 0.
+    ///
+    /// A child that receives such an ACK turns its receiver off (IEEE
+    /// 802.15.4-2015 §6.7.3), so a frame queued for it after the
+    /// acknowledgement but before the poll is serviced must wait for the next
+    /// poll. Only backends whose auto-ACK decides the bit outside the upper
+    /// layer report it; the default (`false`) keeps delivering at once.
+    fn poll_acked_without_frame_pending(&self, _child: &MacAddress) -> bool {
+        false
+    }
+
     /// Transmit one indirect transaction already dequeued by the upper layer.
     ///
     /// This is called only after a matching Data Request event. It does not

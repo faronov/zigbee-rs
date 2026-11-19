@@ -44,6 +44,8 @@ pub mod nib;
 pub mod nlde;
 pub mod nlme;
 pub mod nwk_commands;
+#[cfg(feature = "adaptive-indirect")]
+pub mod poll_estimate;
 pub mod routing;
 pub mod security;
 
@@ -361,6 +363,9 @@ pub struct NwkLayer<M: MacDriver> {
     pending_route_errors: heapless::Vec<PendingNetworkStatus, 0>,
     /// Indirect frame queue for sleeping end device children.
     indirect: indirect::IndirectQueue,
+    /// Observed poll intervals of sleepy children (indirect hold).
+    #[cfg(feature = "adaptive-indirect")]
+    poll_estimates: poll_estimate::PollEstimates,
     /// Link status periodic timer counter (seconds).
     link_status_counter: u16,
     /// Flag: link status should be sent in next async context.
@@ -468,6 +473,8 @@ impl<M: MacDriver> NwkLayer<M> {
             #[cfg(not(feature = "router"))]
             pending_route_errors: heapless::Vec::new(),
             indirect: indirect::IndirectQueue::new(),
+            #[cfg(feature = "adaptive-indirect")]
+            poll_estimates: poll_estimate::PollEstimates::new(),
             link_status_counter: 0,
             link_status_due: false,
             concentrator_active: false,
@@ -533,6 +540,9 @@ impl<M: MacDriver> NwkLayer<M> {
             #[cfg(not(feature = "router"))]
             core::ptr::addr_of_mut!((*slot).pending_route_errors).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).indirect).write(indirect::IndirectQueue::new());
+            #[cfg(feature = "adaptive-indirect")]
+            core::ptr::addr_of_mut!((*slot).poll_estimates)
+                .write(poll_estimate::PollEstimates::new());
             core::ptr::addr_of_mut!((*slot).link_status_counter).write(0);
             core::ptr::addr_of_mut!((*slot).link_status_due).write(false);
             core::ptr::addr_of_mut!((*slot).concentrator_active).write(false);
@@ -1836,6 +1846,10 @@ impl<M: MacDriver> NwkLayer<M> {
         let Some(slot) = self.indirect.enqueue_tagged_with_slot(child, frame, kind) else {
             return Err(NwkStatus::FrameNotBuffered);
         };
+        #[cfg(feature = "adaptive-indirect")]
+        if let Some(hold) = self.sleepy_child_hold_secs(child) {
+            self.indirect.set_ttl(slot, hold);
+        }
         if self
             .mac
             .set_indirect_data_pending(MacAddress::Short(self.nib.pan_id, child), true)
@@ -1845,6 +1859,24 @@ impl<M: MacDriver> NwkLayer<M> {
             return Err(NwkStatus::FrameNotBuffered);
         }
         Ok(())
+    }
+
+    /// Seconds a data frame for `child` stays queued (`adaptive-indirect`):
+    /// up to the child's next expected poll, bounded by its End Device
+    /// Timeout. `None` when `child` is not a sleepy child of this parent
+    /// (its frames are sent directly).
+    #[cfg(feature = "adaptive-indirect")]
+    pub fn sleepy_child_hold_secs(&self, child: ShortAddress) -> Option<u8> {
+        let entry = self.neighbors.find_by_short(child).filter(|entry| {
+            !entry.rx_on_when_idle
+                && matches!(
+                    entry.relationship,
+                    neighbor::Relationship::Child | neighbor::Relationship::UnauthenticatedChild
+                )
+        })?;
+        let timeout_secs =
+            frames::ed_timeout_enum_to_seconds(entry.end_device_timeout).unwrap_or(10);
+        Some(self.poll_estimates.hold_secs(child, timeout_secs))
     }
 
     /// Service at most one queued transaction for one physical child poll.
@@ -1876,6 +1908,16 @@ impl<M: MacDriver> NwkLayer<M> {
         // deadline, whether or not any indirect data is waiting. Advertised to
         // the child through `PARENT_INFO_MAC_DATA_POLL_KEEPALIVE`.
         self.refresh_child_keepalive_by_short(child);
+        #[cfg(feature = "adaptive-indirect")]
+        self.poll_estimates
+            .note_poll(child, self.mac.monotonic_micros());
+        // The ACK to this poll said "no data" (the frame was queued after the
+        // hardware acknowledged it), so the child has turned its receiver
+        // off: a frame sent now is acknowledged by its radio and dropped by
+        // its stack. It stays queued, Frame Pending armed, for the next poll.
+        if self.mac.poll_acked_without_frame_pending(&source) {
+            return Ok(ChildPollOutcome::NoData);
+        }
         let mut refreshed = [0u8; nlde::MAX_NWK_FRAME];
         let (kind, len) = {
             let Some(frame) = self.indirect.peek(child) else {

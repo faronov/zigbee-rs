@@ -1233,6 +1233,20 @@ running the stack meanwhile (`ApsLayer::last_ack_handle` + `ack_status`).
 `elapsed_ms` then counts from the transmission. Group and broadcast frames,
 and frames without bit0, are confirmed after the MAC/NWK transmission.
 
+Sleepy destinations. A sleepy end-device child of the NCP is reached through
+the NCP's indirect queue. The NCP learns each child's poll interval from its
+MAC Data Requests (the largest interval seen in the last 10 minutes) and
+keeps the child's data frames queued until its next expected poll: interval
++ 25 % + 1 s, at least 8 s (the default `macTransactionPersistenceTime`),
+at most 64 s and never longer than the child's End Device Timeout. Each APS
+ACK wait for such a child is `apscAckWaitDuration` (1.5 s) plus that hold, so
+an APS retry is only sent once the previous copy was delivered or expired,
+never queued beside it. This applies with or without `tx_options` bit5.
+With bit5, a sleepy destination that is not a child of the NCP gets the
+default 7.68 s indirect hold of its own parent added to each ACK wait. A
+confirm can therefore take up to 4 × (hold + 1.5 s); `elapsed_ms` saturates
+at 65535.
+
 `EVT_APS_DATA_INDICATION` (`0x0280`):
 
 | Offset | Size | Field |
@@ -2773,7 +2787,7 @@ shadow-sink steps of 7.11.
 | `load_network_info(load_devices)` | `NWK_GET_INFO` + `SEC_GET_NETWORK_KEY`. With `load_devices`: `BKP_EXPORT_*` merged with the host store, filling `network_info.children`, `nwk_addresses`, `key_table` (with `tx_counter = aps limit`, `rx_counter = floor`, `seq`), `tc_link_key`, `stack_specific.zigbee_rs` and `ezsp.hashed_tclk`, `metadata.zigbee_rs`. `NOT_FORMED` ⇒ `NetworkNotFormed`. |
 | `write_network_info(network_info, node_info)` | `BKP_RESTORE_*` (9.4) with `nwk_margin = 0`, `aps_margin = 10000`, `allow_ieee_change = IEEE_REWRITABLE`. `form_quickly` / new networks produce the same records with zero counters. |
 | `reset_network_info()` | `NWK_LEAVE_RESET`. |
-| `send_packet(packet)` | `APS_DATA_REQUEST`; `BUSY` ⇒ retry with backoff inside the concurrency limit. Wait for `EVT_APS_DATA_CONFIRM` (timeout 3 s mains / 8 s with `extended_timeout`, same as bellows). Non-success ⇒ `DeliveryError`. `packet.source_route` ⇒ relays (zigpy already reverses `device.relays`). ZDO requests to the coordinator itself are answered locally from `DIAG_*`/`NWK_GET_INFO` (7.4). GP sink transmissions are swallowed in NCP-sink mode (7.11 step 4). |
+| `send_packet(packet)` | `APS_DATA_REQUEST`; `BUSY` ⇒ retry with backoff inside the concurrency limit. Wait for `EVT_APS_DATA_CONFIRM` (timeout 3 s mains; with `extended_timeout`, which sets `tx_options` bit5, up to 4 × (hold + 1.5 s): about 37 s for a sleepy device behind a router, longer for a long-polling child of the NCP, see 7.3). Non-success ⇒ `DeliveryError`. `packet.source_route` ⇒ relays (zigpy already reverses `device.relays`). ZDO requests to the coordinator itself are answered locally from `DIAG_*`/`NWK_GET_INFO` (7.4). GP sink transmissions are swallowed in NCP-sink mode (7.11 step 4). |
 | `permit_ncp(time_s)` | `NWK_PERMIT_JOIN{target 0x0000}` |
 | `permit(time_s, node)` | `NWK_PERMIT_JOIN{target 0xFFFC or the router}` + `GP_SINK_COMMISSIONING{enter, involve proxies, time_s}` |
 | `permit_with_link_key(node, key, time_s)` | `SEC_ADD_LINK_KEY{temporary}` + permit; or `SEC_ADD_INSTALL_CODE` when the host has a code |

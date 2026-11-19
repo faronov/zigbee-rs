@@ -13031,6 +13031,95 @@ mod tests {
         );
     }
 
+    /// `adaptive-indirect`: a child that long-polls every 30 s finds a frame
+    /// queued right after its poll still waiting at the next one (the
+    /// default 8 s lifetime would have dropped it), and an unretrieved frame
+    /// is still released once the learned hold has passed.
+    #[test]
+    #[cfg(feature = "adaptive-indirect")]
+    fn a_long_polling_child_keeps_its_frame_until_the_next_poll() {
+        use zigbee_mac::PlatformServices;
+
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        parent.update_neighbor_address(ORIGIN, ORIGIN_IEEE);
+        let child = parent.neighbors.find_by_short_mut(ORIGIN).unwrap();
+        child.relationship = crate::neighbor::Relationship::Child;
+        child.rx_on_when_idle = false;
+        let poll = |parent: &mut NwkLayer<MockMac>| {
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap()
+        };
+        assert_eq!(
+            parent.sleepy_child_hold_secs(ORIGIN),
+            Some(crate::poll_estimate::DEFAULT_HOLD_SECS)
+        );
+        assert_eq!(parent.sleepy_child_hold_secs(OUR_ADDR), None);
+        assert_eq!(poll(&mut parent), crate::ChildPollOutcome::NoData);
+        block_on(parent.mac.delay_micros(30_000_000));
+        assert_eq!(poll(&mut parent), crate::ChildPollOutcome::NoData);
+        assert_eq!(parent.sleepy_child_hold_secs(ORIGIN), Some(38));
+
+        block_on(parent.nlde_data_request(ORIGIN, 1, &[0xAA], false, false)).unwrap();
+        for _ in 0..30 {
+            assert!(parent.indirect.age().is_empty());
+        }
+        assert_eq!(
+            poll(&mut parent),
+            crate::ChildPollOutcome::Delivered {
+                child: ORIGIN,
+                more_pending: false,
+                kind: crate::IndirectFrameKind::Data,
+            }
+        );
+
+        block_on(parent.nlde_data_request(ORIGIN, 1, &[0xBB], false, false)).unwrap();
+        for _ in 0..37 {
+            assert!(parent.indirect.age().is_empty());
+        }
+        assert_eq!(parent.indirect.age().as_slice(), &[ORIGIN]);
+        assert!(!parent.indirect.has_pending(ORIGIN));
+    }
+
+    /// A frame queued after the parent's auto-ACK told the polling child "no
+    /// data" (Frame Pending = 0) is not sent in reply to that poll — the
+    /// child has turned its receiver off, its radio would acknowledge the
+    /// frame and its stack drop it (an ESP32-C6 lost its first Confirm-Key
+    /// and every End Device Timeout Response this way). It goes out at the
+    /// next poll, whose ACK carries Frame Pending.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_poll_acked_without_frame_pending_leaves_the_frame_for_the_next_poll() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        parent.update_neighbor_address(ORIGIN, ORIGIN_IEEE);
+        let child = parent.neighbors.find_by_short_mut(ORIGIN).unwrap();
+        child.relationship = crate::neighbor::Relationship::Child;
+        child.rx_on_when_idle = false;
+        block_on(parent.nlde_data_request(ORIGIN, 1, &[0xAA], false, false)).unwrap();
+
+        parent.mac.set_poll_acked_without_frame_pending(true);
+        assert_eq!(
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap(),
+            crate::ChildPollOutcome::NoData
+        );
+        assert!(parent.mac.tx_history().is_empty());
+        assert!(parent.indirect.has_pending(ORIGIN));
+        assert_ne!(
+            parent.mac.indirect_pending_history().last(),
+            Some(&(MacAddress::Short(PAN, ORIGIN), false)),
+            "Frame Pending stays armed for the next poll"
+        );
+
+        parent.mac.set_poll_acked_without_frame_pending(false);
+        assert_eq!(
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap(),
+            crate::ChildPollOutcome::Delivered {
+                child: ORIGIN,
+                more_pending: false,
+                kind: crate::IndirectFrameKind::Data,
+            }
+        );
+        assert_eq!(tx_frame(&parent.mac.tx_history()[0]).1, 0xAA);
+    }
+
     #[test]
     #[cfg(feature = "router")]
     fn indirect_delivery_advertises_each_additional_queued_frame() {

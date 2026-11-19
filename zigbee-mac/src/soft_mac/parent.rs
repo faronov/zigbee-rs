@@ -460,6 +460,11 @@ impl<
         self.set_frame_pending(child, pending)
     }
 
+    fn poll_acked_without_frame_pending(&self, child: &MacAddress) -> bool {
+        self.phy.capabilities().hardware_auto_ack
+            && self.phy.data_request_acked_without_pending(child)
+    }
+
     fn mcps_indirect_data(
         &mut self,
         req: McpsDataRequest<'_>,
