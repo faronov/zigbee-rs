@@ -368,8 +368,8 @@ at the end of `raw.rs`/`mod.rs`.
 
 ## Leave a stalled `TxAck` (`ieee802154-tx-ack-watchdog`)
 
-Opt-in cargo feature (only the ZRHP NCP image enables it, so the shipped
-sensor/router images stay byte-identical); a residual case of the
+Cargo feature, enabled for every ESP image by `zigbee-mac`'s ESP backend
+(2026-11-19; first only the ZRHP NCP image); a residual case of the
 `ieee802154-tx-ack-abort` stall.
 
 - **Observed:** the ESP32-H2 NCP on the Thread BR board (coordinator, one
