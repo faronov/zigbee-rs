@@ -66,6 +66,13 @@ impl<const N: usize> TxQueue<N> {
         N - self.len
     }
 
+    /// The queued, not yet transmitted messages (whole encoded messages in
+    /// order). Lets a sender inspect what it just queued, e.g. to cache a
+    /// response for retries (6.5).
+    pub fn queued(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
     /// Drop everything.
     pub fn clear(&mut self) {
         self.len = 0;
