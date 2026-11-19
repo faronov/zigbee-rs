@@ -95,6 +95,6 @@ enables it and it has not run on a C5.
 
 ## `ieee802154-tx-ack-watchdog` and `debug_state`
 
-Ported unchanged from `vendor/esp-radio` (see its `LOCAL-PATCHES.md`): an
-opt-in watchdog that leaves a `TxAck` state with no `AckTxDone`, no RX
+Ported unchanged from `vendor/esp-radio` (see its `LOCAL-PATCHES.md`): a
+watchdog (enabled by `zigbee-mac`'s ESP backend) that leaves a `TxAck` state with no `AckTxDone`, no RX
 abort and an idle receiver after 2 ms, and a diagnostic state read.

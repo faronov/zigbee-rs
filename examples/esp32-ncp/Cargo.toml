@@ -53,10 +53,9 @@ esp-println = { version = "0.12", features = ["esp32h2"], optional = true }
 
 esp-bootloader-esp-idf = { version = "0.4.0", default-features = false }
 esp-hal = { version = "=1.0.0", features = ["unstable"] }
-# `ieee802154-tx-ack-watchdog`: leave a stalled automatic-ACK state (local
-# patch, vendor/esp-radio/LOCAL-PATCHES.md); seen on the H2 coordinator with
-# a sleepy child.
-esp-radio = { version = "=0.17.0", features = ["ieee802154", "ieee802154-tx-ack-watchdog", "unstable"] }
+# The stalled automatic-ACK watchdog (`ieee802154-tx-ack-watchdog`) comes
+# with zigbee-mac's ESP backend.
+esp-radio = { version = "=0.17.0", features = ["ieee802154", "unstable"] }
 esp-alloc = "0.9"
 static_cell = "2"
 log = "0.4"
