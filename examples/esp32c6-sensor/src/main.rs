@@ -116,7 +116,7 @@ fn build_device(
         .date_code(product::DATE_CODE)
         .sw_build(FIRMWARE_VERSION_STR)
         .power_source(PowerSource::DcSource)
-        .channels(zigbee_types::ChannelMask::ALL_2_4GHZ)
+        .channels(STEERING_CHANNELS)
         .endpoint(
             profile.endpoint(),
             profile.profile_id(),
@@ -125,6 +125,27 @@ fn build_device(
         )
         .build_into(DEVICE.uninit())
 }
+
+/// Steering channels: all of 2.4 GHz, or only `ZIGBEE_LAB_CHANNEL` (11–26)
+/// when a lab build sets it, so a factory-new lab sensor cannot join another
+/// network that happens to permit joining on an earlier channel. A bad value
+/// fails the build.
+const STEERING_CHANNELS: zigbee_types::ChannelMask = match option_env!("ZIGBEE_LAB_CHANNEL") {
+    None => zigbee_types::ChannelMask::ALL_2_4GHZ,
+    Some(value) => {
+        let digits = value.as_bytes();
+        assert!(
+            digits.len() == 2 && digits[0].is_ascii_digit() && digits[1].is_ascii_digit(),
+            "ZIGBEE_LAB_CHANNEL: a channel number 11..=26"
+        );
+        let channel = (digits[0] - b'0') * 10 + (digits[1] - b'0');
+        assert!(
+            matches!(channel, 11..=26),
+            "ZIGBEE_LAB_CHANNEL: a channel number 11..=26"
+        );
+        zigbee_types::ChannelMask(1 << channel)
+    }
+};
 
 /// Bring up the radio and the shared software MAC.
 ///

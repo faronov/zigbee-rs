@@ -575,6 +575,12 @@ OTA corpus separately from the default images. Size reports measure the
 artifacts without enforcing artificial regression budgets; physical OTA-slot
 and other layout checks remain mandatory.
 
+Lab C6 sensor images can restrict steering to one channel with
+`ZIGBEE_LAB_CHANNEL=17 cargo +nightly-2026-08-01 build …`. Then a factory-new
+bench sensor cannot join another network that is open for joining on an
+earlier channel. A value outside 11–26 fails the build. Without the variable
+the image scans all 2.4 GHz channels, as before.
+
 Documentation can be published after its core/code checks pass even when a
 required firmware job fails a build, physical limit, or other check. In that
 case the site includes no prebuilt ESP binaries, its firmware manifest has no
