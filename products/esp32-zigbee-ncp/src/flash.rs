@@ -70,17 +70,7 @@ impl<const START: u32, const SIZE: usize> NorFlash for FlashWindow<START, SIZE> 
         let physical_to = physical_from
             .checked_add(to - from)
             .ok_or(FlashStorageError::OutOfBounds)?;
-        // One sector per call (as esp-storage does internally), timed: every
-        // ROM call runs with interrupts masked, the radio's included.
-        let mut sector = physical_from;
-        while sector < physical_to {
-            let next = sector.saturating_add(FlashStorage::ERASE_SIZE as u32);
-            masked("erase", sector, FlashStorage::ERASE_SIZE, || {
-                self.flash.erase(sector, next.min(physical_to))
-            })?;
-            sector = next;
-        }
-        Ok(())
+        erase_sectors(&mut self.flash, physical_from, physical_to)
     }
 
     /// Programs at most one 256-byte flash page per ROM call. Every call runs
@@ -91,17 +81,44 @@ impl<const START: u32, const SIZE: usize> NorFlash for FlashWindow<START, SIZE> 
     /// treat any prefix of a record as torn.
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
         let physical = Self::physical_offset(offset, bytes.len())?;
-        let mut done = 0;
-        while done < bytes.len() {
-            let address = physical + done as u32;
-            let room = FLASH_PAGE - address as usize % FLASH_PAGE;
-            let length = room.min(bytes.len() - done);
-            let page = &bytes[done..done + length];
-            masked("write", address, length, || self.flash.write(address, page))?;
-            done += length;
-        }
-        Ok(())
+        write_pages(&mut self.flash, physical, bytes)
     }
+}
+
+/// Erase `from..to` (physical, sector-aligned) one sector per ROM call (as
+/// esp-storage does internally), timed: every ROM call runs with interrupts
+/// masked, the radio's included. Not generic: one copy for every window.
+#[inline(never)]
+fn erase_sectors(flash: &mut FlashStorage, from: u32, to: u32) -> Result<(), FlashStorageError> {
+    let mut sector = from;
+    while sector < to {
+        let next = sector.saturating_add(FlashStorage::ERASE_SIZE as u32);
+        masked("erase", sector, FlashStorage::ERASE_SIZE, || {
+            flash.erase(sector, next.min(to))
+        })?;
+        sector = next;
+    }
+    Ok(())
+}
+
+/// Program `bytes` at physical `address`, at most one flash page per ROM
+/// call. Not generic: one copy for every window.
+#[inline(never)]
+fn write_pages(
+    flash: &mut FlashStorage,
+    address: u32,
+    bytes: &[u8],
+) -> Result<(), FlashStorageError> {
+    let mut done = 0;
+    while done < bytes.len() {
+        let at = address + done as u32;
+        let room = FLASH_PAGE - at as usize % FLASH_PAGE;
+        let length = room.min(bytes.len() - done);
+        let page = &bytes[done..done + length];
+        masked("write", at, length, || flash.write(at, page))?;
+        done += length;
+    }
+    Ok(())
 }
 
 /// SPI NOR page: the unit a single program command writes.

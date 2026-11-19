@@ -568,6 +568,8 @@ fn radio_idle() -> bool {
 
 /// Parent radio counters once a minute when they changed (LOG endpoint):
 /// children's Data Requests (polls), Frame Pending ACKs and transmissions.
+/// Out of line: its formatting frame stays off the serve loop's stack.
+#[inline(never)]
 fn radio_stats(now_us: u64) {
     use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
     use portable_atomic::AtomicU64;
@@ -595,6 +597,7 @@ fn radio_stats(now_us: u64) {
     }
 }
 
+#[inline(never)]
 fn radio_watch(now_us: u64) {
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
     use portable_atomic::AtomicU64;
