@@ -473,6 +473,22 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         self.upsert_table_device(device, &address, false)
     }
 
+    /// Forget a device at the host's request (`TBL_INVALIDATE`, spec 8.3
+    /// I5): its Trust Center record and unique link key are durably dropped
+    /// without sending anything on air. `Ok(false)` when it was unknown.
+    pub fn forget_device<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        address: IeeeAddress,
+    ) -> Result<bool, TrustCenterRuntimeError> {
+        self.require_initialized_network(device)?;
+        if self.table.device(&address).is_none() {
+            return Ok(false);
+        }
+        self.revoke(device, &address)?;
+        Ok(true)
+    }
+
     /// Add one directional application-link-key request pair to the durable allowlist.
     pub fn allow_application_key_request<M: MacDriver>(
         &mut self,

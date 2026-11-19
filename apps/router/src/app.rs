@@ -3847,4 +3847,18 @@ where
             self.coordinator.node_mut().device_mut(),
         )
     }
+
+    /// Allow [`Self::initialize`] again after a completed wipe
+    /// ([`Self::urgent_factory_reset_and_recommission`]) without a reboot,
+    /// so a network co-processor can form or install the next network in
+    /// the same session. Refused (`false`) while joined or while a reset is
+    /// still pending.
+    pub fn rearm_initialize(&mut self) -> bool {
+        let core = &mut self.coordinator.core;
+        if core.node.device().is_joined() || core.pending_factory_reset {
+            return false;
+        }
+        core.initialized = false;
+        true
+    }
 }
