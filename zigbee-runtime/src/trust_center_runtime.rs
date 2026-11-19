@@ -471,6 +471,23 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         &self.store
     }
 
+    /// Re-store the live state when the journal asks for it
+    /// ([`TrustCenterDeviceStore::wants_compaction`]): the live state is
+    /// the durable one (every mutation commits before it is published), so
+    /// this only moves it into the pre-erased spare sector. Returns whether
+    /// it stored. Call it only in a quiet window.
+    #[cfg(feature = "journal-pre-erase")]
+    pub fn compact_journal(&mut self) -> Result<bool, TrustCenterRuntimeError> {
+        if !self.is_initialized() || !self.store.wants_compaction() {
+            return Ok(false);
+        }
+        if let Err(error) = self.store.compact(&self.state) {
+            self.discard();
+            return Err(error.into());
+        }
+        Ok(true)
+    }
+
     pub fn store_mut(&mut self) -> &mut S {
         &mut self.store
     }

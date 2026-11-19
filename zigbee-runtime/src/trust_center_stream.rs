@@ -108,6 +108,13 @@ pub struct TrustCenterStreamJournal<S, const SECTOR_SIZE: usize> {
     sectors: [u32; 2],
     current: Option<Located>,
     scanned: bool,
+    /// `current` was decoded (load) or written and verified (store), not
+    /// only framed: the other sector then holds only older generations.
+    #[cfg(feature = "journal-pre-erase")]
+    verified: bool,
+    /// Pre-erase of the sector not holding `current`.
+    #[cfg(feature = "journal-pre-erase")]
+    spare: crate::spare_erase::SpareErase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +157,20 @@ impl<S, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_SIZE> {
             sectors: [first_sector, second_sector],
             current: None,
             scanned: false,
+            #[cfg(feature = "journal-pre-erase")]
+            verified: false,
+            #[cfg(feature = "journal-pre-erase")]
+            spare: crate::spare_erase::SpareErase::new(),
+        }
+    }
+
+    /// Record whether `current` is validated; an unvalidated one also
+    /// voids every pre-erase.
+    #[cfg(feature = "journal-pre-erase")]
+    fn set_verified(&mut self, verified: bool) {
+        self.verified = verified;
+        if !verified {
+            self.spare.forget();
         }
     }
 
@@ -163,6 +184,73 @@ impl<S, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_SIZE> {
 }
 
 impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_SIZE> {
+    /// Store `state` after the current snapshot, or in the other sector
+    /// when it does not fit or `rollover` asks for the move.
+    fn store_snapshot(
+        &mut self,
+        state: &PersistentTrustCenterState,
+        rollover: bool,
+    ) -> Result<(), TrustCenterStoreError> {
+        state.validate()?;
+        let current = self.current()?;
+        let generation = match current {
+            Some(located) => located
+                .generation
+                .checked_add(1)
+                .ok_or(TrustCenterStoreError::GenerationExhausted)?,
+            None => 0,
+        };
+        let stream = Self::stream_for(state, generation)?;
+        // Append after the current snapshot, or roll over: erase the other
+        // sector (the current one stays intact until the new commit).
+        let append = match current {
+            Some(_) if rollover => None,
+            Some(located) => Some(self.append_slot(located.sector)?)
+                .filter(|slot| slot + stream.chunks <= Self::SLOTS_PER_SECTOR)
+                .map(|slot| (located.sector, slot)),
+            None => None,
+        };
+        let (sector, slot) = append.unwrap_or(match current {
+            Some(located) => (1 - located.sector, 0),
+            None => (0, 0),
+        });
+        let result = (|| {
+            if append.is_none() {
+                let start = self.sectors[sector];
+                #[cfg(feature = "journal-pre-erase")]
+                self.spare
+                    .erase_for_rollover(&mut self.storage, sector, start, SECTOR_SIZE as u32)
+                    .map_err(|_| TrustCenterStoreError::Hardware)?;
+                #[cfg(not(feature = "journal-pre-erase"))]
+                self.storage
+                    .erase(start, start + SECTOR_SIZE as u32)
+                    .map_err(|_| TrustCenterStoreError::Hardware)?;
+            }
+            self.write_snapshot(sector, slot, stream, state)
+        })();
+        match result {
+            Ok(()) => {
+                self.current = Some(Located {
+                    generation,
+                    sector,
+                    slot,
+                    slots: stream.chunks,
+                });
+                // Written and read back (`write_snapshot` verifies).
+                #[cfg(feature = "journal-pre-erase")]
+                self.set_verified(true);
+                Ok(())
+            }
+            Err(error) => {
+                self.current = None;
+                self.scanned = false;
+                #[cfg(feature = "journal-pre-erase")]
+                self.set_verified(false);
+                Err(error)
+            }
+        }
+    }
+
     fn geometry_ok(&self) -> bool {
         self.sectors[0] != self.sectors[1]
             && self.sectors[0].abs_diff(self.sectors[1]) >= SECTOR_SIZE as u32
@@ -361,6 +449,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_S
         if !self.scanned {
             self.current = self.newest_framed(None)?;
             self.scanned = true;
+            #[cfg(feature = "journal-pre-erase")]
+            self.set_verified(false);
         }
         Ok(self.current)
     }
@@ -454,6 +544,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterDeviceStore
             // The flash changed under the cache: rescan on the next call.
             self.current = None;
             self.scanned = false;
+            #[cfg(feature = "journal-pre-erase")]
+            self.set_verified(false);
             return Err(TrustCenterStoreError::Corrupt);
         }
         // Newest decodable snapshot: complete snapshots newest first, with
@@ -464,11 +556,15 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterDeviceStore
             let Some(located) = self.newest_framed(below)? else {
                 self.current = None;
                 self.scanned = true;
+                #[cfg(feature = "journal-pre-erase")]
+                self.set_verified(false);
                 return Ok(false);
             };
             if self.decode_snapshot(located, state)? {
                 self.current = Some(located);
                 self.scanned = true;
+                #[cfg(feature = "journal-pre-erase")]
+                self.set_verified(true);
                 return Ok(true);
             }
             below = Some(located.generation);
@@ -476,53 +572,12 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterDeviceStore
     }
 
     fn store(&mut self, state: &PersistentTrustCenterState) -> Result<(), TrustCenterStoreError> {
-        state.validate()?;
-        let current = self.current()?;
-        let generation = match current {
-            Some(located) => located
-                .generation
-                .checked_add(1)
-                .ok_or(TrustCenterStoreError::GenerationExhausted)?,
-            None => 0,
-        };
-        let stream = Self::stream_for(state, generation)?;
-        // Append after the current snapshot, or roll over: erase the other
-        // sector (the current one stays intact until the new commit).
-        let append = match current {
-            Some(located) => Some(self.append_slot(located.sector)?)
-                .filter(|slot| slot + stream.chunks <= Self::SLOTS_PER_SECTOR)
-                .map(|slot| (located.sector, slot)),
-            None => None,
-        };
-        let (sector, slot) = append.unwrap_or(match current {
-            Some(located) => (1 - located.sector, 0),
-            None => (0, 0),
-        });
-        let result = (|| {
-            if append.is_none() {
-                let start = self.sectors[sector];
-                self.storage
-                    .erase(start, start + SECTOR_SIZE as u32)
-                    .map_err(|_| TrustCenterStoreError::Hardware)?;
-            }
-            self.write_snapshot(sector, slot, stream, state)
-        })();
-        match result {
-            Ok(()) => {
-                self.current = Some(Located {
-                    generation,
-                    sector,
-                    slot,
-                    slots: stream.chunks,
-                });
-                Ok(())
-            }
-            Err(error) => {
-                self.current = None;
-                self.scanned = false;
-                Err(error)
-            }
-        }
+        self.store_snapshot(state, false)
+    }
+
+    #[cfg(feature = "journal-pre-erase")]
+    fn compact(&mut self, state: &PersistentTrustCenterState) -> Result<(), TrustCenterStoreError> {
+        self.store_snapshot(state, true)
     }
 
     fn clear(&mut self) -> Result<(), TrustCenterStoreError> {
@@ -531,6 +586,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterDeviceStore
         }
         self.current = None;
         self.scanned = false;
+        #[cfg(feature = "journal-pre-erase")]
+        self.set_verified(false);
         for sector in self.sectors {
             self.storage
                 .erase(sector, sector + SECTOR_SIZE as u32)
@@ -538,6 +595,39 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterDeviceStore
         }
         self.scanned = true;
         Ok(())
+    }
+
+    /// Pre-erase the sector that does not hold the current, validated
+    /// snapshot (it only holds older generations), one erase unit per call.
+    #[cfg(feature = "journal-pre-erase")]
+    fn pre_erase_step(&mut self) -> Result<bool, TrustCenterStoreError> {
+        if !self.geometry_ok() {
+            return Err(TrustCenterStoreError::Hardware);
+        }
+        let Some(current) = self.current.filter(|_| self.scanned && self.verified) else {
+            return Ok(false);
+        };
+        let spare = 1 - current.sector;
+        let start = self.sectors[spare];
+        self.spare
+            .step(&mut self.storage, spare, start, SECTOR_SIZE as u32)
+            .map_err(|_| TrustCenterStoreError::Hardware)
+    }
+
+    /// Half of the current sector is used, the spare is fully pre-erased
+    /// and moving would gain room (the snapshot is not already first in
+    /// its sector). A join stores about ten snapshots; a sector holds eight.
+    #[cfg(feature = "journal-pre-erase")]
+    fn wants_compaction(&self) -> bool {
+        self.current
+            .filter(|_| self.scanned && self.verified)
+            .is_some_and(|current| {
+                current.slot > 0
+                    && (current.slot + current.slots) * 2 >= Self::SLOTS_PER_SECTOR
+                    && self
+                        .spare
+                        .is_complete(1 - current.sector, SECTOR_SIZE as u32)
+            })
     }
 }
 
@@ -982,6 +1072,120 @@ mod tests {
 
     fn reopen(journal: Journal) -> Journal {
         self::journal(journal.into_storage().power_on())
+    }
+
+    impl Journal {
+        fn storage_mut_for_test(&mut self) -> &mut MockFlash {
+            &mut self.storage
+        }
+    }
+
+    /// `journal-pre-erase`: once the current snapshot is validated, the
+    /// other sector is erased ahead of time, one 4 KiB unit per step, and the
+    /// rollover no longer erases (the radio-deaf 8 × 4 KiB erase leaves the
+    /// store path).
+    #[test]
+    #[cfg(feature = "journal-pre-erase")]
+    fn a_pre_erased_spare_sector_takes_the_erase_out_of_the_rollover() {
+        let mut journal = journal(MockFlash::new());
+        journal.store(&state(1, 0, false)).unwrap();
+        let mut steps = 0;
+        while journal.pre_erase_step().unwrap() {
+            steps += 1;
+        }
+        assert_eq!(steps, SECTOR / 4096);
+        assert!(!journal.pre_erase_step().unwrap(), "nothing left");
+        let erases = journal.storage().erases;
+        // Seven appends fill sector 0; the ninth store rolls over.
+        for tag in 1..=8 {
+            journal.store(&state(1, tag, false)).unwrap();
+        }
+        assert_eq!(journal.current.map(|located| located.sector), Some(1));
+        assert_eq!(
+            journal.storage().erases,
+            erases,
+            "rollover without an erase"
+        );
+
+        let mut journal = reopen(journal);
+        assert_eq!(journal.load(), Ok(Some(state(1, 8, false))));
+    }
+
+    /// Compaction is asked for once half of the current sector is used and
+    /// the spare is fully pre-erased; re-storing then rolls over without an
+    /// erase and leaves a free sector, and the request stops until the new
+    /// spare is pre-erased again.
+    #[test]
+    #[cfg(feature = "journal-pre-erase")]
+    fn a_half_used_sector_compacts_into_the_pre_erased_spare() {
+        let slots = Journal::SLOTS_PER_SECTOR;
+        let mut journal = journal(MockFlash::new());
+        for tag in 0..slots as u8 / 2 {
+            journal.store(&state(3, tag, false)).unwrap();
+        }
+        assert!(!journal.wants_compaction(), "spare not pre-erased yet");
+        while journal.pre_erase_step().unwrap() {}
+        assert!(journal.wants_compaction(), "half used, spare erased");
+        let reopened = reopen(journal);
+        assert!(!reopened.wants_compaction(), "progress is RAM-only");
+        let mut journal = reopened;
+        let current = state(3, slots as u8 / 2 - 1, false);
+        assert_eq!(journal.load(), Ok(Some(current.clone())));
+        while journal.pre_erase_step().unwrap() {}
+        assert!(journal.wants_compaction());
+        // A power cut during the move keeps the current snapshot.
+        journal.storage_mut_for_test().cut_after = Some(1);
+        assert!(journal.compact(&current).is_err());
+        let mut journal = reopen(journal);
+        assert_eq!(journal.load(), Ok(Some(current.clone())));
+        while journal.pre_erase_step().unwrap() {}
+        assert!(journal.wants_compaction());
+
+        let erases = journal.storage().erases;
+        journal.compact(&current).unwrap();
+        assert_eq!(journal.storage().erases, erases, "no erase in the move");
+        assert_eq!(journal.current.map(|located| located.sector), Some(1));
+        assert!(!journal.wants_compaction(), "first slot of a fresh sector");
+        let mut journal = reopen(journal);
+        assert_eq!(journal.load(), Ok(Some(current)));
+        // A whole free sector minus one slot, then a pre-erased spare.
+        while journal.pre_erase_step().unwrap() {}
+        let erases = journal.storage().erases;
+        for tag in 0x40..0x40 + slots as u8 {
+            journal.store(&state(3, tag, false)).unwrap();
+        }
+        assert_eq!(journal.storage().erases, erases, "{slots} stores, no erase");
+    }
+
+    /// A snapshot that is only framed (no load yet) does not authorize a
+    /// pre-erase, a reboot forgets the progress (the rollover erases fully
+    /// again), and a power cut in the middle of a pre-erase leaves the
+    /// current snapshot intact.
+    #[test]
+    #[cfg(feature = "journal-pre-erase")]
+    fn pre_erase_needs_a_validated_snapshot_and_survives_a_power_cut() {
+        let mut journal = journal(MockFlash::new());
+        journal.store(&state(2, 1, false)).unwrap();
+        let mut journal = reopen(journal);
+        assert_eq!(journal.pre_erase_step(), Ok(false), "not validated yet");
+        assert_eq!(journal.load(), Ok(Some(state(2, 1, false))));
+
+        journal.pre_erase_step().unwrap();
+        journal.storage_mut_for_test().cut_after = Some(1);
+        assert!(journal.pre_erase_step().is_err(), "power cut mid-erase");
+        let mut journal = reopen(journal);
+        assert_eq!(journal.load(), Ok(Some(state(2, 1, false))));
+        let erases = journal.storage().erases;
+        for tag in 2..=9 {
+            journal.store(&state(2, tag, false)).unwrap();
+        }
+        assert_eq!(
+            journal.storage().erases,
+            erases + 1,
+            "after a reboot the rollover erases the whole sector"
+        );
+        let mut journal = reopen(journal);
+        assert_eq!(journal.load(), Ok(Some(state(2, 9, false))));
     }
 
     #[test]

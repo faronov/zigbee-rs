@@ -72,6 +72,10 @@ global-aps-counter = ["trust-center", "zigbee-aps/global-aps-counter"]
 # removal intents) with the streamed multi-slot journal
 # `trust_center_stream::TrustCenterStreamJournal`. Needs the global APS
 # counter. Off by default: images without it are unchanged.
+# Erase the spare sector of the Trust Center and child journals ahead of
+# their rollover, in owner-chosen quiet moments (`pre_erase_step`), instead
+# of inside the store. Off by default: images without it are unchanged.
+journal-pre-erase = []
 ncp-capacity = [
     "global-aps-counter",
     "zigbee-aps/ncp-capacity",

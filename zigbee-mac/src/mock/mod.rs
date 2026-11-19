@@ -58,6 +58,7 @@ pub struct MockMac {
     orphan_responses: Vec<MlmeOrphanResponse, 8>,
     indirect_pending_history: Vec<(MacAddress, bool), 16>,
     poll_acked_without_frame_pending: bool,
+    joined_polls: u32,
     rx_queue: Vec<McpsDataIndication, 8>,
     command_queue: Vec<MacCommandEvent, 8>,
     poll_count: u32,
@@ -153,6 +154,7 @@ impl MockMac {
             orphan_responses: Vec::new(),
             indirect_pending_history: Vec::new(),
             poll_acked_without_frame_pending: false,
+            joined_polls: 0,
             rx_queue: Vec::new(),
             command_queue: Vec::new(),
             poll_count: 0,
@@ -304,6 +306,12 @@ impl MockMac {
     /// Pending = 0 ([`MacDriver::poll_acked_without_frame_pending`]).
     pub fn set_poll_acked_without_frame_pending(&mut self, acked_without: bool) {
         self.poll_acked_without_frame_pending = acked_without;
+    }
+
+    /// Polls issued through [`MacDriver::mlme_poll_joined`] (also counted
+    /// by `poll_count`).
+    pub fn joined_poll_count(&self) -> u32 {
+        self.joined_polls
     }
 
     pub fn set_poll_failures(&mut self, count: u32) {
@@ -635,6 +643,11 @@ impl MacDriver for MockMac {
         } else {
             Ok(Some(self.poll_queue.remove(0)))
         }
+    }
+
+    async fn mlme_poll_joined(&mut self) -> Result<Option<MacFrame>, MacError> {
+        self.joined_polls = self.joined_polls.wrapping_add(1);
+        self.mlme_poll().await
     }
 
     async fn mlme_poll_timeout(&mut self, timeout_us: u32) -> Result<Option<MacFrame>, MacError> {

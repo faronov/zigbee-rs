@@ -66,8 +66,9 @@ pub trait MacDriver {
     // Capability query
     fn capabilities(&self) -> MacCapabilities;
 
-    // Provided methods with defaults: mlme_poll_timeout and
-    // mcps_data_indication_timeout (bounded waits), plus the parent-only
+    // Provided methods with defaults: mlme_poll_timeout,
+    // mlme_poll_joined and mcps_data_indication_timeout (bounded waits),
+    // plus the parent-only
     // primitives listed under "Parent capability boundary" below.
 }
 ```
@@ -107,6 +108,7 @@ pub trait MacDriver {
 | Method | Description |
 |--------|-------------|
 | `mlme_poll()` | Send a MAC Data Request to the coordinator and return any pending indirect frame.  Used by Sleepy End Devices to retrieve queued data. |
+| `mlme_poll_joined()` | The steady-state poll of a joined end device (`ZigbeeNode::poll`). Defaults to `mlme_poll`; `SoftMacCore` never adds the extended-source fallback poll here, because a parent keys a joined child's frames by its short address. Join and rejoin keep the fallback (`mlme_poll`/`mlme_poll_timeout`). |
 
 #### Data Service
 

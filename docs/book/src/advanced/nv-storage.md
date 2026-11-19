@@ -313,6 +313,78 @@ lifecycle transaction checkpoints are explicit writes. Factory reset clears
 child persistence before recommissioning, even if the next network has the
 same extended PAN ID.
 
+## Journal pre-erase (`journal-pre-erase`)
+
+On ESP32 every ROM flash call runs with all interrupts masked (esp-storage
+`critical-section`). Masked interrupts stop the 802.15.4 driver, so it sends
+no automatic ACK and does not re-arm receive. Without pre-erase, the NCP's
+Trust Center stream journal (two 32 KiB halves, one 4 KiB slot per snapshot)
+erased a whole half when it rolled over. That is eight sector erases
+(26–37 ms each), back to back, inside the store, and a join triggers about
+ten stores.
+
+With the `zigbee-runtime` feature `journal-pre-erase`,
+`TrustCenterStreamJournal` and `ChildTableJournal` implement
+`pre_erase_step()`. Each call erases at most one 4 KiB unit of the half that
+does not hold the current record. The rollover then skips the units already
+erased. Safety rules:
+
+- only after the current record was validated in this boot (decoded on
+  load, or written and verified); a framed-only scan does not qualify;
+- progress is kept in RAM only. It is forgotten on rollover, clear, any
+  storage error and an unvalidated rescan. After a reboot the rollover
+  erases the full half again, so a power cut during a pre-erase can only
+  repeat an erase. It never skips one;
+- the rollover still writes the new record into an erased half and keeps the
+  old half until the new record is verified. Torn-write and generation rules
+  are unchanged.
+
+Pre-erase alone does not change flash wear: the same erases happen earlier.
+The worst case is one extra erase of a spare unit per reboot (progress
+lost).
+
+The ESP32 NCP (`apps/ncp-coordinator`, `TcPort`) schedules the steps. A step
+runs only when all of these hold:
+
+- no secured frame for 150 ms;
+- no pending APS ACK or indirect frame;
+- permit-join is closed;
+- at least 250 ms since the previous step;
+- the platform reports the radio idle-listening (`esp_radio`
+  `debug_state`: receive state, no pending events). An erase that starts
+  while an automatic ACK is being sent leaves the driver stuck until the
+  `TxAck` watchdog recovers it.
+
+Once the spare is fully erased, the NCP also asks the Trust Center runtime
+to compact (`TrustCenterRuntime::compact_journal`). This happens when the
+current half is at least half used and its snapshot is not first in it. The
+runtime re-stores its live state, which is already the durable state, with
+`TrustCenterDeviceStore::compact`. That rollover lands in the pre-erased
+spare: a write, no erase. The old half then becomes the spare and is
+pre-erased in later quiet windows. A join that starts after enough quiet
+time (about 2.5 s) has at least 12 slots of erase-free capacity, more than
+its about ten stores. A compaction cut by power loss leaves the current
+snapshot, like any rollover. Erasing between a join's frames instead
+(tried on hardware) lost Transport-Key deliveries and failed one join.
+
+Wear: a half can be retired with half of it unused. In the worst case
+(stores spread out, a quiet window after each), a half takes the compacted
+snapshot plus three stores, against eight stores in the plain journal. The
+Trust Center erase rate per store is then at most 8/3 of the plain rate,
+plus one 4 KiB write per compaction. Trust Center stores are rare: joins,
+leaves, key events, and a counter reservation every 1,024 frames. At
+100,000 erase cycles per sector, this stays far inside the endurance. The
+other pre-erases add no erases.
+
+The product flash window (`products/esp32-zigbee-ncp/src/flash.rs`) also
+splits writes into 256-byte pages. A 4 KiB snapshot used to be one masked
+call of about 5 ms; each page is now well under 2 ms. Program count and
+torn-write behaviour are unchanged.
+
+The security-state journal (frame counters, rare rotations), APS-table and
+Green Power journals are not pre-erased. Their rollovers are rare and still
+erase in the store path.
+
 ## Current product partitions
 
 | product | security state | other protected storage |

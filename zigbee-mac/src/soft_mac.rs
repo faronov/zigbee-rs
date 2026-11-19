@@ -936,7 +936,21 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
     /// poll that retrieves a frame the parent queued by our EUI-64 (Rejoin
     /// Response, Transport-Key). A transmit failure of that optional second
     /// poll is reported as "no data" so it never masks the first result.
-    pub async fn poll_within(&mut self, timeout_us: u32) -> Result<Option<MacFrame>, MacError> {
+    pub fn poll_within(
+        &mut self,
+        timeout_us: u32,
+    ) -> impl Future<Output = Result<Option<MacFrame>, MacError>> + '_ {
+        self.poll_with(timeout_us, true)
+    }
+
+    /// [`Self::poll_within`]; `extended_fallback == false` never sends the
+    /// second, extended-source poll ([`MacDriver::mlme_poll_joined`]). One
+    /// instance serves both (a backend without the fallback ignores it).
+    async fn poll_with(
+        &mut self,
+        timeout_us: u32,
+        extended_fallback: bool,
+    ) -> Result<Option<MacFrame>, MacError> {
         let started_at = self.phy.monotonic_micros();
         if let Some(frame) = self.take_pending_data() {
             return Ok(Some(frame));
@@ -986,7 +1000,11 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             {
                 return Ok(self.take_pending_data());
             }
-            if !(P::POLL_EXTENDED_FALLBACK && short_source && has_extended_source) {
+            if !(P::POLL_EXTENDED_FALLBACK
+                && extended_fallback
+                && short_source
+                && has_extended_source)
+            {
                 return Ok(None);
             }
             short_source = false;
@@ -1539,6 +1557,10 @@ macro_rules! soft_mac_driver_common {
 
         fn mlme_poll(&mut self) -> impl Future<Output = Result<Option<MacFrame>, MacError>> {
             self.poll_within(u32::MAX)
+        }
+
+        fn mlme_poll_joined(&mut self) -> impl Future<Output = Result<Option<MacFrame>, MacError>> {
+            self.poll_with(u32::MAX, false)
         }
 
         fn mlme_poll_timeout(
@@ -3404,6 +3426,26 @@ mod tests {
         // The extended-source poll gets no ACK: reported as "no data".
         assert!(block_on(core.poll()).unwrap().is_none());
         assert_eq!(core.phy().tx_attempts, 2);
+    }
+
+    /// A joined device's poll (`mlme_poll_joined`) is not repeated with the
+    /// EUI-64 source: the parent keys a joined child's frames by its short
+    /// address. Join/rejoin keep the fallback through `mlme_poll`.
+    #[test]
+    fn joined_poll_never_repeats_with_the_extended_source() {
+        let mut core = associated_core_of::<SoftwareTx, true>();
+        let first = core.pib().dsn();
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(
+                PhyRxFrame::from_slice(&[0x02, 0x00, first], 255).unwrap(),
+            )))
+            .unwrap();
+
+        assert!(block_on(core.mlme_poll_joined()).unwrap().is_none());
+        assert_eq!(core.phy().tx_attempts, 1, "one Data Request per poll");
+        let last = core.phy().last_tx.as_slice();
+        assert_eq!(last[1] & 0xC0, 0x80, "short source address");
     }
 
     #[test]

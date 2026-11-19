@@ -575,6 +575,12 @@ OTA corpus separately from the default images. Size reports measure the
 artifacts without enforcing artificial regression budgets; physical OTA-slot
 and other layout checks remain mandatory.
 
+Lab C6 sensor images can restrict steering to one channel with
+`ZIGBEE_LAB_CHANNEL=17 cargo +nightly-2026-08-01 build …`. Then a factory-new
+bench sensor cannot join another network that is open for joining on an
+earlier channel. A value outside 11–26 fails the build. Without the variable
+the image scans all 2.4 GHz channels, as before.
+
 Documentation can be published after its core/code checks pass even when a
 required firmware job fails a build, physical limit, or other check. In that
 case the site includes no prebuilt ESP binaries, its firmware manifest has no
@@ -835,8 +841,27 @@ Thread BR board (PAN `0x1C06`, channel 17, 2026-11-19, branch
 | Device_annce | no retry once the coordinator had sent Configure Reporting (before: initial + post-auth + 5 retries) | same |
 | long-poll delivery | the Mgmt_Leave sent to the sensor in its 30 s long poll was acknowledged after 27.7 s in 5 of 5 cycles (before: `NO_ACK` after ~6 s). A ZCL Read Basic outside the fast-poll window was answered at the next poll | `2026-11-19T171833Z-sed-join-fixes-c6-5-joins` |
 
-Still open: the NCP radio stops acknowledging for 25–250 ms while it writes
-flash (Trust Center journal commits).
+The NCP radio stopped acknowledging while it wrote flash. On ESP32 every ROM
+flash call masks interrupts, the 802.15.4 driver's included. Branch
+`ncp-radio-flash` (2026-11-19) moved that work out of the join. The
+measurements come from the NCP's log of flash calls that masked
+interrupts for 2 ms or more, the C6 console and the NCP `[RADIO]` counters.
+The sniffer was in use by another session.
+
+| image | result | hwlab sessions |
+|---|---|---|
+| before (master) | per join about eight 4 KiB Trust Center snapshot writes at 5.1 ms each, and a 32 KiB rollover erase inside the join: 8 × 26–37 ms back to back (≈ 240 ms). One of three joins had `Polls to parent failing` (retry cancelled) | `2026-11-19T184424Z-ncp-radio-flash-before-c6log` |
+| pre-erase in quiet windows only | writes split into 256-byte pages (none ≥ 2 ms). Erases moved after the joins, but a join stores about ten snapshots: one of three still rolled over a second time with a back-to-back 32 KiB erase and a stuck automatic ACK | `2026-11-19T191008Z-ncp-radio-flash-after-c6log-2`, `2026-11-19T193122Z-ncp-radio-flash-after2-c6log-b` (first half) |
+| urgent erases between frames (rejected) | when the current sector was a quarter used, one 4 KiB erase every 100 ms even during a join. A frame arriving during an erase left the driver in `TxAck` until the watchdog (18 recoveries in 6 joins). One join lost its Transport-Key (128 empty polls, join failed), others their first TCLK Transport-Key (5 s retry) | `2026-11-19T193122Z-ncp-radio-flash-after2-c6log-b` (second half), `2026-11-19T195505Z-ncp-radio-flash-urgent-c6log` |
+| quiet-window pre-erase + compaction (kept) | 4 of 4 factory-new joins with no flash call of 2 ms or more from Association to the end of the interview, one Verify-Key each, no failed polls, no `TxAck` recovery. All erases (26–37 ms each, 250 ms apart) started 180–430 ms after the last frame | `2026-11-19T200603Z-ncp-radio-flash-compact-c6log` |
+
+The C6's steady-state polling with the old image (extended-source fallback
+after every empty poll) was measured on the same NCP: 10.4 Data Requests per
+minute, 3.6 of them answered with frame pending (7 minutes, reporting 10–60 s,
+`2026-11-19T202000Z-ncp-radio-flash-dr-old-c6`). The new image sends one
+Data Request per empty joined poll (host-tested). Its hardware count was
+interrupted: the Thread BR board's S3 was reflashed by another session
+during the run.
 
 Open hardware gates:
 

@@ -7619,6 +7619,18 @@ mod resume_tests {
         );
     }
 
+    /// The joined device's steady-state poll does not repeat an empty answer
+    /// with the extended source (one Data Request per poll instead of two).
+    #[test]
+    fn a_joined_end_device_polls_without_the_extended_source_fallback() {
+        let (mut device, _store) = resumed_end_device(negotiated_state(0x01, true, 14));
+        let _ = device.take_forced_poll();
+        let (polls, joined) = (device.mac().poll_count(), device.mac().joined_poll_count());
+        assert!(matches!(block_on(device.poll()), Ok(None)));
+        assert_eq!(device.mac().poll_count(), polls + 1);
+        assert_eq!(device.mac().joined_poll_count(), joined + 1);
+    }
+
     #[test]
     fn application_driven_empty_polls_are_normal_and_never_trigger_recovery() {
         // With nothing queued the MAC returns `Ok(None)` — an ACKed-but-empty
@@ -14169,6 +14181,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// deadline — unless the parent advertised *only* End Device Timeout
     /// Request keepalive, in which case a poll does not reset its child timer
     /// and must not postpone the next request either.
+    ///
+    /// This is the joined device's poll ([`MacDriver::mlme_poll_joined`]):
+    /// an empty answer is not repeated with the extended source address.
+    /// Join and rejoin poll through BDB/NWK, which keep that fallback for
+    /// frames a parent queues by EUI-64 (Rejoin Response, join
+    /// Transport-Key); a parent that lost this child is recovered by the
+    /// keepalive / End Device Timeout failure path and its secured rejoin.
     pub async fn poll(&mut self) -> Result<Option<McpsDataIndication>, MacError> {
         // Any application-driven parent poll also satisfies a pending forced
         // End Device Timeout poll. Clear that request before touching the MAC
@@ -14180,7 +14199,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             .aps_mut()
             .nwk_mut()
             .mac_mut()
-            .mlme_poll()
+            .mlme_poll_joined()
             .await
         {
             Ok(frame) => frame,
@@ -21053,6 +21072,9 @@ pub(crate) const fn ncp_capacity(default: usize, ncp: usize) -> usize {
     }
 }
 
+/// Background pre-erase of journal spare sectors.
+#[cfg(feature = "journal-pre-erase")]
+mod spare_erase;
 /// Streamed multi-slot Trust Center journal of the coordinator NCP.
 #[cfg(feature = "ncp-capacity")]
 pub mod trust_center_stream;
