@@ -129,6 +129,8 @@ pub struct UartDmaStream {
     line: LineConfig,
     counters: UartCounters,
     pending_line_faults: u32,
+    /// Of `pending_line_faults`, FIFO overflows and DMA restarts.
+    pending_overruns: u32,
 }
 
 impl UartDmaStream {
@@ -147,6 +149,7 @@ impl UartDmaStream {
         let mut uhci = Uhci::new(uart, uhci0, dma);
         uhci.set_uart_config(&uart_config(line))
             .map_err(|_| UartStreamError::Config)?;
+        set_idle_rts(port, line.flow_control);
         // A descriptor closes on UART idle (`idle_eof`) or after a chunk.
         uhci.apply_rx_config(&uhci::RxConfig::default().with_chunk_limit(UART_RX_CHUNK as u16))
             .map_err(|_| UartStreamError::Config)?;
@@ -170,6 +173,7 @@ impl UartDmaStream {
             line,
             counters: UartCounters::default(),
             pending_line_faults: 0,
+            pending_overruns: 0,
         })
     }
 
@@ -244,10 +248,15 @@ impl UartDmaStream {
     }
 
     /// Line faults (framing/parity/glitch errors and overflows) since the
-    /// last call, for the protocol's corrupted-frame accounting.
-    pub fn take_line_faults(&mut self) -> u32 {
+    /// last call, for the protocol's corrupted-frame accounting:
+    /// `(faults, of which overruns)` (FIFO overflows and DMA restarts, i.e.
+    /// bytes lost rather than corrupted).
+    pub fn take_line_faults(&mut self) -> (u32, u32) {
         self.service_rx();
-        core::mem::take(&mut self.pending_line_faults)
+        (
+            core::mem::take(&mut self.pending_line_faults),
+            core::mem::take(&mut self.pending_overruns),
+        )
     }
 
     pub fn counters(&self) -> UartCounters {
@@ -264,6 +273,7 @@ impl UartDmaStream {
         };
         tx.apply_uart_config(&uart_config(line))
             .map_err(|_| UartStreamError::Config)?;
+        set_idle_rts(self.port, line.flow_control);
         self.line = line;
         Ok(())
     }
@@ -301,6 +311,7 @@ impl UartDmaStream {
         if restart {
             self.counters.rx_overflow = self.counters.rx_overflow.saturating_add(1);
             self.pending_line_faults = self.pending_line_faults.saturating_add(1);
+            self.pending_overruns = self.pending_overruns.saturating_add(1);
         }
         // Only a stopped DMA (every descriptor full, or a descriptor error)
         // needs a restart; the bytes it could not take are lost.
@@ -309,6 +320,7 @@ impl UartDmaStream {
             if !restart {
                 self.counters.rx_overflow = self.counters.rx_overflow.saturating_add(1);
                 self.pending_line_faults = self.pending_line_faults.saturating_add(1);
+                self.pending_overruns = self.pending_overruns.saturating_add(1);
             }
             let transfer = self.rx.take().expect("checked above");
             let (rx, buf) = transfer.cancel();
@@ -381,6 +393,28 @@ fn take_line_faults(port: UartPort) -> LineFaults {
     match port {
         UartPort::Uart0 => poll!(UART0),
         UartPort::Uart1 => poll!(UART1),
+    }
+}
+
+/// With flow control off the UART drives RTS from `CONF0.SW_RTS`, whose
+/// reset value (0) holds RTS high: a peer with flow control on would never
+/// send. Assert it ("ready", RTS low) then, so a mixed pair degrades to no
+/// flow control instead of stalling (spec 11.5, N10; measured on the Thread
+/// BR board). With flow control on the hardware drives RTS and the bit is
+/// left at its reset value.
+fn set_idle_rts(port: UartPort, flow_control: bool) {
+    macro_rules! apply {
+        ($uart:ident) => {{
+            let regs = esp_hal::peripherals::$uart::regs();
+            regs.conf0().modify(|_, w| w.sw_rts().bit(!flow_control));
+            // CONF0 lives in the UART core clock domain (esp-hal `sync_regs`).
+            regs.reg_update().modify(|_, w| w.reg_update().set_bit());
+            while regs.reg_update().read().reg_update().bit_is_set() {}
+        }};
+    }
+    match port {
+        UartPort::Uart0 => apply!(UART0),
+        UartPort::Uart1 => apply!(UART1),
     }
 }
 
