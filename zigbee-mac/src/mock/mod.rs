@@ -573,6 +573,12 @@ impl MacDriver for MockMac {
             PibAttribute::MacPanId => {
                 self.pan_id = value.as_pan_id().ok_or(MacError::InvalidParameter)?;
             }
+            PibAttribute::MacExtendedAddress => {
+                let PibValue::ExtendedAddress(address) = value else {
+                    return Err(MacError::InvalidParameter);
+                };
+                self.ieee_address = address;
+            }
             PibAttribute::MacCoordShortAddress => {
                 self.coord_short_address =
                     value.as_short_address().ok_or(MacError::InvalidParameter)?;
