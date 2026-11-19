@@ -28,6 +28,7 @@ use zigbee_aps::security::{
 use zigbee_mac::mock::MockMac;
 use zigbee_mac::primitives::{
     AssociationStatus, MacFrame, McpsDataIndication, MlmeAssociateIndication,
+    MlmeDataRequestIndication,
 };
 use zigbee_mac::{CapabilityInfo, MacCommandEvent, PlatformServices};
 use zigbee_nwk::frames::{NwkCommandId, NwkFrameControl, NwkFrameType, NwkHeader};
@@ -536,6 +537,105 @@ fn ack_request_confirms_wait_for_the_aps_ack_outcome() {
     pollster::block_on(port.leave_reset()).unwrap();
     let done = port.take_data_confirm().expect("reset outcome");
     assert_eq!((done.req_tid, done.confirm.zb_status), (4, 0xA7));
+}
+
+/// Spec 7.3 `tx_options` bit5 / sleepy children: a read sent right after a
+/// 30 s long-polling child's poll stays queued until its next poll, and the
+/// confirm waits for the APS ACK that follows — instead of NO_ACK after the
+/// fixed ~6 s of APS retries while the frame expired in the 8 s queue.
+#[test]
+fn a_long_polling_sleepy_child_is_reached_at_its_next_poll() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    formed_port!(port);
+    let key = network_key(&port);
+    let pan = pan(&port);
+    let child = ShortAddress(0x3344);
+    let child_ieee = [0xB1; 8];
+    {
+        let nwk = port.app_mut().device_mut().aps_mut().nwk_mut();
+        assert!(nwk.restore_child(child_ieee, child, false, true, false, 8));
+        nwk.update_address_map(child, child_ieee);
+    }
+    let poll = |port: &mut TcPort<_>| {
+        mac(port).enqueue_command_event(MacCommandEvent::DataRequest(MlmeDataRequestIndication {
+            source_address: MacAddress::Short(pan, child),
+            destination_address: MacAddress::Short(pan, ShortAddress::COORDINATOR),
+            lqi: 180,
+            security_use: false,
+        }));
+        steps(port, 1);
+    };
+    let wait_secs = |port: &mut TcPort<_>, secs: u32| {
+        for _ in 0..secs {
+            pollster::block_on(mac(port).delay_micros(1_000_000));
+            steps(port, 1);
+        }
+    };
+    // Two long polls teach the NCP the child's 30 s interval.
+    poll(&mut port);
+    wait_secs(&mut port, 30);
+    poll(&mut port);
+
+    let request = DataRequest {
+        req_tid: 7,
+        dst: Destination::Nwk(child.0),
+        dst_ep: 1,
+        src_ep: 1,
+        profile: PROFILE_HOME_AUTOMATION,
+        cluster: 0x0000,
+        tx_options: 0x21,
+        radius: 0,
+        asdu: heapless::Vec::from_slice(&[0x00, 0x01, 0x00, 0x04, 0x00]).unwrap(),
+    };
+    let to_child = |port: &mut TcPort<_>| {
+        mac(port)
+            .tx_history()
+            .iter()
+            .filter(|tx| tx.dst == MacAddress::Short(pan, child))
+            .count()
+    };
+    let sent = to_child(&mut port);
+    let confirm = pollster::block_on(port.send(&request)).unwrap();
+    assert!(confirm.deferred());
+    wait_secs(&mut port, 29);
+    assert_eq!(port.take_data_confirm(), None, "still waiting for the poll");
+    assert_eq!(
+        to_child(&mut port),
+        sent,
+        "nothing went to the child before its poll"
+    );
+
+    poll(&mut port);
+    let delivered_indirect = mac(&mut port).tx_history().last().unwrap().indirect;
+    assert_eq!(to_child(&mut port), sent + 1, "delivered at the poll");
+    assert!(delivered_indirect, "as the indirect transaction");
+    assert_eq!(
+        port.app_mut()
+            .device_mut()
+            .aps_mut()
+            .nwk_mut()
+            .indirect_queue()
+            .pending_count(child),
+        0,
+        "and no APS retry was queued beside it"
+    );
+    receive(
+        &mut port,
+        child,
+        -60,
+        secured_nwk_frame(
+            &key,
+            NwkFrameType::Data,
+            (child, child_ieee),
+            ShortAddress(0),
+            0x30,
+            &aps_ack_frame(confirm.aps_counter),
+        ),
+    );
+    let done = port.take_data_confirm().expect("ACK outcome");
+    assert_eq!(done.req_tid, 7);
+    assert_eq!(done.confirm.zb_status, 0);
+    assert_eq!(done.confirm.flags, DataConfirm::FLAG_ACK_RECEIVED);
 }
 
 // ── The host side (ZRHP over an in-memory pipe) ────────────────────

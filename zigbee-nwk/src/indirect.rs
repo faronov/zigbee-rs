@@ -111,6 +111,14 @@ impl IndirectQueue {
             .map(|(index, _)| index)
     }
 
+    /// Override the lifetime of one queued transaction (`adaptive-indirect`).
+    #[cfg(feature = "adaptive-indirect")]
+    pub(crate) fn set_ttl(&mut self, index: usize, ttl_secs: u8) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry.ttl = ttl_secs;
+        }
+    }
+
     pub(crate) fn remove_slot(&mut self, index: usize) {
         if let Some(entry) = self.entries.get_mut(index) {
             entry.active = false;

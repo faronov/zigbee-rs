@@ -402,6 +402,13 @@ const APS_ACK_TABLE_SIZE: usize = 4;
 /// runs maintenance far more often.
 pub const APS_ACK_WAIT_DURATION_US: u32 = 1_500_000;
 
+/// Default indirect transaction lifetime of a remote parent
+/// (`macTransactionPersistenceTime` 0x01F4 × aBaseSuperframeDuration), added
+/// to the ACK wait of an extended-timeout send to a sleepy device that is not
+/// our child (`adaptive-indirect`).
+#[cfg(feature = "adaptive-indirect")]
+pub const REMOTE_INDIRECT_HOLD_US: u32 = 7_680_000;
+
 /// APS duplicate rejection entry (R22 §2.2.8.4.2).
 ///
 /// Holds the source address, the APS counter and *timing information*: the
@@ -485,6 +492,23 @@ struct PendingApsAckEntry {
     original_frame: heapless::Vec<u8, 128>,
     /// APS security context of the original transmission, when it was secured.
     security: Option<PendingApsSecurity>,
+    /// Acknowledgement wait of this transaction (`adaptive-indirect`).
+    #[cfg(feature = "adaptive-indirect")]
+    wait_us: u32,
+}
+
+impl PendingApsAckEntry {
+    /// How long each transmission of this transaction waits for its ACK.
+    const fn wait_us(&self) -> u32 {
+        #[cfg(feature = "adaptive-indirect")]
+        {
+            self.wait_us
+        }
+        #[cfg(not(feature = "adaptive-indirect"))]
+        {
+            APS_ACK_WAIT_DURATION_US
+        }
+    }
 }
 
 /// Everything needed to re-secure an APS data retransmission.
@@ -590,6 +614,10 @@ pub struct ApsLayer<M: MacDriver> {
     next_ack_generation: u16,
     /// Unicasts without an APS ACK after every retry since the last ACK.
     consecutive_ack_failures: u8,
+    /// The next acknowledged unicast goes to a sleepy destination (ZRHP
+    /// `tx_options` bit5, `adaptive-indirect`).
+    #[cfg(feature = "adaptive-indirect")]
+    extended_timeout: bool,
     host_rx: HostRxSecurity,
     /// Fragment reassembly buffer for incoming fragmented frames
     fragment_rx: fragment::FragmentReassembly,
@@ -635,6 +663,8 @@ impl<M: MacDriver> ApsLayer<M> {
             ack_table: heapless::Vec::new(),
             ack_completions: heapless::Vec::new(),
             consecutive_ack_failures: 0,
+            #[cfg(feature = "adaptive-indirect")]
+            extended_timeout: false,
             host_rx: HostRxSecurity::new(),
             next_ack_generation: 1,
             fragment_rx: fragment::FragmentReassembly::new(),
@@ -685,6 +715,8 @@ impl<M: MacDriver> ApsLayer<M> {
             core::ptr::addr_of_mut!((*slot).ack_table).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).ack_completions).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).next_ack_generation).write(1);
+            #[cfg(feature = "adaptive-indirect")]
+            core::ptr::addr_of_mut!((*slot).extended_timeout).write(false);
             core::ptr::addr_of_mut!((*slot).host_rx).write(HostRxSecurity::new());
             core::ptr::addr_of_mut!((*slot).fragment_rx).write(fragment::FragmentReassembly::new());
         }
@@ -989,6 +1021,8 @@ impl<M: MacDriver> ApsLayer<M> {
             self.next_ack_generation = 1;
         }
         let now = self.nwk.mac().monotonic_micros();
+        #[cfg(feature = "adaptive-indirect")]
+        let wait_us = self.ack_wait_us(dst_addr);
         // Try to find an inactive slot to reuse
         for (i, entry) in self.ack_table.iter_mut().enumerate() {
             if !entry.active {
@@ -1002,6 +1036,8 @@ impl<M: MacDriver> ApsLayer<M> {
                     waiting_since_us: now,
                     original_frame: heapless::Vec::new(),
                     security,
+                    #[cfg(feature = "adaptive-indirect")]
+                    wait_us,
                 };
                 let _ = entry.original_frame.extend_from_slice(frame_bytes);
                 return Some(i);
@@ -1019,6 +1055,8 @@ impl<M: MacDriver> ApsLayer<M> {
             waiting_since_us: now,
             original_frame: heapless::Vec::new(),
             security,
+            #[cfg(feature = "adaptive-indirect")]
+            wait_us,
         };
         let _ = new_entry.original_frame.extend_from_slice(frame_bytes);
         if self.ack_table.push(new_entry).is_ok() {
@@ -1035,10 +1073,26 @@ impl<M: MacDriver> ApsLayer<M> {
         // tracking for the *newest* frame would silently disable retries for
         // exactly the traffic in flight.
         let mut victim: Option<(usize, u32)> = None;
+        #[cfg(not(feature = "adaptive-indirect"))]
         for (i, entry) in self.ack_table.iter().enumerate() {
             let waited = now.wrapping_sub(entry.waiting_since_us);
             if victim.is_none_or(|(_, longest)| waited > longest) {
                 victim = Some((i, waited));
+            }
+        }
+        // Waits differ per destination: the entry closest to its own
+        // deadline is evicted, so a long wait for a sleepy child is not
+        // always the first victim of a burst of mains-powered traffic.
+        #[cfg(feature = "adaptive-indirect")]
+        {
+            let mut closest = u32::MAX;
+            for (i, entry) in self.ack_table.iter().enumerate() {
+                let waited = now.wrapping_sub(entry.waiting_since_us);
+                let remaining = entry.wait_us().saturating_sub(waited);
+                if victim.is_none() || remaining < closest {
+                    closest = remaining;
+                    victim = Some((i, waited));
+                }
             }
         }
         let Some((idx, waited)) = victim else {
@@ -1062,6 +1116,8 @@ impl<M: MacDriver> ApsLayer<M> {
             waiting_since_us: now,
             original_frame: heapless::Vec::new(),
             security,
+            #[cfg(feature = "adaptive-indirect")]
+            wait_us,
         };
         let _ = entry.original_frame.extend_from_slice(frame_bytes);
         Some(idx)
@@ -1077,6 +1133,34 @@ impl<M: MacDriver> ApsLayer<M> {
 
     /// Acknowledged unicasts that failed end to end (no APS ACK after every
     /// retry) since the last APS ACK arrived or [`Self::clear_ack_failures`].
+    /// Mark the next acknowledged unicast as addressed to a sleepy
+    /// destination (ZRHP `tx_options` bit5); cleared once it is registered.
+    #[cfg(feature = "adaptive-indirect")]
+    pub fn set_extended_timeout(&mut self, extended: bool) {
+        self.extended_timeout = extended;
+    }
+
+    /// Acknowledgement wait for one transmission to `dst_addr`
+    /// (`adaptive-indirect`): `apscAckWaitDuration`, plus
+    /// - for a sleepy child of this node, the time its frame stays in the
+    ///   indirect queue — a retry is only sent once the previous copy was
+    ///   delivered or expired, never queued beside it;
+    /// - for another sleepy destination (`set_extended_timeout`), the
+    ///   default transaction persistence of its parent (7.68 s).
+    #[cfg(feature = "adaptive-indirect")]
+    fn ack_wait_us(&mut self, dst_addr: u16) -> u32 {
+        let extended = core::mem::take(&mut self.extended_timeout);
+        let hold_us = match self
+            .nwk
+            .sleepy_child_hold_secs(zigbee_types::ShortAddress(dst_addr))
+        {
+            Some(hold_secs) => u32::from(hold_secs) * 1_000_000,
+            None if extended => REMOTE_INDIRECT_HOLD_US,
+            None => 0,
+        };
+        APS_ACK_WAIT_DURATION_US + hold_us
+    }
+
     pub fn consecutive_ack_failures(&self) -> u8 {
         self.consecutive_ack_failures
     }
@@ -1292,7 +1376,7 @@ impl<M: MacDriver> ApsLayer<M> {
             }
             // Wrapping subtraction: the monotonic microsecond clock rolls over
             // every ~71.6 minutes, and only the difference matters.
-            if now.wrapping_sub(entry.waiting_since_us) < APS_ACK_WAIT_DURATION_US {
+            if now.wrapping_sub(entry.waiting_since_us) < entry.wait_us() {
                 continue;
             }
             if entry.retries == 0 {

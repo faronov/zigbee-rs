@@ -7220,6 +7220,70 @@ mod tests {
         assert_eq!(retransmissions[0].frame.as_slice(), &[0xAA, 0xBB, 0xCC]);
     }
 
+    /// `adaptive-indirect`: an acknowledged unicast to a sleepy child waits
+    /// for the child's indirect hold plus `apscAckWaitDuration` before the
+    /// retry, so a retry never sits in the indirect queue beside the copy the
+    /// child has not polled yet. Mains destinations keep the plain window.
+    #[test]
+    #[cfg(feature = "adaptive-indirect")]
+    fn a_sleepy_child_gets_its_indirect_hold_added_to_the_ack_wait() {
+        const CHILD: ShortAddress = ShortAddress(0x2D69);
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        assert!(
+            aps.nwk_mut()
+                .restore_child([0x60; 8], CHILD, false, true, false, 8)
+        );
+        let hold_us = u32::from(zigbee_nwk::poll_estimate::DEFAULT_HOLD_SECS) * 1_000_000;
+        aps.register_ack_pending(0x42, CHILD.0, &[0xAA])
+            .expect("a free ACK slot");
+        aps.register_ack_pending(0x43, 0x1234, &[0xBB])
+            .expect("a free ACK slot");
+
+        advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US);
+        let due = aps.age_ack_table();
+        assert_eq!(due.len(), 1, "only the mains destination is due");
+        assert_eq!(due[0].dst_addr, ShortAddress(0x1234));
+
+        // The mains retry restarts its own 1.5 s windows meanwhile.
+        let due_for = |aps: &mut ApsLayer<MockMac>, dst| {
+            aps.age_ack_table()
+                .iter()
+                .any(|retry| retry.dst_addr == dst)
+        };
+        advance_aps_clock(&mut aps, hold_us - 1);
+        assert!(!due_for(&mut aps, CHILD));
+        advance_aps_clock(&mut aps, 1);
+        assert!(due_for(&mut aps, CHILD));
+    }
+
+    /// `adaptive-indirect`: an extended-timeout send (ZRHP `tx_options` bit5)
+    /// to a sleepy device behind another parent waits that parent's default
+    /// 7.68 s transaction lifetime longer; the flag covers one transaction.
+    #[test]
+    #[cfg(feature = "adaptive-indirect")]
+    fn an_extended_timeout_send_waits_for_the_remote_parent_hold() {
+        let mut aps = aps_node(DeviceType::Router, LOCAL_SHORT);
+        aps.set_extended_timeout(true);
+        aps.register_ack_pending(0x42, 0x4444, &[0xAA])
+            .expect("a free ACK slot");
+        aps.register_ack_pending(0x43, 0x5555, &[0xBB])
+            .expect("a free ACK slot");
+
+        advance_aps_clock(&mut aps, crate::APS_ACK_WAIT_DURATION_US);
+        let due = aps.age_ack_table();
+        assert_eq!(due.len(), 1, "the flag applied to the first send only");
+        assert_eq!(due[0].dst_addr, ShortAddress(0x5555));
+        let due_for = |aps: &mut ApsLayer<MockMac>, dst| {
+            aps.age_ack_table()
+                .iter()
+                .any(|retry| retry.dst_addr == ShortAddress(dst))
+        };
+        advance_aps_clock(&mut aps, crate::REMOTE_INDIRECT_HOLD_US - 1);
+        assert!(!due_for(&mut aps, 0x4444));
+        advance_aps_clock(&mut aps, 1);
+        assert!(due_for(&mut aps, 0x4444));
+    }
+
     /// A burst of acknowledged unicasts — a ZDO interview answers several in a
     /// row — must not lose retry tracking for the newest frame just because
     /// older transmissions are still inside their acknowledgement window.
