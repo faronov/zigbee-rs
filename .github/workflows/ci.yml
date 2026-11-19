@@ -90,6 +90,12 @@ jobs:
       - run: cargo test -p zigbee-bdb --all-features --locked
       - run: cargo test -p router-app --all-features --locked
       - run: cargo test -p zigbee-runtime --all-features --locked
+      # --all-features selects the compact NCP tier (ncp-capacity-compact);
+      # the full ESP32-H2 NCP capacities are tested on their own.
+      - run: cargo test -p zigbee-nwk --features router,ncp-capacity --locked
+      - run: cargo test -p zigbee-aps --features ncp-capacity --locked
+      - run: cargo test -p zigbee-bdb --features ncp-capacity --locked
+      - run: cargo test -p zigbee-runtime --features ncp-capacity,green-power-ncp,host-passthrough --locked
       - run: cargo test -p zigbee-tests --all-features --locked
       - run: cargo test -p zigbee-zdo --features router --locked
       - run: cargo test -p zigbee-mac --features stm32wb --lib stm32wb --locked
