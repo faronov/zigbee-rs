@@ -23,6 +23,10 @@ green-power = []
 # indirect queue 16 frames, NWK replay-floor table 128 and a NIB default of
 # `max_children = 64`. Off by default: images without it are unchanged.
 ncp-capacity = ["router"]
+# Compact coordinator NCP tables (address map 256, 64 neighbors with 32
+# children, 64 source routes, 64 replay floors) for parts with less RAM.
+# Off by default: images without it are unchanged.
+ncp-capacity-compact = ["ncp-capacity"]
 # Network co-processor: record neighbour Leave indications (with the rejoin
 # bit) and aged-out children for the host (`host_events`). Off by default:
 # images without it are unchanged.

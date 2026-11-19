@@ -121,6 +121,8 @@ jobs:
       - run: cargo test -p zigbee-nwk --features router,host-passthrough --locked
       - run: cargo test -p zigbee-zdo --features router,host-passthrough --locked
       - run: cargo test --manifest-path apps/ncp-coordinator/Cargo.toml --locked
+      # Compact NCP (CC2652P7): 8-frame link window, compact stack tables.
+      - run: cargo test --manifest-path apps/ncp-coordinator/Cargo.toml --features compact --locked
       # nRF product crates are excluded from the root workspace (they pull in
       # `embassy-nrf`), but their battery-curve and profile logic is
       # host-testable because the hardware dependencies are
@@ -424,6 +426,10 @@ jobs:
             manifest: products/cc26x2-dongle/Cargo.toml
             workspace: products/cc26x2-dongle
             features: "cc2652p7-dongle"
+          - name: CC26x2 NCP product (CC2652P7)
+            manifest: products/cc26x2-ncp/Cargo.toml
+            workspace: products/cc26x2-ncp
+            features: "cc2652p7-dongle"
           # Chip-independent logic (word flash, MAC address/confirm mapping);
           # the chip feature only builds for the target.
           - name: STM32WB HAL
@@ -518,6 +524,7 @@ jobs:
       - run: cargo clippy -p zigbee-bdb --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --features pan-coordinator --all-targets --locked -- -D warnings
       - run: cargo clippy --manifest-path apps/ncp-coordinator/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo clippy --manifest-path apps/ncp-coordinator/Cargo.toml --all-targets --features compact --locked -- -D warnings
       - run: cargo clippy -p router-app --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p router-app --no-default-features --locked -- -D warnings
       - run: cargo clippy -p sensor-sed-app --all-targets --features ota --locked -- -D warnings
@@ -600,6 +607,8 @@ jobs:
           cargo fmt --manifest-path boards/cc26x2-dongle/Cargo.toml -- --check
           cargo fmt --manifest-path products/cc26x2-dongle/Cargo.toml -- --check
           cargo fmt --manifest-path examples/cc26x2-router/Cargo.toml -- --check
+          cargo fmt --manifest-path products/cc26x2-ncp/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/cc26x2-ncp/Cargo.toml -- --check
           cargo fmt --manifest-path stm32wb-hal/Cargo.toml -- --check
           cargo fmt --manifest-path boards/stm32wb5mm-dk/Cargo.toml -- --check
           cargo fmt --manifest-path products/stm32wb5mm-dk-router/Cargo.toml -- --check
@@ -2748,6 +2757,42 @@ jobs:
           path: |
             examples/cc26x2-router/target/cc26x2-router-*.hex
             examples/cc26x2-router/target/cc26x2-router-*.size.json
+          if-no-files-found: error
+
+  build-cc26x2-ncp:
+    name: Build CC2652P7 ZRHP NCP (compact capacity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv7em-none-eabihf
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: examples/cc26x2-ncp
+          key: thumbv7em-cc26x2-ncp-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('examples/cc26x2-ncp/Cargo.lock', 'products/cc26x2-ncp/link/**', 'cc26x2-hal/link/**') }}
+      - name: Build CC2652P7 NCP (release)
+        working-directory: examples/cc26x2-ncp
+        run: cargo build --release --locked
+      - name: Clippy CC2652P7 NCP
+        working-directory: examples/cc26x2-ncp
+        run: cargo clippy --release --locked --target thumbv7em-none-eabihf -- -D warnings
+      - name: Layout and CCFG gate, size report
+        run: |
+          ELF=examples/cc26x2-ncp/target/thumbv7em-none-eabihf/release/cc26x2-ncp
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          python3 examples/cc26x2-router/tools/verify-layout.py --chip cc2652p7 --layout ncp "$ELF"
+          "$OBJCOPY" -O ihex "$ELF" examples/cc26x2-ncp/target/cc26x2-ncp-cc2652p7.hex
+          ./tools/firmware-size-report.sh cc26x2-ncp-cc2652p7 "$ELF" examples/cc26x2-ncp/target/cc26x2-ncp-cc2652p7.size.json
+      - name: Upload CC2652P7 NCP firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cc26x2-ncp-firmware
+          path: |
+            examples/cc26x2-ncp/target/cc26x2-ncp-*.hex
+            examples/cc26x2-ncp/target/cc26x2-ncp-*.size.json
           if-no-files-found: error
 
   build-efr32mg22:

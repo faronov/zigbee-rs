@@ -1,0 +1,66 @@
+[package]
+name = "cc26x2-ncp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+autobins = false
+
+# zigbee-rs ZRHP v1 network co-processor (coordinator + Trust Center + GP
+# combo) for CC2652P7 USB dongles; the host link is the dongle's UART.
+#   cargo build --release
+[[bin]]
+name = "cc26x2-ncp"
+path = "src/main.rs"
+
+[features]
+default = ["cc2652p7-dongle"]
+cc2652p7-dongle = ["cc26x2-ncp-product/cc2652p7-dongle", "cc26x2-dongle/cc2652p7-dongle"]
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+cc26x2-hal = { path = "../../cc26x2-hal", features = ["rt", "time-driver", "uart-host-rings"] }
+cc26x2-dongle = { path = "../../boards/cc26x2-dongle", default-features = false }
+cc26x2-ncp-product = { path = "../../products/cc26x2-ncp", default-features = false }
+# `compact`: 8-frame link window, 1 KiB endpoint queues and the compact
+# stack tables (128 Trust Center devices): the full ESP32-H2 capacity
+# needs ~164 KiB of static RAM, more than the CC2652P7's 144 KiB.
+ncp-coordinator-app = { path = "../../apps/ncp-coordinator", features = ["compact"] }
+# GP combo without the TempMaster: `green-power-bidirectional` needs a MAC
+# with timed transmission (`zigbee-mac/timed-tx`), which the CC26x2 backend
+# does not implement yet.
+router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity", "ncp-capacity-compact", "green-power-sink"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = [
+    "centralized-tclk",
+    "trust-center",
+    "global-aps-counter",
+    "host-passthrough",
+    "ncp-capacity",
+    "ncp-capacity-compact",
+    "green-power-ncp",
+] }
+# `pan-coordinator`: MLME-START with short address 0x0000; `ncp-capacity`:
+# the NCP table sizes (the CC26x2 RF core source-match tables stay 16 + 16).
+zigbee-mac = { path = "../../zigbee-mac", features = ["cc26x2", "pan-coordinator", "ncp-capacity"] }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-bdb = { path = "../../zigbee-bdb", default-features = false }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
+embassy-time = "0.5"
+embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
+log = { version = "0.4", features = ["max_level_info", "release_max_level_info"] }
+static_cell = "2"
+
+[profile.dev]
+opt-level = "s"
+debug = true
+
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+debug = true
+panic = "abort"

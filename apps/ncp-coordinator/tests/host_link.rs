@@ -344,11 +344,24 @@ fn host_negotiates_forms_reads_counters_and_sends_data() {
     assert_eq!(negotiated.ncp_caps & caps::NCP_FW_UPDATE, 0, "NoPlatform");
     assert_eq!(negotiated.capacity(1), Some(16), "max_aps_inflight");
     assert_eq!(negotiated.capacity(7), Some(0x400), "fc_stride");
-    // `ncp-capacity` table sizes (spec 8.9).
-    assert_eq!(negotiated.capacity(3), Some(256), "link_key_cache");
-    assert_eq!(negotiated.capacity(4), Some(512), "address_map_cache");
-    assert_eq!(negotiated.capacity(5), Some(128), "source_route_cache");
-    assert_eq!(negotiated.capacity(11), Some(96), "neighbor_table");
+    // `ncp-capacity` table sizes (spec 8.9), halved by `compact`.
+    let (keys, address_map, source_routes, neighbors) = if cfg!(feature = "compact") {
+        (128, 256, 64, 64)
+    } else {
+        (256, 512, 128, 96)
+    };
+    assert_eq!(negotiated.capacity(3), Some(keys), "link_key_cache");
+    assert_eq!(
+        negotiated.capacity(4),
+        Some(address_map),
+        "address_map_cache"
+    );
+    assert_eq!(
+        negotiated.capacity(5),
+        Some(source_routes),
+        "source_route_cache"
+    );
+    assert_eq!(negotiated.capacity(11), Some(neighbors), "neighbor_table");
 
     // NWK_INIT on a factory-new NCP: NOT_FORMED.
     let init = host.request(&NwkInit {

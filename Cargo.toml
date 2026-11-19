@@ -35,6 +35,8 @@ exclude = [
     "boards/cc26x2-dongle",
     "products/cc26x2-dongle",
     "examples/cc26x2-router",
+    "products/cc26x2-ncp",
+    "examples/cc26x2-ncp",
     "vendor/esp-hal",
     "vendor/esp-radio",
     "vendor/esp-radio-0.18",

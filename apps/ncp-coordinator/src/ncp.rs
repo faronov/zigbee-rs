@@ -53,10 +53,10 @@ use crate::port::{
 use crate::transport::{HostTransport, UartChangeError};
 use zigbee_zrhp::msg::tables::EvtTblEpochChanged;
 
-/// Link slots (spec 8.9: 16 × 652 B each direction).
-pub const WINDOW: usize = 16;
+/// Link slots (spec 8.9: 16 × 652 B each direction; 8 with `compact`).
+pub const WINDOW: usize = [16, 8][cfg!(feature = "compact") as usize];
 /// Bytes of queued outgoing messages per endpoint.
-pub const QUEUE_BYTES: usize = 1536;
+pub const QUEUE_BYTES: usize = [1536, 1024][cfg!(feature = "compact") as usize];
 /// `max_aps_inflight`: accepted, not yet confirmed `APS_DATA_REQUEST`s.
 pub const MAX_APS_INFLIGHT: usize = 16;
 /// Outgoing-counter reservation stride (`FRAME_COUNTER_RESERVATION_SIZE`).

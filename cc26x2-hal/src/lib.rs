@@ -49,6 +49,7 @@ pub mod flash;
 pub mod gpio;
 mod mmio;
 pub mod prcm;
+pub mod reset;
 pub mod rf;
 pub mod setup;
 #[cfg(feature = "time-driver")]

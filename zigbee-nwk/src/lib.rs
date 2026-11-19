@@ -2311,7 +2311,7 @@ impl<M: MacDriver> NwkLayer<M> {
 }
 
 /// Coordinator NCP table sizes (`ncp-capacity`, ZRHP spec 8.2/8.9).
-#[cfg(all(test, feature = "ncp-capacity"))]
+#[cfg(all(test, feature = "ncp-capacity", not(feature = "ncp-capacity-compact")))]
 mod ncp_capacity_tests {
     use super::*;
     use crate::neighbor::{NeighborEntry, NeighborTable, Relationship};
@@ -2389,3 +2389,56 @@ pub(crate) const fn ncp_capacity(default: usize, ncp: usize) -> usize {
 /// Device departures for a network co-processor host (declared last: keeps
 /// the line numbers above, which panic locations embed, unchanged).
 pub mod host_events;
+
+/// Three-tier table capacity: `default`, `ncp` with `ncp-capacity`, and
+/// `compact` with `ncp-capacity-compact` (a coordinator NCP on a part with
+/// less RAM, e.g. the CC2652P7's 144 KiB). Only evaluated in constant
+/// contexts (declared last: keeps the line numbers above unchanged).
+pub(crate) const fn ncp_capacity_tier(default: usize, ncp: usize, compact: usize) -> usize {
+    if cfg!(feature = "ncp-capacity-compact") {
+        compact
+    } else {
+        ncp_capacity(default, ncp)
+    }
+}
+
+/// Compact coordinator NCP table sizes (`ncp-capacity-compact`).
+#[cfg(all(test, feature = "ncp-capacity-compact"))]
+mod ncp_capacity_compact_tests {
+    use super::*;
+    use crate::neighbor::{NeighborEntry, NeighborTable, Relationship};
+
+    #[test]
+    fn tables_have_the_compact_capacities() {
+        assert_eq!(neighbor::MAX_NEIGHBORS, 64);
+        assert_eq!(address_map::MAX_ADDRESS_MAP_ENTRIES, 256);
+        assert_eq!(routing::MAX_SOURCE_ROUTES, 64);
+        assert_eq!(indirect::MAX_INDIRECT, 16);
+        assert_eq!(security::MAX_FRAME_COUNTER_ENTRIES, 96);
+        // 32 children plus 32 router neighbors; every neighbor (and a
+        // margin) has an NWK replay floor that is never displaced.
+        assert_eq!(nib::Nib::new().max_children, 32);
+        const { assert!(neighbor::MAX_NEIGHBORS >= 32 + 32) };
+        const { assert!(security::MAX_FRAME_COUNTER_ENTRIES > neighbor::MAX_NEIGHBORS) };
+    }
+
+    #[test]
+    fn the_neighbor_table_holds_32_children_and_32_routers() {
+        let mut table = NeighborTable::new();
+        for index in 0..neighbor::MAX_NEIGHBORS as u16 {
+            let [lo, hi] = index.to_le_bytes();
+            let mut entry = NeighborEntry::new_from_annce(
+                ShortAddress(0x1000 + index),
+                [lo, hi, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5],
+            );
+            entry.relationship = if index < 32 {
+                Relationship::Child
+            } else {
+                Relationship::Sibling
+            };
+            assert!(table.add_or_update(entry).is_ok(), "slot {index}");
+        }
+        assert_eq!(table.len(), neighbor::MAX_NEIGHBORS);
+        assert_eq!(table.children().count(), 32);
+    }
+}

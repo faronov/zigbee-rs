@@ -39,11 +39,13 @@ const CTL_CTSEN: u32 = 1 << 15;
 const INT_RX: u32 = (1 << 4) | (1 << 6) | (1 << 10);
 /// TX FIFO level interrupt.
 const INT_TX: u32 = 1 << 5;
+/// `DR` framing, parity and break error bits.
+const DR_ERRORS: u32 = 0x7 << 8;
 
 /// Receive ring capacity (power of two). The `uart-host-rings` feature
 /// sizes it for a host link (ZRHP NCP); logging-only images keep 1 KiB.
 #[cfg(feature = "uart-host-rings")]
-pub const RX_RING_LEN: usize = 4096;
+pub const RX_RING_LEN: usize = 8192;
 /// Receive ring capacity (power of two).
 #[cfg(not(feature = "uart-host-rings"))]
 pub const RX_RING_LEN: usize = 1024;
@@ -72,6 +74,8 @@ pub enum UartError {
     Baud,
     /// The SERIAL power domain did not come up.
     Power,
+    /// The transmit ring did not drain (rate change refused; retry).
+    Busy,
 }
 
 /// Divisors for `baud` at `clock` (driverlib `UARTConfigSetExpClk`).
@@ -138,6 +142,10 @@ impl Uart0 {
     /// (ZRHP `SYS_SET_UART`).
     pub fn set_baud(&mut self, baud: u32) -> Result<(), UartError> {
         let (ibrd, fbrd) = divisors(crate::MCU_CLOCK_HZ, baud).ok_or(UartError::Baud)?;
+        // Bytes queued by `try_write` leave at the old rate first.
+        if !prcm::wait(|| TX_RING.is_empty()) {
+            return Err(UartError::Busy);
+        }
         self.flush();
         let ctl = mmio::read(CTL);
         mmio::write(CTL, ctl & !CTL_UARTEN);
@@ -205,6 +213,12 @@ impl Uart0 {
     pub fn rx_overruns(&self) -> u32 {
         RX_OVERRUNS.load(Ordering::Relaxed)
     }
+
+    /// Received bytes dropped for a framing, parity or break error since
+    /// boot (wrapping).
+    pub fn rx_line_errors(&self) -> u32 {
+        RX_LINE_ERRORS.load(Ordering::Relaxed)
+    }
 }
 
 /// Blocking FIFO write usable before a [`Uart0`] exists (panic/log path).
@@ -223,6 +237,7 @@ pub fn flush_blocking() {
 }
 
 static RX_OVERRUNS: AtomicU32 = AtomicU32::new(0);
+static RX_LINE_ERRORS: AtomicU32 = AtomicU32::new(0);
 static RING: Ring<RX_RING_LEN> = Ring::new();
 static TX_RING: Ring<TX_RING_LEN> = Ring::new();
 
@@ -303,8 +318,13 @@ extern "C" fn UART0_COMB() {
         mmio::write(RSR_ECR, 0);
     }
     while mmio::read(FR) & FR_RXFE == 0 {
-        let byte = (mmio::read(DR) & 0xFF) as u8;
-        if !RING.push(byte) {
+        let word = mmio::read(DR);
+        // Framing, parity or break error: the byte is not data.
+        if word & DR_ERRORS != 0 {
+            RX_LINE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if !RING.push((word & 0xFF) as u8) {
             RX_OVERRUNS.fetch_add(1, Ordering::Relaxed);
         }
     }

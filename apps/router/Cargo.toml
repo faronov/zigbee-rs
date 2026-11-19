@@ -21,6 +21,8 @@ global-aps-counter = ["trust-center", "zigbee-runtime/global-aps-counter"]
 # zigbee-runtime `ncp-capacity`). Off by default: images without it are
 # unchanged.
 ncp-capacity = ["global-aps-counter", "zigbee-runtime/ncp-capacity"]
+# Compact NCP tables (zigbee-runtime `ncp-capacity-compact`).
+ncp-capacity-compact = ["ncp-capacity", "zigbee-runtime/ncp-capacity-compact"]
 # Maintenance rejoin requests through `RouterObserver::take_rejoin_request`.
 # Off by default so products that never request one carry no request path.
 rejoin-request = []

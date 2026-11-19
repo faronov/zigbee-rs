@@ -25,7 +25,7 @@ use zigbee_types::IeeeAddress;
 
 /// Maximum number of link key entries (256 with `ncp-capacity`, spec 8.9).
 #[cfg(feature = "trust-center")]
-pub const MAX_KEY_TABLE_ENTRIES: usize = [32, 256][cfg!(feature = "ncp-capacity") as usize];
+pub const MAX_KEY_TABLE_ENTRIES: usize = key_table_entries();
 #[cfg(not(feature = "trust-center"))]
 pub const MAX_KEY_TABLE_ENTRIES: usize = 16;
 
@@ -1344,7 +1344,7 @@ mod global;
 pub use global::GlobalApsCounter;
 
 /// Coordinator NCP link-key table (`ncp-capacity`, ZRHP spec 8.9).
-#[cfg(all(test, feature = "ncp-capacity"))]
+#[cfg(all(test, feature = "ncp-capacity", not(feature = "ncp-capacity-compact")))]
 mod ncp_capacity_tests {
     use super::*;
 
@@ -1378,5 +1378,49 @@ mod ncp_capacity_tests {
         );
         // Fail closed: a full table refuses a new partner.
         assert!(security.add_key(entry(0x7FFF)).is_err());
+    }
+}
+
+/// Compact coordinator NCP link-key table (`ncp-capacity-compact`).
+#[cfg(all(test, feature = "ncp-capacity-compact"))]
+mod ncp_capacity_compact_tests {
+    use super::*;
+
+    fn entry(index: u16) -> ApsLinkKeyEntry {
+        let [lo, hi] = index.to_le_bytes();
+        ApsLinkKeyEntry {
+            partner_address: [lo, hi, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A],
+            key: [lo; 16],
+            key_type: ApsKeyType::TrustCenterLinkKey,
+            outgoing_frame_counter: 0,
+            outgoing_frame_counter_limit: 0x400,
+            incoming_frame_counter: 0,
+            incoming_frame_counter_valid: false,
+        }
+    }
+
+    #[test]
+    fn the_link_key_table_holds_128_unique_keys_and_then_refuses() {
+        assert_eq!(MAX_KEY_TABLE_ENTRIES, 128);
+        let mut security = ApsSecurity::new();
+        for index in 0..MAX_KEY_TABLE_ENTRIES as u16 {
+            assert!(security.add_key(entry(index)).is_ok(), "key {index}");
+        }
+        assert_eq!(security.key_count(), MAX_KEY_TABLE_ENTRIES);
+        assert!(security.add_key(entry(0x7FFF)).is_err());
+    }
+}
+
+/// Link-key table size: 32, 256 with `ncp-capacity`, 128 with
+/// `ncp-capacity-compact` (declared last: keeps the line numbers above
+/// unchanged).
+#[cfg(feature = "trust-center")]
+const fn key_table_entries() -> usize {
+    if cfg!(feature = "ncp-capacity-compact") {
+        128
+    } else if cfg!(feature = "ncp-capacity") {
+        256
+    } else {
+        32
     }
 }

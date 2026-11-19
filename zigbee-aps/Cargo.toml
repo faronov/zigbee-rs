@@ -39,6 +39,8 @@ green-power = ["zigbee-nwk/green-power"]
 # link-key table and the NWK `ncp-capacity` tables. Off by default: images
 # without it are unchanged.
 ncp-capacity = ["trust-center", "zigbee-nwk/ncp-capacity"]
+# Compact coordinator NCP: 128 link keys and the compact NWK tables.
+ncp-capacity-compact = ["ncp-capacity", "zigbee-nwk/ncp-capacity-compact"]
 
 [dev-dependencies]
 zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }

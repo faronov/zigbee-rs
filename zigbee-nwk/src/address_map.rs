@@ -24,7 +24,7 @@ use zigbee_types::{IeeeAddress, ShortAddress};
 /// cache exactly as before and the address map has zero capacity — keeping
 /// the sleepy end-device image lean.
 #[cfg(feature = "router")]
-pub const MAX_ADDRESS_MAP_ENTRIES: usize = crate::ncp_capacity(32, 512);
+pub const MAX_ADDRESS_MAP_ENTRIES: usize = crate::ncp_capacity_tier(32, 512, 256);
 #[cfg(not(feature = "router"))]
 pub const MAX_ADDRESS_MAP_ENTRIES: usize = 0;
 

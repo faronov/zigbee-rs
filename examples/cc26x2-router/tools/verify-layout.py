@@ -9,10 +9,13 @@ Checks (all hard failures):
   bootloader and its backdoor enabled (the only recovery path of a dongle
   without a debug header), the image valid at 0 and no sector protected;
 * the vector table has 16 + 38 entries and starts at 0;
-* RAM use leaves at least 12 KiB of stack.
+* RAM use leaves at least 12 KiB of stack (16 KiB for the NCP).
 
     verify-layout.py --chip cc2652p  target/.../cc26x2-router
     verify-layout.py --chip cc2652p7 target/p7/.../cc26x2-router
+    verify-layout.py --chip cc2652p7 --layout ncp examples/cc26x2-ncp/target/.../cc26x2-ncp
+
+`--layout ncp` checks against `products/cc26x2-ncp/link/memory-<chip>.x`.
 """
 import argparse
 import struct
@@ -23,6 +26,9 @@ CHIPS = {
     "cc2652p": (352 * 1024, 0x4A000, 0x20014000),
     "cc2652p7": (704 * 1024, 0x9E000, 0x20024000),
 }
+# Application end of the ZRHP NCP product (160 KiB of NV journals).
+NCP_APP_END = {"cc2652p7": 0x86000}
+NCP_MIN_STACK = 16 * 1024
 RAM_START = 0x20000000
 MIN_STACK = 12 * 1024
 VECTORS = (16 + 38) * 4
@@ -59,9 +65,15 @@ def segments(data):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--chip", choices=sorted(CHIPS), required=True)
+    ap.add_argument("--layout", choices=("router", "ncp"), default="router")
     ap.add_argument("elf")
     args = ap.parse_args()
     flash_size, app_end, ram_end = CHIPS[args.chip]
+    min_stack = MIN_STACK
+    if args.layout == "ncp":
+        if args.chip not in NCP_APP_END:
+            fail("no NCP layout for %s" % args.chip)
+        app_end, min_stack = NCP_APP_END[args.chip], NCP_MIN_STACK
     ccfg_addr = flash_size - 88
     data = open(args.elf, "rb").read()
     secs = sections(data)
@@ -99,7 +111,7 @@ def main():
         h = secs.get(name)
         if h and h[5]:
             ram_top = max(ram_top, h[3] + h[5])
-    if ram_end - ram_top < MIN_STACK:
+    if ram_end - ram_top < min_stack:
         fail("RAM ends at 0x%08X: only %d bytes left for the stack" % (ram_top, ram_end - ram_top))
     print("%s: flash %d B of %d (%.1f%%), headroom %d B; RAM static %d B, stack %d B; CCFG BL 0x%08X"
           % (args.chip, flash_end, app_end, 100.0 * flash_end / app_end, app_end - flash_end,
