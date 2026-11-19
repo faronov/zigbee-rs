@@ -85,9 +85,22 @@ rotation commands.
   S3 bridge (2026-11-18, IDF v5.5.1 rollback bootloader, 4 MB A/B table):
   smoke (echo RTT ≈ 5.6 ms), `NWK_FORM` (PAN 0x1C06, channel 17), reset +
   `NWK_INIT` resume with forward-only counters (gates H2/H8 subset).
-* Not run on hardware: TABLES, BACKUP, FW_* (update, trial, rollback), IEEE
-  override, PTA, GP sink, the heap in `dram2_seg`, any device join and the
-  remaining gates.
+* Same board, this image (2026-11-19): boots with the esp-alloc heap in
+  `dram2_seg`; the new image resumed the network the previous image formed
+  (NV format unchanged); `TBL_STATS`/`TBL_SYNC`/`TBL_READ` (empty table);
+  `BKP_EXPORT` (6 records, END verified) → reset → `BKP_RESTORE` (counters
+  3072/4096 → 13072/14096 with margins 10 000) → reset → `NWK_INIT` resumed
+  the restored network with forward-only counters.
+* FW_* A/B on the same H2 (`dev-unsigned-fw` builds 0.1.0 → 0.1.1, 702 KB,
+  512 B writes, ≈ 30 s at 460 800): staged in `ota_1`, verified, activated;
+  the trial image resumed the network and reported slot 1 on trial; a reset
+  without `FW_CONFIRM` rolled back to 0.1.0 (slot 0 confirmed, network and
+  counters kept); a second update with `FW_CONFIRM` stayed on 0.1.1 across a
+  reset. Signed (envelope) images and the 10-minute trial-window expiry were
+  not run on hardware.
+* Not run on hardware: SYS_SET_IEEE, PTA (`pta` image), GP sink commissioning,
+  restore of a foreign backup (other IEEE, z2m/OCB with device keys), any
+  device join and the remaining gates.
 
 ## Sizes (release, nightly-2026-08-01, 2026-11-19)
 
