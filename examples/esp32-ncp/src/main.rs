@@ -166,6 +166,8 @@ fn main() -> ! {
     // stack exist (the check may program otadata).
     static PLATFORM: StaticCell<EspPlatform> = StaticCell::new();
     let (platform, boot) = boot_platform();
+    // The first boot of a new image reports `reset_reason` 5.
+    let trial = matches!(boot, BootOutcome::Trial { .. });
     match boot {
         BootOutcome::RolledBack { slot } => {
             log::error!("unconfirmed image rolled back to slot {}", slot);
@@ -221,7 +223,7 @@ fn main() -> ! {
         flash_size: verdict.reported_size(),
         board: product::BOARD_NAME,
         product: product::PRODUCT_NAME,
-        reset_reason: reset_reason(),
+        reset_reason: if trial { 5 } else { reset_reason() },
         key_export: true,
         max_children: zigbee_runtime::child_store::MAX_PERSISTED_CHILDREN as u32,
         max_tc_devices: zigbee_bdb::trust_center::MAX_TRUST_CENTER_DEVICES as u32,
