@@ -57,6 +57,7 @@ pub struct MockMac {
     association_responses: Vec<MlmeAssociateResponse, 8>,
     orphan_responses: Vec<MlmeOrphanResponse, 8>,
     indirect_pending_history: Vec<(MacAddress, bool), 16>,
+    poll_acked_without_frame_pending: bool,
     rx_queue: Vec<McpsDataIndication, 8>,
     command_queue: Vec<MacCommandEvent, 8>,
     poll_count: u32,
@@ -151,6 +152,7 @@ impl MockMac {
             association_responses: Vec::new(),
             orphan_responses: Vec::new(),
             indirect_pending_history: Vec::new(),
+            poll_acked_without_frame_pending: false,
             rx_queue: Vec::new(),
             command_queue: Vec::new(),
             poll_count: 0,
@@ -298,6 +300,12 @@ impl MockMac {
     }
 
     /// Fail the next `count` MLME-POLL requests with `MacError::NoAck`.
+    /// Report every child's latest Data Request as acknowledged with Frame
+    /// Pending = 0 ([`MacDriver::poll_acked_without_frame_pending`]).
+    pub fn set_poll_acked_without_frame_pending(&mut self, acked_without: bool) {
+        self.poll_acked_without_frame_pending = acked_without;
+    }
+
     pub fn set_poll_failures(&mut self, count: u32) {
         self.poll_failures = count;
     }
@@ -703,6 +711,10 @@ impl MacDriver for MockMac {
         self.indirect_pending_history
             .push((child, pending))
             .map_err(|_| MacError::TransactionOverflow)
+    }
+
+    fn poll_acked_without_frame_pending(&self, _child: &MacAddress) -> bool {
+        self.poll_acked_without_frame_pending
     }
 
     async fn mcps_indirect_data(

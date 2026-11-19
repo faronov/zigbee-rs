@@ -320,6 +320,13 @@ pub trait RadioPhy {
     /// Forget every armed Frame Pending source (MLME-RESET).
     fn clear_ack_frame_pending(&mut self) {}
 
+    /// Whether the hardware / ISR auto-ACK to the latest Data Request from
+    /// `source` carried Frame Pending = 0 (see
+    /// [`crate::MacDriver::poll_acked_without_frame_pending`]).
+    fn data_request_acked_without_pending(&self, _source: &MacAddress) -> bool {
+        false
+    }
+
     /// Whether [`Self::transmit_at`] is implemented and every received
     /// frame carries [`PhyRxFrame::rx_end_us`] (`timed-tx`).
     #[cfg(feature = "timed-tx")]

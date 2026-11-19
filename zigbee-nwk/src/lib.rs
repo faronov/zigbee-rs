@@ -1911,6 +1911,13 @@ impl<M: MacDriver> NwkLayer<M> {
         #[cfg(feature = "adaptive-indirect")]
         self.poll_estimates
             .note_poll(child, self.mac.monotonic_micros());
+        // The ACK to this poll said "no data" (the frame was queued after the
+        // hardware acknowledged it), so the child has turned its receiver
+        // off: a frame sent now is acknowledged by its radio and dropped by
+        // its stack. It stays queued, Frame Pending armed, for the next poll.
+        if self.mac.poll_acked_without_frame_pending(&source) {
+            return Ok(ChildPollOutcome::NoData);
+        }
         let mut refreshed = [0u8; nlde::MAX_NWK_FRAME];
         let (kind, len) = {
             let Some(frame) = self.indirect.peek(child) else {
