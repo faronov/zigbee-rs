@@ -9,3 +9,9 @@ publish = false
 
 [dependencies]
 embassy-nrf = { version = "0.3", features = ["nrf52840"] }
+
+[features]
+# AT2401C (SKY66112-11-class two-pin) RF front-end add-on wired to the DK
+# header as in devbis/nrf-ncp's nrf52840dk overlay: CTX on P1.04, CRX on
+# P1.02. Not fitted on a stock DK; hardware-unverified.
+fem-at2401c = []

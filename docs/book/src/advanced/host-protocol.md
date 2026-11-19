@@ -1176,6 +1176,20 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | `0x0189` | `EVT_CHANNEL_CHANGED` | `u8 channel, u8 nwk_update_id, u16 req_tid` | event | N |
 | `0x018A` | `EVT_ENERGY_SCAN_RESULT` | `u16 req_tid, u8 status, u8 n, n×{u8 channel, i8 max_rssi_dbm, u8 energy}` | event | N |
 
+**RF front-end modules (external PA/LNA).** Every power and level on this
+interface is **antenna-referred**, with or without a FEM, so no capability
+bit is needed and a host never applies FEM gains itself. `NWK_SET_TX_POWER`
+`dbm` (and `NWK_FORM`/restore `tx_power`) is the requested output at the
+antenna port. An NCP with a FEM caps it at the product's regulatory
+maximum and programs the radio with `dbm − PA gain`, rounded down to a
+supported radio step. It must return the effective antenna output in
+`applied_dbm`, which on nRF52 is `TxPowerSplit::antenna_dbm` from
+`NrfFemPhy`. `applied_dbm` can therefore be lower than the request, for
+example 18 for a request of 20 with a 22 dB PA. RSSI, LQI and energy-scan
+values exclude the LNA gain. This is `zigbee-mac` `fem`, with the nRF52
+backend `nrf-fem`, which is hardware-unverified; see the nRF platform
+guide. No current NCP image has a FEM.
+
 ### 7.3 DATA (`0x02xx`, endpoint 2)
 
 `APS_DATA_REQUEST` (`0x0201`) request payload:

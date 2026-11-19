@@ -134,6 +134,17 @@ nrf52833 = [
 # `nrf52833`. Kept opt-in so sleepy images compile the unchanged MAC.
 nrf-isr-phy = []
 
+# External RF front-end module (PA/LNA) policy: antenna-referred TX power
+# split, received-level and CCA-threshold correction (`fem`). Pure and
+# platform-independent; selected by a platform FEM backend.
+fem = []
+# nRF52833/nRF52840 FEM pin control (`nrf::NrfFem`): CTX/CRX (and optional
+# PDN) switched by RADIO events through PPI + GPIOTE, attached to
+# `NrfRadioPhy` or `NrfIsrRadioPhy` by the composition root. Off by default:
+# every image without it is byte-identical. Hardware-unverified (no FEM
+# board has been tested); see docs/book/src/platform-guides/nrf.md.
+nrf-fem = ["fem"]
+
 # Nordic ECB hardware AES-128 is mandatory for both nRF production backends.
 # This marker feature is pulled in by each chip feature; it is not an
 # independently selectable software/hardware switch.

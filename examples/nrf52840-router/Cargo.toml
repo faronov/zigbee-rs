@@ -46,6 +46,15 @@ green-power = [
     "router-app/green-power",
     "nrf52840-router-product/green-power",
 ]
+# AT2401C RF front-end add-on (devbis/nrf-ncp wiring: CTX P1.04, CRX
+# P1.02, LNA 5 dB, PA 22 dB) under either role: PA/LNA switched by RADIO
+# events through PPI 16..=19 + GPIOTE 6/7, antenna-referred TX power capped
+# by the product. Hardware-unverified; images without it are unchanged.
+fem-at2401c = [
+    "zigbee-mac/nrf-fem",
+    "nrf52840-dk/fem-at2401c",
+    "nrf52840-router-product/fem-at2401c",
+]
 
 [dependencies]
 zigbee-types = { path = "../../zigbee-types" }

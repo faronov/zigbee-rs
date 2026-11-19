@@ -27,6 +27,8 @@ extern crate alloc;
 
 #[cfg(any(feature = "esp-parent", test))]
 pub mod ack_pending;
+#[cfg(any(test, feature = "fem"))]
+pub mod fem;
 pub mod frames;
 #[cfg(feature = "timed-tx")]
 pub mod gp_reply;
@@ -58,6 +60,9 @@ mod nrf_aes;
 
 #[cfg(any(test, feature = "nrf-isr-phy"))]
 pub mod nrf_ack;
+
+#[cfg(any(test, feature = "nrf-fem"))]
+pub mod nrf_fem;
 
 #[cfg(any(feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 pub mod esp;

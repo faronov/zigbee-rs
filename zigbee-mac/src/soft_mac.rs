@@ -522,10 +522,10 @@ impl<P: RadioPhy, R: MacRole, const RX: usize> SoftMacCore<P, R, RX> {
 
     pub fn reset_pib(&mut self, dsn: u8, bsn: u8) -> Result<(), MacError> {
         let mut next = MacPib::new(self.pib.extended_address(), dsn, bsn);
-        if P::DEFAULT_TX_POWER_DBM != 0 {
+        if self.phy.default_tx_power_dbm() != 0 {
             next.set(
                 PibAttribute::PhyTransmitPower,
-                PibValue::I8(P::DEFAULT_TX_POWER_DBM),
+                PibValue::I8(self.phy.default_tx_power_dbm()),
             )
             .map_err(pib_error)?;
         }

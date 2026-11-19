@@ -272,6 +272,10 @@ jobs:
             manifest: products/nrf52840-router/Cargo.toml
             workspace: products/nrf52840-router
             features: green-power
+          - name: nRF52840 router product (AT2401C FEM policy)
+            manifest: products/nrf52840-router/Cargo.toml
+            workspace: products/nrf52840-router
+            features: fem-at2401c
           - name: EFR32MG21 board
             manifest: boards/efr32mg21-devkit/Cargo.toml
             workspace: boards/efr32mg21-devkit
@@ -501,6 +505,7 @@ jobs:
       - run: cargo clippy -p zigbee-runtime --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zdo --features router --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --features stm32wb --all-targets --locked -- -D warnings
+      - run: cargo clippy -p zigbee-mac --features nrf-fem --all-targets --locked -- -D warnings
       - run: cargo clippy -p zigbee-runtime --no-default-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --no-default-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --no-default-features --features float32 --locked -- -D warnings
@@ -1034,6 +1039,46 @@ jobs:
           done
           NM="$NM" ./tools/check-role-symbols.sh leaf "$D33/nrf52833-ed"
           NM="$NM" ./tools/check-role-symbols.sh parent "$D33/nrf52833-router" "$D40/nrf52840-router"
+          # The shipped images carry no FEM pin control (`nrf-fem` is opt-in).
+          for ELF in "$D33/nrf52833-ed" "$D33/nrf52833-router" "$D40/nrf52840-router"; do
+            if "$NM" --demangle "$ELF" | grep -q 'zigbee_mac::nrf::fem'; then
+              echo "$(basename "$ELF") links the opt-in FEM backend" >&2
+              exit 1
+            fi
+          done
+      # AT2401C front-end variant (devbis/nrf-ncp wiring). Hardware-unverified:
+      # build, clippy and symbol gates only. Separate target dir, so the
+      # shipped artifacts above are untouched.
+      - name: Build nRF52840 FEM variants (hardware-unverified)
+        run: |
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          cd examples/nrf52840-router
+          cargo build --release --locked --target-dir target/fem --features fem-at2401c
+          cargo build --release --locked --target-dir target/fem \
+            --no-default-features --features router,fem-at2401c
+          cargo clippy --release --locked --target-dir target/fem --target thumbv7em-none-eabihf \
+            --no-default-features --features router,fem-at2401c -- -D warnings
+          for ELF in target/fem/thumbv7em-none-eabihf/release/nrf52840-ed \
+                     target/fem/thumbv7em-none-eabihf/release/nrf52840-router; do
+            "$OBJCOPY" -O binary "$ELF" "${ELF}.bin"
+            IMAGE_BYTES=$(wc -c < "${ELF}.bin" | tr -d '[:space:]')
+            echo "$(basename "$ELF") (fem-at2401c): $IMAGE_BYTES B"
+            if [ "$IMAGE_BYTES" -gt 1015808 ]; then
+              echo "$(basename "$ELF") FEM variant overruns application flash" >&2
+              exit 1
+            fi
+            # The FEM must be attached (its PPI plan and power split linked).
+            if ! "$NM" --demangle "$ELF" | grep -q 'zigbee_mac::nrf::fem'; then
+              echo "$(basename "$ELF") FEM variant does not link the nRF FEM backend" >&2
+              exit 1
+            fi
+          done
+          # nRF52833: both PHYs with the FEM backend compiled (no board wiring).
+          cd ../nrf52833-sensor
+          cargo check --release --locked --target-dir target/fem --features zigbee-mac/nrf-fem
+          cargo check --release --locked --target-dir target/fem \
+            --no-default-features --features router,zigbee-mac/nrf-fem
       - name: Upload nRF role firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

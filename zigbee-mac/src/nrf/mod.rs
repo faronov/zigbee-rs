@@ -318,3 +318,26 @@ impl zigbee_crypto::Aes128Forward for NrfHardwareAes128<'_> {
             .encrypt_block(&self.key, block)
     }
 }
+
+/// Nordic ED/LQI byte → IEEE 802.15.4 LQI, applied exactly once per
+/// received frame by both PHYs.
+#[cfg(not(feature = "nrf-fem"))]
+#[inline(always)]
+fn nrf_lqi(hardware: u8) -> u8 {
+    crate::lqi::nrf_from_hardware(hardware)
+}
+
+/// With `nrf-fem` the attached FEM's LNA gain is removed first, so the LQI
+/// reflects the level at the antenna (no-op without an attached FEM).
+#[cfg(feature = "nrf-fem")]
+#[inline(always)]
+fn nrf_lqi(hardware: u8) -> u8 {
+    crate::lqi::nrf_from_hardware(fem::rx_level(hardware))
+}
+
+#[cfg(feature = "nrf-fem")]
+mod fem;
+#[cfg(feature = "nrf-fem")]
+pub use fem::{FemGpioteChannel, FemLine, NrfFem, NrfFemHost, NrfFemPhy, NrfFemSoftMac};
+#[cfg(all(feature = "nrf-fem", feature = "nrf-isr-phy"))]
+pub use fem::{NrfFemIsrSoftMac, NrfFemRouterMac};

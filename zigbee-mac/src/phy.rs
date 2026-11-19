@@ -388,6 +388,13 @@ pub trait RadioPhy {
     fn wake(&mut self) -> Result<(), PhyError> {
         Ok(())
     }
+
+    /// `phyTransmitPower` (dBm) that an `MLME-RESET` with default PIB
+    /// restores on this instance: [`Self::DEFAULT_TX_POWER_DBM`] unless the
+    /// PHY's runtime configuration (an RF front-end module) defines it.
+    fn default_tx_power_dbm(&self) -> i8 {
+        Self::DEFAULT_TX_POWER_DBM
+    }
 }
 
 #[cfg(all(

@@ -168,7 +168,7 @@ impl<T: RadioInstance, R: RngInstance> RadioPhy for NrfRadioPhy<'_, T, R> {
             Either::Second(Ok(())) => {
                 // `Packet::lqi()` is the raw Nordic ED byte; the stack works
                 // in IEEE 802.15.4 LQI. Normalize exactly once, here.
-                frame.set(packet.as_ref(), crate::lqi::nrf_from_hardware(packet.lqi()))?;
+                frame.set(packet.as_ref(), super::nrf_lqi(packet.lqi()))?;
                 Ok(true)
             }
             Either::Second(Err(error)) => Err(Self::map_radio_error(error)),

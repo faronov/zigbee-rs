@@ -862,7 +862,7 @@ impl<'a, R: RngInstance> NrfIsrRadioPhy<'a, R> {
             let len = phr.saturating_sub(2);
             let data = core::slice::from_raw_parts(slot.add(1), len);
             let lqi = slot.add(1 + len).read();
-            frame.set(data, crate::lqi::nrf_from_hardware(lqi))
+            frame.set(data, super::nrf_lqi(lqi))
         };
         with_shared(|shared| {
             shared.head = (shared.head + 1) % NRF_ISR_RX_SLOTS;
@@ -1094,5 +1094,42 @@ impl<R: RngInstance> PlatformServices for NrfIsrRadioPhy<'_, R> {
     fn fill_random(&mut self, output: &mut [u8]) -> Result<(), MacError> {
         self.rng.blocking_fill_bytes(output);
         Ok(())
+    }
+}
+
+// ── FEM hooks (`nrf-fem`, used by `super::NrfFemPhy`) ─────────
+
+/// CCAEDTHRES of [`CCACTRL_DEFAULT`] (1 dB units), antenna-referred.
+#[cfg(feature = "nrf-fem")]
+const CCA_ED_THRESHOLD: u8 = 0x14;
+#[cfg(feature = "nrf-fem")]
+const _: () = assert!((CCACTRL_DEFAULT >> 8) & 0xFF == CCA_ED_THRESHOLD as u32);
+/// `FORK[20].TEP`: second task of `TIMER0 COMPARE[0]` → `TXEN`.
+#[cfg(feature = "nrf-fem")]
+const PPI_FORK20_TEP: usize =
+    crate::nrf_fem::fork_register(crate::nrf_fem::PPI_CH_ACK_TXEN) as usize;
+
+#[cfg(feature = "nrf-fem")]
+impl<R: RngInstance> NrfIsrRadioPhy<'_, R> {
+    /// Switch the FEM's PA on at the Imm-Ack's TXEN instant (FORK of the
+    /// pre-programmed channel 20, owned by this PHY) and raise the energy
+    /// CCA threshold by the LNA gain so it stays antenna-referred.
+    pub(super) fn arm_fem(&mut self, ack_txen_fork: u32, rx_gain_db: u8) {
+        let threshold = crate::fem::radio_ed_threshold(CCA_ED_THRESHOLD, rx_gain_db);
+        self.reconfigure(|_| {
+            write(
+                RADIO_CCACTRL,
+                (CCACTRL_DEFAULT & !0xFF00) | (u32::from(threshold) << 8),
+            );
+            write(PPI_FORK20_TEP, ack_txen_fork);
+        });
+    }
+
+    /// Undo [`Self::arm_fem`].
+    pub(super) fn disarm_fem(&mut self) {
+        self.reconfigure(|_| {
+            write(RADIO_CCACTRL, CCACTRL_DEFAULT);
+            write(PPI_FORK20_TEP, 0);
+        });
     }
 }
