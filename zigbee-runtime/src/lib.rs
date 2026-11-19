@@ -21061,3 +21061,8 @@ pub mod trust_center_stream;
 #[cfg(all(test, feature = "router", feature = "green-power-translation-table"))]
 #[path = "green_power/translation_tests.rs"]
 mod gp_translation_tests;
+
+/// GP sink configuration issued by the local application.
+#[cfg(feature = "green-power-translation-table")]
+#[path = "green_power/local_config.rs"]
+mod gp_local_config;

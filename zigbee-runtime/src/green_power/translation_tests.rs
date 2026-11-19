@@ -426,3 +426,85 @@ fn pairing_configuration_and_translation_update_retarget_a_gpd_toggle() {
     assert!(lights.two.is_on());
     assert!(!lights.one.is_on());
 }
+
+#[test]
+fn locally_issued_configuration_retargets_a_paired_gpd_without_a_tool() {
+    let gpd = GpdId::SrcId(SRC);
+    let mut router = combo();
+    let mut lights = Lights {
+        one: OnOffCluster::new(),
+        two: OnOffCluster::new(),
+    };
+    // Not a configuration command: nothing applied.
+    assert!(!router.gp_sink_configure_locally(server_cmd::NOTIFICATION, &[]));
+
+    // A Translation Table Update before the GPD is paired is refused
+    // (NOT_FOUND, no response on the local path).
+    let record = TranslationRecord {
+        index: 0xFF,
+        gpd_command: 0x22,
+        endpoint: 2,
+        profile: 0x0104,
+        cluster: 0x0006,
+        zcl_command: 0x01,
+        payload: TtPayload::Fixed(&[]),
+        additional_info: None,
+    };
+    let mut update = [0u8; 64];
+    let update_len =
+        TranslationTableUpdate::encode(&gpd, tt_action::ADD, &[record], &mut update).unwrap();
+    assert!(
+        router
+            .gp_sink_configure_locally(server_cmd::TRANSLATION_TABLE_UPDATE, &update[..update_len])
+    );
+    assert!(router.gp_sink().translations().is_empty());
+
+    // Pair (Extend creates the entry), then retarget Toggle.
+    let pc = PairingConfiguration {
+        actions: pairing_action::EXTEND,
+        gpd_id: gpd,
+        communication_mode: CommunicationMode::DerivedGroupcast,
+        mac_seq_cap: true,
+        rx_on_cap: false,
+        fixed_location: true,
+        device_id: 0x02,
+        groups: &[],
+        assigned_alias: None,
+        groupcast_radius: 0,
+        security: Some(PairingSecurity {
+            level: SecurityLevel::Encrypted,
+            key_type: KeyType::IndividualKey,
+            key: KEY,
+        }),
+        frame_counter: Some(10),
+        number_of_paired_endpoints: 0xFE,
+        paired_endpoints: &[],
+        application_information: None,
+    };
+    let mut payload = [0u8; 64];
+    let n = pc.encode(&mut payload).unwrap();
+    router.mac_mut().clear_tx_history();
+    assert!(router.gp_sink_configure_locally(server_cmd::PAIRING_CONFIGURATION, &payload[..n]));
+    assert!(
+        router
+            .gp_sink_configure_locally(server_cmd::TRANSLATION_TABLE_UPDATE, &update[..update_len])
+    );
+    assert_eq!(router.gp_sink().entries().len(), 1);
+    assert_eq!(router.gp_sink().translations().len(), 1);
+    assert!(router.gp_take_dirty());
+    // A broadcast without "send GP Pairing": nothing goes on the air.
+    block_on(router.gp_poll());
+    assert!(router.mac().tx_history().is_empty());
+
+    process(&mut router, &mut lights, &gpdf(11, 0x22));
+    assert!(lights.two.is_on());
+    assert!(!lights.one.is_on());
+
+    // Remove the translation: Toggle is back on the built-in endpoint 1.
+    let n =
+        TranslationTableUpdate::encode(&gpd, tt_action::REMOVE, &[record], &mut payload).unwrap();
+    assert!(router.gp_sink_configure_locally(server_cmd::TRANSLATION_TABLE_UPDATE, &payload[..n]));
+    assert!(router.gp_sink().translations().is_empty());
+    process(&mut router, &mut lights, &gpdf(12, 0x22));
+    assert!(lights.one.is_on());
+}

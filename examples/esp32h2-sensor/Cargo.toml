@@ -65,6 +65,8 @@ esp-println = { version = "0.12", features = ["esp32h2"] }
 esp-alloc = "0.9"
 static_cell = "2"
 heapless = { version = "0.9", optional = true }
+# GP cluster codecs for the `lab-gp-translation` image only.
+zigbee-gp = { path = "../../zigbee-gp", optional = true }
 log = "0.4"
 
 # The product supplies the interrupt-driven clock and CPU-idle executor.
@@ -135,6 +137,13 @@ combo-light = [
     "router-app/green-power-translation-table",
     "esp32-zigbee-devkit-product/combo-light",
 ]
+# Lab only, never in shipped images (with `combo-light`): ten seconds after
+# boot, retarget the lab GPD's Toggle to On/Off On through a locally issued
+# GP Pairing Configuration (Extend) and GP Translation Table Update, unless
+# the translation was restored from the GP journal (see
+# `src/gp_translation_lab.rs`). `lab-gp-translation-remove` removes it.
+lab-gp-translation = ["combo-light", "dep:zigbee-gp", "zigbee-gp/translation-table"]
+lab-gp-translation-remove = ["lab-gp-translation"]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
 # Accept only signed MCUboot envelopes over OTA (see the product's
