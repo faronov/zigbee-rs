@@ -358,6 +358,26 @@ impl TrustCenterTable {
                         device_address: indication.device_address,
                     });
                 }
+                // A MAC association comes from a factory-new device: the
+                // unique key this Trust Center generated for an earlier
+                // membership is gone on its side, so the network key would
+                // be undecryptable. Fall back to the default global key
+                // (and require a new link-key update). Install-code and
+                // provisioned keys are preconfigured on the device and stay;
+                // with install codes required nothing is relaxed.
+                if policy.install_codes != TrustCenterInstallCodePolicy::Required
+                    && self
+                        .device(&indication.device_address)
+                        .is_some_and(|device| {
+                            device.key_origin == TrustCenterKeyOrigin::GeneratedUnique
+                        })
+                {
+                    self.provision_link_key(
+                        indication.device_address,
+                        DEFAULT_TC_LINK_KEY,
+                        TrustCenterKeyOrigin::DefaultGlobal,
+                    )?;
+                }
                 self.admit_with_network_key(policy, indication)
             }
             ApsUpdateDeviceStatus::StandardDeviceTrustCenterRejoin => {
@@ -1327,6 +1347,60 @@ mod tests {
                 device_address: DEVICE
             }
         );
+    }
+
+    #[test]
+    fn association_of_a_reset_device_falls_back_to_the_global_key() {
+        let mut table = TrustCenterTable::new();
+        table
+            .handle_update_device(
+                policy(),
+                update(ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin),
+            )
+            .unwrap();
+        let unique = [0x5C; 16];
+        table
+            .install_generated_trust_center_link_key(DEVICE, unique, 15)
+            .unwrap();
+        table
+            .handle_verify_key(ApsmeVerifyKeyIndication {
+                source_address: DEVICE,
+                key_type: 0x04,
+                hash: derive_verify_key_hash(&unique),
+            })
+            .unwrap();
+        assert_eq!(table.device(&DEVICE).unwrap().link_key, unique);
+
+        // A secured rejoin keeps the verified key.
+        assert_eq!(
+            table
+                .handle_update_device(
+                    policy(),
+                    update(ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin)
+                )
+                .unwrap(),
+            TrustCenterAction::None
+        );
+        assert_eq!(table.device(&DEVICE).unwrap().link_key, unique);
+
+        // A new association (factory-new device) gets the network key under
+        // the default global key and must update its link key again.
+        assert!(matches!(
+            table
+                .handle_update_device(
+                    policy(),
+                    update(ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin)
+                )
+                .unwrap(),
+            TrustCenterAction::TransportNetworkKey {
+                link_key: DEFAULT_TC_LINK_KEY,
+                require_link_key_update: true,
+                ..
+            }
+        ));
+        let device = table.device(&DEVICE).unwrap();
+        assert_eq!(device.key_origin, TrustCenterKeyOrigin::DefaultGlobal);
+        assert_eq!(device.key_attributes, TrustCenterKeyAttributes::Provisional);
     }
 }
 
