@@ -29,6 +29,14 @@
 //!                  FW_BEGIN/WRITE/FINISH/ACTIVATE of FILE (format 1); the
 //!                  NCP reboots into the trial image
 //! --fw-confirm     FW_CONFIRM (after the trial image resumed: use --form)
+//! --join SECS      open NWK_PERMIT_JOIN on the NCP only for at most SECS,
+//!                  close it at the first admitted join, interview the
+//!                  device (Active_EP, Basic attributes), bind its
+//!                  measurement clusters to the NCP and print every event
+//!                  and indication until SECS elapsed
+//! --listen SECS --device 0xNWK [--ep N]
+//!                  read the device's Basic attributes and print every
+//!                  event and indication for SECS (no join window)
 //! ```
 
 use std::process::Command;
@@ -41,11 +49,14 @@ use zigbee_zrhp::msg::backup::{
     BkpExportBegin, BkpExportBeginRsp, BkpExportEnd, BkpExportRead, BkpRestoreBegin,
     BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, BkpRestorePutRsp,
 };
+use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst};
 use zigbee_zrhp::msg::diag::{DiagGetCounters, DiagGetCountersRsp};
 use zigbee_zrhp::msg::firmware::{
     FwActivate, FwBegin, FwBeginRsp, FwFinishRsp, FwGetSlotsRsp, FwWrite, FwWriteRsp,
 };
-use zigbee_zrhp::msg::network::{EvtNetworkState, NwkForm, NwkGetInfoRsp, NwkInit, NwkInitRsp};
+use zigbee_zrhp::msg::network::{
+    EvtNetworkState, NwkForm, NwkGetInfoRsp, NwkInit, NwkInitRsp, NwkPermitJoin,
+};
 use zigbee_zrhp::msg::security::SecGetFrameCountersRsp;
 use zigbee_zrhp::msg::system::{
     EvtNcpReady, SysEcho, SysGetInfoRsp, SysGetStatusRsp, SysNegotiateReq, SysNegotiateRsp,
@@ -765,6 +776,315 @@ fn fw_update<S: ByteStream>(host: &mut Host<S>, path: &str, version: u32) -> Res
     Ok(())
 }
 
+/// A ZCL/ZDO conversation with one joined device.
+struct Peer {
+    nwk: u16,
+    ieee: [u8; 8],
+    ep: Option<u8>,
+    seq: u8,
+}
+
+fn data_request<S: ByteStream>(
+    host: &mut Host<S>,
+    nwk: u16,
+    dst_ep: u8,
+    src_ep: u8,
+    profile: u16,
+    cluster: u16,
+    asdu: &[u8],
+) -> u16 {
+    host.request(&ApsDataRequest {
+        dst: ApsDst::Nwk(nwk),
+        dst_ep,
+        src_ep,
+        profile,
+        cluster,
+        // APS ACK, extended timeout (sleepy destination).
+        tx_options: 0x21,
+        radius: 0,
+        non_member_radius: 0,
+        priority: 1,
+        relays: None,
+        alias: None,
+        asdu,
+    })
+}
+
+/// ZCL Read Attributes of Basic: manufacturer, model, date code, SW build.
+fn read_basic<S: ByteStream>(host: &mut Host<S>, peer: &mut Peer) {
+    let Some(ep) = peer.ep else { return };
+    peer.seq = peer.seq.wrapping_add(1);
+    let mut zcl = vec![0x00, peer.seq, 0x00];
+    for attr in [0x0004u16, 0x0005, 0x0006, 0x4000] {
+        zcl.extend_from_slice(&attr.to_le_bytes());
+    }
+    data_request(host, peer.nwk, ep, 1, 0x0104, 0x0000, &zcl);
+    println!("-> ZCL Read Attributes Basic to 0x{:04X} ep {ep}", peer.nwk);
+}
+
+/// ZDO Bind_req: `cluster` of the device to the NCP (IEEE, endpoint 1).
+fn bind_to_ncp<S: ByteStream>(host: &mut Host<S>, peer: &mut Peer, own: [u8; 8], cluster: u16) {
+    let Some(ep) = peer.ep else { return };
+    peer.seq = peer.seq.wrapping_add(1);
+    let mut zdo = vec![peer.seq];
+    zdo.extend_from_slice(&peer.ieee);
+    zdo.push(ep);
+    zdo.extend_from_slice(&cluster.to_le_bytes());
+    zdo.push(0x03);
+    zdo.extend_from_slice(&own);
+    zdo.push(1);
+    data_request(host, peer.nwk, 0, 0, 0x0000, 0x0021, &zdo);
+    println!("-> ZDO Bind_req 0x{cluster:04X} to the NCP");
+}
+
+/// ZCL Configure Reporting of the measurement attributes (10 s .. 60 s).
+fn configure_reporting<S: ByteStream>(host: &mut Host<S>, peer: &mut Peer) {
+    let Some(ep) = peer.ep else { return };
+    // (cluster, attribute, type, reportable change)
+    let configs: [(u16, u16, u8, &[u8]); 3] = [
+        (0x0402, 0x0000, 0x29, &10i16.to_le_bytes()),
+        (0x0405, 0x0000, 0x21, &10u16.to_le_bytes()),
+        (0x0001, 0x0021, 0x20, &[1]),
+    ];
+    for (cluster, attribute, data_type, change) in configs {
+        peer.seq = peer.seq.wrapping_add(1);
+        let mut zcl = vec![0x00, peer.seq, 0x06, 0x00];
+        zcl.extend_from_slice(&attribute.to_le_bytes());
+        zcl.push(data_type);
+        zcl.extend_from_slice(&10u16.to_le_bytes());
+        zcl.extend_from_slice(&60u16.to_le_bytes());
+        zcl.extend_from_slice(change);
+        data_request(host, peer.nwk, ep, 1, 0x0104, cluster, &zcl);
+        println!("-> ZCL Configure Reporting 0x{cluster:04X}/0x{attribute:04X} 10..60 s");
+    }
+}
+
+/// Print one event; returns a newly admitted device.
+fn report_event(message: &Received) -> Option<(u16, [u8; 8])> {
+    use zigbee_zrhp::msg::data::{EvtApsDataConfirm, EvtApsDataIndication};
+    use zigbee_zrhp::msg::network::{EvtDeviceAuthorized, EvtDeviceJoined, EvtDeviceLeft};
+    let raw = message.raw();
+    match message.msg_id {
+        ids::EVT_DEVICE_JOINED => {
+            let joined: EvtDeviceJoined = raw.decode().ok()?;
+            println!(
+                "EVT_DEVICE_JOINED nwk 0x{:04X} ieee {:02X?} parent 0x{:04X} type {} cap 0x{:02X} decision {}",
+                joined.nwk,
+                joined.ieee.0,
+                joined.parent_nwk,
+                joined.join_type,
+                joined.capability,
+                joined.decision
+            );
+            return (joined.decision == 0).then_some((joined.nwk, joined.ieee.0));
+        }
+        ids::EVT_DEVICE_AUTHORIZED => {
+            let event: EvtDeviceAuthorized = raw.decode().ok()?;
+            println!(
+                "EVT_DEVICE_AUTHORIZED nwk 0x{:04X} ieee {:02X?} result {} link_key_type {}",
+                event.nwk, event.ieee.0, event.result, event.link_key_type
+            );
+        }
+        ids::EVT_DEVICE_LEFT => {
+            let event: EvtDeviceLeft = raw.decode().ok()?;
+            println!(
+                "EVT_DEVICE_LEFT nwk 0x{:04X} ieee {:02X?} flags 0x{:02X} reason {}",
+                event.nwk, event.ieee.0, event.flags, event.reason
+            );
+        }
+        ids::EVT_APS_DATA_CONFIRM => {
+            let event: EvtApsDataConfirm = raw.decode().ok()?;
+            println!(
+                "EVT_APS_DATA_CONFIRM tid {} status {} zb 0x{:02X} flags 0x{:02X} {} ms",
+                event.req_tid, event.status, event.zb_status, event.flags, event.elapsed_ms
+            );
+        }
+        ids::EVT_APS_DATA_INDICATION => {
+            let event: EvtApsDataIndication = raw.decode().ok()?;
+            println!(
+                "IND from 0x{:04X} ep {} -> ep {} profile 0x{:04X} cluster 0x{:04X} lqi {} rssi {} dBm flags 0x{:02X} key {} asdu {:02X?}",
+                event.src_nwk,
+                event.src_ep,
+                event.dst_ep,
+                event.profile,
+                event.cluster,
+                event.lqi,
+                event.rssi,
+                event.flags,
+                event.key_source,
+                event.asdu.0
+            );
+        }
+        ids::EVT_LOG_RECORD => {
+            if let Ok(log) = raw.decode::<zigbee_zrhp::msg::log::EvtLogRecord>() {
+                println!(
+                    "LOG [{} ms L{}] {}",
+                    log.time_ms,
+                    log.level,
+                    log.text.as_str().unwrap_or("<invalid UTF-8>")
+                );
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Drive the interview from the indications of `peer`.
+fn interview_step<S: ByteStream>(
+    host: &mut Host<S>,
+    peer: &mut Peer,
+    own: [u8; 8],
+    message: &Received,
+) {
+    use zigbee_zrhp::msg::data::EvtApsDataIndication;
+    if message.msg_id != ids::EVT_APS_DATA_INDICATION {
+        return;
+    }
+    let Ok(event) = message.raw().decode::<EvtApsDataIndication>() else {
+        return;
+    };
+    if event.src_nwk != peer.nwk || event.profile != 0x0000 {
+        return;
+    }
+    let asdu = event.asdu.0;
+    match event.cluster {
+        // Device_annce: ask for the endpoints.
+        0x0013 => {
+            peer.seq = peer.seq.wrapping_add(1);
+            let mut zdo = vec![peer.seq];
+            zdo.extend_from_slice(&peer.nwk.to_le_bytes());
+            data_request(host, peer.nwk, 0, 0, 0x0000, 0x0005, &zdo);
+            println!("-> ZDO Active_EP_req");
+        }
+        // Active_EP_rsp: seq, status, nwk, n, eps.
+        0x8005 if asdu.len() >= 5 && asdu[1] == 0 && asdu[4] > 0 && peer.ep.is_none() => {
+            peer.ep = Some(asdu[5]);
+            println!("Active_EP_rsp: endpoints {:?}", &asdu[5..]);
+            read_basic(host, peer);
+            for cluster in [0x0402, 0x0405, 0x0001] {
+                bind_to_ncp(host, peer, own, cluster);
+            }
+            configure_reporting(host, peer);
+        }
+        0x8021 => println!(
+            "Bind_rsp status 0x{:02X}",
+            asdu.get(1).copied().unwrap_or(0xFF)
+        ),
+        _ => {}
+    }
+}
+
+fn own_ieee<S: ByteStream>(host: &mut Host<S>) -> Result<[u8; 8], String> {
+    let tid = host.request_empty(ids::SYS_GET_INFO);
+    let rsp = host.response(tid)?;
+    let info: SysGetInfoRsp = body(&rsp)?;
+    Ok(info.ieee_active.0)
+}
+
+/// Open joining on the NCP only, admit one device and interview it.
+fn join<S: ByteStream>(host: &mut Host<S>, secs: u64) -> Result<(), String> {
+    let own = own_ieee(host)?;
+    let tid = host.request(&NwkPermitJoin {
+        duration_s: secs.min(254) as u8,
+        target: 0x0000,
+        flags: 0,
+    });
+    let rsp = host.response(tid)?;
+    println!("NWK_PERMIT_JOIN {secs} s (NCP only): {:?}", rsp.status());
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut peer: Option<Peer> = None;
+    let mut closed = false;
+    while Instant::now() < deadline {
+        host.round(Duration::from_millis(100))?;
+        let events: Vec<Received> = host
+            .inbox
+            .drain(..)
+            .filter(|m| m.kind == Kind::Event)
+            .collect();
+        for message in &events {
+            if let Some((nwk, ieee)) = report_event(message)
+                && peer.is_none()
+            {
+                peer = Some(Peer {
+                    nwk,
+                    ieee,
+                    ep: None,
+                    seq: 0x40,
+                });
+                if !closed {
+                    host.request(&NwkPermitJoin {
+                        duration_s: 0,
+                        target: 0x0000,
+                        flags: 0,
+                    });
+                    closed = true;
+                    println!("-> NWK_PERMIT_JOIN 0 (closed after the first join)");
+                }
+            }
+            if let Some(peer) = peer.as_mut() {
+                interview_step(host, peer, own, message);
+            }
+        }
+    }
+    if !closed {
+        let tid = host.request(&NwkPermitJoin {
+            duration_s: 0,
+            target: 0x0000,
+            flags: 0,
+        });
+        host.response(tid)?;
+        println!("NWK_PERMIT_JOIN 0 (window over)");
+    }
+    match peer {
+        Some(peer) => {
+            println!(
+                "joined: nwk 0x{:04X} ieee {:02X?} ep {:?}",
+                peer.nwk, peer.ieee, peer.ep
+            );
+            Ok(())
+        }
+        None => Err("no device joined".into()),
+    }
+}
+
+/// Talk to an already joined device and print what arrives.
+fn listen<S: ByteStream>(
+    host: &mut Host<S>,
+    secs: u64,
+    nwk: u16,
+    ep: u8,
+    bind_ieee: Option<[u8; 8]>,
+) -> Result<(), String> {
+    let mut peer = Peer {
+        nwk,
+        ieee: bind_ieee.unwrap_or([0; 8]),
+        ep: Some(ep),
+        seq: 0x80,
+    };
+    read_basic(host, &mut peer);
+    if bind_ieee.is_some() {
+        let own = own_ieee(host)?;
+        for cluster in [0x0402, 0x0405, 0x0001] {
+            bind_to_ncp(host, &mut peer, own, cluster);
+        }
+        configure_reporting(host, &mut peer);
+    }
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        host.round(Duration::from_millis(100))?;
+        let events: Vec<Received> = host
+            .inbox
+            .drain(..)
+            .filter(|m| m.kind == Kind::Event)
+            .collect();
+        for message in &events {
+            report_event(message);
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let value = |flag: &str| {
@@ -810,6 +1130,36 @@ fn main() {
             let rsp = host.response(tid)?;
             println!("FW_CONFIRM: {:?}", rsp.status());
             fw_slots(&mut host)?;
+        }
+        if let Some(secs) = value("--join") {
+            join(&mut host, secs.parse().map_err(|_| "--join SECS")?)?;
+        }
+        if let Some(secs) = value("--listen") {
+            let nwk = value("--device")
+                .and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .ok_or("--device 0xNWK required")?;
+            let ep = value("--ep")
+                .map_or(Ok(1), |v| v.parse())
+                .map_err(|_| "--ep N")?;
+            // `--bind IEEE` (16 hex digits in the byte order EVT_DEVICE_JOINED
+            // prints) re-binds and configures reporting.
+            let bind = value("--bind").map(|hex| {
+                let mut ieee = [0u8; 8];
+                for (index, byte) in ieee.iter_mut().enumerate() {
+                    *byte = hex
+                        .get(index * 2..index * 2 + 2)
+                        .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                        .unwrap_or(0);
+                }
+                ieee
+            });
+            listen(
+                &mut host,
+                secs.parse().map_err(|_| "--listen SECS")?,
+                nwk,
+                ep,
+                bind,
+            )?;
         }
         if let Some(path) = value("--fw-update") {
             let version = value("--fw-version")
