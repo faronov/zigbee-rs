@@ -54,7 +54,7 @@ use crate::port::{
     EndpointError, FormParams, FrameCounters, HostEndpoint, Indication, MAX_HOST_ENDPOINTS,
     NetworkInfo, NetworkState, OpError, joined, left,
 };
-use crate::port::{DeviceView, LinkView, NetworkImage, RestoredChild};
+use crate::port::{DeviceView, LinkView, NetworkImage, RestoredChild, RestoredKey};
 use zigbee_mac::{MacDriver as _, PlatformServices as _};
 
 /// NWK reservation size (`FRAME_COUNTER_RESERVATION_SIZE`).
@@ -87,6 +87,18 @@ pub trait TcApp {
     fn provision_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError>;
     /// Durably drop a device's record and key; `false` when unknown.
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError>;
+    /// The highest global outgoing APS counter any key may have used
+    /// (live, or read from the journal while the stack is stopped).
+    fn aps_counter_bound(&mut self) -> Result<u32, OpError>;
+    /// Restore a key from a backup with origin, attributes and location.
+    fn restore_link_key(
+        &mut self,
+        ieee: [u8; 8],
+        key: [u8; 16],
+        origin: zigbee_bdb::trust_center::TrustCenterKeyOrigin,
+        attributes: zigbee_bdb::trust_center::TrustCenterKeyAttributes,
+        location: Option<([u8; 8], u16)>,
+    ) -> Result<(), OpError>;
     /// Replace the durable child table (restored at the next `initialize`).
     fn store_children(
         &mut self,
@@ -195,6 +207,34 @@ where
             .forget_device(device, ieee)
             .map_err(|_| OpError::Storage)
     }
+
+    fn aps_counter_bound(&mut self) -> Result<u32, OpError> {
+        let (trust_center, device) = self.trust_center_and_device_mut();
+        trust_center
+            .outgoing_aps_bound(device)
+            .map_err(|_| OpError::Storage)
+    }
+
+    fn restore_link_key(
+        &mut self,
+        ieee: [u8; 8],
+        key: [u8; 16],
+        origin: zigbee_bdb::trust_center::TrustCenterKeyOrigin,
+        attributes: zigbee_bdb::trust_center::TrustCenterKeyAttributes,
+        location: Option<([u8; 8], u16)>,
+    ) -> Result<(), OpError> {
+        let (trust_center, device) = self.trust_center_and_device_mut();
+        trust_center
+            .restore_link_key(
+                device,
+                ieee,
+                key,
+                origin,
+                attributes,
+                location.map(|(parent, short)| (parent, ShortAddress(short))),
+            )
+            .map_err(|_| OpError::Storage)
+    }
 }
 
 /// Acknowledged sends awaiting their APS ACK outcome (`max_aps_inflight`).
@@ -236,6 +276,12 @@ pub struct TcPort<A: TcApp> {
     pending_acks: Vec<PendingAck, MAX_PENDING_ACKS>,
     /// Endpoints registered by the host (`NWK_ADD_ENDPOINT`).
     host_endpoints: Vec<u8, MAX_HOST_ENDPOINTS>,
+    /// Highest NWK / global APS outgoing counter bounds seen in this
+    /// session. A wipe (`NWK_LEAVE_RESET`, re-form) clears the Trust Center
+    /// journal, so the next installed network (possibly the same keys from
+    /// a restore) floors its counters here. Not durable across a reboot.
+    retained_nwk_bound: u32,
+    retained_aps_bound: u32,
 }
 
 impl<A: TcApp> TcPort<A> {
@@ -253,6 +299,8 @@ impl<A: TcApp> TcPort<A> {
             ieee,
             pending_acks: Vec::new(),
             host_endpoints: Vec::new(),
+            retained_nwk_bound: 0,
+            retained_aps_bound: 0,
         }
     }
 
@@ -786,6 +834,9 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
     }
 
     async fn leave_reset(&mut self) -> Result<(), OpError> {
+        if self.formed {
+            self.retain_counter_bounds()?;
+        }
         self.app.wipe().await.map_err(|_| OpError::Storage)?;
         host_passthrough::clear();
         self.app
@@ -888,6 +939,10 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         {
             return Err(OpError::InvalidParameter);
         }
+        // Outgoing counters already used by this NCP: the network installed
+        // next may reuse the same keys (a restore of its own backup), so it
+        // starts above them whatever the image says.
+        self.retain_counter_bounds()?;
         if self.formed {
             // The previous network's NWK, child, APS and Trust Center state.
             self.app.wipe().await.map_err(|_| OpError::Storage)?;
@@ -909,7 +964,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         state.key_sequence = image.key_seq;
         // The resume reserves `[limit, limit + stride)` from here (a
         // commissioned record never holds 0).
-        state.global_counter_limit = image.nwk_fc_start.max(1);
+        state.global_counter_limit = image.nwk_fc_start.max(self.retained_nwk_bound).max(1);
         state.validate().map_err(|_| OpError::InvalidParameter)?;
         {
             let (_, store) = self.app.device_and_store_mut();
@@ -934,8 +989,9 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             return Err(OpError::Zigbee(0x01));
         }
         self.running = true;
-        if image.aps_fc_start != 0 {
-            self.app.raise_aps_floor(image.aps_fc_start)?;
+        let aps_floor = image.aps_fc_start.max(self.retained_aps_bound);
+        if aps_floor != 0 {
+            self.app.raise_aps_floor(aps_floor)?;
         }
         let device = self.app.device_mut();
         device.aps_mut().nwk_mut().nib_mut().nwk_manager_addr = ShortAddress(image.nwk_manager);
@@ -1041,6 +1097,30 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             return Err(OpError::InvalidState);
         }
         self.app.forget_device(ieee)
+    }
+
+    fn restore_link_key(&mut self, key: &RestoredKey) -> Result<(), OpError> {
+        use zigbee_bdb::trust_center::{TrustCenterKeyAttributes, TrustCenterKeyOrigin};
+        if !self.running {
+            return Err(OpError::InvalidState);
+        }
+        let origin = match key.origin {
+            1 => TrustCenterKeyOrigin::InstallCode,
+            2 => TrustCenterKeyOrigin::GeneratedUnique,
+            3 => TrustCenterKeyOrigin::ApplicationProvisioned,
+            _ => return Err(OpError::InvalidParameter),
+        };
+        let attributes = match key.attrs {
+            0 => TrustCenterKeyAttributes::Provisional,
+            1 => TrustCenterKeyAttributes::Unverified,
+            2 => TrustCenterKeyAttributes::Verified,
+            _ => return Err(OpError::InvalidParameter),
+        };
+        // The parent of a non-child is not in the backup: its location
+        // stays unknown until it is heard (its next Update-Device).
+        let location = key.nwk.filter(|_| key.child).map(|nwk| (self.ieee, nwk));
+        self.app
+            .restore_link_key(key.ieee, key.key, origin, attributes, location)
     }
 
     async fn set_ieee(&mut self, ieee: [u8; 8]) -> Result<(), OpError> {
@@ -1243,6 +1323,42 @@ impl<T: TcApp + ?Sized> TcApp for &mut T {
 
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
         (**self).forget_device(ieee)
+    }
+
+    fn restore_link_key(
+        &mut self,
+        ieee: [u8; 8],
+        key: [u8; 16],
+        origin: zigbee_bdb::trust_center::TrustCenterKeyOrigin,
+        attributes: zigbee_bdb::trust_center::TrustCenterKeyAttributes,
+        location: Option<([u8; 8], u16)>,
+    ) -> Result<(), OpError> {
+        (**self).restore_link_key(ieee, key, origin, attributes, location)
+    }
+
+    fn aps_counter_bound(&mut self) -> Result<u32, OpError> {
+        (**self).aps_counter_bound()
+    }
+}
+
+impl<A: TcApp> TcPort<A> {
+    /// Folds the outgoing counter bounds of the network in NV into the
+    /// session bounds: the durable NWK reservation (kept by a wipe as a
+    /// factory-new tombstone) and the global APS counter. Its own frame: the
+    /// security record stays out of the async callers' poll frames.
+    #[inline(never)]
+    fn retain_counter_bounds(&mut self) -> Result<(), OpError> {
+        let nwk = {
+            let (_, store) = self.app.device_and_store_mut();
+            store
+                .load()
+                .map_err(|_| OpError::Storage)?
+                .map_or(0, |state| state.global_counter_limit)
+        };
+        let aps = self.app.aps_counter_bound()?;
+        self.retained_nwk_bound = self.retained_nwk_bound.max(nwk);
+        self.retained_aps_bound = self.retained_aps_bound.max(aps);
+        Ok(())
     }
 }
 

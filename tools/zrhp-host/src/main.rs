@@ -402,7 +402,8 @@ fn body<'a, T: Wire<'a>>(message: &'a Received) -> Result<T, String> {
     response.body.ok_or_else(|| "empty body".into())
 }
 
-fn smoke<S: ByteStream>(host: &mut Host<S>, form: bool) -> Result<(), String> {
+/// `floors`: `NWK_INIT` counter floors `(nwk, aps)` for a resume.
+fn smoke<S: ByteStream>(host: &mut Host<S>, form: bool, floors: (u32, u32)) -> Result<(), String> {
     let started = Instant::now();
     let ready = host.event(ids::EVT_NCP_READY, Duration::from_secs(15))?;
     let ready: EvtNcpReady = ready.raw().decode().map_err(|e| format!("{e:?}"))?;
@@ -489,8 +490,8 @@ fn smoke<S: ByteStream>(host: &mut Host<S>, form: bool) -> Result<(), String> {
         );
     } else if form {
         let tid = host.request(&NwkInit {
-            nwk_fc_floor: 0,
-            aps_fc_floor: 0,
+            nwk_fc_floor: floors.0,
+            aps_fc_floor: floors.1,
         });
         let rsp = host.response(tid)?;
         let init: NwkInitRsp = body(&rsp)?;
@@ -1112,7 +1113,16 @@ fn main() {
     };
     let form = args.iter().any(|a| a == "--form");
     let mut host = Host::new(stream);
-    let result = smoke(&mut host, form).and_then(|()| {
+    let floor = |flag: &str| match value(flag).map(|v| v.parse::<u32>()) {
+        None => 0,
+        Some(Ok(n)) => n,
+        Some(Err(_)) => {
+            eprintln!("{flag} N: decimal counter floor");
+            std::process::exit(2);
+        }
+    };
+    let floors = (floor("--nwk-floor"), floor("--aps-floor"));
+    let result = smoke(&mut host, form, floors).and_then(|()| {
         if let Some(path) = value("--restore") {
             backup_restore(&mut host, &path)?;
         }

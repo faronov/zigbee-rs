@@ -337,6 +337,30 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         })
     }
 
+    /// The highest global outgoing APS counter any key may have used: the
+    /// live state, or (closed runtime) the journal read in place into the
+    /// state buffer, which stays closed. A caller that wipes and installs a
+    /// network with the same keys (an NCP restore) floors the new counter
+    /// here so no key/counter pair is reused. 0 without a journal.
+    #[cfg(feature = "global-aps-counter")]
+    pub fn outgoing_aps_bound<M: MacDriver>(
+        &mut self,
+        device: &ZigbeeDevice<M>,
+    ) -> Result<u32, TrustCenterRuntimeError> {
+        if self.live {
+            return Ok(global_aps_start(&self.state, device));
+        }
+        if self.store.load_into(&mut self.state)? {
+            let bound = global_aps_start(&self.state, device);
+            // Scratch only: initialization reloads and resets it.
+            self.state.reset([0; 8]);
+            Ok(bound)
+        } else {
+            self.state.reset([0; 8]);
+            Ok(0)
+        }
+    }
+
     /// Raise the global outgoing APS counter to at least `floor` (a host
     /// checkpoint floor or a restore start) and durably reserve a range
     /// above it before any further APS-secured transmission.
@@ -481,6 +505,24 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             key,
             zigbee_bdb::trust_center::TrustCenterKeyOrigin::ApplicationProvisioned,
         )?;
+        self.upsert_table_device(device, &address, false)
+    }
+
+    /// Restore a device's link key from a backup with its origin,
+    /// verification state and location
+    /// ([`zigbee_bdb::trust_center::TrustCenterTable::restore_link_key`]).
+    pub fn restore_link_key<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        address: IeeeAddress,
+        key: [u8; 16],
+        origin: zigbee_bdb::trust_center::TrustCenterKeyOrigin,
+        attributes: zigbee_bdb::trust_center::TrustCenterKeyAttributes,
+        location: Option<(IeeeAddress, ShortAddress)>,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        self.require_initialized_network(device)?;
+        self.table
+            .restore_link_key(address, key, origin, attributes, location)?;
         self.upsert_table_device(device, &address, false)
     }
 
