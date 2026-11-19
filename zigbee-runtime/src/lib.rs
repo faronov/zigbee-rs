@@ -21072,6 +21072,9 @@ pub(crate) const fn ncp_capacity(default: usize, ncp: usize) -> usize {
     }
 }
 
+/// Background pre-erase of journal spare sectors.
+#[cfg(feature = "journal-pre-erase")]
+mod spare_erase;
 /// Streamed multi-slot Trust Center journal of the coordinator NCP.
 #[cfg(feature = "ncp-capacity")]
 pub mod trust_center_stream;

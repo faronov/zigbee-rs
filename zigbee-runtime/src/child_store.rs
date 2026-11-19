@@ -826,6 +826,14 @@ pub trait ChildTableStore {
     fn load(&mut self) -> Result<Option<PersistentChildTable>, ChildStoreError>;
     /// Persist `table`, superseding any previous snapshot.
     fn store(&mut self, table: &PersistentChildTable) -> Result<(), ChildStoreError>;
+
+    /// Erase one more unit of the sector the next rollover will need, ahead
+    /// of time (`journal-pre-erase`; see `ChildTableJournal`). Call it only
+    /// when an erase may stall the caller. Returns whether it erased (call
+    /// again later); stores without a spare sector do nothing.
+    fn pre_erase_step(&mut self) -> Result<bool, ChildStoreError> {
+        Ok(false)
+    }
 }
 
 /// Volatile child-table store: keeps a snapshot for the current power cycle
@@ -896,6 +904,9 @@ pub struct ChildTableJournal<S, const SECTOR_SIZE: usize = CHILD_JOURNAL_SECTOR_
     sectors: [u32; 2],
     cached: Option<LocatedTable>,
     scanned: bool,
+    /// Pre-erase of the sector not holding `cached`.
+    #[cfg(feature = "journal-pre-erase")]
+    spare: crate::spare_erase::SpareErase,
 }
 
 struct LocatedTable {
@@ -933,7 +944,24 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> ChildTableJournal<S, SECTOR_SIZE> {
             sectors: [first_sector, second_sector],
             cached: None,
             scanned: false,
+            #[cfg(feature = "journal-pre-erase")]
+            spare: crate::spare_erase::SpareErase::new(),
         }
+    }
+
+    /// Erase the logical `sector` before its first record.
+    fn erase_sector(&mut self, target: usize) -> Result<(), ChildStoreError> {
+        let sector = self.sectors[target];
+        #[cfg(feature = "journal-pre-erase")]
+        {
+            self.spare
+                .erase_for_rollover(&mut self.storage, target, sector, SECTOR_SIZE as u32)
+                .map_err(|_| ChildStoreError::Hardware)
+        }
+        #[cfg(not(feature = "journal-pre-erase"))]
+        self.storage
+            .erase(sector, sector + SECTOR_SIZE as u32)
+            .map_err(|_| ChildStoreError::Hardware)
     }
 
     /// Borrow the backing storage.
@@ -1188,24 +1216,32 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> ChildTableStore for ChildTableJourna
                 return result;
             }
             let target = 1 - current_sector;
-            let sector = self.sectors[target];
             let result = self
-                .storage
-                .erase(sector, sector + SECTOR_SIZE as u32)
-                .map_err(|_| ChildStoreError::Hardware)
+                .erase_sector(target)
                 .and_then(|()| self.write_record(target, 0, generation, table));
             self.cache_result(&result, generation, target, table);
             return result;
         }
 
-        let sector = self.sectors[0];
         let result = self
-            .storage
-            .erase(sector, sector + SECTOR_SIZE as u32)
-            .map_err(|_| ChildStoreError::Hardware)
+            .erase_sector(0)
             .and_then(|()| self.write_record(0, 0, generation, table));
         self.cache_result(&result, generation, 0, table);
         result
+    }
+
+    /// Pre-erase the sector that does not hold the current, validated table
+    /// (it only holds older generations), one erase unit per call.
+    #[cfg(feature = "journal-pre-erase")]
+    fn pre_erase_step(&mut self) -> Result<bool, ChildStoreError> {
+        let Some(current) = self.cached.as_ref().map(|located| located.sector) else {
+            return Ok(false);
+        };
+        let spare = 1 - current;
+        let start = self.sectors[spare];
+        self.spare
+            .step(&mut self.storage, spare, start, SECTOR_SIZE as u32)
+            .map_err(|_| ChildStoreError::Hardware)
     }
 }
 
@@ -1235,6 +1271,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> ChildTableJournal<S, SECTOR_SIZE> {
         } else {
             self.cached = None;
             self.scanned = false;
+            #[cfg(feature = "journal-pre-erase")]
+            self.spare.forget();
         }
     }
 }
@@ -1423,6 +1461,8 @@ mod tests {
         /// This absolute byte silently keeps its old value when programmed
         /// (HW-04 read-back verification coverage).
         drop_program_at: Option<usize>,
+        /// Erase calls (pre-erase coverage).
+        erases: usize,
     }
 
     impl MockFlash {
@@ -1432,6 +1472,7 @@ mod tests {
                 programs_before_failure: None,
                 fail_reads: false,
                 drop_program_at: None,
+                erases: 0,
             }
         }
 
@@ -1507,6 +1548,7 @@ mod tests {
             {
                 return Err(NorFlashErrorKind::NotAligned);
             }
+            self.erases += 1;
             self.data[start..end].fill(0xFF);
             Ok(())
         }
@@ -1514,6 +1556,38 @@ mod tests {
 
     fn journal(flash: MockFlash) -> ChildTableJournal<MockFlash> {
         ChildTableJournal::new(flash, 0, CHILD_JOURNAL_SECTOR_SIZE as u32)
+    }
+
+    /// `journal-pre-erase`: the sector not holding the current table is
+    /// erased ahead of time and the rollover writes without erasing.
+    #[test]
+    #[cfg(feature = "journal-pre-erase")]
+    fn a_pre_erased_spare_sector_takes_the_erase_out_of_the_rollover() {
+        let mut store = journal(MockFlash::new());
+        store.store(&table(&[child(1, 0x0002, 8)])).unwrap();
+        assert_eq!(store.pre_erase_step(), Ok(true), "one erase unit");
+        assert_eq!(store.pre_erase_step(), Ok(false), "done");
+        let erases = store.storage().erases;
+        let slots = CHILD_JOURNAL_SECTOR_SIZE / CHILD_JOURNAL_SLOT_SIZE;
+        for seed in 0..slots as u8 {
+            store
+                .store(&table(&[
+                    child(1, 0x0002, 8),
+                    child(2, 0x0100 + u16::from(seed), 8),
+                ]))
+                .unwrap();
+        }
+        assert_eq!(store.cached.as_ref().map(|located| located.sector), Some(1));
+        assert_eq!(store.storage().erases, erases, "rollover without an erase");
+        let last = table(&[child(1, 0x0002, 8), child(2, 0x0100 + slots as u16 - 1, 8)]);
+        // After a reboot nothing is pre-erased until the table is loaded.
+        let mut reopened = journal(store.into_storage());
+        let erases = reopened.storage().erases;
+        assert_eq!(reopened.pre_erase_step(), Ok(false));
+        assert_eq!(reopened.storage().erases, erases);
+        assert_eq!(reopened.load(), Ok(Some(last)));
+        assert_eq!(reopened.pre_erase_step(), Ok(true));
+        assert_eq!(reopened.storage().erases, erases + 1);
     }
 
     /// HW-04 HIL fixture: an 8 KiB child journal partition image with

@@ -858,6 +858,29 @@ pub trait TrustCenterDeviceStore {
     fn store(&mut self, state: &PersistentTrustCenterState) -> Result<(), TrustCenterStoreError>;
     fn clear(&mut self) -> Result<(), TrustCenterStoreError>;
 
+    /// Erase one more unit of the sector the next rollover will need, ahead
+    /// of time (`journal-pre-erase`; see `TrustCenterStreamJournal`). Call it
+    /// only when an erase may stall the caller. Returns whether it erased
+    /// (call again later); stores without a spare sector do nothing.
+    fn pre_erase_step(&mut self) -> Result<bool, TrustCenterStoreError> {
+        Ok(false)
+    }
+
+    /// The current sector is half used and the spare one is fully
+    /// pre-erased: re-storing the current state now (in a quiet window)
+    /// rolls over without an erase and leaves a whole free sector plus a
+    /// spare for the next burst of stores (a join stores about ten
+    /// snapshots). Stores without a spare sector never ask.
+    fn wants_compaction(&self) -> bool {
+        false
+    }
+
+    /// Store `state` into the spare sector even if the current one has room
+    /// (see [`Self::wants_compaction`]); same durability as [`Self::store`].
+    fn compact(&mut self, state: &PersistentTrustCenterState) -> Result<(), TrustCenterStoreError> {
+        self.store(state)
+    }
+
     /// By-value [`Self::load_into`] for hosts and tests. Embedded stack
     /// paths must use [`Self::load_into`]: this returns the whole state on
     /// the stack.
