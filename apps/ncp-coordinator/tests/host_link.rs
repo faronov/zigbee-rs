@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 use ncp_coordinator_app::port::CoordinatorPort;
 use ncp_coordinator_app::tc::TcPort;
-use ncp_coordinator_app::transport::{HostTransport, TransportInfo};
+use ncp_coordinator_app::transport::{HostTransport, TransportInfo, UartChangeError};
 use ncp_coordinator_app::{LogRing, Ncp, NcpIdentity};
 use router_app::{
     NoDiagnostics, NoStatus, NoSupervisor, PersistentChildren, RouterParts, RouterPolicy,
@@ -31,7 +31,9 @@ use zigbee_zrhp::msg::network::{EvtNetworkState, NwkForm, NwkGetInfoRsp, NwkInit
 use zigbee_zrhp::msg::security::{
     EvtFcCheckpoint, SecGetFrameCountersRsp, SecGetNetworkKey, SecLockKeyExport,
 };
-use zigbee_zrhp::msg::system::{EvtNcpReady, SysEcho, SysNegotiateReq, SysNegotiateRsp, caps};
+use zigbee_zrhp::msg::system::{
+    EvtNcpReady, SysEcho, SysNegotiateReq, SysNegotiateRsp, SysSetUart, caps,
+};
 use zigbee_zrhp::msg::{Batch, Kind, MsgHeader, RawMessage, ids};
 use zigbee_zrhp::queue::EndpointQueues;
 use zigbee_zrhp::types::{Endpoint, Status};
@@ -49,6 +51,13 @@ static POLICY: RouterPolicy = RouterPolicy {
 struct Pipe {
     to_ncp: VecDeque<u8>,
     to_host: Vec<u8>,
+    /// A UART link (`SYS_SET_UART` accepted) at this rate and flow control.
+    uart: Option<(u32, bool)>,
+    /// `apply_uart` answers `Busy` this many more times (a transfer still
+    /// draining at the old rate).
+    uart_busy: u8,
+    /// Every applied `(baud, flow)`.
+    uart_applied: Vec<(u32, bool)>,
 }
 
 impl HostTransport for Pipe {
@@ -64,11 +73,31 @@ impl HostTransport for Pipe {
         data.len()
     }
     fn info(&self) -> TransportInfo {
-        TransportInfo {
-            kind: 1,
-            baud: 0,
-            flow_control: false,
+        match self.uart {
+            Some((baud, flow_control)) => TransportInfo {
+                kind: 2,
+                baud,
+                flow_control,
+            },
+            None => TransportInfo {
+                kind: 1,
+                baud: 0,
+                flow_control: false,
+            },
         }
+    }
+    fn check_uart(&self, _baud: u32, _flow: bool) -> Result<(), UartChangeError> {
+        self.uart.map(|_| ()).ok_or(UartChangeError::Unsupported)
+    }
+    fn apply_uart(&mut self, baud: u32, flow: bool) -> Result<(), UartChangeError> {
+        self.check_uart(baud, flow)?;
+        if self.uart_busy > 0 {
+            self.uart_busy -= 1;
+            return Err(UartChangeError::Busy);
+        }
+        self.uart = Some((baud, flow));
+        self.uart_applied.push((baud, flow));
+        Ok(())
     }
 }
 
@@ -500,4 +529,76 @@ fn host_negotiates_forms_reads_counters_and_sends_data() {
         host.response(unsupported).status(),
         Status::UnsupportedCommand.to_u8()
     );
+}
+
+/// `SYS_SET_UART` (spec 7.1): a switch that finds the transmitter still
+/// busy is retried, not dropped (the host has already switched), and is
+/// kept once a valid frame arrives at the new rate.
+#[test]
+fn a_uart_switch_waits_for_a_busy_transmitter_and_commits_on_traffic() {
+    let mut security = RamSecurityStateStore::new();
+    let mut gp_store = zigbee_runtime::gp_store::RamGpProxyStore::new();
+    let mut profile = profile();
+    let mut device = device(&profile);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let mut app = TrustCenterCoordinatorApp::new(
+        node,
+        PersistentChildren::new(RamChildTableStore::new()),
+        RamTrustCenterDeviceStore::new(),
+        &POLICY,
+        RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+    )
+    .unwrap();
+    app.set_green_power_store(&mut gp_store);
+    let mut port = TcPort::new(app, IEEE, clock_ms);
+    let log = LogRing::<8>::new();
+    let mut pipe = Pipe {
+        uart: Some((921_600, true)),
+        uart_busy: 2,
+        ..Pipe::default()
+    };
+    let mut now = 1_000u64;
+    let mut ncp = Ncp::<8>::new(identity(), 0xC0FF_EE02, now);
+    let mut host = Host::new(now);
+    macro_rules! exchange {
+        () => {
+            exchange(&mut ncp, &mut host, &mut port, &mut pipe, &log, &mut now)
+        };
+    }
+    exchange!();
+    host.event(ids::EVT_NCP_READY).expect("EVT_NCP_READY");
+    let negotiate = host.request(&SysNegotiateReq {
+        major_min: 1,
+        major_max: 1,
+        host_caps: 0,
+        name: Bytes8(b"pipe-host"),
+    });
+    exchange!();
+    let _: SysNegotiateRsp = host.response(negotiate).body();
+
+    let switch = host.request(&SysSetUart {
+        baud: 2_000_000,
+        flow: 1,
+        apply_delay_ms: 5,
+    });
+    exchange!();
+    assert_eq!(host.response(switch).status(), Status::Success.to_u8());
+    for _ in 0..4 {
+        exchange!();
+    }
+    assert_eq!(pipe.uart_busy, 0, "retried while busy");
+    assert_eq!(pipe.uart_applied, [(2_000_000, true)]);
+
+    // Traffic at the new rate commits it: no revert after the 3 s window.
+    let echo = host.request(&SysEcho {
+        data: Rest(b"new rate"),
+    });
+    exchange!();
+    assert_eq!(host.response(echo).status(), Status::Success.to_u8());
+    for _ in 0..40 {
+        now += 100_000;
+        exchange!();
+    }
+    assert_eq!(pipe.uart_applied, [(2_000_000, true)], "no revert");
+    assert_eq!(pipe.uart, Some((2_000_000, true)));
 }
