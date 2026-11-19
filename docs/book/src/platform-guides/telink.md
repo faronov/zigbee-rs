@@ -427,6 +427,86 @@ frames). An overflow counted here can be the sender's MAC retry of a frame
 whose ACK was withheld, rather than a lost frame. The traffic differed too
 much between the soaks for a like-for-like loss comparison.
 
+#### Soak with sniffer correlation (2026-11-19)
+
+The production image with ACK withholding ran for 2 h 59 min as 0x045B
+(PAN 0xDFE9, channel 15) with no child and no commissioning. Its identity was
+read over SWire from the HAL ACK filter (PAN, short address and the EUI-64
+that ZHA lists for the device), and it was on air sending Link Status as
+0x045B. hwlab polled the HAL counters over SWire throughout. The queue
+overflow word was read about every 14 ms, so each overflow is timed to within
+about ±65 ms of the sniffer clock; that offset was calibrated from the
+router's own transmissions. An nRF52840 sniffer captured channel 15 at the
+same time: 139,005 frames, about 13 per second. The router was found about
+one second after a restart at the first SWire access. It resumed from its
+journal without a new association, and the counter-based reboot check stayed
+clean for the whole soak.
+
+| counter (soak delta) | value |
+|---|---:|
+| valid frames | 148,586 |
+| invalid CRC / invalid length | 38,901 / 2,301 |
+| DMA incomplete | 2 |
+| software ACKs sent / ACK TX timeouts | 21 / 0 |
+| RX queue overflow / evicted | 2,057 / 0 |
+| queue high-water | 16 of 16 |
+| channel-access failures / busy CCAs | 14 / 1,021 of 9,285 |
+| MAC command-queue overflow | 0 |
+
+Queue loss per hour was 785 frames (1.24 %), 1,183 (2.78 %) and 89 (0.22 %).
+Home Assistant did not restart. Almost all of the loss came from
+two other kinds of burst:
+
+- ZHA re-initialised the coordinator three times. All Zigbee entities went
+  unavailable at 20:34, 21:13 and 21:40. Each time the coordinator then sent
+  floods of route requests: about 35 new requests per minute, each relayed
+  by about 17 routers.
+- A Green Power remote was pressed in bursts between 21:10 and 21:53. Each
+  press produced GPDF repeats and a GP Notification broadcast from every
+  proxy. The 21:22–21:30 burst alone overflowed 1,014 times.
+
+Class by class:
+
+- **ACKed, then dropped at the HAL queue: none.** The software ACK decision
+  and the queue push use the same full-queue test in the same uninterruptible
+  RX-completion path. In this soak, `evicted` stayed 0 across 2,057
+  overflows. A frame addressed to the router that reaches a full queue holding
+  any broadcast evicts that broadcast and counts as evicted, so no frame
+  addressed to the router was dropped or had its ACK withheld. On air, the
+  sniffer saw 18 transmissions to 0x045B. All 4 ACKed frames the router had to
+  relay were forwarded. Of the 6 ACKed frames addressed to the router itself,
+  2 got a visible NWK reply. The other 4 are encrypted, and they may be
+  one-way traffic.
+- **Withheld ACK (retried or lost): none.** No frame addressed to the router
+  reached a full queue. The production image has no counter for withheld
+  ACKs. In this soak, evicted = 0 shows that none occurred, but that inference
+  only holds while broadcasts dominate the queue.
+- **Broadcast and GPDF drops: all 2,057.** The sniffer attributes 1,921 of
+  them to frames on air: 1,259 NWK broadcasts to 0xFFFD (mostly GP
+  Notifications), 476 coordinator route requests, 130 GPDFs (this image is
+  not a GP proxy), and 56 others. For 82 % of them the router still relayed
+  the same broadcast from another copy. Of the 1,287 distinct broadcasts that
+  the sniffer heard with radius above 1, the router relayed 95.3 %. Of the
+  61 it did not relay, 24 had a copy that arrived near an overflow, and 37
+  had none.
+
+The frames the router did not ACK came from radio conditions, not from the
+queue:
+
+- 0x670B routed through 0x045B, but none of its 7 transmissions (11
+  frames) to the router was ACKed. The router's own 4 attempts to 0x670B
+  also got no ACK.
+- One retry from 0x4304 started 0.8 ms after the router's own transmission
+  ended, and the router did not ACK it.
+- On the transmit side, 4 of the 14 ACKs the sniffer saw for router unicasts
+  did not stop the router's retries. One transmission used all 4 attempts
+  even though the last three were ACKed on air.
+
+The sample is small. Whether the router misses ACKs just after its own
+transmissions needs instrumented ACK-wait counters. The ACK-withholding path
+itself still needs a test in which frames addressed to the router reach a
+full queue, through a child or injected traffic.
+
 A shared SoftMac duplicate filter (IEEE 802.15.4 §7.5.6.2, one
 source/DSN entry) was measured at +304 B flash, +16 B bss and +16 B stack.
 It fired once in 16 minutes of soak and was not adopted.
@@ -472,7 +552,11 @@ Remaining gates:
 - the parent router: a child joining (and Trust Center rejoining) through
   it, its own neighbour table in ZHA, and a paint-based stack high-water on
   the persistence paths;
-- independent packet-capture proof of the ACK-withholding behaviour (no
-  sniffer was available);
+- a router transmit-side ACK-miss measurement (the sniffer saw ACKs that
+  the router retried past, n = 14);
+- independent packet-capture proof of the ACK-withholding behaviour: the
+  2026-11-19 sniffer-correlated soak found no withheld ACK and no frame
+  for the router lost at the queue, but never filled the queue with frames
+  for the router, so the withholding path itself was not exercised;
 - the one-off SED `security persistence` panic seen once and not reproduced;
-- long-duration router and sleep stability.
+- sleep stability, and router stability beyond the 3-hour soak.
