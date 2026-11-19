@@ -21,6 +21,7 @@ const REG_RF_IRQ_STATUS: u32 = 0x800F20; // RF IRQ status (u16)
 const REG_RF_RX_MODE: u32 = 0x800428; // RX mode enable
 const REG_RF_CHANNEL: u32 = 0x80040D; // physical channel
 const REG_RF_RSSI: u32 = 0x800441; // RSSI readback
+const REG_RF_RX_STATE: u32 = 0x800448; // RX state; bit 5 = receiving a packet
 const REG_PLL_FINE_TUNE: u32 = 0x8004D6; // PLL fine divider (u16)
 const REG_RF_POWER_MODE: u32 = 0x801225;
 const REG_RF_POWER_LSB: u32 = 0x801226;
@@ -281,6 +282,12 @@ pub fn enable_dma_tx() {
         let v = r8(REG_DMA_CHN_EN);
         w8(REG_DMA_CHN_EN, v | 0x08);
     }
+}
+
+/// Baseband is inside a packet (`reg 0x448` bit 5), the SDK's
+/// `is_rf_receiving_pkt()`.
+pub fn rx_in_progress() -> bool {
+    unsafe { r8(REG_RF_RX_STATE) & (1 << 5) != 0 }
 }
 
 pub fn rx_done() -> bool {

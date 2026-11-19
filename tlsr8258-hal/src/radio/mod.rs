@@ -1768,6 +1768,9 @@ mod hw {
         crate::irq::IrqSource::Dma.mask() | crate::irq::IrqSource::ZbRt.mask();
 
     const CCA_THRESHOLD_DBM: i8 = -70;
+    /// Longest 802.15.4 PPDU on air (6 B SHR/PHR + 127 B PSDU at 32 us/B),
+    /// rounded up.
+    const RX_MAX_PPDU_TICKS: u32 = timer::us(4_300);
     const CCA_RX_SETTLE_TICKS: u32 = timer::TICKS_PER_MS * 128 / 1_000;
     const CCA_SAMPLE_TICKS: u32 = timer::TICKS_PER_MS * 128 / 1_000;
     const UNIT_BACKOFF_TICKS: u32 = timer::TICKS_PER_MS * 320 / 1_000;
@@ -2790,6 +2793,10 @@ mod hw {
             let slots = next_random() & ((1u32 << backoff_exponent) - 1);
             let rx_ptr = active_rx_ptr();
 
+            // Never turn the transceiver off under a frame being received
+            // (see `finish_reception`). Only the CCA below decides whether
+            // the channel is busy, as before.
+            finish_reception();
             phy::set_trx_off();
             set_rx_armed(false);
             phy::rx_done_clear();
@@ -2814,6 +2821,10 @@ mod hw {
 
             increment_counter(core::ptr::addr_of_mut!(CCA_ATTEMPT_COUNT));
             if channel_is_clear() {
+                // A frame whose preamble began during the energy samples
+                // (or one too weak to raise them) is let through before
+                // TRX off, instead of being cut off by the transmission.
+                finish_reception();
                 phy::set_trx_off();
                 set_rx_armed(false);
                 phy::rx_done_clear();
@@ -2830,6 +2841,36 @@ mod hw {
                 return false;
             }
             backoff_exponent = backoff_exponent.saturating_add(1).min(csma.max_be);
+        }
+    }
+
+    /// Let a frame the baseband is still receiving complete, and queue it,
+    /// before the caller turns the transceiver off.
+    ///
+    /// Turning the transceiver off in the middle of a reception does not
+    /// only lose that frame: the aborted reception corrupts the next one
+    /// the radio receives (RX-done about 320 us into it, with PHR 0 or a
+    /// shifted PSDU in the DMA buffer). CSMA-CA started every backoff with
+    /// TRX off; when that cut off a frame, the next reception after the
+    /// transmission failed in 27 of 31 lab cases, and that reception is the
+    /// ACK of a unicast or a frame this node has to ACK. A completed frame
+    /// still waiting for service is queued too instead of being cleared.
+    /// Bounded by the longest PPDU.
+    // Out of line: inlined into the CSMA loop it deepened the sensor and ED
+    // rejoin stack chains past their gates.
+    #[inline(never)]
+    fn finish_reception() {
+        if phy::rx_in_progress() {
+            let start = timer::now_ticks();
+            while !phy::rx_done()
+                && phy::rx_in_progress()
+                && timer::now_ticks().wrapping_sub(start) < RX_MAX_PPDU_TICKS
+            {
+                unsafe { core::arch::asm!("nop") };
+            }
+        }
+        if phy::rx_done() {
+            queue_completed_rx();
         }
     }
 
