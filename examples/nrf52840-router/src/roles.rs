@@ -50,7 +50,7 @@ core::arch::global_asm!(
     "bx lr",
 );
 
-pub type Phy = NrfIsrRadioPhy<'static, peripherals::RNG>;
+pub use radio::{Mac, Phy};
 
 /// Resources a role composition needs after clocks and time are running.
 pub struct Started {
@@ -97,7 +97,7 @@ pub fn start(spawner: Spawner, model: &str) -> Started {
     }
 
     Started {
-        phy,
+        phy: with_fem!(phy, p),
         nvmc: Nvmc::new(p.NVMC),
         led: nrf52840_dk::status_led(p.P0_13),
         button: nrf52840_dk::button(p.P0_11),
@@ -365,3 +365,32 @@ pub fn halt() -> ! {
         cortex_m::asm::wfi();
     }
 }
+
+/// Radio and MAC types of the router image, with or without the AT2401C
+/// front end (`fem-at2401c`).
+mod radio {
+    use embassy_nrf::peripherals::RNG;
+    use zigbee_mac::nrf::NrfIsrRadioPhy;
+
+    #[cfg(not(feature = "fem-at2401c"))]
+    pub type Phy = NrfIsrRadioPhy<'static, RNG>;
+    #[cfg(not(feature = "fem-at2401c"))]
+    pub type Mac = zigbee_mac::nrf::NrfRouterMac<'static, RNG>;
+
+    #[cfg(feature = "fem-at2401c")]
+    pub type Phy = zigbee_mac::nrf::NrfFemPhy<'static, NrfIsrRadioPhy<'static, RNG>>;
+    #[cfg(feature = "fem-at2401c")]
+    pub type Mac = zigbee_mac::nrf::NrfFemRouterMac<'static, RNG>;
+}
+
+/// `Started::phy` without a front end: the radio itself.
+#[cfg(not(feature = "fem-at2401c"))]
+macro_rules! with_fem {
+    ($phy:ident, $p:ident) => {{
+        $phy
+    }};
+}
+#[cfg(feature = "fem-at2401c")]
+use crate::fem::with_fem;
+#[cfg(not(feature = "fem-at2401c"))]
+use with_fem;

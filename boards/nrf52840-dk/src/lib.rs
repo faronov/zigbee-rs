@@ -16,6 +16,10 @@
 //! board crate does not re-wrap them; callers construct
 //! `embassy_nrf::radio`, `embassy_nrf::rng`, `embassy_nrf::saadc`, and
 //! `embassy_nrf::nvmc` directly from `embassy_nrf::Peripherals`.
+//!
+//! With `fem-at2401c` the crate also describes an AT2401C RF front-end
+//! add-on ([`fem_at2401c`]): its pins, active levels, gains and settle
+//! times. The regulatory output cap belongs to the product.
 
 #![no_std]
 
@@ -112,4 +116,48 @@ pub fn vcom_tx<'d>(
     config.baudrate = VCOM_BAUDRATE;
     config.parity = uarte::Parity::EXCLUDED;
     uarte::UarteTx::new(uarte0, irqs, txd, config)
+}
+
+/// AT2401C RF front-end add-on (two control pins, SKY66112-11-compatible)
+/// wired as in devbis/nrf-ncp's `nrf52840dk_nrf52840.overlay`:
+///
+/// ```text
+/// compatible = "skyworks,sky66112-11", "generic-fem-two-ctrl-pins";
+/// ctx-gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;   // PA enable (TXEN)
+/// crx-gpios = <&gpio1 2 GPIO_ACTIVE_HIGH>;   // LNA enable (RXEN)
+/// rx-gain-db = <5>;
+/// ```
+///
+/// Values the overlay does not override are the `skyworks,sky66112-11`
+/// binding defaults (`tx-gain-db` 22, `ctx-settle-time-us` 23,
+/// `crx-settle-time-us` 5). The add-on has no CSD/PDN line: both enables low
+/// is its shutdown state. **Hardware-unverified** in zigbee-rs.
+#[cfg(feature = "fem-at2401c")]
+pub mod fem_at2401c {
+    use embassy_nrf::peripherals;
+
+    /// CTX (PA enable) is active high.
+    pub const CTX_ACTIVE_HIGH: bool = true;
+    /// CRX (LNA enable) is active high.
+    pub const CRX_ACTIVE_HIGH: bool = true;
+    /// PA gain (dB), SKY66112-11 binding default kept by the overlay.
+    pub const TX_GAIN_DB: u8 = 22;
+    /// LNA gain (dB), `rx-gain-db = <5>` in the overlay.
+    pub const RX_GAIN_DB: u8 = 5;
+    /// CTX assertion to first transmitted symbol (µs).
+    pub const CTX_SETTLE_US: u8 = 23;
+    /// CRX assertion to start of reception (µs).
+    pub const CRX_SETTLE_US: u8 = 5;
+
+    /// The add-on's control pins; the signature fixes the board wiring.
+    pub struct Pins {
+        /// CTX / PA enable, P1.04.
+        pub ctx: peripherals::P1_04,
+        /// CRX / LNA enable, P1.02.
+        pub crx: peripherals::P1_02,
+    }
+
+    pub fn pins(ctx: peripherals::P1_04, crx: peripherals::P1_02) -> Pins {
+        Pins { ctx, crx }
+    }
 }

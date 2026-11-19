@@ -15,6 +15,9 @@ publish = false
 # Green Power Proxy Basic: the router's GP Proxy Table journal
 # (`router::gp_proxy_table_store`). The window is reserved in every image.
 green-power = ["router-app/green-power", "zigbee-runtime/green-power"]
+# Regulatory output cap and default output for the DK's AT2401C front-end
+# add-on (`nrf52840-dk/fem-at2401c`). Hardware-unverified.
+fem-at2401c = []
 
 [dependencies]
 router-app = { path = "../../apps/router" }

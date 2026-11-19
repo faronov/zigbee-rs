@@ -73,6 +73,23 @@ mandatory in CI. Both nRF52840 images are build-, layout- and symbol-checked
 only. The same router code is hardware-tested on the nRF52833 DK
 (`examples/nrf52833-sensor`, bin `nrf52833-router`).
 
+## AT2401C front-end variant (hardware-unverified)
+
+`--features fem-at2401c` (with either role) attaches an AT2401C
+(SKY66112-11-class) PA/LNA add-on wired as in devbis/nrf-ncp's DK overlay:
+CTX on P1.04, CRX on P1.02, both active high, PA 22 dB, LNA 5 dB. The RADIO
+events drive both lines through PPI 16–19 and GPIOTE 6/7. TX power is
+antenna-referred and capped at 18 dBm by the product
+(`products/nrf52840-router/src/fem.rs`). The MAC logs the effective split
+whenever it applies a power. No board with a FEM has run this variant; see the
+"RF front-end modules" section of the nRF platform guide for the timing,
+the caveats and the open hardware gates.
+
+```bash
+cargo +nightly-2026-03-23 build --release --locked --features fem-at2401c
+cargo +nightly-2026-03-23 build --release --locked --no-default-features --features router,fem-at2401c
+```
+
 ## Hardware validation still required
 
 Before release, verify on an nRF52840-DK that commissioning/resume survives

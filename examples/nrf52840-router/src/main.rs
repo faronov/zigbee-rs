@@ -272,7 +272,7 @@ async fn main(_spawner: Spawner) {
     info!("Nordic ECB hardware AES dual-KAT passed");
     // FICR DEVICEID-derived EUI-64 (never a constant), RNG-seeded DSN/BSN,
     // TX power 0 dBm from the default PIB.
-    let Ok(mac) = phy.into_soft_mac() else {
+    let Ok(mac) = with_fem!(phy, p).into_soft_mac() else {
         status.set(RouterStatus::Fault {
             archetype: NodeArchetype::AlwaysOnEndDevice,
         });
@@ -382,3 +382,18 @@ fn build_device<'a, M: MacDriver>(
         )
         .build_into(slot)
 }
+
+/// The radio without a front end: `with_fem!` is the identity.
+#[cfg(not(feature = "fem-at2401c"))]
+macro_rules! with_fem {
+    ($phy:ident, $p:ident) => {{
+        $phy
+    }};
+}
+#[cfg(not(feature = "fem-at2401c"))]
+use with_fem;
+
+#[cfg(feature = "fem-at2401c")]
+mod fem;
+#[cfg(feature = "fem-at2401c")]
+use fem::with_fem;

@@ -20,6 +20,8 @@
 #![no_std]
 
 pub mod button;
+#[cfg(feature = "fem-at2401c")]
+pub mod fem;
 #[cfg(target_os = "none")]
 mod partition;
 pub mod policy;

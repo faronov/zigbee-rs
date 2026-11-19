@@ -28,14 +28,14 @@ use router_app::{
     NoObserver, NodeArchetype, ParentRouterApp, PersistentApsTables, PersistentChildren,
 };
 use static_cell::StaticCell;
-use zigbee_mac::nrf::{NrfRouterMac, NRF_ROUTER_PENDING_RX};
+use zigbee_mac::nrf::NRF_ROUTER_PENDING_RX;
 use zigbee_runtime::{
     node::ZigbeeNode, power::PowerMode, profile::ApplicationProfile, role::Router, ZigbeeDevice,
 };
 use zigbee_types::ChannelMask;
 use zigbee_zcl::clusters::basic::PowerSource;
 
-type Mac = NrfRouterMac<'static, embassy_nrf::peripherals::RNG>;
+type Mac = roles::Mac;
 type App = ParentRouterApp<
     'static,
     Mac,
@@ -207,3 +207,6 @@ fn log_summary(app: &App) {
 
 // The router PHY retains this many received frames between runtime calls.
 const _: () = assert!(NRF_ROUTER_PENDING_RX >= 4);
+
+#[cfg(feature = "fem-at2401c")]
+mod fem;
