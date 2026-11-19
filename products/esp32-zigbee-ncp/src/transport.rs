@@ -6,9 +6,10 @@
 //!   port, Waveshare ESP32-H2-Zero). No line rate, no RTS/CTS; USB NAK and
 //!   ZRHP credits are the flow control. The chip's DTR/RTS reset stays on.
 //! * `transport-uart` — a UART with UHCI DMA receive. On the Thread Border
-//!   Router board: UART0 to the ESP32-S3 at 460 800 without flow control
-//!   (RTS/CTS only with the reserved-line board mod). Elsewhere: 921 600
-//!   with RTS/CTS behind a USB-UART bridge.
+//!   Router board: UART0 to the ESP32-S3 at 921 600 with RTS/CTS on the
+//!   reserved links (`rtscts-reserved-lines`, the profile default, decision
+//!   N10), 2 000 000 allowed; images built without that feature run the
+//!   fallback, 460 800 without flow control.
 
 #[cfg(all(feature = "transport-usj", feature = "transport-uart"))]
 compile_error!("select exactly one ZRHP transport: transport-usj or transport-uart");
@@ -45,11 +46,10 @@ pub const USJ_BURST_FILLER: Option<u8> = Some(0x00);
 pub const UART_FLOW_WIRED: bool = cfg!(feature = "rtscts-reserved-lines");
 
 /// Product default line rate (volatile `SYS_SET_UART` changes revert to it
-/// on reboot).
-pub const UART_DEFAULT_BAUD: u32 = 460_800;
-/// Product default flow control: off on the Thread BR board even with the
-/// board mod, until gate H8 has checked R19/R20 (the host enables it).
-pub const UART_DEFAULT_FLOW: bool = false;
+/// on reboot): 921 600 with RTS/CTS, 460 800 without (spec 11.5, N10).
+pub const UART_DEFAULT_BAUD: u32 = if UART_FLOW_WIRED { 921_600 } else { 460_800 };
+/// Product default flow control: on whenever the board wires RTS/CTS.
+pub const UART_DEFAULT_FLOW: bool = UART_FLOW_WIRED;
 
 /// Rates `SYS_SET_UART` accepts on the ESP32-H2 (spec 4.1/4.4): 2 000 000
 /// only with RTS/CTS; 3 000 000 stays off until gate H2 measures it.
@@ -101,6 +101,28 @@ mod tests {
     #[test]
     fn default_rate_is_admissible() {
         assert!(uart_rate_supported(UART_DEFAULT_BAUD, UART_DEFAULT_FLOW));
+    }
+
+    /// N10: 921 600 with RTS/CTS on the reserved links, else the 460 800
+    /// fallback without flow control.
+    #[test]
+    fn the_default_line_follows_the_wiring() {
+        if UART_FLOW_WIRED {
+            assert_eq!((UART_DEFAULT_BAUD, UART_DEFAULT_FLOW), (921_600, true));
+        } else {
+            assert_eq!((UART_DEFAULT_BAUD, UART_DEFAULT_FLOW), (460_800, false));
+        }
+    }
+
+    #[cfg(all(feature = "transport-uart", feature = "rtscts-reserved-lines"))]
+    #[test]
+    fn wired_flow_control_allows_two_megabaud_and_turning_it_off() {
+        assert_eq!(check_uart_change(2_000_000, true), Ok(()));
+        assert_eq!(check_uart_change(460_800, false), Ok(()));
+        assert_eq!(
+            check_uart_change(2_000_000, false),
+            Err(UartChangeRefusal::InvalidRate)
+        );
     }
 
     #[cfg(feature = "transport-usj")]
