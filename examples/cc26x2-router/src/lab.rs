@@ -74,7 +74,7 @@ async fn main(_spawner: Spawner) {
             }
         }
         if busiest.1 > 0 {
-            sniff(&mut radio, busiest.0, Duration::from_secs(20)).await;
+            sniff(&mut radio, busiest.0, Duration::from_secs(60)).await;
         }
         log::info!("[LAB] stats {:?}", radio.stats());
         Timer::after(Duration::from_secs(10)).await;
@@ -195,10 +195,13 @@ async fn scan_channel(radio: &mut Radio, channel: u8) -> usize {
     beacons
 }
 
-/// Promiscuous receive on `channel`: frame type, length, RSSI.
+/// Promiscuous receive on `channel`: frame type, length, RSSI, and the
+/// RSSI/correlation distribution of FCS-valid versus FCS-failed frames
+/// (CRC-error frames are kept for this gate only).
 async fn sniff(radio: &mut Radio, channel: u8, window: Duration) {
     if radio.set_filter(None).is_err()
         || radio.set_channel(channel).is_err()
+        || radio.set_keep_crc_errors(true).is_err()
         || radio.rx_on().is_err()
     {
         return;
@@ -207,13 +210,32 @@ async fn sniff(radio: &mut Radio, channel: u8, window: Duration) {
         "[LAB] sniffing channel {channel} for {} s",
         window.as_secs()
     );
+    // RSSI buckets: < -90, -90..-81, -80..-71, -70..-61, >= -60 dBm.
+    let mut ok = [0u32; 5];
+    let mut bad = [0u32; 5];
+    let mut corr_ok = 0u32;
+    let mut corr_bad = 0u32;
     let mut frame = [0u8; MAX_FRAME];
     let mut count = 0u32;
     let end = Instant::now() + window;
     while Instant::now() < end {
-        while let Some(info) = radio.receive(&mut frame) {
+        while let Some(info) = radio.receive_any(&mut frame) {
+            let bucket = match info.rssi_dbm {
+                ..=-91 => 0,
+                -90..=-81 => 1,
+                -80..=-71 => 2,
+                -70..=-61 => 3,
+                _ => 4,
+            };
+            if !info.crc_ok {
+                bad[bucket] += 1;
+                corr_bad += u32::from(info.correlation);
+                continue;
+            }
+            ok[bucket] += 1;
+            corr_ok += u32::from(info.correlation);
             count += 1;
-            if count <= 40 {
+            if count <= 20 {
                 let f = &frame[..info.len];
                 log::info!(
                     "[LAB]   rx type {} len {} seq {} rssi {} {:02X?}",
@@ -227,5 +249,13 @@ async fn sniff(radio: &mut Radio, channel: u8, window: Duration) {
         }
         Timer::after(Duration::from_millis(2)).await;
     }
-    log::info!("[LAB] {count} frame(s) on channel {channel}");
+    let _ = radio.set_keep_crc_errors(false);
+    let n_bad: u32 = bad.iter().sum();
+    log::info!("[LAB] {count} frame(s) on channel {channel}, {n_bad} CRC error(s)");
+    log::info!("[LAB]   rssi <-90/-90/-80/-70/>=-60 ok {ok:?} crc-error {bad:?}");
+    log::info!(
+        "[LAB]   mean correlation ok {} crc-error {}",
+        corr_ok.checked_div(count).unwrap_or(0),
+        corr_bad.checked_div(n_bad).unwrap_or(0)
+    );
 }

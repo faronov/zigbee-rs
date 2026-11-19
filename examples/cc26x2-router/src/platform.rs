@@ -14,7 +14,7 @@ use cortex_m::interrupt::Mutex;
 /// Resources a composition needs after clocks and time are running.
 pub struct Started {
     pub identity: Identity,
-    pub radio: cc26x2_hal::rf::RadioToken,
+    pub radio: cc26x2_dongle::BoardRadio,
     pub trng: cc26x2_hal::trng::TrngToken,
     pub flash: cc26x2_hal::flash::Flash,
 }

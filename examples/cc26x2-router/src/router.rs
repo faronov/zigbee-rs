@@ -32,7 +32,7 @@ use zigbee_mac::cc26x2::{CC26X2_ROUTER_PENDING_RX, Cc26x2RadioPhy, Cc26x2RouterM
 use zigbee_runtime::{
     ZigbeeDevice, node::ZigbeeNode, power::PowerMode, profile::ApplicationProfile, role::Router,
 };
-use zigbee_types::ChannelMask;
+use zigbee_types::{ChannelMask, ShortAddress};
 use zigbee_zcl::clusters::basic::PowerSource;
 
 #[allow(unused_imports)]
@@ -81,6 +81,9 @@ async fn main(_spawner: Spawner) {
     // Keep the product CCFG in the image.
     let _ = unsafe { core::ptr::read_volatile(&product::ccfg::CCFG[0]) };
     let started = platform::start(product::ROUTER_MODEL);
+    if ACK_PROBE {
+        log::warn!("[CC26X2] TEST-ONLY unicast ACK probe enabled");
+    }
     if CHANNELS.0 != ChannelMask::ALL_2_4GHZ.0 {
         log::warn!("[CC26X2] TEST-ONLY channel mask 0x{:08X}", CHANNELS.0);
     }
@@ -91,6 +94,7 @@ async fn main(_spawner: Spawner) {
 
     let mut awaiting_since: Option<Instant> = None;
     let mut next_summary = Instant::now() + SUMMARY_PERIOD;
+    let mut probe_slot: Option<usize> = None;
     loop {
         // No button: re-arm commissioning automatically after a Leave.
         if app.awaiting_commissioning_request() {
@@ -112,7 +116,38 @@ async fn main(_spawner: Spawner) {
         if Instant::now() >= next_summary {
             next_summary += SUMMARY_PERIOD;
             log_summary(app);
+            if ACK_PROBE {
+                ack_probe(app, &mut probe_slot).await;
+            }
         }
+    }
+}
+
+/// TEST-ONLY (`CC26X2_ROUTER_ACK_PROBE=1` at build time): once per summary
+/// period, send a unicast IEEE_addr_req to the coordinator. Its response
+/// arrives as a MAC unicast with AR set, which the RF core must
+/// auto-acknowledge (compare `ar-unicast` with `auto-acks`).
+const ACK_PROBE: bool = match option_env!("CC26X2_ROUTER_ACK_PROBE") {
+    Some(v) => matches!(v.as_bytes(), [b'1']),
+    None => false,
+};
+
+async fn ack_probe(app: &mut App, slot: &mut Option<usize>) {
+    let zdo = app.node_mut().device_mut().bdb_mut().zdo_mut();
+    if let Some(previous) = slot.take() {
+        let answered = zdo.take_response(previous).is_some();
+        zdo.cancel_pending(previous);
+        log::info!("[CC26X2] TEST-ONLY ack probe answered: {answered}");
+    }
+    if !zdo.nwk().is_joined() {
+        return;
+    }
+    match zdo.start_ieee_addr_req(ShortAddress(0x0000)).await {
+        Ok((pending, tsn)) => {
+            log::info!("[CC26X2] TEST-ONLY ack probe IEEE_addr_req tsn {tsn} to 0x0000");
+            *slot = Some(pending);
+        }
+        Err(status) => log::warn!("[CC26X2] TEST-ONLY ack probe failed: {status:?}"),
     }
 }
 
@@ -231,12 +266,13 @@ fn log_summary(app: &App) {
     let radio = phy.radio_stats();
     let (last_error, rx_status) = phy.last_error();
     log::info!(
-        "[CC26X2] neighbours {} children {} routes {} | rx {} restarts {} auto-acks {} buf-full {} nok {} | tx {} no-ack {} busy {} err {} | rx 0x{:04X} last-err {:?}",
+        "[CC26X2] neighbours {} children {} routes {} | rx {} restarts {} ar-unicast {} auto-acks {} buf-full {} nok {} | tx {} no-ack {} busy {} err {} | rx 0x{:04X} last-err {:?}",
         neighbors.len(),
         neighbors.children().count(),
         nwk.routing_table().len(),
         radio.rx_frames,
         radio.rx_restarts,
+        radio.rx_ack_requested,
         radio.auto_acks,
         radio.rx_buf_full,
         radio.rx_nok,

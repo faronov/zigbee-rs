@@ -37,9 +37,22 @@ const CTL_RTSEN: u32 = 1 << 14;
 const CTL_CTSEN: u32 = 1 << 15;
 /// RX, RX timeout and overrun interrupts.
 const INT_RX: u32 = (1 << 4) | (1 << 6) | (1 << 10);
+/// TX FIFO level interrupt.
+const INT_TX: u32 = 1 << 5;
 
+/// Receive ring capacity (power of two). The `uart-host-rings` feature
+/// sizes it for a host link (ZRHP NCP); logging-only images keep 1 KiB.
+#[cfg(feature = "uart-host-rings")]
+pub const RX_RING_LEN: usize = 4096;
 /// Receive ring capacity (power of two).
+#[cfg(not(feature = "uart-host-rings"))]
 pub const RX_RING_LEN: usize = 1024;
+/// Transmit ring capacity for [`Uart0::try_write`] (power of two).
+#[cfg(feature = "uart-host-rings")]
+pub const TX_RING_LEN: usize = 2048;
+/// Transmit ring capacity for [`Uart0::try_write`] (power of two).
+#[cfg(not(feature = "uart-host-rings"))]
+pub const TX_RING_LEN: usize = 64;
 
 /// Ownership token for UART0.
 pub struct Uart0Token(pub(crate) ());
@@ -148,11 +161,39 @@ impl Uart0 {
 
     /// Unmask the RX interrupts that fill the ring.
     pub fn enable_rx_interrupt(&mut self) {
-        mmio::write(IMSC, INT_RX);
+        mmio::modify(IMSC, 0, INT_RX);
         #[cfg(all(target_arch = "arm", target_os = "none"))]
         unsafe {
             cortex_m::peripheral::NVIC::unmask(crate::vectors::Interrupt::UART0_COMB)
         };
+    }
+
+    /// Queue as much of `data` as fits in the transmit ring without
+    /// blocking; the `UART0_COMB` interrupt feeds the FIFO. Returns the
+    /// number of bytes accepted (0 when the ring is full). Do not mix with
+    /// [`Uart0::write`] while bytes are queued.
+    pub fn try_write(&mut self, data: &[u8]) -> usize {
+        let mut n = 0;
+        for &b in data {
+            if !TX_RING.push(b) {
+                break;
+            }
+            n += 1;
+        }
+        if n > 0 {
+            cortex_m_free(|| {
+                fill_fifo();
+                if !TX_RING.is_empty() {
+                    mmio::modify(IMSC, 0, INT_TX);
+                }
+            });
+        }
+        n
+    }
+
+    /// Nothing queued in the transmit ring.
+    pub fn tx_idle(&self) -> bool {
+        TX_RING.is_empty()
     }
 
     /// Move received bytes from the ring into `out`; returns the count.
@@ -182,42 +223,66 @@ pub fn flush_blocking() {
 }
 
 static RX_OVERRUNS: AtomicU32 = AtomicU32::new(0);
-static RING: Ring = Ring::new();
+static RING: Ring<RX_RING_LEN> = Ring::new();
+static TX_RING: Ring<TX_RING_LEN> = Ring::new();
 
-struct Ring {
-    buf: [AtomicU8; RX_RING_LEN],
+fn cortex_m_free(f: impl FnOnce()) {
+    #[cfg(all(target_arch = "arm", target_os = "none"))]
+    cortex_m::interrupt::free(|_| f());
+    #[cfg(not(all(target_arch = "arm", target_os = "none")))]
+    f();
+}
+
+/// Move queued bytes into the TX FIFO while it has room.
+fn fill_fifo() {
+    let mut byte = [0u8; 1];
+    while mmio::read(FR) & FR_TXFF == 0 && TX_RING.pop(&mut byte) == 1 {
+        mmio::write(DR, u32::from(byte[0]));
+    }
+}
+
+/// Single-producer/single-consumer byte ring.
+struct Ring<const N: usize> {
+    buf: [AtomicU8; N],
     head: AtomicU16,
     tail: AtomicU16,
 }
 
-impl Ring {
+impl<const N: usize> Ring<N> {
+    const VALID: () = assert!(N.is_power_of_two() && N <= 32768);
+
     const fn new() -> Self {
+        let () = Self::VALID;
         Self {
-            buf: [const { AtomicU8::new(0) }; RX_RING_LEN],
+            buf: [const { AtomicU8::new(0) }; N],
             head: AtomicU16::new(0),
             tail: AtomicU16::new(0),
         }
     }
 
-    /// Producer (interrupt).
+    fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
+    }
+
+    /// Producer.
     fn push(&self, byte: u8) -> bool {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
-        if head.wrapping_sub(tail) as usize >= RX_RING_LEN {
+        if head.wrapping_sub(tail) as usize >= N {
             return false;
         }
-        self.buf[head as usize % RX_RING_LEN].store(byte, Ordering::Relaxed);
+        self.buf[head as usize % N].store(byte, Ordering::Relaxed);
         self.head.store(head.wrapping_add(1), Ordering::Release);
         true
     }
 
-    /// Consumer (task).
+    /// Consumer.
     fn pop(&self, out: &mut [u8]) -> usize {
         let head = self.head.load(Ordering::Acquire);
         let mut tail = self.tail.load(Ordering::Relaxed);
         let mut n = 0;
         while tail != head && n < out.len() {
-            out[n] = self.buf[tail as usize % RX_RING_LEN].load(Ordering::Relaxed);
+            out[n] = self.buf[tail as usize % N].load(Ordering::Relaxed);
             tail = tail.wrapping_add(1);
             n += 1;
         }
@@ -226,9 +291,8 @@ impl Ring {
     }
 }
 
-const _: () = assert!(RX_RING_LEN.is_power_of_two() && RX_RING_LEN <= 32768);
-
-/// UART0 combined interrupt: drain the RX FIFO into the ring.
+/// UART0 combined interrupt: drain the RX FIFO into the ring and refill
+/// the TX FIFO from the transmit ring.
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 #[unsafe(no_mangle)]
 extern "C" fn UART0_COMB() {
@@ -243,6 +307,10 @@ extern "C" fn UART0_COMB() {
         if !RING.push(byte) {
             RX_OVERRUNS.fetch_add(1, Ordering::Relaxed);
         }
+    }
+    fill_fifo();
+    if TX_RING.is_empty() {
+        mmio::modify(IMSC, INT_TX, 0);
     }
 }
 
@@ -264,7 +332,7 @@ mod tests {
 
     #[test]
     fn ring_is_bounded_and_ordered() {
-        let ring = Ring::new();
+        let ring = Ring::<RX_RING_LEN>::new();
         for i in 0..RX_RING_LEN {
             assert!(ring.push(i as u8));
         }

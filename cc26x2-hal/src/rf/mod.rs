@@ -140,6 +140,49 @@ pub struct RxInfo {
     pub rssi_dbm: i8,
     /// Correlation value 0..63 (higher is better).
     pub correlation: u8,
+    /// FCS check passed. Always true from [`Radio::receive`]; only
+    /// [`Radio::receive_any`] with [`Radio::set_keep_crc_errors`] returns
+    /// failed frames.
+    pub crc_ok: bool,
+}
+
+/// Board RF front-end switch (`rfDriverCallbackAntennaSwitching` of the TI
+/// CC1352P/CC2652P LaunchPads, 2.4 GHz part):
+///
+/// - standard PA (and receive): `path_24ghz` high, `high_pa` low;
+/// - +20 dBm PA: `path_24ghz` follows the RF core LNA enable (RFC_GPO0),
+///   `high_pa` follows the high-PA enable (RFC_GPO3).
+///
+/// A board without a line leaves it `None`. Lines are driven low while the
+/// radio is not set up.
+#[derive(Debug, Default)]
+pub struct RfSwitch {
+    pub path_24ghz: Option<crate::gpio::RfControlPin>,
+    pub high_pa: Option<crate::gpio::RfControlPin>,
+}
+
+impl RfSwitch {
+    fn apply(&self, pa: Pa) {
+        use crate::gpio::{PORT_RFC_GPO0, PORT_RFC_GPO3};
+        match pa {
+            Pa::Standard => {
+                if let Some(pin) = &self.high_pa {
+                    pin.drive(false);
+                }
+                if let Some(pin) = &self.path_24ghz {
+                    pin.drive(true);
+                }
+            }
+            Pa::High => {
+                if let Some(pin) = &self.path_24ghz {
+                    pin.follow_rfc(PORT_RFC_GPO0);
+                }
+                if let Some(pin) = &self.high_pa {
+                    pin.follow_rfc(PORT_RFC_GPO3);
+                }
+            }
+        }
+    }
 }
 
 /// Frame Pending table address.
@@ -164,7 +207,14 @@ pub struct RadioStats {
     pub tx_no_ack: u32,
     pub tx_busy: u32,
     pub tx_errors: u32,
-    /// `rfc_ieeeRxOutput_t` counters of the running receiver.
+    /// Delivered frames that requested an ACK (AR = 1) and were addressed
+    /// to this node (not broadcast) while the address filter was active:
+    /// the RF core must have auto-acknowledged each of them.
+    pub rx_ack_requested: u32,
+    /// CRC-failed frames returned by [`Radio::receive_any`].
+    pub rx_crc_errors: u32,
+    /// `rfc_ieeeRxOutput_t` counters of the running receiver (8-bit,
+    /// saturating, since the radio was set up).
     pub auto_acks: u8,
     pub rx_buf_full: u8,
     pub rx_nok: u8,
@@ -313,12 +363,24 @@ pub struct Radio {
     random_state: u16,
     stats: RadioStats,
     tx_pending: bool,
+    keep_crc_errors: bool,
+    rf_switch: RfSwitch,
 }
 
 impl RadioToken {
     /// Power the RF core, patch it and run the IEEE 802.15.4 setup. SCLK_HF
     /// must already run from XOSC_HF ([`crate::setup::start_xosc_hf`]).
     pub fn init(self, tx_power_dbm: i8) -> Result<Radio, RadioError> {
+        self.init_with_switch(tx_power_dbm, RfSwitch::default())
+    }
+
+    /// [`RadioToken::init`] for a board with an RF front-end switch; the
+    /// switch is set for the selected PA before the radio is set up.
+    pub fn init_with_switch(
+        self,
+        tx_power_dbm: i8,
+        rf_switch: RfSwitch,
+    ) -> Result<Radio, RadioError> {
         let mem = addr_of_mut!(RF_MEM);
         let mut radio = Radio {
             mem,
@@ -330,7 +392,10 @@ impl RadioToken {
             random_state: 0xACE1,
             stats: RadioStats::default(),
             tx_pending: false,
+            keep_crc_errors: false,
+            rf_switch,
         };
+        radio.rf_switch.apply(radio.power.pa);
         radio.init_queue();
         radio.power_up()?;
         Ok(radio)
@@ -484,6 +549,11 @@ impl Radio {
     fn start_rx(&mut self) -> Result<(), RadioError> {
         let channel = self.channel;
         let filter = self.filter;
+        let flush_crc = if self.keep_crc_errors {
+            0
+        } else {
+            rx_config::AUTO_FLUSH_CRC
+        };
         let m = self.m();
         let rx = &mut m.rx;
         rx.status = status::IDLE;
@@ -491,7 +561,7 @@ impl Radio {
         rx.start_trigger = TRIG_NOW;
         rx.condition = COND_NEVER;
         rx.channel = channel;
-        rx.rx_config = rx_config::AUTO_FLUSH_CRC
+        rx.rx_config = flush_crc
             | rx_config::AUTO_FLUSH_IGN
             | rx_config::APPEND_RSSI
             | rx_config::APPEND_CORR_CRC;
@@ -598,11 +668,36 @@ impl Radio {
             let word = addr(addr_of!(m.set_power));
             submit(word)?;
         }
+        self.rf_switch.apply(new.pa);
         Ok(new)
     }
 
-    /// Take the next received frame into `out`.
+    /// Diagnostics: keep CRC-failed frames in the RX queue so
+    /// [`Radio::receive_any`] can report them (RSSI/correlation of corrupt
+    /// frames). Restarts a running receiver.
+    pub fn set_keep_crc_errors(&mut self, keep: bool) -> Result<(), RadioError> {
+        self.keep_crc_errors = keep;
+        if self.is_rx_on() {
+            self.stop_rx();
+            self.start_rx()?;
+        }
+        Ok(())
+    }
+
+    /// Take the next received frame with a valid FCS into `out`.
     pub fn receive(&mut self, out: &mut [u8; MAX_FRAME]) -> Option<RxInfo> {
+        for _ in 0..RX_ENTRIES {
+            let info = self.receive_any(out)?;
+            if info.crc_ok {
+                return Some(info);
+            }
+        }
+        None
+    }
+
+    /// Take the next received frame into `out`, including CRC failures when
+    /// [`Radio::set_keep_crc_errors`] is on.
+    pub fn receive_any(&mut self, out: &mut [u8; MAX_FRAME]) -> Option<RxInfo> {
         // A receiver that ended (queue overflow, synth error) is restarted.
         if self.rx_wanted && !self.tx_pending && !self.is_rx_on() {
             self.stats.rx_restarts += 1;
@@ -624,10 +719,11 @@ impl Radio {
                         }
                         let rssi = unsafe { read_volatile(data.add(n - 1)) } as i8;
                         let corr = unsafe { read_volatile(data.add(n)) };
-                        (corr & 0x80 == 0).then_some(RxInfo {
+                        Some(RxInfo {
                             len,
                             rssi_dbm: rssi,
                             correlation: corr & 0x3F,
+                            crc_ok: corr & 0x80 == 0,
                         })
                     } else {
                         None
@@ -635,7 +731,14 @@ impl Radio {
                     unsafe { write_volatile(entry.add(4), DATA_ENTRY_PENDING) };
                     self.read_index = (index + 1) % RX_ENTRIES;
                     if let Some(info) = result {
-                        self.stats.rx_frames += 1;
+                        if !info.crc_ok {
+                            self.stats.rx_crc_errors += 1;
+                        } else {
+                            self.stats.rx_frames += 1;
+                            if self.filter.is_some() && acked_unicast(&out[..info.len]) {
+                                self.stats.rx_ack_requested += 1;
+                            }
+                        }
                         return Some(info);
                     }
                 }
@@ -933,6 +1036,22 @@ impl Radio {
     }
 }
 
+/// AR = 1 and a destination that is not the broadcast short address.
+fn acked_unicast(frame: &[u8]) -> bool {
+    let [fc0, fc1, ..] = *frame else {
+        return false;
+    };
+    if fc0 & 0x20 == 0 {
+        return false;
+    }
+    match (fc1 >> 2) & 0x03 {
+        // Short destination: [fc 2][seq][pan 2][dst 2].
+        2 => frame.get(5..7).is_some_and(|d| d != [0xFF, 0xFF]),
+        3 => true,
+        _ => false,
+    }
+}
+
 /// Copy the CPE patch into RF core RAM (`rf_patch_cpe_ieee_802_15_4()`,
 /// patch-entered state not tracked: the image is always copied).
 fn apply_patch() {
@@ -954,5 +1073,26 @@ mod tests {
     fn entry_fits_the_largest_frame() {
         const { assert!(ENTRY_SIZE >= 8 + 1 + MAX_FRAME + 2) };
         const { assert!(ENTRY_SIZE.is_multiple_of(4)) };
+    }
+
+    #[test]
+    fn acked_unicast_classification() {
+        // Data, AR, PAN-ID compression, short dst 0x6D6B / short src.
+        assert!(acked_unicast(&[
+            0x61, 0x88, 1, 0xE9, 0xDF, 0x6B, 0x6D, 0, 0
+        ]));
+        // Same without AR.
+        assert!(!acked_unicast(&[
+            0x41, 0x88, 1, 0xE9, 0xDF, 0x6B, 0x6D, 0, 0
+        ]));
+        // Broadcast destination never requests an ACK.
+        assert!(!acked_unicast(&[
+            0x61, 0x88, 1, 0xE9, 0xDF, 0xFF, 0xFF, 0, 0
+        ]));
+        // Extended destination with AR.
+        assert!(acked_unicast(&[
+            0x61, 0xCC, 1, 0xE9, 0xDF, 0, 0, 0, 0, 0, 0, 0, 0
+        ]));
+        assert!(!acked_unicast(&[0x61]));
     }
 }

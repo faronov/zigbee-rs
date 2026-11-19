@@ -18,6 +18,12 @@ pub(crate) const PORT_UART0_RX: u32 = 0x0F;
 pub(crate) const PORT_UART0_TX: u32 = 0x10;
 pub(crate) const PORT_UART0_CTS: u32 = 0x11;
 pub(crate) const PORT_UART0_RTS: u32 = 0x12;
+/// RF core data out 0: LNA enable (receiving).
+pub(crate) const PORT_RFC_GPO0: u32 = 0x2F;
+/// RF core data out 3: high-power PA enable (transmitting). TI routes the
+/// high-PA switch to GPO3 instead of GPO1 (PA enable is sometimes not
+/// de-asserted on GPO1).
+pub(crate) const PORT_RFC_GPO3: u32 = 0x32;
 
 const IOCFG_IE: u32 = 1 << 29;
 const PULL_DOWN: u32 = 1 << 13;
@@ -101,6 +107,37 @@ impl Dio {
         mmio::modify(DOE, 1 << self.0, 0);
         self.configure(PORT_GPIO, true, pull);
         Input(self)
+    }
+}
+
+/// A pad that an RF front-end switch control line is wired to: driven as a
+/// GPIO level or handed to an RF core output.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RfControlPin(Dio);
+
+impl RfControlPin {
+    pub fn new(dio: Dio) -> Self {
+        ensure_gpio();
+        let pin = Self(dio);
+        pin.drive(false);
+        pin
+    }
+
+    /// GPIO output at `high`.
+    pub(crate) fn drive(&self, high: bool) {
+        let bit = 1u32 << (self.0).0;
+        mmio::write(if high { DOUTSET } else { DOUTCLR }, bit);
+        self.0.configure(PORT_GPIO, false, Pull::None);
+        mmio::modify(DOE, 0, bit);
+    }
+
+    /// Output follows RF core signal `port` (`PORT_RFC_GPO*`).
+    pub(crate) fn follow_rfc(&self, port: u32) {
+        self.0.configure(port, false, Pull::None);
+    }
+
+    pub const fn number(&self) -> u8 {
+        (self.0).0
     }
 }
 

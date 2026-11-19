@@ -26,6 +26,9 @@ cc1352p7 = ["family-x2x7", "high-pa"]
 family-x2 = []
 family-x2x7 = []
 high-pa = []
+# Large UART0 RX/TX rings (4 KiB / 2 KiB) for a host link such as the
+# ZRHP NCP; without it the rings are 1 KiB / 64 B.
+uart-host-rings = []
 # Provide `__INTERRUPTS` for cortex-m-rt's `device` feature.
 rt = []
 # Embassy time driver on the AON RTC (32,768 Hz). Defines the
