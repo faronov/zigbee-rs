@@ -3479,3 +3479,190 @@ mod tests {
         );
     }
 }
+
+/// Why [`Sink::import`] refused an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportError {
+    /// The Sink Table already has an entry for the GPD.
+    AlreadyExists,
+    /// The Sink Table is full.
+    TableFull,
+    /// The entry cannot be used: reserved GPD ID or security level, a
+    /// protected entry without a key, or commissioned groupcast without a
+    /// group.
+    Invalid,
+}
+
+/// Host-managed Sink Table: a network co-processor whose host mirrors,
+/// backs up and restores the table (ZRHP spec 7.11). Kept apart from the
+/// commissioning paths above; nothing here runs unless a product calls it.
+impl<const N: usize, const Q: usize> Sink<N, Q> {
+    /// Add an entry that was commissioned elsewhere (a backup, another
+    /// sink, the host's own records). The frame counter is taken as the last
+    /// accepted one and is persisted exactly. GPEP group membership follows
+    /// the entry; with `announce` a GP Pairing (AddSink) is broadcast, as
+    /// after a commissioning, otherwise nothing is sent (the proxies are
+    /// assumed to be paired already).
+    pub fn import(
+        &mut self,
+        mut entry: SinkEntry,
+        announce: bool,
+    ) -> core::result::Result<(), ImportError> {
+        let protected = entry.security_level.is_protected();
+        if entry.gpd_id.is_reserved()
+            || entry.security_level == SecurityLevel::Reserved
+            || (protected && (entry.key.is_none() || entry.key_type == KeyType::NoKey))
+            || (entry.communication_mode == CommunicationMode::CommissionedGroupcast
+                && entry.groups.is_empty())
+        {
+            return Err(ImportError::Invalid);
+        }
+        if !protected {
+            entry.key = None;
+            entry.key_type = KeyType::NoKey;
+        }
+        if self.find(&entry.gpd_id).is_some() {
+            return Err(ImportError::AlreadyExists);
+        }
+        if self.table.is_full() {
+            return Err(ImportError::TableFull);
+        }
+        entry.persisted_counter = entry.frame_counter;
+        entry.counter_exact = true;
+        let gpd_id = entry.gpd_id;
+        let groups = entry.group_ids();
+        for &g in &groups {
+            if !self.table.iter().any(|e| e.group_ids().contains(&g)) {
+                let _ = self.group_changes.push_back(GroupChange::Join(g));
+            }
+        }
+        let _ = self.table.push(entry);
+        self.dirty = true;
+        if announce {
+            self.queue(Out::PairingAdd(gpd_id));
+        }
+        Ok(())
+    }
+
+    /// Remove a GPD from the Sink Table without GP Pairing (RemoveGPD): the
+    /// proxies keep forwarding for it (e.g. another sink takes over). Reports
+    /// [`SinkEvent::Decommissioned`] like [`remove`](Self::remove).
+    pub fn remove_quietly(&mut self, gpd: &GpdId) -> bool {
+        let Some(i) = self.find(gpd) else {
+            return false;
+        };
+        let e = self.table.swap_remove(i);
+        self.dup.forget(&e.gpd_id);
+        self.release_groups(&e.group_ids());
+        self.dirty = true;
+        self.event(SinkEvent::Decommissioned { gpd_id: e.gpd_id });
+        true
+    }
+
+    /// Queued application events, oldest first, without taking them (the
+    /// newest is the one the last processed frame produced).
+    pub fn events(&self) -> impl Iterator<Item = &SinkEvent> {
+        self.events.iter()
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    const OWN: u16 = 0x0000;
+    const KEY: AesKey = [0x5A; 16];
+
+    fn sink() -> Sink<2, 4> {
+        let mut s = Sink::<2, 4>::new(SinkConfig::default());
+        s.set_own_address(OWN, [1, 2, 3, 4, 5, 6, 7, 8], 0x1A62);
+        s
+    }
+
+    fn protected(src: u32, counter: u32) -> SinkEntry {
+        let mut e = SinkEntry::new(GpdId::SrcId(src));
+        e.security_level = SecurityLevel::Encrypted;
+        e.key_type = KeyType::IndividualKey;
+        e.key = Some(KEY);
+        e.frame_counter = counter;
+        e.device_id = 0x02;
+        e
+    }
+
+    #[test]
+    fn import_keeps_the_counter_joins_groups_and_pairs_only_on_request() {
+        let mut s = sink();
+        assert_eq!(s.import(protected(0x1111_2222, 500), false), Ok(()));
+        assert!(s.take_dirty());
+        let alias = derive_alias(&GpdId::SrcId(0x1111_2222));
+        assert_eq!(s.take_group_change(), Some(GroupChange::Join(alias)));
+        assert!(!s.has_tx(), "no GP Pairing without announce");
+        let e = &s.entries()[0];
+        assert_eq!(
+            (e.frame_counter, e.key, e.counter_exact()),
+            (500, Some(KEY), true)
+        );
+        // A restored copy keeps the exact counter: nothing at or below it
+        // is ever accepted again.
+        let mut copy = sink();
+        copy.restore(e.clone()).unwrap();
+        assert_eq!(copy.entries()[0].frame_counter, 500);
+
+        assert_eq!(
+            s.import(protected(0x1111_2222, 9), false),
+            Err(ImportError::AlreadyExists)
+        );
+        assert_eq!(s.import(protected(0x3333_4444, 1), true), Ok(()));
+        assert!(s.has_tx(), "announce queues GP Pairing");
+        let tx = s.poll(0).unwrap();
+        assert!(matches!(
+            tx.tx.frame,
+            TxFrame::GpCommand {
+                command_id: client_cmd::PAIRING,
+                ..
+            }
+        ));
+        assert_eq!(
+            s.import(protected(0x5555_6666, 1), false),
+            Err(ImportError::TableFull)
+        );
+    }
+
+    #[test]
+    fn import_rejects_unusable_entries() {
+        let mut s = sink();
+        let mut no_key = protected(0x1111_2222, 1);
+        no_key.key = None;
+        assert_eq!(s.import(no_key, false), Err(ImportError::Invalid));
+        let mut reserved = protected(0x1111_2222, 1);
+        reserved.security_level = SecurityLevel::Reserved;
+        assert_eq!(s.import(reserved, false), Err(ImportError::Invalid));
+        assert_eq!(
+            s.import(protected(0, 1), false),
+            Err(ImportError::Invalid),
+            "SrcID 0 is reserved"
+        );
+        let mut group = protected(0x1111_2222, 1);
+        group.communication_mode = CommunicationMode::CommissionedGroupcast;
+        assert_eq!(s.import(group, false), Err(ImportError::Invalid));
+        assert!(s.entries().is_empty());
+    }
+
+    #[test]
+    fn quiet_removal_sends_nothing_but_reports_and_releases_groups() {
+        let mut s = sink();
+        s.import(protected(0x1111_2222, 5), false).unwrap();
+        let _ = s.take_group_change();
+        assert!(s.remove_quietly(&GpdId::SrcId(0x1111_2222)));
+        assert!(!s.remove_quietly(&GpdId::SrcId(0x1111_2222)));
+        assert!(!s.has_tx());
+        assert!(matches!(s.take_group_change(), Some(GroupChange::Leave(_))));
+        assert_eq!(
+            s.events().last(),
+            Some(&SinkEvent::Decommissioned {
+                gpd_id: GpdId::SrcId(0x1111_2222)
+            })
+        );
+        assert!(s.entries().is_empty());
+    }
+}

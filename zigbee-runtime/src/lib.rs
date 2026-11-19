@@ -833,7 +833,7 @@ mod builder_cluster_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "host-passthrough")))]
 mod resume_tests {
     use core::future::Future;
     use core::task::{Context, Poll, Waker};
@@ -9253,7 +9253,7 @@ impl<M: MacDriver, R: crate::role::ParentRole> ZigbeeDevice<M, R> {
 /// role-specific [`ParentState`](crate::role::ParentState) through the
 /// [`ParentRole`](crate::role::ParentRole) accessors rather than a common
 /// field (which no longer exists on a leaf/relay device).
-#[cfg(all(test, feature = "router"))]
+#[cfg(all(test, feature = "router", not(feature = "global-aps-counter")))]
 impl<M: MacDriver, R: crate::role::ParentRole> ZigbeeDevice<M, R> {
     /// Whether a R22 Parent Announce is currently scheduled
     /// (`apsParentAnnounceTimer` running).
@@ -14950,14 +14950,14 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         // kept out of the per-backend receive future.
         let (dst_ep, cluster_id, src_addr) = aps_route_metadata(&aps_indication);
 
-        // Send APS ACK now if the incoming frame requested one. This must
-        // happen for *every* endpoint (ZDO and application clusters alike),
-        // not just for ZDO — otherwise the coordinator/TC retransmits ZCL
-        // Read Attributes (e.g. Basic Manufacturer/Model) until the ZHA
-        // interview times out, leaving the device as `unk_manufacturer /
-        // unk_model` with empty endpoints. Spec: APS sub-layer ACKs precede
-        // any application-level response (ZB R22 §2.2.5.1).
+        // Send APS ACK now if the incoming frame requested one. This must happen for *every* endpoint (ZDO and application clusters alike),
+        // not just for ZDO — otherwise the coordinator/TC retransmits ZCL Read Attributes (e.g. Basic Manufacturer/Model) until the ZHA
+        // interview times out, leaving the device as `unk_manufacturer / unk_model` with empty endpoints. Spec: APS sub-layer ACKs precede any application-level response (ZB R22 §2.2.5.1).
         self.send_pending_aps_ack_if_ready().await;
+        #[cfg(feature = "host-passthrough")]
+        if self.host_passthrough_capture(&aps_indication, indication, src, nwk_security) {
+            return None;
+        }
 
         if dst_ep == 0x00 {
             if defer_binding {
@@ -15929,7 +15929,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     }
 }
 
-#[cfg(all(test, feature = "router"))]
+#[cfg(all(test, feature = "router", not(feature = "global-aps-counter")))]
 mod parent_router_tests {
     use super::child_store::{
         ChildStoreError, ChildTableStore, PersistentChildTable, RamChildTableStore,
@@ -20975,6 +20975,24 @@ mod start_identify_tests {
     }
 }
 
+/// Raw APS indications for an external host (declared last, see above).
+#[cfg(feature = "host-passthrough")]
+pub mod host_passthrough;
 /// Small durable application settings (declared last: keeps the line
 /// numbers above, which panic locations embed, unchanged).
 pub mod settings_journal;
+
+/// Table capacity selection: `ncp` with the `ncp-capacity` feature (the
+/// coordinator NCP, ZRHP spec 8.9), otherwise `default`. Only evaluated in
+/// constant contexts (declared last, like the modules above).
+pub(crate) const fn ncp_capacity(default: usize, ncp: usize) -> usize {
+    if cfg!(feature = "ncp-capacity") {
+        ncp
+    } else {
+        default
+    }
+}
+
+/// Streamed multi-slot Trust Center journal of the coordinator NCP.
+#[cfg(feature = "ncp-capacity")]
+pub mod trust_center_stream;

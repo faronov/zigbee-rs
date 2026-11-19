@@ -460,6 +460,15 @@ where
         let reg = self.uhci_per.register_block();
         config.apply_config(reg)
     }
+
+    /// LOCAL PATCH (zigbee-rs): apply a full UART configuration (baud rate,
+    /// format and hardware flow control) to the UART this UHCI drives, after
+    /// [`Uhci::split`]. The baud-rate divider is shared by both directions;
+    /// call it only while no TX transfer runs.
+    pub fn apply_uart_config(&mut self, config: &uart::Config) -> Result<(), uart::ConfigError> {
+        use uart::Instance as _;
+        self.uart_tx.uart.info().apply_config(config)
+    }
 }
 
 /// Splitted Uhci structs, Rx part for receiving data

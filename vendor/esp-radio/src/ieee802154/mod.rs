@@ -520,3 +520,44 @@ fn rx_available() {
 
     CALLBACKS.with(|cbs| cbs.call_rx_available());
 }
+
+/// Energy detection (local patch `ieee802154-energy-detect`, declared last).
+#[cfg(feature = "ieee802154-energy-detect")]
+impl Ieee802154<'_> {
+    /// Start an energy-detect measurement of `duration_symbols` × 16 µs on
+    /// the configured channel; poll [`Self::take_energy_detect`]. Reception
+    /// stops for the measurement and resumes afterwards.
+    pub fn start_energy_detect(&mut self, duration_symbols: u32) -> Result<(), Error> {
+        raw::energy_detect::start(duration_symbols)
+    }
+
+    /// The completed measurement (maximum/average RSS in dBm), once.
+    pub fn take_energy_detect(&mut self) -> Option<i8> {
+        raw::energy_detect::take()
+    }
+
+    /// Abandon an unfinished measurement and resume reception.
+    pub fn cancel_energy_detect(&mut self) {
+        raw::energy_detect::cancel()
+    }
+}
+
+/// External (PTA) coexistence priorities of the radio (local patch
+/// `ieee802154-extcoex`, declared last).
+#[cfg(feature = "ieee802154-extcoex")]
+pub use self::raw::extcoex::{CoexPriority, CoexPti, coex_pti, set_coex_pti};
+
+/// The driver state a stalled radio is diagnosed from (local patch
+/// `ieee802154-debug-state`, declared last): `(state, pending events,
+/// hardware rx_state, queued frames)`; state 0 idle, 1 receive, 2 transmit,
+/// 3 TX ACK, 4 sleep.
+pub fn debug_state() -> (u8, u16, u8, u8) {
+    raw::debug_state()
+}
+
+/// `TxAck` stalls left by the watchdog since boot (local patch
+/// `ieee802154-tx-ack-watchdog`, declared last).
+#[cfg(feature = "ieee802154-tx-ack-watchdog")]
+pub fn tx_ack_recoveries() -> u32 {
+    raw::tx_ack_recoveries()
+}

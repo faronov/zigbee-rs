@@ -63,6 +63,11 @@ mock = []
 # (unsecured GPDF replay/duplicate counter). Off by default; shipped images
 # are byte-identical without it.
 green-power = []
+# Received-frame RSSI (dBm, last hop) in `PhyRxFrame`/`MacFrame`, measured
+# by the ESP32 PHY and `RSSI_UNKNOWN_DBM` (-128) on other backends. Used by
+# the network co-processor's host indications. Off by default; images without
+# it are unchanged.
+rx-rssi = []
 # Timed transmission: `RadioPhy::transmit_at` / `MacDriver::transmit_raw_at`
 # and the end-of-frame receive time in `PhyRxFrame`/`MacFrame`. Used by the
 # Green Power TempMaster (gpTxQueue) to answer inside a GPD's rxAfterTx
@@ -97,6 +102,18 @@ esp32c5 = [
 # decided by a bounded source table in the RX_DONE interrupt
 # (vendor/esp-radio/LOCAL-PATCHES.md). Only router images enable it.
 esp-parent = ["esp-radio?/ieee802154-ack-pending"]
+# Zigbee coordinator on a parent-capable soft MAC: accept PAN-coordinator
+# MLME-START (short address 0x0000) and report `coordinator` capability.
+# Only coordinator/NCP images enable it; router images stay unchanged.
+pan-coordinator = []
+# Coordinator network co-processor capacity (ZRHP spec 8.9): the ESP parent
+# Frame Pending source table grows 16 -> 64 (one entry per sleepy child with
+# a queued indirect frame). Off by default: images without it are unchanged.
+ncp-capacity = []
+# ESP32-C6/H2 hardware energy-detect scan (local esp-radio patch
+# `ieee802154-energy-detect`): NWK formation channel selection and
+# Mgmt_NWK_Update ED scans. Off by default; images without it are unchanged.
+energy-detect = ["esp-radio?/ieee802154-energy-detect"]
 nrf52840 = [
     "hardware-aes-nrf",
     "dep:embassy-nrf52840",

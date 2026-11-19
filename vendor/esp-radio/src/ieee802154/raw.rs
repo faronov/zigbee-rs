@@ -319,7 +319,7 @@ fn triggered_fire() {
                     notify = Some(Ieee802154State::Receive);
                 }
                 tx_init(core::ptr::addr_of!(TRIGGERED_BUFFER).cast());
-                ieee802154_set_txrx_pti(Ieee802154TxRxScene::Tx);
+                #[cfg(not(feature = "ieee802154-extcoex"))] ieee802154_set_txrx_pti(Ieee802154TxRxScene::Tx); #[cfg(feature = "ieee802154-extcoex")] ieee802154_set_txrx_pti(Ieee802154TxRxScene::TxAt);
                 set_cmd(Command::TxStart);
                 state.state = Ieee802154State::Transmit;
                 t.outcome = Some(TriggeredOutcome::Sent { fired_after_us });
@@ -399,7 +399,7 @@ fn ieee802154_mac_init() {
 
     set_ed_sample_mode(EdSampleMode::Avg);
 
-    unsafe { esp_coex_ieee802154_ack_pti_set(ieee802154_coex_event_t_IEEE802154_MIDDLE) };
+    #[cfg(not(feature = "ieee802154-extcoex"))] unsafe { esp_coex_ieee802154_ack_pti_set(ieee802154_coex_event_t_IEEE802154_MIDDLE) }; #[cfg(feature = "ieee802154-extcoex")] extcoex::apply_ack_pti();
     ieee802154_set_txrx_pti(Ieee802154TxRxScene::Idle);
 
     unsafe {
@@ -423,7 +423,7 @@ fn ieee802154_mac_init() {
     .unwrap();
 }
 
-fn ieee802154_set_txrx_pti(txrx_scene: Ieee802154TxRxScene) {
+#[cfg(not(feature = "ieee802154-extcoex"))] fn ieee802154_set_txrx_pti(txrx_scene: Ieee802154TxRxScene) {
     match txrx_scene {
         Ieee802154TxRxScene::Idle => {
             unsafe { esp_coex_ieee802154_txrx_pti_set(ieee802154_coex_event_t_IEEE802154_IDLE) };
@@ -449,7 +449,7 @@ pub fn tx_init(frame: *const u8) {
     // ieee802154_frame_is_ack_required(frame)
     {
         // set rx pointer for ack frame
-        set_next_rx_buffer();
+        set_next_rx_buffer(); #[cfg(feature = "ieee802154-extcoex")] extcoex::tx_stage();
     }
 }
 
@@ -496,7 +496,7 @@ fn transmit_inner(
 ) -> Result<(), super::Error> {
     use super::suspend::Boundary;
     STATE.with(|state| {
-        match state.state {
+        #[cfg(feature = "ieee802154-tx-ack-watchdog")] tx_ack_watchdog::recover(state); match state.state {
             Ieee802154State::Sleep => return Err(super::Error::Sleeping),
             Ieee802154State::Transmit | Ieee802154State::TxAck => return Err(super::Error::Busy),
             _ if events() != 0
@@ -519,7 +519,7 @@ fn transmit_inner(
         }
         tx_init(frame);
 
-        ieee802154_set_txrx_pti(Ieee802154TxRxScene::Tx);
+        #[cfg(not(feature = "ieee802154-extcoex"))] ieee802154_set_txrx_pti(Ieee802154TxRxScene::Tx); #[cfg(feature = "ieee802154-extcoex")] ieee802154_set_txrx_pti(if preempt_rx { Ieee802154TxRxScene::TxAt } else { Ieee802154TxRxScene::Tx });
 
         if cca {
             // disable_events(IEEE802154_EVENT_ED_DONE);
@@ -611,14 +611,14 @@ fn rx_queue_blocks_tx(state: &IeeeState) -> bool {
 }
 
 pub(crate) fn can_transmit() -> Result<(), super::Error> {
-    STATE.with(|state| match state.state {
+    STATE.with(|state| { #[cfg(feature = "ieee802154-tx-ack-watchdog")] tx_ack_watchdog::recover(state); match state.state {
         Ieee802154State::Sleep => Err(super::Error::Sleeping),
         Ieee802154State::Transmit | Ieee802154State::TxAck => Err(super::Error::Busy),
         _ if events() != 0 || receive_in_progress() => Err(super::Error::Busy),
         #[cfg(feature = "ieee802154-triggered-tx")]
         _ if triggered_waiting() => Err(super::Error::Busy),
         _ => Ok(()),
-    })
+    }})
 }
 
 struct SleepBoundary<'a>(&'a mut IeeeState);
@@ -735,7 +735,7 @@ fn rx_init() {
 }
 
 fn enable_rx() {
-    set_next_rx_buffer();
+    #[cfg(feature = "ieee802154-extcoex")] extcoex::rx_stage(); set_next_rx_buffer();
     ieee802154_set_txrx_pti(Ieee802154TxRxScene::Rx);
 
     set_cmd(Command::RxStart);
@@ -859,7 +859,7 @@ pub(crate) fn ensure_receive_enabled() {
     // is in its automatic-ACK turnaround; RxStart then aborts the ACK, and
     // an inbound frame would be cut off.
     STATE.with(|state| {
-        if state.state == Ieee802154State::Receive && events() == 0 && !receive_in_progress() {
+        #[cfg(feature = "ieee802154-tx-ack-watchdog")] tx_ack_watchdog::recover(state); if state.state == Ieee802154State::Receive && events() == 0 && !receive_in_progress() {
             set_cmd(Command::RxStart);
         }
     });
@@ -965,7 +965,7 @@ fn zb_mac_handler() {
                     &RX_BUFFER[1..][..RX_BUFFER[0] as usize]
                 };
                 if will_auto_send_ack(frm) {
-                    state.state = Ieee802154State::TxAck;
+                    state.state = Ieee802154State::TxAck; #[cfg(feature = "ieee802154-extcoex")] extcoex::tx_stage(); #[cfg(feature = "ieee802154-tx-ack-watchdog")] tx_ack_watchdog::armed();
                 } else if should_send_enhanced_ack(frm) {
                     // TODO
                 } else {
@@ -988,18 +988,18 @@ fn zb_mac_handler() {
     }
 
     if events & Event::AckRxDone != 0 {
-        trace!("EventAckRxDone");
+        trace!("EventAckRxDone"); // ED_DONE is handled after this block (`ieee802154-energy-detect`).
     }
 
     if events & Event::AckTxDone != 0 {
-        trace!("EventAckTxDone");
+        trace!("EventAckTxDone"); #[cfg(feature = "ieee802154-extcoex")] extcoex::rx_stage();
         next_operation();
     }
 
     if events & Event::TxAbort != 0 {
         trace!("TxAbort");
         abort_tx();
-    }
+    } #[cfg(feature = "ieee802154-energy-detect")] energy_detect::on_interrupt(events);
 }
 
 fn freq_to_channel(freq: u8) -> u8 {
@@ -1012,4 +1012,303 @@ fn will_auto_send_ack(frame: &[u8]) -> bool {
 
 fn should_send_enhanced_ack(frame: &[u8]) -> bool {
     frame_is_ack_required(frame) && frame_get_version(frame) <= FRAME_VERSION_2 && tx_enhance_ack()
+}
+
+/// Energy detection (local patch `ieee802154-energy-detect`, declared last).
+///
+/// Ordering reference: ESP-IDF **v5.5.1** `esp_ieee802154_dev.c`
+/// (`ieee802154_energy_detect`: stop the current operation, update the PIB,
+/// `start_ed`; `isr_handle_ed_done` reads `ieee802154_ll_get_ed_rss`, then
+/// `next_operation`). The caller owns the driver exclusively while a
+/// measurement runs, so no transmission can start in the meantime.
+#[cfg(feature = "ieee802154-energy-detect")]
+pub(crate) mod energy_detect {
+    use core::sync::atomic::{AtomicI8, AtomicU8, Ordering};
+
+    use super::*;
+
+    const IDLE: u8 = 0;
+    const RUNNING: u8 = 1;
+    const DONE: u8 = 2;
+
+    static ED_STATE: AtomicU8 = AtomicU8::new(IDLE);
+    static ED_RSS: AtomicI8 = AtomicI8::new(i8::MIN);
+
+    /// Start one measurement of `duration_symbols` × 16 µs on the current
+    /// channel. Refused while a transmission, ACK or reception is active.
+    pub(crate) fn start(duration_symbols: u32) -> Result<(), crate::ieee802154::Error> {
+        STATE.with(|state| match state.state {
+            Ieee802154State::Sleep => Err(crate::ieee802154::Error::Sleeping),
+            Ieee802154State::Transmit | Ieee802154State::TxAck => {
+                Err(crate::ieee802154::Error::Busy)
+            }
+            _ if events() != 0 || receive_in_progress() => Err(crate::ieee802154::Error::Busy),
+            _ => {
+                stop_current_operation();
+                ieee802154_pib_update();
+                ED_STATE.store(RUNNING, Ordering::Release);
+                set_ed_duration(duration_symbols);
+                enable_events(Event::EdDone as u16);
+                set_cmd(Command::EdStart);
+                Ok(())
+            }
+        })
+    }
+
+    /// ZB_MAC interrupt part: latch the result and restart the receiver.
+    pub(crate) fn on_interrupt(events: u16) {
+        if events & Event::EdDone != 0 && ED_STATE.load(Ordering::Acquire) == RUNNING {
+            ED_RSS.store(ed_rss(), Ordering::Relaxed);
+            ED_STATE.store(DONE, Ordering::Release);
+            STATE.with(next_operation_inner);
+        }
+    }
+
+    /// The finished measurement in dBm, once.
+    pub(crate) fn take() -> Option<i8> {
+        ED_STATE
+            .compare_exchange(DONE, IDLE, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| ED_RSS.load(Ordering::Relaxed))
+    }
+
+    /// Abandon a measurement that did not complete and resume reception.
+    pub(crate) fn cancel() {
+        if ED_STATE.swap(IDLE, Ordering::AcqRel) == RUNNING {
+            STATE.with(|state| {
+                stop_current_operation();
+                next_operation_inner(state);
+            });
+        }
+    }
+}
+
+/// Scene priority with configurable PTIs (local patch `ieee802154-extcoex`;
+/// replaces the fixed-PTI function above, which is compiled out).
+#[cfg(feature = "ieee802154-extcoex")]
+fn ieee802154_set_txrx_pti(txrx_scene: Ieee802154TxRxScene) {
+    let pti = extcoex::coex_pti();
+    let priority = match txrx_scene {
+        Ieee802154TxRxScene::Idle => pti.idle,
+        Ieee802154TxRxScene::Tx => pti.tx,
+        Ieee802154TxRxScene::Rx => pti.rx,
+        Ieee802154TxRxScene::TxAt | Ieee802154TxRxScene::RxAt => pti.timed,
+    };
+    unsafe { esp_coex_ieee802154_txrx_pti_set(priority.event()) };
+}
+
+/// External (PTA) coexistence support of the 802.15.4 driver (local patch
+/// `ieee802154-extcoex`, declared last so earlier line numbers are kept).
+///
+/// ESP-IDF **v5.5.1** reference: `components/ieee802154/driver/
+/// esp_ieee802154_dev.c` (`extcoex_tx_stage_start`/`extcoex_rx_stage_start`
+/// call sites, `CONFIG_ESP_COEX_EXTERNAL_COEXIST_ENABLE`) and
+/// `esp_ieee802154_util.c` (`s_coex_config`, `ieee802154_set_txrx_pti`).
+/// The functions are in the ESP32-H2/C6 `libcoexist.a` that `esp-wifi-sys`
+/// already links (the H2 archive is byte-identical to ESP-IDF v5.5.1's).
+/// Enabling the external arbiter itself (GPIO matrix, `esp_coex_external_*`)
+/// is the application's job; this module only gives the radio the same
+/// per-operation hooks and priorities as the ESP-IDF driver.
+#[cfg(feature = "ieee802154-extcoex")]
+pub(crate) mod extcoex {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use esp_wifi_sys::include::{
+        ieee802154_coex_event_t, ieee802154_coex_event_t_IEEE802154_HIGH,
+        ieee802154_coex_event_t_IEEE802154_IDLE, ieee802154_coex_event_t_IEEE802154_LOW,
+        ieee802154_coex_event_t_IEEE802154_MIDDLE,
+    };
+
+    unsafe extern "C" {
+        // libcoexist.a (coexist_api.o): PTI offset 0 / 0xF of the external
+        // arbiter for the coming TX / RX stage.
+        fn esp_coex_ieee802154_extcoex_tx_stage();
+        fn esp_coex_ieee802154_extcoex_rx_stage();
+    }
+
+    /// Coexistence priority of a radio operation
+    /// (`ieee802154_coex_event_t`). The blob maps it through `coex_pti_tab`
+    /// to the PTI the 802.15.4 MAC presents to the arbiter.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CoexPriority {
+        High,
+        Middle,
+        Low,
+        Idle,
+    }
+
+    impl CoexPriority {
+        pub(crate) const fn event(self) -> ieee802154_coex_event_t {
+            match self {
+                Self::High => ieee802154_coex_event_t_IEEE802154_HIGH,
+                Self::Middle => ieee802154_coex_event_t_IEEE802154_MIDDLE,
+                Self::Low => ieee802154_coex_event_t_IEEE802154_LOW,
+                Self::Idle => ieee802154_coex_event_t_IEEE802154_IDLE,
+            }
+        }
+
+        const fn bits(self) -> u32 {
+            match self {
+                Self::High => 0,
+                Self::Middle => 1,
+                Self::Low => 2,
+                Self::Idle => 3,
+            }
+        }
+
+        const fn from_bits(bits: u32) -> Self {
+            match bits & 3 {
+                0 => Self::High,
+                1 => Self::Middle,
+                2 => Self::Low,
+                _ => Self::Idle,
+            }
+        }
+    }
+
+    /// Priorities per radio scene. `timed` covers transmissions started at
+    /// an instant (`transmit_raw_preempting_rx` and the triggered reply,
+    /// ESP-IDF's `TX_AT` scene); `ack` is the hardware automatic ACK.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CoexPti {
+        pub idle: CoexPriority,
+        pub rx: CoexPriority,
+        pub tx: CoexPriority,
+        pub timed: CoexPriority,
+        pub ack: CoexPriority,
+    }
+
+    impl CoexPti {
+        /// ESP-IDF v5.5.1 defaults (`s_coex_config` and the MAC-init ACK
+        /// PTI); also what the driver uses without this feature, except
+        /// that timed transmissions there use the `tx` priority.
+        pub const DEFAULT: Self = Self {
+            idle: CoexPriority::Idle,
+            rx: CoexPriority::Low,
+            tx: CoexPriority::Low,
+            timed: CoexPriority::Middle,
+            ack: CoexPriority::Middle,
+        };
+
+        const fn pack(self) -> u32 {
+            self.idle.bits()
+                | self.rx.bits() << 2
+                | self.tx.bits() << 4
+                | self.timed.bits() << 6
+                | self.ack.bits() << 8
+        }
+
+        const fn unpack(bits: u32) -> Self {
+            Self {
+                idle: CoexPriority::from_bits(bits),
+                rx: CoexPriority::from_bits(bits >> 2),
+                tx: CoexPriority::from_bits(bits >> 4),
+                timed: CoexPriority::from_bits(bits >> 6),
+                ack: CoexPriority::from_bits(bits >> 8),
+            }
+        }
+    }
+
+    static PTI: AtomicU32 = AtomicU32::new(CoexPti::DEFAULT.pack());
+
+    /// The configured priorities.
+    pub fn coex_pti() -> CoexPti {
+        CoexPti::unpack(PTI.load(Ordering::Relaxed))
+    }
+
+    /// Set the priorities. The ACK PTI is written at once; the scene PTIs
+    /// take effect at the next scene change (every TX start and receiver
+    /// restart). Must not be called from the ZB_MAC interrupt.
+    pub fn set_coex_pti(pti: CoexPti) {
+        PTI.store(pti.pack(), Ordering::Relaxed);
+        // The ACK and TX/RX PTIs share one register; the interrupt rewrites
+        // the TX/RX field, so the read-modify-write runs with it masked.
+        super::STATE.with(|_| apply_ack_pti());
+    }
+
+    pub(crate) fn apply_ack_pti() {
+        unsafe { super::esp_coex_ieee802154_ack_pti_set(coex_pti().ack.event()) };
+    }
+
+    #[inline(always)]
+    pub(crate) fn tx_stage() {
+        unsafe { esp_coex_ieee802154_extcoex_tx_stage() };
+    }
+
+    #[inline(always)]
+    pub(crate) fn rx_stage() {
+        unsafe { esp_coex_ieee802154_extcoex_rx_stage() };
+    }
+}
+
+/// Local patch `ieee802154-debug-state` (declared last): the driver state a
+/// stalled radio is diagnosed from: `(state, pending events, hardware
+/// rx_state, queued frames)`; state 0 idle, 1 receive, 2 transmit, 3 TX
+/// ACK, 4 sleep.
+pub(crate) fn debug_state() -> (u8, u16, u8, u8) {
+    let pending = events();
+    let rx_state = IEEE802154::regs().rx_status().read().rx_state().bits() as u8;
+    STATE.with(|state| {
+        let code = match state.state {
+            Ieee802154State::Idle => 0,
+            Ieee802154State::Receive => 1,
+            Ieee802154State::Transmit => 2,
+            Ieee802154State::TxAck => 3,
+            Ieee802154State::Sleep => 4,
+        };
+        (code, pending, rx_state, state.rx_queue.len() as u8)
+    })
+}
+
+/// Local patch `ieee802154-tx-ack-watchdog` (declared last): RX_DONE of a
+/// frame with the ACK-request bit enters `TxAck`, which only `AckTxDone` or
+/// an RX abort leaves. When neither arrives (observed on an ESP32-H2
+/// coordinator with a sleepy child: state `TxAck`, no event pending, the
+/// receiver idle) every transmission is refused as busy and the receiver is
+/// never restarted. A `TxAck` older than any automatic ACK (192 µs
+/// turnaround + 352 µs frame), with nothing pending and nothing on the air,
+/// is left like an aborted ACK.
+#[cfg(feature = "ieee802154-tx-ack-watchdog")]
+mod tx_ack_watchdog {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use super::{IeeeState, Ieee802154State};
+
+    static SINCE_US: AtomicU32 = AtomicU32::new(0);
+    static RECOVERED: AtomicU32 = AtomicU32::new(0);
+    const LIMIT_US: u32 = 2_000;
+
+    fn now_us() -> u32 {
+        esp_hal::time::Instant::now()
+            .duration_since_epoch()
+            .as_micros() as u32
+    }
+
+    #[inline(always)]
+    pub(super) fn armed() {
+        SINCE_US.store(now_us(), Ordering::Relaxed);
+    }
+
+    pub(super) fn recover(state: &mut IeeeState) {
+        if state.state == Ieee802154State::TxAck
+            && super::events() == 0
+            && !super::receive_in_progress()
+            && now_us().wrapping_sub(SINCE_US.load(Ordering::Relaxed)) > LIMIT_US
+        {
+            RECOVERED.fetch_add(1, Ordering::Relaxed);
+            super::next_operation_inner(state);
+        }
+    }
+
+    /// Stalled `TxAck` states left since boot.
+    pub(crate) fn recovered() -> u32 {
+        RECOVERED.load(Ordering::Relaxed)
+    }
+}
+
+/// `TxAck` stalls the watchdog left (local patch
+/// `ieee802154-tx-ack-watchdog`).
+#[cfg(feature = "ieee802154-tx-ack-watchdog")]
+pub(crate) fn tx_ack_recoveries() -> u32 {
+    tx_ack_watchdog::recovered()
 }

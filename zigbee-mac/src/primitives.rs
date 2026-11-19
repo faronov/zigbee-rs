@@ -496,14 +496,14 @@ pub struct McpsDataIndication {
 pub struct MacFrame {
     buf: [u8; MAX_MAC_PAYLOAD],
     len: usize,
-    /// MAC header sequence number of the received frame. Green Power uses it
-    /// as the replay/duplicate counter of unsecured GPDFs (GP 1.1 A.3.6.1.3).
+    /// MAC sequence number: the unsecured-GPDF replay counter (GP A.3.6.1.3).
     #[cfg(feature = "green-power")]
     mac_sequence: u8,
-    /// End-of-frame receive time of a PHY with timed transmission
-    /// (`timed-tx`), see [`crate::PhyRxFrame::rx_end_us`].
+    /// End-of-frame receive time (`timed-tx`), see `PhyRxFrame::rx_end_us`.
     #[cfg(feature = "timed-tx")]
     rx_end_us: u32,
+    #[cfg(feature = "rx-rssi")]
+    rssi_dbm: i8,
 }
 
 impl MacFrame {
@@ -515,12 +515,13 @@ impl MacFrame {
             mac_sequence: 0,
             #[cfg(feature = "timed-tx")]
             rx_end_us: 0,
+            #[cfg(feature = "rx-rssi")]
+            rssi_dbm: crate::phy::RSSI_UNKNOWN_DBM,
         }
     }
 
     /// [`crate::PlatformServices::monotonic_micros`] at the end of the
-    /// received frame; 0 when the PHY does not time-stamp frames
-    /// (`timed-tx`).
+    /// received frame; 0 when not time-stamped (`timed-tx`).
     #[cfg(feature = "timed-tx")]
     pub fn rx_end_us(&self) -> u32 {
         self.rx_end_us
@@ -533,8 +534,7 @@ impl MacFrame {
         self
     }
 
-    /// MAC sequence number of the received frame (0 when the producer did
-    /// not record one).
+    /// MAC sequence number of the received frame (0 when not recorded).
     #[cfg(feature = "green-power")]
     pub fn mac_sequence(&self) -> u8 {
         self.mac_sequence
@@ -573,6 +573,26 @@ impl MacFrame {
 impl Default for MacFrame {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Received signal strength (`rx-rssi`).
+#[cfg(feature = "rx-rssi")]
+impl MacFrame {
+    /// RSSI of the received frame in dBm (last hop), or
+    /// [`crate::RSSI_UNKNOWN_DBM`] when the PHY does not measure it.
+    pub fn rssi_dbm(&self) -> i8 {
+        self.rssi_dbm
+    }
+
+    /// Record the RSSI of the received frame.
+    pub fn with_rssi_dbm(mut self, rssi_dbm: i8) -> Self {
+        self.rssi_dbm = rssi_dbm;
+        self
+    }
+
+    pub(crate) fn set_rssi_dbm(&mut self, rssi_dbm: i8) {
+        self.rssi_dbm = rssi_dbm;
     }
 }
 
@@ -734,5 +754,67 @@ mod parent_capability_tests {
         let capabilities = requires_parent_mac(&mac);
         assert!(capabilities.router);
         assert!(capabilities.coordinator);
+    }
+}
+
+/// MLME-START validation for a parent-capable soft MAC (declared last).
+///
+/// Without the `pan-coordinator` feature this is exactly
+/// [`validate_router_start`]. With it, a PAN-coordinator start is accepted
+/// too: a Zigbee coordinator differs from a router at the MAC only in the
+/// PAN Coordinator beacon bit (supplied by the NWK beacon response) and its
+/// fixed short address `0x0000`, which must already be programmed.
+#[inline(always)]
+pub(crate) fn validate_parent_start(
+    req: &MlmeStartRequest,
+    short_address: zigbee_types::ShortAddress,
+) -> Result<(), MacError> {
+    #[cfg(feature = "pan-coordinator")]
+    if req.pan_coordinator {
+        if short_address.0 != 0x0000 {
+            return Err(MacError::InvalidParameter);
+        }
+        return validate_router_start(&MlmeStartRequest {
+            pan_coordinator: false,
+            ..*req
+        });
+    }
+    let _ = short_address;
+    validate_router_start(req)
+}
+
+#[cfg(all(test, feature = "pan-coordinator"))]
+mod pan_coordinator_tests {
+    use super::*;
+    use zigbee_types::{PanId, ShortAddress};
+
+    fn start(pan_coordinator: bool) -> MlmeStartRequest {
+        MlmeStartRequest {
+            pan_id: PanId(0x1A62),
+            channel: 15,
+            beacon_order: 15,
+            superframe_order: 15,
+            pan_coordinator,
+            battery_life_ext: false,
+        }
+    }
+
+    #[test]
+    fn coordinator_start_requires_short_address_zero() {
+        assert_eq!(validate_parent_start(&start(true), ShortAddress(0)), Ok(()));
+        assert_eq!(
+            validate_parent_start(&start(true), ShortAddress(1)),
+            Err(MacError::InvalidParameter)
+        );
+        assert_eq!(
+            validate_parent_start(&start(false), ShortAddress(1)),
+            Ok(())
+        );
+        let mut beacon = start(true);
+        beacon.beacon_order = 14;
+        assert_eq!(
+            validate_parent_start(&beacon, ShortAddress(0)),
+            Err(MacError::Unsupported)
+        );
     }
 }

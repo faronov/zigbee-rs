@@ -141,9 +141,9 @@ pub type EspSoftMac<'a> = SoftMacCore<EspRadioPhy<'a>, EndDevice, ESP_PENDING_RX
 /// Child sources the hardware auto-ACK can flag with Frame Pending at once.
 /// The parent core arms one entry per child with a queued indirect frame and
 /// one per association in progress; a full table is reported as
-/// `TransactionOverflow`, never silently dropped.
+/// `TransactionOverflow`, never silently dropped. 64 with `ncp-capacity`.
 #[cfg(feature = "esp-parent")]
-pub const ESP_ACK_PENDING_SOURCES: usize = 16;
+pub const ESP_ACK_PENDING_SOURCES: usize = [16, 64][cfg!(feature = "ncp-capacity") as usize];
 
 /// Indication slots of [`EspRouterMac`] (parent core `EVENTS`).
 #[cfg(feature = "esp-parent")]
@@ -774,11 +774,11 @@ fn take_from_radio(driver: &mut Ieee802154<'_>, frame: &mut PhyRxFrame) -> bool 
     if phr < 3 || phr >= raw.data.len() {
         return false;
     }
-    // The radio's own LQI byte is on an undocumented small scale (about 7
-    // at -84 dBm and 9 at -70 dBm on the C6). NWK link costs need the IEEE
-    // 0..=255 scale on every role: an end device's rejoin parent selection
-    // gates on link cost, and the raw byte maps every router to cost 7. So
-    // all images apply the stack-wide RSSI policy.
+    // The radio's own LQI byte is on an undocumented small scale (about 7 at
+    // -84 dBm, 9 at -70 dBm on the C6), but NWK link costs (and an end
+    // device's rejoin parent selection) need the IEEE 0..=255 scale on every
+    // role, so all images apply the stack-wide RSSI policy.
+    crate::rx_rssi!(frame, raw.data[phr - 1] as i8);
     let lqi = crate::lqi::from_rssi_dbm(raw.data[phr - 1] as i8);
     #[cfg(not(feature = "timed-tx"))]
     {
@@ -947,9 +947,9 @@ impl RadioPhy for EspRadioPhy<'_> {
         Ok(())
     }
 
-    /// esp-radio 0.17 exposes no energy-detect measurement.
+    /// Hardware ED scan with the `energy-detect` feature, else unsupported.
     async fn energy_detect(&mut self, _duration_us: u32) -> Result<u8, PhyError> {
-        Err(PhyError::Unsupported)
+        energy_detect_body!(self, _duration_us)
     }
 
     /// Program the hardware address filter, or enter promiscuous mode
@@ -1145,4 +1145,31 @@ fn read_efuse_ieee() -> IeeeAddress {
     // Display order (OUI first), as Zigbee coordinators show it.
     log::info!("[ESP] EUI-64: {:016X}", u64::from_le_bytes(ieee));
     ieee
+}
+
+/// Hardware ED scan on the current channel (local esp-radio patch
+/// `ieee802154-energy-detect`). The radio reports the average RSS in dBm,
+/// mapped linearly from -100..=+5 dBm onto 0..=255 like the BL702 backend.
+/// Reception pauses for the measurement and resumes afterwards.
+#[cfg(feature = "energy-detect")]
+async fn energy_detect(phy: &mut EspRadioPhy<'_>, duration_us: u32) -> Result<u8, PhyError> {
+    // 16 µs symbols; 8 symbols (128 µs) is the IEEE 802.15.4 ED minimum.
+    let symbols = (duration_us / 16).max(8);
+    phy.driver
+        .start_energy_detect(symbols)
+        .map_err(|_| PhyError::ChannelBusy)?;
+    // Bounded: the scan length plus a fixed margin for the ED_DONE interrupt.
+    let deadline =
+        Instant::now() + embassy_time::Duration::from_micros(u64::from(symbols) * 16 + 2_000);
+    loop {
+        if let Some(dbm) = phy.driver.take_energy_detect() {
+            let level = (i16::from(dbm) + 100).clamp(0, 105);
+            return Ok((level * 255 / 105) as u8);
+        }
+        if Instant::now() >= deadline {
+            phy.driver.cancel_energy_detect();
+            return Err(PhyError::Hardware);
+        }
+        Timer::after_micros(RX_POLL_INTERVAL_US).await;
+    }
 }

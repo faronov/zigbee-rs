@@ -19,6 +19,10 @@ constrained-memory = []
 compact-single-endpoint = []
 end-device = []
 router = ["zigbee-aps/router", "zigbee-nwk/router"]
+# Network co-processor: replace and remove registry endpoints at run time
+# (host-registered endpoints). Off by default: images without it are
+# unchanged.
+host-passthrough = []
 
 [dev-dependencies]
 # The ZDP dispatcher tests drive real indications through APS/NWK down to the

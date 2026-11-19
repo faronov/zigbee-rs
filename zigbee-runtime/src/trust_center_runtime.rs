@@ -92,7 +92,12 @@ impl From<SecurityStoreError> for TrustCenterRuntimeError {
 pub struct TrustCenterRuntime<S> {
     store: S,
     table: TrustCenterTable,
-    state: Option<PersistentTrustCenterState>,
+    /// Live state, mutated in place (never cloned: about 23 KiB with
+    /// `ncp-capacity`). While `live`, it equals the last durably committed
+    /// state: every mutation ends in [`Self::commit`], and an uncommitted
+    /// one is dropped by [`Self::discard`].
+    state: PersistentTrustCenterState,
+    live: bool,
     last_poll_us: u32,
     residual_us: u64,
     network_key_update_elapsed_secs: u64,
@@ -103,6 +108,141 @@ pub struct TrustCenterRuntime<S> {
     initialization_pending: bool,
     initial_key_attempts: heapless::Vec<(IeeeAddress, u32), MAX_TRUST_CENTER_DEVICES>,
     network_key_propagation_started: Option<u32>,
+    /// Durable global APS reservations committed since construction.
+    #[cfg(feature = "global-aps-counter")]
+    global_aps_commits: u32,
+    /// Decisions reported to a network co-processor host.
+    #[cfg(feature = "host-passthrough")]
+    host_events: HostEvents,
+}
+
+/// Remaining values below which the global APS reservation is extended
+/// (`global-aps-counter`): half a reservation, so a burst between two polls
+/// never reaches the limit in practice. If it does, sends are refused, never
+/// a counter reused.
+#[cfg(feature = "global-aps-counter")]
+pub const GLOBAL_APS_LOW_WATER: u32 = APS_COUNTER_RESERVATION / 2;
+
+/// State of the global outgoing APS counter for host checkpoints
+/// (`EVT_FC_CHECKPOINT{domain = 2}`, `SEC_GET_FRAME_COUNTERS`).
+#[cfg(feature = "global-aps-counter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalApsCheckpoint {
+    /// Next value to use.
+    pub current: u32,
+    /// Durable, exclusive limit; no value at or above it was ever used.
+    pub durable_limit: u32,
+    /// Reservation commits since start (changes with every new limit).
+    pub commits: u32,
+}
+
+/// A Trust Center decision for a network co-processor host
+/// (`host-passthrough`, ZRHP `EVT_DEVICE_JOINED` / `EVT_DEVICE_LEFT`).
+#[cfg(feature = "host-passthrough")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustCenterHostEvent {
+    /// An Update-Device join or rejoin (from a parent router, or from this
+    /// coordinator for its own child) was decided.
+    Joined {
+        device_address: IeeeAddress,
+        short_address: ShortAddress,
+        /// The reporting parent; this coordinator's own IEEE for its child.
+        parent_address: IeeeAddress,
+        /// Unsecured join (association), secured rejoin, or Trust Center
+        /// (unsecured) rejoin.
+        status: zigbee_aps::apsme::ApsUpdateDeviceStatus,
+        /// Admitted (network key sent, or rejoin accepted); `false` when
+        /// rejected or removed by policy.
+        admitted: bool,
+    },
+    /// A parent reported, with Update-Device "device left", that the device
+    /// left the network (this coordinator's own IEEE for its own child).
+    Left {
+        device_address: IeeeAddress,
+        short_address: ShortAddress,
+        parent_address: IeeeAddress,
+    },
+    /// The Trust Center removed an admitted device (Remove-Device or Leave
+    /// request: a rejected rejoin, an expired join timeout, a failed key
+    /// exchange).
+    Removed {
+        device_address: IeeeAddress,
+        short_address: ShortAddress,
+        parent_address: IeeeAddress,
+    },
+    /// Key establishment progressed: the device proved it holds the
+    /// network key (its first Request-Key; `result` 0), or answered the
+    /// unique Trust Center link key's Verify-Key (`result` 1 verified, 2
+    /// failed).
+    Authorized {
+        device_address: IeeeAddress,
+        short_address: ShortAddress,
+        result: u8,
+        /// The unique TCLK (`true`) or the global default TCLK.
+        unique_link_key: bool,
+    },
+}
+
+/// Trust Center host events held until the owner drains them.
+#[cfg(feature = "host-passthrough")]
+pub const TRUST_CENTER_HOST_EVENTS: usize = 8;
+
+#[cfg(feature = "host-passthrough")]
+struct HostEvents {
+    queue: heapless::Deque<TrustCenterHostEvent, TRUST_CENTER_HOST_EVENTS>,
+    dropped: u16,
+}
+
+#[cfg(feature = "host-passthrough")]
+impl HostEvents {
+    const fn new() -> Self {
+        Self {
+            queue: heapless::Deque::new(),
+            dropped: 0,
+        }
+    }
+
+    fn push(&mut self, event: TrustCenterHostEvent) {
+        if self.queue.push_back(event).is_err() {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    /// `accepted`: a join was admitted, or a departure report accepted.
+    fn update_device(&mut self, indication: ApsmeUpdateDeviceIndication, accepted: bool) {
+        let event = if indication.status == zigbee_aps::apsme::ApsUpdateDeviceStatus::DeviceLeft {
+            if !accepted {
+                return;
+            }
+            TrustCenterHostEvent::Left {
+                device_address: indication.device_address,
+                short_address: indication.device_short_address,
+                parent_address: indication.source_address,
+            }
+        } else {
+            TrustCenterHostEvent::Joined {
+                device_address: indication.device_address,
+                short_address: indication.device_short_address,
+                parent_address: indication.source_address,
+                status: indication.status,
+                admitted: accepted,
+            }
+        };
+        self.push(event);
+    }
+}
+
+#[cfg(feature = "host-passthrough")]
+impl<S> TrustCenterRuntime<S> {
+    /// Oldest Trust Center decision for the host (`host-passthrough`).
+    pub fn take_host_event(&mut self) -> Option<TrustCenterHostEvent> {
+        self.host_events.queue.pop_front()
+    }
+
+    /// Host events lost because the queue was full, since the last call.
+    pub fn take_host_events_dropped(&mut self) -> u16 {
+        core::mem::take(&mut self.host_events.dropped)
+    }
 }
 
 impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
@@ -110,7 +250,8 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         Self {
             store,
             table: TrustCenterTable::new(),
-            state: None,
+            state: PersistentTrustCenterState::new([0; 8]),
+            live: false,
             last_poll_us: 0,
             residual_us: 0,
             network_key_update_elapsed_secs: 0,
@@ -121,11 +262,185 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             initialization_pending: false,
             initial_key_attempts: heapless::Vec::new(),
             network_key_propagation_started: None,
+            #[cfg(feature = "global-aps-counter")]
+            global_aps_commits: 0,
+            #[cfg(feature = "host-passthrough")]
+            host_events: HostEvents::new(),
         }
     }
 
+    /// [`Self::new`] directly into caller-provided (normally static)
+    /// storage: the device table and the persisted state (about 40 KiB
+    /// together with `ncp-capacity`) are initialized in place instead of
+    /// being built on the stack and moved.
+    ///
+    /// # Safety
+    /// `slot` must point to valid, properly aligned, uninitialized storage for `Self`.
+    pub unsafe fn write_into(slot: *mut Self, store: S) {
+        // Every field is written below; a new field must be added there.
+        let _exhaustive = |runtime: &Self| {
+            let Self {
+                store: _,
+                table: _,
+                state: _,
+                live: _,
+                last_poll_us: _,
+                residual_us: _,
+                network_key_update_elapsed_secs: _,
+                network_key_cooldown_started: _,
+                last_transport_error: _,
+                pending_delivery: _,
+                pending_device_replay_tombstone: _,
+                initialization_pending: _,
+                initial_key_attempts: _,
+                network_key_propagation_started: _,
+                #[cfg(feature = "global-aps-counter")]
+                    global_aps_commits: _,
+                #[cfg(feature = "host-passthrough")]
+                    host_events: _,
+            } = runtime;
+        };
+        unsafe {
+            core::ptr::addr_of_mut!((*slot).store).write(store);
+            TrustCenterTable::write_into(core::ptr::addr_of_mut!((*slot).table));
+            PersistentTrustCenterState::write_into(core::ptr::addr_of_mut!((*slot).state), [0; 8]);
+            core::ptr::addr_of_mut!((*slot).live).write(false);
+            core::ptr::addr_of_mut!((*slot).last_poll_us).write(0);
+            core::ptr::addr_of_mut!((*slot).residual_us).write(0);
+            core::ptr::addr_of_mut!((*slot).network_key_update_elapsed_secs).write(0);
+            core::ptr::addr_of_mut!((*slot).network_key_cooldown_started).write(None);
+            core::ptr::addr_of_mut!((*slot).last_transport_error).write(None);
+            core::ptr::addr_of_mut!((*slot).pending_delivery).write(None);
+            core::ptr::addr_of_mut!((*slot).pending_device_replay_tombstone).write(None);
+            core::ptr::addr_of_mut!((*slot).initialization_pending).write(false);
+            core::ptr::addr_of_mut!((*slot).initial_key_attempts).write(heapless::Vec::new());
+            core::ptr::addr_of_mut!((*slot).network_key_propagation_started).write(None);
+            #[cfg(feature = "global-aps-counter")]
+            core::ptr::addr_of_mut!((*slot).global_aps_commits).write(0);
+            #[cfg(feature = "host-passthrough")]
+            core::ptr::addr_of_mut!((*slot).host_events).write(HostEvents::new());
+        }
+    }
+
+    /// The global outgoing APS counter, once a reservation is installed.
+    #[cfg(feature = "global-aps-counter")]
+    pub fn global_aps_counter<M: MacDriver>(
+        &self,
+        device: &ZigbeeDevice<M>,
+    ) -> Option<GlobalApsCheckpoint> {
+        let live = device.aps().security().global_outgoing_counter()?;
+        let durable_limit = live_ref(&self.state, self.live)?.global_aps_limit();
+        Some(GlobalApsCheckpoint {
+            current: live.current,
+            durable_limit,
+            commits: self.global_aps_commits,
+        })
+    }
+
+    /// Raise the global outgoing APS counter to at least `floor` (a host
+    /// checkpoint floor or a restore start) and durably reserve a range
+    /// above it before any further APS-secured transmission.
+    #[cfg(feature = "global-aps-counter")]
+    pub fn raise_global_aps_floor<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        floor: u32,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        self.require_initialized_network(device)?;
+        let live = device.aps().security().global_outgoing_counter();
+        let current = live.map_or(0, |counter| counter.current);
+        if live.is_some() && floor <= current {
+            return Ok(());
+        }
+        let state = live_ref(&self.state, self.live).ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let start = floor.max(current).max(state.global_aps_limit());
+        self.commit_global_aps(device, start, reserve_end(start)?)
+    }
+
+    /// Keep a global APS reservation installed and ahead of use: re-install
+    /// one from the durable limit if it was dropped, extend it when fewer
+    /// than [`GLOBAL_APS_LOW_WATER`] values remain.
+    #[cfg(feature = "global-aps-counter")]
+    fn maintain_global_aps_reservation<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        let state = live_ref(&self.state, self.live).ok_or(TrustCenterRuntimeError::NotJoined)?;
+        match device.aps().security().global_outgoing_counter() {
+            None => {
+                let start = global_aps_start(state, device);
+                self.commit_global_aps(device, start, reserve_end(start)?)
+            }
+            Some(counter)
+                if counter.limit.saturating_sub(counter.current) <= GLOBAL_APS_LOW_WATER =>
+            {
+                let limit = reserve_end(counter.current)?.max(counter.limit);
+                self.commit_global_aps(device, counter.current, limit)
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Durably commit `limit`, then install `start..limit` as the live
+    /// reservation. Nothing is installed if the commit fails.
+    #[cfg(feature = "global-aps-counter")]
+    fn commit_global_aps<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        start: u32,
+        limit: u32,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        let state = live_mut(&mut self.state, self.live)?;
+        if !state.set_global_aps_limit(limit) {
+            return Err(TrustCenterRuntimeError::CounterExhausted);
+        }
+        self.commit()?;
+        self.global_aps_commits = self.global_aps_commits.wrapping_add(1);
+        if !device
+            .aps_mut()
+            .security_mut()
+            .set_global_outgoing_counter(start, limit)
+        {
+            return Err(TrustCenterRuntimeError::CounterExhausted);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn live_state(&self) -> Option<&PersistentTrustCenterState> {
+        live_ref(&self.state, self.live)
+    }
+
     pub const fn is_initialized(&self) -> bool {
-        self.state.is_some() && !self.initialization_pending
+        self.live && !self.initialization_pending
+    }
+
+    /// Durably commit the live state after an in-place mutation. A failed
+    /// store re-synchronises the live state from the journal
+    /// ([`Self::discard`]), so RAM never runs ahead of flash.
+    fn commit(&mut self) -> Result<(), TrustCenterRuntimeError> {
+        if let Err(error) = self.store.store(&self.state) {
+            self.discard();
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// Drop an uncommitted in-place mutation of the live state by reloading
+    /// the last durably committed state into it (in place). If that is not
+    /// possible the runtime closes: it is not initialized until the next
+    /// [`Self::initialize_with_security_store`] restores everything.
+    fn discard(&mut self) {
+        if !self.live {
+            return;
+        }
+        let extended_pan_id = self.state.extended_pan_id();
+        let reloaded = matches!(self.store.load_into(&mut self.state), Ok(true))
+            && self.state.matches_network(&extended_pan_id);
+        if !reloaded {
+            log::error!("[TC] Trust Center state reload failed; re-initialization required");
+            self.live = false;
+        }
     }
 
     pub fn store(&self) -> &S {
@@ -169,6 +484,22 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         self.upsert_table_device(device, &address, false)
     }
 
+    /// Forget a device at the host's request (`TBL_INVALIDATE`, spec 8.3
+    /// I5): its Trust Center record and unique link key are durably dropped
+    /// without sending anything on air. `Ok(false)` when it was unknown.
+    pub fn forget_device<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        address: IeeeAddress,
+    ) -> Result<bool, TrustCenterRuntimeError> {
+        self.require_initialized_network(device)?;
+        if self.table.device(&address).is_none() {
+            return Ok(false);
+        }
+        self.revoke(device, &address)?;
+        Ok(true)
+    }
+
     /// Add one directional application-link-key request pair to the durable allowlist.
     pub fn allow_application_key_request<M: MacDriver>(
         &mut self,
@@ -177,14 +508,15 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         responder_address: IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
         self.require_initialized_network(device)?;
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
-        state.allow_application_key_request(initiator_address, responder_address)?;
-        self.store.store(&state)?;
-        self.state = Some(state);
-        Ok(())
+        let state = live_mut(&mut self.state, self.live)?;
+        // The entry is pushed before validation: drop it on a refusal.
+        if let Err(error) =
+            state.allow_application_key_request(initiator_address, responder_address)
+        {
+            self.discard();
+            return Err(error.into());
+        }
+        self.commit()
     }
 
     /// Remove one directional pair from the durable application-key allowlist.
@@ -195,20 +527,16 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         responder_address: &IeeeAddress,
     ) -> Result<bool, TrustCenterRuntimeError> {
         self.require_initialized_network(device)?;
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         let removed = state.deny_application_key_request(initiator_address, responder_address);
         if removed {
-            self.store.store(&state)?;
-            self.state = Some(state);
+            self.commit()?;
         }
         Ok(removed)
     }
 
     pub fn has_pending_transactions(&self) -> bool {
-        self.state.as_ref().is_some_and(|state| {
+        live_ref(&self.state, self.live).is_some_and(|state| {
             state.rotation().is_some()
                 || state.pending_application_key().is_some()
                 || !state.pending_unknown_removals().is_empty()
@@ -232,8 +560,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &ZigbeeDevice<M>,
     ) -> Option<IeeeAddress> {
         let local_ieee = device.aps().nwk().nib().ieee_address;
-        self.state
-            .as_ref()
+        live_ref(&self.state, self.live)
             .and_then(|state| {
                 state.devices().iter().find_map(|stored| {
                     (stored.removal_pending
@@ -247,8 +574,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 })
             })
             .or_else(|| {
-                self.state
-                    .as_ref()?
+                live_ref(&self.state, self.live)?
                     .pending_unknown_removals()
                     .iter()
                     .find_map(|pending| {
@@ -277,19 +603,21 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         // re-initialization of a previously live runtime. A partial key-table
         // restore must never be mistaken for a completed restore.
         self.initialization_pending = true;
-        self.state = None;
+        self.live = false;
         self.cancel_delivery();
         self.initial_key_attempts.clear();
         self.network_key_propagation_started = None;
         let extended_pan_id = validate_coordinator(device)?;
-        let mut state = match self.store.load()? {
-            Some(state) if state.matches_network(&extended_pan_id) => state,
-            Some(_) => {
+        // Decode straight into the (not yet live) state: no by-value copy.
+        if self.store.load_into(&mut self.state)? {
+            if !self.state.matches_network(&extended_pan_id) {
                 self.store.clear()?;
-                PersistentTrustCenterState::new(extended_pan_id)
+                self.state.reset(extended_pan_id);
             }
-            None => PersistentTrustCenterState::new(extended_pan_id),
-        };
+        } else {
+            self.state.reset(extended_pan_id);
+        }
+        let state = &mut self.state;
         self.table.clear();
         for stored in state.devices() {
             self.table.restore_device(stored.device)?;
@@ -301,12 +629,34 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 )?;
             }
         }
-        reserve_restored_ranges(&mut state)?;
-        self.store.store(&state)?;
+        reserve_restored_ranges(state)?;
+        // Global APS counter: resume at (or migrate to) the highest value any
+        // key could have used, reserved in the same atomic journal write as
+        // the restored per-key ranges.
+        #[cfg(feature = "global-aps-counter")]
+        let global_start = {
+            let start = global_aps_start(state, device);
+            if !state.set_global_aps_limit(reserve_end(start)?) {
+                return Err(TrustCenterRuntimeError::CounterExhausted);
+            }
+            start
+        };
+        self.store.store(state)?;
         for stored in state.devices() {
             install_key(device, stored)?;
         }
-        self.state = Some(state);
+        #[cfg(feature = "global-aps-counter")]
+        {
+            self.global_aps_commits = self.global_aps_commits.wrapping_add(1);
+            if !device
+                .aps_mut()
+                .security_mut()
+                .set_global_outgoing_counter(global_start, state.global_aps_limit())
+            {
+                return Err(TrustCenterRuntimeError::CounterExhausted);
+            }
+        }
+        self.live = true;
         self.last_poll_us = device.mac().monotonic_micros();
         self.residual_us = 0;
         self.network_key_update_elapsed_secs = 0;
@@ -327,7 +677,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         &mut self,
         device: &mut ZigbeeDevice<M>,
     ) -> Result<(), TrustCenterRuntimeError> {
-        if self.state.is_none() {
+        if !self.live {
             return Err(TrustCenterRuntimeError::NotJoined);
         }
         if !self.initialization_pending {
@@ -352,9 +702,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
     ) -> Result<(), TrustCenterRuntimeError> {
         self.restore_before_replay(device)?;
         device.restore_incoming_replay_state(replay_store)?;
-        if self
-            .state
-            .as_ref()
+        if live_ref(&self.state, self.live)
             .and_then(PersistentTrustCenterState::rotation)
             .is_some_and(|rotation| {
                 rotation.method == NetworkKeyUpdateMethod::Broadcast
@@ -385,7 +733,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         &mut self,
         device: &mut ZigbeeDevice<M>,
     ) -> Result<(), TrustCenterRuntimeError> {
-        if let Some(state) = self.state.as_ref() {
+        if let Some(state) = live_ref(&self.state, self.live) {
             for stored in state.devices() {
                 device
                     .aps_mut()
@@ -394,7 +742,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             }
         }
         self.table.clear();
-        self.state = None;
+        self.live = false;
         self.last_poll_us = 0;
         self.residual_us = 0;
         self.network_key_update_elapsed_secs = 0;
@@ -405,6 +753,10 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         self.initial_key_attempts.clear();
         self.network_key_propagation_started = None;
         self.cancel_delivery();
+        #[cfg(feature = "host-passthrough")]
+        {
+            self.host_events = HostEvents::new();
+        }
         self.store.clear()?;
         Ok(())
     }
@@ -416,6 +768,8 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         indication: ApsmeSecurityIndication,
     ) -> Result<(), TrustCenterRuntimeError> {
         self.require_initialized_network(device)?;
+        #[cfg(feature = "global-aps-counter")]
+        self.maintain_global_aps_reservation(device)?;
         self.checkpoint_live_counters(device)?;
         let mut policy = TrustCenterPolicy::from_attributes(device.bdb().attributes());
         policy.allow_joins &= device.aps().nwk().nib().permit_joining;
@@ -449,6 +803,8 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
     ) -> Result<(), TrustCenterRuntimeError> {
         self.require_initialized_network(device)?;
+        #[cfg(feature = "global-aps-counter")]
+        self.maintain_global_aps_reservation(device)?;
         self.resume_pending(device, true).await?;
         let now = device.mac().monotonic_micros();
         let delta = u64::from(now.wrapping_sub(self.last_poll_us));
@@ -462,11 +818,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         self.residual_us = self.residual_us.saturating_add(delta);
         let elapsed_total_secs = self.residual_us / MICROS_PER_SECOND;
         self.residual_us %= MICROS_PER_SECOND;
-        if self
-            .state
-            .as_ref()
-            .is_some_and(|state| state.rotation().is_none())
-        {
+        if live_ref(&self.state, self.live).is_some_and(|state| state.rotation().is_none()) {
             self.network_key_update_elapsed_secs = self
                 .network_key_update_elapsed_secs
                 .saturating_add(elapsed_total_secs);
@@ -488,10 +840,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             .attributes()
             .trust_center_network_key_update_period;
         period_minutes != 0
-            && self
-                .state
-                .as_ref()
-                .is_some_and(|state| state.rotation().is_none())
+            && live_ref(&self.state, self.live).is_some_and(|state| state.rotation().is_none())
             && self.network_key_update_elapsed_secs >= u64::from(period_minutes).saturating_mul(60)
     }
 
@@ -501,11 +850,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         &self,
         device: &ZigbeeDevice<M>,
     ) -> bool {
-        if self
-            .state
-            .as_ref()
-            .is_none_or(|state| state.rotation().is_some())
-        {
+        if live_ref(&self.state, self.live).is_none_or(|state| state.rotation().is_some()) {
             return false;
         }
         let security = device.aps().nwk().security();
@@ -526,11 +871,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
     ) -> Result<u8, TrustCenterRuntimeError> {
         self.require_initialized_network(device)?;
-        if self
-            .state
-            .as_ref()
-            .is_some_and(|state| state.rotation().is_some())
-        {
+        if live_ref(&self.state, self.live).is_some_and(|state| state.rotation().is_some()) {
             return Err(TrustCenterRuntimeError::NetworkKeyRotationInProgress);
         }
         let active_sequence = device
@@ -588,10 +929,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         method: NetworkKeyUpdateMethod,
     ) -> Result<(), TrustCenterRuntimeError> {
         self.require_initialized_network(device)?;
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         if state.rotation().is_some() {
             return Err(TrustCenterRuntimeError::NetworkKeyRotationInProgress);
         }
@@ -621,17 +959,17 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             method,
             target_sequence,
         }));
-        self.store.store(&state)?;
-        self.state = Some(state);
+        self.commit()?;
         self.network_key_update_elapsed_secs = 0;
         self.network_key_cooldown_started = Some(device.mac().monotonic_micros());
         Ok(())
     }
 
     pub const fn network_key_rotation(&self) -> Option<NetworkKeyRotation> {
-        match self.state.as_ref() {
-            Some(state) => state.rotation(),
-            None => None,
+        if self.live {
+            self.state.rotation()
+        } else {
+            None
         }
     }
 
@@ -643,10 +981,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         capabilities: u8,
     ) -> Result<(), TrustCenterRuntimeError> {
         self.require_initialized_network(device)?;
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         let Some(stored) = state.device_mut(&address) else {
             log::debug!("[TC] Ignoring announcement from an unadmitted peer");
             return Ok(());
@@ -659,8 +994,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         if stored.is_router != is_router || stored.network_key_pending {
             stored.is_router = is_router;
             stored.network_key_pending = false;
-            self.store.store(&state)?;
-            self.state = Some(state);
+            self.commit()?;
         }
         self.initial_key_attempts
             .retain(|(peer, _)| *peer != address);
@@ -668,8 +1002,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
     }
 
     pub fn pending_network_key_activation(&self) -> Option<u8> {
-        self.state
-            .as_ref()?
+        live_ref(&self.state, self.live)?
             .rotation()
             .filter(|rotation| rotation.phase == NetworkKeyRotationPhase::Activating)
             .map(|rotation| rotation.target_sequence)
@@ -726,13 +1059,9 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         // Retain the old key until the next staged update replaces its slot.
         // Its next authenticated new-key packet can activate the staged key.
         device.refresh_security_state(replay_store)?;
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         state.set_rotation(None);
-        self.store.store(&state)?;
-        self.state = Some(state);
+        self.commit()?;
         self.network_key_update_elapsed_secs = 0;
         Ok(())
     }
@@ -742,9 +1071,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &ZigbeeDevice<M>,
     ) -> Result<(), TrustCenterRuntimeError> {
         let extended_pan_id = validate_coordinator(device)?;
-        if self
-            .state
-            .as_ref()
+        if live_ref(&self.state, self.live)
             .is_some_and(|state| state.matches_network(&extended_pan_id))
             && !self.initialization_pending
         {
@@ -784,13 +1111,15 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         // Do not admit a peer while a previously committed rejection is still
         // being delivered. Repeated updates refresh its parent, not its trust.
         if indication.status != zigbee_aps::apsme::ApsUpdateDeviceStatus::DeviceLeft
-            && self.state.as_ref().is_some_and(|state| {
+            && live_ref(&self.state, self.live).is_some_and(|state| {
                 state
                     .pending_unknown_removals()
                     .iter()
                     .any(|pending| pending.device_address == indication.device_address)
             })
         {
+            #[cfg(feature = "host-passthrough")]
+            self.host_events.update_device(indication, false);
             self.stage_unknown_removal(
                 device,
                 indication.source_address,
@@ -807,9 +1136,21 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                     indication.device_address,
                     error
                 );
+                #[cfg(feature = "host-passthrough")]
+                self.host_events.update_device(indication, false);
                 return Ok(());
             }
         };
+        #[cfg(feature = "host-passthrough")]
+        self.host_events.update_device(
+            indication,
+            matches!(
+                action,
+                TrustCenterAction::TransportNetworkKey { .. }
+                    | TrustCenterAction::None
+                    | TrustCenterAction::RevokeDevice { .. }
+            ),
+        );
         match action {
             TrustCenterAction::TransportNetworkKey { device_address, .. } => {
                 self.upsert_table_device(device, &device_address, true)?;
@@ -833,9 +1174,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         indication: ApsmeRequestKeyIndication,
     ) -> Result<(), TrustCenterRuntimeError> {
         if indication.key_type == zigbee_aps::apsme::ApsRequestKeyType::TrustCenterLink
-            && self
-                .state
-                .as_ref()
+            && live_ref(&self.state, self.live)
                 .and_then(|state| state.device(&indication.source_address))
                 .is_some_and(|stored| stored.pending_link_key.is_some())
         {
@@ -856,7 +1195,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 );
                 return Ok(());
             };
-            let allowed = self.state.as_ref().is_some_and(|state| {
+            let allowed = live_ref(&self.state, self.live).is_some_and(|state| {
                 state
                     .application_key_request_allowed(&indication.source_address, &responder_address)
             });
@@ -964,9 +1303,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 device_address,
                 device_short_address,
             } => {
-                let known = self
-                    .state
-                    .as_ref()
+                let known = live_ref(&self.state, self.live)
                     .is_some_and(|state| state.device(&device_address).is_some());
                 let result = if known {
                     self.stage_removal(
@@ -975,6 +1312,12 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                         parent_address,
                         device_short_address,
                     )?;
+                    #[cfg(feature = "host-passthrough")]
+                    self.host_events.push(TrustCenterHostEvent::Removed {
+                        device_address,
+                        short_address: device_short_address,
+                        parent_address,
+                    });
                     self.resume_removal(device, device_address).await
                 } else {
                     self.stage_unknown_removal(device, parent_address, device_address)?;
@@ -983,9 +1326,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 self.defer_transport_error(result)?;
             }
             TrustCenterAction::RevokeDevice { device_address } => {
-                if let Some(stored) = self
-                    .state
-                    .as_ref()
+                if let Some(stored) = live_ref(&self.state, self.live)
                     .and_then(|state| state.device(&device_address))
                     .copied()
                 {
@@ -1029,10 +1370,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
         address: IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         let stored = state
             .device_mut(&address)
             .ok_or(TrustCenterError::DeviceNotFound)?;
@@ -1053,8 +1391,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 transported: false,
             });
         }
-        self.store.store(&state)?;
-        self.state = Some(state);
+        self.commit()?;
         Ok(())
     }
 
@@ -1064,10 +1401,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         initiator_address: IeeeAddress,
         responder_address: IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         if let Some(pending) = state.pending_application_key() {
             if pending.initiator_address != initiator_address
                 || pending.responder_address != responder_address
@@ -1090,8 +1424,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             delivered_to_initiator: false,
             delivered_to_responder: false,
         }));
-        self.store.store(&state)?;
-        self.state = Some(state);
+        self.commit()?;
         Ok(())
     }
 
@@ -1100,46 +1433,64 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
         resume_confirm_key: bool,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let mut network_pending = [None; MAX_TRUST_CENTER_DEVICES];
-        let mut link_pending = [None; MAX_TRUST_CENTER_DEVICES];
-        let mut confirm_pending = [None; MAX_TRUST_CENTER_DEVICES];
-        let mut removal_pending = [None; MAX_TRUST_CENTER_DEVICES];
+        // One snapshot of the pending devices, in table order, taken before
+        // any transaction runs (they may reorder or remove table entries).
+        // It lives across awaits, so it is part of the caller's future: one
+        // address plus flags per device, not one array per kind.
+        let mut pending: heapless::Vec<(IeeeAddress, u8), MAX_TRUST_CENTER_DEVICES> =
+            heapless::Vec::new();
         self.last_transport_error = None;
-        if let Some(state) = self.state.as_ref() {
-            for (index, stored) in state.devices().iter().enumerate() {
-                if stored.removal_pending {
-                    removal_pending[index] = Some(stored.device.ieee_address);
-                    continue;
-                }
-                if stored.network_key_pending {
-                    network_pending[index] = Some(stored.device.ieee_address);
-                }
-                if stored.pending_link_key.is_some() {
-                    link_pending[index] = Some(stored.device.ieee_address);
-                }
-                if stored.confirm_key_pending.is_some() {
-                    confirm_pending[index] = Some(stored.device.ieee_address);
+        if let Some(state) = live_ref(&self.state, self.live) {
+            for stored in state.devices() {
+                let flags = if stored.removal_pending {
+                    PENDING_REMOVAL
+                } else {
+                    (if stored.network_key_pending {
+                        PENDING_NETWORK_KEY
+                    } else {
+                        0
+                    }) | (if stored.pending_link_key.is_some() {
+                        PENDING_LINK_KEY
+                    } else {
+                        0
+                    }) | (if stored.confirm_key_pending.is_some() {
+                        PENDING_CONFIRM_KEY
+                    } else {
+                        0
+                    })
+                };
+                if flags != 0 {
+                    // Bounded by the device table: cannot fail.
+                    let _ = pending.push((stored.device.ieee_address, flags));
                 }
             }
         }
-        for address in removal_pending.into_iter().flatten() {
-            let result = self.resume_removal(device, address).await;
-            self.defer_transport_error(result)?;
+        for (address, flags) in pending.iter().copied() {
+            if flags & PENDING_REMOVAL != 0 {
+                let result = self.resume_removal(device, address).await;
+                self.defer_transport_error(result)?;
+            }
         }
         let result = self.resume_unknown_removal(device).await;
         self.defer_transport_error(result)?;
-        for address in network_pending.into_iter().flatten() {
-            let result = self.resume_network_key(device, address).await;
-            self.defer_transport_error(result)?;
+        for (address, flags) in pending.iter().copied() {
+            if flags & PENDING_NETWORK_KEY != 0 {
+                let result = self.resume_network_key(device, address).await;
+                self.defer_transport_error(result)?;
+            }
         }
-        for address in link_pending.into_iter().flatten() {
-            let result = self.resume_trust_center_link_key(device, address).await;
-            self.defer_transport_error(result)?;
+        for (address, flags) in pending.iter().copied() {
+            if flags & PENDING_LINK_KEY != 0 {
+                let result = self.resume_trust_center_link_key(device, address).await;
+                self.defer_transport_error(result)?;
+            }
         }
         if resume_confirm_key {
-            for address in confirm_pending.into_iter().flatten() {
-                let result = self.resume_confirm_key(device, address).await;
-                self.defer_transport_error(result)?;
+            for (address, flags) in pending.iter().copied() {
+                if flags & PENDING_CONFIRM_KEY != 0 {
+                    let result = self.resume_confirm_key(device, address).await;
+                    self.defer_transport_error(result)?;
+                }
             }
         }
         let result = self.resume_application_link_key(device).await;
@@ -1153,10 +1504,8 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
     ) -> Result<(), TrustCenterRuntimeError> {
         loop {
-            let Some(rotation) = self
-                .state
-                .as_ref()
-                .and_then(PersistentTrustCenterState::rotation)
+            let Some(rotation) =
+                live_ref(&self.state, self.live).and_then(PersistentTrustCenterState::rotation)
             else {
                 return Ok(());
             };
@@ -1183,15 +1532,17 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                             )
                             .await
                             .map_err(TrustCenterRuntimeError::Aps)?;
-                    } else if let Some(address) = self.state.as_ref().and_then(|state| {
-                        state.devices().iter().find_map(|stored| {
-                            (stored.is_router == Some(true)
-                                && !stored.new_network_key_delivered
-                                && !stored.removal_pending
-                                && stored.device.short_address.0 < 0xFFF8)
-                                .then_some(stored.device.ieee_address)
+                    } else if let Some(address) =
+                        live_ref(&self.state, self.live).and_then(|state| {
+                            state.devices().iter().find_map(|stored| {
+                                (stored.is_router == Some(true)
+                                    && !stored.new_network_key_delivered
+                                    && !stored.removal_pending
+                                    && stored.device.short_address.0 < 0xFFF8)
+                                    .then_some(stored.device.ieee_address)
+                            })
                         })
-                    }) {
+                    {
                         self.ensure_counter_available(device, &address)?;
                         let destination = self.device_short(&address)?;
                         device
@@ -1207,13 +1558,14 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                             .await
                             .map_err(TrustCenterRuntimeError::Aps)?;
                         self.checkpoint_live_counters(device)?;
-                        let mut state = self
-                            .state
-                            .clone()
-                            .ok_or(TrustCenterRuntimeError::NotJoined)?;
-                        state.mark_network_key_delivered(&address)?;
-                        self.store.store(&state)?;
-                        self.state = Some(state);
+                        let state = live_mut(&mut self.state, self.live)?;
+                        // The flag is set before validation: drop it on a
+                        // refusal.
+                        if let Err(error) = state.mark_network_key_delivered(&address) {
+                            self.discard();
+                            return Err(error.into());
+                        }
+                        self.commit()?;
                         return Ok(());
                     }
                     self.set_network_key_rotation_phase(
@@ -1231,7 +1583,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                         .children()
                         .next()
                         .is_some()
-                        || self.state.as_ref().is_some_and(|state| {
+                        || live_ref(&self.state, self.live).is_some_and(|state| {
                             state.devices().iter().any(|stored| {
                                 !stored.removal_pending && stored.device.short_address.0 < 0xFFF8
                             })
@@ -1264,16 +1616,12 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         &mut self,
         phase: NetworkKeyRotationPhase,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         let rotation = state
             .rotation()
             .ok_or(TrustCenterRuntimeError::NetworkKeyRotationNotPrepared)?;
         state.set_rotation(Some(NetworkKeyRotation { phase, ..rotation }));
-        self.store.store(&state)?;
-        self.state = Some(state);
+        self.commit()?;
         Ok(())
     }
 
@@ -1282,9 +1630,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
         address: IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let stored = *self
-            .state
-            .as_ref()
+        let stored = *live_ref(&self.state, self.live)
             .and_then(|state| state.device(&address))
             .ok_or(TrustCenterError::DeviceNotFound)?;
         if !stored.network_key_pending {
@@ -1313,6 +1659,20 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         } else {
             self.device_short(&stored.device.parent_address)?
         };
+        // Paced before the attempt: a failed send (the child expired, no
+        // route) is retried after the same interval as an unanswered one,
+        // not on every step.
+        if let Some((_, sent)) = self
+            .initial_key_attempts
+            .iter_mut()
+            .find(|(peer, _)| *peer == address)
+        {
+            *sent = now;
+        } else {
+            self.initial_key_attempts
+                .push((address, now))
+                .map_err(|_| TrustCenterRuntimeError::Store(TrustCenterStoreError::Full))?;
+        }
         device
             .aps_mut()
             .send_initial_network_key_to(
@@ -1326,17 +1686,6 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             .await
             .map_err(TrustCenterRuntimeError::Aps)?;
         self.checkpoint_live_counters(device)?;
-        if let Some((_, sent)) = self
-            .initial_key_attempts
-            .iter_mut()
-            .find(|(peer, _)| *peer == address)
-        {
-            *sent = now;
-        } else {
-            self.initial_key_attempts
-                .push((address, now))
-                .map_err(|_| TrustCenterRuntimeError::Store(TrustCenterStoreError::Full))?;
-        }
         Ok(())
     }
 
@@ -1346,16 +1695,21 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         &mut self,
         address: IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         if let Some(stored) = state.device_mut(&address)
             && stored.network_key_pending
         {
             stored.network_key_pending = false;
-            self.store.store(&state)?;
-            self.state = Some(state);
+            #[cfg(feature = "host-passthrough")]
+            let short_address = stored.device.short_address;
+            self.commit()?;
+            #[cfg(feature = "host-passthrough")]
+            self.host_events.push(TrustCenterHostEvent::Authorized {
+                device_address: address,
+                short_address,
+                result: 0,
+                unique_link_key: false,
+            });
         }
         self.initial_key_attempts
             .retain(|(peer, _)| *peer != address);
@@ -1367,9 +1721,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
         address: IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let stored = *self
-            .state
-            .as_ref()
+        let stored = *live_ref(&self.state, self.live)
             .and_then(|state| state.device(&address))
             .ok_or(TrustCenterError::DeviceNotFound)?;
         let Some(pending) = stored.pending_link_key else {
@@ -1396,10 +1748,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         let join_timeout = device.bdb().attributes().trust_center_node_join_timeout;
         self.table
             .install_generated_trust_center_link_key(address, pending.key, join_timeout)?;
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         let stored = state
             .device_mut(&address)
             .ok_or(TrustCenterError::DeviceNotFound)?;
@@ -1408,8 +1757,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             .as_mut()
             .ok_or(TrustCenterError::DeviceNotFound)?
             .transported = true;
-        self.store.store(&state)?;
-        self.state = Some(state);
+        self.commit()?;
         Ok(())
     }
 
@@ -1417,9 +1765,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         &mut self,
         device: &mut ZigbeeDevice<M>,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let Some(mut pending) = self
-            .state
-            .as_ref()
+        let Some(mut pending) = live_ref(&self.state, self.live)
             .and_then(PersistentTrustCenterState::pending_application_key)
         else {
             return Ok(());
@@ -1432,13 +1778,9 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 DeliveryProgress::Busy => return Ok(()),
                 DeliveryProgress::Submitted => {
                     pending.delivered_to_initiator = true;
-                    let mut state = self
-                        .state
-                        .clone()
-                        .ok_or(TrustCenterRuntimeError::NotJoined)?;
+                    let state = live_mut(&mut self.state, self.live)?;
                     state.set_pending_application_key(Some(pending));
-                    self.store.store(&state)?;
-                    self.state = Some(state);
+                    self.commit()?;
                     self.cancel_delivery();
                 }
                 DeliveryProgress::Ready => {
@@ -1472,13 +1814,9 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 DeliveryProgress::Busy => return Ok(()),
                 DeliveryProgress::Submitted => {
                     pending.delivered_to_responder = true;
-                    let mut state = self
-                        .state
-                        .clone()
-                        .ok_or(TrustCenterRuntimeError::NotJoined)?;
+                    let state = live_mut(&mut self.state, self.live)?;
                     state.set_pending_application_key(Some(pending));
-                    self.store.store(&state)?;
-                    self.state = Some(state);
+                    self.commit()?;
                     self.cancel_delivery();
                 }
                 DeliveryProgress::Ready => {
@@ -1504,13 +1842,9 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 }
             }
         }
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         state.set_pending_application_key(None);
-        self.store.store(&state)?;
-        self.state = Some(state);
+        self.commit()?;
         Ok(())
     }
 
@@ -1524,15 +1858,14 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             .table
             .device(address)
             .ok_or(TrustCenterError::DeviceNotFound)?;
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         if let Some(stored) = state.device_mut(address) {
             if stored.device.link_key != table_device.link_key {
+                // Fallible part first: nothing is changed on an error.
                 let start = stored.outgoing_frame_counter_limit;
+                let limit = reserve_end(start)?;
                 stored.outgoing_frame_counter = start;
-                stored.outgoing_frame_counter_limit = reserve_end(start)?;
+                stored.outgoing_frame_counter_limit = limit;
                 stored.incoming_frame_counter = 0;
                 stored.incoming_frame_counter_valid = false;
                 stored.pending_link_key = None;
@@ -1543,26 +1876,31 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             if network_key_pending {
                 stored.is_router = None;
             }
-        } else {
-            state.upsert(PersistentTrustCenterDevice {
-                device: table_device,
-                outgoing_frame_counter: 0,
-                outgoing_frame_counter_limit: APS_COUNTER_RESERVATION,
-                incoming_frame_counter: 0,
-                incoming_frame_counter_valid: false,
-                network_key_pending,
-                confirm_key_pending: None,
-                removal_pending: false,
-                new_network_key_delivered: false,
-                is_router: None,
-                pending_link_key: None,
-            })?;
-        }
-        if let Err(error) = self.store.store(&state) {
-            self.restore_policy_device_from_state(address)?;
+        } else if let Err(error) = state.upsert(PersistentTrustCenterDevice {
+            device: table_device,
+            outgoing_frame_counter: 0,
+            outgoing_frame_counter_limit: APS_COUNTER_RESERVATION,
+            incoming_frame_counter: 0,
+            incoming_frame_counter_valid: false,
+            network_key_pending,
+            confirm_key_pending: None,
+            removal_pending: false,
+            new_network_key_delivered: false,
+            is_router: None,
+            pending_link_key: None,
+        }) {
+            // The device is pushed before validation: drop it on a refusal.
+            self.discard();
             return Err(error.into());
         }
-        self.state = Some(state);
+        if let Err(error) = self.commit() {
+            // `commit` reloaded the durable state; realign the policy table
+            // (a closed runtime rebuilds it on re-initialization).
+            if self.live {
+                self.restore_policy_device_from_state(address)?;
+            }
+            return Err(error);
+        }
         if network_key_pending {
             self.initial_key_attempts
                 .retain(|(peer, _)| peer != address);
@@ -1574,7 +1912,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
     /// already verified device without removing the device. Drop the
     /// persisted replacement as well so it is not resurrected on restore.
     fn discard_abandoned_link_keys(&mut self) -> Result<(), TrustCenterRuntimeError> {
-        let Some(mut state) = self.state.clone() else {
+        let Some(state) = live_mut(&mut self.state, self.live).ok() else {
             return Ok(());
         };
         let mut changed = false;
@@ -1599,8 +1937,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             }
         }
         if changed {
-            self.store.store(&state)?;
-            self.state = Some(state);
+            self.commit()?;
         }
         Ok(())
     }
@@ -1609,10 +1946,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         &mut self,
         device: &ZigbeeDevice<M>,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         let mut changed = false;
         for table_device in self.table.devices() {
             if let Some(stored) = state.device_mut(&table_device.ieee_address) {
@@ -1640,10 +1974,9 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 }
             }
         }
-        changed |= sync_live_counters(&mut state, device);
+        changed |= sync_live_counters(state, device);
         if changed {
-            self.store.store(&state)?;
-            self.state = Some(state);
+            self.commit()?;
         }
         Ok(())
     }
@@ -1652,17 +1985,24 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         &mut self,
         device: &ZigbeeDevice<M>,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
-        if sync_live_counters(&mut state, device) {
-            self.store.store(&state)?;
-            self.state = Some(state);
+        let state = live_mut(&mut self.state, self.live)?;
+        if sync_live_counters(state, device) {
+            self.commit()?;
         }
         Ok(())
     }
 
+    /// One global reservation covers every key: per-key counters are unused.
+    #[cfg(feature = "global-aps-counter")]
+    fn ensure_counter_available<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        _address: &IeeeAddress,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        self.maintain_global_aps_reservation(device)
+    }
+
+    #[cfg(not(feature = "global-aps-counter"))]
     fn ensure_counter_available<M: MacDriver>(
         &mut self,
         device: &mut ZigbeeDevice<M>,
@@ -1676,18 +2016,16 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 entry.outgoing_frame_counter.saturating_add(1) >= entry.outgoing_frame_counter_limit
             });
         if exhausted {
-            let mut state = self
-                .state
-                .clone()
-                .ok_or(TrustCenterRuntimeError::NotJoined)?;
+            let state = live_mut(&mut self.state, self.live)?;
             let stored = state
                 .device_mut(address)
                 .ok_or(TrustCenterError::DeviceNotFound)?;
+            // Fallible part first: nothing is changed on an error.
             let start = stored.outgoing_frame_counter_limit;
+            let limit = reserve_end(start)?;
             stored.outgoing_frame_counter = start;
-            stored.outgoing_frame_counter_limit = reserve_end(start)?;
-            self.store.store(&state)?;
-            self.state = Some(state);
+            stored.outgoing_frame_counter_limit = limit;
+            self.commit()?;
             self.install_live_key(device, *address)?;
         }
         Ok(())
@@ -1697,10 +2035,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         &mut self,
         address: &IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let state = self
-            .state
-            .as_ref()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_ref(&self.state, self.live).ok_or(TrustCenterRuntimeError::NotJoined)?;
         if let Some(stored) = state.device(address) {
             self.table.restore_device(stored.device)?;
             if let Some(pending) = stored.pending_link_key {
@@ -1721,9 +2056,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
         address: IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let stored = self
-            .state
-            .as_ref()
+        let stored = live_ref(&self.state, self.live)
             .and_then(|state| state.device(&address))
             .ok_or(TrustCenterError::DeviceNotFound)?;
         install_key(device, stored)
@@ -1735,7 +2068,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         address: &IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
         let mut cancel_application_delivery = false;
-        if let Some(mut state) = self.state.clone() {
+        if let Ok(state) = live_mut(&mut self.state, self.live) {
             let mut changed = false;
             if state.pending_application_key().is_some_and(|pending| {
                 pending.initiator_address == *address || pending.responder_address == *address
@@ -1748,14 +2081,13 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             changed |= state.remove(address);
             changed |= state.remove_unknown_removal(address);
             if changed {
-                self.store.store(&state)?;
-                self.state = Some(state);
+                self.commit()?;
             }
         }
         if self.pending_delivery.is_some_and(|pending| {
             pending.address == *address
                 || (pending.kind == TrustCenterDeliveryKind::RemoveDevice
-                    && self.state.as_ref().is_some_and(|state| {
+                    && live_ref(&self.state, self.live).is_some_and(|state| {
                         state.pending_unknown_removals().iter().any(|removal| {
                             removal.parent_address == *address
                                 && removal.device_address == pending.address
@@ -1811,10 +2143,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             .table
             .device(&address)
             .ok_or(TrustCenterError::DeviceNotFound)?;
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         let stored = state
             .device_mut(&address)
             .ok_or(TrustCenterError::DeviceNotFound)?;
@@ -1845,13 +2174,16 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             stored.network_key_pending = false;
         }
         stored.confirm_key_pending = Some(status);
-        if let Err(error) = self.store.store(&state) {
+        if let Err(error) = self.commit() {
             // Verify-Key mutates the policy table first. Restore it too if
-            // the verified key and response obligation cannot be committed.
-            self.restore_policy_device_from_state(&address)?;
-            return Err(error.into());
+            // the verified key and response obligation cannot be committed
+            // (`commit` reloaded the durable state; a closed runtime
+            // rebuilds the table on re-initialization).
+            if self.live {
+                self.restore_policy_device_from_state(&address)?;
+            }
+            return Err(error);
         }
-        self.state = Some(state);
         if previous_status.is_some_and(|previous| previous != status)
             && self.pending_delivery.is_some_and(|pending| {
                 pending.kind == TrustCenterDeliveryKind::ConfirmKey && pending.address == address
@@ -1864,6 +2196,13 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             self.initial_key_attempts
                 .retain(|(peer, _)| *peer != address);
         }
+        #[cfg(feature = "host-passthrough")]
+        self.host_events.push(TrustCenterHostEvent::Authorized {
+            device_address: address,
+            short_address: table_device.short_address,
+            result: if status == 0 { 1 } else { 2 },
+            unique_link_key: true,
+        });
         Ok(())
     }
 
@@ -1872,26 +2211,23 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
         address: IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let status = self
-            .state
-            .as_ref()
+        let status = live_ref(&self.state, self.live)
             .and_then(|state| state.device(&address))
             .and_then(|stored| stored.confirm_key_pending)
             .ok_or(TrustCenterError::DeviceNotFound)?;
         match self.delivery_progress(TrustCenterDeliveryKind::ConfirmKey, address) {
             DeliveryProgress::Busy => return Ok(()),
             DeliveryProgress::Submitted => {
-                let mut state = self
-                    .state
-                    .clone()
-                    .ok_or(TrustCenterRuntimeError::NotJoined)?;
-                sync_live_counters(&mut state, device);
-                state
-                    .device_mut(&address)
-                    .ok_or(TrustCenterError::DeviceNotFound)?
-                    .confirm_key_pending = None;
-                self.store.store(&state)?;
-                self.state = Some(state);
+                let state = live_mut(&mut self.state, self.live)?;
+                // Fallible lookup first: nothing is changed on an error.
+                if state.device(&address).is_none() {
+                    return Err(TrustCenterError::DeviceNotFound.into());
+                }
+                sync_live_counters(state, device);
+                if let Some(stored) = state.device_mut(&address) {
+                    stored.confirm_key_pending = None;
+                }
+                self.commit()?;
                 self.cancel_delivery();
                 return Ok(());
             }
@@ -1918,10 +2254,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         parent_address: IeeeAddress,
         short_address: ShortAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let mut state = self
-            .state
-            .clone()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         let pending_application_key = state.pending_application_key();
         {
             let stored = state
@@ -1940,8 +2273,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             state.set_pending_application_key(None);
         }
         state.remove_application_key_requests_for(&address);
-        self.store.store(&state)?;
-        self.state = Some(state);
+        self.commit()?;
         let cancel_delivery = self.pending_delivery.is_some_and(|pending| {
             pending.kind != TrustCenterDeliveryKind::RemoveDevice
                 && (pending.address == address
@@ -1966,9 +2298,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
         address: IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let stored = *self
-            .state
-            .as_ref()
+        let stored = *live_ref(&self.state, self.live)
             .and_then(|state| state.device(&address))
             .ok_or(TrustCenterError::DeviceNotFound)?;
         if !stored.removal_pending {
@@ -2008,10 +2338,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         parent_address: IeeeAddress,
         device_address: IeeeAddress,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let state = self
-            .state
-            .as_ref()
-            .ok_or(TrustCenterRuntimeError::NotJoined)?;
+        let state = live_mut(&mut self.state, self.live)?;
         let pending = PendingUnknownRemoval {
             parent_address,
             device_address,
@@ -2019,12 +2346,11 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         if state.pending_unknown_removals().contains(&pending) {
             return Ok(());
         }
-        // Publish only after the journal commits. Otherwise a subsequent poll
-        // could transmit a rejection whose failed write was lost.
-        let mut next = state.clone();
-        next.stage_unknown_removal(pending)?;
-        self.store.store(&next)?;
-        self.state = Some(next);
+        // Refusals happen before any change. Publish only after the journal
+        // commits: a failed commit reloads the durable state, so a later
+        // poll never transmits a rejection whose write was lost.
+        state.stage_unknown_removal(pending)?;
+        self.commit()?;
         if self.pending_delivery.is_some_and(|delivery| {
             delivery.kind == TrustCenterDeliveryKind::RemoveDevice
                 && delivery.address == device_address
@@ -2039,9 +2365,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         &mut self,
         device: &mut ZigbeeDevice<M>,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let Some(pending) = self
-            .state
-            .as_ref()
+        let Some(pending) = live_ref(&self.state, self.live)
             .and_then(|state| state.pending_unknown_removals().first())
             .copied()
         else {
@@ -2138,11 +2462,36 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
     }
 
     fn device_short(&self, address: &IeeeAddress) -> Result<ShortAddress, TrustCenterRuntimeError> {
-        self.state
-            .as_ref()
+        live_ref(&self.state, self.live)
             .and_then(|state| state.device(address))
             .map(|stored| stored.device.short_address)
             .ok_or_else(|| TrustCenterError::DeviceNotFound.into())
+    }
+}
+
+/// Pending-transaction flags of one device in `resume_pending`.
+const PENDING_REMOVAL: u8 = 0x01;
+const PENDING_NETWORK_KEY: u8 = 0x02;
+const PENDING_LINK_KEY: u8 = 0x04;
+const PENDING_CONFIRM_KEY: u8 = 0x08;
+
+/// The live state, if any (a field-level borrow, so the other runtime
+/// fields stay usable).
+fn live_ref(state: &PersistentTrustCenterState, live: bool) -> Option<&PersistentTrustCenterState> {
+    if live { Some(state) } else { None }
+}
+
+/// The live state for an in-place mutation, which must end in
+/// `TrustCenterRuntime::commit`, or in `TrustCenterRuntime::discard` when
+/// an error follows the first change.
+fn live_mut(
+    state: &mut PersistentTrustCenterState,
+    live: bool,
+) -> Result<&mut PersistentTrustCenterState, TrustCenterRuntimeError> {
+    if live {
+        Ok(state)
+    } else {
+        Err(TrustCenterRuntimeError::NotJoined)
     }
 }
 
@@ -2214,6 +2563,32 @@ fn reserve_restored_ranges(
     Ok(())
 }
 
+/// Lowest safe value of the global APS counter: at or above every value any
+/// key could have used — the durable global limit, every per-key
+/// reservation in the journal and in the live APS key table (the per-key
+/// counters before migration), the live global counter, and the NWK limit
+/// (the preconfigured global keys used the NWK counter before migration).
+#[cfg(feature = "global-aps-counter")]
+fn global_aps_start<M: MacDriver>(
+    state: &PersistentTrustCenterState,
+    device: &ZigbeeDevice<M>,
+) -> u32 {
+    let mut start = state.global_aps_limit();
+    for stored in state.devices() {
+        start = start.max(stored.outgoing_frame_counter_limit);
+        if let Some(pending) = stored.pending_link_key {
+            start = start.max(pending.outgoing_frame_counter_limit);
+        }
+    }
+    for entry in device.aps().security().key_table() {
+        start = start.max(entry.outgoing_frame_counter_limit);
+    }
+    if let Some(live) = device.aps().security().global_outgoing_counter() {
+        start = start.max(live.current);
+    }
+    start.max(device.aps().nwk().nib().outgoing_frame_counter_limit)
+}
+
 fn reserve_end(start: u32) -> Result<u32, TrustCenterRuntimeError> {
     start
         .checked_add(APS_COUNTER_RESERVATION)
@@ -2274,8 +2649,11 @@ mod tests {
     }
 
     impl TrustCenterDeviceStore for CountingStore {
-        fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
-            self.inner.load()
+        fn load_into(
+            &mut self,
+            state: &mut PersistentTrustCenterState,
+        ) -> Result<bool, TrustCenterStoreError> {
+            self.inner.load_into(state)
         }
 
         fn store(
@@ -2295,11 +2673,20 @@ mod tests {
     struct FailingStore {
         inner: RamTrustCenterDeviceStore,
         fail_next_store: bool,
+        fail_loads: bool,
     }
 
     impl TrustCenterDeviceStore for FailingStore {
-        fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
-            self.inner.load()
+        fn load_into(
+            &mut self,
+            state: &mut PersistentTrustCenterState,
+        ) -> Result<bool, TrustCenterStoreError> {
+            if self.fail_loads {
+                // A reload that fails half way leaves `state` garbled.
+                state.reset([0x5A; 8]);
+                return Err(TrustCenterStoreError::Hardware);
+            }
+            self.inner.load_into(state)
         }
 
         fn store(
@@ -2559,8 +2946,7 @@ mod tests {
         block_on(runtime.poll(&mut rebooted)).unwrap();
         assert!(
             runtime
-                .state
-                .as_ref()
+                .live_state()
                 .unwrap()
                 .device(&CHILD_A)
                 .unwrap()
@@ -2607,7 +2993,7 @@ mod tests {
         poll_child(&mut device, short);
         assert!(device.mac().tx_history().is_empty());
         assert!(runtime.table().device(&CHILD_A).is_none());
-        assert!(runtime.state.as_ref().unwrap().device(&CHILD_A).is_none());
+        assert!(runtime.live_state().unwrap().device(&CHILD_A).is_none());
         assert!(
             runtime
                 .store_mut()
@@ -2640,6 +3026,67 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_commit_whose_reload_fails_closes_until_reinitialized() {
+        let (mut device, mut security_store) = coordinator_with_security_store();
+        let short = add_sleepy_child(&mut device, CHILD_A);
+        let mut runtime = TrustCenterRuntime::new(FailingStore::default());
+        block_on(runtime.initialize_with_security_store(&mut device, &mut security_store)).unwrap();
+        begin_join(&mut runtime, &mut device, CHILD_A, short);
+        poll_child(&mut device, short);
+        assert!(device.aps_mut().nwk_mut().authorize_child(short));
+        runtime.store_mut().fail_next_store = true;
+        runtime.store_mut().fail_loads = true;
+        assert_eq!(
+            runtime.handle_device_announce(&device, CHILD_A, short, 0x80),
+            Err(TrustCenterRuntimeError::Store(
+                TrustCenterStoreError::Hardware
+            ))
+        );
+        // The mutated live state could not be re-synchronised: the runtime
+        // refuses everything instead of running ahead of flash.
+        assert!(!runtime.is_initialized());
+        assert!(runtime.live_state().is_none());
+        assert_eq!(
+            runtime.handle_device_announce(&device, CHILD_A, short, 0x80),
+            Err(TrustCenterRuntimeError::NotJoined)
+        );
+        // Re-initialization restores the durable (pre-failure) intent.
+        runtime.store_mut().fail_loads = false;
+        block_on(runtime.initialize_with_security_store(&mut device, &mut security_store)).unwrap();
+        assert!(
+            runtime
+                .live_state()
+                .unwrap()
+                .device(&CHILD_A)
+                .unwrap()
+                .network_key_pending
+        );
+    }
+
+    #[test]
+    fn write_into_constructs_the_new_runtime_in_place() {
+        let mut storage =
+            core::mem::MaybeUninit::<TrustCenterRuntime<RamTrustCenterDeviceStore>>::uninit();
+        // Poison: nothing may be read before it is written.
+        unsafe {
+            storage.as_mut_ptr().write_bytes(0xA5, 1);
+            TrustCenterRuntime::write_into(storage.as_mut_ptr(), RamTrustCenterDeviceStore::new());
+        }
+        let runtime = unsafe { storage.assume_init_mut() };
+        assert!(!runtime.is_initialized());
+        assert!(runtime.live_state().is_none());
+        assert_eq!(runtime.table().devices().count(), 0);
+        assert!(!runtime.has_pending_transactions());
+        assert_eq!(runtime.last_transport_error(), None);
+        assert_eq!(runtime.pending_device_replay_tombstone(), None);
+        assert_eq!(runtime.state, PersistentTrustCenterState::new([0; 8]));
+        let mut device = coordinator();
+        block_on(runtime.initialize(&mut device)).unwrap();
+        assert!(runtime.is_initialized());
+        unsafe { storage.assume_init_drop() };
+    }
+
+    #[test]
     fn initial_key_completion_failure_keeps_live_and_durable_intent() {
         let mut device = coordinator();
         let short = add_sleepy_child(&mut device, CHILD_A);
@@ -2657,8 +3104,7 @@ mod tests {
         );
         assert!(
             runtime
-                .state
-                .as_ref()
+                .live_state()
                 .unwrap()
                 .device(&CHILD_A)
                 .unwrap()
@@ -2700,8 +3146,7 @@ mod tests {
         assert!(device.aps().nwk().child_is_authorized(&CHILD_A));
         assert!(
             runtime
-                .state
-                .as_ref()
+                .live_state()
                 .unwrap()
                 .device(&CHILD_A)
                 .unwrap()
@@ -2756,14 +3201,14 @@ mod tests {
             .handle_device_announce(&device, CHILD_B, ShortAddress(0x1234), 0x8E)
             .unwrap();
         assert!(runtime.store().fail_next_store);
-        assert!(runtime.state.as_ref().unwrap().device(&CHILD_B).is_none());
+        assert!(runtime.live_state().unwrap().device(&CHILD_B).is_none());
         assert_eq!(
             runtime.handle_device_announce(&device, CHILD_A, short, 0x8E),
             Err(TrustCenterRuntimeError::Store(
                 TrustCenterStoreError::Hardware
             ))
         );
-        let live = runtime.state.as_ref().unwrap().device(&CHILD_A).unwrap();
+        let live = runtime.live_state().unwrap().device(&CHILD_A).unwrap();
         assert!(live.network_key_pending);
         assert_eq!(live.is_router, None);
         let durable = runtime.store_mut().load().unwrap().unwrap();
@@ -2816,8 +3261,7 @@ mod tests {
             .unwrap();
         assert!(
             runtime
-                .state
-                .as_ref()
+                .live_state()
                 .unwrap()
                 .device(&CHILD_B)
                 .unwrap()
@@ -2980,8 +3424,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             runtime
-                .state
-                .as_ref()
+                .live_state()
                 .unwrap()
                 .device(&CHILD_A)
                 .unwrap()
@@ -3059,6 +3502,9 @@ mod tests {
     }
 
     #[test]
+    // Asserts a per-key reservation commit before Confirm-Key; with
+    // `global-aps-counter` the global reservation covers it.
+    #[cfg(not(feature = "global-aps-counter"))]
     fn confirm_key_send_intent_survives_reboot_and_completes_without_aps_ack() {
         let (mut device, mut security_store) = coordinator_with_security_store();
         let child_short = add_child(&mut device, CHILD_A);
@@ -3075,8 +3521,7 @@ mod tests {
         ))
         .unwrap();
         let key = runtime
-            .state
-            .as_ref()
+            .live_state()
             .unwrap()
             .device(&CHILD_A)
             .unwrap()
@@ -3101,14 +3546,14 @@ mod tests {
             runtime.table().device(&CHILD_A).unwrap().link_key,
             DEFAULT_TC_LINK_KEY
         );
-        let unchanged = runtime.state.as_ref().unwrap().device(&CHILD_A).unwrap();
+        let unchanged = runtime.live_state().unwrap().device(&CHILD_A).unwrap();
         assert_eq!(unchanged.device.link_key, DEFAULT_TC_LINK_KEY);
         assert!(unchanged.pending_link_key.is_some());
         assert!(unchanged.confirm_key_pending.is_none());
         assert!(device.mac().tx_history().is_empty());
         assert_eq!(
             runtime.store_mut().load().unwrap().as_ref(),
-            runtime.state.as_ref()
+            runtime.live_state()
         );
 
         block_on(runtime.handle_indication(
@@ -3118,8 +3563,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             runtime
-                .state
-                .as_ref()
+                .live_state()
                 .unwrap()
                 .device(&CHILD_A)
                 .unwrap()
@@ -3348,8 +3792,7 @@ mod tests {
         ))
         .unwrap();
         let generation = runtime
-            .state
-            .as_ref()
+            .live_state()
             .unwrap()
             .pending_application_key()
             .unwrap()
@@ -3366,15 +3809,14 @@ mod tests {
             );
             assert_eq!(device.mac().tx_history().len(), submitted);
             let durable = runtime.store_mut().load().unwrap().unwrap();
-            assert_eq!(runtime.state.as_ref(), Some(&durable));
+            assert_eq!(runtime.live_state(), Some(&durable));
             assert_eq!(durable.pending_application_key().unwrap().key, generation);
             assert!(runtime.pending_delivery.is_some());
             block_on(runtime.resume_application_link_key(&mut device)).unwrap();
         }
         assert!(
             runtime
-                .state
-                .as_ref()
+                .live_state()
                 .unwrap()
                 .pending_application_key()
                 .is_none()
@@ -4437,5 +4879,288 @@ mod tests {
                 .pending_unknown_removals()
                 .is_empty()
         );
+    }
+
+    #[cfg(feature = "global-aps-counter")]
+    mod global_aps {
+        use super::*;
+        use crate::trust_center_store::PersistentTrustCenterDevice;
+        use zigbee_bdb::trust_center::TrustCenterDevice;
+
+        fn initialized<S: TrustCenterDeviceStore>(
+            store: S,
+            device: &mut ZigbeeDevice<MockMac>,
+        ) -> TrustCenterRuntime<S> {
+            let mut runtime = TrustCenterRuntime::new(store);
+            block_on(runtime.initialize(device)).unwrap();
+            runtime
+        }
+
+        fn take(device: &mut ZigbeeDevice<MockMac>, count: u32) -> u32 {
+            let mut last = 0;
+            for _ in 0..count {
+                last = device
+                    .aps_mut()
+                    .security_mut()
+                    .next_global_frame_counter()
+                    .unwrap();
+            }
+            last
+        }
+
+        #[test]
+        fn fresh_coordinator_reserves_above_the_nwk_limit_before_any_aps_send() {
+            let mut device = coordinator();
+            let nwk_limit = device.aps().nwk().nib().outgoing_frame_counter_limit;
+            // Composed but not initialized: every APS-secured send is refused.
+            assert_eq!(device.aps().security().global_outgoing_counter(), None);
+            let mut runtime = initialized(RamTrustCenterDeviceStore::new(), &mut device);
+            let checkpoint = runtime.global_aps_counter(&device).unwrap();
+            assert_eq!(checkpoint.current, nwk_limit);
+            assert_eq!(
+                checkpoint.durable_limit,
+                nwk_limit + APS_COUNTER_RESERVATION
+            );
+            assert_eq!(
+                runtime
+                    .store_mut()
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .global_aps_limit(),
+                checkpoint.durable_limit
+            );
+        }
+
+        #[test]
+        fn restart_resumes_at_the_durable_limit_and_never_reuses_a_value() {
+            let (mut device, mut security_store) = coordinator_with_security_store();
+            let mut runtime = initialized(RamTrustCenterDeviceStore::new(), &mut device);
+            let used = take(&mut device, 10);
+            let limit = runtime.global_aps_counter(&device).unwrap().durable_limit;
+            let saved = runtime.store_mut().load().unwrap().unwrap();
+            drop(runtime);
+            let mut store = RamTrustCenterDeviceStore::new();
+            store.store(&saved).unwrap();
+
+            let mut rebooted = restored_coordinator(&mut security_store);
+            let runtime = initialized(store, &mut rebooted);
+            let checkpoint = runtime.global_aps_counter(&rebooted).unwrap();
+            assert!(checkpoint.current >= limit && checkpoint.current > used);
+            assert_eq!(
+                checkpoint.durable_limit,
+                checkpoint.current + APS_COUNTER_RESERVATION
+            );
+        }
+
+        #[test]
+        fn version_4_state_migrates_above_every_per_key_reservation() {
+            let mut device = coordinator();
+            let extended_pan_id = device.aps().nwk().nib().extended_pan_id;
+            let mut state = PersistentTrustCenterState::new(extended_pan_id);
+            state
+                .upsert(PersistentTrustCenterDevice {
+                    device: TrustCenterDevice {
+                        ieee_address: CHILD_A,
+                        parent_address: TC,
+                        short_address: ShortAddress(0x1234),
+                        link_key: [0x5A; 16],
+                        key_origin: TrustCenterKeyOrigin::GeneratedUnique,
+                        key_attributes: TrustCenterKeyAttributes::Verified,
+                        join_timeout_remaining_secs: 0,
+                        active: true,
+                    },
+                    outgoing_frame_counter: 0x7_0000,
+                    outgoing_frame_counter_limit: 0x7_0400,
+                    incoming_frame_counter: 3,
+                    incoming_frame_counter_valid: true,
+                    pending_link_key: None,
+                    network_key_pending: false,
+                    confirm_key_pending: None,
+                    removal_pending: false,
+                    new_network_key_delivered: false,
+                    is_router: Some(false),
+                })
+                .unwrap();
+            assert_eq!(state.global_aps_limit(), 0);
+            let mut store = RamTrustCenterDeviceStore::new();
+            store.store(&state).unwrap();
+
+            let runtime = initialized(store, &mut device);
+            let checkpoint = runtime.global_aps_counter(&device).unwrap();
+            // The restore reserved a fresh per-key range above 0x70400; the
+            // global counter starts above that too.
+            assert!(checkpoint.current >= 0x7_0400 + APS_COUNTER_RESERVATION);
+            let next = device
+                .aps_mut()
+                .security_mut()
+                .next_frame_counter(&CHILD_A, ApsKeyType::TrustCenterLinkKey)
+                .unwrap();
+            assert_eq!(next, checkpoint.current);
+        }
+
+        #[test]
+        fn a_failed_reservation_commit_leaves_aps_sends_refused() {
+            let mut device = coordinator();
+            let mut runtime = TrustCenterRuntime::new(FailingStore {
+                fail_next_store: true,
+                ..FailingStore::default()
+            });
+            assert!(block_on(runtime.initialize(&mut device)).is_err());
+            assert_eq!(device.aps().security().global_outgoing_counter(), None);
+            assert_eq!(
+                device.aps_mut().security_mut().next_global_frame_counter(),
+                None
+            );
+        }
+
+        #[test]
+        fn poll_extends_the_reservation_before_it_runs_out() {
+            let mut device = coordinator();
+            let mut runtime = initialized(RamTrustCenterDeviceStore::new(), &mut device);
+            let first = runtime.global_aps_counter(&device).unwrap();
+            take(&mut device, APS_COUNTER_RESERVATION - GLOBAL_APS_LOW_WATER);
+            block_on(runtime.poll(&mut device)).unwrap();
+            let second = runtime.global_aps_counter(&device).unwrap();
+            assert!(second.durable_limit > first.durable_limit);
+            assert_eq!(second.commits, first.commits + 1);
+            assert_eq!(
+                second.durable_limit,
+                second.current + APS_COUNTER_RESERVATION
+            );
+            // A dropped reservation (leave/clear of the key table) is
+            // re-installed from the durable limit, never below it.
+            device
+                .aps_mut()
+                .security_mut()
+                .clear_global_outgoing_counter();
+            block_on(runtime.poll(&mut device)).unwrap();
+            let third = runtime.global_aps_counter(&device).unwrap();
+            assert!(third.current >= second.durable_limit);
+        }
+
+        #[test]
+        fn host_floors_only_raise_the_counter() {
+            let mut device = coordinator();
+            let mut runtime = initialized(RamTrustCenterDeviceStore::new(), &mut device);
+            let before = runtime.global_aps_counter(&device).unwrap();
+            runtime.raise_global_aps_floor(&mut device, 5).unwrap();
+            assert_eq!(runtime.global_aps_counter(&device).unwrap(), before);
+            runtime
+                .raise_global_aps_floor(&mut device, 0x0100_0000)
+                .unwrap();
+            let raised = runtime.global_aps_counter(&device).unwrap();
+            assert_eq!(raised.current, 0x0100_0000);
+            assert_eq!(raised.durable_limit, 0x0100_0000 + APS_COUNTER_RESERVATION);
+        }
+    }
+
+    /// `host-passthrough`: join decisions, departure reports and removals
+    /// are queued for the network co-processor host.
+    #[test]
+    #[cfg(feature = "host-passthrough")]
+    fn trust_center_decisions_are_reported_to_the_host() {
+        let mut device = coordinator();
+        let short_a = add_child(&mut device, CHILD_A);
+        let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
+        block_on(runtime.initialize(&mut device)).unwrap();
+        assert_eq!(runtime.take_host_event(), None);
+
+        join(&mut runtime, &mut device, CHILD_A, short_a);
+        assert_eq!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Joined {
+                device_address: CHILD_A,
+                short_address: short_a,
+                parent_address: TC,
+                status: ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin,
+                admitted: true,
+            })
+        );
+        assert_eq!(runtime.take_host_event(), None);
+
+        // An unknown device's secured rejoin through CHILD_A is refused.
+        let unknown = [0x99; 8];
+        let rejoin = ApsmeUpdateDeviceIndication {
+            source_address: CHILD_A,
+            device_address: unknown,
+            device_short_address: ShortAddress(0x4455),
+            status: ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+        };
+        block_on(
+            runtime.handle_indication(&mut device, ApsmeSecurityIndication::UpdateDevice(rejoin)),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Joined {
+                device_address: unknown,
+                short_address: ShortAddress(0x4455),
+                parent_address: CHILD_A,
+                status: ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+                admitted: false,
+            })
+        );
+        complete_pending_submission(&mut runtime, &mut device);
+        runtime
+            .complete_pending_device_revocation(&mut device, unknown)
+            .unwrap();
+
+        // A device that has not completed its admission and rejoins without
+        // `allow_rejoins` is removed by the Trust Center.
+        let short_b = ShortAddress(0x5566);
+        begin_join(&mut runtime, &mut device, CHILD_B, short_b);
+        assert!(matches!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Joined { admitted: true, .. })
+        ));
+        block_on(runtime.handle_indication(
+            &mut device,
+            ApsmeSecurityIndication::UpdateDevice(ApsmeUpdateDeviceIndication {
+                source_address: CHILD_A,
+                device_address: CHILD_B,
+                device_short_address: short_b,
+                status: ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+            }),
+        ))
+        .unwrap();
+        assert!(matches!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Joined {
+                device_address: CHILD_B,
+                admitted: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Removed {
+                device_address: CHILD_B,
+                short_address: short_b,
+                parent_address: CHILD_A,
+            })
+        );
+
+        // The coordinator reports its own child's departure.
+        block_on(runtime.handle_indication(
+            &mut device,
+            ApsmeSecurityIndication::UpdateDevice(ApsmeUpdateDeviceIndication {
+                source_address: TC,
+                device_address: CHILD_A,
+                device_short_address: short_a,
+                status: ApsUpdateDeviceStatus::DeviceLeft,
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Left {
+                device_address: CHILD_A,
+                short_address: short_a,
+                parent_address: TC,
+            })
+        );
+        assert_eq!(runtime.take_host_event(), None);
+        assert_eq!(runtime.take_host_events_dropped(), 0);
     }
 }

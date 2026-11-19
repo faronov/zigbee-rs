@@ -32,6 +32,8 @@ sleepy-end-device = ["end-device", "zigbee-aps/sleepy-end-device"]
 # Keep formation independently selectable for host tests without enabling
 # router behavior in an end-device production graph.
 formation = []
+# Formation leaves joining closed (network co-processors: the host opens it).
+formation-joining-closed = ["formation"]
 finding-binding = ["finding-binding-target"]
 finding-binding-target = []
 float32 = ["zigbee-zcl/float32"]
@@ -40,6 +42,9 @@ router = ["centralized-tclk", "distributed-security", "formation"]
 # Joiner-side install-code provisioning (`BdbLayer::set_install_code`).
 install-code = ["centralized-tclk", "dep:zigbee-crypto"]
 trust-center = ["router", "install-code", "zigbee-aps/trust-center"]
+# Coordinator network co-processor capacity (ZRHP spec 8.9): a 256-device
+# Trust Center table and the APS/NWK `ncp-capacity` tables. Off by default.
+ncp-capacity = ["trust-center", "zigbee-aps/ncp-capacity"]
 trace = ["zigbee-aps/trace", "zigbee-nwk/trace"]
 touchlink = []
 

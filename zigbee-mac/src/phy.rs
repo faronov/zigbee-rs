@@ -65,36 +65,34 @@ pub struct TxParams {
     pub max_frame_retries: u8,
 }
 
-/// FCS-validated MAC bytes received from the PHY.
-///
-/// `data[..len]` contains the MAC header and payload without the two-byte FCS.
+/// FCS-validated MAC bytes received from the PHY: `data[..len]` contains the
+/// MAC header and payload without the two-byte FCS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhyRxFrame {
     data: [u8; MAX_PHY_FRAME_LEN],
     len: u8,
-    /// IEEE 802.15.4 Link Quality Indicator, normalized to `0..=255` (larger
-    /// is better).
-    ///
-    /// Backends whose hardware reports a different scale must convert before
-    /// constructing this frame; see [`crate::lqi`].
+    /// IEEE 802.15.4 LQI normalized to `0..=255` (larger is better); backends
+    /// with another hardware scale convert first, see [`crate::lqi`].
     pub lqi: u8,
-    /// [`crate::PlatformServices::monotonic_micros`] when the last octet of
-    /// the frame was received (`timed-tx`). Set by PHYs whose
-    /// [`RadioPhy::TIMED_TX`] is `true`; 0 otherwise. [`Self::set`] and
-    /// [`Self::set_len`] clear it, so the PHY records it after them.
+    /// [`crate::PlatformServices::monotonic_micros`] at the last octet
+    /// (`timed-tx`, [`RadioPhy::TIMED_TX`] PHYs; 0 otherwise). [`Self::set`]
+    /// and [`Self::set_len`] clear it, so the PHY records it after them.
     #[cfg(feature = "timed-tx")]
     pub rx_end_us: u32,
+    #[cfg(feature = "rx-rssi")]
+    pub rssi_dbm: i8,
 }
 
 impl PhyRxFrame {
-    /// An empty frame: initialises fixed-capacity queues and the receive
-    /// buffer of lab code that calls a PHY directly.
+    /// An empty frame for fixed-capacity queues and lab receive buffers.
     pub const EMPTY: Self = Self {
         data: [0; MAX_PHY_FRAME_LEN],
         len: 0,
         lqi: 0,
         #[cfg(feature = "timed-tx")]
         rx_end_us: 0,
+        #[cfg(feature = "rx-rssi")]
+        rssi_dbm: RSSI_UNKNOWN_DBM,
     };
 
     pub fn from_slice(data: &[u8], lqi: u8) -> Result<Self, PhyError> {
@@ -108,6 +106,8 @@ impl PhyRxFrame {
             lqi,
             #[cfg(feature = "timed-tx")]
             rx_end_us: 0,
+            #[cfg(feature = "rx-rssi")]
+            rssi_dbm: RSSI_UNKNOWN_DBM,
         };
         frame.data[..data.len()].copy_from_slice(data);
         Ok(frame)
@@ -421,6 +421,15 @@ pub(crate) fn transmit_with_deadline(
         }
     }
 }
+
+/// RSSI reported for a received frame whose PHY does not measure it
+/// (`rx-rssi`): [`PhyRxFrame::rssi_dbm`] and `MacFrame::rssi_dbm` carry the
+/// received signal strength of the frame in dBm, or this value.
+///
+/// Measured today by the ESP32-C6/H2/C5 PHY (the RSSI byte the radio stores
+/// in place of the FCS); every other backend reports this value.
+#[cfg(feature = "rx-rssi")]
+pub const RSSI_UNKNOWN_DBM: i8 = -128;
 
 #[cfg(test)]
 mod tests {

@@ -150,6 +150,17 @@ and H2 `soc/regi2c_bias.h`. These are references, not linked IDF dependencies.
 - Correct SYSTIMER high-word reload (`>> 32`, not `<< 32`) for all existing
   setter branches.
 
+## UHCI: UART reconfiguration after split (ZRHP NCP)
+
+`uart::uhci::UhciTx::apply_uart_config(&uart::Config)` applies a full UART
+configuration (baud rate, format, RTS/CTS) after `Uhci::split`. Upstream
+1.0.0 only offers `Uhci::set_uart_config` before the split, and
+`UartTx::apply_config` touches the TX FIFO threshold only, so a split UHCI
+link could never change its rate. The ZRHP NCP's `SYS_SET_UART` needs it
+(`esp-serial-stream`). The method is new and only called by that crate;
+images that do not call it link no new code. The rate switch itself on a
+running link is a hardware gate (H2/H8).
+
 ## H2 sleep entry superseded (pending removal)
 
 The product no longer calls the H2 light/deep sleep entry points of this

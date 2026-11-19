@@ -559,8 +559,7 @@ pub struct ApsLayer<M: MacDriver> {
     pending_local_remove_device: bool,
     /// Whether Transport-Key may install an application link key.
     application_link_key_installation_enabled: bool,
-    /// Whether a Network Transport-Key must wait for an external security
-    /// snapshot before its replay floor becomes live.
+    /// Whether a Network Transport-Key's replay floor awaits a snapshot.
     network_key_persistence_enabled: bool,
     /// A newly installed network key awaits that durable snapshot.
     pending_network_key_persistence: bool,
@@ -589,10 +588,9 @@ pub struct ApsLayer<M: MacDriver> {
     ack_completions: heapless::Vec<ApsAckHandle, APS_ACK_TABLE_SIZE>,
     /// Identity assigned to the next acknowledged outbound transaction.
     next_ack_generation: u16,
-    /// Acknowledged unicasts that exhausted their retries since the last
-    /// APS ACK arrived (saturating): end-to-end delivery evidence that the
-    /// MAC-level parent acknowledgement cannot provide.
+    /// Unicasts without an APS ACK after every retry since the last ACK.
     consecutive_ack_failures: u8,
+    host_rx: HostRxSecurity,
     /// Fragment reassembly buffer for incoming fragmented frames
     fragment_rx: fragment::FragmentReassembly,
 }
@@ -637,6 +635,7 @@ impl<M: MacDriver> ApsLayer<M> {
             ack_table: heapless::Vec::new(),
             ack_completions: heapless::Vec::new(),
             consecutive_ack_failures: 0,
+            host_rx: HostRxSecurity::new(),
             next_ack_generation: 1,
             fragment_rx: fragment::FragmentReassembly::new(),
         }
@@ -686,6 +685,7 @@ impl<M: MacDriver> ApsLayer<M> {
             core::ptr::addr_of_mut!((*slot).ack_table).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).ack_completions).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).next_ack_generation).write(1);
+            core::ptr::addr_of_mut!((*slot).host_rx).write(HostRxSecurity::new());
             core::ptr::addr_of_mut!((*slot).fragment_rx).write(fragment::FragmentReassembly::new());
         }
     }
@@ -1442,5 +1442,121 @@ impl<M: MacDriver> ApsLayer<M> {
     /// Mutable reference to the fragment reassembly buffer.
     pub fn fragment_rx_mut(&mut self) -> &mut fragment::FragmentReassembly {
         &mut self.fragment_rx
+    }
+}
+
+/// APS security of a received data frame (`host-passthrough`).
+#[cfg(feature = "host-passthrough")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApsRxSecurity {
+    /// The frame was APS-secured (decrypted with a link key), independently
+    /// of NWK security.
+    pub aps_secured: bool,
+    /// The link key that secured it.
+    pub key_source: ApsRxKeySource,
+}
+
+/// Link key of an APS-secured data frame (ZRHP `key_source`).
+#[cfg(feature = "host-passthrough")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ApsRxKeySource {
+    /// Not APS-secured.
+    #[default]
+    None = 0,
+    /// A preconfigured global link key (the well-known Trust Center link
+    /// key or the distributed-security global key).
+    GlobalTrustCenter = 1,
+    /// A unique (key-pair entry) Trust Center link key.
+    UniqueTrustCenter = 2,
+    /// An application link key.
+    Application = 3,
+}
+
+#[cfg(feature = "host-passthrough")]
+impl ApsRxKeySource {
+    /// Classify the key that verified a frame.
+    pub fn from_origin(origin: Option<security::ApsKeyOrigin>, used_default_key: bool) -> Self {
+        match origin {
+            None => Self::None,
+            Some(_) if used_default_key => Self::GlobalTrustCenter,
+            Some(
+                security::ApsKeyOrigin::PreconfiguredGlobal
+                | security::ApsKeyOrigin::DistributedGlobal,
+            ) => Self::GlobalTrustCenter,
+            Some(security::ApsKeyOrigin::KeyPair {
+                key_type: security::ApsKeyType::ApplicationLinkKey,
+                ..
+            }) => Self::Application,
+            Some(security::ApsKeyOrigin::KeyPair { .. }) => Self::UniqueTrustCenter,
+        }
+    }
+}
+
+/// Per-layer `host-passthrough` receive metadata; zero-sized without it.
+#[derive(Clone, Copy)]
+struct HostRxSecurity {
+    #[cfg(feature = "host-passthrough")]
+    last: ApsRxSecurity,
+}
+
+impl HostRxSecurity {
+    const fn new() -> Self {
+        Self {
+            #[cfg(feature = "host-passthrough")]
+            last: ApsRxSecurity {
+                aps_secured: false,
+                key_source: ApsRxKeySource::None,
+            },
+        }
+    }
+}
+
+/// Record the APS security of the data frame being delivered upward
+/// (`host-passthrough`); without the feature no code is generated.
+#[cfg(feature = "host-passthrough")]
+macro_rules! host_rx_security {
+    ($aps:ident, $origin:expr, $used_default:expr) => {
+        $aps.host_rx.last = crate::ApsRxSecurity {
+            aps_secured: $origin.is_some(),
+            key_source: crate::ApsRxKeySource::from_origin($origin, $used_default),
+        }
+    };
+}
+#[cfg(not(feature = "host-passthrough"))]
+macro_rules! host_rx_security {
+    ($aps:ident, $origin:expr, $used_default:expr) => {};
+}
+pub(crate) use host_rx_security;
+
+/// Network co-processor surface (`host-passthrough`).
+#[cfg(feature = "host-passthrough")]
+impl<M: MacDriver> ApsLayer<M> {
+    /// APS security of the last data frame this layer delivered upward.
+    /// Read it while handling that frame's indication.
+    pub fn last_rx_security(&self) -> ApsRxSecurity {
+        self.host_rx.last
+    }
+
+    /// Handle of the acknowledged unicast registered by the last
+    /// [`Self::apsde_data_request`] with `ack_request`, while it is tracked.
+    ///
+    /// Poll it with [`Self::ack_status`]: `Confirmed` once the APS ACK
+    /// arrived, `Pending` while retries remain, and `None` once the
+    /// transaction ended without an ACK (retries exhausted, tracking evicted
+    /// by a newer transaction, or cancelled). Release a confirmed handle with
+    /// [`Self::clear_ack_status`].
+    pub fn last_ack_handle(&self) -> Option<ApsAckHandle> {
+        let generation = match self.next_ack_generation {
+            1 => u16::MAX,
+            next => next.wrapping_sub(1),
+        };
+        self.ack_table.iter().find_map(|entry| {
+            (entry.active && entry.generation == generation).then_some(ApsAckHandle::new(
+                entry.dst_addr,
+                entry.aps_counter,
+                generation,
+            ))
+        })
     }
 }

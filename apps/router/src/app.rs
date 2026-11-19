@@ -2856,6 +2856,46 @@ where
         })
     }
 
+    /// [`Self::new_observed_with_aps_tables`] directly into caller-provided
+    /// (normally static) storage. The Trust Center runtime (about 40 KiB
+    /// with `ncp-capacity`) is initialized in place instead of being built
+    /// on the stack and moved; only the coordinator frontend is moved.
+    /// On an error `dst` stays uninitialized.
+    pub fn new_observed_with_aps_tables_into<'s>(
+        dst: &'s mut core::mem::MaybeUninit<Self>,
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        aps_tables: A,
+        trust_center_store: T,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<&'s mut Self, RouterAppError> {
+        // Every field is written below; a new field must be added there.
+        let _exhaustive = |app: &Self| {
+            let Self {
+                coordinator: _,
+                trust_center: _,
+                pending_local_child_departure_completion: _,
+            } = app;
+        };
+        let coordinator = CoordinatorApp::new_observed_with_aps_tables(
+            node, children, aps_tables, policy, parts,
+        )?;
+        let slot = dst.as_mut_ptr();
+        // SAFETY: `slot` is valid, aligned, uninitialized storage for `Self`
+        // and every field is written exactly once before the reference is
+        // created.
+        unsafe {
+            core::ptr::addr_of_mut!((*slot).coordinator).write(coordinator);
+            TrustCenterRuntime::write_into(
+                core::ptr::addr_of_mut!((*slot).trust_center),
+                trust_center_store,
+            );
+            core::ptr::addr_of_mut!((*slot).pending_local_child_departure_completion).write(None);
+            Ok(&mut *slot)
+        }
+    }
+
     pub const fn coordinator(&self) -> &CoordinatorApp<'a, M, S, P, C, St, Sv, D, O, A> {
         &self.coordinator
     }
@@ -3330,6 +3370,28 @@ where
             parts,
         )
     }
+
+    /// [`Self::new_with_aps_tables`] directly into caller-provided storage
+    /// (see [`Self::new_observed_with_aps_tables_into`]).
+    pub fn new_with_aps_tables_into<'s>(
+        dst: &'s mut core::mem::MaybeUninit<Self>,
+        node: RouterNode<'a, M, S, P, Router>,
+        children: PersistentChildren<C>,
+        aps_tables: A,
+        trust_center_store: T,
+        policy: &'static RouterPolicy,
+        parts: RouterParts<St, Sv, D>,
+    ) -> Result<&'s mut Self, RouterAppError> {
+        Self::new_observed_with_aps_tables_into(
+            dst,
+            node,
+            children,
+            aps_tables,
+            trust_center_store,
+            policy,
+            parts,
+        )
+    }
 }
 
 #[cfg(feature = "router")]
@@ -3752,5 +3814,51 @@ where
         parts: RouterParts<St, Sv, D>,
     ) -> Result<Self, RouterAppError> {
         Self::new_observed_with_aps_tables(node, children, aps_tables, policy, parts)
+    }
+}
+
+// Declared last: inserting code above shifts the panic-location line numbers
+// of every image built from this crate.
+#[cfg(feature = "trust-center")]
+impl<'a, M, S, P, C, T, St, Sv, D, O, A>
+    TrustCenterCoordinatorApp<'a, M, S, P, C, T, St, Sv, D, O, A>
+where
+    M: ParentMacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+    C: ChildTableStore,
+    T: TrustCenterDeviceStore,
+    St: StatusSink,
+    Sv: Supervisor,
+    D: Diagnostics,
+    O: RouterObserver<M, Router>,
+    A: ApsTableLifecycle<M, S, P, Router>,
+{
+    /// The Trust Center runtime and the coordinator device at once (for
+    /// runtime calls that take the device, such as counter floors).
+    pub fn trust_center_and_device_mut(
+        &mut self,
+    ) -> (
+        &mut TrustCenterRuntime<T>,
+        &mut zigbee_runtime::ZigbeeDevice<M, Router>,
+    ) {
+        (
+            &mut self.trust_center,
+            self.coordinator.node_mut().device_mut(),
+        )
+    }
+
+    /// Allow [`Self::initialize`] again after a completed wipe
+    /// ([`Self::urgent_factory_reset_and_recommission`]) without a reboot,
+    /// so a network co-processor can form or install the next network in
+    /// the same session. Refused (`false`) while joined or while a reset is
+    /// still pending.
+    pub fn rearm_initialize(&mut self) -> bool {
+        let core = &mut self.coordinator.core;
+        if core.node.device().is_joined() || core.pending_factory_reset {
+            return false;
+        }
+        core.initialized = false;
+        true
     }
 }

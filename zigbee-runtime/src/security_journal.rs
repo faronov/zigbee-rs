@@ -133,8 +133,8 @@ pub const SECURITY_JOURNAL_MIN_SECTOR_SIZE: usize =
     (SECURITY_JOURNAL_MAX_REPLAY_SNAPSHOT_SLOTS + 1) * SECURITY_JOURNAL_SLOT_SIZE;
 const _: () = assert!(SECURITY_JOURNAL_REPLAY_ENTRIES_PER_SLOT == 4);
 const _: () = assert!(
-    MAX_PERSISTENT_REPLAY_COUNTERS
-        <= (SECURITY_JOURNAL_SLOTS_PER_SECTOR - 1) * SECURITY_JOURNAL_REPLAY_ENTRIES_PER_SLOT
+    NCP_CAPACITY_NEEDS_LARGER_SECTORS
+        || MAX_PERSISTENT_REPLAY_COUNTERS <= DEFAULT_SECTOR_REPLAY_CAPACITY
 );
 
 // The encoded state starts at byte 12 and must stay clear of the CRC field.
@@ -1150,6 +1150,24 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// Replay domains a full snapshot of the default 4 KiB sector can hold.
+const DEFAULT_SECTOR_REPLAY_CAPACITY: usize =
+    (SECURITY_JOURNAL_SLOTS_PER_SECTOR - 1) * SECURITY_JOURNAL_REPLAY_ENTRIES_PER_SLOT;
+
+/// The coordinator NCP (`ncp-capacity`: 256 APS keys, 128 NWK floors) has
+/// more replay domains than a default 4 KiB sector holds, so it must select
+/// larger logical sectors; [`SecurityStateJournal::NCP_SECTOR_FITS`] is the
+/// product's compile-time check. A snapshot that does not fit a sector is
+/// still refused at run time (`SecurityStoreError::Full`), never truncated.
+const NCP_CAPACITY_NEEDS_LARGER_SECTORS: bool = cfg!(feature = "ncp-capacity");
+
+#[cfg(feature = "ncp-capacity")]
+impl<S, const SECTOR_SIZE: usize> SecurityStateJournal<S, SECTOR_SIZE> {
+    /// `true` when a rollover snapshot of every replay domain plus the state
+    /// record fits one logical sector with room left for appends.
+    pub const NCP_SECTOR_FITS: bool = Self::FULL_TABLE_APPEND_CAPACITY > 0;
 }
 
 #[cfg(test)]

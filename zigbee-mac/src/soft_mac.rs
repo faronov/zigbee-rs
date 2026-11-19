@@ -1378,7 +1378,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             return None;
         }
 
-        Some(McpsDataIndication {
+        crate::rx_indication! {frame, McpsDataIndication {
             src_address: source,
             dst_address: destination,
             lqi: frame.lqi,
@@ -1389,7 +1389,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
             #[cfg(feature = "timed-tx")]
             payload: timed_payload(&data[payload_offset..], data[2], frame.rx_end_us)?,
             security_use,
-        })
+        }}
     }
 
     /// The next queued data indication; non-data frames are discarded.
@@ -1606,7 +1606,7 @@ macro_rules! soft_mac_driver_common {
         fn capabilities(&self) -> MacCapabilities {
             let phy = self.phy.capabilities();
             MacCapabilities {
-                coordinator: false,
+                coordinator: cfg!(feature = "pan-coordinator") && <Self as RoleOf>::Role::PARENT,
                 router: <Self as RoleOf>::Role::PARENT,
                 hardware_security: false,
                 max_payload: 102,
@@ -2299,6 +2299,33 @@ mod tests {
 
         frame.set(&gpdf, 150).unwrap();
         assert_eq!(frame.rx_end_us, 0);
+    }
+
+    /// `rx-rssi`: the PHY's RSSI reaches the data indication; a frame whose
+    /// PHY does not measure it reports `RSSI_UNKNOWN_DBM`.
+    #[test]
+    #[cfg(feature = "rx-rssi")]
+    fn received_frame_rssi_reaches_the_indication() {
+        let mut core = core();
+        core.set_pib(PibAttribute::MacPanId, PibValue::PanId(PanId(0x1234)))
+            .unwrap();
+        let gpdf = [
+            0x01, 0x08, 0xA7, 0xFF, 0xFF, 0xFF, 0xFF, // MAC header, seq 0xA7
+            0x8C, 0x10, 0x32, 0x54, 0x76, 0x98, 0x20, // NWK FC v3, SrcID, Off
+        ];
+        let unmeasured = PhyRxFrame::from_slice(&gpdf, 150).unwrap();
+        assert_eq!(unmeasured.rssi_dbm, crate::RSSI_UNKNOWN_DBM);
+        let mut measured = unmeasured;
+        measured.rssi_dbm = -57;
+        let rx = &mut core.phy_mut().rx_frames;
+        rx.push_back(Ok(Some(measured))).unwrap();
+        rx.push_back(Ok(Some(unmeasured))).unwrap();
+
+        let indication = block_on(core.receive_data(5_000)).unwrap();
+        assert_eq!(indication.payload.rssi_dbm(), -57);
+        let indication = block_on(core.receive_data(5_000)).unwrap();
+        assert_eq!(indication.payload.rssi_dbm(), -128);
+        assert_eq!(MacFrame::new().rssi_dbm(), -128);
     }
 
     /// `timed-tx` on a PHY without it: not advertised, and a timed
@@ -3500,7 +3527,14 @@ mod tests {
         let mut core = ParentCore::new_custom(TestPhy::new(), MacPib::new(IEEE, 1, 2)).unwrap();
         let mut coordinator = router_start(20);
         coordinator.pan_coordinator = true;
-        assert_eq!(core.start(coordinator), Err(MacError::Unsupported));
+        // A PAN-coordinator start needs the `pan-coordinator` feature and
+        // short address 0x0000; this core is a router (0x0001 below).
+        let expected = if cfg!(feature = "pan-coordinator") {
+            MacError::InvalidParameter
+        } else {
+            MacError::Unsupported
+        };
+        assert_eq!(core.start(coordinator), Err(expected));
         assert_eq!(core.phy().channel, 11);
 
         block_on(MacDriver::mlme_start(&mut core, router_start(20))).unwrap();
@@ -3513,6 +3547,23 @@ mod tests {
         );
         assert_eq!(core.phy().rx_on_when_idle, Some(true));
         assert!(MacDriver::capabilities(&core).router);
+    }
+
+    #[cfg(feature = "pan-coordinator")]
+    #[test]
+    fn pan_coordinator_start_with_short_address_zero() {
+        let mut core = ParentCore::new_custom(TestPhy::new(), MacPib::new(IEEE, 1, 2)).unwrap();
+        core.set_pib(
+            PibAttribute::MacShortAddress,
+            PibValue::ShortAddress(ShortAddress(0x0000)),
+        )
+        .unwrap();
+        let mut coordinator = router_start(25);
+        coordinator.pan_coordinator = true;
+        block_on(MacDriver::mlme_start(&mut core, coordinator)).unwrap();
+        assert_eq!(core.phy().channel, 25);
+        assert_eq!(core.pib().pan_id(), PAN);
+        assert!(MacDriver::capabilities(&core).coordinator);
     }
 
     #[test]

@@ -620,6 +620,7 @@ fn child_leave_frame_to(
     )
 }
 
+#[cfg(not(feature = "global-aps-counter"))]
 fn child_leave_frame(child_short: u16, child_ieee: [u8; 8], counter: u32) -> MacFrame {
     child_leave_frame_to(
         child_short,
@@ -629,6 +630,7 @@ fn child_leave_frame(child_short: u16, child_ieee: [u8; 8], counter: u32) -> Mac
     )
 }
 
+#[cfg(not(feature = "global-aps-counter"))]
 fn remove_children_frame(rejoin: bool, counter: u32) -> MacFrame {
     let command = [
         NwkCommandId::Leave as u8,
@@ -1158,6 +1160,9 @@ fn binding_responses(mac: &MockMac, unbind: bool) -> Vec<Vec<u8>> {
         .collect()
 }
 
+// A ParentRouterApp has no Trust Center runtime to install the global APS
+// reservation: with `global-aps-counter` its APS-secured sends are refused.
+#[cfg(not(feature = "global-aps-counter"))]
 #[test]
 fn bind_store_failure_holds_response_ack_and_replay_across_reboot() {
     for aps_secured in [false, true] {
@@ -1165,6 +1170,7 @@ fn bind_store_failure_holds_response_ack_and_replay_across_reboot() {
     }
 }
 
+#[cfg(not(feature = "global-aps-counter"))]
 fn assert_bind_store_failure_recovers_after_reboot(aps_secured: bool) {
     let mut p = profile();
     let mut device = parent_device(&mut p);
@@ -1329,6 +1335,9 @@ fn binding_store(present: bool) -> RamApsTableStore {
     store
 }
 
+// A ParentRouterApp has no Trust Center runtime to install the global APS
+// reservation: with `global-aps-counter` its APS-secured sends are refused.
+#[cfg(not(feature = "global-aps-counter"))]
 #[test]
 fn secured_bind_and_unbind_retry_each_durable_boundary_without_reapplying() {
     use zigbee_runtime::binding_persistence::BindingPersistenceError;
@@ -1630,8 +1639,17 @@ impl FaultTrustCenterStore {
 
 #[cfg(feature = "trust-center")]
 impl TrustCenterDeviceStore for FaultTrustCenterStore {
-    fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
-        Ok(self.state.borrow().state.clone())
+    fn load_into(
+        &mut self,
+        state: &mut PersistentTrustCenterState,
+    ) -> Result<bool, TrustCenterStoreError> {
+        match &self.state.borrow().state {
+            Some(stored) => {
+                state.copy_from(stored);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     fn store(&mut self, state: &PersistentTrustCenterState) -> Result<(), TrustCenterStoreError> {
@@ -3132,6 +3150,9 @@ fn remove_device_cancels_a_sleepy_child_reassignment_response() {
     );
 }
 
+// A ParentRouterApp has no Trust Center runtime to install the global APS
+// reservation: with `global-aps-counter` its APS-secured sends are refused.
+#[cfg(not(feature = "global-aps-counter"))]
 #[test]
 fn child_departure_store_failure_reboots_without_device_left_notification() {
     const CHILD_IEEE: [u8; 8] = [0x65; 8];
@@ -3240,6 +3261,9 @@ fn child_departure_store_failure_reboots_without_device_left_notification() {
 
 /// The departure intent is durable before Update-Device(device left) is
 /// submitted; the child's NWK floor is RAM-only and needs no journal write.
+// A ParentRouterApp has no Trust Center runtime to install the global APS
+// reservation: with `global-aps-counter` its APS-secured sends are refused.
+#[cfg(not(feature = "global-aps-counter"))]
 #[test]
 fn child_departure_releases_device_left_without_a_nwk_replay_write() {
     const CHILD_IEEE: [u8; 8] = [0x66; 8];
@@ -3310,6 +3334,9 @@ fn child_departure_releases_device_left_without_a_nwk_replay_write() {
     );
 }
 
+// A ParentRouterApp has no Trust Center runtime to install the global APS
+// reservation: with `global-aps-counter` its APS-secured sends are refused.
+#[cfg(not(feature = "global-aps-counter"))]
 #[test]
 fn remove_children_cascade_store_failure_reboots_before_child_or_parent_action() {
     const CHILD_IEEE: [u8; 8] = [0x67; 8];
@@ -3427,6 +3454,9 @@ fn remove_children_cascade_store_failure_reboots_before_child_or_parent_action()
 
 /// The leave-cascade intent is durable before the children and the parent
 /// act; the parent's NWK floor is RAM-only and needs no journal write.
+// A ParentRouterApp has no Trust Center runtime to install the global APS
+// reservation: with `global-aps-counter` its APS-secured sends are refused.
+#[cfg(not(feature = "global-aps-counter"))]
 #[test]
 fn remove_children_cascade_acts_after_durable_intent_without_a_nwk_replay_write() {
     const CHILD_IEEE: [u8; 8] = [0x68; 8];
@@ -3499,6 +3529,9 @@ fn remove_children_cascade_acts_after_durable_intent_without_a_nwk_replay_write(
     assert_eq!(nwk_replay_count(&mut security), 0);
 }
 
+// A ParentRouterApp has no Trust Center runtime to install the global APS
+// reservation: with `global-aps-counter` its APS-secured sends are refused.
+#[cfg(not(feature = "global-aps-counter"))]
 #[test]
 fn remove_children_cascade_waits_for_two_sleepy_children_and_device_left_submissions() {
     const CHILD1_IEEE: [u8; 8] = [0x69; 8];
@@ -4620,6 +4653,51 @@ fn coordinator_frontend_forms_then_restarts_the_same_persisted_pan() {
 
 #[cfg(feature = "trust-center")]
 #[test]
+fn trust_center_coordinator_constructed_in_place_initializes_and_persists() {
+    let mut security = RamSecurityStateStore::new();
+    let mut profile = profile();
+    let mut device = coordinator_device(&mut profile);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    // Poison: every field must be written by the in-place constructor.
+    fn poisoned<T>(slot: &mut core::mem::MaybeUninit<T>) -> &mut core::mem::MaybeUninit<T> {
+        unsafe { slot.as_mut_ptr().write_bytes(0xA5, 1) };
+        slot
+    }
+    let mut storage = Box::new(core::mem::MaybeUninit::uninit());
+    let app = TrustCenterCoordinatorApp::new_with_aps_tables_into(
+        poisoned(&mut storage),
+        node,
+        PersistentChildren::new(CountingChildStore::default()),
+        router_app::NoApsTables,
+        RamTrustCenterDeviceStore::new(),
+        &POLICY,
+        RouterParts::new(NoStatus, TestSupervisor::default(), NoDiagnostics),
+    )
+    .unwrap();
+    #[cfg(feature = "green-power")]
+    app.set_green_power_store(leaked_gp_store());
+    assert!(!app.trust_center().is_initialized());
+
+    block_on(app.initialize()).unwrap();
+    assert!(app.node().device().is_joined());
+    assert!(app.trust_center().is_initialized());
+    let epid = app.node().device().bdb().zdo().nwk().nib().extended_pan_id;
+    assert!(
+        app.trust_center_mut()
+            .store_mut()
+            .load()
+            .unwrap()
+            .unwrap()
+            .matches_network(&epid)
+    );
+    block_on(app.step()).unwrap();
+    assert!(app.trust_center().is_initialized());
+    // The app owns stores and borrows the device: drop it in place.
+    unsafe { storage.assume_init_drop() };
+}
+
+#[cfg(feature = "trust-center")]
+#[test]
 fn trust_center_factory_reset_is_cross_journal_crash_safe() {
     let mut security = RamSecurityStateStore::new();
     let mut trust_center_store = RamTrustCenterDeviceStore::new();
@@ -4736,11 +4814,14 @@ fn trust_center_replay_floor_is_reapplied_after_restoring_device_keys() {
         armed: bool,
     }
     impl TrustCenterDeviceStore for ArmReplayFailure {
-        fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
+        fn load_into(
+            &mut self,
+            state: &mut PersistentTrustCenterState,
+        ) -> Result<bool, TrustCenterStoreError> {
             if self.armed {
                 self.fail.set(true);
             }
-            self.inner.load()
+            self.inner.load_into(state)
         }
         fn store(
             &mut self,
@@ -6036,8 +6117,11 @@ mod key_power_cuts {
     }
 
     impl<S: TrustCenterDeviceStore> TrustCenterDeviceStore for CutStore<S> {
-        fn load(&mut self) -> Result<Option<PersistentTrustCenterState>, TrustCenterStoreError> {
-            self.inner.load()
+        fn load_into(
+            &mut self,
+            state: &mut PersistentTrustCenterState,
+        ) -> Result<bool, TrustCenterStoreError> {
+            self.inner.load_into(state)
         }
 
         fn store(

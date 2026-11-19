@@ -3,10 +3,14 @@
 > **Status: design specification. The user's decisions of 2026-11-18 are
 > applied (section 16).** The shared crate `zigbee-zrhp` (step 1 of section
 > 15) implements the framing, the link layer and every message and record
-> codec, and passes all vectors; it is host-tested only. The zigbee-rs
-> coordinator and Trust Center are host-tested only (see
-> [Coordinator & Router](coordinator-router.md)), and no backend advertises a
-> hardware coordinator. The NCP application, zigpy library, Go adapter,
+> codec, and passes all vectors; it is host-tested only. A first NCP
+> (`apps/ncp-coordinator`, `products/esp32-zigbee-ncp`, `examples/esp32-ncp`)
+> implements the SYSTEM, DIAG, NWK, DATA, SEC and LOG subset listed in
+> [`apps/ncp-coordinator/README.md`](https://github.com/faronov/zigbee-rs/blob/zrhp-ncp/apps/ncp-coordinator/README.md);
+> on an ESP32-C6 DevKit (lab variant, USB-Serial-JTAG) it completed the
+> session, formed a network (soft MAC `pan-coordinator` + `energy-detect`)
+> and resumed it after a reset. No device has joined it yet and none of the
+> hardware gates H1–H12 has passed. The zigpy library, Go adapter,
 > zigbee-herdsman adapter and embedded hub described here do not exist yet.
 > Byte layouts are normative for v1. The golden vectors in
 > [`host-protocol-vectors/`](host-protocol-vectors/generate.py) are generated
@@ -1099,7 +1103,7 @@ fields after it are shown as "→ …". Events list their full payload.
 | `0x0005` | `SYS_SET_CONFIG` | `u8 n, n×{u16 id, u8 len, value[]}` | `u8 n, n×{u16 id, u8 status}` | N |
 | `0x0006` | `SYS_GET_CONFIG` | `u8 n, n×u16 id` | `u8 n, n×{u16 id, u8 status, u8 len, value[]}` | N |
 | `0x0007` | `SYS_ECHO` | `data[]` (≤ 64) | `data[]` | N |
-| `0x0008` | `SYS_SET_IEEE` | `[8] ieee` (all `FF` = revert to factory) | — | P (MAC PIB `MacExtendedAddress` is settable; persistence and boot application are N) |
+| `0x0008` | `SYS_SET_IEEE` | `[8] ieee` (all `FF` = revert to factory) | — | E (`products/esp32-zigbee-ncp` identity item applied at boot; the NCP also sets the MAC PIB and NIB at once while no network runs) |
 | `0x0009` | `SYS_SET_UART` | `u32 baud, u8 flow (0 none, 1 RTS/CTS), u16 apply_delay_ms` | — (sent at the old rate; see the rule below) | N |
 | `0x0080` | `EVT_NCP_READY` | `u32 ncp_cookie, u8 reset_reason, u8 network_state (0 none, 1 formed-down, 2 up), u32 table_epoch, u32 nwk_fc_limit, u32 aps_fc_limit, u16 dirty_writebacks, u32 dropped_indications` | event | N |
 | `0x0081` | `EVT_INDICATIONS_DROPPED` | `u8 endpoint, u8 reason (1 host absent, 2 no credit, 3 queue full), u32 count, u32 first_ms, u32 last_ms` | event | N |
@@ -1147,8 +1151,8 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
 | `0x0101` | `NWK_INIT` | `u32 nwk_fc_floor, u32 aps_fc_floor` (host checkpoint floors, 0 = none) | `u8 network_state`; `NOT_FORMED` if NV has no network. Completes with `EVT_NETWORK_STATE`. | E (`CoordinatorApp`/`TrustCenterCoordinatorApp::initialize` persisted path) + N (floors) |
-| `0x0102` | `NWK_FORM` | `u32 channel_mask, u16 pan_id (FFFF = random), [8] ext_pan_id (0 = random), [16] network_key (0 = random), u8 key_seq, u8 nwk_update_id, i8 tx_power, u16 nwk_manager` | accepted; `EVT_NETWORK_STATE` follows | E (BDB formation) + P (host-supplied parameters) |
-| `0x0103` | `NWK_LEAVE_RESET` | `u8 flags (bit0 keep IEEE override, bit1 keep host-endpoint registrations)` | — | P (store clears exist; ordered wipe API is N) |
+| `0x0102` | `NWK_FORM` | `u32 channel_mask, u16 pan_id (FFFF = random), [8] ext_pan_id (0 = random), [16] network_key (0 = random), u8 key_seq, u8 nwk_update_id, i8 tx_power, u16 nwk_manager` | accepted; `EVT_NETWORK_STATE` follows | E (BDB formation; host-supplied parameters install the network directly on the quietest channel of the mask) |
+| `0x0103` | `NWK_LEAVE_RESET` | `u8 flags (bit0 keep IEEE override, bit1 keep host-endpoint registrations)` | — | E (`urgent_factory_reset_and_recommission`; a new network can follow in the same session) |
 | `0x0104` | `NWK_GET_INFO` | — | `u8 state, u16 pan_id, [8] ext_pan_id, u8 channel, u32 channel_mask, u16 short, [8] ieee, u8 nwk_update_id, u16 nwk_manager, u8 key_seq, u8 security_level, i8 tx_power, u8 stack_profile` | P |
 | `0x0105` | `NWK_PERMIT_JOIN` | `u8 duration_s, u16 target (0xFFFC all routers + NCP, 0x0000 NCP only, else a router), u8 flags (bit0 TC significance)` | — | E (`nlme_permit_joining`, `mgmt_permit_joining_req`) |
 | `0x0106` | `NWK_ENERGY_SCAN` | `u32 channel_mask, u8 duration_exp, u8 count` | accepted; `EVT_ENERGY_SCAN_RESULT` follows | P (`nlme_ed_scan` exists; running it on an active coordinator must pause TX/RX and is N) |
@@ -1156,14 +1160,14 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | `0x0108` | `NWK_SET_TX_POWER` | `i8 dbm` | `i8 applied_dbm` | E (MAC PIB `PhyTransmitPower`) |
 | `0x0109` | `NWK_CONCENTRATOR` | `u8 mode (0 off, 1 low-RAM, 2 high-RAM), u16 min_s, u16 max_s, u8 radius` | — | P (NWK concentrator state exists) |
 | `0x010A` | `NWK_ACTIVE_SCAN` | `u32 channel_mask, u8 duration_exp` | `u8 n, n×{u8 channel, u16 pan, [8] epid, u16 src, u8 lqi, i8 rssi, u8 permit, u8 stack_profile, u8 update_id}` | P (`nlme_network_discovery`) |
-| `0x010B` | `NWK_ADD_ENDPOINT` | `u8 ep, u16 profile, u16 device_id, u8 version, u8 n_in, n_in×u16, u8 n_out, n_out×u16` | — (`NO_SPACE` beyond `max_host_endpoints`) | N (dynamic host-endpoint simple descriptors) |
+| `0x010B` | `NWK_ADD_ENDPOINT` | `u8 ep, u16 profile, u16 device_id, u8 version, u8 n_in, n_in×u16, u8 n_out, n_out×u16` | — (`NO_SPACE` beyond `max_host_endpoints`; `INVALID_PARAMETER` for `ep` outside 1..=240 or more than 16 clusters in a list) | E (`ZigbeeDevice::register_host_endpoint`: the ZDO registry the server answers from; `max_host_endpoints` = 8; registering an endpoint again replaces it, including the product profile's endpoint with that number; registrations are RAM only and cleared by `NWK_LEAVE_RESET` without flags bit1) |
 | `0x010C` | `NWK_SET_MANUFACTURER_CODE` | `u16 code` | — | P (node descriptor field) |
 | `0x010D` | `NWK_GROUP_MEMBERSHIP` | `u8 op (1 add, 2 remove, 3 clear), u16 group, u8 ep` | — | E (APS group table, 16 groups × 8 endpoints) |
 | `0x010E` | `NWK_REMOVE_DEVICE` | `u16 nwk, [8] ieee, u8 flags (bit0 rejoin, bit1 remove children, bit2 TC remove via parent)` | — | E (TC Remove-Device/leave journal) + P |
 | `0x0180` | `EVT_NETWORK_STATE` | `u8 state (0 down, 1 forming, 2 up, 3 leaving), u8 reason, u8 zb_status, u16 req_tid` | event | N |
-| `0x0181` | `EVT_DEVICE_JOINED` | `u16 nwk, [8] ieee, u16 parent_nwk, u8 join_type (0 association, 1 secured rejoin, 2 unsecured/TC rejoin, 3 direct), u8 capability, u8 decision (0 admitted, 1 denied)` | event | P (TC `handle_update_device` and association exist; the event surface is N) |
-| `0x0182` | `EVT_DEVICE_AUTHORIZED` | `u16 nwk, [8] ieee, u8 result (0 key delivered, 1 TCLK verified, 2 failed), u8 link_key_type` | event | P |
-| `0x0183` | `EVT_DEVICE_LEFT` | `u16 nwk, [8] ieee, u8 flags (bit0 rejoin, bit1 removed by TC, bit2 reported by parent), u8 reason` | event | P |
+| `0x0181` | `EVT_DEVICE_JOINED` | `u16 nwk, [8] ieee, u16 parent_nwk, u8 join_type (0 association, 1 secured rejoin, 2 unsecured/TC rejoin, 3 direct), u8 capability, u8 decision (0 admitted, 1 denied)` | event | E (`TrustCenterHostEvent::Joined`: one event per Trust Center Update-Device join decision, through any parent including the NCP itself; `capability` is reconstructed from the neighbour entry for a child of the NCP and 0 for a device that joined through another parent; `parent_nwk` `0xFFFF` when unknown. `Device_annce` is forwarded as an indication, not as this event) |
+| `0x0182` | `EVT_DEVICE_AUTHORIZED` | `u16 nwk, [8] ieee, u8 result (0 key delivered, 1 TCLK verified, 2 failed), u8 link_key_type` | event | E (`TrustCenterHostEvent::Authorized`: result 0 when the device first uses the network key (its Request-Key) while no TCLK exchange already closed it, 1/2 at the Verify-Key decision; `link_key_type` 0 global default TCLK, 1 unique TCLK) |
+| `0x0183` | `EVT_DEVICE_LEFT` | `u16 nwk, [8] ieee, u8 flags (bit0 rejoin, bit1 removed by TC, bit2 reported by parent), u8 reason (0 unknown, 1 NWK Leave heard by the NCP, 2 parent's Update-Device "device left", 3 Trust Center removal, 4 child of the NCP aged out)` | event | E (NWK Leave indications of neighbours with the rejoin bit and aged-out children: `NwkLayer::take_host_departure`; parent reports and removals: `TrustCenterHostEvent`; `ieee` all zero when unknown. A child of the NCP is reported once, from its Leave) |
 | `0x0184` | `EVT_ADDRESS_CHANGED` | `[8] ieee, u16 old_nwk, u16 new_nwk, u8 cause (0 announce, 1 conflict)` | event | P |
 | `0x0185` | `EVT_ROUTE_RECORD` | `u16 src_nwk, [8] src_ieee (0 if unknown), u8 n, n×u16 relays` (Route Record order: entry 0 is nearest the originator) | event | P (route-record receive exists) |
 | `0x0186` | `EVT_NWK_STATUS` | `u16 dst, u8 nwk_status, u16 reporter` | event | P |
@@ -1207,6 +1211,14 @@ u8 aps_counter, u16 dst_nwk, u8 flags (bit0 APS ACK received, bit1 via source
 route, bit2 route discovery done), u16 elapsed_ms`. `status` is `SUCCESS` or
 `FAILURE`. `zb_status` carries the Zigbee reason.
 
+For a unicast with `tx_options` bit0 the confirm waits for the APS ACK: it
+follows once the ACK arrives (`SUCCESS`, flags bit0) or once the APS retries
+are exhausted, the ACK tracking was evicted by newer acknowledged sends, or
+the network was reset (`FAILURE`, `zb_status` `0xA7` NO_ACK). The NCP keeps
+running the stack meanwhile (`ApsLayer::last_ack_handle` + `ack_status`).
+`elapsed_ms` then counts from the transmission. Group and broadcast frames,
+and frames without bit0, are confirmed after the MAC/NWK transmission.
+
 `EVT_APS_DATA_INDICATION` (`0x0280`):
 
 | Offset | Size | Field |
@@ -1229,10 +1241,11 @@ route, bit2 route discovery done), u16 elapsed_ms`. `status` is `SUCCESS` or
 | 30 | 2 | `asdu_len` |
 | 32 | n | `asdu` |
 
-Map: **E** for most fields (`ApsdeDataIndication`). **N** for `rssi`,
-`last_hop_nwk`, the IEEE lookup and the host-endpoint passthrough:
-indications for host endpoints currently go to the compile-time ZCL
-dispatcher, and a raw passthrough sink is new runtime work.
+Map: **E** (runtime `host-passthrough`). `rssi` is the received signal
+strength of the last hop as measured by the radio (`zigbee-mac` `rx-rssi`:
+the ESP32-H2/C6/C5 PHY; `-128` on backends that do not measure it). Flags
+bit0 and `key_source` come from the APS layer's verification of the frame
+(`ApsLayer::last_rx_security`), independently of bit1.
 
 ### 7.4 ZDO (`0x03xx`, endpoint 2)
 
@@ -1337,7 +1350,7 @@ Section 9 defines these commands.
 
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
-| `0x0701` | `DIAG_GET_COUNTERS` | `u8 group_mask` (bit0 link, bit1 MAC, bit2 NWK, bit3 APS, bit4 security, bit5 tables, bit6 queues) | `u8 n, n×{u16 id, u32 value}` | P (several counters exist, e.g. `replay_table_full`, `frame_pending_acks`; a registry is N) |
+| `0x0701` | `DIAG_GET_COUNTERS` | `u8 group_mask` (bit0 link, bit1 MAC, bit2 NWK, bit3 APS, bit4 security, bit5 tables, bit6 queues, bit7 Green Power) | `u8 n, n×{u16 id, u32 value}` | P (several counters exist, e.g. `replay_table_full`, `frame_pending_acks`; a registry is N) |
 | `0x0702` | `DIAG_RESET_COUNTERS` | `u8 group_mask` | — | N |
 | `0x0703` | `DIAG_GET_NEIGHBORS` | `u8 start` | `u8 total, u8 n, n×{[8] ieee, u16 nwk, u8 type, u8 rx_on, u8 relationship, u8 lqi, u8 outgoing_cost, u8 age}` | P |
 | `0x0704` | `DIAG_GET_ROUTES` | `u8 start` | `u8 total, u8 n, n×{u16 dst, u16 next_hop, u8 status, u8 flags}` | P |
@@ -1359,6 +1372,7 @@ Counter ID groups:
   writebacks, evictions, conflicts).
 - `0x07xx`: queues (APS queue high-water, `BUSY` responses, host-absent
   drops, indirect queue full).
+- `0x08xx` (group bit 7): Green Power (7.11).
 
 ### 7.9 FIRMWARE (`0x08xx`, endpoint 4)
 
@@ -1366,13 +1380,13 @@ These commands update the NCP's own firmware.
 
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
-| `0x0801` | `FW_BEGIN` | `u32 image_size, u8 format (1 ESP app image + MCUboot TLVs, 2 MCUboot), [32] sha256, u32 version, u8 flags (bit0 allow downgrade, dev builds only)` | `u16 max_chunk, u8 slot` | P (`esp32-zigbee-devkit` signed OTA, otadata, `FirmwareWriter`) |
-| `0x0802` | `FW_WRITE` | `u32 offset, data[]` | `u32 next_offset` | P |
-| `0x0803` | `FW_FINISH` | — | `u8 verify_result` | P |
-| `0x0804` | `FW_ACTIVATE` | `u16 delay_ms` | — (then reboot) | P |
-| `0x0805` | `FW_CONFIRM` | — | — | P |
-| `0x0806` | `FW_ABORT` | — | — | P |
-| `0x0807` | `FW_GET_SLOTS` | — | `u8 n, n×{u8 slot, u8 state, u32 version, [32] sha256}` | P |
+| `0x0801` | `FW_BEGIN` | `u32 image_size, u8 format (1 ESP app image + MCUboot TLVs, 2 MCUboot), [32] sha256, u32 version, u8 flags (bit0 allow downgrade, dev builds only)` | `u16 max_chunk, u8 slot` | E (`products/esp32-zigbee-ncp` A/B slots, signed policy, IDF rollback bootloader; host-tested, not yet on hardware) |
+| `0x0802` | `FW_WRITE` | `u32 offset, data[]` | `u32 next_offset` | E |
+| `0x0803` | `FW_FINISH` | — | `u8 verify_result` | E |
+| `0x0804` | `FW_ACTIVATE` | `u16 delay_ms` | — (then reboot) | E |
+| `0x0805` | `FW_CONFIRM` | — | — | E |
+| `0x0806` | `FW_ABORT` | — | — | E |
+| `0x0807` | `FW_GET_SLOTS` | — | `u8 n, n×{u8 slot, u8 state, u32 version, [32] sha256}` | E |
 
 Rules:
 
@@ -1429,8 +1443,11 @@ State on master 184b82d (see [Green Power](green-power.md)):
 | Sink (`Sink<8, 4>`; Sink Table persisted in the GP journal as `ZBGS` records paired with the Proxy Table; adaptive per-GPD counter persistence) | Host-tested and lab-tested on the ESP32-H2-Zero combo light |
 | Bidirectional commissioning with the combo as its own TempMaster (reply armed in the radio and started from its interrupts, `MacDriver::arm_gp_reply`, ESP32 only) | Proven 3 of 3 on the H2 combo light on 2026-11-17 |
 
-None of this is validated **as a coordinator NCP** yet; gate H10 covers
-that. Since fd3bc03 the NWK layer also accepts the empty source-route relay
+The NCP integration (2026-11-19) is host-tested only: the commands and
+events below over the in-memory host link with the real Trust Center
+coordinator on a mock MAC (`apps/ncp-coordinator/tests/gp.rs`), and the GP
+journal in the NCP's `zbnv` geometry. None of it is validated **as a
+coordinator NCP** on hardware yet; gate H10 covers that. Since fd3bc03 the NWK layer also accepts the empty source-route relay
 lists that some coordinators send (section 7.3).
 
 **Sink modes.** There is exactly **one sink authority** per network on the
@@ -1562,12 +1579,60 @@ coordinator, and every accepted GPD command reaches the host as
 `EVT_GP_FRAME`.
 
 **Capacity.** `gp_sink_table` = 16 and `gp_proxy_table` = 8 on the H2 NCP
-(8.9). Today `GP_SINK_TABLE_ENTRIES` is a runtime constant (8), so making it
-a product parameter is runtime work (N).
+(8.9). `GP_SINK_TABLE_ENTRIES` follows the runtime's `ncp-capacity` product
+parameter (8 otherwise, so router images are unchanged); both values are
+reported in `SYS_NEGOTIATE`.
 
 **Backup.** Sink entries go to `stack_specific.zigbee_rs.gp_sink_table` as
 hex `R_GP_SINK` values, and proxy entries to `gp_proxy_table` (9.2). OCB
 itself has no GP fields.
+
+**Implementation notes** (`apps/ncp-coordinator/src/gp.rs` over
+`zigbee_runtime::green_power::ncp`, feature `green-power-ncp`):
+
+- The NCP boots in `NCP_SINK` with the defaults above (window 180 s, exit
+  on first pairing, derived groupcast). `GP_SINK_CONFIG` is kept in RAM:
+  a host sends it at every start. `window_s` 0 selects 180 s; a
+  `security_level` with bit 3 (involve the Trust Center) is
+  `UNSUPPORTED_COMMAND`. `GP_SINK_COMMISSIONING` (enter) also sets
+  `gpsCommissioningWindow` (non-zero `window_s`) and the "on first pairing"
+  exit bit from its flags; it needs a running network and `NCP_SINK`
+  (`INVALID_STATE`).
+- `GP_SET_SHARED_KEY` is `UNSUPPORTED_COMMAND`: the sink provisions no
+  shared GPD key (`zigbee_gp::sink`).
+- `EVT_GP_FRAME.result` follows the sink outcome: 0–4 as listed. Result 5
+  is not emitted by this build. A bidirectional commissioning reports the
+  Commissioning frame with result 3 and the completing frame (Success)
+  with result 2; `EVT_GP_COMMISSIONED` carries the full `R_GP_SINK`
+  (key, counter). `rssi` is -128 (the MAC reports none); `lqi` is the
+  GPDF's, or the APS frame's for a proxied one. An encrypted frame the sink
+  could not decrypt for the report keeps its raw payload, flag bit 1 clear,
+  `command_id` 0xFF.
+- `R_GP_SINK` carries one group: a pre-commissioned groupcast entry exports
+  its first group. `GP_SINK_TABLE_PUT` and `GP_SINK_REMOVE` need a running
+  network (`INVALID_STATE`; the table is restored from NV when the network
+  resumes). An imported entry's counter is taken as the last accepted one
+  and is persisted exactly. Table reads page at
+  400 record bytes (`n` may be smaller than the remaining entries; continue
+  at `start + n`). `R_GP_PROXY` holds one entry per record (`format_version`
+  1); with export locked its key bytes are zero.
+- `HOST_SINK` hands the host's GP Pairing and Proxy Commissioning Mode, not
+  only GP Response, to the local proxy (broadcast, group or unicast to the
+  NCP): its proxy must be paired and in commissioning mode like any other.
+  Its GP Notifications and Commissioning Notifications are copied once per
+  GPDF (several destinations), and one addressed to the NCP itself is not
+  transmitted. Group-addressed GP frames reach the host only for groups the
+  GP endpoint is a member of (the NCP sink's or the proxy's; there is no
+  host group-membership command yet).
+- Counters (`DIAG_GET_COUNTERS` group bit 7, IDs `0x08xx`): `0x0801`–
+  `0x080D` sink drops by `SinkDrop` reason (duplicates `0x0807`, stale
+  `0x0806`, unknown GPD `0x0803`), `0x0810` reports lost to a full queue,
+  `0x0811` local proxy copies, `0x0812` frames handed to a host sink,
+  `0x0813` `CONFLICT` refusals.
+- Persistence: the runtime's GP journal (`ZBGS` sink record paired with the
+  Proxy Table record, adaptive counter records) in the product's `zbnv` GP
+  window, 2 × 8 KiB logical sectors; restored by the coordinator's
+  `NWK_INIT` resume like the router combo's.
 
 ---
 
@@ -1827,7 +1892,7 @@ share it.
 | Children 64 (see below): neighbor table 32 → 96 (+64 × 32 B), child records 64 × 24 B, source-match table 16 → 64 (+48 × 10 B), indirect queue 8 → 16 frames (+8 × 128 B) | 5 088 | — |
 | APS request queue: `max_aps_inflight` 16 × 160 B | 2 560 | — |
 | Host-absent queue 32 × 80 B + miss queue 8 × 128 B + retry cache 64 × 24 B | 5 120 | — |
-| GP Sink Table 8 → 16 entries (+8 × ~80 B) | 640 | — |
+| GP Sink Table 8 → 16 entries (+8 × ~80 B) | 640 | Measured 2026-11-19 for the whole NCP GP combo (H2 Thread-BR image): device +4 928 B (Proxy 2 264 + Sink 2 480 + reply buffers), NCP report queue 916 B, `.data` +776 B; the 32 KiB `esp-alloc` heap moved to the reclaimed 2nd-stage bootloader RAM (`dram2_seg`), so the main stack grew by 25 860 B |
 | **Total static** | **≈ 130 000** | about 50 % of the region |
 | Remaining for stacks and margin | ≈ 128 000 | Must be confirmed by the product's post-link check and stack painting |
 
@@ -1838,8 +1903,9 @@ share it.
 - The binding limit is the child journal record: `8 + 2 + C × 14` bytes
   (`CHILD_ENTRY_LEN` = 14) must fit a slot minus its 16-byte CRC and
   commit trailer.
-  - Today's slots are 512 B, so C ≤ 34 (`MAX_PERSISTED_CHILDREN` = 32).
-  - With **1 024-byte slots**, C ≤ 71. 64 children need 906 B.
+  - Router images use 512 B slots, so C ≤ 34 (`MAX_PERSISTED_CHILDREN` = 32).
+  - With **1 024-byte slots**, C ≤ 71. 64 children need 906 B. The
+    `ncp-capacity` feature selects them (`MAX_PERSISTED_CHILDREN` = 64).
 - 64 is the first power of two that is ≥ 32 and fits. A restore whose child
   list exceeds 64 demotes the extras (note `CHILD_DEMOTED`), and they
   rejoin.
@@ -1853,7 +1919,7 @@ defines both layouts.
 | Journal | Geometry | Size | Calculation |
 |---|---|---:|---|
 | `SecurityStateJournal` (NWK and global APS reservations, keys, APS replay floors) | 2 × 16 KiB logical sectors | 32 KiB | Coordinator guide: 16 KiB sectors for the full 64-entry replay table |
-| `TrustCenterDeviceJournal` (256 cached entries) | 2 × 32 KiB | 64 KiB | Snapshot: 43 B header + 256 × 72 B (75 B today − 8 B per-key counter fields + 5 B rev/host-ack) + 32 removal intents × 16 B = 18 987 B ≈ 18.5 KiB. A logical sector holds one 20 KiB snapshot + 12 KiB of appends (≈ 128 × 96 B). The snapshot must be **streamed across slots** (new runtime work); today's single 4 KiB slot holds only 32 devices. |
+| `TrustCenterStreamJournal` (256 cached entries) | 2 × 32 KiB | 64 KiB | Implemented snapshot (record version 6): 43 B header + 256 × 75 B (per-key counter fields still encoded) + 1 + 8 × 16 B allowlist + 3 B rotation + 1 + 32 removal intents × 16 B + 5 B trailer = 19 893 B, **streamed** across 5 × 4 KiB chunk slots (4 060 B payload each) with a single commit marker after all chunks. The planned 72 B entries (rev/host-ack) and delta appends are not implemented: every store writes a full snapshot (a sector holds 8 one-chunk or one 5-chunk snapshot). |
 | `ChildTableJournal` (64 children) | 2 × 4 KiB, 1 024 B slots | 8 KiB | 906 B record + trailer |
 | GP journal (Proxy 8 + Sink 16) | 2 × 8 KiB, 1 024 B slots | 16 KiB | Sink snapshot 1 + 16 × (1 + 45) = 737 B fits a slot. The proxy+sink pair uses 2 slots. 8 KiB sectors give room for adaptive counter records (32 B). |
 | APS tables (bindings, groups, application keys) | 2 × 4 KiB | 8 KiB | as on routers |
@@ -1881,6 +1947,66 @@ image is not confirmed (7.9).
   product's `zbnv` at 0x3F0000.
 - `SYS_GET_INFO.flash_size` lets hosts and the ROM recovery path pick the
   right images.
+
+**Implementation status (`ncp-capacity`).** One opt-in cargo feature per
+crate (`zigbee-nwk`, `zigbee-aps`, `zigbee-bdb`, `zigbee-mac`,
+`zigbee-runtime`, `router-app`) selects the NCP table sizes; only
+`apps/ncp-coordinator`, `products/esp32-zigbee-ncp` and
+`examples/esp32-ncp` enable it, and images without it are byte-identical.
+
+| Table | Router / TC build | `ncp-capacity` |
+|---|---:|---:|
+| APS link-key table (`MAX_KEY_TABLE_ENTRIES`) | 32 | 256 |
+| Trust Center devices (`MAX_TRUST_CENTER_DEVICES`) | 32 | 256 |
+| TC removal intents (`MAX_PENDING_UNKNOWN_REMOVALS`) | 32 | 32 |
+| Persisted APS application keys | 32 | 32 |
+| Address map | 32 | 512 |
+| Neighbor table | 32 | 96 |
+| NIB `max_children` default | 20 | 64 |
+| Persisted children / child-journal slot | 32 / 512 B | 64 / 1 024 B |
+| Source-route cache | 32 | 128 |
+| Indirect queue | 8 | 16 |
+| NWK replay-floor table | 64 | 128 |
+| ESP Frame Pending source table | 16 | 64 |
+| Security-journal replay domains | 112 | 400 (16 KiB sectors required) |
+
+The streamed Trust Center journal (`trust_center_stream`) writes every chunk
+prefix first and the commit marker of the last chunk last; a snapshot is
+current only when all chunks are contiguous, agree on generation/count/
+length, pass their chunk CRCs and the whole-snapshot CRC, are committed and
+decode. Torn stores, bit errors, missing chunks and generation wraparound
+fall back to (or keep) the previous complete snapshot (host fault-injection
+tests). A single-slot record of the previous NCP layout is read and
+migrated on the next store.
+
+Measured on the ESP32-H2 USJ image: `.bss` 128 120 → 192 216 B, `.data`
+6 308 B, so 56 160 B of the 258 000 B region remain for the stack (56 096 B
+above esp-hal's stack-guard word).
+
+The first `ncp-capacity` image did not fit: the Trust Center runtime cloned
+its full persisted state (~23 KiB at 256 devices) for every mutation and the
+composition built the coordinator application (and the NCP) on the stack
+before moving them into statics (`main`'s frame 77 824 B, Trust Center poll
+frames up to 116 KiB, a 650 KiB static worst case). Now:
+
+- `TrustCenterRuntime` mutates its live state **in place** and commits it;
+  a failed store re-synchronises the live state from the journal in place
+  (`TrustCenterDeviceStore::load_into`), or closes the runtime (not
+  initialized) until it is re-initialized when that reload fails. RAM never
+  runs ahead of flash. The journals decode straight into caller storage and
+  scan by framing/CRC without materializing candidate states.
+- The app (`TrustCenterCoordinatorApp::new_with_aps_tables_into`), its Trust
+  Center runtime and table, and the NCP (`Ncp::new_into`) are constructed in
+  their static storage; `TcPort` borrows the app. The composition root runs
+  each construction step in its own frame.
+
+`tools/esp32-ncp-stack-gate.py` (CI job `build-esp32-ncp`) bounds the static
+worst case: the boot composition (device assembly, 34 112 B) plus the log
+sink and every interrupt handler nested once leaves 20.6 KiB on the H2 USJ
+image, 17.8 KiB on the Thread BR image (both ≥ the 16 KiB gate) and
+205 KiB on the C6. Trust Center chains are ≤ 16 KiB (step) and ≤ 9.5 KiB
+(runtime/journal). This is a direct-call bound, not hardware evidence: the
+images have not been flashed or stack-painted yet.
 
 ## 9. Backup, restore and Open Coordinator Backup
 

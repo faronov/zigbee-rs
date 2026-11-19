@@ -1,0 +1,42 @@
+[package]
+name = "ncp-coordinator-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "ZRHP v1 network co-processor: coordinator, Trust Center and host protocol dispatch"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Platform-independent: the product supplies the transport, the identity and
+# the stack composition; this crate speaks ZRHP (zigbee-zrhp) and drives a
+# `CoordinatorPort`. No board, product or vendor dependency.
+[dependencies]
+critical-section = "1.2"
+heapless = "0.9"
+log = "0.4"
+zigbee-zrhp = { path = "../../zigbee-zrhp" }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-mac = { path = "../../zigbee-mac" }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+# Only the host opens joining (NWK_PERMIT_JOIN); formation leaves it closed.
+zigbee-bdb = { path = "../../zigbee-bdb", default-features = false, features = ["formation-joining-closed"] }
+# `ncp-capacity`: the NCP table sizes (256 TC devices/link keys, 512 address
+# map, 96 neighbors with 64 children, 128 source routes; spec 8.9).
+# `green-power-ncp`: the GP combo (Proxy Basic + sink) behind the GREEN POWER
+# commands (spec 7.11), with the 16-entry Sink Table of `ncp-capacity`.
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["centralized-tclk", "trust-center", "global-aps-counter", "host-passthrough", "ncp-capacity", "green-power-ncp"] }
+router-app = { path = "../router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity", "green-power-sink"] }
+zigbee-gp = { path = "../../zigbee-gp", features = ["sink"] }
+
+# The GP TempMaster (`green-power-bidirectional`) needs a MAC with timed
+# transmission (`zigbee-mac/timed-tx`), which resolves only against the
+# patched esp-radio: the image enables it on its own `router-app` and
+# `zigbee-runtime` dependencies (examples/esp32-ncp). This crate's logic does
+# not depend on it.
+
+[dev-dependencies]
+critical-section = { version = "1.2", features = ["std"] }
+pollster = "0.4"
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

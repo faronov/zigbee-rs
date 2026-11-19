@@ -3794,7 +3794,7 @@ impl<M: MacDriver> NwkLayer<M> {
         if dst != self.nib.network_address && dst != ShortAddress::BROADCAST_RX_ON_WHEN_IDLE {
             return None;
         }
-
+        crate::host_events::host_event!(self.host_note_leave(src, leave.rejoin));
         #[cfg(feature = "router")]
         let departing_child = self.neighbors.find_by_short(src).and_then(|entry| {
             matches!(
@@ -14130,5 +14130,67 @@ mod tests {
         assert!(parent.neighbor_table().find_by_short(ORIGIN).is_none());
         // An IEEE we do not parent is ignored.
         assert!(parent.remove_children_by_ieee(&[[0x99; 8]]).is_empty());
+    }
+
+    // ── Network co-processor departures (`host-passthrough`) ────────
+
+    /// A child's Leave indication is recorded with its IEEE and rejoin bit,
+    /// an aged-out child with its timeout cause; the queue is bounded and
+    /// counts what it drops.
+    #[test]
+    #[cfg(all(feature = "router", feature = "host-passthrough"))]
+    fn departures_are_recorded_for_the_host() {
+        use crate::host_events::{HOST_DEPARTURE_QUEUE_LEN, NwkDeparture, NwkDepartureCause};
+
+        let mut parent = parent_with_sleepy_child();
+        assert_eq!(parent.take_host_departure(), None);
+        let rejoin_leave = frame_with_network_key(
+            &frame(NwkFrameType::Command, ORIGIN, OUR_ADDR),
+            &[NwkCommandId::Leave as u8, 1 << 5],
+            NETWORK_KEY,
+            KEY_SEQ,
+            10,
+        );
+        let _ = block_on(parent.process_incoming_nwk_frame(&rejoin_leave, 42));
+        assert!(matches!(
+            parent.take_command_outcome(),
+            Some(NwkCommandOutcome::DeviceLeft { .. })
+        ));
+        assert_eq!(
+            parent.take_host_departure(),
+            Some(NwkDeparture {
+                short_address: ORIGIN,
+                ieee_address: Some(ORIGIN_IEEE),
+                child: true,
+                cause: NwkDepartureCause::Leave { rejoin: true },
+            })
+        );
+        assert_eq!(parent.take_host_departure(), None);
+
+        let mut parent = parent_with_sleepy_child();
+        parent.update_address_map(ORIGIN, ORIGIN_IEEE);
+        let window =
+            crate::frames::ed_timeout_enum_to_seconds(crate::frames::ED_TIMEOUT_ENUM_DEFAULT)
+                .unwrap() as u16;
+        assert!(parent.age_end_device_children(window - 1).is_empty());
+        assert_eq!(parent.take_host_departure(), None);
+        assert_eq!(parent.age_end_device_children(1).as_slice(), &[ORIGIN]);
+        assert_eq!(
+            parent.take_host_departure(),
+            Some(NwkDeparture {
+                short_address: ORIGIN,
+                ieee_address: Some(ORIGIN_IEEE),
+                child: true,
+                cause: NwkDepartureCause::ChildTimedOut,
+            })
+        );
+
+        for _ in 0..HOST_DEPARTURE_QUEUE_LEN + 3 {
+            parent.host_note_aged(&[ORIGIN]);
+        }
+        assert_eq!(parent.take_host_departures_dropped(), 3);
+        assert_eq!(parent.take_host_departures_dropped(), 0);
+        parent.clear_host_departures();
+        assert_eq!(parent.take_host_departure(), None);
     }
 }

@@ -1,0 +1,27 @@
+[package]
+name = "esp-serial-stream"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Non-blocking byte streams over the ESP32-H2/C6 USB-Serial-JTAG and UART (UHCI GDMA receive)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Protocol-agnostic platform glue: it moves bytes and counts line faults.
+# Framing, ARQ and every protocol decision live above it. The host build
+# compiles and tests the pure pieces (SPSC ring, USB burst accounting,
+# UART rate policy); the drivers exist only for the chip target.
+[dependencies]
+
+[target.'cfg(target_os = "none")'.dependencies]
+critical-section = "1.2"
+esp-hal = { version = "=1.0.0", features = ["unstable"] }
+
+[features]
+default = []
+esp32h2 = ["esp-hal/esp32h2"]
+esp32c6 = ["esp-hal/esp32c6"]
+
+# Same esp-hal as the products when this crate is the root (host tests).
+[patch.crates-io]
+esp-hal = { path = "../vendor/esp-hal" }

@@ -151,7 +151,7 @@ impl<
 
     /// MLME-START for a Zigbee non-beacon router.
     pub fn start(&mut self, req: MlmeStartRequest) -> Result<(), MacError> {
-        crate::validate_router_start(&req)?;
+        crate::validate_parent_start(&req, self.pib.short_address())?;
         self.set_channel(req.channel)?;
         self.set_addresses(req.pan_id, self.pib.short_address())?;
         self.pib.rx_on_when_idle = true;

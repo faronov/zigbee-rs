@@ -436,3 +436,19 @@ pub(crate) fn abort_rx() {
         .rx_status()
         .modify(|_, w| unsafe { w.rx_abort_status().bits(0) });
 }
+
+/// ED scan length in symbols (16 µs); `ieee802154-energy-detect`.
+#[cfg(feature = "ieee802154-energy-detect")]
+#[inline(always)]
+pub(crate) fn set_ed_duration(duration_symbols: u32) {
+    IEEE802154::regs()
+        .ed_scan_duration()
+        .modify(|_, w| unsafe { w.ed_scan_duration().bits(duration_symbols.min(0x00FF_FFFF)) });
+}
+
+/// Result of the last ED scan in dBm; `ieee802154-energy-detect`.
+#[cfg(feature = "ieee802154-energy-detect")]
+#[inline(always)]
+pub(crate) fn ed_rss() -> i8 {
+    IEEE802154::regs().ed_scan_cfg().read().ed_rss().bits() as i8
+}

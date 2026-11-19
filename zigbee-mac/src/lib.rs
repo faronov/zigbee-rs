@@ -488,3 +488,42 @@ pub(crate) mod sealed {
     /// assertion rather than a compiler-checked proof.
     pub trait SealedParent {}
 }
+
+/// `Some(indication)` for a frame received from the PHY. With `rx-rssi` the
+/// indication's payload also carries the frame's RSSI; without it this is
+/// exactly `Some(indication)`.
+#[cfg(feature = "rx-rssi")]
+macro_rules! rx_indication {
+    ($frame:expr, $indication:expr) => {{
+        let mut indication = $indication;
+        indication.payload.set_rssi_dbm($frame.rssi_dbm);
+        Some(indication)
+    }};
+}
+#[cfg(not(feature = "rx-rssi"))]
+macro_rules! rx_indication {
+    ($frame:expr, $indication:expr) => {
+        Some($indication)
+    };
+}
+pub(crate) use rx_indication;
+
+/// Store a received frame's RSSI (`rx-rssi`); without the feature the
+/// arguments are not evaluated and no code is generated.
+#[cfg(feature = "rx-rssi")]
+#[allow(unused_macros)]
+macro_rules! rx_rssi {
+    ($frame:expr, $rssi_dbm:expr) => {
+        $frame.rssi_dbm = $rssi_dbm
+    };
+}
+#[cfg(not(feature = "rx-rssi"))]
+#[allow(unused_macros)]
+macro_rules! rx_rssi {
+    ($frame:expr, $rssi_dbm:expr) => {};
+}
+#[allow(unused_imports)]
+pub(crate) use rx_rssi;
+
+#[cfg(feature = "rx-rssi")]
+pub use phy::RSSI_UNKNOWN_DBM;

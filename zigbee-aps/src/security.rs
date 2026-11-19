@@ -23,9 +23,9 @@ use zigbee_crypto::{
 };
 use zigbee_types::IeeeAddress;
 
-/// Maximum number of link key entries.
+/// Maximum number of link key entries (256 with `ncp-capacity`, spec 8.9).
 #[cfg(feature = "trust-center")]
-pub const MAX_KEY_TABLE_ENTRIES: usize = 32;
+pub const MAX_KEY_TABLE_ENTRIES: usize = [32, 256][cfg!(feature = "ncp-capacity") as usize];
 #[cfg(not(feature = "trust-center"))]
 pub const MAX_KEY_TABLE_ENTRIES: usize = 16;
 
@@ -361,19 +361,17 @@ pub struct ApsSecurity {
     distributed_security_link_key: Option<AesKey>,
     /// Aggregate replay state for the two global commissioning keys.
     ///
-    /// One floor per global key regardless of sender (finding F15, kept by
-    /// design): per-sender floors would let attacker-chosen IEEE addresses
-    /// exhaust the table or evict the Trust Center's floor. The accepted
+    /// One floor per global key regardless of sender (finding F15, kept by design): per-sender floors would let attacker-chosen IEEE addresses exhaust the table or evict the Trust Center's floor. The accepted
     /// cost is that a *second* legitimate sender under the same global key
     /// (or a Trust Center whose APS counter restarted, e.g. after its own
     /// factory reset) is rejected until its counter passes the floor. The
     /// floor is dropped by [`Self::clear_keys`] (leave / factory reset) and
     /// whenever the global key value changes.
     global_replay_table: heapless::Vec<ApsReplayCounter, MAX_ACTIVE_GLOBAL_REPLAY_DOMAINS>,
-    /// Key-pair entries whose key was replaced by [`Self::add_key`] while
-    /// carrying a committed incoming floor: that floor was established under
-    /// the previous key and no frame has yet been verified with the new one.
+    /// Key-pair entries whose key was replaced by [`Self::add_key`] while carrying a committed incoming floor: that floor was established under the previous key and no frame has yet been verified with the new one.
     stale_incoming_floors: heapless::Vec<(IeeeAddress, ApsKeyType), MAX_KEY_TABLE_ENTRIES>,
+    #[cfg(feature = "global-aps-counter")]
+    global_outgoing: Option<GlobalApsCounter>,
 }
 
 impl ApsSecurity {
@@ -384,6 +382,8 @@ impl ApsSecurity {
             distributed_security_link_key: None,
             global_replay_table: heapless::Vec::new(),
             stale_incoming_floors: heapless::Vec::new(),
+            #[cfg(feature = "global-aps-counter")]
+            global_outgoing: None,
         }
     }
 
@@ -551,8 +551,8 @@ impl ApsSecurity {
         }
     }
 
-    /// Remove all negotiated link keys while retaining the configured default
-    /// Trust Center key. Key material is wiped before the slots are released.
+    /// Remove all negotiated link keys while retaining the configured default Trust Center key. Key material is wiped before the slots are released.
+    #[cfg(not(feature = "global-aps-counter"))]
     pub fn clear_keys(&mut self) {
         for entry in self.key_table.iter_mut() {
             zigbee_crypto::zeroize_key(&mut entry.key);
@@ -793,8 +793,8 @@ impl ApsSecurity {
         true
     }
 
-    /// Increment outgoing frame counter for a partner key.
-    /// Returns the pre-increment value.
+    /// Increment outgoing frame counter for a partner key. Returns the pre-increment value.
+    #[cfg(not(feature = "global-aps-counter"))]
     pub fn next_frame_counter(
         &mut self,
         partner: &IeeeAddress,
@@ -1332,5 +1332,51 @@ mod mmo_tests {
                 0x91, 0x24,
             ]
         );
+    }
+}
+
+// Global outgoing APS counter (`global-aps-counter`). Kept in a submodule
+// at the end of the file so builds without the feature keep every line
+// number (panic locations) of this file.
+#[cfg(feature = "global-aps-counter")]
+mod global;
+#[cfg(feature = "global-aps-counter")]
+pub use global::GlobalApsCounter;
+
+/// Coordinator NCP link-key table (`ncp-capacity`, ZRHP spec 8.9).
+#[cfg(all(test, feature = "ncp-capacity"))]
+mod ncp_capacity_tests {
+    use super::*;
+
+    fn entry(index: u16) -> ApsLinkKeyEntry {
+        let [lo, hi] = index.to_le_bytes();
+        ApsLinkKeyEntry {
+            partner_address: [lo, hi, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A],
+            key: [lo; 16],
+            key_type: ApsKeyType::TrustCenterLinkKey,
+            outgoing_frame_counter: 0,
+            outgoing_frame_counter_limit: 0x400,
+            incoming_frame_counter: 0,
+            incoming_frame_counter_valid: false,
+        }
+    }
+
+    #[test]
+    fn the_link_key_table_holds_256_unique_keys_and_then_refuses() {
+        assert_eq!(MAX_KEY_TABLE_ENTRIES, 256);
+        let mut security = ApsSecurity::new();
+        for index in 0..MAX_KEY_TABLE_ENTRIES as u16 {
+            assert!(security.add_key(entry(index)).is_ok(), "key {index}");
+        }
+        assert_eq!(security.key_count(), MAX_KEY_TABLE_ENTRIES);
+        let last = entry(MAX_KEY_TABLE_ENTRIES as u16 - 1);
+        assert_eq!(
+            security
+                .find_key(&last.partner_address, ApsKeyType::TrustCenterLinkKey)
+                .map(|found| found.key),
+            Some(last.key)
+        );
+        // Fail closed: a full table refuses a new partner.
+        assert!(security.add_key(entry(0x7FFF)).is_err());
     }
 }

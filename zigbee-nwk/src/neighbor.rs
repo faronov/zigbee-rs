@@ -8,7 +8,7 @@ use zigbee_types::*;
 
 /// Maximum number of neighbors we track
 #[cfg(feature = "router")]
-pub const MAX_NEIGHBORS: usize = 32;
+pub const MAX_NEIGHBORS: usize = crate::ncp_capacity(32, 96);
 #[cfg(not(feature = "router"))]
 pub const MAX_NEIGHBORS: usize = 8;
 

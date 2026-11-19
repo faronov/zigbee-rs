@@ -6,6 +6,8 @@ license = "MIT OR Apache-2.0"
 description = "Zigbee device runtime — event loop, device builder, NV storage"
 
 [dependencies]
+# `host-passthrough` queue only.
+critical-section = { version = "1.2", optional = true }
 embedded-storage = { workspace = true }
 heapless = "0.9"
 zigbee-types = { version = "0.1.0", path = "../zigbee-types" }
@@ -56,6 +58,40 @@ router = [
     "zigbee-zdo/router",
 ]
 trust-center = ["router", "zigbee-aps/trust-center", "zigbee-bdb/trust-center"]
+# One durably reserved outgoing APS frame counter for every APS-secured frame
+# the coordinator sends (ZRHP decision 2). Kept in the Trust Center journal
+# (record version 5); a version-4 journal migrates on the first start with
+# start = max(every per-key limit, the NWK limit). Off by default: images
+# without it are unchanged.
+global-aps-counter = ["trust-center", "zigbee-aps/global-aps-counter"]
+# Coordinator network co-processor capacity (ZRHP spec 8.2/8.9): 256 Trust
+# Center devices and APS link keys, a 512-entry address map, 96 neighbors
+# with 64 persisted children (1 024-byte child-journal slots), a 128-entry
+# source-route cache, 16 indirect frames, a 64-entry ESP Frame Pending table,
+# and Trust Center journal record version 6 (16-bit device count, at most 32
+# removal intents) with the streamed multi-slot journal
+# `trust_center_stream::TrustCenterStreamJournal`. Needs the global APS
+# counter. Off by default: images without it are unchanged.
+ncp-capacity = [
+    "global-aps-counter",
+    "zigbee-aps/ncp-capacity",
+    "zigbee-bdb/ncp-capacity",
+    "zigbee-mac/ncp-capacity",
+    "zigbee-nwk/ncp-capacity",
+]
+# Network co-processor: APS data frames for application endpoints go to a
+# bounded host queue (`host_passthrough`) instead of the ZCL dispatcher, with
+# the last hop RSSI and the APS security/key source; neighbour departures,
+# Trust Center join decisions and removals are recorded for the host; the ZDO
+# endpoint registry accepts host endpoints. Off by default: images without it
+# are unchanged.
+host-passthrough = [
+    "dep:critical-section",
+    "zigbee-mac/rx-rssi",
+    "zigbee-aps/host-passthrough",
+    "zigbee-nwk/host-passthrough",
+    "zigbee-zdo/host-passthrough",
+]
 ota = []
 # Green Power Proxy Basic (GP 1.1) for routers: GPDF reception, Proxy Table,
 # GP Notification / Commissioning Notification tunnelling with NWK aliasing.
@@ -94,6 +130,15 @@ green-power-full-proxy = [
 # TempMasters it always works. Off by default: images built without it are
 # unchanged.
 green-power-sink = ["green-power", "zigbee-gp/sink"]
+# ZRHP network co-processor integration of the GP combo (spec 7.11,
+# `green_power::ncp`): one sink authority switchable at runtime between the
+# runtime's sink (NCP_SINK) and the host's (HOST_SINK: GP server frames and
+# the local proxy's output go to the host), sink frame reports with their
+# security metadata, Sink Table import/quiet removal, and host-originated GP
+# client commands looped back to the local proxy. Pair with `ncp-capacity`
+# for the 16-entry Sink Table. Off by default: images without it are
+# unchanged.
+green-power-ncp = ["green-power-sink", "host-passthrough"]
 # Deprecated item-by-item `save_state`/`restore_state` persistence. It does not
 # persist the Trust Center link key, APS keys, bindings or groups; production
 # devices use `SecurityStateStore`. Kept only for tests and mock examples.
@@ -109,6 +154,7 @@ compact-single-endpoint = [
 ]
 
 [dev-dependencies]
+critical-section = { version = "1.2", features = ["std"] }
 # Runtime unit tests expose coordinator helpers under `cfg(test)`; compile the
 # BDB formation implementation without enabling router behavior.
 zigbee-bdb = { path = "../zigbee-bdb", default-features = false, features = ["formation"] }
