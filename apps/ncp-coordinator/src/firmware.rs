@@ -19,6 +19,11 @@ use crate::ncp::QUEUE_BYTES;
 use crate::platform::{self, NcpPlatform, PlatformError};
 use crate::port::{CoordinatorPort, NetworkState};
 
+/// Largest `FW_WRITE` data the NCP announces: a power of two that fits
+/// one message with its `u32 offset` (`MAX_MESSAGE_PAYLOAD` = 633 B).
+pub const MAX_WRITE_DATA: u16 = 512;
+const _: () = assert!(MAX_WRITE_DATA as usize + 4 <= zigbee_zrhp::msg::MAX_MESSAGE_PAYLOAD);
+
 /// Whether `id` belongs to the FIRMWARE group.
 pub(crate) const fn is_fw_request(id: u16) -> bool {
     matches!(
@@ -96,7 +101,8 @@ pub(crate) fn dispatch_fw<P: NcpPlatform, C: CoordinatorPort>(
             match platform.fw_begin(&image) {
                 Ok(begin) => {
                     let response = FwBeginRsp {
-                        max_chunk: begin.max_chunk,
+                        // A FW_WRITE (u32 offset + data) must fit one frame.
+                        max_chunk: begin.max_chunk.min(MAX_WRITE_DATA),
                         slot: begin.slot,
                     };
                     let _ = queues.response(tid, Status::Success, Some(&response));

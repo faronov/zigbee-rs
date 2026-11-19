@@ -265,8 +265,9 @@ impl NcpPlatform for FakePlatform {
         self.image = Some(*image);
         self.staged.clear();
         self.finished = false;
+        // The product engine's chunk (1 KiB) exceeds a frame.
         Ok(FwBegin {
-            max_chunk: 128,
+            max_chunk: 1024,
             slot: 1,
         })
     }
@@ -873,7 +874,7 @@ fn firmware_ieee_pta_and_retry_cache() {
     setup!(ncp, host, port, platform, pipe, log, now, exchange);
 
     // FW_*: stage, verify, activate (reboot after the delay), confirm.
-    let image: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+    let image: Vec<u8> = (0..1300u32).map(|i| i as u8).collect();
     let begin = host.request(&FwBeginReq {
         image_size: image.len() as u32,
         format: 1,
@@ -884,7 +885,7 @@ fn firmware_ieee_pta_and_retry_cache() {
     exchange!();
     let begin = host.response(begin);
     let begin: FwBeginRsp = begin.body();
-    assert_eq!((begin.max_chunk, begin.slot), (128, 1));
+    assert_eq!((begin.max_chunk, begin.slot), (512, 1), "capped to a frame");
     let mut offset = 0;
     for chunk in image.chunks(usize::from(begin.max_chunk)) {
         let write = host.request(&FwWrite {
@@ -895,7 +896,7 @@ fn firmware_ieee_pta_and_retry_cache() {
         let write = host.response(write);
         offset = write.body::<FwWriteRsp>().next_offset;
     }
-    assert_eq!(offset, 300);
+    assert_eq!(offset, 1300);
     let bad = host.request(&FwWrite {
         offset: 7,
         data: Rest(&[0]),
