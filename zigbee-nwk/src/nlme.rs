@@ -2600,6 +2600,9 @@ mod tests {
             "a refused rejoin must not make the candidate's update id authoritative"
         );
         assert_eq!(nwk.mac().poll_count(), 2);
+        // Rejoin polls keep the EUI-64 fallback (a Rejoin Response may be
+        // queued by extended address): never the joined-device poll.
+        assert_eq!(nwk.mac().joined_poll_count(), 0);
         assert!(!nwk.security().check_frame_counter(&PARENT_IEEE, 6));
         assert!(nwk.security().check_frame_counter(&PARENT_IEEE, 7));
 

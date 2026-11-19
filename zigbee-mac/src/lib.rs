@@ -225,6 +225,21 @@ pub trait MacDriver: PlatformServices {
     /// any pending indirect frame.
     async fn mlme_poll(&mut self) -> Result<Option<MacFrame>, MacError>;
 
+    /// MLME-POLL of a joined end device that knows its short address.
+    ///
+    /// Like [`Self::mlme_poll`], but a backend that follows an empty
+    /// short-source poll with a second, extended-source one
+    /// ([`crate::RadioPhy::POLL_EXTENDED_FALLBACK`]) does not: a parent keys
+    /// the frames of a joined child by its short address. The EUI-64 poll
+    /// only retrieves what a parent queues by extended address while the
+    /// child cannot know its short address yet — an Association or Rejoin
+    /// Response, some parents' join Transport-Key — so join and rejoin keep
+    /// [`Self::mlme_poll`]. Defaults to [`Self::mlme_poll`] (the same
+    /// future, no extra state machine).
+    fn mlme_poll_joined(&mut self) -> impl Future<Output = Result<Option<MacFrame>, MacError>> {
+        self.mlme_poll()
+    }
+
     /// MLME-ORPHAN.response — answer an orphan notification from a child.
     ///
     /// A parent that recognises the orphan as its child transmits a
