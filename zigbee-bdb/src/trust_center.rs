@@ -672,6 +672,43 @@ fn constant_time_eq(left: &[u8; 16], right: &[u8; 16]) -> bool {
         == 0
 }
 
+impl TrustCenterTable {
+    /// Install a link key restored from a backup with its origin and
+    /// verification state, and the device's last known location (parent
+    /// IEEE, short address) when the backup carries it. Unlike
+    /// [`Self::provision_link_key`] the key keeps what it was: a verified
+    /// unique key stays a verified generated key, so the join and rejoin
+    /// rules treat the device as before the backup.
+    pub fn restore_link_key(
+        &mut self,
+        address: IeeeAddress,
+        key: AesKey,
+        origin: TrustCenterKeyOrigin,
+        attributes: TrustCenterKeyAttributes,
+        location: Option<(IeeeAddress, ShortAddress)>,
+    ) -> Result<(), TrustCenterError> {
+        if let Some((parent, short)) = location {
+            validate_device_address(parent)?;
+            if short.0 > 0xFFF7 {
+                return Err(TrustCenterError::InvalidAddress);
+            }
+        }
+        self.provision_link_key(address, key, origin)?;
+        let index = self
+            .device_index(&address)
+            .ok_or(TrustCenterError::DeviceNotFound)?;
+        let device = self.devices[index]
+            .as_mut()
+            .ok_or(TrustCenterError::DeviceNotFound)?;
+        device.key_attributes = attributes;
+        if let Some((parent, short)) = location {
+            device.parent_address = parent;
+            device.short_address = short;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1401,6 +1438,54 @@ mod tests {
         let device = table.device(&DEVICE).unwrap();
         assert_eq!(device.key_origin, TrustCenterKeyOrigin::DefaultGlobal);
         assert_eq!(device.key_attributes, TrustCenterKeyAttributes::Provisional);
+    }
+
+    #[test]
+    fn a_restored_generated_key_keeps_its_rules() {
+        let mut table = TrustCenterTable::new();
+        let unique = [0x6D; 16];
+        let parent = [0x11; 8];
+        table
+            .restore_link_key(
+                DEVICE,
+                unique,
+                TrustCenterKeyOrigin::GeneratedUnique,
+                TrustCenterKeyAttributes::Verified,
+                Some((parent, ShortAddress(0x2D69))),
+            )
+            .unwrap();
+        let restored = table.device(&DEVICE).unwrap();
+        assert!(restored.has_verified_replacement_key());
+        assert!(restored.has_completed_admission());
+
+        // A secured rejoin is accepted with the restored key.
+        let mut strict = policy();
+        strict.allow_rejoins = false;
+        assert_eq!(
+            table
+                .handle_update_device(
+                    strict,
+                    update(ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin)
+                )
+                .unwrap(),
+            TrustCenterAction::None
+        );
+        assert_eq!(table.device(&DEVICE).unwrap().link_key, unique);
+
+        // A factory-reset device re-associating gets the global key.
+        assert!(matches!(
+            table
+                .handle_update_device(
+                    policy(),
+                    update(ApsUpdateDeviceStatus::StandardDeviceUnsecuredJoin)
+                )
+                .unwrap(),
+            TrustCenterAction::TransportNetworkKey {
+                link_key: DEFAULT_TC_LINK_KEY,
+                require_link_key_update: true,
+                ..
+            }
+        ));
     }
 }
 

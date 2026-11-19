@@ -42,7 +42,9 @@ use zigbee_zrhp::types::{Endpoint, Ieee, Status};
 
 use crate::ncp::{FC_STRIDE, QUEUE_BYTES};
 use crate::platform::NcpPlatform;
-use crate::port::{CoordinatorPort, NetworkImage, NetworkState, OpError, RestoredChild};
+use crate::port::{
+    CoordinatorPort, NetworkImage, NetworkState, OpError, RestoredChild, RestoredKey,
+};
 use crate::tables::device_record;
 
 /// NCP children staged by a restore; more are `CHILD_DEMOTED` (they
@@ -95,7 +97,7 @@ pub struct Restore {
     network: Option<NetworkRecord>,
     network_key: Option<NetworkKeyRecord>,
     tclk_counter_known: bool,
-    keys: Vec<([u8; 8], [u8; 16]), MAX_STAGED_KEYS>,
+    keys: Vec<RestoredKey, MAX_STAGED_KEYS>,
     host_backed: u16,
     children: Vec<RestoredChild, MAX_STAGED_CHILDREN>,
     end: Option<EndRecord>,
@@ -438,7 +440,7 @@ pub(crate) async fn commit_staged<C: CoordinatorPort, P: NcpPlatform>(
     port: &mut C,
     platform: &mut P,
 ) -> bool {
-    // Committed in place: the staged keys (1.5 KiB) are never moved onto
+    // Committed in place: the staged keys (2 KiB) are never moved onto
     // the stack or into the future.
     let result = match state.restore.as_ref() {
         Some(restore) => commit(restore, port, platform).await,
@@ -526,7 +528,19 @@ fn stage(restore: &mut Restore, record: &Record<'_>, own_ieee: [u8; 8]) -> Resul
                 None => {}
             }
             if let Some(link) = &device.link
-                && restore.keys.push((device.ieee.0, link.key)).is_err()
+                && restore
+                    .keys
+                    .push(RestoredKey {
+                        ieee: device.ieee.0,
+                        key: link.key,
+                        origin: link.origin,
+                        attrs: link.attrs,
+                        nwk: (0x0001..=0xFFF7)
+                            .contains(&device.nwk)
+                            .then_some(device.nwk),
+                        child: device.child.is_some(),
+                    })
+                    .is_err()
             {
                 restore.host_backed = restore.host_backed.saturating_add(1);
                 result = Some(note::HOST_BACKED);
@@ -599,14 +613,7 @@ async fn commit<C: CoordinatorPort, P: NcpPlatform>(
     port.install_network(&image, &restore.children)
         .await
         .map_err(op_status)?;
-    let mut on_ncp = 0u16;
-    let mut host_backed = restore.host_backed;
-    for (ieee, link_key) in &restore.keys {
-        match port.put_link_key(*ieee, *link_key) {
-            Ok(()) => on_ncp += 1,
-            Err(_) => host_backed = host_backed.saturating_add(1),
-        }
-    }
+    let (on_ncp, host_backed) = restore_keys(port, &restore.keys, restore.host_backed);
     let counters = port.frame_counters();
     Ok(BkpRestoreCommitRsp {
         nwk_fc_start: counters.nwk_current.max(nwk_fc_start),
@@ -615,6 +622,27 @@ async fn commit<C: CoordinatorPort, P: NcpPlatform>(
         link_keys_host_backed: host_backed,
         children: restore.children.len() as u16,
     })
+}
+
+/// Install the staged link keys; `(on the NCP, host-backed)`. Its own
+/// frame (no await): the loop stays out of the root future's poll frame.
+#[inline(never)]
+fn restore_keys<C: CoordinatorPort>(
+    port: &mut C,
+    keys: &[RestoredKey],
+    mut host_backed: u16,
+) -> (u16, u16) {
+    let mut on_ncp = 0u16;
+    for key in keys {
+        // The key keeps its origin and verification state: a factory-reset
+        // device re-pairing after the restore gets the global key, and a
+        // known device can secure-rejoin.
+        match port.restore_link_key(key) {
+            Ok(()) => on_ncp += 1,
+            Err(_) => host_backed = host_backed.saturating_add(1),
+        }
+    }
+    (on_ncp, host_backed)
 }
 
 fn op_status(error: OpError) -> Status {

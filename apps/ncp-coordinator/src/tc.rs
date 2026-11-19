@@ -54,7 +54,7 @@ use crate::port::{
     EndpointError, FormParams, FrameCounters, HostEndpoint, Indication, MAX_HOST_ENDPOINTS,
     NetworkInfo, NetworkState, OpError, joined, left,
 };
-use crate::port::{DeviceView, LinkView, NetworkImage, RestoredChild};
+use crate::port::{DeviceView, LinkView, NetworkImage, RestoredChild, RestoredKey};
 use zigbee_mac::{MacDriver as _, PlatformServices as _};
 
 /// NWK reservation size (`FRAME_COUNTER_RESERVATION_SIZE`).
@@ -87,6 +87,15 @@ pub trait TcApp {
     fn provision_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError>;
     /// Durably drop a device's record and key; `false` when unknown.
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError>;
+    /// Restore a key from a backup with origin, attributes and location.
+    fn restore_link_key(
+        &mut self,
+        ieee: [u8; 8],
+        key: [u8; 16],
+        origin: zigbee_bdb::trust_center::TrustCenterKeyOrigin,
+        attributes: zigbee_bdb::trust_center::TrustCenterKeyAttributes,
+        location: Option<([u8; 8], u16)>,
+    ) -> Result<(), OpError>;
     /// Replace the durable child table (restored at the next `initialize`).
     fn store_children(
         &mut self,
@@ -193,6 +202,27 @@ where
         let (trust_center, device) = self.trust_center_and_device_mut();
         trust_center
             .forget_device(device, ieee)
+            .map_err(|_| OpError::Storage)
+    }
+
+    fn restore_link_key(
+        &mut self,
+        ieee: [u8; 8],
+        key: [u8; 16],
+        origin: zigbee_bdb::trust_center::TrustCenterKeyOrigin,
+        attributes: zigbee_bdb::trust_center::TrustCenterKeyAttributes,
+        location: Option<([u8; 8], u16)>,
+    ) -> Result<(), OpError> {
+        let (trust_center, device) = self.trust_center_and_device_mut();
+        trust_center
+            .restore_link_key(
+                device,
+                ieee,
+                key,
+                origin,
+                attributes,
+                location.map(|(parent, short)| (parent, ShortAddress(short))),
+            )
             .map_err(|_| OpError::Storage)
     }
 }
@@ -1043,6 +1073,30 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         self.app.forget_device(ieee)
     }
 
+    fn restore_link_key(&mut self, key: &RestoredKey) -> Result<(), OpError> {
+        use zigbee_bdb::trust_center::{TrustCenterKeyAttributes, TrustCenterKeyOrigin};
+        if !self.running {
+            return Err(OpError::InvalidState);
+        }
+        let origin = match key.origin {
+            1 => TrustCenterKeyOrigin::InstallCode,
+            2 => TrustCenterKeyOrigin::GeneratedUnique,
+            3 => TrustCenterKeyOrigin::ApplicationProvisioned,
+            _ => return Err(OpError::InvalidParameter),
+        };
+        let attributes = match key.attrs {
+            0 => TrustCenterKeyAttributes::Provisional,
+            1 => TrustCenterKeyAttributes::Unverified,
+            2 => TrustCenterKeyAttributes::Verified,
+            _ => return Err(OpError::InvalidParameter),
+        };
+        // The parent of a non-child is not in the backup: its location
+        // stays unknown until it is heard (its next Update-Device).
+        let location = key.nwk.filter(|_| key.child).map(|nwk| (self.ieee, nwk));
+        self.app
+            .restore_link_key(key.ieee, key.key, origin, attributes, location)
+    }
+
     async fn set_ieee(&mut self, ieee: [u8; 8]) -> Result<(), OpError> {
         if self.running {
             return Err(OpError::InvalidState);
@@ -1243,6 +1297,17 @@ impl<T: TcApp + ?Sized> TcApp for &mut T {
 
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
         (**self).forget_device(ieee)
+    }
+
+    fn restore_link_key(
+        &mut self,
+        ieee: [u8; 8],
+        key: [u8; 16],
+        origin: zigbee_bdb::trust_center::TrustCenterKeyOrigin,
+        attributes: zigbee_bdb::trust_center::TrustCenterKeyAttributes,
+        location: Option<([u8; 8], u16)>,
+    ) -> Result<(), OpError> {
+        (**self).restore_link_key(ieee, key, origin, attributes, location)
     }
 }
 

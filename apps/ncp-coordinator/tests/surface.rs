@@ -1070,7 +1070,7 @@ fn restore_keeps_ncp_children_and_their_keys() {
         link: Some(LinkBlock {
             key: DEVICE_KEY,
             key_seq: 0,
-            attrs: 0,
+            attrs: 2,
             origin: 2,
             tx_counter: 0,
             rx_floor: 0,
@@ -1115,5 +1115,10 @@ fn restore_keeps_ncp_children_and_their_keys() {
     assert_eq!(view.ieee, DEVICE_IEEE);
     assert_eq!(view.nwk, Some(0x4C21));
     assert_eq!(view.child, Some((0x80, 9)));
-    assert_eq!(view.link.map(|link| link.key), Some(DEVICE_KEY));
+    let link = view.link.expect("restored key");
+    assert_eq!(link.key, DEVICE_KEY);
+    // A verified generated key stays one (not "provisioned"): a
+    // factory-reset device re-pairing gets the network key under the
+    // global key, and the device may secure-rejoin.
+    assert_eq!((link.origin, link.attrs), (2, 2));
 }

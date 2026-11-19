@@ -484,6 +484,24 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         self.upsert_table_device(device, &address, false)
     }
 
+    /// Restore a device's link key from a backup with its origin,
+    /// verification state and location
+    /// ([`zigbee_bdb::trust_center::TrustCenterTable::restore_link_key`]).
+    pub fn restore_link_key<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        address: IeeeAddress,
+        key: [u8; 16],
+        origin: zigbee_bdb::trust_center::TrustCenterKeyOrigin,
+        attributes: zigbee_bdb::trust_center::TrustCenterKeyAttributes,
+        location: Option<(IeeeAddress, ShortAddress)>,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        self.require_initialized_network(device)?;
+        self.table
+            .restore_link_key(address, key, origin, attributes, location)?;
+        self.upsert_table_device(device, &address, false)
+    }
+
     /// Forget a device at the host's request (`TBL_INVALIDATE`, spec 8.3
     /// I5): its Trust Center record and unique link key are durably dropped
     /// without sending anything on air. `Ok(false)` when it was unknown.
