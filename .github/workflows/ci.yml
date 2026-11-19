@@ -1636,6 +1636,12 @@ jobs:
             chip: esp32h2
             features: esp32h2,transport-uart,thread-br-h2,flash-2mb
             csv: esp32h2-ncp-2mb.csv
+          # PTA coexistence follower (`pta`; off until the host sets
+          # coex_enable). Not yet proven on hardware.
+          - name: h2-thread-br-pta
+            chip: esp32h2
+            features: esp32h2,transport-uart,thread-br-h2,pta
+            csv: esp32h2-ncp-4mb.csv
           - name: c6-usj
             chip: esp32c6
             features: esp32c6,transport-usj

@@ -20,6 +20,8 @@
 # the reclaimed bootloader RAM (`dram2_seg`): H2 USJ 81 964 B usable, a
 # 45 676 B gap; H2 Thread-BR 79 348 B usable, 1 472 B interrupts, a 42 820 B
 # gap; C6 271 316 B usable. Not measured on hardware.
+# With the rest of the NCP surface (2026-11-19: TABLES, BACKUP staging,
+# retry cache, FW/IEEE/PTA services): H2 USJ 77 756 B usable, a 41 420 B gap.
 --min-gap
 16384
 
@@ -59,8 +61,11 @@ RingLogger as log::Log>::log$
 # measured on the fix build, rounded up to the next 512 B. A regression fails.
 --chain-budget
 boot=^esp32_ncp::compose$=33280
+# serve: +1 760 B in the root future's poll frame (2026-11-19) for the
+# operations that install a network from the host (NWK_FORM with host
+# identity, BKP_RESTORE_COMMIT, SYS_SET_IEEE): 30 720 B, all variants.
 --chain-budget
-serve=^esp32_ncp::serve$=29696
+serve=^esp32_ncp::serve$=30720
 # Trust Center: initialization, the step's TC service and persistence. Before
 # the in-place state fix these were 485-576 KiB (whole-state clones).
 --chain-budget

@@ -224,3 +224,34 @@ fn the_product_policy_trusts_the_devkit_signed_ota_keys() {
     assert!(!policy.keys.is_empty());
     assert_eq!(policy.dev_build, cfg!(feature = "dev-unsigned-fw"));
 }
+
+#[derive(Default)]
+struct FakeCoex(Rc<RefCell<Vec<(bool, u8)>>>);
+
+impl CoexControl for FakeCoex {
+    fn set(&mut self, enable: bool, priority_mask: u8) -> Result<(), PlatformError> {
+        if priority_mask > 0x0F {
+            return Err(PlatformError::InvalidParameter);
+        }
+        self.0.borrow_mut().push((enable, priority_mask));
+        Ok(())
+    }
+}
+
+#[test]
+fn factory_ieee_and_attached_pta_are_platform_services() {
+    let (mut platform, _) = boot(&MockFlash::new(), &Settings::default(), 0);
+    assert_eq!(platform.factory_ieee(), None);
+    assert_eq!(platform.set_pta(true, 1), Err(PlatformError::Unsupported));
+    platform.set_factory_ieee([7; 8]);
+    assert_eq!(platform.factory_ieee(), Some([7; 8]));
+    let log = Rc::new(RefCell::new(Vec::new()));
+    platform.attach_coex(Box::leak(Box::new(FakeCoex(log.clone()))));
+    assert!(platform.pta_supported());
+    assert_eq!(platform.set_pta(true, 0x05), Ok(()));
+    assert_eq!(
+        platform.set_pta(false, 0x10),
+        Err(PlatformError::InvalidParameter)
+    );
+    assert_eq!(*log.borrow(), [(true, 0x05)]);
+}

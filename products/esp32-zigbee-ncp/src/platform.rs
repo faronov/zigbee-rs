@@ -73,6 +73,14 @@ pub enum TrialPoll {
     Expired { rolled_back: Option<u8> },
 }
 
+/// PTA arbitration a board can attach ([`Platform::attach_coex`]; spec
+/// 11.5, `crate::pta::Pta` on the Thread BR board).
+pub trait CoexControl {
+    /// Enable/disable with `coex_tx_priority_mask`; validates the mask even
+    /// when disabling.
+    fn set(&mut self, enable: bool, priority_mask: u8) -> Result<(), PlatformError>;
+}
+
 /// The product platform over an OTA flash `F` and the identity journal `S`.
 pub struct Platform<F: OtaFlash, S: SettingsStore> {
     fw: Option<FwUpdate<F>>,
@@ -80,6 +88,8 @@ pub struct Platform<F: OtaFlash, S: SettingsStore> {
     boot_ieee: Option<[u8; 8]>,
     identity_error: Option<IdentityError>,
     trial_deadline_ms: Option<u64>,
+    factory_ieee: Option<[u8; 8]>,
+    coex: Option<&'static mut dyn CoexControl>,
 }
 
 impl<F: OtaFlash, S: SettingsStore> Platform<F, S> {
@@ -130,6 +140,8 @@ impl<F: OtaFlash, S: SettingsStore> Platform<F, S> {
                 boot_ieee,
                 identity_error,
                 trial_deadline_ms,
+                factory_ieee: None,
+                coex: None,
             },
             outcome,
         )
@@ -139,6 +151,17 @@ impl<F: OtaFlash, S: SettingsStore> Platform<F, S> {
     /// `SYS_SET_IEEE` takes effect at the next boot.
     pub fn boot_ieee_override(&self) -> Option<[u8; 8]> {
         self.boot_ieee
+    }
+
+    /// The factory EUI-64 (eFuse), read by the composition root before the
+    /// override is applied (`SYS_GET_INFO.ieee_factory`, `SYS_SET_IEEE FF…`).
+    pub fn set_factory_ieee(&mut self, ieee: [u8; 8]) {
+        self.factory_ieee = Some(ieee);
+    }
+
+    /// The board's PTA lines (`PTA_COEX`).
+    pub fn attach_coex(&mut self, coex: &'static mut dyn CoexControl) {
+        self.coex = Some(coex);
     }
 
     /// Why the identity item could not be read at boot, if it could not.
@@ -242,6 +265,21 @@ impl<F: OtaFlash, S: SettingsStore> NcpPlatform for Platform<F, S> {
 
     fn fw_trial_pending(&self) -> bool {
         self.trial_deadline_ms.is_some()
+    }
+
+    fn factory_ieee(&self) -> Option<[u8; 8]> {
+        self.factory_ieee
+    }
+
+    fn pta_supported(&self) -> bool {
+        self.coex.is_some()
+    }
+
+    fn set_pta(&mut self, enable: bool, priority_mask: u8) -> Result<(), PlatformError> {
+        match self.coex.as_mut() {
+            Some(coex) => coex.set(enable, priority_mask),
+            None => Err(PlatformError::Unsupported),
+        }
     }
 
     fn ieee_rewritable(&self) -> bool {

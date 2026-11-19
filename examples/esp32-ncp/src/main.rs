@@ -197,10 +197,21 @@ fn main() -> ! {
         peripherals.DMA_CH0,
     );
 
+    let mut factory_ieee = [0; 8];
     let port = compose(
         peripherals.IEEE802154,
         peripherals.AES,
         platform.boot_ieee_override(),
+        &mut factory_ieee,
+    );
+    platform.set_factory_ieee(factory_ieee);
+    #[cfg(feature = "pta")]
+    attach_pta(
+        platform,
+        peripherals.GPIO0,
+        peripherals.GPIO1,
+        peripherals.GPIO2,
+        peripherals.GPIO3,
     );
     let identity = NcpIdentity {
         fw_version: env!("CARGO_PKG_VERSION"),
@@ -294,6 +305,7 @@ fn compose(
     radio: esp_hal::peripherals::IEEE802154<'static>,
     aes: esp_hal::peripherals::AES<'static>,
     ieee_override: Option<[u8; 8]>,
+    factory_ieee: &mut [u8; 8],
 ) -> Port {
     static PROFILE: StaticCell<Profile> = StaticCell::new();
     let profile = PROFILE.init(DeviceProfile::new(
@@ -302,7 +314,7 @@ fn compose(
         DeviceId::COMBINED_INTERFACE,
         RangeExtender,
     ));
-    let (device, ieee) = compose_device(radio, aes, ieee_override, profile);
+    let (device, ieee) = compose_device(radio, aes, ieee_override, profile, factory_ieee);
     let security = compose_security(device, ieee);
     let app = compose_app(ZigbeeNode::new(device, security, profile));
     // GP combo: Proxy and Sink Tables in the `zbnv` GP journal.
@@ -319,10 +331,11 @@ fn compose_device(
     aes: esp_hal::peripherals::AES<'static>,
     ieee_override: Option<[u8; 8]>,
     profile: &Profile,
+    factory_ieee: &mut [u8; 8],
 ) -> (&'static mut ZigbeeDevice<Mac, Router>, [u8; 8]) {
     static DEVICE: StaticCell<ZigbeeDevice<Mac, Router>> = StaticCell::new();
     let mut ieee = [0; 8];
-    let device = device_builder(radio, aes, ieee_override, profile, &mut ieee)
+    let device = device_builder(radio, aes, ieee_override, profile, &mut ieee, factory_ieee)
         .build_coordinator_into(DEVICE.uninit());
     (device, ieee)
 }
@@ -335,6 +348,7 @@ fn radio_mac(
     radio: esp_hal::peripherals::IEEE802154<'static>,
     aes: esp_hal::peripherals::AES<'static>,
     ieee_override: Option<[u8; 8]>,
+    factory_ieee: &mut [u8; 8],
 ) -> Mac {
     let ieee802154 = esp_radio::ieee802154::Ieee802154::new(radio);
     let mut phy =
@@ -345,6 +359,8 @@ fn radio_mac(
     let Ok(mut mac) = phy.into_parent_mac() else {
         halt()
     };
+    // The eFuse EUI-64, before the override replaces it.
+    *factory_ieee = mac.pib().extended_address();
     if let Some(ieee) = ieee_override
         && mac
             .set_pib(
@@ -368,8 +384,9 @@ fn device_builder(
     ieee_override: Option<[u8; 8]>,
     profile: &Profile,
     ieee: &mut [u8; 8],
+    factory_ieee: &mut [u8; 8],
 ) -> zigbee_runtime::builder::DeviceBuilder<Mac> {
-    let mac = radio_mac(radio, aes, ieee_override);
+    let mac = radio_mac(radio, aes, ieee_override, factory_ieee);
     // The active IEEE: the override, else the factory eFuse EUI-64.
     *ieee = mac.pib().extended_address();
     if *ieee == [0; 8] || *ieee == [0xFF; 8] {
@@ -441,13 +458,15 @@ async fn run(
         if let TrialPoll::Expired { .. } = platform.poll_trial(now_ms()) {
             esp_hal::system::software_reset();
         }
-        if let Some(PlatformRequest::Reset { .. }) = ncp.service(now_us(), host, port, &LOG) {
+        if let Some(PlatformRequest::Reset { .. }) =
+            ncp.service_with(now_us(), host, port, platform, &LOG)
+        {
             // Mode 1 (ROM download) is entered by the host through the USJ
             // DTR/RTS lines or the board's BOOT line; both modes reboot.
             esp_hal::system::software_reset();
         }
-        while ncp.drive(port, now_us).await {
-            ncp.service(now_us(), host, port, &LOG);
+        while ncp.drive_with(port, platform, now_us).await {
+            ncp.service_with(now_us(), host, port, platform, &LOG);
         }
         let dropped = zigbee_runtime::host_passthrough::take_dropped();
         if dropped != 0 {
@@ -511,4 +530,19 @@ fn new_ncp(
     cookie: u32,
 ) -> &'static mut Ncp<LOG_RECORDS> {
     Ncp::new_into(slot, identity, cookie, now_us())
+}
+
+/// The Thread BR board's PTA lines, disabled until the host sets
+/// `coex_enable` (spec 11.5).
+#[cfg(feature = "pta")]
+#[inline(never)]
+fn attach_pta(
+    platform: &mut EspPlatform,
+    request: esp_hal::peripherals::GPIO0<'static>,
+    grant: esp_hal::peripherals::GPIO1<'static>,
+    priority: esp_hal::peripherals::GPIO2<'static>,
+    tx_line: esp_hal::peripherals::GPIO3<'static>,
+) {
+    static PTA: StaticCell<product::pta::Pta<'static>> = StaticCell::new();
+    platform.attach_coex(PTA.init(product::pta::Pta::new(request, grant, priority, tx_line)));
 }

@@ -502,3 +502,23 @@ mod tests {
         }
     }
 }
+
+#[cfg(target_os = "none")]
+impl crate::platform::CoexControl for Pta<'static> {
+    fn set(
+        &mut self,
+        enable: bool,
+        priority_mask: u8,
+    ) -> Result<(), ncp_coordinator_app::platform::PlatformError> {
+        use ncp_coordinator_app::platform::PlatformError;
+        Pta::set(self, enable, priority_mask).map_err(|error| {
+            log::warn!("[PTA] refused: {:?}", error);
+            match error {
+                PtaError::ReservedBits(_) => PlatformError::InvalidParameter,
+                PtaError::UnsupportedClass(_) => PlatformError::Unsupported,
+                PtaError::RadioOff => PlatformError::InvalidState,
+                PtaError::Arbiter(_) => PlatformError::Hardware,
+            }
+        })
+    }
+}
