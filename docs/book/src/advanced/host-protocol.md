@@ -1144,7 +1144,7 @@ Enabling `flow = 1` is refused with `UNSUPPORTED_COMMAND` unless the board
 has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 
 `chip` values: 1 ESP32-H2, 2 ESP32-C6, 3 nRF52840, 4 EFR32MG21, 5 EFR32MG22,
-6 TLSR8258, 7 BL702, 8 STM32WB55, 9 CC2340R5.
+6 TLSR8258, 7 BL702, 8 STM32WB55, 9 CC2340R5, 10 CC2652P, 11 CC2652P7.
 
 ### 7.2 NETWORK (`0x01xx`, endpoint 2)
 
@@ -1997,6 +1997,14 @@ crate (`zigbee-nwk`, `zigbee-aps`, `zigbee-bdb`, `zigbee-mac`,
 | NWK replay-floor table | 64 | 128 |
 | ESP Frame Pending source table | 16 | 64 |
 | Security-journal replay domains | 112 | 400 (16 KiB sectors required) |
+
+**Compact tier (`ncp-capacity-compact`, CC2652P7).** Parts with less RAM
+than the H2 enable `ncp-coordinator-app/compact`: 128 Trust Center devices
+and link keys, a 256-entry address map, 64 neighbors with 32 children, 64
+source routes, 96 NWK replay floors, an 8-frame link window and 1 KiB
+endpoint queues; journal formats stay those of `ncp-capacity`. The
+negotiated capacities (`SYS_NEGOTIATE`) report the smaller sizes. See the
+[CC26x2 guide](../platform-guides/cc26x2.md).
 
 The streamed Trust Center journal (`trust_center_stream`) writes every chunk
 prefix first and the commit marker of the last chunk last; a snapshot is

@@ -38,6 +38,14 @@ zigbee-gp = { path = "../../zigbee-gp", features = ["sink"] }
 # `zigbee-runtime` dependencies (examples/esp32-ncp). This crate's logic does
 # not depend on it.
 
+[features]
+# Compact NCP for parts with less RAM (CC2652P7, 144 KiB): an 8-frame link
+# window each way (the spec minimum is 4; negotiated), 1 KiB endpoint
+# queues, and the compact stack tables (zigbee-runtime
+# `ncp-capacity-compact`: 128 Trust Center devices). Off by default: images
+# without it are unchanged.
+compact = ["zigbee-runtime/ncp-capacity-compact", "router-app/ncp-capacity-compact"]
+
 [dev-dependencies]
 critical-section = { version = "1.2", features = ["std"] }
 pollster = "0.4"

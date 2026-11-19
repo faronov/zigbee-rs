@@ -1,0 +1,28 @@
+[package]
+name = "cc26x2-dongle-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Product configuration for CC2652P / CC2652P7 USB dongles (Zigbee Router)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+
+[features]
+default = ["zbdongle-p"]
+# Board variant (memory map, CCFG); exactly one.
+zbdongle-p = ["cc26x2-dongle/zbdongle-p"]
+cc2652p7-dongle = ["cc26x2-dongle/cc2652p7-dongle"]
+
+[dependencies]
+cc26x2-dongle = { path = "../../boards/cc26x2-dongle", default-features = false }
+cc26x2-hal = { path = "../../cc26x2-hal" }
+embedded-storage = "0.3"
+router-app = { path = "../../apps/router", default-features = false }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+[dev-dependencies]
+zigbee-mac = { path = "../../zigbee-mac", features = ["mock"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }

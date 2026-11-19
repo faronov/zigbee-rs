@@ -66,7 +66,7 @@ pub const fn routing_random_sample(mut seed: u32) -> u32 {
 
 /// Maximum number of source route table entries.
 #[cfg(feature = "router")]
-pub const MAX_SOURCE_ROUTES: usize = crate::ncp_capacity(32, 128);
+pub const MAX_SOURCE_ROUTES: usize = crate::ncp_capacity_tier(32, 128, 64);
 #[cfg(not(feature = "router"))]
 pub const MAX_SOURCE_ROUTES: usize = 0;
 

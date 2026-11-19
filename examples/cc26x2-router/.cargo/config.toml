@@ -1,0 +1,14 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-L", "../../cc26x2-hal/link",
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=--nmagic",
+    # Panic locations cost ~4 KiB of strings; the panic message stays.
+    "-Zlocation-detail=none",
+]
+
+[unstable]
+build-std = ["core"]

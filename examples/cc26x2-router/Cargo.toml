@@ -1,0 +1,60 @@
+[package]
+name = "cc26x2-router"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+
+# CC2652P / CC2652P7 USB dongle images. One board variant per build:
+#   cargo build --release                                   # ZBDongle-P (default)
+#   cargo build --release --no-default-features --features cc2652p7-dongle
+# Bins: `cc26x2-router` (Zigbee Router) and `cc26x2-lab` (peripheral and
+# radio bring-up gates, never part of the product image).
+[[bin]]
+name = "cc26x2-router"
+path = "src/router.rs"
+
+[[bin]]
+name = "cc26x2-lab"
+path = "src/lab.rs"
+
+[features]
+default = ["zbdongle-p"]
+zbdongle-p = ["cc26x2-dongle-product/zbdongle-p", "cc26x2-dongle/zbdongle-p"]
+cc2652p7-dongle = ["cc26x2-dongle-product/cc2652p7-dongle", "cc26x2-dongle/cc2652p7-dongle"]
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+cc26x2-hal = { path = "../../cc26x2-hal", features = ["rt", "time-driver"] }
+cc26x2-dongle = { path = "../../boards/cc26x2-dongle", default-features = false }
+cc26x2-dongle-product = { path = "../../products/cc26x2-dongle", default-features = false }
+router-app = { path = "../../apps/router", default-features = false, features = ["router"] }
+zigbee-mac = { path = "../../zigbee-mac", features = ["cc26x2"] }
+zigbee-nwk = { path = "../../zigbee-nwk" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["router"] }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+# `tick-hz-32_768` matches the AON RTC driving `cc26x2-hal/time-driver`;
+# zigbee-mac's embassy-time 0.4 and this crate's 0.5 share that driver
+# (`embassy-time-driver` is `links = "embassy-time"`).
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
+embassy-time = "0.5"
+embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
+log = { version = "0.4", features = ["max_level_info", "release_max_level_info"] }
+static_cell = "2"
+
+[profile.dev]
+opt-level = "s"
+debug = true
+
+# `z` and (in .cargo/config.toml) `-Zlocation-detail=none`, with debug and
+# trace log sites compiled out (`log` features above): the CC2652P router
+# must fit the 296 KiB application window of its 352 KiB flash.
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+debug = true
+panic = "abort"

@@ -1,0 +1,44 @@
+[package]
+name = "cc26x2-hal"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust TI CC26x2/CC13x2 (CC2652R/RB/P, CC2652R7/P7, CC1352P/P7) chip services, peripherals and IEEE 802.15.4 RF core driver"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Exactly one chip feature. The chip selects the silicon family (CC26x2
+# rev E `cc13x2_cc26x2` or the 7-series `cc13x2x7_cc26x2x7`), the RF core
+# patch, the TX power table and whether the +20 dBm high-power PA exists.
+# The vendored RF core patches are BSD-3-Clause (see `vendor/ti/README.md`).
+[features]
+# CC13x2/CC26x2 rev E family, standard PA only (+5 dBm).
+cc2652r = ["family-x2"]
+cc2652rb = ["family-x2"]
+# CC13x2/CC26x2 rev E family with the +20 dBm high-power PA.
+cc2652p = ["family-x2", "high-pa"]
+cc1352p = ["family-x2", "high-pa"]
+# CC13x2x7/CC26x2x7 family (704 KiB flash, 144 KiB SRAM).
+cc2652r7 = ["family-x2x7"]
+cc2652p7 = ["family-x2x7", "high-pa"]
+cc1352p7 = ["family-x2x7", "high-pa"]
+# Internal: selected by the chip features above.
+family-x2 = []
+family-x2x7 = []
+high-pa = []
+# Large UART0 RX/TX rings (8 KiB / 2 KiB) for a host link such as the
+# ZRHP NCP (an RX ring of at least rx_window x 656 bytes without RTS/CTS,
+# spec 4.1); without it the rings are 1 KiB / 64 B.
+uart-host-rings = []
+# Provide `__INTERRUPTS` for cortex-m-rt's `device` feature.
+rt = []
+# Embassy time driver on the AON RTC (32,768 Hz). Defines the
+# `AON_RTC_COMB` interrupt handler.
+time-driver = ["dep:embassy-time-driver", "dep:embassy-time-queue-utils"]
+
+[dependencies]
+cortex-m = "0.7"
+embedded-hal = "1.0"
+embedded-storage = "0.3"
+embassy-time-driver = { version = "0.2", optional = true }
+embassy-time-queue-utils = { version = "0.1", optional = true }

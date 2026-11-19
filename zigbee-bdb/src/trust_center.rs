@@ -17,7 +17,7 @@ use zigbee_types::{IeeeAddress, ShortAddress};
 #[cfg(not(feature = "ncp-capacity"))]
 pub const MAX_TRUST_CENTER_DEVICES: usize = 32;
 #[cfg(feature = "ncp-capacity")]
-pub const MAX_TRUST_CENTER_DEVICES: usize = 256;
+pub const MAX_TRUST_CENTER_DEVICES: usize = if COMPACT_TABLES { 128 } else { 256 };
 /// One pending-replacement bit per device slot.
 const PENDING_MASK_WORDS: usize = MAX_TRUST_CENTER_DEVICES.div_ceil(u32::BITS as usize);
 
@@ -1490,7 +1490,7 @@ mod tests {
 }
 
 /// Coordinator NCP Trust Center table (`ncp-capacity`, ZRHP spec 8.9).
-#[cfg(all(test, feature = "ncp-capacity"))]
+#[cfg(all(test, feature = "ncp-capacity", not(feature = "ncp-capacity-compact")))]
 mod ncp_capacity_tests {
     use super::*;
 
@@ -1544,3 +1544,57 @@ mod ncp_capacity_tests {
         assert_eq!(table.devices().count(), MAX_TRUST_CENTER_DEVICES);
     }
 }
+
+/// Compact coordinator NCP Trust Center table (`ncp-capacity-compact`).
+#[cfg(all(test, feature = "ncp-capacity-compact"))]
+mod ncp_capacity_compact_tests {
+    use super::*;
+
+    fn ieee(index: usize) -> IeeeAddress {
+        let [lo, hi] = (index as u16).to_le_bytes();
+        [lo, hi, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C]
+    }
+
+    fn joined(index: usize) -> TrustCenterDevice {
+        TrustCenterDevice {
+            ieee_address: ieee(index),
+            parent_address: [0x11; 8],
+            short_address: ShortAddress(0x1000 + index as u16),
+            link_key: [index as u8; 16],
+            key_origin: TrustCenterKeyOrigin::GeneratedUnique,
+            key_attributes: TrustCenterKeyAttributes::Verified,
+            join_timeout_remaining_secs: 0,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn the_table_holds_128_devices_and_tracks_pending_keys_beyond_bit_31() {
+        assert_eq!(MAX_TRUST_CENTER_DEVICES, 128);
+        let mut table = TrustCenterTable::new();
+        for index in 0..MAX_TRUST_CENTER_DEVICES {
+            table.restore_device(joined(index)).unwrap();
+        }
+        assert_eq!(
+            table.restore_device(joined(MAX_TRUST_CENTER_DEVICES)),
+            Err(TrustCenterError::DeviceTableFull)
+        );
+        for index in [31, 32, 100, 127] {
+            table
+                .install_generated_trust_center_link_key(ieee(index), [0xA7; 16], 2)
+                .unwrap();
+        }
+        for index in 0..MAX_TRUST_CENTER_DEVICES {
+            assert_eq!(
+                table.has_pending_link_key_for(&ieee(index)),
+                matches!(index, 31 | 32 | 100 | 127),
+                "slot {index}"
+            );
+        }
+    }
+}
+
+/// `ncp-capacity-compact`: 128 Trust Center devices (declared last: keeps
+/// the line numbers above unchanged).
+#[cfg(feature = "ncp-capacity")]
+const COMPACT_TABLES: bool = cfg!(feature = "ncp-capacity-compact");

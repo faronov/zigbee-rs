@@ -986,10 +986,16 @@ mod tests {
 
     #[test]
     fn a_full_256_device_snapshot_streams_across_five_chunks_and_round_trips() {
-        assert_eq!(MAX_TRUST_CENTER_DEVICES, 256);
+        // 256 devices in five chunks; `ncp-capacity-compact`: 128 in three.
+        let (devices, chunks) = if cfg!(feature = "ncp-capacity-compact") {
+            (128, 3)
+        } else {
+            (256, 5)
+        };
+        assert_eq!(MAX_TRUST_CENTER_DEVICES, devices);
         let full = state(MAX_TRUST_CENTER_DEVICES, 1, true);
         assert_eq!(full.encoded_len(), MAX_ENCODED_TRUST_CENTER_STATE_LEN);
-        assert_eq!(TRUST_CENTER_STREAM_MAX_CHUNKS, 5);
+        assert_eq!(TRUST_CENTER_STREAM_MAX_CHUNKS, chunks);
         const { assert!(TRUST_CENTER_STREAM_MIN_SECTOR_SIZE <= SECTOR) };
 
         let mut journal = journal(MockFlash::new());
@@ -1001,12 +1007,12 @@ mod tests {
                 generation: 0,
                 sector: 0,
                 slot: 0,
-                slots: 5
+                slots: chunks
             })
         );
         let mut journal = reopen(journal);
         assert_eq!(journal.load(), Ok(Some(full.clone())));
-        assert_eq!(journal.load().unwrap().unwrap().devices().len(), 256);
+        assert_eq!(journal.load().unwrap().unwrap().devices().len(), devices);
         // One more device than the table holds is refused before flash work.
         let mut too_many = full;
         assert_eq!(
@@ -1075,26 +1081,31 @@ mod tests {
 
     #[test]
     fn a_missing_commit_marker_or_bad_crc_falls_back_to_the_previous_snapshot() {
-        let older = state(200, 1, false);
+        let older = state(MAX_TRUST_CENTER_DEVICES * 200 / 256, 1, false);
         let newer = state(MAX_TRUST_CENTER_DEVICES, 2, true);
         let mut journal = journal(MockFlash::new());
         journal.store(&older).unwrap();
         journal.store(&newer).unwrap();
         let located = journal.current.unwrap();
-        assert_eq!((located.sector, located.slots), (1, 5), "rolled over");
+        let chunks = TRUST_CENTER_STREAM_MAX_CHUNKS;
+        assert_eq!(located.slots, chunks);
+        if chunks == 5 {
+            assert_eq!(located.sector, 1, "rolled over");
+        }
         let flash = journal.into_storage();
         fn chunk(flash: &mut MockFlash, slot: usize, index: usize) -> &mut [u8] {
-            let start = SECTOR + (slot + index) * SLOT;
+            let start = (slot + index) * SLOT;
             &mut flash.bytes[start..start + SLOT]
         }
-        let slot = located.slot;
+        // Absolute slot index of the newest snapshot's first chunk.
+        let slot = located.sector * (SECTOR / SLOT) + located.slot;
 
         // Payload bit error in a middle chunk.
         let mut corrupted = MockFlash {
             bytes: flash.bytes.clone(),
             ..MockFlash::new()
         };
-        chunk(&mut corrupted, slot, 2)[HEADER_LEN + 100] ^= 0x04;
+        chunk(&mut corrupted, slot, chunks / 2)[HEADER_LEN + 100] ^= 0x04;
         assert_eq!(journal_load(corrupted), Some(older.clone()));
         // Chunk CRC damaged.
         let mut corrupted = MockFlash {
@@ -1108,14 +1119,14 @@ mod tests {
             bytes: flash.bytes.clone(),
             ..MockFlash::new()
         };
-        chunk(&mut uncommitted, slot, 4)[COMMIT_OFFSET..COMMIT_OFFSET + 4].fill(0xFF);
+        chunk(&mut uncommitted, slot, chunks - 1)[COMMIT_OFFSET..COMMIT_OFFSET + 4].fill(0xFF);
         assert_eq!(journal_load(uncommitted), Some(older.clone()));
         // A missing middle chunk (erased slot).
         let mut missing = MockFlash {
             bytes: flash.bytes.clone(),
             ..MockFlash::new()
         };
-        chunk(&mut missing, slot, 3).fill(0xFF);
+        chunk(&mut missing, slot, chunks - 2).fill(0xFF);
         assert_eq!(journal_load(missing), Some(older.clone()));
         // A chunk from another generation spliced in.
         let mut spliced = MockFlash {

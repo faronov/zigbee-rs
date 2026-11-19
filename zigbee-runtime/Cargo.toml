@@ -79,6 +79,11 @@ ncp-capacity = [
     "zigbee-mac/ncp-capacity",
     "zigbee-nwk/ncp-capacity",
 ]
+# Compact coordinator NCP tables (128 Trust Center devices and link keys,
+# 256 address-map entries, 64 neighbors with 32 children, 64 source routes)
+# for parts with less RAM (CC2652P7). Off by default: images without it are
+# unchanged.
+ncp-capacity-compact = ["ncp-capacity", "zigbee-bdb/ncp-capacity-compact"]
 # Network co-processor: APS data frames for application endpoints go to a
 # bounded host queue (`host_passthrough`) instead of the ZCL dispatcher, with
 # the last hop RSSI and the APS security/key source; neighbour departures,

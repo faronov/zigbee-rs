@@ -27,6 +27,10 @@ ncp-capacity = ["router"]
 # parent learns each child's poll interval from its Data Requests
 # (`poll_estimate`). Off by default: images without it are unchanged.
 adaptive-indirect = ["router"]
+# Compact coordinator NCP tables (address map 256, 64 neighbors with 32
+# children, 64 source routes, 64 replay floors) for parts with less RAM.
+# Off by default: images without it are unchanged.
+ncp-capacity-compact = ["ncp-capacity"]
 # Network co-processor: record neighbour Leave indications (with the rejoin
 # bit) and aged-out children for the host (`host_events`). Off by default:
 # images without it are unchanged.

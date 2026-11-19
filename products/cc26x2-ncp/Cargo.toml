@@ -1,0 +1,30 @@
+[package]
+name = "cc26x2-ncp-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "ZRHP network co-processor product for CC2652P7 / CC2652P USB dongles"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[features]
+default = ["cc2652p7-dongle"]
+# Board variant (memory map, CCFG); exactly one.
+cc2652p7-dongle = ["cc26x2-dongle/cc2652p7-dongle"]
+zbdongle-p = ["cc26x2-dongle/zbdongle-p"]
+
+[dependencies]
+cc26x2-dongle = { path = "../../boards/cc26x2-dongle", default-features = false }
+cc26x2-hal = { path = "../../cc26x2-hal", features = ["uart-host-rings"] }
+embedded-storage = "0.3"
+ncp-coordinator-app = { path = "../../apps/ncp-coordinator", features = ["compact"] }
+router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity", "ncp-capacity-compact", "green-power-sink"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = [
+    "centralized-tclk",
+    "trust-center",
+    "global-aps-counter",
+    "host-passthrough",
+    "ncp-capacity",
+    "ncp-capacity-compact",
+    "green-power-ncp",
+] }
