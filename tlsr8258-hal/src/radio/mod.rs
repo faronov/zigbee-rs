@@ -762,6 +762,11 @@ impl RxQueue {
 ///   value that never approaches the capacity means the bound is generous,
 ///   and a value pinned at the capacity alongside a rising
 ///   `queue_overflow - queue_evicted` means it is too small.
+/// - `ack_withheld` counts ACK-requested frames for this node whose software
+///   ACK was withheld because the queue would have dropped them outright.
+///   Each is also counted in `queue_overflow`; the sender's MAC retries
+///   deliver it once the queue drains. Without this counter a withheld ACK
+///   could only be inferred from `queue_evicted` staying 0.
 /// - `serviced_irq` versus `serviced_polled` shows which servicing path is
 ///   actually running; `serviced_irq == 0` on an `rx_on_when_idle` router
 ///   means the RF interrupt is not reaching [`handle_irq`].
@@ -781,6 +786,10 @@ pub struct RxDiagnostics {
     pub queue_high_water: u8,
     pub serviced_irq: u32,
     pub serviced_polled: u32,
+    /// ACK-requested frames for this node whose software ACK was withheld
+    /// because the receive queue would have dropped them. Each one is also
+    /// counted in `queue_overflow`; the sender's MAC retries deliver it.
+    pub ack_withheld: u32,
 }
 
 /// Exclusive handle to the TLSR8258 radio/DMA engine.
@@ -1725,6 +1734,7 @@ mod hw {
     static mut ACK_PENDING_ACTIVE: u8 = 0;
     static mut SOFTWARE_ACK_COUNT: u32 = 0;
     static mut SOFTWARE_ACK_TIMEOUT_COUNT: u32 = 0;
+    static mut SOFTWARE_ACK_WITHHELD_COUNT: u32 = 0;
     static mut ACTIVE_RX_INDEX: u8 = 0;
     static mut RX_ARMED_AFTER_TX: u8 = 0;
     static mut RX_ON_WHEN_IDLE: u8 = 0;
@@ -1959,6 +1969,9 @@ mod hw {
                 serviced_irq: core::ptr::read_volatile(core::ptr::addr_of!(RX_SERVICED_IRQ_COUNT)),
                 serviced_polled: core::ptr::read_volatile(core::ptr::addr_of!(
                     RX_SERVICED_POLLED_COUNT
+                )),
+                ack_withheld: core::ptr::read_volatile(core::ptr::addr_of!(
+                    SOFTWARE_ACK_WITHHELD_COUNT
                 )),
             }
         }
@@ -2948,6 +2961,10 @@ mod hw {
         // deliver it after the consumer drains the queue. Only reachable
         // while the queue is full, so the normal turnaround is unchanged.
         if unsafe { (*core::ptr::addr_of!(IRQ_RX_QUEUE)).would_drop(RxPriority::Local) } {
+            unsafe {
+                let ptr = core::ptr::addr_of_mut!(SOFTWARE_ACK_WITHHELD_COUNT);
+                core::ptr::write_volatile(ptr, core::ptr::read_volatile(ptr).wrapping_add(1));
+            }
             return false;
         }
 
