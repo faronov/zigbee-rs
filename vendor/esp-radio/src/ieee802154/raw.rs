@@ -496,7 +496,7 @@ fn transmit_inner(
 ) -> Result<(), super::Error> {
     use super::suspend::Boundary;
     STATE.with(|state| {
-        match state.state {
+        #[cfg(feature = "ieee802154-tx-ack-watchdog")] tx_ack_watchdog::recover(state); match state.state {
             Ieee802154State::Sleep => return Err(super::Error::Sleeping),
             Ieee802154State::Transmit | Ieee802154State::TxAck => return Err(super::Error::Busy),
             _ if events() != 0
@@ -611,14 +611,14 @@ fn rx_queue_blocks_tx(state: &IeeeState) -> bool {
 }
 
 pub(crate) fn can_transmit() -> Result<(), super::Error> {
-    STATE.with(|state| match state.state {
+    STATE.with(|state| { #[cfg(feature = "ieee802154-tx-ack-watchdog")] tx_ack_watchdog::recover(state); match state.state {
         Ieee802154State::Sleep => Err(super::Error::Sleeping),
         Ieee802154State::Transmit | Ieee802154State::TxAck => Err(super::Error::Busy),
         _ if events() != 0 || receive_in_progress() => Err(super::Error::Busy),
         #[cfg(feature = "ieee802154-triggered-tx")]
         _ if triggered_waiting() => Err(super::Error::Busy),
         _ => Ok(()),
-    })
+    }})
 }
 
 struct SleepBoundary<'a>(&'a mut IeeeState);
@@ -859,7 +859,7 @@ pub(crate) fn ensure_receive_enabled() {
     // is in its automatic-ACK turnaround; RxStart then aborts the ACK, and
     // an inbound frame would be cut off.
     STATE.with(|state| {
-        if state.state == Ieee802154State::Receive && events() == 0 && !receive_in_progress() {
+        #[cfg(feature = "ieee802154-tx-ack-watchdog")] tx_ack_watchdog::recover(state); if state.state == Ieee802154State::Receive && events() == 0 && !receive_in_progress() {
             set_cmd(Command::RxStart);
         }
     });
@@ -965,7 +965,7 @@ fn zb_mac_handler() {
                     &RX_BUFFER[1..][..RX_BUFFER[0] as usize]
                 };
                 if will_auto_send_ack(frm) {
-                    state.state = Ieee802154State::TxAck; #[cfg(feature = "ieee802154-extcoex")] extcoex::tx_stage();
+                    state.state = Ieee802154State::TxAck; #[cfg(feature = "ieee802154-extcoex")] extcoex::tx_stage(); #[cfg(feature = "ieee802154-tx-ack-watchdog")] tx_ack_watchdog::armed();
                 } else if should_send_enhanced_ack(frm) {
                     // TODO
                 } else {
@@ -1239,4 +1239,76 @@ pub(crate) mod extcoex {
     pub(crate) fn rx_stage() {
         unsafe { esp_coex_ieee802154_extcoex_rx_stage() };
     }
+}
+
+/// Local patch `ieee802154-debug-state` (declared last): the driver state a
+/// stalled radio is diagnosed from: `(state, pending events, hardware
+/// rx_state, queued frames)`; state 0 idle, 1 receive, 2 transmit, 3 TX
+/// ACK, 4 sleep.
+pub(crate) fn debug_state() -> (u8, u16, u8, u8) {
+    let pending = events();
+    let rx_state = IEEE802154::regs().rx_status().read().rx_state().bits() as u8;
+    STATE.with(|state| {
+        let code = match state.state {
+            Ieee802154State::Idle => 0,
+            Ieee802154State::Receive => 1,
+            Ieee802154State::Transmit => 2,
+            Ieee802154State::TxAck => 3,
+            Ieee802154State::Sleep => 4,
+        };
+        (code, pending, rx_state, state.rx_queue.len() as u8)
+    })
+}
+
+/// Local patch `ieee802154-tx-ack-watchdog` (declared last): RX_DONE of a
+/// frame with the ACK-request bit enters `TxAck`, which only `AckTxDone` or
+/// an RX abort leaves. When neither arrives (observed on an ESP32-H2
+/// coordinator with a sleepy child: state `TxAck`, no event pending, the
+/// receiver idle) every transmission is refused as busy and the receiver is
+/// never restarted. A `TxAck` older than any automatic ACK (192 µs
+/// turnaround + 352 µs frame), with nothing pending and nothing on the air,
+/// is left like an aborted ACK.
+#[cfg(feature = "ieee802154-tx-ack-watchdog")]
+mod tx_ack_watchdog {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use super::{IeeeState, Ieee802154State};
+
+    static SINCE_US: AtomicU32 = AtomicU32::new(0);
+    static RECOVERED: AtomicU32 = AtomicU32::new(0);
+    const LIMIT_US: u32 = 2_000;
+
+    fn now_us() -> u32 {
+        esp_hal::time::Instant::now()
+            .duration_since_epoch()
+            .as_micros() as u32
+    }
+
+    #[inline(always)]
+    pub(super) fn armed() {
+        SINCE_US.store(now_us(), Ordering::Relaxed);
+    }
+
+    pub(super) fn recover(state: &mut IeeeState) {
+        if state.state == Ieee802154State::TxAck
+            && super::events() == 0
+            && !super::receive_in_progress()
+            && now_us().wrapping_sub(SINCE_US.load(Ordering::Relaxed)) > LIMIT_US
+        {
+            RECOVERED.fetch_add(1, Ordering::Relaxed);
+            super::next_operation_inner(state);
+        }
+    }
+
+    /// Stalled `TxAck` states left since boot.
+    pub(crate) fn recovered() -> u32 {
+        RECOVERED.load(Ordering::Relaxed)
+    }
+}
+
+/// `TxAck` stalls the watchdog left (local patch
+/// `ieee802154-tx-ack-watchdog`).
+#[cfg(feature = "ieee802154-tx-ack-watchdog")]
+pub(crate) fn tx_ack_recoveries() -> u32 {
+    tx_ack_watchdog::recovered()
 }

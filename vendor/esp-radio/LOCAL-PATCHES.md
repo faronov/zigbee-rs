@@ -365,3 +365,38 @@ at the end of `raw.rs`/`mod.rs`.
   caller's TX-done timeout reports it.
 - **Hardware:** not yet run on the Thread BR board
   (`examples/esp32-ncp` `pta_lab`).
+
+## Leave a stalled `TxAck` (`ieee802154-tx-ack-watchdog`)
+
+Opt-in cargo feature (only the ZRHP NCP image enables it, so the shipped
+sensor/router images stay byte-identical); a residual case of the
+`ieee802154-tx-ack-abort` stall.
+
+- **Observed:** the ESP32-H2 NCP on the Thread BR board (coordinator, one
+  sleepy ESP32-C6 child, hwlab sessions `2026-11-19T065841Z-zrhp-ncp-c6-join`
+  and `…071539Z-zrhp-ncp-c6-join3`). Right after the child's APS Verify-Key
+  (ACKed on air), the NCP stopped acknowledging every Data Request and
+  refused every transmission (`ChannelAccessFailure` on each broadcast)
+  until it was reset. The diagnostic read (`debug_state`) showed state
+  `TxAck`, no event pending, receiver idle (`rx_state 0`), empty queue: an
+  automatic ACK that produced neither `AckTxDone` nor an RX abort. The
+  Verify-Key makes the Trust Center commit its journal to flash at once.
+- **Fix:** RX_DONE timestamps entry into `TxAck`; `can_transmit`,
+  `transmit_*` and `ensure_receive_enabled` (every receive poll) leave a
+  `TxAck` older than 2 ms (an automatic ACK takes 192 µs + 352 µs) when no
+  event is pending and nothing is on the air, like an aborted ACK
+  (`next_operation`). `tx_ack_recoveries()` counts the recoveries.
+- **Hardware:** with the feature the same join sequence completed (four
+  stalls left within ≤ 2 ms each, `[RADIO] stalled automatic ACK left`),
+  sniffer-confirmed.
+- **Edits:** same-line additions in `raw.rs` (the RX_DONE `TxAck` line, the
+  first statements of `can_transmit`, `transmit_inner` and
+  `ensure_receive_enabled`) and a module appended at the end; mirrored in
+  `vendor/esp-radio-0.18`.
+
+## Driver state for diagnostics (`debug_state`)
+
+`ieee802154::debug_state() -> (state, pending events, hardware rx_state,
+queued frames)`, appended at the end of `raw.rs`/`mod.rs` (unused code is
+not linked). The NCP reports a radio that stays out of "receive, nothing
+pending" for 200 ms (`examples/esp32-ncp` `RadioWatch`).

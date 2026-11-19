@@ -546,3 +546,18 @@ impl Ieee802154<'_> {
 /// `ieee802154-extcoex`, declared last).
 #[cfg(feature = "ieee802154-extcoex")]
 pub use self::raw::extcoex::{CoexPriority, CoexPti, coex_pti, set_coex_pti};
+
+/// The driver state a stalled radio is diagnosed from (local patch
+/// `ieee802154-debug-state`, declared last): `(state, pending events,
+/// hardware rx_state, queued frames)`; state 0 idle, 1 receive, 2 transmit,
+/// 3 TX ACK, 4 sleep.
+pub fn debug_state() -> (u8, u16, u8, u8) {
+    raw::debug_state()
+}
+
+/// `TxAck` stalls left by the watchdog since boot (local patch
+/// `ieee802154-tx-ack-watchdog`, declared last).
+#[cfg(feature = "ieee802154-tx-ack-watchdog")]
+pub fn tx_ack_recoveries() -> u32 {
+    raw::tx_ack_recoveries()
+}
