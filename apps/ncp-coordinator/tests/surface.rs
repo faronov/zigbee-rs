@@ -1122,3 +1122,61 @@ fn restore_keeps_ncp_children_and_their_keys() {
     // global key, and the device may secure-rejoin.
     assert_eq!((link.origin, link.attrs), (2, 2));
 }
+
+#[test]
+fn restoring_an_old_backup_never_lowers_the_outgoing_counters() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let form = host.request(&form_request(0x6B11, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let begin = host.request(&BkpExportBegin { flags: 0x03 });
+    exchange!();
+    let begin = host.response(begin);
+    let begin: BkpExportBeginRsp = begin.body();
+    let read = host.request(&BkpExportRead {
+        txn: begin.txn,
+        max_bytes: 480,
+    });
+    exchange!();
+    let read = host.response(read);
+    let stream = read.payload[2..].to_vec();
+
+    // The NCP keeps running well past the backup (host floors stand in
+    // for weeks of traffic).
+    let init = host.request(&zigbee_zrhp::msg::network::NwkInit {
+        nwk_fc_floor: 0x20_0000,
+        aps_fc_floor: 0x30_0000,
+    });
+    exchange!();
+    assert_eq!(host.response(init).status(), 0);
+    let used = port.frame_counters();
+    assert!(used.nwk_current >= 0x20_0000 && used.aps_current >= 0x30_0000);
+
+    // Wipe, then restore the old backup without margins: the counters
+    // must not go back below what this NCP already used with these keys.
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+    let restore = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 0,
+        aps_margin: 0,
+        expected_records: 6,
+    });
+    exchange!();
+    let restore = host.response(restore);
+    let txn = restore.body::<BkpRestoreBeginRsp>().txn;
+    let mut payload = txn.to_le_bytes().to_vec();
+    payload.extend_from_slice(&stream);
+    let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+    let commit = host.request(&BkpRestoreCommit { txn });
+    exchange!();
+    assert_eq!(host.response(put).status(), 0);
+    let commit = host.response(commit);
+    let commit: BkpRestoreCommitRsp = commit.body();
+    assert!(commit.nwk_fc_start >= used.nwk_limit, "{commit:?} {used:?}");
+    assert!(commit.aps_fc_start >= used.aps_limit, "{commit:?} {used:?}");
+    let after = port.frame_counters();
+    assert!(after.nwk_current >= used.nwk_limit);
+    assert!(after.aps_current >= used.aps_limit);
+}

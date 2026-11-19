@@ -337,6 +337,30 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         })
     }
 
+    /// The highest global outgoing APS counter any key may have used: the
+    /// live state, or (closed runtime) the journal read in place into the
+    /// state buffer, which stays closed. A caller that wipes and installs a
+    /// network with the same keys (an NCP restore) floors the new counter
+    /// here so no key/counter pair is reused. 0 without a journal.
+    #[cfg(feature = "global-aps-counter")]
+    pub fn outgoing_aps_bound<M: MacDriver>(
+        &mut self,
+        device: &ZigbeeDevice<M>,
+    ) -> Result<u32, TrustCenterRuntimeError> {
+        if self.live {
+            return Ok(global_aps_start(&self.state, device));
+        }
+        if self.store.load_into(&mut self.state)? {
+            let bound = global_aps_start(&self.state, device);
+            // Scratch only: initialization reloads and resets it.
+            self.state.reset([0; 8]);
+            Ok(bound)
+        } else {
+            self.state.reset([0; 8]);
+            Ok(0)
+        }
+    }
+
     /// Raise the global outgoing APS counter to at least `floor` (a host
     /// checkpoint floor or a restore start) and durably reserve a range
     /// above it before any further APS-secured transmission.
