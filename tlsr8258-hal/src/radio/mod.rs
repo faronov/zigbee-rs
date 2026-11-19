@@ -2045,7 +2045,11 @@ mod hw {
 
         let restore_rx = begin_radio_operation();
         set_rx_armed_after_tx(false);
+        #[cfg(feature = "lab-radio-log")]
+        lab_radio_log::set_ctx(lab_radio_log::CTX_CSMA);
         if !perform_csma_ca(csma) {
+            #[cfg(feature = "lab-radio-log")]
+            lab_radio_log::set_ctx(lab_radio_log::CTX_IDLE);
             end_radio_operation(restore_rx);
             return Err(TxOutcome::ChannelAccessFailure);
         }
@@ -2061,6 +2065,8 @@ mod hw {
         // Settle delay before triggering DMA, matching the proven sensor-lab
         // sequence (PLL/analog settle after the mode-register write).
         timer::sleep_ticks(timer::ms(1) / 4); // ~0.25 ms fixed pause
+        #[cfg(feature = "lab-radio-log")]
+        let tx_start_ticks = timer::now_ticks();
         phy::tx_pkt(tx_ptr);
 
         let ok = timer::wait_until(TX_TIMEOUT_TICKS, phy::tx_done);
@@ -2076,12 +2082,53 @@ mod hw {
             phy::set_trx_off();
             set_rx_armed(false);
         }
+        #[cfg(feature = "lab-radio-log")]
+        let window_ticks = {
+            let done = timer::now_ticks();
+            let seq = if mac_frame.len() >= 3 {
+                mac_frame[2]
+            } else {
+                0
+            };
+            lab_radio_log::record(
+                tx_start_ticks,
+                seq,
+                lab_radio_log::TX,
+                mac_frame.len() as u16,
+            );
+            lab_radio_log::record(
+                done,
+                seq,
+                lab_radio_log::TX_DONE,
+                if ok {
+                    (done.wrapping_sub(tx_start_ticks) / timer::TICKS_PER_US).min(0xFFFE) as u16
+                } else {
+                    0xFFFF
+                },
+            );
+            lab_radio_log::set_ctx(lab_radio_log::CTX_ACK_WAIT);
+            done
+        };
         let outcome = if !ok {
             Err(TxOutcome::Timeout)
         } else if ack_wait_ticks == 0 {
             Ok(None)
         } else {
             let ack = wait_for_ack(mac_frame[2], ack_wait_ticks);
+            #[cfg(feature = "lab-radio-log")]
+            {
+                let now = timer::now_ticks();
+                lab_radio_log::record(
+                    now,
+                    mac_frame[2],
+                    if ack.is_some() {
+                        lab_radio_log::ACK_OK
+                    } else {
+                        lab_radio_log::ACK_EXPIRED
+                    },
+                    (now.wrapping_sub(window_ticks) / timer::TICKS_PER_US).min(0xFFFF) as u16,
+                );
+            }
             if super::idle_rx_state(restore_rx) == super::IdleRxState::Off {
                 phy::set_trx_off();
                 set_rx_armed(false);
@@ -2089,6 +2136,8 @@ mod hw {
             }
             Ok(ack)
         };
+        #[cfg(feature = "lab-radio-log")]
+        lab_radio_log::set_ctx(lab_radio_log::CTX_IDLE);
         end_radio_operation(restore_rx);
         outcome
     }
@@ -2195,6 +2244,8 @@ mod hw {
     ) -> u32 {
         let restore_rx = begin_radio_operation();
         let rx_ptr = active_rx_ptr();
+        #[cfg(feature = "lab-radio-log")]
+        lab_radio_log::set_ctx(lab_radio_log::CTX_POLLED);
 
         if !take_rx_armed_after_tx() && !rx_is_armed() {
             phy::set_trx_off();
@@ -2234,6 +2285,8 @@ mod hw {
             unsafe { core::arch::asm!("nop") };
         }
         let elapsed = timer::now_ticks().wrapping_sub(start);
+        #[cfg(feature = "lab-radio-log")]
+        lab_radio_log::set_ctx(lab_radio_log::CTX_IDLE);
         if super::idle_rx_state(restore_rx) == super::IdleRxState::Off {
             phy::set_trx_off();
             set_rx_armed(false);
@@ -2486,6 +2539,11 @@ mod hw {
     #[inline(never)]
     #[unsafe(link_section = ".ram_code")]
     fn take_completed_rx() -> RawRxOutcome {
+        // Lab: was the baseband still inside a packet when RX-done was seen?
+        #[cfg(feature = "lab-radio-log")]
+        if phy::rx_in_progress() {
+            lab_radio_log::note_rx_done_mid_packet();
+        }
         // Anchor RX->TX settling before clearing status or parsing. The
         // pending lookup and ACK encoding run inside the hardware settle.
         let rx_complete_ticks = timer::now_ticks();
@@ -2512,7 +2570,18 @@ mod hw {
 
         let completed =
             unsafe { core::slice::from_raw_parts(completed_rx_ptr.cast_const(), DMA_BUF_LEN) };
-        decode_received_frame(completed)
+        let outcome = decode_received_frame(completed);
+        #[cfg(feature = "lab-radio-log")]
+        lab_radio_log::record_rx(
+            completed,
+            rx_complete_ticks,
+            match outcome {
+                RawRxOutcome::Frame(_) => lab_radio_log::RX_OK,
+                RawRxOutcome::InvalidCrc => lab_radio_log::RX_CRC,
+                RawRxOutcome::InvalidLength => lab_radio_log::RX_LEN,
+            },
+        );
+        outcome
     }
 
     #[inline(always)]
@@ -2769,6 +2838,151 @@ mod hw {
         }
     }
 
+    /// Lab-only radio event log for sniffer correlation of the ACK paths.
+    ///
+    /// Every RX completion (valid, CRC or length failure), every
+    /// [`send_mac_frame_csma`] transmission, its TX-done latency and the
+    /// outcome of its ACK wait append one 8-byte record to a ring a debugger
+    /// polls over SWire (`TLSR_LAB_RADIO_LOG`). Records are written after
+    /// the software-ACK decision and after the TX->RX switch, so they never
+    /// sit inside a turnaround. Never built into production images.
+    ///
+    /// Record: `[ticks, seq | kind << 8 | aux << 16]`. `kind` bits 0..2:
+    /// 0 RX valid, 1 RX CRC failure, 2 RX length failure, 3 TX start
+    /// (`aux` = PSDU length), 4 TX done (`aux` = us since TX start, 0xFFFF
+    /// on timeout), 5 ACK matched, 6 ACK window expired (`aux` = us since
+    /// the window opened), 7 CSMA backoff start; bits 3..4 context: 0
+    /// idle/IRQ, 1 polled window,
+    /// 2 CSMA, 3 ACK wait; bit 5 software ACK sent, bit 6 software ACK
+    /// withheld, bit 7 software ACK TX timeout. RX `aux` = PSDU length |
+    /// RSSI byte << 8. RX `ticks` is the RX-completion anchor taken before
+    /// the software ACK.
+    #[cfg(feature = "lab-radio-log")]
+    pub mod lab_radio_log {
+        pub const RX_OK: u8 = 0;
+        pub const RX_CRC: u8 = 1;
+        pub const RX_LEN: u8 = 2;
+        pub const TX: u8 = 3;
+        pub const TX_DONE: u8 = 4;
+        pub const ACK_OK: u8 = 5;
+        pub const ACK_EXPIRED: u8 = 6;
+        /// CSMA backoff iteration start (`seq` = backoffs so far, `aux` =
+        /// raw RX state register | RX-done << 8) right before TRX off.
+        pub const CSMA_BEGIN: u8 = 7;
+        pub const CTX_IDLE: u8 = 0;
+        pub const CTX_POLLED: u8 = 1 << 3;
+        pub const CTX_CSMA: u8 = 2 << 3;
+        pub const CTX_ACK_WAIT: u8 = 3 << 3;
+        pub const ACK_SENT: u8 = 1 << 5;
+        pub const ACK_WITHHELD: u8 = 1 << 6;
+        pub const ACK_TIMEOUT: u8 = 1 << 7;
+
+        /// Bounded by the router's 4 KiB static-RAM/stack-guard margin; the
+        /// host polls the ring faster than it wraps.
+        const ENTRIES: usize = 64;
+        const MAGIC: u32 = 0x474C_524C; // "LRLG"
+
+        #[repr(C)]
+        pub struct Log {
+            magic: u32,
+            count: u32,
+            ctx: u32,
+            ack: u32,
+            entries: [[u32; 2]; ENTRIES],
+            /// RX completions serviced while the baseband was still inside
+            /// a packet (`reg 0x448` bit 5).
+            rx_done_mid_packet: u32,
+        }
+
+        #[unsafe(no_mangle)]
+        #[used]
+        pub static mut TLSR_LAB_RADIO_LOG: Log = Log {
+            magic: 0,
+            count: 0,
+            ctx: 0,
+            ack: 0,
+            entries: [[0; 2]; ENTRIES],
+            rx_done_mid_packet: 0,
+        };
+
+        #[inline(never)]
+        pub fn note_rx_done_mid_packet() {
+            unsafe {
+                let log = &mut *core::ptr::addr_of_mut!(TLSR_LAB_RADIO_LOG);
+                core::ptr::write_volatile(
+                    &mut log.rx_done_mid_packet,
+                    log.rx_done_mid_packet.wrapping_add(1),
+                );
+            }
+        }
+
+        #[inline(always)]
+        pub fn set_ctx(ctx: u8) {
+            unsafe {
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!(TLSR_LAB_RADIO_LOG.ctx),
+                    ctx as u32,
+                )
+            }
+        }
+
+        #[inline(always)]
+        pub fn ctx() -> u8 {
+            unsafe { core::ptr::read_volatile(core::ptr::addr_of!(TLSR_LAB_RADIO_LOG.ctx)) as u8 }
+        }
+
+        /// Software-ACK decision of the RX completion in progress.
+        #[inline(always)]
+        pub fn note_ack(flags: u8) {
+            unsafe {
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!(TLSR_LAB_RADIO_LOG.ack),
+                    flags as u32,
+                )
+            }
+        }
+
+        #[inline(always)]
+        pub fn take_ack() -> u8 {
+            unsafe {
+                let ptr = core::ptr::addr_of_mut!(TLSR_LAB_RADIO_LOG.ack);
+                let flags = core::ptr::read_volatile(ptr) as u8;
+                core::ptr::write_volatile(ptr, 0);
+                flags
+            }
+        }
+
+        #[inline(never)]
+        pub fn record(ticks: u32, seq: u8, kind: u8, aux: u16) {
+            unsafe {
+                let log = &mut *core::ptr::addr_of_mut!(TLSR_LAB_RADIO_LOG);
+                log.magic = MAGIC;
+                let count = core::ptr::read_volatile(&log.count);
+                let index = count as usize % ENTRIES;
+                core::ptr::write_volatile(
+                    &mut log.entries[index],
+                    [ticks, seq as u32 | (kind as u32) << 8 | (aux as u32) << 16],
+                );
+                core::ptr::write_volatile(&mut log.count, count.wrapping_add(1));
+            }
+        }
+
+        /// Log one RX completion from its raw DMA buffer.
+        #[inline(never)]
+        pub fn record_rx(buf: &[u8], ticks: u32, outcome: u8) {
+            let total = buf[0] as usize;
+            let len = buf[4];
+            let seq = if len >= 3 { buf[7] } else { 0 };
+            let rssi = if (1..=136).contains(&total) {
+                buf[total + 2]
+            } else {
+                0
+            };
+            let kind = outcome | ctx() | take_ack();
+            record(ticks, seq, kind, len as u16 | (rssi as u16) << 8);
+        }
+    }
+
     fn irq_rx_queue_counters() -> (u32, u32, u8) {
         let restore_irq = mask_cpu_rx_irq();
         compiler_fence(Ordering::Acquire);
@@ -2793,6 +3007,13 @@ mod hw {
             let slots = next_random() & ((1u32 << backoff_exponent) - 1);
             let rx_ptr = active_rx_ptr();
 
+            #[cfg(feature = "lab-radio-log")]
+            lab_radio_log::record(
+                timer::now_ticks(),
+                backoffs,
+                lab_radio_log::CSMA_BEGIN,
+                phy::rx_state_raw() as u16 | (phy::rx_done() as u16) << 8,
+            );
             // Never turn the transceiver off under a frame being received
             // (see `finish_reception`). Only the CCA below decides whether
             // the channel is busy, as before.
@@ -3002,6 +3223,8 @@ mod hw {
         // deliver it after the consumer drains the queue. Only reachable
         // while the queue is full, so the normal turnaround is unchanged.
         if unsafe { (*core::ptr::addr_of!(IRQ_RX_QUEUE)).would_drop(RxPriority::Local) } {
+            #[cfg(feature = "lab-radio-log")]
+            lab_radio_log::note_ack(lab_radio_log::ACK_WITHHELD);
             unsafe {
                 let ptr = core::ptr::addr_of_mut!(SOFTWARE_ACK_WITHHELD_COUNT);
                 core::ptr::write_volatile(ptr, core::ptr::read_volatile(ptr).wrapping_add(1));
@@ -3024,7 +3247,14 @@ mod hw {
         } else {
             false
         };
-        if send_ack_fast(sequence, frame_pending, rx_complete_ticks) {
+        let sent = send_ack_fast(sequence, frame_pending, rx_complete_ticks);
+        #[cfg(feature = "lab-radio-log")]
+        lab_radio_log::note_ack(if sent {
+            lab_radio_log::ACK_SENT
+        } else {
+            lab_radio_log::ACK_TIMEOUT
+        });
+        if sent {
             unsafe {
                 let count = core::ptr::read_volatile(core::ptr::addr_of!(SOFTWARE_ACK_COUNT));
                 core::ptr::write_volatile(

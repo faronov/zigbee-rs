@@ -290,6 +290,11 @@ pub fn rx_in_progress() -> bool {
     unsafe { r8(REG_RF_RX_STATE) & (1 << 5) != 0 }
 }
 
+/// Raw RX state register (lab diagnostics).
+pub fn rx_state_raw() -> u8 {
+    unsafe { r8(REG_RF_RX_STATE) }
+}
+
 pub fn rx_done() -> bool {
     unsafe { r16(REG_RF_IRQ_STATUS) & 0x01 != 0 }
 }
