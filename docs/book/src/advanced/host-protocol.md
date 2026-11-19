@@ -1070,7 +1070,7 @@ fields after it are shown as "→ …". Events list their full payload.
 | `0x0005` | `SYS_SET_CONFIG` | `u8 n, n×{u16 id, u8 len, value[]}` | `u8 n, n×{u16 id, u8 status}` | N |
 | `0x0006` | `SYS_GET_CONFIG` | `u8 n, n×u16 id` | `u8 n, n×{u16 id, u8 status, u8 len, value[]}` | N |
 | `0x0007` | `SYS_ECHO` | `data[]` (≤ 64) | `data[]` | N |
-| `0x0008` | `SYS_SET_IEEE` | `[8] ieee` (all `FF` = revert to factory) | — | P (MAC PIB `MacExtendedAddress` is settable; persistence and boot application are N) |
+| `0x0008` | `SYS_SET_IEEE` | `[8] ieee` (all `FF` = revert to factory) | — | E (`products/esp32-zigbee-ncp` identity item applied at boot; the NCP also sets the MAC PIB and NIB at once while no network runs) |
 | `0x0009` | `SYS_SET_UART` | `u32 baud, u8 flow (0 none, 1 RTS/CTS), u16 apply_delay_ms` | — (sent at the old rate; see the rule below) | N |
 | `0x0080` | `EVT_NCP_READY` | `u32 ncp_cookie, u8 reset_reason, u8 network_state (0 none, 1 formed-down, 2 up), u32 table_epoch, u32 nwk_fc_limit, u32 aps_fc_limit, u16 dirty_writebacks, u32 dropped_indications` | event | N |
 | `0x0081` | `EVT_INDICATIONS_DROPPED` | `u8 endpoint, u8 reason (1 host absent, 2 no credit, 3 queue full), u32 count, u32 first_ms, u32 last_ms` | event | N |
@@ -1118,8 +1118,8 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
 | `0x0101` | `NWK_INIT` | `u32 nwk_fc_floor, u32 aps_fc_floor` (host checkpoint floors, 0 = none) | `u8 network_state`; `NOT_FORMED` if NV has no network. Completes with `EVT_NETWORK_STATE`. | E (`CoordinatorApp`/`TrustCenterCoordinatorApp::initialize` persisted path) + N (floors) |
-| `0x0102` | `NWK_FORM` | `u32 channel_mask, u16 pan_id (FFFF = random), [8] ext_pan_id (0 = random), [16] network_key (0 = random), u8 key_seq, u8 nwk_update_id, i8 tx_power, u16 nwk_manager` | accepted; `EVT_NETWORK_STATE` follows | E (BDB formation) + P (host-supplied parameters) |
-| `0x0103` | `NWK_LEAVE_RESET` | `u8 flags (bit0 keep IEEE override, bit1 keep host-endpoint registrations)` | — | P (store clears exist; ordered wipe API is N) |
+| `0x0102` | `NWK_FORM` | `u32 channel_mask, u16 pan_id (FFFF = random), [8] ext_pan_id (0 = random), [16] network_key (0 = random), u8 key_seq, u8 nwk_update_id, i8 tx_power, u16 nwk_manager` | accepted; `EVT_NETWORK_STATE` follows | E (BDB formation; host-supplied parameters install the network directly on the quietest channel of the mask) |
+| `0x0103` | `NWK_LEAVE_RESET` | `u8 flags (bit0 keep IEEE override, bit1 keep host-endpoint registrations)` | — | E (`urgent_factory_reset_and_recommission`; a new network can follow in the same session) |
 | `0x0104` | `NWK_GET_INFO` | — | `u8 state, u16 pan_id, [8] ext_pan_id, u8 channel, u32 channel_mask, u16 short, [8] ieee, u8 nwk_update_id, u16 nwk_manager, u8 key_seq, u8 security_level, i8 tx_power, u8 stack_profile` | P |
 | `0x0105` | `NWK_PERMIT_JOIN` | `u8 duration_s, u16 target (0xFFFC all routers + NCP, 0x0000 NCP only, else a router), u8 flags (bit0 TC significance)` | — | E (`nlme_permit_joining`, `mgmt_permit_joining_req`) |
 | `0x0106` | `NWK_ENERGY_SCAN` | `u32 channel_mask, u8 duration_exp, u8 count` | accepted; `EVT_ENERGY_SCAN_RESULT` follows | P (`nlme_ed_scan` exists; running it on an active coordinator must pause TX/RX and is N) |
@@ -1347,13 +1347,13 @@ These commands update the NCP's own firmware.
 
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
-| `0x0801` | `FW_BEGIN` | `u32 image_size, u8 format (1 ESP app image + MCUboot TLVs, 2 MCUboot), [32] sha256, u32 version, u8 flags (bit0 allow downgrade, dev builds only)` | `u16 max_chunk, u8 slot` | P (`esp32-zigbee-devkit` signed OTA, otadata, `FirmwareWriter`) |
-| `0x0802` | `FW_WRITE` | `u32 offset, data[]` | `u32 next_offset` | P |
-| `0x0803` | `FW_FINISH` | — | `u8 verify_result` | P |
-| `0x0804` | `FW_ACTIVATE` | `u16 delay_ms` | — (then reboot) | P |
-| `0x0805` | `FW_CONFIRM` | — | — | P |
-| `0x0806` | `FW_ABORT` | — | — | P |
-| `0x0807` | `FW_GET_SLOTS` | — | `u8 n, n×{u8 slot, u8 state, u32 version, [32] sha256}` | P |
+| `0x0801` | `FW_BEGIN` | `u32 image_size, u8 format (1 ESP app image + MCUboot TLVs, 2 MCUboot), [32] sha256, u32 version, u8 flags (bit0 allow downgrade, dev builds only)` | `u16 max_chunk, u8 slot` | E (`products/esp32-zigbee-ncp` A/B slots, signed policy, IDF rollback bootloader; host-tested, not yet on hardware) |
+| `0x0802` | `FW_WRITE` | `u32 offset, data[]` | `u32 next_offset` | E |
+| `0x0803` | `FW_FINISH` | — | `u8 verify_result` | E |
+| `0x0804` | `FW_ACTIVATE` | `u16 delay_ms` | — (then reboot) | E |
+| `0x0805` | `FW_CONFIRM` | — | — | E |
+| `0x0806` | `FW_ABORT` | — | — | E |
+| `0x0807` | `FW_GET_SLOTS` | — | `u8 n, n×{u8 slot, u8 state, u32 version, [32] sha256}` | E |
 
 Rules:
 
