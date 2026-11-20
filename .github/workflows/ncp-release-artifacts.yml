@@ -111,8 +111,12 @@ jobs:
                   Full flash (factory-new NCP; erases any Zigbee network stored on the chip):
                     esptool --chip ${{ matrix.chip }} --port <PORT> write-flash 0x0 $NAME-merged.bin
 
-                  Or the parts:
+                  Or the parts (erase first, so that no old otadata or Zigbee state remains):
+                    esptool --chip ${{ matrix.chip }} --port <PORT> erase-flash
                     esptool --chip ${{ matrix.chip }} --port <PORT> write-flash 0x0 $NAME-bootloader.bin 0x8000 $NAME-partition-table.bin 0x10000 $NAME-app.bin
+
+                  Firmware update keeping the network (same partition table):
+                    esptool --chip ${{ matrix.chip }} --port <PORT> write-flash 0x10000 $NAME-app.bin
 
                   (esptool v4: write_flash instead of write-flash.) See docs/zrhp-z2m-testing.md in faronov/zigbee-herdsman (branch zrhp).
                   EOF
