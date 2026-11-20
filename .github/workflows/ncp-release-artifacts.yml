@@ -18,7 +18,7 @@ on:
     workflow_dispatch:
         inputs:
             ref:
-                description: zigbee-rs ref to build (default: this branch)
+                description: "zigbee-rs ref to build (default: this branch)"
                 required: false
 
 permissions:
@@ -40,15 +40,15 @@ jobs:
                     - name: h2-usj
                       chip: esp32h2
                       features: esp32h2,transport-usj
-                      board: ESP32-H2 DevKit, native USB-Serial-JTAG port ("USB")
+                      board: 'ESP32-H2 DevKit, native USB-Serial-JTAG port ("USB")'
                     - name: c6-usj
                       chip: esp32c6
                       features: esp32c6,transport-usj
-                      board: ESP32-C6 DevKit, native USB-Serial-JTAG port ("USB")
+                      board: 'ESP32-C6 DevKit, native USB-Serial-JTAG port ("USB")'
                     - name: h2-br
                       chip: esp32h2
                       features: esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines
-                      board: Espressif Thread Border Router board, H2 side, UART0 921600 8N1 RTS/CTS (R19/R20)
+                      board: 'Espressif Thread Border Router board, H2 side, UART0 921600 8N1 RTS/CTS (R19/R20)'
         steps:
             - uses: actions/checkout@v4
               with:
