@@ -32,8 +32,8 @@ use zigbee_zrhp::codec::{Wire, Writer};
 use zigbee_zrhp::frame::TX_BUFFER_LEN;
 use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent};
 use zigbee_zrhp::msg::backup::{
-    BkpExportBegin, BkpExportBeginRsp, BkpExportEnd, BkpExportRead, BkpRestoreBegin,
-    BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, BkpRestorePutRsp,
+    BkpExportBegin, BkpExportBeginRsp, BkpExportEnd, BkpExportRead, BkpRestoreAbort,
+    BkpRestoreBegin, BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, BkpRestorePutRsp,
 };
 use zigbee_zrhp::msg::diag::{
     DiagGetChildren, DiagGetChildrenRsp, DiagGetNeighbors, DiagGetNeighborsRsp, DiagGetRoutes,
@@ -625,7 +625,8 @@ fn host_identity_formation_tables_and_backup_restore() {
     assert_eq!(records[0][0], record_type::NODE);
     assert_eq!(*records.last().unwrap().first().unwrap(), record_type::END);
 
-    // Restore needs the stack stopped.
+    // A restore begun with the network up stages while it keeps running;
+    // ABORT leaves it as it was (9.4 rule 1).
     let early = host.request(&BkpRestoreBegin {
         flags: 0,
         nwk_margin: 10_000,
@@ -633,7 +634,12 @@ fn host_identity_formation_tables_and_backup_restore() {
         expected_records: 7,
     });
     exchange!();
-    assert_eq!(host.response(early).status(), Status::InvalidState.to_u8());
+    let early = host.response(early);
+    let early: BkpRestoreBeginRsp = early.body();
+    let abort = host.request(&BkpRestoreAbort { txn: early.txn });
+    exchange!();
+    assert_eq!(host.response(abort).status(), 0);
+    assert_eq!(port.state() as u8, 2, "still up after ABORT");
 
     // Factory reset of the network, then the restore.
     let leave = host.request(&NwkLeaveReset { flags: 0 });
@@ -719,6 +725,39 @@ fn host_identity_formation_tables_and_backup_restore() {
     exchange!();
     assert_eq!(host.response(invalidate).status(), 0);
     assert!(port.device(0).is_none());
+
+    // A restore committed while the network is up replaces it in place:
+    // the device key returns, counters only move forward.
+    let before = port.frame_counters();
+    let begin = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 0,
+        aps_margin: 0,
+        expected_records: 7,
+    });
+    exchange!();
+    let begin = host.response(begin);
+    let begin: BkpRestoreBeginRsp = begin.body();
+    let mut payload = begin.txn.to_le_bytes().to_vec();
+    for record in &records {
+        payload.extend_from_slice(record);
+    }
+    let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+    exchange!();
+    let put = host.response(put);
+    assert_eq!(usize::from(put.body::<BkpRestorePutRsp>().accepted), 7);
+    let commit = host.request(&BkpRestoreCommit { txn: begin.txn });
+    exchange!();
+    let commit = host.response(commit);
+    let commit: BkpRestoreCommitRsp = commit.body();
+    assert!(commit.nwk_fc_start > before.nwk_current);
+    assert!(commit.aps_fc_start > before.aps_current);
+    assert_eq!(commit.link_keys_on_ncp, 1);
+    assert_eq!(port.state() as u8, 2);
+    let after = port.frame_counters();
+    assert!(after.nwk_current > before.nwk_current);
+    assert!(after.aps_current > before.aps_current);
+    assert_eq!(port.device(0).map(|view| view.ieee), Some(DEVICE_IEEE));
 }
 
 #[test]

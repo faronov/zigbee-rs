@@ -21,9 +21,12 @@
 //! the resume, so they keep their parent and short address. Deviations,
 //! reported as notes: link keys beyond the staging capacity
 //! (`HOST_BACKED`), children beyond it (`CHILD_DEMOTED`: they rejoin), GP
-//! records, the EZSP hashed TCLK and unknown records (`IGNORED`). The network is started at commit (flags bit1 is implied);
-//! a later `NWK_INIT` only applies floors. Restore needs the stack stopped
-//! (after a reboot, before `NWK_INIT`).
+//! records, the EZSP hashed TCLK and unknown records (`IGNORED`). The
+//! network is started at commit (flags bit1 is implied); a later `NWK_INIT`
+//! only applies floors. A restore may begin with the network up: it keeps
+//! running while records are staged, and `COMMIT` (once `END` checked)
+//! wipes it like `NWK_LEAVE_RESET`, outgoing counters retained, before
+//! installing the restored one.
 
 use heapless::Vec;
 use zigbee_zrhp::codec::List;
@@ -323,12 +326,9 @@ pub(crate) fn dispatch_backup<C: CoordinatorPort>(
                 status(queues, Status::InProgress);
                 return false;
             }
-            if port.state() == NetworkState::Up {
-                // The stack must be stopped: reboot, then restore before
-                // NWK_INIT.
-                status(queues, Status::InvalidState);
-                return false;
-            }
+            // A running network keeps serving while the records are
+            // staged; COMMIT stops and replaces it, ABORT leaves it as is
+            // (9.4 rule 1).
             let txn = state.txn();
             state.restore = Some(Restore {
                 txn,
@@ -584,18 +584,27 @@ async fn commit<C: CoordinatorPort, P: NcpPlatform>(
     };
     let nwk_fc_start = restore.counters.nwk_start(restore.nwk_margin);
     let aps_fc_start = restore.counters.aps_start(aps_margin);
+    let new_ieee = restore
+        .node
+        .as_ref()
+        .map(|node| node.ieee.0)
+        .filter(|ieee| *ieee != port.ieee());
+    if new_ieee.is_some() && !platform.ieee_rewritable() {
+        return Err(Status::SecurityError);
+    }
+    if port.state() == NetworkState::Up {
+        // Rule 1, restore begun with the network up: it served while the
+        // records were staged and stops only now that they are complete
+        // (its outgoing counters are retained by the wipe).
+        await_out_of_line!(port.leave_reset()).map_err(op_status)?;
+    }
     // Rule 7: the IEEE override first, so the network is stored under the
     // EUI-64 the radio will use.
-    if let Some(node) = &restore.node
-        && node.ieee.0 != port.ieee()
-    {
-        if !platform.ieee_rewritable() {
-            return Err(Status::SecurityError);
-        }
+    if let Some(ieee) = new_ieee {
         platform
-            .set_ieee_override(Some(node.ieee.0))
+            .set_ieee_override(Some(ieee))
             .map_err(crate::firmware::status_of)?;
-        port.set_ieee(node.ieee.0).await.map_err(op_status)?;
+        port.set_ieee(ieee).await.map_err(op_status)?;
     }
     let image = NetworkImage {
         pan_id: network.pan_id,
