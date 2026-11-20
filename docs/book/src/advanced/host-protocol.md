@@ -1645,8 +1645,12 @@ makes zigpy a **shadow sink**:
    window, but its transmissions are swallowed (step 4).
 3. **Feeding zigpy.** Every `EVT_GP_FRAME` becomes a
    `zigpy.types.ZigbeeGpPacket` passed to `app.gp_packet_received()`:
-   - commissioning frames with `result` 2 or 5, so zigpy creates the
-     `GreenPowerDevice` with the same key and counter;
+   - commissioning frames with `result` 2, 3 or 5, so zigpy creates the
+     `GreenPowerDevice` with the same key and counter. In bidirectional
+     commissioning the Commissioning frame arrives with `result` 3
+     (Commissioning Reply sent) and only the Success frame with 2; zigpy
+     needs the result-3 frame to open its pending entry, otherwise it drops
+     the Success frame as coming from an unknown GPD;
    - operational frames with `result` 1, so quirk entities update.
 
    zigpy's own counter and duplicate checks then see a strictly increasing
@@ -1654,9 +1658,12 @@ makes zigpy a **shadow sink**:
 4. **Swallowed transmissions.** The library **does not transmit**, and
    reports success to zigpy for, every zigpy-originated packet that belongs
    to sink behaviour: GP cluster `0x0021` server → client commands from
-   EP 242 (Pairing 0x01, Proxy Commissioning Mode 0x02, Response 0x06,
-   Translation Table Update/Request) and zigpy's alias `Device_annce` for a
-   GPD. The NCP sink already sent its own.
+   EP 242 (Pairing 0x01, Proxy Commissioning Mode 0x02, Response 0x06) and
+   zigpy's alias `Device_annce` for a GPD. The NCP sink already sent its
+   own. (Translation Table Update/Request are client → server commands
+   0x07/0x08 that zigpy does not send; a library that sees them swallows
+   them too.) A swallowed GP Pairing with `remove_gpd` set becomes
+   `GP_SINK_REMOVE{send RemoveGPD}` (step 6).
 5. **Defence in depth.** As a second guard, the NCP rejects such frames from
    the host with `CONFLICT` in `NCP_SINK` mode and counts them.
 6. **Unpair.** `zigpy.green_power.unpair()` / `force_remove` of a GP device
@@ -2937,10 +2944,10 @@ shadow-sink steps of 7.11.
 | `connect()` | Open the port (stable identity, 11.3), link handshake, `SYS_NEGOTIATE`, wait for `EVT_NCP_READY`. Must be side-effect free on failure (used by `probe()`). |
 | `disconnect()` | Close the port. No NCP reset. |
 | `start_network()` | `NWK_INIT{floors from the checkpoint log}`, `TBL_SYNC`, register endpoints (`NWK_ADD_ENDPOINT` for each `add_endpoint`), `NWK_GROUP_MEMBERSHIP` resync, `SEC_SET_TC_POLICY`, `GP_SINK_CONFIG{NCP sink, pre-commissioned groupcast 0x0B84}` and the GP shadow reconciliation (7.11 step 7), create the coordinator device. Set `_concurrent_requests_semaphore.max_concurrency = max_aps_inflight`. |
-| `load_network_info(load_devices)` | `NWK_GET_INFO` + `SEC_GET_NETWORK_KEY`. With `load_devices`: `BKP_EXPORT_*` merged with the host store, filling `network_info.children`, `nwk_addresses`, `key_table` (with `tx_counter = aps limit`, `rx_counter = floor`, `seq`), `tc_link_key`, `stack_specific.zigbee_rs` and `ezsp.hashed_tclk`, `metadata.zigbee_rs`. `NOT_FORMED` ⇒ `NetworkNotFormed`. |
-| `write_network_info(network_info, node_info)` | `BKP_RESTORE_*` (9.4) with `nwk_margin = 0`, `aps_margin = 10000`, `allow_ieee_change = IEEE_REWRITABLE`. `form_quickly` / new networks produce the same records with zero counters. |
+| `load_network_info(load_devices)` | `NWK_GET_INFO`; a formed but stopped network is brought up with `NWK_INIT` first, because `BKP_EXPORT_BEGIN` needs a running network and zigpy calls this before `start_network`. Then `BKP_EXPORT_*` with keys (6 records without devices), which also carries the TCLK zigpy compares at start. With `load_devices`: `BKP_EXPORT_*` merged with the host store, filling `network_info.children`, `nwk_addresses`, `key_table` (with `tx_counter = aps limit`, `rx_counter = floor`, `seq`), `tc_link_key`, `stack_specific.zigbee_rs` and `ezsp.hashed_tclk`, `metadata.zigbee_rs`. `NOT_FORMED` ⇒ `NetworkNotFormed`. |
+| `write_network_info(network_info, node_info)` | `BKP_RESTORE_*` (9.4) with `nwk_margin = 0`, `aps_margin = 10000` (2²⁰ when the backup has no APS counter information, 12.1.1), `allow_ieee_change = IEEE_REWRITABLE`. A running network is first wiped with `NWK_LEAVE_RESET{flags 0x03}` (frame-counter bounds, IEEE override and endpoints kept), because the NCP restores only with the stack stopped. `form_quickly` / new networks produce the same records with zero counters. |
 | `reset_network_info()` | `NWK_LEAVE_RESET`. |
-| `send_packet(packet)` | `APS_DATA_REQUEST`; `BUSY` ⇒ retry with backoff inside the concurrency limit. Wait for `EVT_APS_DATA_CONFIRM` (timeout 3 s mains; with `extended_timeout`, which sets `tx_options` bit5, up to 4 × (hold + 1.5 s): about 37 s for a sleepy device behind a router, longer for a long-polling child of the NCP, see 7.3). Non-success ⇒ `DeliveryError`. `packet.source_route` ⇒ relays (zigpy already reverses `device.relays`). ZDO requests to the coordinator itself are answered locally from `DIAG_*`/`NWK_GET_INFO` (7.4). GP sink transmissions are swallowed in NCP-sink mode (7.11 step 4). |
+| `send_packet(packet)` | `APS_DATA_REQUEST`; `BUSY` ⇒ retry with backoff inside the concurrency limit. Wait for `EVT_APS_DATA_CONFIRM` (timeout 10 s mains, which covers the NCP's own APS retries of about 6 s; with `extended_timeout`, which sets `tx_options` bit5, up to 4 × (hold + 1.5 s): about 37 s for a sleepy device behind a router, longer for a long-polling child of the NCP, see 7.3). Non-success ⇒ `DeliveryError`. `packet.source_route` ⇒ relays (zigpy already reverses `device.relays`). ZDO requests to the coordinator itself are answered locally from `DIAG_*`/`NWK_GET_INFO` (7.4). GP sink transmissions are swallowed in NCP-sink mode (7.11 step 4). |
 | `permit_ncp(time_s)` | `NWK_PERMIT_JOIN{target 0x0000}` |
 | `permit(time_s, node)` | `NWK_PERMIT_JOIN{target 0xFFFC or the router}` + `GP_SINK_COMMISSIONING{enter, involve proxies, time_s}` |
 | `permit_with_link_key(node, key, time_s)` | `SEC_ADD_LINK_KEY{temporary}` + permit; or `SEC_ADD_INSTALL_CODE` when the host has a code |
@@ -2975,6 +2982,25 @@ transient link loss from zigpy whenever the NCP state can be reconciled:
 | 4. Reconcile | `EVT_NCP_READY` and `NWK_GET_INFO` must match zigpy's `state.node_info` / `state.network_info`: IEEE, PAN ID, EPID, channel, security level, `nwk_update_id` ≥ known, key sequence ≥ known. `network_state` must be formed (1/2) and `table_epoch` must equal the sidecar's. A higher key sequence or update ID (rotation or channel change that completed during the outage) is accepted and copied into zigpy's state. | `connection_lost` (zigpy re-initializes and may restore from backup) |
 | 5. Replay | `NWK_INIT` with checkpoint floors (if not up). Then: `SEC_SET_TC_POLICY`, `NWK_ADD_ENDPOINT` ×n, `NWK_GROUP_MEMBERSHIP`, `NWK_SET_TX_POWER`, `NWK_CONCENTRATOR`, `NWK_SET_MANUFACTURER_CODE`, `GP_SINK_CONFIG`, the open permit-join and GP-commissioning remainders, `SEC_LOCK_KEY_EXPORT` if the user configured the lock, `TBL_SYNC`, and the GP shadow check. | `connection_lost` |
 | 6. Release | Resume queued calls. Log the event and increment `state.counters["zrhp"]["ncp_resumed"]`. If the port did not come back within the budget, try the USJ hard reset (11.3) once before giving up. | `connection_lost` |
+
+#### 12.1.1 Notes from the zigpy library (proposals, 2026-11-20)
+
+Found while writing `faronov/zigpy-zrhp` against this chapter, the Rust NCP
+(`apps/ncp-coordinator`) and its host simulator (`examples/ncp_sim.rs`).
+Each item is what the library does today and a proposed spec change.
+
+| # | Gap | Library behaviour | Proposal |
+|---:|---|---|---|
+| Z1 | The NCP drops a response when its per-endpoint queue (1 536 B, 1 024 B compact) is full (`let _ = queues.response(..)`), although 6.2 requires exactly one response per request and credits only bound *frames*. A burst of 4 SYSTEM frames of 64-byte `SYS_ECHO`s already overflows it. | Bounds the response bytes it has outstanding per endpoint to 1 024 (estimated per request). | The NCP returns a frame's credit only once the responses to its requests fit (`auto_credit = false`), or advertises the response budget as a capacity (new ID 19, `host_response_bytes`). |
+| Z2 | `BKP_EXPORT_BEGIN` needs a running network (`INVALID_STATE` otherwise); 9.5 does not say so. | `NWK_INIT` first. | State it in 9.5, or export from NV when the network is formed but down. |
+| Z3 | `BKP_RESTORE_BEGIN` with the network up is `INVALID_STATE` (9.4 rule 1 says BEGIN stops it). | `NWK_LEAVE_RESET{0x03}` first. | Implement rule 1, or document the host-side wipe. |
+| Z4 | 9.5 merges exported `DEVICE` records "if its `rev` is newer", but export records carry no `rev`. | An NCP record with a link block wins; host-store keys fill records without one (paging). | Append `u32 rev` to exported `DEVICE` records, or define the presence rule. |
+| Z5 | Through zigpy a Z2M backup loses "no TCLK counter" (zigpy stores 0 and re-exports `frame_counter: 0`), so the 2²⁰ rule of 9.4 cannot be applied from the OCB alone. | `aps_margin = 2²⁰` when the TCLK and every key counter are 0, `stack_specific.zigbee_rs` is absent and the backup has devices. | Adopt this rule in 9.4 rule 6 for hosts that only see a zigpy `NetworkBackup`. |
+| Z6 | `stack_specific.zigbee_rs.gp_sink_table` / `gp_proxy_table` hold "hex R_GP_SINK values": TLV or value? | Record *value* (no type/length). | Say "value bytes, without the TLV header". |
+| Z7 | 6.5 retries after `PEER_RESYNC`, but the retry cache belongs to the cookie *pair*: a host that reopened its port (new host cookie) sees the same NCP cookie, yet the cache is gone. | Retries only when neither cookie changed; otherwise `LINK_RESET` (zigpy then retries at its level). | "RETRY only if both cookies are unchanged." |
+| Z8 | zigpy registers its GP endpoint 242 with `add_endpoint`; `NWK_ADD_ENDPOINT` refuses endpoints outside 1..=240. | Endpoint 242 is kept host-side only (the NCP owns it) and answered by the local ZDO responder. | Note in 7.2 that hosts do not register 242. |
+| Z9 | 11.3 describes the DTR/RTS reset for native USJ only. On the Thread BR board the S3 bridge (`tbr-bridge`, CDC 0) maps DTR/RTS to the H2's EN/BOOT like esptool, so the same `(0,0) → (RTS 1, DTR 0) → (0,0)` sequence resets the H2 and the port does not re-enumerate. | Same sequence for both. | Add the bridge case to 11.3 and 12.1 step 6. |
+| Z10 | `NWK_ENERGY_SCAN`, `NWK_GROUP_MEMBERSHIP`, `SEC_SET_TC_POLICY` and `NWK_CHANGE_CHANNEL` are not implemented by the NCP yet (`UNSUPPORTED_COMMAND`); zigpy's formation runs an energy scan. | Treats `UNSUPPORTED_COMMAND` as "not available": zero energies (zigpy then picks 11/15/20/25 by its penalties), membership and policy calls logged only. | None (implementation gap); listed so that hardware results are read correctly. |
 
 **Sidecar store** (decision 4).
 
