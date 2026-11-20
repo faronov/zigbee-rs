@@ -35,6 +35,10 @@ use zigbee_zrhp::msg::backup::{
     BkpExportBegin, BkpExportBeginRsp, BkpExportEnd, BkpExportRead, BkpRestoreBegin,
     BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, BkpRestorePutRsp,
 };
+use zigbee_zrhp::msg::diag::{
+    DiagGetChildren, DiagGetChildrenRsp, DiagGetNeighbors, DiagGetNeighborsRsp, DiagGetRoutes,
+    DiagGetRoutesRsp,
+};
 use zigbee_zrhp::msg::firmware::{
     FwActivate, FwBegin as FwBeginReq, FwBeginRsp, FwFinishRsp, FwGetSlotsRsp, FwWrite, FwWriteRsp,
 };
@@ -1121,6 +1125,43 @@ fn restore_keeps_ncp_children_and_their_keys() {
     // factory-reset device re-pairing gets the network key under the
     // global key, and the device may secure-rejoin.
     assert_eq!((link.origin, link.attrs), (2, 2));
+
+    // The coordinator's tables for hosts (spec 7.8; zigpy Z13, herdsman
+    // H6): the restored child appears as a child neighbour.
+    let neighbors = host.request(&DiagGetNeighbors { start: 0 });
+    let children = host.request(&DiagGetChildren { start: 0 });
+    let routes = host.request(&DiagGetRoutes { start: 0 });
+    let past_end = host.request(&DiagGetChildren { start: 5 });
+    exchange!();
+    let neighbors = host.response(neighbors);
+    let neighbors: DiagGetNeighborsRsp = neighbors.body();
+    assert_eq!(neighbors.total, 1);
+    let neighbor = neighbors.entries.iter().next().unwrap();
+    assert_eq!(
+        (
+            neighbor.ieee.0,
+            neighbor.nwk,
+            neighbor.relationship,
+            neighbor.device_type
+        ),
+        (DEVICE_IEEE, 0x4C21, 1, 2)
+    );
+    let children = host.response(children);
+    let children: DiagGetChildrenRsp = children.body();
+    let child = children.entries.iter().next().unwrap();
+    assert_eq!(children.total, 1);
+    assert_eq!(
+        (child.ieee.0, child.nwk, child.timeout_exp),
+        (DEVICE_IEEE, 0x4C21, 9)
+    );
+    assert_eq!(child.capability & 0x88, 0x80, "a sleepy end device");
+    assert_eq!(child.last_poll_ms, u32::MAX, "not heard since the restore");
+    let routes = host.response(routes);
+    let routes: DiagGetRoutesRsp = routes.body();
+    assert_eq!(routes.entries.iter().count(), usize::from(routes.total));
+    let past_end = host.response(past_end);
+    let past_end: DiagGetChildrenRsp = past_end.body();
+    assert_eq!((past_end.total, past_end.entries.iter().count()), (1, 0));
 }
 
 #[test]

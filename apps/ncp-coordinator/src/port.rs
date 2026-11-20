@@ -303,6 +303,27 @@ pub trait CoordinatorPort {
     }
     /// The `index`-th known device (Trust Center records first, then
     /// children without a record); `None` past the end.
+    /// Entries of a `DIAG_GET_*` table (`DiagTable`), the coordinator's
+    /// Mgmt_Lqi / Mgmt_Rtg view (spec 7.8). None by default.
+    fn diag_count(&self, _table: DiagTable) -> usize {
+        0
+    }
+
+    /// Neighbour `index` (0-based, in table order).
+    fn diag_neighbor(&self, _index: usize) -> Option<zigbee_zrhp::msg::diag::Neighbor> {
+        None
+    }
+
+    /// Route `index`.
+    fn diag_route(&self, _index: usize) -> Option<zigbee_zrhp::msg::diag::Route> {
+        None
+    }
+
+    /// Child `index`.
+    fn diag_child(&self, _index: usize) -> Option<zigbee_zrhp::msg::diag::Child> {
+        None
+    }
+
     fn device(&self, index: usize) -> Option<DeviceView> {
         let _ = index;
         None
@@ -384,6 +405,14 @@ pub struct NetworkImage {
     pub nwk_fc_start: u32,
     /// Floor of the global outgoing APS counter (0 = none).
     pub aps_fc_start: u32,
+}
+
+/// The tables `DIAG_GET_NEIGHBORS` / `_ROUTES` / `_CHILDREN` read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagTable {
+    Neighbors,
+    Routes,
+    Children,
 }
 
 /// A device known to the Trust Center or the child table.

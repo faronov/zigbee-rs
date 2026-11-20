@@ -20,6 +20,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod backup;
+pub mod diag;
 pub mod firmware;
 pub mod gp;
 pub mod gp_remote;

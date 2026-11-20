@@ -561,22 +561,7 @@ impl<A: TcApp> TcPort<A> {
                 .neighbor_table()
                 .find_by_short(short_address)
                 .filter(|entry| entry.ieee_address == device_address)
-                .map_or(0, |entry| {
-                    // Reconstructed MAC capability of an NCP child: allocate
-                    // address, security, receiver on when idle (which also
-                    // stands for mains power), and the device type.
-                    let mut capability = 0x80;
-                    if entry.security_capable {
-                        capability |= 0x40;
-                    }
-                    if entry.rx_on_when_idle {
-                        capability |= 0x08 | 0x04;
-                    }
-                    if entry.device_type == NeighborDeviceType::Router {
-                        capability |= 0x02;
-                    }
-                    capability
-                });
+                .map_or(0, child_capability);
             (nwk.nib().network_address.0, capability)
         } else {
             let parent_nwk = nwk
@@ -682,6 +667,14 @@ fn left_event(event: TrustCenterHostEvent, own: [u8; 8]) -> Option<DeviceEvent> 
     }
 }
 
+fn is_child(entry: &zigbee_nwk::neighbor::NeighborEntry) -> bool {
+    matches!(
+        entry.relationship,
+        zigbee_nwk::neighbor::Relationship::Child
+            | zigbee_nwk::neighbor::Relationship::UnauthenticatedChild
+    )
+}
+
 /// The committed network's identity, as `NWK_GET_INFO` reports it while
 /// the network is formed but not running (spec 7.2, 7.11 step 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -710,6 +703,115 @@ fn stored_network<A: TcApp>(app: &mut A) -> Option<StoredNetwork> {
 impl<A: TcApp> CoordinatorPort for TcPort<A> {
     fn ieee(&self) -> [u8; 8] {
         self.ieee
+    }
+
+    fn diag_count(&self, table: crate::port::DiagTable) -> usize {
+        let nwk = self.app.device().aps().nwk();
+        match table {
+            crate::port::DiagTable::Neighbors => nwk.neighbor_table().iter().count(),
+            crate::port::DiagTable::Routes => nwk.routing_table().iter().count(),
+            crate::port::DiagTable::Children => {
+                nwk.neighbor_table().iter().filter(|e| is_child(e)).count()
+            }
+        }
+    }
+
+    /// Mgmt_Lqi codes (R22 Table 2-127): device type 0 coordinator,
+    /// 1 router, 2 end device, 3 unknown; relationship 0 parent, 1 child,
+    /// 2 sibling, 4 previous child, 5 unauthenticated child.
+    fn diag_neighbor(&self, index: usize) -> Option<zigbee_zrhp::msg::diag::Neighbor> {
+        use zigbee_nwk::neighbor::Relationship;
+        let entry = self
+            .app
+            .device()
+            .aps()
+            .nwk()
+            .neighbor_table()
+            .iter()
+            .nth(index)?;
+        Some(zigbee_zrhp::msg::diag::Neighbor {
+            ieee: zigbee_zrhp::types::Ieee(entry.ieee_address),
+            nwk: entry.network_address.0,
+            device_type: match entry.device_type {
+                NeighborDeviceType::Coordinator => 0,
+                NeighborDeviceType::Router => 1,
+                NeighborDeviceType::EndDevice => 2,
+                NeighborDeviceType::Unknown => 3,
+            },
+            rx_on: u8::from(entry.rx_on_when_idle),
+            relationship: match entry.relationship {
+                Relationship::Parent => 0,
+                Relationship::Child => 1,
+                Relationship::Sibling => 2,
+                Relationship::PreviousChild => 4,
+                Relationship::UnauthenticatedChild => 5,
+            },
+            lqi: entry.lqi,
+            outgoing_cost: entry.outgoing_cost,
+            age: entry.age.min(u16::from(u8::MAX)) as u8,
+        })
+    }
+
+    /// Mgmt_Rtg status codes (R22 Table 2-129); flags bit0 memory
+    /// constrained (never), bit1 many-to-one, bit2 route record required
+    /// (the Mgmt_Rtg status byte's bits 3–5).
+    fn diag_route(&self, index: usize) -> Option<zigbee_zrhp::msg::diag::Route> {
+        use zigbee_nwk::routing::RouteStatus;
+        let route = self
+            .app
+            .device()
+            .aps()
+            .nwk()
+            .routing_table()
+            .iter()
+            .nth(index)?;
+        Some(zigbee_zrhp::msg::diag::Route {
+            dst: route.destination.0,
+            next_hop: route.next_hop.0,
+            status: match route.status {
+                RouteStatus::Active => 0,
+                RouteStatus::DiscoveryUnderway => 1,
+                RouteStatus::DiscoveryFailed => 2,
+                RouteStatus::Inactive => 3,
+                RouteStatus::ValidationUnderway => 4,
+            },
+            flags: (u8::from(route.many_to_one) << 1)
+                | (u8::from(route.route_record_required) << 2),
+        })
+    }
+
+    /// `last_poll_ms`: time since the child last proved liveness (poll or
+    /// keepalive) as the End Device Timeout countdown shows it; `u32::MAX`
+    /// until it has been heard this power cycle.
+    fn diag_child(&self, index: usize) -> Option<zigbee_zrhp::msg::diag::Child> {
+        let entry = self
+            .app
+            .device()
+            .aps()
+            .nwk()
+            .neighbor_table()
+            .iter()
+            .filter(|e| is_child(e))
+            .nth(index)?;
+        let last_poll_ms = if entry.keepalive_confirmed {
+            zigbee_nwk::frames::ed_timeout_enum_to_seconds(entry.end_device_timeout).map_or(
+                u32::MAX,
+                |timeout| {
+                    timeout
+                        .saturating_sub(entry.keepalive_remaining_secs)
+                        .saturating_mul(1000)
+                },
+            )
+        } else {
+            u32::MAX
+        };
+        Some(zigbee_zrhp::msg::diag::Child {
+            ieee: zigbee_zrhp::types::Ieee(entry.ieee_address),
+            nwk: entry.network_address.0,
+            capability: child_capability(entry),
+            timeout_exp: entry.end_device_timeout,
+            last_poll_ms,
+        })
     }
 
     fn state(&self) -> NetworkState {

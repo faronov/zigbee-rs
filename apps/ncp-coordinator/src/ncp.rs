@@ -1258,6 +1258,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     status_only(queues, Status::Busy);
                 }
             }
+            _ if crate::diag::is_diag_table_request(id) => {
+                crate::diag::dispatch_diag_table(queues, endpoint, message, port);
+            }
             _ if crate::firmware::is_fw_request(id) => crate::firmware::dispatch_fw(
                 queues,
                 endpoint,
