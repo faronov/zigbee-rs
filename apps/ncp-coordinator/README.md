@@ -13,6 +13,8 @@ composition; this crate has no board, product or vendor dependency.
 | Product: layout, NV stores, transport policy | `products/esp32-zigbee-ncp` |
 | Board (Thread BR, H2 side) | `boards/esp-thread-br-h2` |
 | Transports (USJ, UART + UHCI DMA) | `esp-serial-stream` |
+| Composition root (EFR32MG24: RF-BM-MG24B1, Dongle-M; build-only) | `examples/efr32mg24-ncp` (product `products/efr32mg24`, Gecko/GBL update path) |
+| Composition root (CC2652P7; build-only) | `examples/cc26x2-ncp` |
 | NCP dispatch, ports | this crate |
 | Lab host harness | `tools/zrhp-host` |
 
