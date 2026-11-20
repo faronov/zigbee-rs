@@ -209,6 +209,16 @@ idempotent only when the requested channel/manager is already in effect, and
 equal-but-conflicting, older or ambiguous ids are answered with
 `INV_REQUESTTYPE` without changing anything.
 
+An accepted channel change (R22 §2.4.3.3.9) adopts the update id at once but
+retunes the radio only after `nwkNetworkBroadcastDeliveryTime` (9 s), from the
+router or end-device NWK maintenance, so the broadcast that carries it can
+still reach the rest of the network on the old channel. A retransmission while
+the change is pending counts as already in effect and keeps the deadline.
+`refresh_security_state` persists the pending channel as the operating channel
+immediately (a reboot inside the interval resumes on the new channel) and,
+while joined, any later NIB channel; an unjoined NIB (scan, rejoin) is never
+persisted.
+
 ## Network Formation (Coordinator)
 
 A coordinator *creates* a new network instead of joining one:

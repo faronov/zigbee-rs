@@ -1532,6 +1532,7 @@ impl<M: MacDriver> NwkLayer<M> {
         #[cfg(feature = "router")]
         self.broadcast_tx.clear();
         self.pending_pan_id_update = None;
+        self.pending_channel_change = None;
         self.pending_pan_id_broadcast = None;
         self.abort_lifecycle_persistence();
         self.nib.device_announce_pending = false;
@@ -1779,6 +1780,7 @@ impl<M: MacDriver> NwkLayer<M> {
             #[cfg(feature = "router")]
             self.broadcast_tx.clear();
             self.pending_pan_id_update = None;
+            self.pending_channel_change = None;
             self.pending_pan_id_broadcast = None;
             self.abort_lifecycle_persistence();
         }

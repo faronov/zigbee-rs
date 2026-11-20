@@ -41,7 +41,10 @@
 use crate::frames::{PanIdConflictReport, PanIdUpdate};
 use crate::nlde::{NwkCommandOutcome, is_unicast_address};
 use crate::nlme::nwk_update_id_is_newer;
-use crate::{DeviceType, NwkLayer, NwkStatus, PendingAddressConflict, PendingPanIdUpdate};
+use crate::{
+    DeviceType, NwkLayer, NwkStatus, PendingAddressConflict, PendingChannelChange,
+    PendingPanIdUpdate,
+};
 use zigbee_mac::MacDriver;
 use zigbee_types::{IeeeAddress, PanId, ShortAddress};
 
@@ -633,6 +636,44 @@ impl<M: MacDriver> NwkLayer<M> {
             new_pan_id,
             apply_at_us,
         });
+    }
+
+    /// Arm a deferred channel change (R22 §2.4.3.3.9): an accepted
+    /// `Mgmt_NWK_Update_req{ScanDuration 0xFE}` retunes the radio only after
+    /// `nwkNetworkBroadcastDeliveryTime`, so that the broadcast that carried
+    /// it can still cross the network on the old channel. Re-arming for the
+    /// channel already pending keeps the original deadline (retransmissions).
+    pub fn arm_channel_change(&mut self, channel: u8) {
+        if self
+            .pending_channel_change
+            .is_some_and(|pending| pending.channel == channel)
+        {
+            return;
+        }
+        let apply_at_us = self
+            .mac
+            .monotonic_micros()
+            .wrapping_add(NETWORK_BROADCAST_DELIVERY_TIME_US);
+        self.pending_channel_change = Some(PendingChannelChange {
+            channel,
+            apply_at_us,
+        });
+    }
+
+    /// Drop a pending channel change (a newer update returned to the
+    /// current channel).
+    pub fn cancel_channel_change(&mut self) {
+        self.pending_channel_change = None;
+    }
+
+    /// The channel this device is about to move to, if any. Persisted as the
+    /// operating channel already, so that a reboot inside the delivery
+    /// interval resumes where the network goes.
+    pub const fn pending_channel_change(&self) -> Option<u8> {
+        match self.pending_channel_change {
+            Some(pending) => Some(pending.channel),
+            None => None,
+        }
     }
 
     /// Short PAN identifier waiting for `nwkNetworkBroadcastDeliveryTime`.

@@ -1276,12 +1276,18 @@ impl<M: MacDriver> ZdoLayer<M> {
 
                 // R22 §3.4.12 — the update ID orders network update state.
                 // Validate *before* touching the NIB/PIB so a stale or
-                // ambiguous request can never move the radio off-channel.
+                // ambiguous request can never move the radio off-channel. A
+                // change already accepted and waiting for its delivery timer
+                // counts as in effect (retransmissions are idempotent).
                 let current_channel = self.nwk().nib().logical_channel;
-                match nwk_update_id_adoption(
+                let effective_channel = self
+                    .nwk()
+                    .pending_channel_change()
+                    .unwrap_or(current_channel);
+                let status = match nwk_update_id_adoption(
                     self.nwk().nib().nwk_update_id(),
                     nwk_update_id,
-                    ch == current_channel,
+                    ch == effective_channel,
                 ) {
                     UpdateIdAdoption::Reject => {
                         log::warn!(
@@ -1289,50 +1295,44 @@ impl<M: MacDriver> ZdoLayer<M> {
                              (update_id={nwk_update_id}, local {:?}, current channel {current_channel})",
                             self.nwk().nib().nwk_update_id(),
                         );
-                        if rsp.is_empty() {
-                            return Err(ZdoError::BufferTooSmall);
-                        }
-                        rsp[0] = ZdpStatus::InvRequestType as u8;
-                        Ok(1)
+                        ZdpStatus::InvRequestType
                     }
                     UpdateIdAdoption::AlreadyApplied => {
-                        // Same update state, already on the requested channel:
-                        // a retransmission. Confirm without re-tuning.
+                        // Same update state, already on (or moving to) the
+                        // requested channel: a retransmission. Confirm
+                        // without re-arming.
                         log::debug!(
                             "[ZDO] Mgmt_NWK_Update: channel change to {ch} already applied \
                              (update_id={nwk_update_id})"
                         );
-                        if rsp.is_empty() {
-                            return Err(ZdoError::BufferTooSmall);
-                        }
-                        rsp[0] = ZdpStatus::Success as u8;
-                        Ok(1)
+                        ZdpStatus::Success
                     }
                     UpdateIdAdoption::Adopt => {
+                        // R22 §2.4.3.3.9: the radio moves only after
+                        // nwkNetworkBroadcastDeliveryTime, so this broadcast
+                        // can still reach the rest of the network on the
+                        // current channel. The update ID is adopted at once
+                        // (as for a PAN identifier update, §3.6.1.13.3) and
+                        // the pending channel is what the next security
+                        // checkpoint persists.
                         log::info!(
                             "[ZDO] Mgmt_NWK_Update: channel change to {ch} (update_id={nwk_update_id})"
                         );
-                        match self.nwk_mut().nlme_set_channel(ch).await {
-                            Ok(()) => {
-                                // Only a channel change that actually took
-                                // effect may advance the update state.
-                                self.nwk_mut().nib_mut().set_nwk_update_id(nwk_update_id);
-                                if rsp.is_empty() {
-                                    return Err(ZdoError::BufferTooSmall);
-                                }
-                                rsp[0] = ZdpStatus::Success as u8;
-                                Ok(1)
-                            }
-                            Err(_) => {
-                                if rsp.is_empty() {
-                                    return Err(ZdoError::BufferTooSmall);
-                                }
-                                rsp[0] = ZdpStatus::InvRequestType as u8;
-                                Ok(1)
-                            }
+                        let nwk = self.nwk_mut();
+                        if ch == current_channel {
+                            nwk.cancel_channel_change();
+                        } else {
+                            nwk.arm_channel_change(ch);
                         }
+                        nwk.nib_mut().set_nwk_update_id(nwk_update_id);
+                        ZdpStatus::Success
                     }
+                };
+                if rsp.is_empty() {
+                    return Err(ZdoError::BufferTooSmall);
                 }
+                rsp[0] = status as u8;
+                Ok(1)
             }
             MgmtNwkUpdateReq::ManagerChange {
                 nwk_update_id,
@@ -2366,6 +2366,25 @@ mod tests {
         payload
     }
 
+    /// An accepted channel change waits for nwkNetworkBroadcastDeliveryTime
+    /// (R22 §2.4.3.3.9): still on the old channel just before it, on the new
+    /// one right after.
+    #[cfg(any(not(feature = "end-device"), feature = "router"))]
+    fn assert_switches_after_delivery_time(zdo: &mut ZdoLayer<MockMac>, from: u8, to: u8) {
+        const DELIVERY: u32 = zigbee_nwk::conflict::NETWORK_BROADCAST_DELIVERY_TIME_US;
+        assert_eq!(zdo.nwk().pending_channel_change(), Some(to));
+        let start = zigbee_mac::PlatformServices::monotonic_micros(zdo.nwk().mac());
+        zdo.nwk_mut()
+            .mac_mut()
+            .set_time_micros(start + DELIVERY - 1);
+        block_on(zdo.nwk_mut().process_pending_end_device_lifecycle());
+        assert_eq!(zdo.nwk().nib().logical_channel, from, "too early");
+        zdo.nwk_mut().mac_mut().set_time_micros(start + DELIVERY);
+        block_on(zdo.nwk_mut().process_pending_end_device_lifecycle());
+        assert_eq!(zdo.nwk().nib().logical_channel, to);
+        assert_eq!(zdo.nwk().pending_channel_change(), None);
+    }
+
     #[cfg(any(not(feature = "end-device"), feature = "router"))]
     fn manager_change(tsn: u8, manager: ShortAddress, nwk_update_id: u8) -> [u8; 9] {
         let mut payload = [0u8; 9];
@@ -2447,8 +2466,13 @@ mod tests {
         block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
 
         assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
-        assert_eq!(zdo.nwk().nib().logical_channel, NEW_CHANNEL);
         assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(5));
+        // A retransmission while the change is pending is idempotent and
+        // keeps the original deadline.
+        let repeat = channel_change(0x61, NEW_CHANNEL, 5);
+        block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &repeat))).unwrap();
+        assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
+        assert_switches_after_delivery_time(&mut zdo, START_CHANNEL, NEW_CHANNEL);
     }
 
     /// Wrap-aware: 0x00 is newer than 0xFF, not eight generations older.
@@ -2460,7 +2484,7 @@ mod tests {
         block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
 
         assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
-        assert_eq!(zdo.nwk().nib().logical_channel, NEW_CHANNEL);
+        assert_switches_after_delivery_time(&mut zdo, START_CHANNEL, NEW_CHANNEL);
         assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(0x00));
     }
 
@@ -2475,6 +2499,7 @@ mod tests {
 
         assert_eq!(zdp_status(&zdo), ZdpStatus::InvRequestType as u8);
         assert_eq!(zdo.nwk().nib().logical_channel, START_CHANNEL);
+        assert_eq!(zdo.nwk().pending_channel_change(), None);
         assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(9));
     }
 
@@ -2532,8 +2557,8 @@ mod tests {
         block_on(zdo.handle_indication(&unicast(crate::MGMT_NWK_UPDATE_REQ, &payload))).unwrap();
 
         assert_eq!(zdp_status(&zdo), ZdpStatus::Success as u8);
-        assert_eq!(zdo.nwk().nib().logical_channel, NEW_CHANNEL);
         assert_eq!(zdo.nwk().nib().nwk_update_id(), Some(0xF0));
+        assert_switches_after_delivery_time(&mut zdo, START_CHANNEL, NEW_CHANNEL);
 
         // Now that the state is known, the same request is a conflict-free
         // retransmission, and an older one is refused.

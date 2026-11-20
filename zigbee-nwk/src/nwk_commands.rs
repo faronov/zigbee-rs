@@ -1088,6 +1088,9 @@ impl<M: MacDriver> NwkLayer<M> {
     /// Transmit address-conflict broadcasts and apply PAN identifier updates
     /// whose deadlines have passed.
     ///
+    /// Channel changes accepted from `Mgmt_NWK_Update_req` follow the same
+    /// delivery timer (R22 §2.4.3.3.9).
+    ///
     /// Both are deferred by design: R22 §3.6.1.9.3 requires a random jitter
     /// before an address-conflict broadcast (cancelled if an identical one is
     /// heard first), and §3.6.1.13.3 requires the new PAN identifier to be
@@ -1143,6 +1146,22 @@ impl<M: MacDriver> NwkLayer<M> {
                     e,
                 );
                 self.arm_pan_id_update(pending.new_pan_id);
+            }
+        }
+
+        // R22 §2.4.3.3.9: the channel named by an accepted Mgmt_NWK_Update_req
+        // once nwkNetworkBroadcastDeliveryTime has passed.
+        if let Some(pending) = self.pending_channel_change
+            && now.wrapping_sub(pending.apply_at_us) < u32::MAX / 2
+        {
+            self.pending_channel_change = None;
+            if let Err(e) = self.nlme_set_channel(pending.channel).await {
+                log::error!(
+                    "[NWK] Channel change to {} failed: {:?}",
+                    pending.channel,
+                    e
+                );
+                self.arm_channel_change(pending.channel);
             }
         }
     }
