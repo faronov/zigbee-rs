@@ -198,6 +198,12 @@ pub enum Op {
         duration_s: u8,
         target: u16,
     },
+    /// `NWK_CHANGE_CHANNEL` (`update_id` 0: current + 1).
+    ChangeChannel {
+        tid: u16,
+        channel: u8,
+        update_id: u8,
+    },
     Data(DataRequest),
     /// `flags`: `NWK_LEAVE_RESET` flags (bit1 keep host endpoints).
     LeaveReset {
@@ -278,6 +284,25 @@ pub trait CoordinatorPort {
     }
     /// Forget every host endpoint (`NWK_LEAVE_RESET` without flags bit1).
     fn clear_endpoints(&mut self) {}
+    /// `NWK_CHANGE_CHANNEL` is implemented ([`Self::commit_channel`],
+    /// [`Self::switch_channel`]).
+    fn channel_change_supported(&self) -> bool {
+        false
+    }
+    /// A channel change (R22 2.4.3.3.9, the network manager moving the
+    /// network) was broadcast as `Mgmt_NWK_Update_req{channel, update_id}`:
+    /// adopt `update_id` and commit `channel` to NV, so that a reboot
+    /// before the switch resumes where the network went. The radio stays on
+    /// the current channel.
+    fn commit_channel(&mut self, channel: u8, update_id: u8) -> Result<(), OpError> {
+        let _ = (channel, update_id);
+        Err(OpError::Unsupported)
+    }
+    /// Second half, `nwkNetworkBroadcastDeliveryTime` later: tune the radio.
+    async fn switch_channel(&mut self, channel: u8) -> Result<(), OpError> {
+        let _ = channel;
+        Err(OpError::Unsupported)
+    }
     /// `GROUP_MEMBERSHIP` capability: [`Self::group_membership`] works.
     fn groups_supported(&self) -> bool {
         false

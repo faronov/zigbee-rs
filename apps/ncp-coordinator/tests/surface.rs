@@ -42,7 +42,9 @@ use zigbee_zrhp::msg::diag::{
 use zigbee_zrhp::msg::firmware::{
     FwActivate, FwBegin as FwBeginReq, FwBeginRsp, FwFinishRsp, FwGetSlotsRsp, FwWrite, FwWriteRsp,
 };
-use zigbee_zrhp::msg::network::{NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkLeaveReset};
+use zigbee_zrhp::msg::network::{
+    EvtChannelChanged, NwkChangeChannel, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkLeaveReset,
+};
 use zigbee_zrhp::msg::security::{
     SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecGetFrameCountersRsp,
     SecGetNetworkKey, SecGetNetworkKeyRsp,
@@ -1550,4 +1552,110 @@ fn group_membership_edits_the_aps_group_table() {
         }
     }
     assert_eq!(status, Status::NoSpace.to_u8(), "a full table says so");
+}
+
+/// `NWK_CHANGE_CHANNEL` (R22 2.4.3.3.9): the Mgmt_NWK_Update_req broadcast
+/// and the NV commit come first, the radio follows after
+/// `nwkNetworkBroadcastDeliveryTime`, then `EVT_CHANNEL_CHANGED`.
+#[test]
+fn channel_change_announces_commits_then_switches() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let early = host.request(&NwkChangeChannel {
+        channel: 25,
+        nwk_update_id: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(early).status(), Status::InvalidState.to_u8());
+    let form = host.request(&form_request(0x1A62, 1 << 20));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    assert_eq!(port.info().channel, 20);
+    let update_id = port.info().nwk_update_id;
+    let sent = TcApp::device(port.app())
+        .aps()
+        .nwk()
+        .mac()
+        .tx_history()
+        .len();
+
+    let change = host.request(&NwkChangeChannel {
+        channel: 25,
+        nwk_update_id: 0,
+    });
+    let bad = host.request(&NwkChangeChannel {
+        channel: 27,
+        nwk_update_id: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(change).status(), 0);
+    assert_eq!(
+        host.response(bad).status(),
+        Status::InvalidParameter.to_u8()
+    );
+    let history = TcApp::device(port.app()).aps().nwk().mac().tx_history();
+    assert!(
+        history[sent..].iter().any(|tx| matches!(
+            tx.dst,
+            zigbee_types::MacAddress::Short(_, zigbee_types::ShortAddress(0xFFFF))
+        )),
+        "Mgmt_NWK_Update_req broadcast"
+    );
+    // Announced: NV and the update ID moved, the radio not yet.
+    let stored = {
+        let (_, store) = TcApp::device_and_store_mut(port.app_mut());
+        zigbee_runtime::security_store::SecurityStateStore::load(store)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(
+        (stored.channel, stored.update_id),
+        (25, update_id.wrapping_add(1))
+    );
+    assert_eq!(port.info().channel, 20);
+    assert_eq!(port.info().nwk_update_id, update_id.wrapping_add(1));
+    assert!(host.event(ids::EVT_CHANNEL_CHANGED).is_none());
+    let again = host.request(&NwkChangeChannel {
+        channel: 15,
+        nwk_update_id: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(again).status(), Status::Busy.to_u8());
+
+    // nwkNetworkBroadcastDeliveryTime later. The test loop's drive clock is
+    // 0 (the switch is due at 9 s on it); run the product loop with the
+    // real one around that point.
+    macro_rules! run_until {
+        ($at:expr) => {
+            let at: u64 = $at;
+            while now < at + 3_000 {
+                // Small steps keep the link's keepalives flowing.
+                now = (now + 50_000).min(at + 3_000);
+                host.pump(now, &mut pipe);
+                let _ = ncp.service_with(now, &mut pipe, &mut port, &mut platform, &log);
+                while pollster::block_on(ncp.drive_with(&mut port, &mut platform, || now)) {}
+                let _ = ncp.service_with(now, &mut pipe, &mut port, &mut platform, &log);
+                host.pump(now, &mut pipe);
+            }
+        };
+    }
+    run_until!(8_900_000);
+    assert!(host.event(ids::EVT_CHANNEL_CHANGED).is_none());
+    assert_eq!(port.info().channel, 20);
+    run_until!(9_000_000);
+    let changed: EvtChannelChanged = host.event(ids::EVT_CHANNEL_CHANGED).unwrap().event();
+    assert_eq!(
+        (changed.channel, changed.nwk_update_id, changed.req_tid),
+        (25, update_id.wrapping_add(1), change)
+    );
+    assert_eq!(port.info().channel, 25);
+
+    // The current channel: done at once, no broadcast.
+    let same = host.request(&NwkChangeChannel {
+        channel: 25,
+        nwk_update_id: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(same).status(), 0);
+    let changed: EvtChannelChanged = host.event(ids::EVT_CHANNEL_CHANGED).unwrap().event();
+    assert_eq!((changed.channel, changed.req_tid), (25, same));
 }

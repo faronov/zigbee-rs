@@ -706,6 +706,20 @@ struct StoredNetwork {
     key_seq: u8,
 }
 
+/// Commit a new operating channel and update ID to the network record.
+#[inline(never)]
+fn commit_channel<A: TcApp>(app: &mut A, channel: u8, update_id: u8) -> Result<(), OpError> {
+    let (_, store) = app.device_and_store_mut();
+    let mut state = store
+        .load()
+        .map_err(|_| OpError::Storage)?
+        .ok_or(OpError::NotFormed)?;
+    state.channel = channel;
+    state.update_id = update_id;
+    state.update_id_valid = true;
+    store.store(&state).map_err(|_| OpError::Storage)
+}
+
 /// The committed network in the security store, if any.
 #[inline(never)]
 fn stored_network<A: TcApp>(app: &mut A) -> Option<StoredNetwork> {
@@ -1203,6 +1217,38 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             device.unregister_host_endpoint(*endpoint);
         }
         self.host_endpoints.clear();
+    }
+
+    fn channel_change_supported(&self) -> bool {
+        true
+    }
+
+    fn commit_channel(&mut self, channel: u8, update_id: u8) -> Result<(), OpError> {
+        if !self.running {
+            return Err(OpError::InvalidState);
+        }
+        commit_channel(&mut self.app, channel, update_id)?;
+        self.app
+            .device_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nib_mut()
+            .set_nwk_update_id(update_id);
+        self.stored = stored_network(&mut self.app);
+        Ok(())
+    }
+
+    async fn switch_channel(&mut self, channel: u8) -> Result<(), OpError> {
+        if !self.running {
+            return Err(OpError::InvalidState);
+        }
+        self.app
+            .device_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nlme_set_channel(channel)
+            .await
+            .map_err(|status| OpError::Zigbee(status as u8))
     }
 
     fn groups_supported(&self) -> bool {

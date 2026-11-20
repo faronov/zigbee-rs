@@ -28,8 +28,9 @@ use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataConfirm, EvtApsDa
 use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagGetCountersRsp, DiagResetCounters};
 use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord, LogConfig};
 use zigbee_zrhp::msg::network::{
-    EvtDeviceJoined, EvtDeviceLeft, EvtNetworkState, NwkAddEndpoint, NwkForm, NwkGetInfoRsp,
-    NwkGroupMembership, NwkInit, NwkInitRsp, NwkLeaveReset, NwkPermitJoin,
+    EvtChannelChanged, EvtDeviceJoined, EvtDeviceLeft, EvtNetworkState, NwkAddEndpoint,
+    NwkChangeChannel, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkInit, NwkInitRsp,
+    NwkLeaveReset, NwkPermitJoin,
 };
 use zigbee_zrhp::msg::security::{
     EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey,
@@ -47,7 +48,7 @@ use zigbee_zrhp::types::{Endpoint, Ieee, Status};
 use crate::log_ring::LogRing;
 use crate::platform::{NcpPlatform, NoPlatform};
 use crate::port::{
-    CoordinatorPort, DataRequest, Destination, DeviceEvent, EndpointError, FormParams,
+    CoordinatorPort, DataConfirm, DataRequest, Destination, DeviceEvent, EndpointError, FormParams,
     HostEndpoint, MAX_ASDU, NetworkState, Op, OpError,
 };
 use crate::transport::{HostTransport, UartChangeError};
@@ -74,6 +75,20 @@ pub const TX_STALL_DISCARD_US: u64 = 50_000;
 pub const UART_REVERT_US: u64 = 3_000_000;
 /// Delay between a `SYS_RESET` response and the reset itself.
 pub const RESET_DELAY_US: u64 = 50_000;
+/// `nwkNetworkBroadcastDeliveryTime` (R22 Table 3-58 with the PRO
+/// defaults): the NCP tunes to a new channel this long after its
+/// `Mgmt_NWK_Update_req` broadcast, as every receiving router does.
+pub const CHANNEL_SWITCH_DELAY_US: u64 =
+    zigbee_nwk::conflict::NETWORK_BROADCAST_DELIVERY_TIME_US as u64;
+
+/// An announced channel change waiting for the broadcast delivery time.
+#[derive(Debug, Clone, Copy)]
+struct PendingChannel {
+    channel: u8,
+    update_id: u8,
+    req_tid: u16,
+    at_us: u64,
+}
 /// A status-only response (message header + status byte).
 const STATUS_RESPONSE: usize = zigbee_zrhp::msg::HEADER_LEN + 1;
 /// The largest response message (one frame payload).
@@ -220,6 +235,7 @@ pub struct Ncp<const LOG_N: usize> {
     /// (`auto_credit = false`, see `release_credits`).
     held_credits: [u8; Endpoint::COUNT],
     deferred: Deque<Deferred, DEFERRED>,
+    pending_channel: Option<PendingChannel>,
 }
 
 impl<const LOG_N: usize> Ncp<LOG_N> {
@@ -261,6 +277,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             host_caps: 0,
             held_credits: [0; Endpoint::COUNT],
             deferred: Deque::new(),
+            pending_channel: None,
         }
     }
 
@@ -283,6 +300,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         let mut fold = |t: u64| next = Some(next.map_or(t, |n: u64| n.min(t)));
         if let Some((_, at)) = self.pending_reset {
             fold(at);
+        }
+        if let Some(pending) = self.pending_channel {
+            fold(pending.at_us);
         }
         if let Some(switch) = self.uart_switch {
             fold(if switch.applied_rx_frames.is_some() {
@@ -358,8 +378,38 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         platform: &mut P,
         mut now_us: impl FnMut() -> u64,
     ) -> bool {
+        if let Some(pending) = self.pending_channel
+            && now_us() >= pending.at_us
+        {
+            self.pending_channel = None;
+            self.finish_channel_change(port, pending).await;
+            return true;
+        }
         let Some((op, accepted_us)) = self.ops.pop_front() else {
             return false;
+        };
+        // A channel change is announced by a broadcast through the data
+        // path's send (one `send` future in the root poll frame).
+        let mut announcing = None;
+        let op = match op {
+            Op::ChangeChannel {
+                tid,
+                channel,
+                update_id,
+            } => match self.prepare_channel_change(port, tid, channel, update_id, now_us()) {
+                Ok((request, pending)) => {
+                    announcing = Some(pending);
+                    Op::Data(request)
+                }
+                Err((status, done)) => {
+                    self.respond_status(ids::NWK_CHANGE_CHANNEL, tid, status);
+                    if let Some(event) = done {
+                        self.event(Endpoint::Zigbee, &event);
+                    }
+                    return true;
+                }
+            },
+            op => op,
         };
         match op {
             Op::SetIeee { tid, ieee } => {
@@ -404,6 +454,8 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 let result = port.form(params).await;
                 self.network_outcome(tid, result, port);
             }
+            // Turned into its broadcast above.
+            Op::ChangeChannel { .. } => {}
             Op::PermitJoin { duration_s, target } => {
                 let status = op_status(port.permit_join(duration_s, target).await);
                 self.respond_status(ids::NWK_PERMIT_JOIN, accepted_tid(accepted_us), status);
@@ -430,6 +482,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             }
             Op::Data(request) => {
                 let result = port.send(&request).await;
+                if let Some(pending) = announcing {
+                    self.announced_channel(port, pending, result);
+                    return true;
+                }
                 self.data_inflight = self.data_inflight.saturating_sub(1);
                 if matches!(&result, Ok(confirm) if confirm.deferred()) {
                     // Awaiting the APS ACK: `emit_stack_events` sends the
@@ -1139,6 +1195,28 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 };
                 status_only(queues, status);
             }
+            ids::NWK_CHANGE_CHANNEL => {
+                let request = decode!(NwkChangeChannel);
+                let status = if !port.channel_change_supported() {
+                    Status::UnsupportedCommand
+                } else if port.state() != NetworkState::Up {
+                    Status::InvalidState
+                } else if !(11..=26).contains(&request.channel) {
+                    Status::InvalidParameter
+                } else {
+                    let op = Op::ChangeChannel {
+                        tid,
+                        channel: request.channel,
+                        update_id: request.nwk_update_id,
+                    };
+                    match state.ops.push_back((op, now_us)) {
+                        // Responded by `drive` after the broadcast.
+                        Ok(()) => return,
+                        Err(_) => Status::Busy,
+                    }
+                };
+                status_only(queues, status);
+            }
             ids::NWK_GROUP_MEMBERSHIP => {
                 let request = decode!(NwkGroupMembership);
                 let status = if !port.groups_supported() {
@@ -1499,6 +1577,103 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         body: &T,
     ) -> bool {
         push_event(&mut self.queues, &mut self.event_seq, body)
+    }
+
+    /// `NWK_CHANGE_CHANNEL`: the `Mgmt_NWK_Update_req` broadcast to send
+    /// (R22 2.4.3.3.9: TSN, ScanChannels with the one target channel,
+    /// ScanDuration 0xFE, update ID) and the switch it schedules. Otherwise
+    /// the response, and for the current channel (no broadcast) the event
+    /// to send after it. A change already announced is `BUSY`.
+    #[inline(never)]
+    fn prepare_channel_change<C: CoordinatorPort>(
+        &self,
+        port: &C,
+        tid: u16,
+        channel: u8,
+        update_id: u8,
+        now_us: u64,
+    ) -> Result<(DataRequest, PendingChannel), (Status, Option<EvtChannelChanged>)> {
+        if self.pending_channel.is_some() {
+            return Err((Status::Busy, None));
+        }
+        let info = port.info();
+        if channel == info.channel {
+            let event = EvtChannelChanged {
+                channel,
+                nwk_update_id: info.nwk_update_id,
+                req_tid: tid,
+            };
+            return Err((Status::Success, Some(event)));
+        }
+        let update_id = if update_id == 0 {
+            info.nwk_update_id.wrapping_add(1)
+        } else {
+            update_id
+        };
+        let mut asdu = heapless::Vec::new();
+        let _ = asdu.push(tid as u8);
+        let _ = asdu.extend_from_slice(&(1u32 << channel).to_le_bytes());
+        let _ = asdu.extend_from_slice(&[0xFE, update_id]);
+        let request = DataRequest {
+            req_tid: tid,
+            dst: Destination::Broadcast(0xFFFD),
+            dst_ep: 0,
+            src_ep: 0,
+            profile: 0x0000,
+            cluster: 0x0038,
+            tx_options: 0,
+            radius: 0,
+            asdu,
+        };
+        let pending = PendingChannel {
+            channel,
+            update_id,
+            req_tid: tid,
+            at_us: now_us + CHANNEL_SWITCH_DELAY_US,
+        };
+        Ok((request, pending))
+    }
+
+    /// The broadcast went out: commit the new channel and update ID to NV
+    /// (a reboot from now on resumes where the network goes), answer, and
+    /// schedule the switch.
+    #[inline(never)]
+    fn announced_channel<C: CoordinatorPort>(
+        &mut self,
+        port: &mut C,
+        pending: PendingChannel,
+        sent: Result<DataConfirm, OpError>,
+    ) {
+        let result = match sent {
+            Ok(confirm) if confirm.zb_status != 0 => Err(OpError::Zigbee(confirm.zb_status)),
+            Ok(_) => port.commit_channel(pending.channel, pending.update_id),
+            Err(error) => Err(error),
+        };
+        if result.is_ok() {
+            self.pending_channel = Some(pending);
+        }
+        self.respond_status(ids::NWK_CHANGE_CHANNEL, pending.req_tid, op_status(result));
+    }
+
+    /// Tune to the announced channel and report it (`EVT_CHANNEL_CHANGED`).
+    /// The new channel is already in NV, so a failure here is reported as
+    /// the channel the radio stayed on; a reboot resumes on the new one.
+    #[inline(never)]
+    async fn finish_channel_change<C: CoordinatorPort>(
+        &mut self,
+        port: &mut C,
+        pending: PendingChannel,
+    ) {
+        let channel = match port.switch_channel(pending.channel).await {
+            Ok(()) => pending.channel,
+            Err(_) => port.info().channel,
+        };
+        let event = EvtChannelChanged {
+            channel,
+            nwk_update_id: pending.update_id,
+            req_tid: pending.req_tid,
+        };
+        self.event(Endpoint::Zigbee, &event);
     }
 
     fn respond_status(&mut self, id: u16, tid: u16, status: Status) {
@@ -2061,6 +2236,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 host_caps: _,
                 held_credits: _,
                 deferred: _,
+                pending_channel: _,
             } = ncp;
         };
         let reason = match identity.reset_reason {
@@ -2103,6 +2279,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             addr_of_mut!((*slot).host_caps).write(0);
             addr_of_mut!((*slot).held_credits).write([0; Endpoint::COUNT]);
             addr_of_mut!((*slot).deferred).write(Deque::new());
+            addr_of_mut!((*slot).pending_channel).write(None);
             let ncp = &mut *slot;
             ncp.link.open(now_us, reason);
             ncp
