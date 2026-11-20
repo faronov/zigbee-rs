@@ -10,8 +10,11 @@
 > on an ESP32-C6 DevKit (lab variant, USB-Serial-JTAG) it completed the
 > session, formed a network (soft MAC `pan-coordinator` + `energy-detect`)
 > and resumed it after a reset. No device has joined it yet and none of the
-> hardware gates H1–H12 has passed. The zigpy library, Go adapter,
-> zigbee-herdsman adapter and embedded hub described here do not exist yet.
+> hardware gates H1–H12 has passed. The zigpy library
+> ([`faronov/zigpy-zrhp`](https://github.com/faronov/zigpy-zrhp)) is tested
+> against the vectors, a Python NCP simulator and the Rust NCP on the host
+> (12.1.1), not yet on hardware. The Go adapter, zigbee-herdsman adapter and
+> embedded hub described here do not exist yet.
 > Byte layouts are normative for v1. The golden vectors in
 > [`host-protocol-vectors/`](host-protocol-vectors/generate.py) are generated
 > from these layouts by a small Python script. The script is a vector
