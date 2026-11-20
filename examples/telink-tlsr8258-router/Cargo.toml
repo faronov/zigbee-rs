@@ -22,6 +22,8 @@ green-power = [
 lab-rejoin-trigger = ["router-app/rejoin-request"]
 # Receive-queue overflow attribution ring in the TLSR8258 HAL.
 lab-rx-trace = ["tlsr8258-hal/lab-rx-trace"]
+# Radio event log for sniffer correlation of the ACK paths.
+lab-radio-log = ["tlsr8258-hal/lab-radio-log"]
 
 [dependencies]
 router-app = { path = "../../apps/router", features = ["router"] }

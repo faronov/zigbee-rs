@@ -427,6 +427,146 @@ frames). An overflow counted here can be the sender's MAC retry of a frame
 whose ACK was withheld, rather than a lost frame. The traffic differed too
 much between the soaks for a like-for-like loss comparison.
 
+#### Soak with sniffer correlation (2026-11-19)
+
+The production image with ACK withholding ran for 2 h 59 min as 0x045B
+(PAN 0xDFE9, channel 15) with no child and no commissioning. Its identity was
+read over SWire from the HAL ACK filter (PAN, short address and the EUI-64
+that ZHA lists for the device), and it was on air sending Link Status as
+0x045B. hwlab polled the HAL counters over SWire throughout. The queue
+overflow word was read about every 14 ms, so each overflow is timed to within
+about ±65 ms of the sniffer clock; that offset was calibrated from the
+router's own transmissions. An nRF52840 sniffer captured channel 15 at the
+same time: 139,005 frames, about 13 per second. The router was found about
+one second after a restart at the first SWire access. It resumed from its
+journal without a new association, and the counter-based reboot check stayed
+clean for the whole soak.
+
+| counter (soak delta) | value |
+|---|---:|
+| valid frames | 148,586 |
+| invalid CRC / invalid length | 38,901 / 2,301 |
+| DMA incomplete | 2 |
+| software ACKs sent / ACK TX timeouts | 21 / 0 |
+| RX queue overflow / evicted | 2,057 / 0 |
+| queue high-water | 16 of 16 |
+| channel-access failures / busy CCAs | 14 / 1,021 of 9,285 |
+| MAC command-queue overflow | 0 |
+
+Queue loss per hour was 785 frames (1.24 %), 1,183 (2.78 %) and 89 (0.22 %).
+Home Assistant did not restart. Almost all of the loss came from
+two other kinds of burst:
+
+- ZHA re-initialised the coordinator three times. All Zigbee entities went
+  unavailable at 20:34, 21:13 and 21:40. Each time the coordinator then sent
+  floods of route requests: about 35 new requests per minute, each relayed
+  by about 17 routers.
+- A Green Power remote was pressed in bursts between 21:10 and 21:53. Each
+  press produced GPDF repeats and a GP Notification broadcast from every
+  proxy. The 21:22–21:30 burst alone overflowed 1,014 times.
+
+Class by class:
+
+- **ACKed, then dropped at the HAL queue: none.** The software ACK decision
+  and the queue push use the same full-queue test in the same uninterruptible
+  RX-completion path. In this soak, `evicted` stayed 0 across 2,057
+  overflows. A frame addressed to the router that reaches a full queue holding
+  any broadcast evicts that broadcast and counts as evicted, so no frame
+  addressed to the router was dropped or had its ACK withheld. On air, the
+  sniffer saw 18 transmissions to 0x045B. All 4 ACKed frames the router had to
+  relay were forwarded. Of the 6 ACKed frames addressed to the router itself,
+  2 got a visible NWK reply. The other 4 are encrypted, and they may be
+  one-way traffic.
+- **Withheld ACK (retried or lost): none.** No frame addressed to the router
+  reached a full queue. The image in this soak had no counter for withheld
+  ACKs. evicted = 0 shows that none occurred, but that inference only holds
+  while broadcasts dominate the queue. `RxDiagnostics::ack_withheld` (router
+  metric `radio_rx_ack_withheld`) now counts them directly.
+- **Broadcast and GPDF drops: all 2,057.** The sniffer attributes 1,921 of
+  them to frames on air: 1,259 NWK broadcasts to 0xFFFD (mostly GP
+  Notifications), 476 coordinator route requests, 130 GPDFs (this image is
+  not a GP proxy), and 56 others. For 82 % of them the router still relayed
+  the same broadcast from another copy. Of the 1,287 distinct broadcasts that
+  the sniffer heard with radius above 1, the router relayed 95.3 %. Of the
+  61 it did not relay, 24 had a copy that arrived near an overflow, and 37
+  had none.
+
+The frames the router did not ACK did not come from the queue:
+
+- 0x670B routed through 0x045B, but none of its 7 transmissions (11
+  frames) to the router was ACKed. The router's own 4 attempts to 0x670B
+  also got no ACK.
+- One retry from 0x4304 started 0.8 ms after the router's own transmission
+  ended, and the router did not ACK it.
+- On the transmit side, 4 of the 14 ACKs the sniffer saw for router unicasts
+  did not stop the router's retries. One transmission used all 4 attempts
+  even though the last three were ACKed on air.
+
+The 0x670B link is weak in both directions. The last two items come from the
+CSMA-CA defect described in the next section, which is now fixed. The
+ACK-withholding path still needs a test in which frames addressed to the
+router reach a full queue, through a child or injected traffic.
+
+#### Receptions lost after the router's own transmissions (2026-11-20)
+
+The `lab-radio-log` feature (off in production) adds `TLSR_LAB_RADIO_LOG`, a
+64-entry ring that hwlab polls over SWire every 0.6 s. It records every RX
+completion (valid, CRC failure or length failure, with context and the
+software-ACK decision) and every transmission with its `tx_pkt` tick,
+TX-done latency and ACK-wait outcome. It also records each CSMA backoff start
+with the raw RX state register. A fit of the logged TX starts to the sniffer
+timestamps of the same frames aligns the log to the air within about 2 us
+(Timer0 runs about 21 ppm off the sniffer clock). TX done is seen 37 us after
+the frame ends on air, the same latency as an RX completion, so RX is
+re-enabled well before an ACK can start.
+
+The base image lost the first reception after 150 of 832 transmissions
+(18 %). That reception was counted as a length failure: RX-done fired about
+320 us into the frame, or at its end, with PHR 0 or a shifted PSDU in the
+DMA buffer. 85 % of all zero-length completions were such first receptions.
+After a transmission, the first reception is the ACK of a unicast or a frame
+the router has to ACK.
+
+The cause was CSMA-CA. It turned the transceiver off at every backoff start
+and again for the transmission, even while the baseband was receiving a
+frame. That lost the frame, and the aborted reception corrupted the next
+one. With RX in progress (reg 0x448 bit 5) at a CSMA start, the first
+reception after the transmission was lost in 27 of 31 cases, against 11 of
+173 otherwise. Resetting the TX/RX state machine before RX (38 of 292 lost)
+and toggling the RX DMA channel before TX (41 of 231 lost) did not help.
+
+CSMA-CA now waits for a frame in progress to complete and queues it before
+either TRX off, bounded by the longest PPDU. A completed frame awaiting
+service is queued instead of cleared, and CCA alone still decides whether
+the channel is busy. In a 28-minute lab run of the fixed image:
+
+| | base (25 min) | fixed (28 min) |
+|---|---:|---:|
+| first reception after a TX lost | 150 / 832 (18 %) | 6 / 1,490 (0.4 %) |
+| ... with RX in progress at a CSMA start | 27 / 31 | 1 / 215 |
+| channel-access failures | 1 / 832 | 3 / 1,490 |
+| router unicasts: on-air ACKs accepted | (soak: 10 / 14) | 8 / 8 |
+| frames to the router ACKed on air | none in this run | 13 / 13 |
+
+Cost of the fix: router and router-core +128 B of flash,
+ED and sensor images +124 B. `.ram_code`, `.bss` and the static stack worst
+paths are unchanged (router 14,568 B, ED 19,112 B, sensor 20,644 B). Inlining
+the helper into the CSMA loop would have pushed the sensor and ED rejoin
+stack chains over their gates, so it stays out of line.
+
+The production image with the fix (no lab log) then ran for 39 minutes as
+0x045B after an application-only reflash. It resumed from its journals
+without a new association. With a capture on the same channel, it received
+25,080 valid frames, with 15 queue overflows (all broadcasts, none
+evicted), no withheld ACK and 1 channel-access failure in 1,160
+transmissions. It relayed 95.5 % of the broadcasts heard with radius above 1
+(soak: 95.3 %). No unicast was sent to or by the router in that window.
+
+One `hwlab target identify` (or `flash info`) on the running router
+left its CPU stalled in flash code until a hard reset, probably because the
+flash JEDEC read runs while the CPU executes from flash. RAM reads are safe.
+Halt the CPU before any flash-identity access.
+
 A shared SoftMac duplicate filter (IEEE 802.15.4 §7.5.6.2, one
 source/DSN entry) was measured at +304 B flash, +16 B bss and +16 B stack.
 It fired once in 16 minutes of soak and was not adopted.
@@ -472,7 +612,9 @@ Remaining gates:
 - the parent router: a child joining (and Trust Center rejoining) through
   it, its own neighbour table in ZHA, and a paint-based stack high-water on
   the persistence paths;
-- independent packet-capture proof of the ACK-withholding behaviour (no
-  sniffer was available);
+- independent packet-capture proof of the ACK-withholding behaviour: the
+  2026-11-19 sniffer-correlated soak found no withheld ACK and no frame
+  for the router lost at the queue, but never filled the queue with frames
+  for the router, so the withholding path itself was not exercised;
 - the one-off SED `security persistence` panic seen once and not reproduced;
-- long-duration router and sleep stability.
+- sleep stability, and router stability beyond the 3-hour soak.

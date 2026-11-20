@@ -120,6 +120,9 @@ struct JoinMetrics {
     mac_data_queue_high_water: AtomicU32,
     mac_command_queue_overflow: AtomicU32,
     mac_command_queue_high_water: AtomicU32,
+    /// Software ACKs withheld because the HAL RX queue was full (subset of
+    /// `radio_rx_queue_overflow`). Appended to keep RAM-dump offsets.
+    radio_rx_ack_withheld: AtomicU32,
 }
 
 impl JoinMetrics {
@@ -190,6 +193,7 @@ impl JoinMetrics {
             mac_data_queue_high_water: AtomicU32::new(0),
             mac_command_queue_overflow: AtomicU32::new(0),
             mac_command_queue_high_water: AtomicU32::new(0),
+            radio_rx_ack_withheld: AtomicU32::new(0),
         }
     }
 
@@ -227,6 +231,8 @@ impl JoinMetrics {
             .store(rx.serviced_polled, Ordering::Relaxed);
         self.mac_command_queue_overflow
             .store(u32::from(mac.dropped_command_events()), Ordering::Relaxed);
+        self.radio_rx_ack_withheld
+            .store(rx.ack_withheld, Ordering::Relaxed);
     }
 
     fn begin_attempt(&self, started_us: u32) {
