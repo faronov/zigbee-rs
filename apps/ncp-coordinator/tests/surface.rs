@@ -8,7 +8,7 @@ use ncp_coordinator_app::platform::{
     FwBegin, FwImage, FwSlot, NcpPlatform, PlatformError, slot_state,
 };
 use ncp_coordinator_app::port::CoordinatorPort;
-use ncp_coordinator_app::tc::TcPort;
+use ncp_coordinator_app::tc::{TcApp, TcPort};
 use ncp_coordinator_app::transport::{HostTransport, TransportInfo};
 use ncp_coordinator_app::{LogRing, Ncp, NcpIdentity, PlatformRequest};
 use router_app::{
@@ -32,17 +32,26 @@ use zigbee_zrhp::codec::{Wire, Writer};
 use zigbee_zrhp::frame::TX_BUFFER_LEN;
 use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent};
 use zigbee_zrhp::msg::backup::{
-    BkpExportBegin, BkpExportBeginRsp, BkpExportEnd, BkpExportRead, BkpRestoreBegin,
-    BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, BkpRestorePutRsp,
+    BkpExportBegin, BkpExportBeginRsp, BkpExportEnd, BkpExportRead, BkpRestoreAbort,
+    BkpRestoreBegin, BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, BkpRestorePutRsp,
+};
+use zigbee_zrhp::msg::diag::{
+    DiagGetChildren, DiagGetChildrenRsp, DiagGetNeighbors, DiagGetNeighborsRsp, DiagGetRoutes,
+    DiagGetRoutesRsp,
 };
 use zigbee_zrhp::msg::firmware::{
     FwActivate, FwBegin as FwBeginReq, FwBeginRsp, FwFinishRsp, FwGetSlotsRsp, FwWrite, FwWriteRsp,
 };
-use zigbee_zrhp::msg::network::{NwkForm, NwkGetInfoRsp, NwkLeaveReset};
-use zigbee_zrhp::msg::security::{SecGetFrameCountersRsp, SecGetNetworkKey, SecGetNetworkKeyRsp};
+use zigbee_zrhp::msg::network::{
+    EvtChannelChanged, NwkChangeChannel, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkLeaveReset,
+};
+use zigbee_zrhp::msg::security::{
+    SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecGetFrameCountersRsp,
+    SecGetNetworkKey, SecGetNetworkKeyRsp,
+};
 use zigbee_zrhp::msg::system::{
     ConfigValue, SysGetConfig, SysGetConfigRsp, SysGetInfoRsp, SysGetStatusRsp, SysNegotiateReq,
-    SysNegotiateRsp, SysSetConfig, SysSetConfigRsp, SysSetIeee, caps, config,
+    SysNegotiateRsp, SysReset, SysSetConfig, SysSetConfigRsp, SysSetIeee, caps, config,
 };
 use zigbee_zrhp::msg::tables::{
     EvtTblEpochChanged, TableKey, TblInvalidate, TblPush, TblPushRsp, TblRead, TblReadRsp,
@@ -475,6 +484,7 @@ macro_rules! setup {
             caps::NCP_FW_UPDATE,
             caps::IEEE_REWRITABLE,
             caps::PTA_COEX,
+            caps::GROUP_MEMBERSHIP,
         ] {
             assert_ne!(negotiated.ncp_caps & bit, 0, "capability {bit:#x}");
         }
@@ -618,7 +628,8 @@ fn host_identity_formation_tables_and_backup_restore() {
     assert_eq!(records[0][0], record_type::NODE);
     assert_eq!(*records.last().unwrap().first().unwrap(), record_type::END);
 
-    // Restore needs the stack stopped.
+    // A restore begun with the network up stages while it keeps running;
+    // ABORT leaves it as it was (9.4 rule 1).
     let early = host.request(&BkpRestoreBegin {
         flags: 0,
         nwk_margin: 10_000,
@@ -626,7 +637,12 @@ fn host_identity_formation_tables_and_backup_restore() {
         expected_records: 7,
     });
     exchange!();
-    assert_eq!(host.response(early).status(), Status::InvalidState.to_u8());
+    let early = host.response(early);
+    let early: BkpRestoreBeginRsp = early.body();
+    let abort = host.request(&BkpRestoreAbort { txn: early.txn });
+    exchange!();
+    assert_eq!(host.response(abort).status(), 0);
+    assert_eq!(port.state() as u8, 2, "still up after ABORT");
 
     // Factory reset of the network, then the restore.
     let leave = host.request(&NwkLeaveReset { flags: 0 });
@@ -712,6 +728,39 @@ fn host_identity_formation_tables_and_backup_restore() {
     exchange!();
     assert_eq!(host.response(invalidate).status(), 0);
     assert!(port.device(0).is_none());
+
+    // A restore committed while the network is up replaces it in place:
+    // the device key returns, counters only move forward.
+    let before = port.frame_counters();
+    let begin = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 0,
+        aps_margin: 0,
+        expected_records: 7,
+    });
+    exchange!();
+    let begin = host.response(begin);
+    let begin: BkpRestoreBeginRsp = begin.body();
+    let mut payload = begin.txn.to_le_bytes().to_vec();
+    for record in &records {
+        payload.extend_from_slice(record);
+    }
+    let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+    exchange!();
+    let put = host.response(put);
+    assert_eq!(usize::from(put.body::<BkpRestorePutRsp>().accepted), 7);
+    let commit = host.request(&BkpRestoreCommit { txn: begin.txn });
+    exchange!();
+    let commit = host.response(commit);
+    let commit: BkpRestoreCommitRsp = commit.body();
+    assert!(commit.nwk_fc_start > before.nwk_current);
+    assert!(commit.aps_fc_start > before.aps_current);
+    assert_eq!(commit.link_keys_on_ncp, 1);
+    assert_eq!(port.state() as u8, 2);
+    let after = port.frame_counters();
+    assert!(after.nwk_current > before.nwk_current);
+    assert!(after.aps_current > before.aps_current);
+    assert_eq!(port.device(0).map(|view| view.ieee), Some(DEVICE_IEEE));
 }
 
 #[test]
@@ -1121,6 +1170,43 @@ fn restore_keeps_ncp_children_and_their_keys() {
     // factory-reset device re-pairing gets the network key under the
     // global key, and the device may secure-rejoin.
     assert_eq!((link.origin, link.attrs), (2, 2));
+
+    // The coordinator's tables for hosts (spec 7.8; zigpy Z13, herdsman
+    // H6): the restored child appears as a child neighbour.
+    let neighbors = host.request(&DiagGetNeighbors { start: 0 });
+    let children = host.request(&DiagGetChildren { start: 0 });
+    let routes = host.request(&DiagGetRoutes { start: 0 });
+    let past_end = host.request(&DiagGetChildren { start: 5 });
+    exchange!();
+    let neighbors = host.response(neighbors);
+    let neighbors: DiagGetNeighborsRsp = neighbors.body();
+    assert_eq!(neighbors.total, 1);
+    let neighbor = neighbors.entries.iter().next().unwrap();
+    assert_eq!(
+        (
+            neighbor.ieee.0,
+            neighbor.nwk,
+            neighbor.relationship,
+            neighbor.device_type
+        ),
+        (DEVICE_IEEE, 0x4C21, 1, 2)
+    );
+    let children = host.response(children);
+    let children: DiagGetChildrenRsp = children.body();
+    let child = children.entries.iter().next().unwrap();
+    assert_eq!(children.total, 1);
+    assert_eq!(
+        (child.ieee.0, child.nwk, child.timeout_exp),
+        (DEVICE_IEEE, 0x4C21, 9)
+    );
+    assert_eq!(child.capability & 0x88, 0x80, "a sleepy end device");
+    assert_eq!(child.last_poll_ms, u32::MAX, "not heard since the restore");
+    let routes = host.response(routes);
+    let routes: DiagGetRoutesRsp = routes.body();
+    assert_eq!(routes.entries.iter().count(), usize::from(routes.total));
+    let past_end = host.response(past_end);
+    let past_end: DiagGetChildrenRsp = past_end.body();
+    assert_eq!((past_end.total, past_end.entries.iter().count()), (1, 0));
 }
 
 #[test]
@@ -1179,4 +1265,407 @@ fn restoring_an_old_backup_never_lowers_the_outgoing_counters() {
     let after = port.frame_counters();
     assert!(after.nwk_current >= used.nwk_limit);
     assert!(after.aps_current >= used.aps_limit);
+}
+
+/// One NCP boot over `security` (the persistent store): negotiates and
+/// runs `body` with the NCP, host and an `exchange` closure-like macro.
+macro_rules! boot {
+    ($security:ident, |$ncp:ident, $host:ident, $port:ident, $platform:ident, $pipe:ident,
+      $log:ident, $now:ident| $body:block) => {{
+        let mut gp_store = zigbee_runtime::gp_store::RamGpProxyStore::new();
+        let mut profile = profile();
+        let mut device = device(&profile);
+        let node = ZigbeeNode::new(&mut device, &mut $security, &mut profile);
+        let mut app = TrustCenterCoordinatorApp::new(
+            node,
+            PersistentChildren::new(RamChildTableStore::new()),
+            RamTrustCenterDeviceStore::new(),
+            &POLICY,
+            RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+        )
+        .unwrap();
+        app.set_green_power_store(&mut gp_store);
+        let mut $port = TcPort::new(app, IEEE, clock_ms);
+        let $log = LogRing::<8>::new();
+        let mut $pipe = Pipe::default();
+        let mut $platform = FakePlatform::default();
+        let mut $now = 1_000u64;
+        let mut $ncp = Ncp::<8>::new(identity(), 0xC0FF_EE05, $now);
+        let mut $host = Host::new($now);
+        exchange(
+            &mut $ncp,
+            &mut $host,
+            &mut $port,
+            &mut $platform,
+            &mut $pipe,
+            &$log,
+            &mut $now,
+        );
+        assert!($host.event(ids::EVT_NCP_READY).is_some());
+        let negotiate = $host.request(&SysNegotiateReq {
+            major_min: 1,
+            major_max: 1,
+            host_caps: 0,
+            name: Bytes8(b"surface"),
+        });
+        exchange(
+            &mut $ncp,
+            &mut $host,
+            &mut $port,
+            &mut $platform,
+            &mut $pipe,
+            &$log,
+            &mut $now,
+        );
+        let _: SysNegotiateRsp = $host.response(negotiate).body();
+        $body
+    }};
+}
+
+/// Spec 7.2 / 7.11 step 4 (zigpy Z11): after a reboot and before
+/// `NWK_INIT`, `NWK_GET_INFO` reports the committed network's identity
+/// with `state` 1 (formed, not up) instead of an empty NIB.
+#[test]
+fn network_info_after_a_reboot_reports_the_stored_identity() {
+    let mut security = RamSecurityStateStore::new();
+    boot!(security, |ncp, host, port, platform, pipe, log, now| {
+        let form = host.request(&form_request(0x1A62, 1 << 20));
+        exchange(
+            &mut ncp,
+            &mut host,
+            &mut port,
+            &mut platform,
+            &mut pipe,
+            &log,
+            &mut now,
+        );
+        assert_eq!(host.response(form).status(), 0);
+    });
+    boot!(security, |ncp, host, port, platform, pipe, log, now| {
+        let info = host.request_raw(ids::NWK_GET_INFO, &[]);
+        exchange(
+            &mut ncp,
+            &mut host,
+            &mut port,
+            &mut platform,
+            &mut pipe,
+            &log,
+            &mut now,
+        );
+        let info = host.response(info);
+        let info: NwkGetInfoRsp = info.body();
+        assert_eq!(
+            (info.state, info.pan_id, info.ext_pan_id, info.channel),
+            (1, 0x1A62, EPID, 20)
+        );
+        assert_eq!((info.key_seq, info.nwk_update_id), (3, 2));
+        assert_eq!(info.ieee.0, IEEE);
+    });
+    // A factory-new NCP still reports nothing.
+    let mut empty = RamSecurityStateStore::new();
+    boot!(empty, |ncp, host, port, platform, pipe, log, now| {
+        let info = host.request_raw(ids::NWK_GET_INFO, &[]);
+        exchange(
+            &mut ncp,
+            &mut host,
+            &mut port,
+            &mut platform,
+            &mut pipe,
+            &log,
+            &mut now,
+        );
+        let info = host.response(info);
+        let info: NwkGetInfoRsp = info.body();
+        assert_eq!(info.state, 0);
+    });
+}
+
+/// `SEC_ADD_INSTALL_CODE` / `SEC_ADD_LINK_KEY` (spec 7.5; herdsman H6):
+/// the derived key (Silicon Labs vector) is returned and provisioned for
+/// the device; a bad CRC is refused; a unique TCLK is provisioned with its
+/// attributes; unsupported variants are refused, not silently accepted.
+#[test]
+fn install_codes_and_link_keys_are_provisioned() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    const CODE: [u8; 18] = [
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0xD4, 0x90,
+    ];
+    const DERIVED: [u8; 16] = [
+        0xFA, 0x80, 0x81, 0xCA, 0xAA, 0x41, 0xD5, 0xAD, 0xE9, 0xB5, 0x65, 0x87, 0x99, 0x26, 0x8B,
+        0x88,
+    ];
+    const CODE_DEVICE: [u8; 8] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38];
+    const KEY_DEVICE: [u8; 8] = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48];
+
+    // Not before the network runs.
+    let early = host.request(&SecAddInstallCode {
+        ieee: Ieee(CODE_DEVICE),
+        code: Bytes8(&CODE),
+    });
+    exchange!();
+    assert_eq!(host.response(early).status(), Status::InvalidState.to_u8());
+
+    let form = host.request(&form_request(0x2C11, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let mut bad = CODE;
+    bad[0] ^= 1;
+    let rejected = host.request(&SecAddInstallCode {
+        ieee: Ieee(CODE_DEVICE),
+        code: Bytes8(&bad),
+    });
+    let added = host.request(&SecAddInstallCode {
+        ieee: Ieee(CODE_DEVICE),
+        code: Bytes8(&CODE),
+    });
+    let key = host.request(&SecAddLinkKey {
+        ieee: Ieee(KEY_DEVICE),
+        key: DEVICE_KEY,
+        key_type: 1,
+        attrs: 1,
+        rx_floor: 0,
+        flags: 1,
+    });
+    let application = host.request(&SecAddLinkKey {
+        ieee: Ieee(KEY_DEVICE),
+        key: DEVICE_KEY,
+        key_type: 3,
+        attrs: 0,
+        rx_floor: 0,
+        flags: 0,
+    });
+    exchange!();
+    assert_eq!(
+        host.response(rejected).status(),
+        Status::InvalidParameter.to_u8()
+    );
+    let added = host.response(added);
+    let added: SecAddInstallCodeRsp = added.body();
+    assert_eq!(added.derived_key, DERIVED);
+    assert_eq!(host.response(key).status(), 0);
+    assert_eq!(
+        host.response(application).status(),
+        Status::UnsupportedCommand.to_u8()
+    );
+
+    let keys: Vec<_> = (0..port.device_capacity())
+        .filter_map(|index| port.device(index))
+        .filter_map(|view| view.link.map(|link| (view.ieee, link.key, link.origin)))
+        .collect();
+    assert!(keys.contains(&(CODE_DEVICE, DERIVED, 1)), "{keys:?}");
+    assert!(keys.contains(&(KEY_DEVICE, DEVICE_KEY, 3)), "{keys:?}");
+}
+
+/// A reboot that falls due while the product drives a queued operation is
+/// not lost: the composition roots ignore the `service` result inside their
+/// drive loop, so the request stays armed until the outer `service` takes
+/// it (a lost one left `SYS_RESET` unanswered until the host reset the NCP
+/// by its lines).
+#[test]
+fn a_reset_due_during_a_queued_operation_is_kept() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let reset = host.request(&SysReset {
+        mode: 0,
+        confirm: 0,
+    });
+    let set = host.request(&SysSetIeee {
+        ieee: Ieee(OTHER_IEEE),
+    });
+    now += 1_000;
+    host.pump(now, &mut pipe);
+    assert_eq!(
+        ncp.service_with(now, &mut pipe, &mut port, &mut platform, &log),
+        None
+    );
+    // The operation runs after the reset delay; the product loop drops the
+    // in-loop `service` result.
+    now += 100_000;
+    while pollster::block_on(ncp.drive_with(&mut port, &mut platform, || 0)) {
+        let _ = ncp.service_with(now, &mut pipe, &mut port, &mut platform, &log);
+    }
+    host.pump(now, &mut pipe);
+    now += 1_000;
+    assert_eq!(
+        ncp.service_with(now, &mut pipe, &mut port, &mut platform, &log),
+        Some(PlatformRequest::Reset { mode: 0 })
+    );
+    host.pump(now, &mut pipe);
+    assert_eq!(host.response(reset).status(), 0);
+    assert_eq!(host.response(set).status(), 0);
+}
+
+#[test]
+fn group_membership_edits_the_aps_group_table() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let early = host.request(&NwkGroupMembership {
+        op: 1,
+        group: 0x0B84,
+        ep: 242,
+    });
+    exchange!();
+    assert_eq!(host.response(early).status(), Status::InvalidState.to_u8());
+    let form = host.request(&form_request(0x1A62, 1 << 20));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+
+    macro_rules! run {
+        ($op:expr, $group:expr, $ep:expr) => {{
+            let request = host.request(&NwkGroupMembership {
+                op: $op,
+                group: $group,
+                ep: $ep,
+            });
+            exchange!();
+            host.response(request).status()
+        }};
+    }
+    assert_eq!(
+        run!(1, 0x0B84, 242),
+        0,
+        "the GP endpoint joins the sink group"
+    );
+    assert_eq!(run!(1, 0x1234, 1), 0);
+    assert_eq!(run!(1, 0x1234, 1), 0, "idempotent");
+    assert_eq!(run!(1, 0x1234, 2), 0);
+    assert_eq!(run!(1, 0x1234, 241), Status::InvalidParameter.to_u8());
+    assert_eq!(run!(1, 0xFFF8, 1), Status::InvalidParameter.to_u8());
+    assert_eq!(run!(9, 0x1234, 1), Status::InvalidParameter.to_u8());
+    {
+        let groups = TcApp::device(port.app()).aps().group_table();
+        assert!(groups.is_member(0x0B84, 242));
+        assert!(groups.is_member(0x1234, 1) && groups.is_member(0x1234, 2));
+    }
+    assert_eq!(run!(2, 0x1234, 2), 0);
+    assert_eq!(run!(2, 0x1234, 2), 0, "removing a non-member is a no-op");
+    assert_eq!(run!(3, 0, 1), 0, "endpoint 1 leaves every group");
+    {
+        let groups = TcApp::device(port.app()).aps().group_table();
+        assert!(!groups.is_member(0x1234, 1) && !groups.is_member(0x1234, 2));
+        assert!(groups.is_member(0x0B84, 242));
+    }
+    let mut status = 0;
+    for group in 1..=32u16 {
+        status = run!(1, group, 1);
+        if status != 0 {
+            break;
+        }
+    }
+    assert_eq!(status, Status::NoSpace.to_u8(), "a full table says so");
+}
+
+/// `NWK_CHANGE_CHANNEL` (R22 2.4.3.3.9): the Mgmt_NWK_Update_req broadcast
+/// and the NV commit come first, the radio follows after
+/// `nwkNetworkBroadcastDeliveryTime`, then `EVT_CHANNEL_CHANGED`.
+#[test]
+fn channel_change_announces_commits_then_switches() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let early = host.request(&NwkChangeChannel {
+        channel: 25,
+        nwk_update_id: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(early).status(), Status::InvalidState.to_u8());
+    let form = host.request(&form_request(0x1A62, 1 << 20));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    assert_eq!(port.info().channel, 20);
+    let update_id = port.info().nwk_update_id;
+    let sent = TcApp::device(port.app())
+        .aps()
+        .nwk()
+        .mac()
+        .tx_history()
+        .len();
+
+    let change = host.request(&NwkChangeChannel {
+        channel: 25,
+        nwk_update_id: 0,
+    });
+    let bad = host.request(&NwkChangeChannel {
+        channel: 27,
+        nwk_update_id: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(change).status(), 0);
+    assert_eq!(
+        host.response(bad).status(),
+        Status::InvalidParameter.to_u8()
+    );
+    let history = TcApp::device(port.app()).aps().nwk().mac().tx_history();
+    assert!(
+        history[sent..].iter().any(|tx| matches!(
+            tx.dst,
+            zigbee_types::MacAddress::Short(_, zigbee_types::ShortAddress(0xFFFF))
+        )),
+        "Mgmt_NWK_Update_req broadcast"
+    );
+    // Announced: NV and the update ID moved, the radio not yet.
+    let stored = {
+        let (_, store) = TcApp::device_and_store_mut(port.app_mut());
+        zigbee_runtime::security_store::SecurityStateStore::load(store)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(
+        (stored.channel, stored.update_id),
+        (25, update_id.wrapping_add(1))
+    );
+    // A security checkpoint inside the delivery interval keeps the new
+    // channel (the NWK holds it as pending).
+    let stored = {
+        let (device, store) = TcApp::device_and_store_mut(port.app_mut());
+        device.refresh_security_state(store).unwrap();
+        zigbee_runtime::security_store::SecurityStateStore::load(store)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(stored.channel, 25);
+    assert_eq!(port.info().channel, 20);
+    assert_eq!(port.info().nwk_update_id, update_id.wrapping_add(1));
+    assert!(host.event(ids::EVT_CHANNEL_CHANGED).is_none());
+    let again = host.request(&NwkChangeChannel {
+        channel: 15,
+        nwk_update_id: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(again).status(), Status::Busy.to_u8());
+
+    // nwkNetworkBroadcastDeliveryTime later. The test loop's drive clock is
+    // 0 (the switch is due at 9 s on it); run the product loop with the
+    // real one around that point.
+    macro_rules! run_until {
+        ($at:expr) => {
+            let at: u64 = $at;
+            while now < at + 3_000 {
+                // Small steps keep the link's keepalives flowing.
+                now = (now + 50_000).min(at + 3_000);
+                host.pump(now, &mut pipe);
+                let _ = ncp.service_with(now, &mut pipe, &mut port, &mut platform, &log);
+                while pollster::block_on(ncp.drive_with(&mut port, &mut platform, || now)) {}
+                let _ = ncp.service_with(now, &mut pipe, &mut port, &mut platform, &log);
+                host.pump(now, &mut pipe);
+            }
+        };
+    }
+    run_until!(8_900_000);
+    assert!(host.event(ids::EVT_CHANNEL_CHANGED).is_none());
+    assert_eq!(port.info().channel, 20);
+    run_until!(9_000_000);
+    let changed: EvtChannelChanged = host.event(ids::EVT_CHANNEL_CHANGED).unwrap().event();
+    assert_eq!(
+        (changed.channel, changed.nwk_update_id, changed.req_tid),
+        (25, update_id.wrapping_add(1), change)
+    );
+    assert_eq!(port.info().channel, 25);
+
+    // The current channel: done at once, no broadcast.
+    let same = host.request(&NwkChangeChannel {
+        channel: 25,
+        nwk_update_id: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(same).status(), 0);
+    let changed: EvtChannelChanged = host.event(ids::EVT_CHANNEL_CHANGED).unwrap().event();
+    assert_eq!((changed.channel, changed.req_tid), (25, same));
 }

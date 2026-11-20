@@ -19,7 +19,19 @@
 
 #![cfg_attr(not(test), no_std)]
 
+/// Await `future` through a `dyn Future`, so that its poll runs in its own
+/// frame instead of being merged into the caller's (the root future's poll
+/// frame is on every stack chain of the NCP loop).
+macro_rules! await_out_of_line {
+    ($future:expr) => {{
+        let future = core::pin::pin!($future);
+        let future: core::pin::Pin<&mut dyn core::future::Future<Output = _>> = future;
+        future.await
+    }};
+}
+
 pub mod backup;
+pub mod diag;
 pub mod firmware;
 pub mod gp;
 pub mod gp_remote;

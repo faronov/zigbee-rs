@@ -85,6 +85,9 @@ pub trait TcApp {
     fn tc_table(&self) -> &zigbee_bdb::trust_center::TrustCenterTable;
     /// Provision a unique TCLK before join (durable).
     fn provision_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError>;
+    /// Durably provision the key derived from an install code (with its
+    /// CRC) before the device joins; returns the key.
+    fn provision_install_code(&mut self, ieee: [u8; 8], code: &[u8]) -> Result<[u8; 16], OpError>;
     /// Durably drop a device's record and key; `false` when unknown.
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError>;
     /// The highest global outgoing APS counter any key may have used
@@ -243,6 +246,20 @@ where
             .map_err(|_| OpError::Storage)
     }
 
+    fn provision_install_code(&mut self, ieee: [u8; 8], code: &[u8]) -> Result<[u8; 16], OpError> {
+        use zigbee_bdb::trust_center::TrustCenterError;
+        use zigbee_runtime::trust_center_runtime::TrustCenterRuntimeError;
+        let (trust_center, device) = self.trust_center_and_device_mut();
+        trust_center
+            .provision_install_code(device, ieee, code)
+            .map_err(|error| match error {
+                TrustCenterRuntimeError::Policy(
+                    TrustCenterError::InvalidInstallCode(_) | TrustCenterError::InvalidAddress,
+                ) => OpError::InvalidParameter,
+                _ => OpError::Storage,
+            })
+    }
+
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
         let (trust_center, device) = self.trust_center_and_device_mut();
         trust_center
@@ -312,7 +329,9 @@ enum AckState {
 pub struct TcPort<A: TcApp> {
     app: A,
     running: bool,
-    formed: bool,
+    /// The committed network (formed), read from the store at boot and
+    /// after every formation, install and wipe.
+    stored: Option<StoredNetwork>,
     events: Deque<DeviceEvent, 8>,
     clock_ms: fn() -> u32,
     ieee: [u8; 8],
@@ -359,12 +378,11 @@ impl<A: TcApp> TcPort<A> {
     /// `ieee`: the radio's EUI-64 (the NIB only learns it at start);
     /// `clock_ms`: monotonic milliseconds for indication timestamps.
     pub fn new(mut app: A, ieee: [u8; 8], clock_ms: fn() -> u32) -> Self {
-        let formed = commissioned(&mut app);
         crate::gp::reset_defaults(&mut app);
-        Self {
+        let mut port = Self {
             app,
             running: false,
-            formed,
+            stored: None,
             events: Deque::new(),
             clock_ms,
             ieee,
@@ -376,7 +394,11 @@ impl<A: TcApp> TcPort<A> {
                 armed: true,
                 ..PreEraseSchedule::default()
             },
-        }
+        };
+        // Probed after construction so that the port is built in place in
+        // the caller's frame (the boot chain).
+        port.stored = stored_network(&mut port.app);
+        port
     }
 
     pub fn app(&self) -> &A {
@@ -559,22 +581,7 @@ impl<A: TcApp> TcPort<A> {
                 .neighbor_table()
                 .find_by_short(short_address)
                 .filter(|entry| entry.ieee_address == device_address)
-                .map_or(0, |entry| {
-                    // Reconstructed MAC capability of an NCP child: allocate
-                    // address, security, receiver on when idle (which also
-                    // stands for mains power), and the device type.
-                    let mut capability = 0x80;
-                    if entry.security_capable {
-                        capability |= 0x40;
-                    }
-                    if entry.rx_on_when_idle {
-                        capability |= 0x08 | 0x04;
-                    }
-                    if entry.device_type == NeighborDeviceType::Router {
-                        capability |= 0x02;
-                    }
-                    capability
-                });
+                .map_or(0, child_capability);
             (nwk.nib().network_address.0, capability)
         } else {
             let parent_nwk = nwk
@@ -680,13 +687,51 @@ fn left_event(event: TrustCenterHostEvent, own: [u8; 8]) -> Option<DeviceEvent> 
     }
 }
 
-fn commissioned<A: TcApp>(app: &mut A) -> bool {
+fn is_child(entry: &zigbee_nwk::neighbor::NeighborEntry) -> bool {
+    matches!(
+        entry.relationship,
+        zigbee_nwk::neighbor::Relationship::Child
+            | zigbee_nwk::neighbor::Relationship::UnauthenticatedChild
+    )
+}
+
+/// The committed network's identity, as `NWK_GET_INFO` reports it while
+/// the network is formed but not running (spec 7.2, 7.11 step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoredNetwork {
+    pan_id: u16,
+    ext_pan_id: [u8; 8],
+    channel: u8,
+    update_id: u8,
+    key_seq: u8,
+}
+
+/// Commit a new operating channel and update ID to the network record.
+#[inline(never)]
+fn commit_channel<A: TcApp>(app: &mut A, channel: u8, update_id: u8) -> Result<(), OpError> {
     let (_, store) = app.device_and_store_mut();
-    store
+    let mut state = store
         .load()
-        .ok()
-        .flatten()
-        .is_some_and(|state| state.commissioned)
+        .map_err(|_| OpError::Storage)?
+        .ok_or(OpError::NotFormed)?;
+    state.channel = channel;
+    state.update_id = update_id;
+    state.update_id_valid = true;
+    store.store(&state).map_err(|_| OpError::Storage)
+}
+
+/// The committed network in the security store, if any.
+#[inline(never)]
+fn stored_network<A: TcApp>(app: &mut A) -> Option<StoredNetwork> {
+    let (_, store) = app.device_and_store_mut();
+    let state = store.load().ok().flatten()?;
+    state.commissioned.then_some(StoredNetwork {
+        pan_id: state.pan_id,
+        ext_pan_id: state.extended_pan_id,
+        channel: state.channel,
+        update_id: state.update_id,
+        key_seq: state.key_sequence,
+    })
 }
 
 impl<A: TcApp> CoordinatorPort for TcPort<A> {
@@ -694,10 +739,119 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         self.ieee
     }
 
+    fn diag_count(&self, table: crate::port::DiagTable) -> usize {
+        let nwk = self.app.device().aps().nwk();
+        match table {
+            crate::port::DiagTable::Neighbors => nwk.neighbor_table().iter().count(),
+            crate::port::DiagTable::Routes => nwk.routing_table().iter().count(),
+            crate::port::DiagTable::Children => {
+                nwk.neighbor_table().iter().filter(|e| is_child(e)).count()
+            }
+        }
+    }
+
+    /// Mgmt_Lqi codes (R22 Table 2-127): device type 0 coordinator,
+    /// 1 router, 2 end device, 3 unknown; relationship 0 parent, 1 child,
+    /// 2 sibling, 4 previous child, 5 unauthenticated child.
+    fn diag_neighbor(&self, index: usize) -> Option<zigbee_zrhp::msg::diag::Neighbor> {
+        use zigbee_nwk::neighbor::Relationship;
+        let entry = self
+            .app
+            .device()
+            .aps()
+            .nwk()
+            .neighbor_table()
+            .iter()
+            .nth(index)?;
+        Some(zigbee_zrhp::msg::diag::Neighbor {
+            ieee: zigbee_zrhp::types::Ieee(entry.ieee_address),
+            nwk: entry.network_address.0,
+            device_type: match entry.device_type {
+                NeighborDeviceType::Coordinator => 0,
+                NeighborDeviceType::Router => 1,
+                NeighborDeviceType::EndDevice => 2,
+                NeighborDeviceType::Unknown => 3,
+            },
+            rx_on: u8::from(entry.rx_on_when_idle),
+            relationship: match entry.relationship {
+                Relationship::Parent => 0,
+                Relationship::Child => 1,
+                Relationship::Sibling => 2,
+                Relationship::PreviousChild => 4,
+                Relationship::UnauthenticatedChild => 5,
+            },
+            lqi: entry.lqi,
+            outgoing_cost: entry.outgoing_cost,
+            age: entry.age.min(u16::from(u8::MAX)) as u8,
+        })
+    }
+
+    /// Mgmt_Rtg status codes (R22 Table 2-129); flags bit0 memory
+    /// constrained (never), bit1 many-to-one, bit2 route record required
+    /// (the Mgmt_Rtg status byte's bits 3–5).
+    fn diag_route(&self, index: usize) -> Option<zigbee_zrhp::msg::diag::Route> {
+        use zigbee_nwk::routing::RouteStatus;
+        let route = self
+            .app
+            .device()
+            .aps()
+            .nwk()
+            .routing_table()
+            .iter()
+            .nth(index)?;
+        Some(zigbee_zrhp::msg::diag::Route {
+            dst: route.destination.0,
+            next_hop: route.next_hop.0,
+            status: match route.status {
+                RouteStatus::Active => 0,
+                RouteStatus::DiscoveryUnderway => 1,
+                RouteStatus::DiscoveryFailed => 2,
+                RouteStatus::Inactive => 3,
+                RouteStatus::ValidationUnderway => 4,
+            },
+            flags: (u8::from(route.many_to_one) << 1)
+                | (u8::from(route.route_record_required) << 2),
+        })
+    }
+
+    /// `last_poll_ms`: time since the child last proved liveness (poll or
+    /// keepalive) as the End Device Timeout countdown shows it; `u32::MAX`
+    /// until it has been heard this power cycle.
+    fn diag_child(&self, index: usize) -> Option<zigbee_zrhp::msg::diag::Child> {
+        let entry = self
+            .app
+            .device()
+            .aps()
+            .nwk()
+            .neighbor_table()
+            .iter()
+            .filter(|e| is_child(e))
+            .nth(index)?;
+        let last_poll_ms = if entry.keepalive_confirmed {
+            zigbee_nwk::frames::ed_timeout_enum_to_seconds(entry.end_device_timeout).map_or(
+                u32::MAX,
+                |timeout| {
+                    timeout
+                        .saturating_sub(entry.keepalive_remaining_secs)
+                        .saturating_mul(1000)
+                },
+            )
+        } else {
+            u32::MAX
+        };
+        Some(zigbee_zrhp::msg::diag::Child {
+            ieee: zigbee_zrhp::types::Ieee(entry.ieee_address),
+            nwk: entry.network_address.0,
+            capability: child_capability(entry),
+            timeout_exp: entry.end_device_timeout,
+            last_poll_ms,
+        })
+    }
+
     fn state(&self) -> NetworkState {
         if self.running && self.app.device().is_joined() {
             NetworkState::Up
-        } else if self.formed {
+        } else if self.stored.is_some() {
             NetworkState::FormedDown
         } else {
             NetworkState::None
@@ -708,6 +862,24 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         let device = self.app.device();
         let nwk = device.aps().nwk();
         let nib = nwk.nib();
+        let state = self.state();
+        if let (NetworkState::FormedDown, Some(stored)) = (state, self.stored) {
+            // Formed but not started (after a reboot, before `NWK_INIT`):
+            // the committed identity, flagged by `state`.
+            return NetworkInfo {
+                state,
+                pan_id: stored.pan_id,
+                ext_pan_id: stored.ext_pan_id,
+                channel: stored.channel,
+                channel_mask: device.bdb().attributes().primary_channel_set.0,
+                short: 0x0000,
+                ieee: self.ieee,
+                nwk_update_id: stored.update_id,
+                nwk_manager: 0x0000,
+                key_seq: stored.key_seq,
+                tx_power: 0x7F,
+            };
+        }
         NetworkInfo {
             state: self.state(),
             pan_id: nib.pan_id.0,
@@ -791,7 +963,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
 
     async fn init(&mut self, nwk_fc_floor: u32, aps_fc_floor: u32) -> Result<(), OpError> {
         if !self.running {
-            if !commissioned(&mut self.app) {
+            if stored_network(&mut self.app).is_none() {
                 return Err(OpError::NotFormed);
             }
             self.raise_nwk_floor(nwk_fc_floor)?;
@@ -810,7 +982,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
     }
 
     async fn form(&mut self, params: FormParams) -> Result<(), OpError> {
-        if self.running || commissioned(&mut self.app) {
+        if self.running || stored_network(&mut self.app).is_some() {
             return Err(OpError::InvalidState);
         }
         if !params.ncp_chosen_identity() {
@@ -827,7 +999,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             .initialize()
             .await
             .map_err(|_| OpError::Zigbee(0x01))?;
-        self.formed = commissioned(&mut self.app);
+        self.stored = stored_network(&mut self.app);
         if !self.app.device().is_joined() {
             // Formation failed: no stack to step; the host may retry.
             return Err(OpError::Zigbee(0x01));
@@ -962,7 +1134,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
     }
 
     async fn leave_reset(&mut self) -> Result<(), OpError> {
-        if self.formed {
+        if self.stored.is_some() {
             self.retain_counter_bounds()?;
         }
         self.app.wipe().await.map_err(|_| OpError::Storage)?;
@@ -975,7 +1147,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         while self.app.take_tc_event().is_some() {}
         self.fail_pending_acks();
         self.running = false;
-        self.formed = false;
+        self.stored = None;
         Ok(())
     }
 
@@ -1047,6 +1219,67 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         self.host_endpoints.clear();
     }
 
+    fn channel_change_supported(&self) -> bool {
+        true
+    }
+
+    fn commit_channel(&mut self, channel: u8, update_id: u8) -> Result<(), OpError> {
+        if !self.running {
+            return Err(OpError::InvalidState);
+        }
+        commit_channel(&mut self.app, channel, update_id)?;
+        // The NWK holds the pending channel too: the security checkpoints
+        // then persist it (not the current one) until the switch, and its
+        // maintenance retunes after the delivery time even if the NCP loop
+        // is late.
+        let nwk = self.app.device_mut().aps_mut().nwk_mut();
+        nwk.nib_mut().set_nwk_update_id(update_id);
+        nwk.arm_channel_change(channel);
+        self.stored = stored_network(&mut self.app);
+        Ok(())
+    }
+
+    async fn switch_channel(&mut self, channel: u8) -> Result<(), OpError> {
+        if !self.running {
+            return Err(OpError::InvalidState);
+        }
+        let nwk = self.app.device_mut().aps_mut().nwk_mut();
+        if nwk.pending_channel_change().is_none() && nwk.nib().logical_channel == channel {
+            // The NWK maintenance already retuned.
+            return Ok(());
+        }
+        nwk.cancel_channel_change();
+        nwk.nlme_set_channel(channel)
+            .await
+            .map_err(|status| OpError::Zigbee(status as u8))
+    }
+
+    fn groups_supported(&self) -> bool {
+        true
+    }
+
+    fn group_membership(&mut self, op: u8, group: u16, endpoint: u8) -> Result<(), EndpointError> {
+        // Host endpoints and the NCP-owned GP endpoint (H5: GP
+        // Notifications groupcast to the sink group).
+        if !(1..=240).contains(&endpoint) && endpoint != 242 || group > 0xFFF7 {
+            return Err(EndpointError::InvalidParameter);
+        }
+        let groups = self.app.device_mut().aps_mut().group_table_mut();
+        match op {
+            1 if groups.add_group(group, endpoint) => Ok(()),
+            1 => Err(EndpointError::NoSpace),
+            2 => {
+                groups.remove_group(group, endpoint);
+                Ok(())
+            }
+            3 => {
+                groups.remove_all_groups(endpoint);
+                Ok(())
+            }
+            _ => Err(EndpointError::InvalidParameter),
+        }
+    }
+
     fn gp(&mut self) -> Option<&mut dyn crate::gp::GpPort> {
         Some(self)
     }
@@ -1071,11 +1304,11 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         // next may reuse the same keys (a restore of its own backup), so it
         // starts above them whatever the image says.
         self.retain_counter_bounds()?;
-        if self.formed {
+        if self.stored.is_some() {
             // The previous network's NWK, child, APS and Trust Center state.
             self.app.wipe().await.map_err(|_| OpError::Storage)?;
             host_passthrough::clear();
-            self.formed = false;
+            self.stored = None;
         }
         let mut state = PersistentSecurityState::empty();
         state.commissioned = true;
@@ -1098,7 +1331,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             let (_, store) = self.app.device_and_store_mut();
             store.store(&state).map_err(|_| OpError::Storage)?;
         }
-        self.formed = true;
+        self.stored = stored_network(&mut self.app);
         if !children.is_empty() {
             // Written before the resume, which restores them like after a
             // reboot (same short address, no rejoin).
@@ -1218,6 +1451,17 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             return Err(OpError::InvalidState);
         }
         self.app.provision_link_key(ieee, key)
+    }
+
+    fn install_codes_supported(&self) -> bool {
+        true
+    }
+
+    fn add_install_code(&mut self, ieee: [u8; 8], code: &[u8]) -> Result<[u8; 16], OpError> {
+        if !self.running {
+            return Err(OpError::InvalidState);
+        }
+        self.app.provision_install_code(ieee, code)
     }
 
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
@@ -1455,6 +1699,10 @@ impl<T: TcApp + ?Sized> TcApp for &mut T {
 
     fn provision_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError> {
         (**self).provision_link_key(ieee, key)
+    }
+
+    fn provision_install_code(&mut self, ieee: [u8; 8], code: &[u8]) -> Result<[u8; 16], OpError> {
+        (**self).provision_install_code(ieee, code)
     }
 
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {

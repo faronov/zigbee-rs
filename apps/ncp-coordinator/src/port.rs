@@ -198,6 +198,12 @@ pub enum Op {
         duration_s: u8,
         target: u16,
     },
+    /// `NWK_CHANGE_CHANNEL` (`update_id` 0: current + 1).
+    ChangeChannel {
+        tid: u16,
+        channel: u8,
+        update_id: u8,
+    },
     Data(DataRequest),
     /// `flags`: `NWK_LEAVE_RESET` flags (bit1 keep host endpoints).
     LeaveReset {
@@ -278,6 +284,37 @@ pub trait CoordinatorPort {
     }
     /// Forget every host endpoint (`NWK_LEAVE_RESET` without flags bit1).
     fn clear_endpoints(&mut self) {}
+    /// `NWK_CHANGE_CHANNEL` is implemented ([`Self::commit_channel`],
+    /// [`Self::switch_channel`]).
+    fn channel_change_supported(&self) -> bool {
+        false
+    }
+    /// A channel change (R22 2.4.3.3.9, the network manager moving the
+    /// network) was broadcast as `Mgmt_NWK_Update_req{channel, update_id}`:
+    /// adopt `update_id` and commit `channel` to NV, so that a reboot
+    /// before the switch resumes where the network went. The radio stays on
+    /// the current channel.
+    fn commit_channel(&mut self, channel: u8, update_id: u8) -> Result<(), OpError> {
+        let _ = (channel, update_id);
+        Err(OpError::Unsupported)
+    }
+    /// Second half, `nwkNetworkBroadcastDeliveryTime` later: tune the radio.
+    async fn switch_channel(&mut self, channel: u8) -> Result<(), OpError> {
+        let _ = channel;
+        Err(OpError::Unsupported)
+    }
+    /// `GROUP_MEMBERSHIP` capability: [`Self::group_membership`] works.
+    fn groups_supported(&self) -> bool {
+        false
+    }
+    /// `NWK_GROUP_MEMBERSHIP` on the running network's APS group table
+    /// (persisted with it): `op` 1 adds `endpoint` to `group`, 2 removes it
+    /// (idempotent), 3 removes `endpoint` from every group. `NoSpace` when
+    /// the table is full.
+    fn group_membership(&mut self, op: u8, group: u16, endpoint: u8) -> Result<(), EndpointError> {
+        let _ = (op, group, endpoint);
+        Err(EndpointError::Unsupported)
+    }
 
     // ── Network images, Trust Center devices (formation parameters,
     //    TABLES, BACKUP) ──────────────────────────────────────────────
@@ -303,6 +340,27 @@ pub trait CoordinatorPort {
     }
     /// The `index`-th known device (Trust Center records first, then
     /// children without a record); `None` past the end.
+    /// Entries of a `DIAG_GET_*` table (`DiagTable`), the coordinator's
+    /// Mgmt_Lqi / Mgmt_Rtg view (spec 7.8). None by default.
+    fn diag_count(&self, _table: DiagTable) -> usize {
+        0
+    }
+
+    /// Neighbour `index` (0-based, in table order).
+    fn diag_neighbor(&self, _index: usize) -> Option<zigbee_zrhp::msg::diag::Neighbor> {
+        None
+    }
+
+    /// Route `index`.
+    fn diag_route(&self, _index: usize) -> Option<zigbee_zrhp::msg::diag::Route> {
+        None
+    }
+
+    /// Child `index`.
+    fn diag_child(&self, _index: usize) -> Option<zigbee_zrhp::msg::diag::Child> {
+        None
+    }
+
     fn device(&self, index: usize) -> Option<DeviceView> {
         let _ = index;
         None
@@ -310,6 +368,16 @@ pub trait CoordinatorPort {
     /// Provision a unique Trust Center link key before the device joins.
     fn put_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError> {
         let _ = (ieee, key);
+        Err(OpError::Unsupported)
+    }
+    /// `INSTALL_CODES` capability: `add_install_code` is implemented.
+    fn install_codes_supported(&self) -> bool {
+        false
+    }
+    /// Provision the key derived from an install code (8/10/14/18 bytes
+    /// including the CRC) before the device joins (`SEC_ADD_INSTALL_CODE`).
+    fn add_install_code(&mut self, ieee: [u8; 8], code: &[u8]) -> Result<[u8; 16], OpError> {
+        let _ = (ieee, code);
         Err(OpError::Unsupported)
     }
     /// Install a device link key from a backup with its origin,
@@ -384,6 +452,14 @@ pub struct NetworkImage {
     pub nwk_fc_start: u32,
     /// Floor of the global outgoing APS counter (0 = none).
     pub aps_fc_start: u32,
+}
+
+/// The tables `DIAG_GET_NEIGHBORS` / `_ROUTES` / `_CHILDREN` read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagTable {
+    Neighbors,
+    Routes,
+    Children,
 }
 
 /// A device known to the Trust Center or the child table.

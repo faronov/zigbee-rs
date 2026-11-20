@@ -28,12 +28,13 @@ use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataConfirm, EvtApsDa
 use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagGetCountersRsp, DiagResetCounters};
 use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord, LogConfig};
 use zigbee_zrhp::msg::network::{
-    EvtDeviceJoined, EvtDeviceLeft, EvtNetworkState, NwkAddEndpoint, NwkForm, NwkGetInfoRsp,
-    NwkInit, NwkInitRsp, NwkLeaveReset, NwkPermitJoin,
+    EvtChannelChanged, EvtDeviceJoined, EvtDeviceLeft, EvtNetworkState, NwkAddEndpoint,
+    NwkChangeChannel, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkInit, NwkInitRsp,
+    NwkLeaveReset, NwkPermitJoin,
 };
 use zigbee_zrhp::msg::security::{
-    EvtFcCheckpoint, SecGetFrameCountersRsp, SecGetNetworkKey, SecGetNetworkKeyRsp,
-    SecLockKeyExport,
+    EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey,
+    SecGetFrameCountersRsp, SecGetNetworkKey, SecGetNetworkKeyRsp, SecLockKeyExport,
 };
 use zigbee_zrhp::msg::system::{
     Capacity, ConfigReadItem, ConfigStatus, EvtIndicationsDropped, EvtNcpReady, SysGetConfig,
@@ -47,7 +48,7 @@ use zigbee_zrhp::types::{Endpoint, Ieee, Status};
 use crate::log_ring::LogRing;
 use crate::platform::{NcpPlatform, NoPlatform};
 use crate::port::{
-    CoordinatorPort, DataRequest, Destination, DeviceEvent, EndpointError, FormParams,
+    CoordinatorPort, DataConfirm, DataRequest, Destination, DeviceEvent, EndpointError, FormParams,
     HostEndpoint, MAX_ASDU, NetworkState, Op, OpError,
 };
 use crate::transport::{HostTransport, UartChangeError};
@@ -74,6 +75,79 @@ pub const TX_STALL_DISCARD_US: u64 = 50_000;
 pub const UART_REVERT_US: u64 = 3_000_000;
 /// Delay between a `SYS_RESET` response and the reset itself.
 pub const RESET_DELAY_US: u64 = 50_000;
+/// `nwkNetworkBroadcastDeliveryTime` (R22 Table 3-58 with the PRO
+/// defaults): the NCP tunes to a new channel this long after its
+/// `Mgmt_NWK_Update_req` broadcast, as every receiving router does.
+pub const CHANNEL_SWITCH_DELAY_US: u64 =
+    zigbee_nwk::conflict::NETWORK_BROADCAST_DELIVERY_TIME_US as u64;
+
+/// An announced channel change waiting for the broadcast delivery time.
+#[derive(Debug, Clone, Copy)]
+struct PendingChannel {
+    channel: u8,
+    update_id: u8,
+    req_tid: u16,
+    at_us: u64,
+}
+/// A status-only response (message header + status byte).
+const STATUS_RESPONSE: usize = zigbee_zrhp::msg::HEADER_LEN + 1;
+/// The largest response message (one frame payload).
+const MAX_RESPONSE: usize = zigbee_zrhp::frame::MAX_PAYLOAD;
+/// Free queue bytes before the NCP returns an endpoint's held frame
+/// credits (spec 6.2: the host may only send more requests on it once
+/// their responses can be queued).
+pub const CREDIT_GATE: usize = QUEUE_BYTES / 2;
+/// `host_response_bytes` (capacity 19): response bytes a host keeps
+/// outstanding per endpoint without ever being answered `BUSY` for space.
+pub const HOST_RESPONSE_BYTES: usize = QUEUE_BYTES - MAX_RESPONSE;
+/// Status responses and APS confirms waiting for queue space: every queued
+/// stack operation, every pending counter read and a margin of `BUSY`
+/// answers to requests whose responses did not fit.
+const DEFERRED: usize = MAX_APS_INFLIGHT + 4 + 4 + 32;
+
+/// The NCP link profile. Credits are returned by `release_credits` once the
+/// responses to a frame's requests can be queued (spec 6.2, 5.10).
+const fn link_config() -> LinkConfig {
+    LinkConfig {
+        auto_credit: false,
+        ..LinkConfig::ncp()
+    }
+}
+
+/// A response or confirm the NCP owes the host but could not queue yet.
+/// Never dropped: sent in order once its endpoint queue has room.
+#[derive(Debug, Clone)]
+enum Deferred {
+    Status { id: u16, tid: u16, status: Status },
+    Confirm(EvtApsDataConfirm),
+}
+
+/// Upper bound of the response bytes `id` produces (spec 6.2: one response
+/// per request, so a request is only taken when this fits).
+fn response_bound(id: u16, request_len: usize) -> usize {
+    match id {
+        ids::SYS_ECHO => STATUS_RESPONSE + request_len,
+        ids::APS_DATA_REQUEST
+        | ids::NWK_FORM
+        | ids::NWK_LEAVE_RESET
+        | ids::NWK_PERMIT_JOIN
+        | ids::NWK_ADD_ENDPOINT
+        | ids::NWK_SET_MANUFACTURER_CODE
+        | ids::NWK_GROUP_MEMBERSHIP
+        | ids::NWK_CHANGE_CHANNEL
+        | ids::NWK_REMOVE_DEVICE
+        | ids::SYS_RESET
+        | ids::SYS_SET_UART
+        | ids::SYS_SET_IEEE
+        | ids::SEC_LOCK_KEY_EXPORT
+        | ids::SEC_ADD_LINK_KEY
+        | ids::LOG_CONFIG
+        | ids::DIAG_RESET_COUNTERS => STATUS_RESPONSE,
+        ids::NWK_INIT => STATUS_RESPONSE + 1,
+        ids::SEC_ADD_INSTALL_CODE => STATUS_RESPONSE + 16,
+        _ => MAX_RESPONSE,
+    }
+}
 
 /// Static facts the product supplies.
 #[derive(Debug, Clone, Copy)]
@@ -157,12 +231,17 @@ pub struct Ncp<const LOG_N: usize> {
     /// `coex_enable`, `coex_tx_priority_mask` (volatile, spec 7.1).
     coex: (bool, u8),
     host_caps: u64,
+    /// Frame credits per endpoint not yet returned to the host
+    /// (`auto_credit = false`, see `release_credits`).
+    held_credits: [u8; Endpoint::COUNT],
+    deferred: Deque<Deferred, DEFERRED>,
+    pending_channel: Option<PendingChannel>,
 }
 
 impl<const LOG_N: usize> Ncp<LOG_N> {
     /// `cookie`: a random non-zero boot cookie from the hardware RNG.
     pub fn new(identity: NcpIdentity, cookie: u32, now_us: u64) -> Self {
-        let mut link = Link::new(LinkConfig::ncp(), cookie.max(1));
+        let mut link = Link::new(link_config(), cookie.max(1));
         let reason = match identity.reset_reason {
             3 => ResetReason::Watchdog,
             5 => ResetReason::FirmwareUpdate,
@@ -196,6 +275,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             backup: crate::backup::BackupState::new(),
             coex: (false, 0),
             host_caps: 0,
+            held_credits: [0; Endpoint::COUNT],
+            deferred: Deque::new(),
+            pending_channel: None,
         }
     }
 
@@ -219,6 +301,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         if let Some((_, at)) = self.pending_reset {
             fold(at);
         }
+        if let Some(pending) = self.pending_channel {
+            fold(pending.at_us);
+        }
         if let Some(switch) = self.uart_switch {
             fold(if switch.applied_rx_frames.is_some() {
                 switch.applied_at_us + UART_REVERT_US
@@ -232,8 +317,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         next
     }
 
-    /// One non-blocking pass. Returns a request the platform must carry out.
-    /// A product without platform services ([`NoPlatform`]).
+    /// One non-blocking pass. Returns a request the platform must carry out
+    /// (repeated on every pass until it is). A product without platform
+    /// services ([`NoPlatform`]).
     pub fn service<T: HostTransport, C: CoordinatorPort>(
         &mut self,
         now_us: u64,
@@ -256,14 +342,19 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     ) -> Option<PlatformRequest> {
         self.receive(now_us, transport, port, platform, log);
         self.service_uart_switch(now_us, transport);
+        self.flush_deferred();
         if self.host_ready() {
             self.emit_stack_events(now_us, port);
         }
         self.emit_logs(log);
         self.transmit(now_us, transport);
+        self.flush_deferred();
+        self.release_credits();
+        // Stays armed once due: the platform reboots and never returns, and
+        // a result dropped by a caller (the products ignore it inside their
+        // drive loop) is handed out again on the next pass.
         match self.pending_reset {
             Some((mode, at)) if now_us >= at && self.tx_len == 0 => {
-                self.pending_reset = None;
                 Some(PlatformRequest::Reset { mode })
             }
             _ => None,
@@ -287,8 +378,38 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         platform: &mut P,
         mut now_us: impl FnMut() -> u64,
     ) -> bool {
+        if let Some(pending) = self.pending_channel
+            && now_us() >= pending.at_us
+        {
+            self.pending_channel = None;
+            self.finish_channel_change(port, pending).await;
+            return true;
+        }
         let Some((op, accepted_us)) = self.ops.pop_front() else {
             return false;
+        };
+        // A channel change is announced by a broadcast through the data
+        // path's send (one `send` future in the root poll frame).
+        let mut announcing = None;
+        let op = match op {
+            Op::ChangeChannel {
+                tid,
+                channel,
+                update_id,
+            } => match self.prepare_channel_change(port, tid, channel, update_id, now_us()) {
+                Ok((request, pending)) => {
+                    announcing = Some(pending);
+                    Op::Data(request)
+                }
+                Err((status, done)) => {
+                    self.respond_status(ids::NWK_CHANGE_CHANNEL, tid, status);
+                    if let Some(event) = done {
+                        self.event(Endpoint::Zigbee, &event);
+                    }
+                    return true;
+                }
+            },
+            op => op,
         };
         match op {
             Op::SetIeee { tid, ieee } => {
@@ -333,6 +454,8 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 let result = port.form(params).await;
                 self.network_outcome(tid, result, port);
             }
+            // Turned into its broadcast above.
+            Op::ChangeChannel { .. } => {}
             Op::PermitJoin { duration_s, target } => {
                 let status = op_status(port.permit_join(duration_s, target).await);
                 self.respond_status(ids::NWK_PERMIT_JOIN, accepted_tid(accepted_us), status);
@@ -359,6 +482,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             }
             Op::Data(request) => {
                 let result = port.send(&request).await;
+                if let Some(pending) = announcing {
+                    self.announced_channel(port, pending, result);
+                    return true;
+                }
                 self.data_inflight = self.data_inflight.saturating_sub(1);
                 if matches!(&result, Ok(confirm) if confirm.deferred()) {
                     // Awaiting the APS ACK: `emit_stack_events` sends the
@@ -391,7 +518,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     flags: confirm.flags,
                     elapsed_ms: elapsed_ms.min(u64::from(u16::MAX)) as u16,
                 };
-                self.event(Endpoint::Zigbee, &event);
+                if !self.deferred.is_empty() || !self.event(Endpoint::Zigbee, &event) {
+                    // Keep it: every accepted request gets its confirm.
+                    let _ = self.deferred.push_back(Deferred::Confirm(event));
+                }
             }
         }
         true
@@ -442,6 +572,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     self.negotiated = false;
                     self.event_seq = [0; Endpoint::COUNT];
                     self.queues.clear();
+                    // A new session starts with fresh credit edges; owed
+                    // responses belong to the old one.
+                    self.held_credits = [0; Endpoint::COUNT];
+                    self.deferred.clear();
                     let ready = ncp_ready(
                         cookie,
                         &self.identity,
@@ -475,70 +609,116 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 LinkEvent::LinkDown | LinkEvent::LinkFailed => {
                     self.negotiated = false;
                 }
-                LinkEvent::Data { endpoint, payload } => match Batch::parse(payload) {
-                    Ok(batch) => {
-                        let mut state = DispatchState {
-                            negotiated: &mut self.negotiated,
-                            ops: &mut self.ops,
-                            data_inflight: &mut self.data_inflight,
-                            key_export_locked: &mut self.key_export_locked,
-                            pending_reset: &mut self.pending_reset,
-                            uart_switch: &mut self.uart_switch,
-                            pending_diag: &mut self.pending_diag,
-                            counters: &mut self.counters,
-                            identity: &self.identity,
-                            boot_us: self.boot_us,
-                            backup: &mut self.backup,
-                            coex: &mut self.coex,
-                            host_caps: &mut self.host_caps,
-                        };
-                        for message in batch.iter() {
-                            let header = message.header;
-                            if header.kind == Kind::Request && header.retry {
-                                // 6.5: answer from the cache, or let a still
-                                // running operation answer.
-                                if let Some(cached) = self.retry.lookup(header.tid, header.msg_id) {
-                                    let _ = self.queues.queue(endpoint).raw(
-                                        Kind::Response,
+                LinkEvent::Data { endpoint, payload } => {
+                    let held = &mut self.held_credits[endpoint as usize];
+                    *held = held.saturating_add(1);
+                    match Batch::parse(payload) {
+                        Ok(batch) => {
+                            let mut state = DispatchState {
+                                negotiated: &mut self.negotiated,
+                                ops: &mut self.ops,
+                                data_inflight: &mut self.data_inflight,
+                                key_export_locked: &mut self.key_export_locked,
+                                pending_reset: &mut self.pending_reset,
+                                uart_switch: &mut self.uart_switch,
+                                pending_diag: &mut self.pending_diag,
+                                counters: &mut self.counters,
+                                identity: &self.identity,
+                                boot_us: self.boot_us,
+                                backup: &mut self.backup,
+                                coex: &mut self.coex,
+                                host_caps: &mut self.host_caps,
+                            };
+                            for message in batch.iter() {
+                                let header = message.header;
+                                // 6.2: take a request only when its response
+                                // fits; otherwise answer BUSY (deferred if even
+                                // that does not fit). Nothing is dropped.
+                                let reserved = if endpoint == Endpoint::System {
+                                    state.pending_diag.len() * MAX_RESPONSE
+                                } else {
+                                    0
+                                };
+                                let room =
+                                    self.queues.queue(endpoint).free().saturating_sub(reserved);
+                                let busy = header.kind == Kind::Request
+                                    && (!self.deferred.is_empty()
+                                        || room
+                                            < response_bound(header.msg_id, message.payload.len()));
+                                if header.kind == Kind::Request && header.retry {
+                                    // 6.5: answer from the cache, or let a still
+                                    // running operation answer.
+                                    if let Some(cached) =
+                                        self.retry.lookup(header.tid, header.msg_id)
+                                    {
+                                        if self.deferred.is_empty()
+                                            && room >= zigbee_zrhp::msg::HEADER_LEN + cached.len()
+                                        {
+                                            let _ = self.queues.queue(endpoint).raw(
+                                                Kind::Response,
+                                                header.msg_id,
+                                                header.tid,
+                                                cached,
+                                            );
+                                        } else {
+                                            state.counters.busy_responses =
+                                                state.counters.busy_responses.saturating_add(1);
+                                            Self::owe_status(
+                                                &mut self.queues,
+                                                &mut self.deferred,
+                                                header.msg_id,
+                                                header.tid,
+                                                Status::Busy,
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                }
+                                if busy {
+                                    state.counters.busy_responses =
+                                        state.counters.busy_responses.saturating_add(1);
+                                    Self::owe_status(
+                                        &mut self.queues,
+                                        &mut self.deferred,
                                         header.msg_id,
                                         header.tid,
-                                        cached,
+                                        Status::Busy,
                                     );
                                     continue;
                                 }
-                            }
-                            let before = self.queues.queue(endpoint).len();
-                            Self::dispatch(
-                                &mut self.queues,
-                                &mut state,
-                                now_us,
-                                endpoint,
-                                &message,
-                                transport,
-                                port,
-                                platform,
-                                log,
-                            );
-                            if header.kind == Kind::Request {
-                                remember_response(
-                                    &mut self.retry,
-                                    &self.queues.queue(endpoint).queued()[before..],
-                                    header.msg_id,
-                                    header.tid,
+                                let before = self.queues.queue(endpoint).len();
+                                Self::dispatch(
+                                    &mut self.queues,
+                                    &mut state,
+                                    now_us,
+                                    endpoint,
+                                    &message,
+                                    transport,
+                                    port,
+                                    platform,
+                                    log,
                                 );
+                                if header.kind == Kind::Request {
+                                    remember_response(
+                                        &mut self.retry,
+                                        &self.queues.queue(endpoint).queued()[before..],
+                                        header.msg_id,
+                                        header.tid,
+                                    );
+                                }
                             }
                         }
+                        Err(_) => {
+                            self.counters.bad_batches = self.counters.bad_batches.saturating_add(1);
+                            let error = zigbee_zrhp::msg::system::EvtProtocolError {
+                                endpoint: endpoint as u8,
+                                msg_id: Batch::first_msg_id(payload).unwrap_or(0),
+                                reason: 1,
+                            };
+                            push_event(&mut self.queues, &mut self.event_seq, &error);
+                        }
                     }
-                    Err(_) => {
-                        self.counters.bad_batches = self.counters.bad_batches.saturating_add(1);
-                        let error = zigbee_zrhp::msg::system::EvtProtocolError {
-                            endpoint: endpoint as u8,
-                            msg_id: Batch::first_msg_id(payload).unwrap_or(0),
-                            reason: 1,
-                        };
-                        push_event(&mut self.queues, &mut self.event_seq, &error);
-                    }
-                },
+                }
                 LinkEvent::TxFailed { .. } => {
                     // Responses and events are not retried: the host times
                     // out or resyncs (6.5).
@@ -629,6 +809,12 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 // Green Power combo (spec 7.11).
                 let (gp_caps, gp_sink_table, gp_proxy_table) = crate::gp::negotiate_facts(port);
                 ncp_caps |= gp_caps | caps::BACKUP_RESTORE;
+                if port.install_codes_supported() {
+                    ncp_caps |= caps::INSTALL_CODES;
+                }
+                if port.groups_supported() {
+                    ncp_caps |= caps::GROUP_MEMBERSHIP;
+                }
                 if platform.fw_supported() {
                     ncp_caps |= caps::NCP_FW_UPDATE;
                 }
@@ -696,6 +882,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     Capacity {
                         id: capacity::GP_PROXY_TABLE,
                         value: gp_proxy_table,
+                    },
+                    Capacity {
+                        id: capacity::HOST_RESPONSE_BYTES,
+                        value: HOST_RESPONSE_BYTES as u32,
                     },
                 ];
                 let response = SysNegotiateRsp {
@@ -1005,6 +1195,44 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 };
                 status_only(queues, status);
             }
+            ids::NWK_CHANGE_CHANNEL => {
+                let request = decode!(NwkChangeChannel);
+                let status = if !port.channel_change_supported() {
+                    Status::UnsupportedCommand
+                } else if port.state() != NetworkState::Up {
+                    Status::InvalidState
+                } else if !(11..=26).contains(&request.channel) {
+                    Status::InvalidParameter
+                } else {
+                    let op = Op::ChangeChannel {
+                        tid,
+                        channel: request.channel,
+                        update_id: request.nwk_update_id,
+                    };
+                    match state.ops.push_back((op, now_us)) {
+                        // Responded by `drive` after the broadcast.
+                        Ok(()) => return,
+                        Err(_) => Status::Busy,
+                    }
+                };
+                status_only(queues, status);
+            }
+            ids::NWK_GROUP_MEMBERSHIP => {
+                let request = decode!(NwkGroupMembership);
+                let status = if !port.groups_supported() {
+                    Status::UnsupportedCommand
+                } else if port.state() != NetworkState::Up {
+                    Status::InvalidState
+                } else {
+                    match port.group_membership(request.op, request.group, request.ep) {
+                        Ok(()) => Status::Success,
+                        Err(EndpointError::InvalidParameter) => Status::InvalidParameter,
+                        Err(EndpointError::NoSpace) => Status::NoSpace,
+                        Err(EndpointError::Unsupported) => Status::UnsupportedCommand,
+                    }
+                };
+                status_only(queues, status);
+            }
             ids::NWK_GET_INFO => {
                 let info = port.info();
                 let response = NwkGetInfoRsp {
@@ -1091,6 +1319,39 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 };
                 let _ = queues.response(tid, Status::Success, Some(&response));
             }
+            ids::SEC_ADD_INSTALL_CODE => {
+                let request = decode!(SecAddInstallCode);
+                match port.add_install_code(request.ieee.0, request.code.0) {
+                    Ok(key) => {
+                        let response = SecAddInstallCodeRsp { derived_key: key };
+                        let _ = queues.response(tid, Status::Success, Some(&response));
+                    }
+                    Err(error) => status_only(queues, op_status(Err(error))),
+                }
+            }
+            ids::SEC_ADD_LINK_KEY => {
+                let request = decode!(SecAddLinkKey);
+                // A unique TCLK (type 1) before the device joins. The NCP
+                // has no temporary keys: flags bit0 keeps it like any
+                // provisioned key until SEC_REMOVE_LINK_KEY or a wipe.
+                // Application keys (type 3) and incoming floors are not
+                // imported this way (TBL_PUSH / restore carry them).
+                let status = if request.key_type != 1 || request.rx_floor != 0 {
+                    Status::UnsupportedCommand
+                } else if request.attrs > 2 {
+                    Status::InvalidParameter
+                } else {
+                    op_status(port.restore_link_key(&crate::port::RestoredKey {
+                        ieee: request.ieee.0,
+                        key: request.key,
+                        origin: 3,
+                        attrs: request.attrs,
+                        nwk: None,
+                        child: false,
+                    }))
+                };
+                status_only(queues, status);
+            }
             ids::SEC_LOCK_KEY_EXPORT => {
                 let request = decode!(SecLockKeyExport);
                 if request.confirm != LOCK_CONFIRM {
@@ -1132,6 +1393,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 {
                     status_only(queues, Status::Busy);
                 }
+            }
+            _ if crate::diag::is_diag_table_request(id) => {
+                crate::diag::dispatch_diag_table(queues, endpoint, message, port);
             }
             _ if crate::firmware::is_fw_request(id) => crate::firmware::dispatch_fw(
                 queues,
@@ -1315,12 +1579,178 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         push_event(&mut self.queues, &mut self.event_seq, body)
     }
 
+    /// `NWK_CHANGE_CHANNEL`: the `Mgmt_NWK_Update_req` broadcast to send
+    /// (R22 2.4.3.3.9: TSN, ScanChannels with the one target channel,
+    /// ScanDuration 0xFE, update ID) and the switch it schedules. Otherwise
+    /// the response, and for the current channel (no broadcast) the event
+    /// to send after it. A change already announced is `BUSY`.
+    #[inline(never)]
+    fn prepare_channel_change<C: CoordinatorPort>(
+        &self,
+        port: &C,
+        tid: u16,
+        channel: u8,
+        update_id: u8,
+        now_us: u64,
+    ) -> Result<(DataRequest, PendingChannel), (Status, Option<EvtChannelChanged>)> {
+        if self.pending_channel.is_some() {
+            return Err((Status::Busy, None));
+        }
+        let info = port.info();
+        if channel == info.channel {
+            let event = EvtChannelChanged {
+                channel,
+                nwk_update_id: info.nwk_update_id,
+                req_tid: tid,
+            };
+            return Err((Status::Success, Some(event)));
+        }
+        let update_id = if update_id == 0 {
+            info.nwk_update_id.wrapping_add(1)
+        } else {
+            update_id
+        };
+        let mut asdu = heapless::Vec::new();
+        let _ = asdu.push(tid as u8);
+        let _ = asdu.extend_from_slice(&(1u32 << channel).to_le_bytes());
+        let _ = asdu.extend_from_slice(&[0xFE, update_id]);
+        let request = DataRequest {
+            req_tid: tid,
+            dst: Destination::Broadcast(0xFFFD),
+            dst_ep: 0,
+            src_ep: 0,
+            profile: 0x0000,
+            cluster: 0x0038,
+            tx_options: 0,
+            radius: 0,
+            asdu,
+        };
+        let pending = PendingChannel {
+            channel,
+            update_id,
+            req_tid: tid,
+            at_us: now_us + CHANNEL_SWITCH_DELAY_US,
+        };
+        Ok((request, pending))
+    }
+
+    /// The broadcast went out: commit the new channel and update ID to NV
+    /// (a reboot from now on resumes where the network goes), answer, and
+    /// schedule the switch.
+    #[inline(never)]
+    fn announced_channel<C: CoordinatorPort>(
+        &mut self,
+        port: &mut C,
+        pending: PendingChannel,
+        sent: Result<DataConfirm, OpError>,
+    ) {
+        let result = match sent {
+            Ok(confirm) if confirm.zb_status != 0 => Err(OpError::Zigbee(confirm.zb_status)),
+            Ok(_) => port.commit_channel(pending.channel, pending.update_id),
+            Err(error) => Err(error),
+        };
+        if result.is_ok() {
+            self.pending_channel = Some(pending);
+        }
+        self.respond_status(ids::NWK_CHANGE_CHANNEL, pending.req_tid, op_status(result));
+    }
+
+    /// Tune to the announced channel and report it (`EVT_CHANNEL_CHANGED`).
+    /// The new channel is already in NV, so a failure here is reported as
+    /// the channel the radio stayed on; a reboot resumes on the new one.
+    #[inline(never)]
+    async fn finish_channel_change<C: CoordinatorPort>(
+        &mut self,
+        port: &mut C,
+        pending: PendingChannel,
+    ) {
+        let channel = match port.switch_channel(pending.channel).await {
+            Ok(()) => pending.channel,
+            Err(_) => port.info().channel,
+        };
+        let event = EvtChannelChanged {
+            channel,
+            nwk_update_id: pending.update_id,
+            req_tid: pending.req_tid,
+        };
+        self.event(Endpoint::Zigbee, &event);
+    }
+
     fn respond_status(&mut self, id: u16, tid: u16, status: Status) {
-        if let Some(endpoint) = home_endpoint(id) {
-            let _ = self
-                .queues
+        Self::owe_status(&mut self.queues, &mut self.deferred, id, tid, status);
+    }
+
+    /// Queue a status response, or keep it (in order) until it fits.
+    fn owe_status(
+        queues: &mut EndpointQueues<QUEUE_BYTES>,
+        deferred: &mut Deque<Deferred, DEFERRED>,
+        id: u16,
+        tid: u16,
+        status: Status,
+    ) {
+        let Some(endpoint) = home_endpoint(id) else {
+            return;
+        };
+        if deferred.is_empty()
+            && queues
                 .queue(endpoint)
-                .push_with(|w| w.response_status(id, tid, status));
+                .push_with(|w| w.response_status(id, tid, status))
+                .is_ok()
+        {
+            return;
+        }
+        if deferred
+            .push_back(Deferred::Status { id, tid, status })
+            .is_err()
+        {
+            // Beyond `DEFERRED`: only a host that ignores the credit gate
+            // and `host_response_bytes` gets here (spec 6.2).
+            debug_assert!(false, "deferred responses exhausted");
+        }
+    }
+
+    /// Send owed responses and confirms, oldest first, as far as they fit.
+    fn flush_deferred(&mut self) {
+        while let Some(front) = self.deferred.front() {
+            let queued = match front {
+                Deferred::Status { id, tid, status } => {
+                    let (id, tid, status) = (*id, *tid, *status);
+                    home_endpoint(id).is_none_or(|endpoint| {
+                        self.queues
+                            .queue(endpoint)
+                            .push_with(|w| w.response_status(id, tid, status))
+                            .is_ok()
+                    })
+                }
+                Deferred::Confirm(event) => {
+                    let event = event.clone();
+                    push_event(&mut self.queues, &mut self.event_seq, &event)
+                }
+            };
+            if !queued {
+                return;
+            }
+            self.deferred.pop_front();
+        }
+    }
+
+    /// Return held frame credits once the endpoint's queue has room for
+    /// another frame's responses and nothing is owed (`auto_credit = false`).
+    fn release_credits(&mut self) {
+        if !self.deferred.is_empty() {
+            return;
+        }
+        for endpoint in [
+            Endpoint::System,
+            Endpoint::Zigbee,
+            Endpoint::Tables,
+            Endpoint::Bulk,
+            Endpoint::Log,
+        ] {
+            let held = &mut self.held_credits[endpoint as usize];
+            if *held != 0 && self.queues.queue(endpoint).free() >= CREDIT_GATE {
+                self.link.release_credit(endpoint, core::mem::take(held));
+            }
         }
     }
 
@@ -1804,6 +2234,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 backup: _,
                 coex: _,
                 host_caps: _,
+                held_credits: _,
+                deferred: _,
+                pending_channel: _,
             } = ncp;
         };
         let reason = match identity.reset_reason {
@@ -1817,7 +2250,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         // created.
         unsafe {
             use core::ptr::addr_of_mut;
-            addr_of_mut!((*slot).link).write(Link::new(LinkConfig::ncp(), cookie.max(1)));
+            addr_of_mut!((*slot).link).write(Link::new(link_config(), cookie.max(1)));
             addr_of_mut!((*slot).queues).write(EndpointQueues::new());
             // An all-zero byte array is a valid value.
             addr_of_mut!((*slot).tx).write_bytes(0, 1);
@@ -1844,6 +2277,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             addr_of_mut!((*slot).backup).write(crate::backup::BackupState::new());
             addr_of_mut!((*slot).coex).write((false, 0));
             addr_of_mut!((*slot).host_caps).write(0);
+            addr_of_mut!((*slot).held_credits).write([0; Endpoint::COUNT]);
+            addr_of_mut!((*slot).deferred).write(Deque::new());
+            addr_of_mut!((*slot).pending_channel).write(None);
             let ncp = &mut *slot;
             ncp.link.open(now_us, reason);
             ncp

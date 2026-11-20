@@ -602,3 +602,91 @@ fn a_uart_switch_waits_for_a_busy_transmitter_and_commits_on_traffic() {
     assert_eq!(pipe.uart_applied, [(2_000_000, true)], "no revert");
     assert_eq!(pipe.uart, Some((2_000_000, true)));
 }
+
+/// A negotiated session on a factory-new NCP: binds `ncp`, `host`, `port`,
+/// `pipe`, `log`, `now` and an `exchange!()` macro in the caller.
+macro_rules! negotiated_session {
+    ($ncp:ident, $host:ident, $port:ident, $pipe:ident, $log:ident, $now:ident) => {
+        let mut security = RamSecurityStateStore::new();
+        let mut gp_store = zigbee_runtime::gp_store::RamGpProxyStore::new();
+        let mut profile = profile();
+        let mut device = device(&profile);
+        let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+        let mut app = TrustCenterCoordinatorApp::new(
+            node,
+            PersistentChildren::new(RamChildTableStore::new()),
+            RamTrustCenterDeviceStore::new(),
+            &POLICY,
+            RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+        )
+        .unwrap();
+        app.set_green_power_store(&mut gp_store);
+        let mut $port = TcPort::new(app, IEEE, clock_ms);
+        let $log = LogRing::<8>::new();
+        let mut $pipe = Pipe::default();
+        let mut $now = 1_000u64;
+        let mut $ncp = Ncp::<8>::new(identity(), 0xC0FF_EE03, $now);
+        let mut $host = Host::new($now);
+        exchange(
+            &mut $ncp, &mut $host, &mut $port, &mut $pipe, &$log, &mut $now,
+        );
+        $host.event(ids::EVT_NCP_READY).expect("EVT_NCP_READY");
+        let negotiate = $host.request(&SysNegotiateReq {
+            major_min: 1,
+            major_max: 1,
+            host_caps: 0,
+            name: Bytes8(b"pipe-host"),
+        });
+        exchange(
+            &mut $ncp, &mut $host, &mut $port, &mut $pipe, &$log, &mut $now,
+        );
+        let _: SysNegotiateRsp = $host.response(negotiate).body();
+    };
+}
+
+/// Z1 (spec 6.2): a burst of requests whose responses exceed the NCP's
+/// endpoint queue is answered completely, each request exactly once,
+/// `SUCCESS` while the responses fit and `BUSY` beyond; the NCP holds the
+/// frame credits until there is room again. (It used to drop responses.)
+#[test]
+fn a_response_burst_beyond_the_queue_is_answered_in_full() {
+    negotiated_session!(ncp, host, port, pipe, log, now);
+    const ECHOES: u16 = 48;
+    let mut tids = Vec::new();
+    for index in 0..ECHOES {
+        tids.push(host.request(&SysEcho {
+            data: Rest(&[index as u8; 64]),
+        }));
+    }
+    let mut answered = std::collections::HashMap::new();
+    for _ in 0..100 {
+        exchange(&mut ncp, &mut host, &mut port, &mut pipe, &log, &mut now);
+        for message in host.inbox.drain(..) {
+            if message.kind == Kind::Response && message.msg_id == ids::SYS_ECHO {
+                assert!(
+                    answered.insert(message.tid, message.status()).is_none(),
+                    "tid {} answered twice",
+                    message.tid
+                );
+            }
+        }
+        if answered.len() == tids.len() {
+            break;
+        }
+    }
+    let missing: Vec<_> = tids
+        .iter()
+        .filter(|tid| !answered.contains_key(tid))
+        .collect();
+    assert!(missing.is_empty(), "unanswered: {missing:?}");
+    let busy = answered
+        .values()
+        .filter(|status| **status == Status::Busy.to_u8())
+        .count();
+    let ok = answered
+        .values()
+        .filter(|status| **status == Status::Success.to_u8())
+        .count();
+    assert_eq!(busy + ok, ECHOES as usize);
+    assert!(ok >= 16, "the queue's worth is answered: {ok}");
+}

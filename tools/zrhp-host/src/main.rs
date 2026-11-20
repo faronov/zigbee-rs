@@ -51,6 +51,7 @@
 //!                  and the NCP's and the host's link counters
 //! ```
 
+mod checks;
 mod gp;
 
 use std::process::Command;
@@ -746,10 +747,15 @@ fn set_uart<S: ByteStream>(host: &mut Host<S>, baud: u32, flow: bool) -> Result<
 }
 
 /// SYS_ECHO flood for `secs`.
-fn stress<S: ByteStream>(host: &mut Host<S>, secs: u64, size: usize) -> Result<(), String> {
+fn stress<S: ByteStream>(
+    host: &mut Host<S>,
+    secs: u64,
+    size: usize,
+    depth: usize,
+) -> Result<(), String> {
     let before = ncp_link_counters(host)?;
     let host_before = host_link_snapshot(host);
-    host.echo = Some(EchoLoad::new(size, 16));
+    host.echo = Some(EchoLoad::new(size, depth));
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(secs) {
         host.round(Duration::from_millis(20))?;
@@ -769,10 +775,29 @@ fn stress<S: ByteStream>(host: &mut Host<S>, secs: u64, size: usize) -> Result<(
         }
         host.inbox.retain(|m| m.kind != Kind::Event);
     }
+    // Drain: no new echoes; every outstanding one must still be answered
+    // (Z1: a response is never dropped, BUSY counts as an answer).
+    if let Some(load) = host.echo.as_mut() {
+        load.depth = 0;
+    }
+    let drain = Instant::now();
+    while host
+        .echo
+        .as_ref()
+        .is_some_and(|l| !l.outstanding.is_empty())
+        && drain.elapsed() < Duration::from_secs(5)
+    {
+        host.round(Duration::from_millis(20))?;
+        host.inbox.retain(|m| m.kind != Kind::Event);
+    }
     let load = host.echo.take().unwrap_or_default();
     println!("{}", load.summary(started.elapsed()));
     print_link_delta(host, &before, host_before)?;
-    if load.mismatched != 0 || load.refused != 0 {
+    // Within the advertised response budget nothing may be refused; beyond
+    // it BUSY is the expected answer.
+    let within_budget = depth * (size + 8) <= 896;
+    if load.mismatched != 0 || !load.outstanding.is_empty() || (within_budget && load.refused != 0)
+    {
         return Err("echo errors".into());
     }
     Ok(())
@@ -1378,10 +1403,12 @@ fn main() {
         }
         if let Some(secs) = value("--stress") {
             let size = value("--echo-size").map_or(Ok(64), |v| v.parse());
+            let depth = value("--echo-depth").map_or(Ok(16), |v| v.parse());
             stress(
                 &mut host,
                 secs.parse().map_err(|_| "--stress SECS")?,
                 size.map_err(|_| "--echo-size N")?,
+                depth.map_err(|_| "--echo-depth N")?,
             )?;
         }
         let load_started = Instant::now();
@@ -1452,6 +1479,56 @@ fn main() {
                     .ok_or("--leave IEEE: 16 hex digits")?;
             }
             leave(&mut host, nwk, ieee, 45)?;
+        }
+        let hex16 = |flag: &str| {
+            value(flag).and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        };
+        if args.iter().any(|a| a == "--diag") {
+            checks::diag(&mut host)?;
+        }
+        if let Some(spec) = value("--group") {
+            // OP,0xGROUP,EP
+            let parts: Vec<&str> = spec.split(',').collect();
+            let parse = || -> Option<(u8, u16, u8)> {
+                Some((
+                    parts.first()?.parse().ok()?,
+                    u16::from_str_radix(parts.get(1)?.trim_start_matches("0x"), 16).ok()?,
+                    parts.get(2)?.parse().ok()?,
+                ))
+            };
+            let (op, group, ep) = parse().ok_or("--group OP,0xGROUP,EP")?;
+            checks::group(&mut host, op, group, ep)?;
+        }
+        if let Some(hex) = value("--invalidate") {
+            let mut ieee = [0u8; 8];
+            for (index, byte) in ieee.iter_mut().enumerate() {
+                *byte = hex
+                    .get(index * 2..index * 2 + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                    .ok_or("--invalidate IEEE: 16 hex digits")?;
+            }
+            checks::invalidate(&mut host, ieee)?;
+        }
+        if let Some(hex) = value("--install-code") {
+            let mut ieee = [0u8; 8];
+            for (index, byte) in ieee.iter_mut().enumerate() {
+                *byte = hex
+                    .get(index * 2..index * 2 + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                    .ok_or("--install-code IEEE: 16 hex digits")?;
+            }
+            checks::install_code(&mut host, ieee)?;
+        }
+        if let Some(channel) = value("--change-channel") {
+            let channel = channel.parse().map_err(|_| "--change-channel CH")?;
+            checks::change_channel(&mut host, channel)?;
+        }
+        if args.iter().any(|a| a == "--reset-under-load") {
+            let nwk = hex16("--device").ok_or("--device 0xNWK required")?;
+            let ep = value("--ep")
+                .map_or(Ok(1), |v| v.parse())
+                .map_err(|_| "--ep N")?;
+            checks::reset_under_load(&mut host, nwk, ep)?;
         }
         if let Some(gp_args) = gp::GpArgs::parse(&args)? {
             gp::run(&mut host, &gp_args)?;
