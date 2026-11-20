@@ -104,6 +104,9 @@ pub mod capacity {
     pub const MAX_NCP_REQUESTS: u8 = 17;
     /// `max_tc_devices`
     pub const MAX_TC_DEVICES: u8 = 18;
+    /// `host_response_bytes`: response bytes a host may keep outstanding
+    /// per endpoint without `BUSY` for queue space (6.2).
+    pub const HOST_RESPONSE_BYTES: u8 = 19;
 }
 
 /// Config IDs for `SYS_SET_CONFIG` / `SYS_GET_CONFIG` (7.1).

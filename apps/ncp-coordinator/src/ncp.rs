@@ -74,6 +74,65 @@ pub const TX_STALL_DISCARD_US: u64 = 50_000;
 pub const UART_REVERT_US: u64 = 3_000_000;
 /// Delay between a `SYS_RESET` response and the reset itself.
 pub const RESET_DELAY_US: u64 = 50_000;
+/// A status-only response (message header + status byte).
+const STATUS_RESPONSE: usize = zigbee_zrhp::msg::HEADER_LEN + 1;
+/// The largest response message (one frame payload).
+const MAX_RESPONSE: usize = zigbee_zrhp::frame::MAX_PAYLOAD;
+/// Free queue bytes before the NCP returns an endpoint's held frame
+/// credits (spec 6.2: the host may only send more requests on it once
+/// their responses can be queued).
+pub const CREDIT_GATE: usize = QUEUE_BYTES / 2;
+/// `host_response_bytes` (capacity 19): response bytes a host keeps
+/// outstanding per endpoint without ever being answered `BUSY` for space.
+pub const HOST_RESPONSE_BYTES: usize = QUEUE_BYTES - MAX_RESPONSE;
+/// Status responses and APS confirms waiting for queue space: every queued
+/// stack operation, every pending counter read and a margin of `BUSY`
+/// answers to requests whose responses did not fit.
+const DEFERRED: usize = MAX_APS_INFLIGHT + 4 + 4 + 32;
+
+/// The NCP link profile. Credits are returned by `release_credits` once the
+/// responses to a frame's requests can be queued (spec 6.2, 5.10).
+const fn link_config() -> LinkConfig {
+    LinkConfig {
+        auto_credit: false,
+        ..LinkConfig::ncp()
+    }
+}
+
+/// A response or confirm the NCP owes the host but could not queue yet.
+/// Never dropped: sent in order once its endpoint queue has room.
+#[derive(Debug, Clone)]
+enum Deferred {
+    Status { id: u16, tid: u16, status: Status },
+    Confirm(EvtApsDataConfirm),
+}
+
+/// Upper bound of the response bytes `id` produces (spec 6.2: one response
+/// per request, so a request is only taken when this fits).
+fn response_bound(id: u16, request_len: usize) -> usize {
+    match id {
+        ids::SYS_ECHO => STATUS_RESPONSE + request_len,
+        ids::APS_DATA_REQUEST
+        | ids::NWK_FORM
+        | ids::NWK_LEAVE_RESET
+        | ids::NWK_PERMIT_JOIN
+        | ids::NWK_ADD_ENDPOINT
+        | ids::NWK_SET_MANUFACTURER_CODE
+        | ids::NWK_GROUP_MEMBERSHIP
+        | ids::NWK_CHANGE_CHANNEL
+        | ids::NWK_REMOVE_DEVICE
+        | ids::SYS_RESET
+        | ids::SYS_SET_UART
+        | ids::SYS_SET_IEEE
+        | ids::SEC_LOCK_KEY_EXPORT
+        | ids::SEC_ADD_LINK_KEY
+        | ids::LOG_CONFIG
+        | ids::DIAG_RESET_COUNTERS => STATUS_RESPONSE,
+        ids::NWK_INIT => STATUS_RESPONSE + 1,
+        ids::SEC_ADD_INSTALL_CODE => STATUS_RESPONSE + 16,
+        _ => MAX_RESPONSE,
+    }
+}
 
 /// Static facts the product supplies.
 #[derive(Debug, Clone, Copy)]
@@ -157,12 +216,16 @@ pub struct Ncp<const LOG_N: usize> {
     /// `coex_enable`, `coex_tx_priority_mask` (volatile, spec 7.1).
     coex: (bool, u8),
     host_caps: u64,
+    /// Frame credits per endpoint not yet returned to the host
+    /// (`auto_credit = false`, see `release_credits`).
+    held_credits: [u8; Endpoint::COUNT],
+    deferred: Deque<Deferred, DEFERRED>,
 }
 
 impl<const LOG_N: usize> Ncp<LOG_N> {
     /// `cookie`: a random non-zero boot cookie from the hardware RNG.
     pub fn new(identity: NcpIdentity, cookie: u32, now_us: u64) -> Self {
-        let mut link = Link::new(LinkConfig::ncp(), cookie.max(1));
+        let mut link = Link::new(link_config(), cookie.max(1));
         let reason = match identity.reset_reason {
             3 => ResetReason::Watchdog,
             5 => ResetReason::FirmwareUpdate,
@@ -196,6 +259,8 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             backup: crate::backup::BackupState::new(),
             coex: (false, 0),
             host_caps: 0,
+            held_credits: [0; Endpoint::COUNT],
+            deferred: Deque::new(),
         }
     }
 
@@ -256,11 +321,14 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     ) -> Option<PlatformRequest> {
         self.receive(now_us, transport, port, platform, log);
         self.service_uart_switch(now_us, transport);
+        self.flush_deferred();
         if self.host_ready() {
             self.emit_stack_events(now_us, port);
         }
         self.emit_logs(log);
         self.transmit(now_us, transport);
+        self.flush_deferred();
+        self.release_credits();
         match self.pending_reset {
             Some((mode, at)) if now_us >= at && self.tx_len == 0 => {
                 self.pending_reset = None;
@@ -391,7 +459,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     flags: confirm.flags,
                     elapsed_ms: elapsed_ms.min(u64::from(u16::MAX)) as u16,
                 };
-                self.event(Endpoint::Zigbee, &event);
+                if !self.deferred.is_empty() || !self.event(Endpoint::Zigbee, &event) {
+                    // Keep it: every accepted request gets its confirm.
+                    let _ = self.deferred.push_back(Deferred::Confirm(event));
+                }
             }
         }
         true
@@ -442,6 +513,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     self.negotiated = false;
                     self.event_seq = [0; Endpoint::COUNT];
                     self.queues.clear();
+                    // A new session starts with fresh credit edges; owed
+                    // responses belong to the old one.
+                    self.held_credits = [0; Endpoint::COUNT];
+                    self.deferred.clear();
                     let ready = ncp_ready(
                         cookie,
                         &self.identity,
@@ -475,70 +550,116 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 LinkEvent::LinkDown | LinkEvent::LinkFailed => {
                     self.negotiated = false;
                 }
-                LinkEvent::Data { endpoint, payload } => match Batch::parse(payload) {
-                    Ok(batch) => {
-                        let mut state = DispatchState {
-                            negotiated: &mut self.negotiated,
-                            ops: &mut self.ops,
-                            data_inflight: &mut self.data_inflight,
-                            key_export_locked: &mut self.key_export_locked,
-                            pending_reset: &mut self.pending_reset,
-                            uart_switch: &mut self.uart_switch,
-                            pending_diag: &mut self.pending_diag,
-                            counters: &mut self.counters,
-                            identity: &self.identity,
-                            boot_us: self.boot_us,
-                            backup: &mut self.backup,
-                            coex: &mut self.coex,
-                            host_caps: &mut self.host_caps,
-                        };
-                        for message in batch.iter() {
-                            let header = message.header;
-                            if header.kind == Kind::Request && header.retry {
-                                // 6.5: answer from the cache, or let a still
-                                // running operation answer.
-                                if let Some(cached) = self.retry.lookup(header.tid, header.msg_id) {
-                                    let _ = self.queues.queue(endpoint).raw(
-                                        Kind::Response,
+                LinkEvent::Data { endpoint, payload } => {
+                    let held = &mut self.held_credits[endpoint as usize];
+                    *held = held.saturating_add(1);
+                    match Batch::parse(payload) {
+                        Ok(batch) => {
+                            let mut state = DispatchState {
+                                negotiated: &mut self.negotiated,
+                                ops: &mut self.ops,
+                                data_inflight: &mut self.data_inflight,
+                                key_export_locked: &mut self.key_export_locked,
+                                pending_reset: &mut self.pending_reset,
+                                uart_switch: &mut self.uart_switch,
+                                pending_diag: &mut self.pending_diag,
+                                counters: &mut self.counters,
+                                identity: &self.identity,
+                                boot_us: self.boot_us,
+                                backup: &mut self.backup,
+                                coex: &mut self.coex,
+                                host_caps: &mut self.host_caps,
+                            };
+                            for message in batch.iter() {
+                                let header = message.header;
+                                // 6.2: take a request only when its response
+                                // fits; otherwise answer BUSY (deferred if even
+                                // that does not fit). Nothing is dropped.
+                                let reserved = if endpoint == Endpoint::System {
+                                    state.pending_diag.len() * MAX_RESPONSE
+                                } else {
+                                    0
+                                };
+                                let room =
+                                    self.queues.queue(endpoint).free().saturating_sub(reserved);
+                                let busy = header.kind == Kind::Request
+                                    && (!self.deferred.is_empty()
+                                        || room
+                                            < response_bound(header.msg_id, message.payload.len()));
+                                if header.kind == Kind::Request && header.retry {
+                                    // 6.5: answer from the cache, or let a still
+                                    // running operation answer.
+                                    if let Some(cached) =
+                                        self.retry.lookup(header.tid, header.msg_id)
+                                    {
+                                        if self.deferred.is_empty()
+                                            && room >= zigbee_zrhp::msg::HEADER_LEN + cached.len()
+                                        {
+                                            let _ = self.queues.queue(endpoint).raw(
+                                                Kind::Response,
+                                                header.msg_id,
+                                                header.tid,
+                                                cached,
+                                            );
+                                        } else {
+                                            state.counters.busy_responses =
+                                                state.counters.busy_responses.saturating_add(1);
+                                            Self::owe_status(
+                                                &mut self.queues,
+                                                &mut self.deferred,
+                                                header.msg_id,
+                                                header.tid,
+                                                Status::Busy,
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                }
+                                if busy {
+                                    state.counters.busy_responses =
+                                        state.counters.busy_responses.saturating_add(1);
+                                    Self::owe_status(
+                                        &mut self.queues,
+                                        &mut self.deferred,
                                         header.msg_id,
                                         header.tid,
-                                        cached,
+                                        Status::Busy,
                                     );
                                     continue;
                                 }
-                            }
-                            let before = self.queues.queue(endpoint).len();
-                            Self::dispatch(
-                                &mut self.queues,
-                                &mut state,
-                                now_us,
-                                endpoint,
-                                &message,
-                                transport,
-                                port,
-                                platform,
-                                log,
-                            );
-                            if header.kind == Kind::Request {
-                                remember_response(
-                                    &mut self.retry,
-                                    &self.queues.queue(endpoint).queued()[before..],
-                                    header.msg_id,
-                                    header.tid,
+                                let before = self.queues.queue(endpoint).len();
+                                Self::dispatch(
+                                    &mut self.queues,
+                                    &mut state,
+                                    now_us,
+                                    endpoint,
+                                    &message,
+                                    transport,
+                                    port,
+                                    platform,
+                                    log,
                                 );
+                                if header.kind == Kind::Request {
+                                    remember_response(
+                                        &mut self.retry,
+                                        &self.queues.queue(endpoint).queued()[before..],
+                                        header.msg_id,
+                                        header.tid,
+                                    );
+                                }
                             }
                         }
+                        Err(_) => {
+                            self.counters.bad_batches = self.counters.bad_batches.saturating_add(1);
+                            let error = zigbee_zrhp::msg::system::EvtProtocolError {
+                                endpoint: endpoint as u8,
+                                msg_id: Batch::first_msg_id(payload).unwrap_or(0),
+                                reason: 1,
+                            };
+                            push_event(&mut self.queues, &mut self.event_seq, &error);
+                        }
                     }
-                    Err(_) => {
-                        self.counters.bad_batches = self.counters.bad_batches.saturating_add(1);
-                        let error = zigbee_zrhp::msg::system::EvtProtocolError {
-                            endpoint: endpoint as u8,
-                            msg_id: Batch::first_msg_id(payload).unwrap_or(0),
-                            reason: 1,
-                        };
-                        push_event(&mut self.queues, &mut self.event_seq, &error);
-                    }
-                },
+                }
                 LinkEvent::TxFailed { .. } => {
                     // Responses and events are not retried: the host times
                     // out or resyncs (6.5).
@@ -696,6 +817,10 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     Capacity {
                         id: capacity::GP_PROXY_TABLE,
                         value: gp_proxy_table,
+                    },
+                    Capacity {
+                        id: capacity::HOST_RESPONSE_BYTES,
+                        value: HOST_RESPONSE_BYTES as u32,
                     },
                 ];
                 let response = SysNegotiateRsp {
@@ -1316,11 +1441,80 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     }
 
     fn respond_status(&mut self, id: u16, tid: u16, status: Status) {
-        if let Some(endpoint) = home_endpoint(id) {
-            let _ = self
-                .queues
+        Self::owe_status(&mut self.queues, &mut self.deferred, id, tid, status);
+    }
+
+    /// Queue a status response, or keep it (in order) until it fits.
+    fn owe_status(
+        queues: &mut EndpointQueues<QUEUE_BYTES>,
+        deferred: &mut Deque<Deferred, DEFERRED>,
+        id: u16,
+        tid: u16,
+        status: Status,
+    ) {
+        let Some(endpoint) = home_endpoint(id) else {
+            return;
+        };
+        if deferred.is_empty()
+            && queues
                 .queue(endpoint)
-                .push_with(|w| w.response_status(id, tid, status));
+                .push_with(|w| w.response_status(id, tid, status))
+                .is_ok()
+        {
+            return;
+        }
+        if deferred
+            .push_back(Deferred::Status { id, tid, status })
+            .is_err()
+        {
+            // Beyond `DEFERRED`: only a host that ignores the credit gate
+            // and `host_response_bytes` gets here (spec 6.2).
+            debug_assert!(false, "deferred responses exhausted");
+        }
+    }
+
+    /// Send owed responses and confirms, oldest first, as far as they fit.
+    fn flush_deferred(&mut self) {
+        while let Some(front) = self.deferred.front() {
+            let queued = match front {
+                Deferred::Status { id, tid, status } => {
+                    let (id, tid, status) = (*id, *tid, *status);
+                    home_endpoint(id).is_none_or(|endpoint| {
+                        self.queues
+                            .queue(endpoint)
+                            .push_with(|w| w.response_status(id, tid, status))
+                            .is_ok()
+                    })
+                }
+                Deferred::Confirm(event) => {
+                    let event = event.clone();
+                    push_event(&mut self.queues, &mut self.event_seq, &event)
+                }
+            };
+            if !queued {
+                return;
+            }
+            self.deferred.pop_front();
+        }
+    }
+
+    /// Return held frame credits once the endpoint's queue has room for
+    /// another frame's responses and nothing is owed (`auto_credit = false`).
+    fn release_credits(&mut self) {
+        if !self.deferred.is_empty() {
+            return;
+        }
+        for endpoint in [
+            Endpoint::System,
+            Endpoint::Zigbee,
+            Endpoint::Tables,
+            Endpoint::Bulk,
+            Endpoint::Log,
+        ] {
+            let held = &mut self.held_credits[endpoint as usize];
+            if *held != 0 && self.queues.queue(endpoint).free() >= CREDIT_GATE {
+                self.link.release_credit(endpoint, core::mem::take(held));
+            }
         }
     }
 
@@ -1804,6 +1998,8 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 backup: _,
                 coex: _,
                 host_caps: _,
+                held_credits: _,
+                deferred: _,
             } = ncp;
         };
         let reason = match identity.reset_reason {
@@ -1817,7 +2013,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         // created.
         unsafe {
             use core::ptr::addr_of_mut;
-            addr_of_mut!((*slot).link).write(Link::new(LinkConfig::ncp(), cookie.max(1)));
+            addr_of_mut!((*slot).link).write(Link::new(link_config(), cookie.max(1)));
             addr_of_mut!((*slot).queues).write(EndpointQueues::new());
             // An all-zero byte array is a valid value.
             addr_of_mut!((*slot).tx).write_bytes(0, 1);
@@ -1844,6 +2040,8 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             addr_of_mut!((*slot).backup).write(crate::backup::BackupState::new());
             addr_of_mut!((*slot).coex).write((false, 0));
             addr_of_mut!((*slot).host_caps).write(0);
+            addr_of_mut!((*slot).held_credits).write([0; Endpoint::COUNT]);
+            addr_of_mut!((*slot).deferred).write(Deque::new());
             let ncp = &mut *slot;
             ncp.link.open(now_us, reason);
             ncp
