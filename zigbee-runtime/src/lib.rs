@@ -1706,6 +1706,81 @@ mod resume_tests {
     /// persistence — the reboot must not be able to promote the placeholder
     /// into an authoritative `0`, which would make every beacon advertising
     /// `0x81..=0xFF` look stale and strand the device off its own network.
+    /// R22 §2.4.3.3.9: a channel change accepted from `Mgmt_NWK_Update_req`
+    /// is durable as soon as it is accepted (a reboot inside the delivery
+    /// interval resumes on the new channel) and stays durable after the
+    /// switch; an unjoined NIB (scan, rejoin) is never persisted.
+    #[test]
+    fn an_accepted_channel_change_is_persisted_ahead_of_the_switch() {
+        const IEEE_ADDRESS: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x47];
+        const FLOOR: u32 = 0x2400;
+
+        let mut state = PersistentSecurityState::empty();
+        state.commissioned = true;
+        state.legacy_default_tclk = true;
+        state.extended_pan_id = [0xAA; 8];
+        state.pan_id = 0x1234;
+        state.short_address = 0x5678;
+        state.ieee_address = IEEE_ADDRESS;
+        state.channel = 15;
+        state.depth = 2;
+        state.parent_address = 0x0001;
+        state.update_id = 4;
+        state.update_id_valid = true;
+        state.network_key = [0xCC; 16];
+        state.key_sequence = 3;
+        state.global_counter_limit = FLOOR;
+        state.tclk_counter_limit = FLOOR;
+        let mut store = RamSecurityStateStore::new();
+        store.store(&state).unwrap();
+
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        assert!(device.restore_security_state(&mut store).unwrap());
+        device.bdb.zdo_mut().nwk_mut().set_joined(true);
+        assert!(!device.refresh_security_state(&mut store).unwrap());
+
+        // Accepted (the ZDO handler arms the switch and adopts the ID).
+        {
+            let nwk = device.bdb.zdo_mut().nwk_mut();
+            nwk.arm_channel_change(20);
+            nwk.nib_mut().set_nwk_update_id(5);
+        }
+        assert!(device.refresh_security_state(&mut store).unwrap());
+        let persisted = store.load().unwrap().unwrap();
+        assert_eq!((persisted.channel, persisted.update_id), (20, 5));
+        assert_eq!(device.bdb.zdo().nwk().nib().logical_channel, 15);
+
+        // What a reboot before the switch would resume from.
+        let before_switch = store.load().unwrap().unwrap();
+
+        // The switch itself, after nwkNetworkBroadcastDeliveryTime.
+        let nwk = device.bdb.zdo_mut().nwk_mut();
+        nwk.mac_mut()
+            .set_time_micros(zigbee_nwk::conflict::NETWORK_BROADCAST_DELIVERY_TIME_US);
+        block_on(nwk.process_pending_end_device_lifecycle());
+        assert_eq!(nwk.nib().logical_channel, 20);
+        assert!(!device.refresh_security_state(&mut store).unwrap());
+        assert_eq!(store.load().unwrap().unwrap().channel, 20);
+
+        // An unjoined NIB (a rejoin scan moving the channel) is not adopted.
+        let nwk = device.bdb.zdo_mut().nwk_mut();
+        nwk.set_joined(false);
+        nwk.nib_mut().logical_channel = 25;
+        assert!(!device.refresh_security_state(&mut store).unwrap());
+        assert_eq!(store.load().unwrap().unwrap().channel, 20);
+
+        // A reboot inside the delivery interval resumes on the new channel.
+        let mut early = RamSecurityStateStore::new();
+        early.store(&before_switch).unwrap();
+        let mut rebooted = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::EndDevice)
+            .build();
+        assert!(rebooted.restore_security_state(&mut early).unwrap());
+        assert_eq!(rebooted.bdb.zdo().nwk().nib().logical_channel, 20);
+    }
+
     #[test]
     fn an_unknown_persisted_update_id_restores_and_persists_as_unknown() {
         const IEEE_ADDRESS: [u8; 8] = [0x02, 0x55, 0x4E, 0x33, 0x39, 0x36, 0x34, 0x46];
@@ -12257,6 +12332,23 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             }
             None => false,
         };
+        // R22 §2.4.3.3.9: a channel change accepted from the network manager
+        // (`Mgmt_NWK_Update_req`) is persisted as soon as it is accepted, the
+        // pending channel ahead of the radio, so that a reboot inside
+        // nwkNetworkBroadcastDeliveryTime resumes where the network goes.
+        // Only a joined NIB is authoritative (scans and rejoins move it).
+        let operating_channel = nwk.pending_channel_change().unwrap_or(nib.logical_channel);
+        let channel_changed = nwk.is_joined()
+            && (11..=26).contains(&operating_channel)
+            && operating_channel != state.channel;
+        if channel_changed {
+            log::warn!(
+                "[Runtime] Persisting channel change {} -> {}",
+                state.channel,
+                operating_channel,
+            );
+            state.channel = operating_channel;
+        }
         let pending_pan_id = nwk.pending_pan_id_update().map(|pan_id| pan_id.0);
         let pending_pan_id_broadcast = nwk.pan_id_update_broadcast_pending();
         let nwk_lifecycle_changed = state.pending_pan_id != pending_pan_id
@@ -12412,6 +12504,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
             || staged_key_changed
             || update_id_changed
             || pan_id_changed
+            || channel_changed
             || short_address_changed
             || nwk_lifecycle_changed
             || end_device_timeout_changed;
