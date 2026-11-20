@@ -299,6 +299,16 @@ pub(crate) struct PendingAddressConflict {
     pub(crate) send_after_us: u32,
 }
 
+/// A channel change accepted from the network manager, waiting out
+/// `nwkNetworkBroadcastDeliveryTime` before the radio is retuned
+/// (R22 §2.4.3.3.9).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingChannelChange {
+    pub(crate) channel: u8,
+    /// Monotonic microsecond timestamp at which the channel changes.
+    pub(crate) apply_at_us: u32,
+}
+
 /// A PAN identifier update accepted from the network manager, waiting out
 /// `nwkNetworkBroadcastDeliveryTime` before it is applied (R22 §3.6.1.13.3).
 #[derive(Debug, Clone, Copy)]
@@ -396,6 +406,10 @@ pub struct NwkLayer<M: MacDriver> {
     /// PAN identifier update accepted from the network manager and waiting out
     /// `nwkNetworkBroadcastDeliveryTime` (R22 §3.6.1.13.3).
     pending_pan_id_update: Option<PendingPanIdUpdate>,
+    /// Channel change accepted from the network manager's
+    /// `Mgmt_NWK_Update_req` and waiting out `nwkNetworkBroadcastDeliveryTime`
+    /// (R22 §2.4.3.3.9).
+    pending_channel_change: Option<PendingChannelChange>,
     /// A Network Update the network manager owes the network after accepting a
     /// PAN identifier conflict report, broadcast on the next async pass.
     pending_pan_id_broadcast: Option<frames::PanIdUpdate>,
@@ -486,6 +500,7 @@ impl<M: MacDriver> NwkLayer<M> {
             source_route_table: routing::SourceRouteTable::new(),
             pending_conflicts: heapless::Vec::new(),
             pending_pan_id_update: None,
+            pending_channel_change: None,
             pending_pan_id_broadcast: None,
             #[cfg(feature = "router")]
             pending_nwk_status: None,
@@ -556,6 +571,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 .write(routing::SourceRouteTable::new());
             core::ptr::addr_of_mut!((*slot).pending_conflicts).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).pending_pan_id_update).write(None);
+            core::ptr::addr_of_mut!((*slot).pending_channel_change).write(None);
             core::ptr::addr_of_mut!((*slot).pending_pan_id_broadcast).write(None);
             #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).pending_nwk_status).write(None);
