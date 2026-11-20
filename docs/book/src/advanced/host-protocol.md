@@ -1243,7 +1243,14 @@ at most 64 s and never longer than the child's End Device Timeout. Each APS
 ACK wait for such a child is `apscAckWaitDuration` (1.5 s) plus that hold, so
 an APS retry is only sent once the previous copy was delivered or expired,
 never queued beside it. This applies with or without `tx_options` bit5.
-With bit5, a sleepy destination that is not a child of the NCP gets the
+The estimates are kept in RAM only. After an NCP reboot, each sleepy child
+restored from the child journal is held at the conservative bound, up to its
+End Device Timeout (at most 64 s). This lasts until a poll interval longer
+than the default hold is measured again, or for 10 minutes. A live child
+must poll within its End Device Timeout or be aged out, so the bound is
+safe. Without it, frames to a long-polling child after a reboot expired
+after 8 s, and a Leave failed with NO_ACK after about 38 s. Fast-poll bursts
+do not replace the bound. With bit5, a sleepy destination that is not a child of the NCP gets the
 default 7.68 s indirect hold of its own parent added to each ACK wait. A
 confirm can therefore take up to 4 × (hold + 1.5 s); `elapsed_ms` saturates
 at 65535.

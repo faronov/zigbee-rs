@@ -13079,6 +13079,43 @@ mod tests {
         assert!(!parent.indirect.has_pending(ORIGIN));
     }
 
+    /// `adaptive-indirect` after a parent reboot: nothing is known of a
+    /// restored sleepy child's polling, so its frames are held up to its End
+    /// Device Timeout (capped at 64 s) until it is heard to long-poll again.
+    /// A frame queued right after the restore (an NCP host's Leave, say)
+    /// waits for the child's 30 s poll instead of expiring after 8 s.
+    #[test]
+    #[cfg(feature = "adaptive-indirect")]
+    fn a_restored_sleepy_child_keeps_its_frame_until_its_next_long_poll() {
+        let mut parent = node(DeviceType::Router, OUR_ADDR);
+        assert!(parent.restore_child(ORIGIN_IEEE, ORIGIN, false, true, false, 14));
+        assert!(parent.restore_child(RESTORED_CHILD_IEEE, RESTORED_CHILD, true, true, true, 8));
+        assert_eq!(
+            parent.sleepy_child_hold_secs(ORIGIN),
+            Some(crate::poll_estimate::MAX_HOLD_SECS)
+        );
+        assert_eq!(parent.sleepy_child_hold_secs(RESTORED_CHILD), None, "rx-on");
+        // A short End Device Timeout bounds the seed (enum 0 = 10 s).
+        assert!(parent.restore_child([0x5A; 8], ShortAddress(0x0501), false, true, false, 0));
+        assert_eq!(
+            parent.sleepy_child_hold_secs(ShortAddress(0x0501)),
+            Some(10)
+        );
+
+        block_on(parent.nlde_data_request(ORIGIN, 1, &[0xAA], false, false)).unwrap();
+        for _ in 0..30 {
+            assert!(parent.indirect.age().is_empty());
+        }
+        assert_eq!(
+            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap(),
+            crate::ChildPollOutcome::Delivered {
+                child: ORIGIN,
+                more_pending: false,
+                kind: crate::IndirectFrameKind::Data,
+            }
+        );
+    }
+
     /// A frame queued after the parent's auto-ACK told the polling child "no
     /// data" (Frame Pending = 0) is not sent in reply to that poll — the
     /// child has turned its receiver off, its radio would acknowledge the
