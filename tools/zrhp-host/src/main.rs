@@ -41,6 +41,8 @@
 //!                  SYS_SET_UART (flow 1 = RTS/CTS), then switch the host
 //!                  port and confirm with SYS_ECHO (runs before the steps
 //!                  below; the Thread BR bridge follows the host's rate)
+//! --gp-sink 0xNWK --gp-src 0xSRCID [--gp-pair KEY:FC] [--gp-translate ...]
+//!                  remote GP provisioning of a sink (see `gp.rs`)
 //! --echo-load      keep SYS_ECHO requests in flight during --join/--listen
 //!                  and check every echo (link stress during the Trust
 //!                  Center's journal writes)
@@ -48,6 +50,8 @@
 //!                  SYS_ECHO flood for SECS; prints throughput, mismatches
 //!                  and the NCP's and the host's link counters
 //! ```
+
+mod gp;
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -1448,6 +1452,9 @@ fn main() {
                     .ok_or("--leave IEEE: 16 hex digits")?;
             }
             leave(&mut host, nwk, ieee, 45)?;
+        }
+        if let Some(gp_args) = gp::GpArgs::parse(&args)? {
+            gp::run(&mut host, &gp_args)?;
         }
         if let Some(path) = value("--fw-update") {
             let version = value("--fw-version")

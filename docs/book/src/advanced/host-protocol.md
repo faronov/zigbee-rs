@@ -1618,7 +1618,12 @@ way; it keeps `GP_SINK_*`.
   Table Requests answered by a second zigbee-rs router stack, a broadcast
   GP Pairing that pairs both the NCP's proxy and the remote proxy,
   `CONFLICT`, and Default Responses of a sink without the Translation
-  Table. **Not run on hardware.**
+  Table. **Lab-tested on hardware 2026-11-20** (Thread BR H2 NCP → an
+  ESP32-C6 combo over the air: Pairing Configuration Extend and Remove
+  GPD, Translation Table Update add/remove and Request, Sink Table
+  Request; [green-power.md 6.12](green-power.md#612-remote-gp-provisioning-over-the-air-ncp--c6-combo-2026-11-20)).
+  `GP_SEND_PAIRING` and `GP_REMOTE_PROXY_TABLE_REQUEST` are not run on
+  hardware.
 
 **Coexistence with zigpy's own GP sink (normative).** zigpy (current `dev`)
 has a complete sink in `zigpy.zgp.GreenPowerManager`:
