@@ -43,7 +43,10 @@ use zigbee_zrhp::msg::firmware::{
     FwActivate, FwBegin as FwBeginReq, FwBeginRsp, FwFinishRsp, FwGetSlotsRsp, FwWrite, FwWriteRsp,
 };
 use zigbee_zrhp::msg::network::{NwkForm, NwkGetInfoRsp, NwkLeaveReset};
-use zigbee_zrhp::msg::security::{SecGetFrameCountersRsp, SecGetNetworkKey, SecGetNetworkKeyRsp};
+use zigbee_zrhp::msg::security::{
+    SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecGetFrameCountersRsp,
+    SecGetNetworkKey, SecGetNetworkKeyRsp,
+};
 use zigbee_zrhp::msg::system::{
     ConfigValue, SysGetConfig, SysGetConfigRsp, SysGetInfoRsp, SysGetStatusRsp, SysNegotiateReq,
     SysNegotiateRsp, SysSetConfig, SysSetConfigRsp, SysSetIeee, caps, config,
@@ -1333,4 +1336,81 @@ fn network_info_after_a_reboot_reports_the_stored_identity() {
         let info: NwkGetInfoRsp = info.body();
         assert_eq!(info.state, 0);
     });
+}
+
+/// `SEC_ADD_INSTALL_CODE` / `SEC_ADD_LINK_KEY` (spec 7.5; herdsman H6):
+/// the derived key (Silicon Labs vector) is returned and provisioned for
+/// the device; a bad CRC is refused; a unique TCLK is provisioned with its
+/// attributes; unsupported variants are refused, not silently accepted.
+#[test]
+fn install_codes_and_link_keys_are_provisioned() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    const CODE: [u8; 18] = [
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0xD4, 0x90,
+    ];
+    const DERIVED: [u8; 16] = [
+        0xFA, 0x80, 0x81, 0xCA, 0xAA, 0x41, 0xD5, 0xAD, 0xE9, 0xB5, 0x65, 0x87, 0x99, 0x26, 0x8B,
+        0x88,
+    ];
+    const CODE_DEVICE: [u8; 8] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38];
+    const KEY_DEVICE: [u8; 8] = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48];
+
+    // Not before the network runs.
+    let early = host.request(&SecAddInstallCode {
+        ieee: Ieee(CODE_DEVICE),
+        code: Bytes8(&CODE),
+    });
+    exchange!();
+    assert_eq!(host.response(early).status(), Status::InvalidState.to_u8());
+
+    let form = host.request(&form_request(0x2C11, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let mut bad = CODE;
+    bad[0] ^= 1;
+    let rejected = host.request(&SecAddInstallCode {
+        ieee: Ieee(CODE_DEVICE),
+        code: Bytes8(&bad),
+    });
+    let added = host.request(&SecAddInstallCode {
+        ieee: Ieee(CODE_DEVICE),
+        code: Bytes8(&CODE),
+    });
+    let key = host.request(&SecAddLinkKey {
+        ieee: Ieee(KEY_DEVICE),
+        key: DEVICE_KEY,
+        key_type: 1,
+        attrs: 1,
+        rx_floor: 0,
+        flags: 1,
+    });
+    let application = host.request(&SecAddLinkKey {
+        ieee: Ieee(KEY_DEVICE),
+        key: DEVICE_KEY,
+        key_type: 3,
+        attrs: 0,
+        rx_floor: 0,
+        flags: 0,
+    });
+    exchange!();
+    assert_eq!(
+        host.response(rejected).status(),
+        Status::InvalidParameter.to_u8()
+    );
+    let added = host.response(added);
+    let added: SecAddInstallCodeRsp = added.body();
+    assert_eq!(added.derived_key, DERIVED);
+    assert_eq!(host.response(key).status(), 0);
+    assert_eq!(
+        host.response(application).status(),
+        Status::UnsupportedCommand.to_u8()
+    );
+
+    let keys: Vec<_> = (0..port.device_capacity())
+        .filter_map(|index| port.device(index))
+        .filter_map(|view| view.link.map(|link| (view.ieee, link.key, link.origin)))
+        .collect();
+    assert!(keys.contains(&(CODE_DEVICE, DERIVED, 1)), "{keys:?}");
+    assert!(keys.contains(&(KEY_DEVICE, DEVICE_KEY, 3)), "{keys:?}");
 }

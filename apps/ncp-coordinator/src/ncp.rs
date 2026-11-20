@@ -32,8 +32,8 @@ use zigbee_zrhp::msg::network::{
     NwkInit, NwkInitRsp, NwkLeaveReset, NwkPermitJoin,
 };
 use zigbee_zrhp::msg::security::{
-    EvtFcCheckpoint, SecGetFrameCountersRsp, SecGetNetworkKey, SecGetNetworkKeyRsp,
-    SecLockKeyExport,
+    EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey,
+    SecGetFrameCountersRsp, SecGetNetworkKey, SecGetNetworkKeyRsp, SecLockKeyExport,
 };
 use zigbee_zrhp::msg::system::{
     Capacity, ConfigReadItem, ConfigStatus, EvtIndicationsDropped, EvtNcpReady, SysGetConfig,
@@ -750,6 +750,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 // Green Power combo (spec 7.11).
                 let (gp_caps, gp_sink_table, gp_proxy_table) = crate::gp::negotiate_facts(port);
                 ncp_caps |= gp_caps | caps::BACKUP_RESTORE;
+                if port.install_codes_supported() {
+                    ncp_caps |= caps::INSTALL_CODES;
+                }
                 if platform.fw_supported() {
                     ncp_caps |= caps::NCP_FW_UPDATE;
                 }
@@ -1215,6 +1218,39 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     stride: FC_STRIDE,
                 };
                 let _ = queues.response(tid, Status::Success, Some(&response));
+            }
+            ids::SEC_ADD_INSTALL_CODE => {
+                let request = decode!(SecAddInstallCode);
+                match port.add_install_code(request.ieee.0, request.code.0) {
+                    Ok(key) => {
+                        let response = SecAddInstallCodeRsp { derived_key: key };
+                        let _ = queues.response(tid, Status::Success, Some(&response));
+                    }
+                    Err(error) => status_only(queues, op_status(Err(error))),
+                }
+            }
+            ids::SEC_ADD_LINK_KEY => {
+                let request = decode!(SecAddLinkKey);
+                // A unique TCLK (type 1) before the device joins. The NCP
+                // has no temporary keys: flags bit0 keeps it like any
+                // provisioned key until SEC_REMOVE_LINK_KEY or a wipe.
+                // Application keys (type 3) and incoming floors are not
+                // imported this way (TBL_PUSH / restore carry them).
+                let status = if request.key_type != 1 || request.rx_floor != 0 {
+                    Status::UnsupportedCommand
+                } else if request.attrs > 2 {
+                    Status::InvalidParameter
+                } else {
+                    op_status(port.restore_link_key(&crate::port::RestoredKey {
+                        ieee: request.ieee.0,
+                        key: request.key,
+                        origin: 3,
+                        attrs: request.attrs,
+                        nwk: None,
+                        child: false,
+                    }))
+                };
+                status_only(queues, status);
             }
             ids::SEC_LOCK_KEY_EXPORT => {
                 let request = decode!(SecLockKeyExport);

@@ -257,11 +257,9 @@ impl TrustCenterTable {
         address: IeeeAddress,
         install_code: &[u8],
     ) -> Result<AesKey, TrustCenterError> {
-        if install_code.len() != 18 {
-            return Err(TrustCenterError::InvalidInstallCode(
-                InstallCodeError::InvalidLength,
-            ));
-        }
+        // 48-, 64-, 96- or 128-bit codes with their CRC-16 (BDB 3.0.1
+        // §10.1, R22 4.6.3.4): `derive_install_code_key` checks the length
+        // (8/10/14/18 bytes) and the CRC.
         let key =
             derive_install_code_key(install_code).map_err(TrustCenterError::InvalidInstallCode)?;
         self.provision_link_key(address, key, TrustCenterKeyOrigin::InstallCode)?;
@@ -922,6 +920,42 @@ mod tests {
                 .unwrap(),
             TrustCenterAction::TransportNetworkKey { link_key, .. } if link_key == key
         ));
+    }
+
+    /// 48-, 64- and 96-bit install codes (with their CRC) are accepted as
+    /// well as 128-bit ones (BDB 3.0.1 §10.1); length and CRC are checked.
+    #[test]
+    fn shorter_install_codes_are_provisioned() {
+        for len in [6usize, 8, 12] {
+            let mut table = TrustCenterTable::new();
+            let mut code = [0u8; 18];
+            for (index, byte) in code[..len].iter_mut().enumerate() {
+                *byte = 0x10 + index as u8;
+            }
+            let crc = zigbee_crypto::install_code_crc(&code[..len]);
+            code[len..len + 2].copy_from_slice(&crc.to_le_bytes());
+            let key = table
+                .provision_install_code(DEVICE, &code[..len + 2])
+                .unwrap();
+            assert_eq!(
+                Ok(key),
+                zigbee_crypto::derive_install_code_key(&code[..len + 2])
+            );
+            code[0] ^= 1;
+            assert_eq!(
+                table.provision_install_code(DEVICE, &code[..len + 2]),
+                Err(TrustCenterError::InvalidInstallCode(
+                    InstallCodeError::InvalidCrc
+                ))
+            );
+        }
+        let mut table = TrustCenterTable::new();
+        assert_eq!(
+            table.provision_install_code(DEVICE, &[0u8; 16]),
+            Err(TrustCenterError::InvalidInstallCode(
+                InstallCodeError::InvalidLength
+            ))
+        );
     }
 
     #[test]

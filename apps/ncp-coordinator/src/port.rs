@@ -333,6 +333,16 @@ pub trait CoordinatorPort {
         let _ = (ieee, key);
         Err(OpError::Unsupported)
     }
+    /// `INSTALL_CODES` capability: `add_install_code` is implemented.
+    fn install_codes_supported(&self) -> bool {
+        false
+    }
+    /// Provision the key derived from an install code (8/10/14/18 bytes
+    /// including the CRC) before the device joins (`SEC_ADD_INSTALL_CODE`).
+    fn add_install_code(&mut self, ieee: [u8; 8], code: &[u8]) -> Result<[u8; 16], OpError> {
+        let _ = (ieee, code);
+        Err(OpError::Unsupported)
+    }
     /// Install a device link key from a backup with its origin,
     /// verification state and address (`BKP_RESTORE_COMMIT`).
     fn restore_link_key(&mut self, key: &RestoredKey) -> Result<(), OpError> {

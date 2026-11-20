@@ -85,6 +85,9 @@ pub trait TcApp {
     fn tc_table(&self) -> &zigbee_bdb::trust_center::TrustCenterTable;
     /// Provision a unique TCLK before join (durable).
     fn provision_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError>;
+    /// Durably provision the key derived from an install code (with its
+    /// CRC) before the device joins; returns the key.
+    fn provision_install_code(&mut self, ieee: [u8; 8], code: &[u8]) -> Result<[u8; 16], OpError>;
     /// Durably drop a device's record and key; `false` when unknown.
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError>;
     /// The highest global outgoing APS counter any key may have used
@@ -241,6 +244,20 @@ where
         trust_center
             .provision_link_key(device, ieee, key)
             .map_err(|_| OpError::Storage)
+    }
+
+    fn provision_install_code(&mut self, ieee: [u8; 8], code: &[u8]) -> Result<[u8; 16], OpError> {
+        use zigbee_bdb::trust_center::TrustCenterError;
+        use zigbee_runtime::trust_center_runtime::TrustCenterRuntimeError;
+        let (trust_center, device) = self.trust_center_and_device_mut();
+        trust_center
+            .provision_install_code(device, ieee, code)
+            .map_err(|error| match error {
+                TrustCenterRuntimeError::Policy(
+                    TrustCenterError::InvalidInstallCode(_) | TrustCenterError::InvalidAddress,
+                ) => OpError::InvalidParameter,
+                _ => OpError::Storage,
+            })
     }
 
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
@@ -1358,6 +1375,17 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         self.app.provision_link_key(ieee, key)
     }
 
+    fn install_codes_supported(&self) -> bool {
+        true
+    }
+
+    fn add_install_code(&mut self, ieee: [u8; 8], code: &[u8]) -> Result<[u8; 16], OpError> {
+        if !self.running {
+            return Err(OpError::InvalidState);
+        }
+        self.app.provision_install_code(ieee, code)
+    }
+
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
         if !self.running {
             return Err(OpError::InvalidState);
@@ -1593,6 +1621,10 @@ impl<T: TcApp + ?Sized> TcApp for &mut T {
 
     fn provision_link_key(&mut self, ieee: [u8; 8], key: [u8; 16]) -> Result<(), OpError> {
         (**self).provision_link_key(ieee, key)
+    }
+
+    fn provision_install_code(&mut self, ieee: [u8; 8], code: &[u8]) -> Result<[u8; 16], OpError> {
+        (**self).provision_install_code(ieee, code)
     }
 
     fn forget_device(&mut self, ieee: [u8; 8]) -> Result<bool, OpError> {
