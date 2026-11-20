@@ -21078,3 +21078,13 @@ mod spare_erase;
 /// Streamed multi-slot Trust Center journal of the coordinator NCP.
 #[cfg(feature = "ncp-capacity")]
 pub mod trust_center_stream;
+
+/// Combo GP Pairing Configuration and Translation Table, end to end.
+#[cfg(all(test, feature = "router", feature = "green-power-translation-table"))]
+#[path = "green_power/translation_tests.rs"]
+mod gp_translation_tests;
+
+/// GP sink configuration issued by the local application.
+#[cfg(feature = "green-power-translation-table")]
+#[path = "green_power/local_config.rs"]
+mod gp_local_config;

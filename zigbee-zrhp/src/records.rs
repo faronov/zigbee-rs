@@ -38,6 +38,8 @@ pub mod record_type {
     pub const RS_PARAMS: u8 = 0x0A;
     /// `GP_SINK` (also a table ID)
     pub const GP_SINK: u8 = 0x0B;
+    /// `GP_TRANSLATION`
+    pub const GP_TRANSLATION: u8 = 0x0C;
     /// `END`
     pub const END: u8 = 0xFF;
 }
@@ -388,6 +390,86 @@ impl<'a> Wire<'a> for GpSinkRecord {
     }
 }
 
+/// `GP_TRANSLATION.payload_len` values that carry no payload bytes.
+pub mod gp_translation_payload {
+    /// Derived from the GPD command as by the sink's default translation.
+    pub const DERIVED: u8 = 0xFE;
+    /// The GPD command payload, copied.
+    pub const COPY_GPD: u8 = 0xFF;
+}
+
+/// One GPD command → ZCL command translation: `u8 gpd_command, u8
+/// endpoint, u16 profile, u16 cluster, u8 zcl_command, u8 payload_len`,
+/// then `payload_len` payload bytes when it is `0x00..=0xFD`
+/// ([`gp_translation_payload`] for `0xFE` and `0xFF`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpTranslation<'a> {
+    /// GPD CommandID.
+    pub gpd_command: u8,
+    /// Endpoint on the sink (`0xFC`: hand the command to the application).
+    pub endpoint: u8,
+    /// Zigbee profile.
+    pub profile: u16,
+    /// ZCL cluster.
+    pub cluster: u16,
+    /// ZCL cluster-specific command.
+    pub zcl_command: u8,
+    /// Payload length or [`gp_translation_payload`].
+    pub payload_len: u8,
+    /// Fixed payload (empty for `0xFE`/`0xFF`).
+    pub payload: &'a [u8],
+}
+
+impl<'a> Wire<'a> for GpTranslation<'a> {
+    fn read(r: &mut Reader<'a>) -> Result<Self, CodecError> {
+        let gpd_command = r.u8()?;
+        let endpoint = r.u8()?;
+        let profile = r.u16()?;
+        let cluster = r.u16()?;
+        let zcl_command = r.u8()?;
+        let payload_len = r.u8()?;
+        let payload = if payload_len < gp_translation_payload::DERIVED {
+            r.bytes(usize::from(payload_len))?
+        } else {
+            &[]
+        };
+        Ok(Self {
+            gpd_command,
+            endpoint,
+            profile,
+            cluster,
+            zcl_command,
+            payload_len,
+            payload,
+        })
+    }
+    fn write(&self, w: &mut Writer<'_>) -> Result<(), CodecError> {
+        let fixed = self.payload_len < gp_translation_payload::DERIVED;
+        if (fixed && usize::from(self.payload_len) != self.payload.len())
+            || (!fixed && !self.payload.is_empty())
+        {
+            return Err(CodecError::Invalid);
+        }
+        w.u8(self.gpd_command)?;
+        w.u8(self.endpoint)?;
+        w.u16(self.profile)?;
+        w.u16(self.cluster)?;
+        w.u8(self.zcl_command)?;
+        w.u8(self.payload_len)?;
+        w.bytes(self.payload)
+    }
+}
+
+wire_struct! {
+    /// `GP_TRANSLATION` (`0x0C`): one Translation Table entry of a sink.
+    pub struct GpTranslationRecord<'a> {
+        /// GPD identifier.
+        pub gpd_id: GpdId,
+        /// The translation.
+        pub translation: GpTranslation<'a>,
+    }
+}
+
 wire_struct! {
     /// `END` (`0xFF`).
     pub struct EndRecord {
@@ -421,6 +503,8 @@ pub enum Record<'a> {
     RsParams(RsParamsRecord),
     /// `0x0B`
     GpSink(GpSinkRecord),
+    /// `0x0C`
+    GpTranslation(GpTranslationRecord<'a>),
     /// `0xFF`
     End(EndRecord),
     /// Any other type (skipped by the NCP, preserved by hosts).
@@ -447,6 +531,7 @@ impl Record<'_> {
             Self::GpProxy(_) => GP_PROXY,
             Self::RsParams(_) => RS_PARAMS,
             Self::GpSink(_) => GP_SINK,
+            Self::GpTranslation(_) => GP_TRANSLATION,
             Self::End(_) => END,
             Self::Unknown { rtype, .. } => *rtype,
         }
@@ -471,6 +556,7 @@ impl<'a> Wire<'a> for Record<'a> {
             GP_PROXY => Self::GpProxy(v.read()?),
             RS_PARAMS => Self::RsParams(v.read()?),
             GP_SINK => Self::GpSink(v.read()?),
+            GP_TRANSLATION => Self::GpTranslation(v.read()?),
             END => Self::End(v.read()?),
             _ => Self::Unknown { rtype, value },
         })
@@ -490,6 +576,7 @@ impl<'a> Wire<'a> for Record<'a> {
             Self::GpProxy(v) => w.write(v)?,
             Self::RsParams(v) => w.write(v)?,
             Self::GpSink(v) => w.write(v)?,
+            Self::GpTranslation(v) => w.write(v)?,
             Self::End(v) => w.write(v)?,
             Self::Unknown { value, .. } => w.bytes(value)?,
         }

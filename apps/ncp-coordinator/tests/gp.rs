@@ -45,10 +45,12 @@ use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent};
 use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataIndication};
 use zigbee_zrhp::msg::diag::{DiagGetCounters, DiagGetCountersRsp};
 use zigbee_zrhp::msg::gp::{
-    EvtGpCommissioned, EvtGpCommissioning, EvtGpDecommissioned, EvtGpFrame, GpProxyTableRead,
-    GpProxyTableReadRsp, GpSetSharedKey, GpSinkCommissioning, GpSinkConfig, GpSinkRemove,
-    GpSinkTablePut, GpSinkTablePutRsp, GpSinkTableRead, GpSinkTableReadRsp, frame_origin,
-    frame_result, sink_mode,
+    EvtGpCommissioned, EvtGpCommissioning, EvtGpDecommissioned, EvtGpFrame, EvtGpRemoteProxyTable,
+    EvtGpRemoteSinkTable, EvtGpRemoteStatus, GpGroup, GpPairingConfiguration, GpProxyTableRead,
+    GpProxyTableReadRsp, GpRemoteProxyTableRequest, GpRemoteRsp, GpRemoteSinkTableRequest,
+    GpSendPairing, GpSetSharedKey, GpSinkCommissioning, GpSinkConfig, GpSinkRemove, GpSinkTablePut,
+    GpSinkTablePutRsp, GpSinkTableRead, GpSinkTableReadRsp, GpTranslationRequest, frame_origin,
+    frame_result, paired_endpoints, pairing_config_flags, send_pairing_flags, sink_mode,
 };
 use zigbee_zrhp::msg::network::{EvtNetworkState, NwkForm};
 use zigbee_zrhp::msg::security::SecLockKeyExport;
@@ -1108,4 +1110,319 @@ fn the_sink_table_resumes_with_the_network_after_a_reboot() {
         .expect("fresh frame after the reboot");
     let next: EvtGpFrame = next.event();
     assert_eq!((next.frame_counter, next.command_id), (78, 0x22));
+}
+
+/// The NCP's frame `index` (from the end of its MAC history) as `proxy`'s
+/// MAC hands it up.
+fn to_proxy<A: TcApp<Mac = MockMac>>(port: &TcPort<A>, pan_id: u16) -> McpsDataIndication {
+    let tx = port.app().device().mac().tx_history().last().unwrap();
+    McpsDataIndication {
+        src_address: MacAddress::Short(PanId(pan_id), ShortAddress::COORDINATOR),
+        dst_address: MacAddress::Short(PanId(pan_id), ShortAddress(PROXY)),
+        lqi: 150,
+        payload: MacFrame::from_slice(tx.payload.as_slice()).unwrap(),
+        security_use: false,
+    }
+}
+
+/// `proxy`'s newest frame as the coordinator's MAC hands it up.
+fn from_proxy_tx(proxy: &ZigbeeDevice<MockMac, Router>, pan_id: u16) -> McpsDataIndication {
+    McpsDataIndication {
+        src_address: MacAddress::Short(PanId(pan_id), ShortAddress(PROXY)),
+        dst_address: MacAddress::Short(PanId(pan_id), ShortAddress::COORDINATOR),
+        lqi: 150,
+        payload: MacFrame::from_slice(proxy.mac().tx_history().last().unwrap().payload.as_slice())
+            .unwrap(),
+        security_use: false,
+    }
+}
+
+/// One remote GP round trip: the NCP's newest frame to `proxy`, the
+/// proxy's answer back to the NCP.
+fn round_trip<A: TcApp<Mac = MockMac>>(
+    port: &mut TcPort<A>,
+    proxy: &mut ZigbeeDevice<MockMac, Router>,
+    pan_id: u16,
+) {
+    steps(port, 2);
+    let frame = to_proxy(port, pan_id);
+    proxy.mac_mut().clear_tx_history();
+    pollster::block_on(proxy.process_incoming(&frame, &mut []));
+    pollster::block_on(proxy.gp_poll());
+    assert!(!proxy.mac().tx_history().is_empty(), "the proxy answered");
+    // Its APS ACK (when one was requested), then its answer.
+    let sent: Vec<Vec<u8>> = proxy
+        .mac()
+        .tx_history()
+        .iter()
+        .map(|tx| tx.payload.as_slice().to_vec())
+        .collect();
+    for payload in sent {
+        receive(
+            port,
+            McpsDataIndication {
+                src_address: MacAddress::Short(PanId(pan_id), ShortAddress(PROXY)),
+                dst_address: MacAddress::Short(PanId(pan_id), ShortAddress::COORDINATOR),
+                lqi: 150,
+                payload: MacFrame::from_slice(&payload).unwrap(),
+                security_use: false,
+            },
+        );
+    }
+}
+
+/// Remote GP provisioning (spec 7.11, `0x0A08`-`0x0A0D`): the host reads
+/// another router's Proxy and Sink Tables, configures its sink and pairs
+/// proxies through the NCP; the answers come back as `EVT_GP_REMOTE_*`
+/// with the TSN of the request.
+#[test]
+fn remote_provisioning_reaches_another_proxy_and_sink() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut security = RamSecurityStateStore::new();
+    let mut gp_store = RamGpProxyStore::new();
+    let log = LogRing::<8>::new();
+    let mut now = 1_000u64;
+    let mut profile = profile();
+    let mut device = device(&profile);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let mut app = TrustCenterCoordinatorApp::new(
+        node,
+        PersistentChildren::new(RamChildTableStore::new()),
+        RamTrustCenterDeviceStore::new(),
+        &POLICY,
+        RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+    )
+    .unwrap();
+    app.set_green_power_store(&mut gp_store);
+    let mut port = TcPort::new(app, IEEE, clock_ms);
+    let mut pipe = Pipe::default();
+    let mut ncp = Ncp::<8>::new(identity(), 3, now);
+    let mut host = Host::new(now);
+    negotiate(&mut ncp, &mut host, &mut port, &mut pipe, &log, &mut now);
+    macro_rules! exchange {
+        () => {
+            exchange(&mut ncp, &mut host, &mut port, &mut pipe, &log, &mut now)
+        };
+    }
+
+    // Before the network is up the request is refused.
+    let early = host.request(&GpRemoteProxyTableRequest {
+        dst: PROXY,
+        index: 0,
+        gpd_id: zigbee_zrhp::records::GpdId::SrcId(SRC),
+    });
+    exchange!();
+    assert_eq!(host.response(early).status(), Status::InvalidState.to_u8());
+
+    let form = host.request(&NwkForm {
+        channel_mask: 1 << 15,
+        pan_id: 0xFFFF,
+        ext_pan_id: [0; 8],
+        network_key: [0; 16],
+        key_seq: 0,
+        nwk_update_id: 0,
+        tx_power: 0,
+        nwk_manager: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let pan_id = port.info().pan_id;
+    let (network_key, key_seq) = port.network_key(0).unwrap();
+    let mut proxy = proxy_router(network_key, key_seq, pan_id);
+    // The proxy router is the coordinator's neighbour.
+    port.app_mut()
+        .device_mut()
+        .bdb_mut()
+        .zdo_mut()
+        .aps_mut()
+        .nwk_mut()
+        .update_neighbor_address(ShortAddress(PROXY), PROXY_IEEE);
+
+    // ── Proxy Table Request → EVT_GP_REMOTE_PROXY_TABLE (empty table).
+    let request = host.request(&GpRemoteProxyTableRequest {
+        dst: PROXY,
+        index: 0,
+        gpd_id: zigbee_zrhp::records::GpdId::SrcId(SRC),
+    });
+    exchange!();
+    let response = host.response(request);
+    let tsn = response.body::<GpRemoteRsp>().zcl_tsn;
+    round_trip(&mut port, &mut proxy, pan_id);
+    exchange!();
+    let table = host
+        .event(ids::EVT_GP_REMOTE_PROXY_TABLE)
+        .expect("proxy table event");
+    let table: EvtGpRemoteProxyTable = table.event();
+    assert_eq!((table.src_nwk, table.zcl_tsn), (PROXY, tsn));
+    assert_eq!(
+        (table.status, table.total, table.records.len()),
+        (0x8B, 0, 0)
+    );
+    assert!(
+        host.event(ids::EVT_APS_DATA_CONFIRM).is_some(),
+        "two-phase: the delivery is confirmed"
+    );
+
+    // ── GP Pairing to the proxies (broadcast, the local proxy learns it
+    // too): unicast sink = the proxy router.
+    let pairing = host.request(&GpSendPairing {
+        dst: 0xFFFD,
+        flags: send_pairing_flags::ADD_SINK
+            | send_pairing_flags::KEY
+            | send_pairing_flags::FRAME_COUNTER
+            | send_pairing_flags::MAC_SEQ_CAPABLE,
+        gpd_id: zigbee_zrhp::records::GpdId::SrcId(SRC),
+        communication_mode: 3,
+        security_level: 3,
+        key_type: 4,
+        sink_ieee: zigbee_zrhp::types::Ieee(PROXY_IEEE),
+        sink_nwk: PROXY,
+        sink_group: 0,
+        device_id: 0x02,
+        frame_counter: 10,
+        key: GPD_KEY,
+        assigned_alias: 0,
+        groupcast_radius: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(pairing).status(), 0);
+    let local = port.app().device().gp_proxy().entries();
+    assert_eq!(local.len(), 1, "the NCP's own proxy is paired");
+    assert_eq!(local[0].gpd_id, GpdId::SrcId(SRC));
+    steps(&mut port, 2);
+    let broadcast = to_proxy(&port, pan_id);
+    pollster::block_on(proxy.process_incoming(&broadcast, &mut []));
+    assert_eq!(
+        proxy.gp_proxy().entries().len(),
+        1,
+        "the remote proxy is paired"
+    );
+    // Naming the NCP itself as the unicast sink is the NCP sink's job.
+    let conflict = host.request(&GpSendPairing {
+        dst: 0xFFFD,
+        flags: send_pairing_flags::ADD_SINK,
+        gpd_id: zigbee_zrhp::records::GpdId::SrcId(SRC),
+        communication_mode: 3,
+        security_level: 0,
+        key_type: 0,
+        sink_ieee: zigbee_zrhp::types::Ieee(IEEE),
+        sink_nwk: 0x0000,
+        sink_group: 0,
+        device_id: 0x02,
+        frame_counter: 0,
+        key: [0; 16],
+        assigned_alias: 0,
+        groupcast_radius: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(conflict).status(), Status::Conflict.to_u8());
+
+    // ── Proxy Table Request by GPD ID now finds the entry.
+    let request = host.request(&GpRemoteProxyTableRequest {
+        dst: PROXY,
+        index: 0xFF,
+        gpd_id: zigbee_zrhp::records::GpdId::SrcId(SRC),
+    });
+    exchange!();
+    let tsn = host.response(request).body::<GpRemoteRsp>().zcl_tsn;
+    round_trip(&mut port, &mut proxy, pan_id);
+    exchange!();
+    let event = host.event(ids::EVT_GP_REMOTE_PROXY_TABLE).unwrap();
+    let table: EvtGpRemoteProxyTable = event.event();
+    assert_eq!(
+        (table.zcl_tsn, table.status, table.records.len()),
+        (tsn, 0, 1)
+    );
+    let Some(Record::GpProxy(row)) = table.records.get(0) else {
+        panic!("not R_GP_PROXY");
+    };
+    let (entry, _) = zigbee_gp::proxy::ProxyEntry::decode(&row.entries[1..]).unwrap();
+    assert_eq!(entry.gpd_id, GpdId::SrcId(SRC));
+    assert_eq!(entry.key, Some(GPD_KEY), "keys exported: export not locked");
+
+    // ── Sink Table Request → EVT_GP_REMOTE_SINK_TABLE.
+    let request = host.request(&GpRemoteSinkTableRequest {
+        dst: PROXY,
+        index: 0,
+        gpd_id: zigbee_zrhp::records::GpdId::SrcId(SRC),
+    });
+    exchange!();
+    let tsn = host.response(request).body::<GpRemoteRsp>().zcl_tsn;
+    round_trip(&mut port, &mut proxy, pan_id);
+    exchange!();
+    let event = host.event(ids::EVT_GP_REMOTE_SINK_TABLE).unwrap();
+    let table: EvtGpRemoteSinkTable = event.event();
+    assert_eq!(
+        (table.src_nwk, table.zcl_tsn, table.status),
+        (PROXY, tsn, 0x8B)
+    );
+
+    // ── Pairing Configuration and Translation Table Request to a sink
+    // without the translation table: Default Response UNSUP_CLUSTER_COMMAND
+    // (0x81) as EVT_GP_REMOTE_STATUS.
+    let groups = [GpGroup {
+        group: 0x0B84,
+        alias: 0xFFFF,
+    }];
+    let request = host.request(&GpPairingConfiguration {
+        dst: PROXY,
+        actions: 0x0A,
+        gpd_id: zigbee_zrhp::records::GpdId::SrcId(SRC),
+        device_id: 0x02,
+        communication_mode: 2,
+        flags: pairing_config_flags::SECURITY | pairing_config_flags::MAC_SEQ_CAPABLE,
+        assigned_alias: 0,
+        groupcast_radius: 0,
+        security_level: 3,
+        key_type: 4,
+        key: GPD_KEY,
+        frame_counter: 10,
+        groups: List::new(&groups),
+        paired: paired_endpoints::SINK_DERIVES,
+        endpoints: List::new(&[]),
+        app_info: 0,
+        manufacturer_id: 0,
+        model_id: 0,
+        gpd_commands: List::new(&[]),
+        server_clusters: List::new(&[]),
+        client_clusters: List::new(&[]),
+    });
+    exchange!();
+    let tsn = host.response(request).body::<GpRemoteRsp>().zcl_tsn;
+    round_trip(&mut port, &mut proxy, pan_id);
+    exchange!();
+    let status: EvtGpRemoteStatus = host.event(ids::EVT_GP_REMOTE_STATUS).unwrap().event();
+    assert_eq!(
+        (status.src_nwk, status.zcl_tsn, status.command_id),
+        (PROXY, tsn, 0x09)
+    );
+    assert_eq!(status.zcl_status, 0x81);
+    let request = host.request(&GpTranslationRequest {
+        dst: PROXY,
+        start_index: 0,
+    });
+    exchange!();
+    let tsn = host.response(request).body::<GpRemoteRsp>().zcl_tsn;
+    round_trip(&mut port, &mut proxy, pan_id);
+    exchange!();
+    let status: EvtGpRemoteStatus = host.event(ids::EVT_GP_REMOTE_STATUS).unwrap().event();
+    assert_eq!(
+        (status.zcl_tsn, status.command_id, status.zcl_status),
+        (tsn, 0x08, 0x81)
+    );
+
+    // Unicast-only requests refuse broadcasts; responses nobody asked for
+    // stay with the stack.
+    let broadcast = host.request(&GpTranslationRequest {
+        dst: 0xFFFD,
+        start_index: 0,
+    });
+    exchange!();
+    assert_eq!(
+        host.response(broadcast).status(),
+        Status::InvalidParameter.to_u8()
+    );
+    receive(&mut port, from_proxy_tx(&proxy, pan_id));
+    exchange!();
+    assert!(host.event(ids::EVT_GP_REMOTE_STATUS).is_none());
 }

@@ -366,5 +366,114 @@
     "fields": {},
     "payload_hex": "01010079983c29022261110000030402ffffffd0dc00",
     "message_hex": "80800a1700160001010079983c29022261110000030402ffffffd0dc00"
+  },
+  {
+    "name": "gp_pairing_configuration",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0a08",
+    "tid": 265,
+    "note": "Replace + send GP Pairing, derived groupcast, level 3 individual key, counter 10, paired endpoints 0xFE (sink derives), no application information",
+    "fields": {
+      "dst": "0x7c87",
+      "actions": 10,
+      "communication_mode": 1,
+      "flags": 13,
+      "paired": 254
+    },
+    "payload_hex": "877c0a0079986b7a02010d0000000304c0c1c2c3c4c5c6c7c8c9cacbcccdcecf0a00000000fe000000000000000000",
+    "message_hex": "00080a09012f00877c0a0079986b7a02010d0000000304c0c1c2c3c4c5c6c7c8c9cacbcccdcecf0a00000000fe000000000000000000"
+  },
+  {
+    "name": "gp_remote_rsp",
+    "endpoint": 2,
+    "kind": 1,
+    "msg_id": "0x0a08",
+    "tid": 265,
+    "note": "accepted; ZCL TSN 5 (EVT_APS_DATA_CONFIRM and EVT_GP_REMOTE_STATUS follow)",
+    "fields": {
+      "zcl_tsn": 5
+    },
+    "payload_hex": "0005",
+    "message_hex": "40080a090102000005"
+  },
+  {
+    "name": "gp_translation_update",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0a0a",
+    "tid": 266,
+    "note": "Add: Toggle -> ep 1 Off; Step Up -> ep 1 Step with On/Off, payload derived (0xFE); On -> ep 2 Move to Level with On/Off 0x80 in 1 s",
+    "fields": {
+      "dst": "0x7c87",
+      "action": 0,
+      "translations": 3
+    },
+    "payload_hex": "877c000079986b7a03220104010600000032010401080006fe2102040108000403800a00",
+    "message_hex": "000a0a0a012400877c000079986b7a03220104010600000032010401080006fe2102040108000403800a00"
+  },
+  {
+    "name": "gp_send_pairing",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0a09",
+    "tid": 267,
+    "note": "GP Pairing broadcast: AddSink, lightweight unicast to 0x7c87, key and counter",
+    "fields": {
+      "dst": "0xfffd",
+      "flags": 89,
+      "communication_mode": 3
+    },
+    "payload_hex": "fdff590079986b7a0303040807060504030201877c0000020a000000c0c1c2c3c4c5c6c7c8c9cacbcccdcecf000000",
+    "message_hex": "00090a0b012f00fdff590079986b7a0303040807060504030201877c0000020a000000c0c1c2c3c4c5c6c7c8c9cacbcccdcecf000000"
+  },
+  {
+    "name": "gp_translation_request",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0a0b",
+    "tid": 268,
+    "note": "Translation Table from index 0 (unicast only)",
+    "fields": {},
+    "payload_hex": "877c00",
+    "message_hex": "000b0a0c010300877c00"
+  },
+  {
+    "name": "gp_remote_sink_table_request",
+    "endpoint": 2,
+    "kind": 0,
+    "msg_id": "0x0a0c",
+    "tid": 269,
+    "note": "Sink Table entry of SrcID 0x7a6b9879 (index 0xFF: by GPD ID)",
+    "fields": {},
+    "payload_hex": "877cff0079986b7a",
+    "message_hex": "000c0a0d010800877cff0079986b7a"
+  },
+  {
+    "name": "evt_gp_remote_status",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0a85",
+    "tid": 24,
+    "note": "Default Response SUCCESS to the GP Pairing Configuration with TSN 5",
+    "fields": {},
+    "payload_hex": "877c050900",
+    "message_hex": "80850a18000500877c050900"
+  },
+  {
+    "name": "evt_gp_remote_translation_table",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0a88",
+    "tid": 25,
+    "note": "GP Translation Table Response: 2 of 2 entries from index 0 as R_GP_TRANSLATION records",
+    "fields": {
+      "records_hex": [
+        "0c0d000079986b7a2201040106000000",
+        "0c0d000079986b7a32010401080006fe"
+      ]
+    },
+    "payload_hex": "877c0600020000020c0d000079986b7a22010401060000000c0d000079986b7a32010401080006fe",
+    "message_hex": "80880a19002800877c0600020000020c0d000079986b7a22010401060000000c0d000079986b7a32010401080006fe"
   }
 ]

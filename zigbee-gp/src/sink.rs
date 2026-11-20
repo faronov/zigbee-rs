@@ -30,12 +30,17 @@
 //! `green-power-server-gpd-cmd-maps.c`) and the zigpy sink used by Home
 //! Assistant; the functions below name the Silicon Labs routine they mirror.
 //!
+//! With the `translation-table` feature the sink also accepts GP Pairing
+//! Configuration and GP Translation Table Update/Request from a
+//! commissioning tool (`configuration`, [`crate::translation_table`]).
+//!
 //! Not implemented (rejected explicitly, not silently accepted): GP
-//! Translation Table Update/Request, GP Pairing Configuration, Application
-//! Description (multi-sensor report descriptors), GPD Channel Request
-//! handling, key provisioning to a GPD (shared-key attributes, key in the
-//! Commissioning Reply), commissioning through a GP commissioning tool
-//! (GPM, involve-TC) and GP Pairing Search.
+//! Translation Table Update/Request and GP Pairing Configuration without
+//! `translation-table`, Application Description (multi-sensor report
+//! descriptors), GPD Channel Request handling, key provisioning to a GPD
+//! (shared-key attributes, key in the Commissioning Reply), commissioning
+//! through a GP Manager in security or pairing (GPM, involve-TC) and GP
+//! Pairing Search.
 
 use zigbee_crypto::{AesKey, ForwardAesProvider};
 
@@ -72,8 +77,14 @@ pub const DEFAULT_SINK_COUNTER_PERSIST_STRIDE: u32 = 64;
 pub const MAX_PENDING_COMMISSIONING: usize = 2;
 /// Application events kept until [`Sink::take_event`].
 pub const SINK_EVENT_QUEUE_LEN: usize = 3;
-/// Translated commands kept until [`Sink::take_command`].
+/// Translated commands kept until [`Sink::take_command`] (with
+/// `translation-table` one GPD command may produce several).
+#[cfg(not(feature = "translation-table"))]
 pub const SINK_COMMAND_QUEUE_LEN: usize = 2;
+/// Translated commands kept until [`Sink::take_command`] (with
+/// `translation-table` one GPD command may produce several).
+#[cfg(feature = "translation-table")]
+pub const SINK_COMMAND_QUEUE_LEN: usize = 4;
 
 /// gpsCommissioningExitMode bits (`GpSinkCommissioningModeExitMode`).
 pub mod exit_mode_attr {
@@ -159,6 +170,13 @@ pub const SINK_FUNCTIONALITY: u32 = functionality::GP_FEATURE
     | functionality::SECURITY_LEVEL_2
     | functionality::SECURITY_LEVEL_3
     | functionality::IEEE_ADDRESS;
+/// gpsFunctionality bits of `translation-table`: CT-based commissioning
+/// (GP Pairing Configuration, bit 11) and the Translation Table (bit 18).
+#[cfg(feature = "translation-table")]
+pub const CONFIGURATION_FUNCTIONALITY: u32 = functionality::CT_BASED_COMMISSIONING | 1 << 18;
+/// gpsFunctionality bits of `translation-table` (none without it).
+#[cfg(not(feature = "translation-table"))]
+pub const CONFIGURATION_FUNCTIONALITY: u32 = 0;
 /// gpsFunctionality bit 6, proximity bidirectional operation.
 pub const PROXIMITY_BIDIRECTIONAL: u32 = 1 << 6;
 /// gpsFunctionality bit 9, proximity commissioning.
@@ -247,6 +265,10 @@ pub struct SinkEntry {
     pub groups: heapless::Vec<SinkGroup, MAX_SINK_GROUPS>,
     /// Groupcast radius (0 = stack default).
     pub groupcast_radius: u8,
+    /// Endpoints GP Pairing Configuration paired the GPD to (not part of
+    /// the Sink Table attribute; persisted by the runtime's GP journal).
+    #[cfg(feature = "translation-table")]
+    pub paired_endpoints: crate::translation_table::PairedEndpoints,
     persisted_counter: u32,
     /// The last write stored the counter exactly ([`crate::counter`]).
     counter_exact: bool,
@@ -269,6 +291,8 @@ impl SinkEntry {
             device_id: 0xFF,
             groups: heapless::Vec::new(),
             groupcast_radius: 0,
+            #[cfg(feature = "translation-table")]
+            paired_endpoints: crate::translation_table::PairedEndpoints::Default,
             persisted_counter: 0,
             counter_exact: false,
         }
@@ -718,6 +742,10 @@ pub struct SinkStats {
     pub tx_dropped: u32,
     /// Events dropped because the application did not take them.
     pub events_dropped: u32,
+    /// Explicit translations skipped: a copied GPD payload too long, or a
+    /// derived payload the GPD command has no default translation for.
+    #[cfg(feature = "translation-table")]
+    pub translations_dropped: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,6 +789,19 @@ enum Out {
         dst: u16,
         tsn: u8,
         request: SinkTableRequest,
+    },
+    #[cfg(feature = "translation-table")]
+    TranslationTableResponse {
+        dst: u16,
+        tsn: u8,
+        start_index: u8,
+    },
+    /// GP Pairing removing this sink's pairing (group or unicast).
+    #[cfg(feature = "translation-table")]
+    PairingRemoveSink {
+        gpd_id: GpdId,
+        mode: CommunicationMode,
+        group: Option<u16>,
     },
 }
 
@@ -823,6 +864,8 @@ pub struct Sink<const N: usize, const Q: usize> {
     /// Bounds exact frame-counter writes ([`crate::counter`]).
     exact_budget: crate::counter::ExactBudget,
     stats: SinkStats,
+    #[cfg(feature = "translation-table")]
+    translations: configuration::SinkTranslationTable,
 }
 
 impl<const N: usize, const Q: usize> Sink<N, Q> {
@@ -849,7 +892,11 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             stats: SinkStats {
                 tx_dropped: 0,
                 events_dropped: 0,
+                #[cfg(feature = "translation-table")]
+                translations_dropped: 0,
             },
+            #[cfg(feature = "translation-table")]
+            translations: configuration::SinkTranslationTable::new(),
         }
     }
 
@@ -904,6 +951,8 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         self.commands.clear();
         self.events.clear();
         self.group_changes.clear();
+        #[cfg(feature = "translation-table")]
+        self.translations.clear();
         self.dirty = true;
     }
 
@@ -1093,6 +1142,29 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 Some(tsn),
                 self.sink_table_response(&request, &mut payload),
             ),
+            #[cfg(feature = "translation-table")]
+            Out::TranslationTableResponse {
+                dst,
+                tsn,
+                start_index,
+            } => (
+                unicast(dst),
+                client_cmd::TRANSLATION_TABLE_RESPONSE,
+                Some(tsn),
+                self.translation_table_response(start_index, &mut payload),
+            ),
+            #[cfg(feature = "translation-table")]
+            Out::PairingRemoveSink {
+                gpd_id,
+                mode,
+                group,
+            } => (
+                broadcast,
+                client_cmd::PAIRING,
+                None,
+                self.pairing_remove_sink(gpd_id, mode, group)
+                    .encode(&mut payload),
+            ),
         };
         payload.truncate(len.ok()?);
         Some(SinkTx {
@@ -1267,7 +1339,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 } else {
                     0
                 };
-                w.u24(SINK_FUNCTIONALITY | proximity_bidirectional)?;
+                w.u24(SINK_FUNCTIONALITY | CONFIGURATION_FUNCTIONALITY | proximity_bidirectional)?;
                 BITMAP24
             }
             attr::GPS_ACTIVE_FUNCTIONALITY => {
@@ -1468,9 +1540,13 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 }
                 Ok((zcl_status::SUCCESS, None))
             }
+            #[cfg(feature = "translation-table")]
+            server_cmd::TRANSLATION_TABLE_UPDATE
+            | server_cmd::TRANSLATION_TABLE_REQUEST
+            | server_cmd::PAIRING_CONFIGURATION => self.on_configuration_command(command),
             // Proxy → sink commands with nothing for a sink to do (gecko_sdk
-            // handles neither) and the not implemented configuration
-            // commands.
+            // handles neither) and, without `translation-table`, the
+            // configuration commands.
             _ => Err(Error::Unsupported),
         }
     }
@@ -1748,6 +1824,10 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             self.dirty = true;
         }
         let device_id = e.device_id;
+        #[cfg(feature = "translation-table")]
+        if let Some(outcome) = self.translate_configured(i, rx) {
+            return outcome;
+        }
         if let (Some(endpoint), Some(translation)) = (
             self.config.endpoint,
             translation::translate(rx.command_id, rx.payload),
@@ -2014,6 +2094,8 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         let e = self.table.swap_remove(i);
         self.dup.forget(&e.gpd_id);
         self.release_groups(&e.group_ids());
+        #[cfg(feature = "translation-table")]
+        self.translations.remove_gpd(&e.gpd_id);
         self.queue(Out::PairingRemove {
             gpd_id: e.gpd_id,
             mode: e.communication_mode,
@@ -3184,7 +3266,7 @@ mod tests {
         assert_eq!(read(&s, attr::GPS_SECURITY_LEVEL, &mut out), (BITMAP8, 1));
         assert_eq!(read(&s, attr::GPS_FUNCTIONALITY, &mut out), (BITMAP24, 3));
         let f = u32::from_le_bytes([out[0], out[1], out[2], 0]);
-        assert_eq!(f, SINK_FUNCTIONALITY);
+        assert_eq!(f, SINK_FUNCTIONALITY | CONFIGURATION_FUNCTIONALITY);
         assert_eq!(f & PROXIMITY_BIDIRECTIONAL, 0);
         s.set_direct_bidirectional(true);
         read(&s, attr::GPS_FUNCTIONALITY, &mut out);
@@ -3286,7 +3368,9 @@ mod tests {
         );
         assert_eq!(send(&mut s, 0, 0xFFFF, 0xFF), zcl_status::SUCCESS);
         assert!(!s.in_commissioning_mode());
-        // Translation Table and Pairing Configuration are not implemented.
+        // Translation Table and Pairing Configuration need
+        // `translation-table`.
+        #[cfg(not(feature = "translation-table"))]
         assert_eq!(
             s.on_server_command(
                 &mut aes,
@@ -3554,6 +3638,8 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         let e = self.table.swap_remove(i);
         self.dup.forget(&e.gpd_id);
         self.release_groups(&e.group_ids());
+        #[cfg(feature = "translation-table")]
+        self.translations.remove_gpd(&e.gpd_id);
         self.dirty = true;
         self.event(SinkEvent::Decommissioned { gpd_id: e.gpd_id });
         true
@@ -3666,3 +3752,8 @@ mod import_tests {
         assert!(s.entries().is_empty());
     }
 }
+
+#[cfg(feature = "translation-table")]
+mod configuration;
+#[cfg(feature = "translation-table")]
+pub use configuration::{SINK_TRANSLATION_ENTRIES, SinkTranslationTable};

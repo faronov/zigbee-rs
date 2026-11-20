@@ -1167,6 +1167,46 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     status_only(queues, Status::Busy);
                 }
             }
+            // Remote GP provisioning (spec 7.11): one GP cluster command
+            // through the APS queue; the response carries its ZCL TSN.
+            _ if crate::gp_remote::is_remote_request(id) => {
+                let request = match crate::gp_remote::remote_request(message, tid, port) {
+                    Ok(request) => request,
+                    Err(status) => {
+                        status_only(queues, status);
+                        return;
+                    }
+                };
+                let tsn = request.tsn;
+                let expect = request.expect;
+                let pairing: Option<Vec<u8, { crate::port::MAX_ASDU }>> =
+                    request.loopback.then(|| request.data.asdu.clone());
+                let status = Self::accept_prepared(state, port, now_us, request.data);
+                if status != Status::Success {
+                    if status == Status::Busy {
+                        state.counters.busy_responses =
+                            state.counters.busy_responses.saturating_add(1);
+                    }
+                    status_only(queues, status);
+                    return;
+                }
+                if let Some(gp) = port.gp() {
+                    if let Some(dst) = expect {
+                        gp.expect_response(dst, tsn);
+                    }
+                    // A broadcast never comes back to its sender: the local
+                    // proxy learns the pairing here.
+                    if let Some(asdu) = &pairing {
+                        gp.loopback(asdu[2], &asdu[3..]);
+                    }
+                }
+                let _ = queues.queue(endpoint).push_with(|w| {
+                    w.push_with(Kind::Response, false, id, tid, |w| {
+                        w.u8(Status::Success.to_u8())?;
+                        w.u8(tsn)
+                    })
+                });
+            }
             // GREEN POWER (`0x0Axx`, spec 7.11) and unknown IDs.
             _ => crate::gp::dispatch_gp(
                 queues,
@@ -1176,6 +1216,31 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 port,
             ),
         }
+    }
+
+    /// Queue a frame the NCP built for the host (remote GP provisioning);
+    /// the same limits as `APS_DATA_REQUEST`.
+    fn accept_prepared<C: CoordinatorPort>(
+        state: &mut DispatchState<'_>,
+        port: &C,
+        now_us: u64,
+        data: DataRequest,
+    ) -> Status {
+        if port.state() != NetworkState::Up {
+            return Status::InvalidState;
+        }
+        if *state.data_inflight >= MAX_APS_INFLIGHT {
+            return Status::Busy;
+        }
+        if state.ops.push_back((Op::Data(data), now_us)).is_err() {
+            return Status::Busy;
+        }
+        *state.data_inflight += 1;
+        state.counters.aps_high_water = state
+            .counters
+            .aps_high_water
+            .max(*state.data_inflight as u32);
+        Status::Success
     }
 
     fn accept_data<C: CoordinatorPort>(

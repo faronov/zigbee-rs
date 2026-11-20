@@ -340,6 +340,13 @@ mod combo {
             }
             let on = app.node().profile().component().is_on();
             app.parts_mut().status.set_light(on);
+            #[cfg(feature = "lab-gp-translation")]
+            super::gp_translation_lab::service(app);
         }
     }
 }
+
+/// Lab only: locally issued GP Pairing Configuration and Translation Table
+/// Update on the combo light (see the module).
+#[cfg(feature = "lab-gp-translation")]
+mod gp_translation_lab;

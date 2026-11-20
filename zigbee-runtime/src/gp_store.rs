@@ -85,7 +85,7 @@ pub struct PersistentGpProxyTable {
     #[cfg(feature = "green-power-sink")]
     sink_len: usize,
     #[cfg(feature = "green-power-sink")]
-    sink_payload: [u8; MAX_ENCODED_GP_SINK_TABLE_LEN],
+    sink_payload: [u8; SINK_PAYLOAD_CAPACITY],
     /// Exact-counter bits of the Sink Table entries.
     #[cfg(feature = "green-power-sink")]
     sink_exact: u32,
@@ -120,7 +120,7 @@ impl PersistentGpProxyTable {
             #[cfg(feature = "green-power-sink")]
             sink_len: 1,
             #[cfg(feature = "green-power-sink")]
-            sink_payload: [0; MAX_ENCODED_GP_SINK_TABLE_LEN],
+            sink_payload: [0; SINK_PAYLOAD_CAPACITY],
             #[cfg(feature = "green-power-sink")]
             sink_exact: 0,
         }
@@ -1324,7 +1324,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             (RECORD_MAGIC, 0),
             generation,
             &epid,
-            snapshot.payload(),
+            (snapshot.payload(), &[]),
         )
     }
 
@@ -1396,6 +1396,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         };
         if let Some(snapshot) = snapshot.as_deref_mut() {
             snapshot.set_sink_validated(&[0]);
+            #[cfg(feature = "green-power-translation-table")]
+            snapshot.set_translation_tail(&[]);
         }
         if slot == 0 {
             return Ok((None, empty));
@@ -1426,6 +1428,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         }
         if let Some(snapshot) = snapshot.as_deref_mut() {
             snapshot.set_sink_validated(payload);
+            #[cfg(feature = "green-power-translation-table")]
+            snapshot.set_translation_tail(translations::stored_tail(record, len));
         }
         Ok((Some(sink), layout))
     }
@@ -1442,11 +1446,17 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             return Ok(snapshot.sink_len() == 0);
         };
         let address = self.slot_address(base.sector as usize, sink.slot as usize);
+        #[cfg(feature = "green-power-translation-table")]
+        if !self.same_translation_tail(address, sink.len, snapshot)? {
+            return Ok(false);
+        }
         self.same_payload(address, sink.len, snapshot.sink_payload(), layout)
     }
 
     /// Write one record of a pair (full-record layout; `kind` is the magic
-    /// and byte 7), commit marker last, verified by read-back.
+    /// and byte 7), commit marker last, verified by read-back. `tail`
+    /// follows the payload inside the CRC-covered record (a sink record's
+    /// translation section); the header length counts the payload only.
     fn write_pair_record(
         &mut self,
         sector: usize,
@@ -1454,7 +1464,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         (magic, flags): ([u8; 4], u8),
         generation: u32,
         extended_pan_id: &IeeeAddress,
-        payload: &[u8],
+        (payload, tail): (&[u8], &[u8]),
     ) -> Result<(), GpStoreError> {
         let mut record = [0xFFu8; GP_PROXY_JOURNAL_SLOT_SIZE];
         record[0..4].copy_from_slice(&magic);
@@ -1465,6 +1475,8 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         record[RECORD_EPID_OFFSET..RECORD_EPID_OFFSET + 8].copy_from_slice(extended_pan_id);
         record[RECORD_PAYLOAD_OFFSET..RECORD_PAYLOAD_OFFSET + payload.len()]
             .copy_from_slice(payload);
+        let tail_at = RECORD_PAYLOAD_OFFSET + payload.len();
+        record[tail_at..tail_at + tail.len()].copy_from_slice(tail);
         let crc = crc32(&record[..RECORD_CRC_OFFSET]);
         record[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         let address = self.slot_address(sector, slot);
@@ -1551,10 +1563,10 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         self.write_pair_record(
             sector,
             slot,
-            (SINK_RECORD_MAGIC, 0),
+            (SINK_RECORD_MAGIC, sink_record_flags(snapshot)),
             generation,
             &epid,
-            snapshot.sink_payload(),
+            (snapshot.sink_payload(), sink_record_tail(snapshot)),
         )?;
         self.write_pair_record(
             sector,
@@ -1562,7 +1574,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
             (RECORD_MAGIC, RECORD_PAIRED_WITH_SINK),
             generation,
             &epid,
-            snapshot.payload(),
+            (snapshot.payload(), &[]),
         )?;
         let payload = snapshot.payload();
         let layout = PayloadLayout::of(payload)?;
@@ -1594,6 +1606,52 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyJournal<S, SECTOR_SIZE> {
         self.current = Some(base);
         Ok(())
     }
+}
+
+/// Sink record byte 7: the record carries the translation section after
+/// the Sink Table payload (`green-power-translation-table`). Zero, and not
+/// checked, in journals written before it.
+#[cfg(feature = "green-power-sink")]
+const SINK_RECORD_HAS_TRANSLATIONS: u8 = 0x02;
+/// Capacity of [`PersistentGpProxyTable`]'s Sink Table buffer: the payload
+/// and, with `green-power-translation-table`, the translation section
+/// behind it.
+#[cfg(feature = "green-power-sink")]
+const SINK_PAYLOAD_CAPACITY: usize = MAX_ENCODED_GP_SINK_TABLE_LEN + SINK_TAIL_CAPACITY;
+#[cfg(all(
+    feature = "green-power-sink",
+    not(feature = "green-power-translation-table")
+))]
+const SINK_TAIL_CAPACITY: usize = 0;
+#[cfg(feature = "green-power-translation-table")]
+const SINK_TAIL_CAPACITY: usize = translations::MAX_TAIL_LEN;
+#[cfg(feature = "green-power-translation-table")]
+const _: () = assert!(
+    RECORD_PAYLOAD_OFFSET + MAX_ENCODED_GP_SINK_TABLE_LEN + SINK_TAIL_CAPACITY <= RECORD_CRC_OFFSET
+);
+
+/// Byte 7 of a snapshot's sink record.
+#[cfg(feature = "green-power-sink")]
+fn sink_record_flags(snapshot: &PersistentGpProxyTable) -> u8 {
+    if sink_record_tail(snapshot).is_empty() {
+        0
+    } else {
+        SINK_RECORD_HAS_TRANSLATIONS
+    }
+}
+
+/// The translation section written after a snapshot's Sink Table payload.
+#[cfg(all(
+    feature = "green-power-sink",
+    not(feature = "green-power-translation-table")
+))]
+fn sink_record_tail(_: &PersistentGpProxyTable) -> &[u8] {
+    &[]
+}
+
+#[cfg(feature = "green-power-translation-table")]
+fn sink_record_tail(snapshot: &PersistentGpProxyTable) -> &[u8] {
+    snapshot.translation_tail()
 }
 
 impl<S: NorFlash, const SECTOR_SIZE: usize> GpProxyStore for GpProxyJournal<S, SECTOR_SIZE> {
@@ -1653,6 +1711,8 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
                 .map_err(|_| GpStoreError::Full)?;
             restored += 1;
         }
+        #[cfg(feature = "green-power-translation-table")]
+        snapshot.restore_translations(self.gp_sink_mut())?;
         self.gp_restore_groups();
         self.gp_take_dirty();
         Ok(restored)
@@ -1673,10 +1733,20 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         #[cfg(not(feature = "green-power-sink"))]
         let result = PersistentGpProxyTable::capture(extended_pan_id, self.gp_proxy().entries())
             .and_then(|snapshot| store.store(&snapshot));
-        #[cfg(feature = "green-power-sink")]
+        #[cfg(all(
+            feature = "green-power-sink",
+            not(feature = "green-power-translation-table")
+        ))]
         let result = PersistentGpProxyTable::capture(extended_pan_id, self.gp_proxy().entries())
             .and_then(|snapshot| snapshot.with_sink(self.gp_sink().entries()))
             .and_then(|snapshot| store.store(&snapshot));
+        #[cfg(feature = "green-power-translation-table")]
+        let result = PersistentGpProxyTable::capture(extended_pan_id, self.gp_proxy().entries())
+            .and_then(|snapshot| snapshot.with_sink(self.gp_sink().entries()))
+            .and_then(|mut snapshot| {
+                snapshot.set_translations(self.gp_sink())?;
+                store.store(&snapshot)
+            });
         if result.is_err() {
             self.gp_mark_dirty();
         }
@@ -2693,3 +2763,6 @@ pub(crate) mod tests {
         }
     }
 }
+
+#[cfg(feature = "green-power-translation-table")]
+mod translations;

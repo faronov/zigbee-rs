@@ -148,7 +148,10 @@ NWK_PERMIT_JOIN, EVT_DEVICE_JOINED, EVT_ROUTE_RECORD = 0x0105, 0x0181, 0x0185
 APS_DATA_REQUEST, EVT_APS_DATA_INDICATION, EVT_APS_DATA_CONFIRM = 0x0201, 0x0280, 0x0281
 SEC_ADD_INSTALL_CODE, SEC_LOCK_KEY_EXPORT, EVT_FC_CHECKPOINT = 0x0403, 0x040A, 0x0483
 GP_SINK_CONFIG, GP_SINK_COMMISSIONING = 0x0A01, 0x0A03
+GP_PAIRING_CONFIGURATION, GP_SEND_PAIRING, GP_TRANSLATION_UPDATE = 0x0A08, 0x0A09, 0x0A0A
+GP_TRANSLATION_REQUEST, GP_REMOTE_SINK_TABLE_REQUEST = 0x0A0B, 0x0A0C
 EVT_GP_FRAME, EVT_GP_COMMISSIONED = 0x0A80, 0x0A82
+EVT_GP_REMOTE_STATUS, EVT_GP_REMOTE_TRANSLATION_TABLE = 0x0A85, 0x0A88
 LOG_RECORD = 0x0980
 TBL_LOOKUP, TBL_WRITEBACK = 0x0501, 0x0502
 BKP_RESTORE_BEGIN, BKP_RESTORE_PUT, BKP_RESTORE_COMMIT = 0x0611, 0x0612, 0x0613
@@ -265,7 +268,7 @@ def hmac_mmo(key: bytes, message: bytes) -> bytes | None:
 
 R_NODE, R_NETWORK, R_NETWORK_KEY, R_TC_LINK_KEY, R_DEVICE = 0x01, 0x02, 0x03, 0x04, 0x05
 R_EZSP_HASHED_TCLK, R_SOURCE_ROUTE, R_GP_PROXY, R_RS_PARAMS, R_END = 0x06, 0x08, 0x09, 0x0A, 0xFF
-R_GP_SINK = 0x0B
+R_GP_SINK, R_GP_TRANSLATION = 0x0B, 0x0C
 APS_UNKNOWN_TCLK_MARGIN = 1 << 20  # host rule when a backup has no TCLK counter (9.4)
 DEV_IS_CHILD, DEV_HAS_LINK_KEY, DEV_HAS_CHILD_INFO, DEV_NWK_VALID = 0x01, 0x02, 0x04, 0x08
 KEY_ATTR_VERIFIED, KEY_ORIGIN_IMPORTED = 2, 3
@@ -282,6 +285,19 @@ def gp_sink_record(src_id, device_id, group, key, frame_counter, security_level=
                         0x01 | (0x08 if key else 0), security_level, key_type)
     value += (key or b"") + struct.pack("<IB", frame_counter, 0)
     return record(R_GP_SINK, value)
+
+
+def gp_translation(gpd_command, endpoint, cluster, zcl_command, payload=b"", payload_len=None,
+                   profile=0x0104):
+    """One translation (7.11): payload_len 0xFE derived, 0xFF copied, else the fixed bytes."""
+    if payload_len is None:
+        payload_len = len(payload)
+    return struct.pack("<BBHHBB", gpd_command, endpoint, profile, cluster, zcl_command,
+                       payload_len) + (payload if payload_len < 0xFE else b"")
+
+
+def gp_translation_record(src_id, translation):
+    return record(R_GP_TRANSLATION, struct.pack("<BI", 0, src_id) + translation)
 
 
 def end_record(records: list[bytes]) -> bytes:
@@ -691,6 +707,51 @@ def build_messages():
         struct.pack("<BBBIBBIBBBHBbBB", 1, 1, 0, 0x293C9879, 0x02, 0x22, 4449, 3, 4, 0x02,
                     0xFFFF, 0xFF, -48, 220, 0),
         "direct GPDF accepted by the NCP sink: Toggle, decrypted, passed through")
+    # Remote GP provisioning (7.11): pair SrcID 0x7a6b9879 on the combo light
+    # 0x7c87 and retarget its Toggle.
+    pairing_config = (struct.pack("<HBBIBBBHBBB", 0x7C87, 0x0A, 0, 0x7A6B9879, 0x02, 1, 0x0D,
+                                  0, 0, 3, 4) + gpd_key + struct.pack("<I", 10)
+                      + b"\x00" + b"\xfe" + b"\x00" + struct.pack("<BHH", 0, 0, 0)
+                      + b"\x00" + b"\x00" + b"\x00")
+    add("gp_pairing_configuration", EP_ZIGBEE, K_REQUEST, GP_PAIRING_CONFIGURATION, 0x0109,
+        pairing_config,
+        "Replace + send GP Pairing, derived groupcast, level 3 individual key, counter 10, "
+        "paired endpoints 0xFE (sink derives), no application information",
+        {"dst": "0x7c87", "actions": 0x0A, "communication_mode": 1, "flags": 0x0D,
+         "paired": 0xFE})
+    add("gp_remote_rsp", EP_ZIGBEE, K_RESPONSE, GP_PAIRING_CONFIGURATION, 0x0109, b"\x00\x05",
+        "accepted; ZCL TSN 5 (EVT_APS_DATA_CONFIRM and EVT_GP_REMOTE_STATUS follow)",
+        {"zcl_tsn": 5})
+    toggle_off = gp_translation(0x22, 1, 0x0006, 0x00)
+    step_derived = gp_translation(0x32, 1, 0x0008, 0x06, payload_len=0xFE)
+    move_to_level = gp_translation(0x21, 2, 0x0008, 0x04, payload=bytes([0x80, 0x0A, 0x00]))
+    add("gp_translation_update", EP_ZIGBEE, K_REQUEST, GP_TRANSLATION_UPDATE, 0x010A,
+        struct.pack("<HBBIB", 0x7C87, 0, 0, 0x7A6B9879, 3) + toggle_off + step_derived
+        + move_to_level,
+        "Add: Toggle -> ep 1 Off; Step Up -> ep 1 Step with On/Off, payload derived (0xFE); "
+        "On -> ep 2 Move to Level with On/Off 0x80 in 1 s",
+        {"dst": "0x7c87", "action": 0, "translations": 3})
+    add("gp_send_pairing", EP_ZIGBEE, K_REQUEST, GP_SEND_PAIRING, 0x010B,
+        struct.pack("<HBBIBBB", 0xFFFD, 0x01 | 0x08 | 0x10 | 0x40, 0, 0x7A6B9879, 3, 3, 4)
+        + ieee_wire("0102030405060708") + struct.pack("<HHBI", 0x7C87, 0, 0x02, 10) + gpd_key
+        + struct.pack("<HB", 0, 0),
+        "GP Pairing broadcast: AddSink, lightweight unicast to 0x7c87, key and counter",
+        {"dst": "0xfffd", "flags": 0x59, "communication_mode": 3})
+    add("gp_translation_request", EP_ZIGBEE, K_REQUEST, GP_TRANSLATION_REQUEST, 0x010C,
+        struct.pack("<HB", 0x7C87, 0), "Translation Table from index 0 (unicast only)")
+    add("gp_remote_sink_table_request", EP_ZIGBEE, K_REQUEST, GP_REMOTE_SINK_TABLE_REQUEST,
+        0x010D, struct.pack("<HBBI", 0x7C87, 0xFF, 0, 0x7A6B9879),
+        "Sink Table entry of SrcID 0x7a6b9879 (index 0xFF: by GPD ID)")
+    add("evt_gp_remote_status", EP_ZIGBEE, K_EVENT, EVT_GP_REMOTE_STATUS, 0x0018,
+        struct.pack("<HBBB", 0x7C87, 5, 0x09, 0x00),
+        "Default Response SUCCESS to the GP Pairing Configuration with TSN 5")
+    tt_records = [gp_translation_record(0x7A6B9879, toggle_off),
+                  gp_translation_record(0x7A6B9879, step_derived)]
+    add("evt_gp_remote_translation_table", EP_ZIGBEE, K_EVENT, EVT_GP_REMOTE_TRANSLATION_TABLE,
+        0x0019,
+        struct.pack("<HBBBBBB", 0x7C87, 6, 0x00, 2, 0, 0, len(tt_records)) + b"".join(tt_records),
+        "GP Translation Table Response: 2 of 2 entries from index 0 as R_GP_TRANSLATION records",
+        {"records_hex": [hx(r) for r in tt_records]})
     return out
 
 

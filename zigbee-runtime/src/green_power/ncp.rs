@@ -23,6 +23,15 @@
 //!   Proxy Commissioning Mode, Response) looped back to the local proxy,
 //!   because a broadcast never comes back to its sender.
 //!
+//! * **Remote provisioning responses.** The host provisions other GP
+//!   devices through the NCP (GP Pairing Configuration, Translation Table
+//!   Update/Request, Sink/Proxy Table Request). The NCP registers each
+//!   unicast request's (destination, ZCL TSN) with
+//!   [`ZigbeeDevice::gp_ncp_expect_response`]; the matching ZCL Default
+//!   Response, GP Translation Table Response, GP Sink Table Response or GP
+//!   Proxy Table Response is handed to the host
+//!   ([`GpNcpEvent::Remote`]) instead of the local proxy and sink.
+//!
 //! The NCP composes exactly one Zigbee device, so the mode, the report queue
 //! and the counters are a process-wide singleton, as the host queue of
 //! [`crate::host_passthrough`] is. [`ZigbeeDevice::gp_ncp_reset`] applies
@@ -36,7 +45,9 @@ use critical_section::Mutex;
 use heapless::{Deque, Vec};
 use zigbee_aps::apsde::ApsdeDataIndication;
 use zigbee_aps::{ApsAddress, ApsAddressMode};
-use zigbee_gp::cluster::{CommissioningNotification, Notification, ProxyInfo, server_cmd};
+use zigbee_gp::cluster::{
+    CommissioningNotification, Notification, ProxyInfo, client_cmd, server_cmd,
+};
 use zigbee_gp::commissioning::CommissioningPayload;
 use zigbee_gp::frame::{Gpdf, MAX_GPD_PAYLOAD};
 use zigbee_gp::proxy::{DestAddr, GpTx, MAX_TX_PAYLOAD, TxFrame};
@@ -61,6 +72,12 @@ pub const REPORT_QUEUE_LEN: usize = 6;
 pub const MAX_LOCAL_FRAME: usize = 3 + MAX_TX_PAYLOAD;
 /// [`SinkDrop`] reasons, numbered 1..=13 as in `EVT_GP_COMMISSIONING_FAILED`.
 pub const SINK_DROP_REASONS: usize = 13;
+/// Largest remote GP response payload kept for the host (after the ZCL
+/// header).
+pub const MAX_REMOTE_PAYLOAD: usize = 100;
+/// Outstanding remote GP requests awaiting a response; the oldest is
+/// forgotten first.
+pub const REMOTE_PENDING: usize = 8;
 
 /// [`GpFrameReport::origin`].
 pub mod origin {
@@ -127,6 +144,24 @@ pub struct GpLocalFrame {
     pub asdu: Vec<u8, MAX_LOCAL_FRAME>,
 }
 
+/// A response to a remote GP request of the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpRemoteFrame {
+    /// Responding node.
+    pub src_nwk: u16,
+    /// ZCL frame control.
+    pub frame_control: u8,
+    /// ZCL TSN (the request's).
+    pub tsn: u8,
+    /// ZCL command (Default Response `0x0B` when global).
+    pub command_id: u8,
+    /// ZCL payload; [`truncated`](Self::truncated) when longer than
+    /// [`MAX_REMOTE_PAYLOAD`].
+    pub payload: Vec<u8, MAX_REMOTE_PAYLOAD>,
+    /// The payload did not fit.
+    pub truncated: bool,
+}
+
 /// Something for the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GpNcpEvent {
@@ -136,6 +171,8 @@ pub enum GpNcpEvent {
     Sink(SinkEvent),
     /// Local proxy output in `HOST_SINK` mode.
     LocalProxy(GpLocalFrame),
+    /// A response to a remote GP request.
+    Remote(GpRemoteFrame),
 }
 
 /// Diagnostic counters (ZRHP DIAG group `0x08xx`).
@@ -204,6 +241,8 @@ struct State {
     /// (CommandID, CRC) of the last local proxy frame copied: one GPDF is
     /// tunnelled to every destination, the host needs it once.
     last_local: Option<(u8, u32)>,
+    /// (destination, ZCL TSN) of remote GP requests awaiting a response.
+    remote: Deque<(u16, u8), REMOTE_PENDING>,
 }
 
 static STATE: Mutex<RefCell<State>> = Mutex::new(RefCell::new(State {
@@ -218,6 +257,7 @@ static STATE: Mutex<RefCell<State>> = Mutex::new(RefCell::new(State {
     },
     last_aps_lqi: 0,
     last_local: None,
+    remote: Deque::new(),
 }));
 
 fn with<T>(f: impl FnOnce(&mut State) -> T) -> T {
@@ -257,6 +297,24 @@ fn push(event: GpNcpEvent) {
     });
 }
 
+/// Remove `pending` from the outstanding remote requests; returns whether it
+/// was there.
+fn forget_remote(remote: &mut Deque<(u16, u8), REMOTE_PENDING>, pending: (u16, u8)) -> bool {
+    let len = remote.len();
+    let mut found = false;
+    for _ in 0..len {
+        let Some(p) = remote.pop_front() else {
+            break;
+        };
+        if p == pending && !found {
+            found = true;
+        } else {
+            let _ = remote.push_back(p);
+        }
+    }
+    found
+}
+
 /// Whether a GPD Commissioning payload carries a TC-LK wrapped key.
 fn key_wrapped(command_id: u8, payload: &[u8]) -> bool {
     command_id == cmd::COMMISSIONING
@@ -276,8 +334,23 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             s.queue.clear();
             s.counters = GpNcpCounters::default();
             s.last_local = None;
+            s.remote.clear();
         });
         self.green_power.sink.set_config(ncp_sink_config());
+    }
+
+    /// Register a unicast remote GP request the host sent to `dst` with ZCL
+    /// TSN `tsn`: its response goes to the host
+    /// ([`GpNcpEvent::Remote`]).
+    pub fn gp_ncp_expect_response(&mut self, dst: u16, tsn: u8) {
+        with(|s| {
+            // A repeated (destination, TSN) becomes the newest.
+            forget_remote(&mut s.remote, (dst, tsn));
+            if s.remote.is_full() {
+                s.remote.pop_front();
+            }
+            let _ = s.remote.push_back((dst, tsn));
+        });
     }
 
     /// Select the sink authority and the NCP sink's configuration (its
@@ -375,10 +448,13 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         src_ieee: Option<IeeeAddress>,
     ) -> Option<bool> {
         with(|s| s.last_aps_lqi = indication.lqi);
-        if indication.profile_id != GP_PROFILE_ID
-            || indication.cluster_id != GP_CLUSTER_ID
-            || !host_sink()
-        {
+        if indication.profile_id != GP_PROFILE_ID || indication.cluster_id != GP_CLUSTER_ID {
+            return None;
+        }
+        if let Some(consumed) = self.gp_ncp_capture_remote(indication, nwk_secured) {
+            return Some(consumed);
+        }
+        if !host_sink() {
             return None;
         }
         let addressed = match (indication.dst_addr_mode, indication.dst_address) {
@@ -420,6 +496,53 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             src_ieee,
         );
         with(|s| s.counters.host_sink_frames = s.counters.host_sink_frames.saturating_add(1));
+        Some(true)
+    }
+
+    /// A response to a registered remote GP request (unicast to this node
+    /// on endpoint 242, NWK secured on a secured network): handed to the
+    /// host, never to the local proxy or sink.
+    fn gp_ncp_capture_remote(
+        &mut self,
+        indication: &ApsdeDataIndication<'_>,
+        nwk_secured: bool,
+    ) -> Option<bool> {
+        let ApsAddress::Short(src) = indication.src_address else {
+            return None;
+        };
+        if indication.dst_addr_mode == ApsAddressMode::Group
+            || indication.dst_endpoint != GP_ENDPOINT
+            || (self.bdb.zdo().nwk().nib().security_enabled && !nwk_secured)
+        {
+            return None;
+        }
+        let (fc, tsn, command, payload) = parse_zcl(indication.payload)?;
+        let response = match fc & 0x03 {
+            // Default Response, either direction.
+            0x00 => command == 0x0B,
+            ZCL_CLUSTER_SPECIFIC if fc & ZCL_SERVER_TO_CLIENT != 0 => matches!(
+                command,
+                client_cmd::TRANSLATION_TABLE_RESPONSE | client_cmd::SINK_TABLE_RESPONSE
+            ),
+            ZCL_CLUSTER_SPECIFIC => command == server_cmd::PROXY_TABLE_RESPONSE,
+            _ => false,
+        };
+        if !response {
+            return None;
+        }
+        if !with(|s| forget_remote(&mut s.remote, (src.0, tsn))) {
+            return None;
+        }
+        let truncated = payload.len() > MAX_REMOTE_PAYLOAD;
+        let kept = &payload[..payload.len().min(MAX_REMOTE_PAYLOAD)];
+        push(GpNcpEvent::Remote(GpRemoteFrame {
+            src_nwk: src.0,
+            frame_control: fc,
+            tsn,
+            command_id: command,
+            payload: Vec::from_slice(kept).unwrap_or_default(),
+            truncated,
+        }));
         Some(true)
     }
 

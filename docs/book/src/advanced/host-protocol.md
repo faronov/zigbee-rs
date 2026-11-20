@@ -1521,6 +1521,16 @@ Behaviour in `HOST_SINK` mode:
 | `0x0A82` | `EVT_GP_COMMISSIONED` | `gpd_id, u8 device_id, u8 flags (bit0 bidirectional, bit1 key present), R_GP_SINK record` | event | E (`SinkEvent::Commissioned`) + N |
 | `0x0A83` | `EVT_GP_COMMISSIONING_FAILED` | `gpd_id, u8 reason` (`SinkDrop`: 1 Invalid, 2 NotCommissioning, 3 NoEntry, 4 SecurityMismatch, 5 AuthFailed, 6 Stale, 7 Duplicate, 8 SecurityPolicy, 9 NoKey, 10 NoTempMaster, 11 TableFull, 12 Unsupported, 13 QueueFull) | event | E |
 | `0x0A84` | `EVT_GP_DECOMMISSIONED` | `gpd_id` | event | E |
+| `0x0A08` | `GP_PAIRING_CONFIGURATION` | `u16 dst, u8 actions, gpd_id, u8 device_id, u8 communication_mode, u8 flags (bit0 MAC seq capable, bit1 rx-on capable, bit2 fixed location, bit3 security, bit4 assigned alias), u16 assigned_alias, u8 groupcast_radius, u8 security_level, u8 key_type, [16] key, u32 frame_counter, u8 n, n×(u16 group, u16 alias), u8 paired (0x00 none, 0x01 listed, 0xFE sink derives, 0xFF all), u8 n, n×u8 endpoint, u8 app_info (bits 0-3), u16 manufacturer_id, u16 model_id, u8 n, n×u8 gpd_command, u8 n, n×u16 server_cluster, u8 n, n×u16 client_cluster` | `u8 zcl_tsn` | N (remote provisioning, below) |
+| `0x0A09` | `GP_SEND_PAIRING` | `u16 dst, u8 flags (bit0 add sink, bit1 remove GPD, bit2 GPD fixed, bit3 MAC seq capable, bit4 key, bit5 assigned alias, bit6 frame counter, bit7 groupcast radius), gpd_id, u8 communication_mode, u8 security_level, u8 key_type, [8] sink_ieee, u16 sink_nwk, u16 sink_group, u8 device_id, u32 frame_counter, [16] key, u16 assigned_alias, u8 groupcast_radius` | `u8 zcl_tsn` (`CONFLICT`) | N |
+| `0x0A0A` | `GP_TRANSLATION_UPDATE` | `u16 dst, u8 action (0 add, 1 replace, 2 remove), gpd_id, u8 n (≤ 7), n×translation` | `u8 zcl_tsn` | N |
+| `0x0A0B` | `GP_TRANSLATION_REQUEST` | `u16 dst, u8 start_index` | `u8 zcl_tsn` | N |
+| `0x0A0C` | `GP_REMOTE_SINK_TABLE_REQUEST` | `u16 dst, u8 index (0xFF: by GPD ID), gpd_id` | `u8 zcl_tsn` | N |
+| `0x0A0D` | `GP_REMOTE_PROXY_TABLE_REQUEST` | `u16 dst, u8 index (0xFF: by GPD ID), gpd_id` | `u8 zcl_tsn` | N |
+| `0x0A85` | `EVT_GP_REMOTE_STATUS` | `u16 src_nwk, u8 zcl_tsn, u8 command_id, u8 zcl_status` | event | N |
+| `0x0A86` | `EVT_GP_REMOTE_SINK_TABLE` | `u16 src_nwk, u8 zcl_tsn, u8 status, u8 total, u8 start_index, u8 flags (bit0 entries omitted), u8 n, n×R_GP_SINK record` | event | N |
+| `0x0A87` | `EVT_GP_REMOTE_PROXY_TABLE` | `u16 src_nwk, u8 zcl_tsn, u8 status, u8 total, u8 start_index, u8 flags, u8 n, n×R_GP_PROXY record` | event | N |
+| `0x0A88` | `EVT_GP_REMOTE_TRANSLATION_TABLE` | `u16 src_nwk, u8 zcl_tsn, u8 status, u8 total, u8 start_index, u8 flags, u8 n, n×R_GP_TRANSLATION record` | event | N |
 
 - `gpd_id` is `u8 app_id` (0 SrcID, 2 IEEE), followed by `u32 src_id`, or by
   `[8] ieee, u8 endpoint`.
@@ -1534,6 +1544,81 @@ Behaviour in `HOST_SINK` mode:
   frames it is the Commissioning command payload exactly as received,
   including the TC-LK-wrapped key and its MIC, so that a host-side sink
   shadow can process it byte-identically.
+
+- A `translation` (in `GP_TRANSLATION_UPDATE` and `R_GP_TRANSLATION`) is
+  `u8 gpd_command, u8 endpoint, u16 profile, u16 cluster, u8 zcl_command,
+  u8 payload_len`, then `payload_len` bytes when it is `0x00`–`0xFD`.
+  `0xFE` means "derived from the GPD command as by the sink's default
+  translation" and `0xFF` "the GPD command payload, copied"; neither carries
+  payload bytes. Endpoint `0xFC` hands the GPD command to the sink's
+  application untranslated.
+
+**Remote GP provisioning** (`0x0A08`–`0x0A0D`, added 2026-11-19). The host
+configures *other* GP sinks and proxies through the NCP, for example a
+lamp that runs the zigbee-rs combo with the Translation Table
+(`green-power-translation-table`, [Green Power](green-power.md) §3.8), or
+any GP 1.1 sink with CT-based commissioning (gpsFunctionality bit 11) and
+the Translation Table (bit 18). The NCP's own sink is not configured this
+way; it keeps `GP_SINK_*`.
+
+- **One GP cluster command per request.** The NCP encodes the GP command
+  (`zigbee_gp::config`, `zigbee_gp::cluster`) and sends it from endpoint
+  242 to endpoint 242, profile `0xA1E0`, cluster `0x0021`, NWK-secured,
+  with APS ACK when unicast, through the queue of `APS_DATA_REQUEST`
+  (`BUSY`, `INVALID_STATE` without a network). The response carries the
+  ZCL TSN it used. Like `APS_DATA_REQUEST`, the request is two-phase:
+  `EVT_APS_DATA_CONFIRM` with the request TID reports the delivery, and
+  the target's answer arrives as an `EVT_GP_REMOTE_*` event with the same
+  `zcl_tsn`.
+
+  | Request | GP command | Answer |
+  |---|---|---|
+  | `GP_PAIRING_CONFIGURATION` | Pairing Configuration (client → server `0x09`), Default Response enabled | `EVT_GP_REMOTE_STATUS` (unicast only) |
+  | `GP_SEND_PAIRING` | Pairing (server → client `0x01`) | none; also handed to the NCP's own proxy |
+  | `GP_TRANSLATION_UPDATE` | Translation Table Update (client → server `0x07`), Default Response enabled | `EVT_GP_REMOTE_STATUS` (unicast only) |
+  | `GP_TRANSLATION_REQUEST` | Translation Table Request (client → server `0x08`) | `EVT_GP_REMOTE_TRANSLATION_TABLE` |
+  | `GP_REMOTE_SINK_TABLE_REQUEST` | Sink Table Request (client → server `0x0A`) | `EVT_GP_REMOTE_SINK_TABLE` |
+  | `GP_REMOTE_PROXY_TABLE_REQUEST` | Proxy Table Request (server → client `0x0B`) | `EVT_GP_REMOTE_PROXY_TABLE` |
+
+- **Destinations.** `dst` is a NWK address (not the NCP's own) or a
+  broadcast (`0xFFFC`, `0xFFFD`, `0xFFFF`). The three table requests are
+  unicast only (`INVALID_PARAMETER`): GP sinks and proxies answer unicast
+  requests only. A broadcast Pairing Configuration or Translation Table
+  Update gets no Default Response, so no event follows it.
+- **Answers.** The NCP remembers the (destination, TSN) of the last 8
+  unicast requests. Only a matching answer, unicast to endpoint 242 and
+  NWK-secured, becomes an event; it never reaches the NCP's proxy or sink.
+  Anything else (an unsolicited or late answer, a ninth outstanding
+  request's oldest answer) stays with the stack. The host times out a
+  missing answer itself (suggested: 3 s after the confirm).
+- **Records.** Sink Table entries become `R_GP_SINK` (one group: the first
+  commissioned group), Proxy Table entries `R_GP_PROXY` (one entry each,
+  `format_version` 1) and translations `R_GP_TRANSLATION`. Keys are
+  included only while key export is allowed (`SEC_LOCK_KEY_EXPORT`), as
+  for the NCP's own tables. An entry the NCP cannot represent (an LPED GPD
+  ID, a Translation Table entry with an additional information block, a
+  malformed or truncated entry) ends the record list and sets `flags`
+  bit 0; `status`, `total` and `start_index` are the target's.
+- **What the typed requests cannot carry.** Application Description
+  (action 0b101), switch information, report descriptors and additional
+  information blocks are not provisioned through ZRHP
+  (`INVALID_PARAMETER`). A raw `APS_DATA_REQUEST` can still carry them in
+  `HOST_SINK` mode.
+- **Sink authority.** In `NCP_SINK` mode a `GP_SEND_PAIRING` that removes
+  a GPD of the NCP's own Sink Table, or that names the NCP (its IEEE or
+  NWK address) as the unicast sink, is refused with `CONFLICT` and
+  counted (`0x0813`): those pairings are the NCP sink's. A raw
+  `APS_DATA_REQUEST` carrying a Translation Table Update/Request is still
+  refused in `NCP_SINK` mode (step 5 below); the typed requests are the
+  supported path.
+- **Implementation:** `apps/ncp-coordinator/src/gp_remote.rs` over
+  `zigbee_runtime::green_power::ncp::gp_ncp_expect_response`. Host-tested
+  end to end (`apps/ncp-coordinator/tests/gp.rs`,
+  `remote_provisioning_reaches_another_proxy_and_sink`): Proxy and Sink
+  Table Requests answered by a second zigbee-rs router stack, a broadcast
+  GP Pairing that pairs both the NCP's proxy and the remote proxy,
+  `CONFLICT`, and Default Responses of a sink without the Translation
+  Table. **Not run on hardware.**
 
 **Coexistence with zigpy's own GP sink (normative).** zigpy (current `dev`)
 has a complete sink in `zigpy.zgp.GreenPowerManager`:
@@ -2142,6 +2227,7 @@ Each record is a TLV: `u8 type, u16 len, value[len]`.
 | `0x09` | `GP_PROXY` | `u8 format_version, entry[]` (zigbee-rs `gp_store` entry encoding) | var |
 | `0x0A` | `RS_PARAMS` | `u32 fc_stride, u32 table_epoch, u32 nwk_fc_limit, u32 aps_fc_limit, u8 flags (bit0 host-backed tables)` | 17 |
 | `0x0B` | `GP_SINK` | `gpd_id` (`u8 app_id`; then `u32 src_id`, or `[8] ieee, u8 endpoint`), `u8 device_id, u8 communication_mode, u16 group (FFFF none), u16 assigned_alias (FFFF derived), u8 flags (bit0 MAC seq capable, bit1 rx-on capable, bit2 fixed location, bit3 key present), u8 security_level, u8 key_type, [16] key (if bit3), u32 frame_counter, u8 groupcast_radius` | 19..40 |
+| `0x0C` | `GP_TRANSLATION` | `gpd_id`, then a translation (7.11): `u8 gpd_command, u8 endpoint, u16 profile, u16 cluster, u8 zcl_command, u8 payload_len, payload[]` | 14.. |
 | `0xFF` | `END` | `u32 record_count, u32 crc32c` over the concatenated TLV bytes of all preceding records in the stream | 8 |
 
 `DEVICE.flags`:

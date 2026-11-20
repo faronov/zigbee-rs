@@ -578,6 +578,88 @@ fn message_vectors() {
                 );
                 assert!(e.payload.0.is_empty());
             }
+            "gp_pairing_configuration" => {
+                let r: GpPairingConfiguration = rt(&m, &whole);
+                assert_eq!(r.dst, fields.at("dst").int() as u16);
+                assert_eq!(r.actions as u64, fields.at("actions").u64());
+                assert_eq!(r.gpd_id, GpdId::SrcId(0x7A6B_9879));
+                assert_eq!(
+                    r.communication_mode as u64,
+                    fields.at("communication_mode").u64()
+                );
+                assert_eq!(r.flags as u64, fields.at("flags").u64());
+                assert_eq!((r.security_level, r.key_type), (3, 4));
+                assert_eq!(r.frame_counter, 10);
+                assert!(r.groups.is_empty() && r.endpoints.is_empty());
+                assert_eq!(r.paired as u64, fields.at("paired").u64());
+                assert_eq!(r.app_info, 0);
+            }
+            "gp_remote_rsp" => {
+                let r: Response<GpRemoteRsp> = m.decode_response().unwrap();
+                assert!(r.status.is_success());
+                assert_eq!(r.body.unwrap().zcl_tsn as u64, fields.at("zcl_tsn").u64());
+            }
+            "gp_translation_update" => {
+                let r: GpTranslationUpdate = rt(&m, &whole);
+                assert_eq!(r.dst, fields.at("dst").int() as u16);
+                assert_eq!(r.action as u64, fields.at("action").u64());
+                assert_eq!(r.translations.len() as u64, fields.at("translations").u64());
+                let t: Vec<GpTranslation> = r.translations.iter().collect();
+                assert_eq!(
+                    (
+                        t[0].gpd_command,
+                        t[0].endpoint,
+                        t[0].cluster,
+                        t[0].zcl_command
+                    ),
+                    (0x22, 1, 0x0006, 0x00)
+                );
+                assert_eq!(t[1].payload_len, gp_translation_payload::DERIVED);
+                assert!(t[1].payload.is_empty());
+                assert_eq!(t[2].payload, &[0x80, 0x0A, 0x00]);
+            }
+            "gp_send_pairing" => {
+                let r: GpSendPairing = rt(&m, &whole);
+                assert_eq!(r.dst, fields.at("dst").int() as u16);
+                assert_eq!(r.flags as u64, fields.at("flags").u64());
+                assert_eq!(
+                    r.communication_mode as u64,
+                    fields.at("communication_mode").u64()
+                );
+                assert_eq!(r.sink_ieee, ieee_be("0102030405060708"));
+                assert_eq!((r.sink_nwk, r.frame_counter), (0x7C87, 10));
+            }
+            "gp_translation_request" => {
+                let r: GpTranslationRequest = rt(&m, &whole);
+                assert_eq!((r.dst, r.start_index), (0x7C87, 0));
+            }
+            "gp_remote_sink_table_request" => {
+                let r: GpRemoteSinkTableRequest = rt(&m, &whole);
+                assert_eq!((r.dst, r.index), (0x7C87, 0xFF));
+                assert_eq!(r.gpd_id, GpdId::SrcId(0x7A6B_9879));
+            }
+            "evt_gp_remote_status" => {
+                let e: EvtGpRemoteStatus = rt(&m, &whole);
+                assert_eq!(
+                    (e.src_nwk, e.zcl_tsn, e.command_id, e.zcl_status),
+                    (0x7C87, 5, 0x09, 0)
+                );
+            }
+            "evt_gp_remote_translation_table" => {
+                let e: EvtGpRemoteTranslationTable = rt(&m, &whole);
+                assert_eq!((e.status, e.total, e.start_index, e.flags), (0, 2, 0, 0));
+                let expected = fields.at("records_hex").arr();
+                assert_eq!(e.records.len(), expected.len());
+                for (record, hexstr) in e.records.iter().zip(expected) {
+                    let mut buf = [0u8; 64];
+                    let n = zigbee_zrhp::codec::encode_into(&record, &mut buf).unwrap();
+                    assert_eq!(hex(&buf[..n]), hexstr.str());
+                    let Record::GpTranslation(t) = record else {
+                        panic!("not R_GP_TRANSLATION")
+                    };
+                    assert_eq!(t.gpd_id, GpdId::SrcId(0x7A6B_9879));
+                }
+            }
             other => panic!("vector {other} has no codec test"),
         }
     }

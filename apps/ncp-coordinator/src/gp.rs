@@ -91,6 +91,9 @@ pub trait GpPort {
     fn take_event(&mut self) -> Option<GpNcpEvent>;
     /// A host GP client command for the local proxy.
     fn loopback(&mut self, command_id: u8, payload: &[u8]);
+    /// Route the response to a remote GP request (unicast to `dst`, ZCL
+    /// TSN `tsn`) to the host.
+    fn expect_response(&mut self, dst: u16, tsn: u8);
 }
 
 impl<A: TcApp> GpPort for TcPort<A> {
@@ -146,6 +149,10 @@ impl<A: TcApp> GpPort for TcPort<A> {
         self.app_mut()
             .device_mut()
             .gp_ncp_loopback(command_id, payload);
+    }
+
+    fn expect_response(&mut self, dst: u16, tsn: u8) {
+        self.app_mut().device_mut().gp_ncp_expect_response(dst, tsn);
     }
 }
 
@@ -694,7 +701,9 @@ pub(crate) fn emit_gp_events<C: CoordinatorPort>(
     let Some(gp) = port.gp() else {
         return;
     };
-    while queues.queue(Endpoint::Zigbee).free() >= 7 + 40 + crate::port::MAX_INDICATION_ASDU {
+    while queues.queue(Endpoint::Zigbee).free()
+        >= (7 + 40 + crate::port::MAX_INDICATION_ASDU).max(crate::gp_remote::MAX_REMOTE_EVENT)
+    {
         let Some(event) = gp.take_event() else {
             break;
         };
@@ -771,6 +780,9 @@ pub(crate) fn emit_gp_events<C: CoordinatorPort>(
             }
             // Reported as `EVT_GP_FRAME` when accepted.
             GpNcpEvent::Sink(SinkEvent::GpdCommand { .. }) => {}
+            GpNcpEvent::Remote(frame) => {
+                crate::gp_remote::emit_remote(queues, seqs, &frame, keys_exportable);
+            }
         }
     }
 }

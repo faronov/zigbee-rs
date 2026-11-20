@@ -83,12 +83,16 @@ green-power-bidirectional = [
 # (dim warm white whenever no status indication is lit), and a Green Power
 # Combo sink delivers paired GPD switch commands to it, with the TempMaster
 # so bidirectional GPDs heard directly can commission. The Sink Table
-# shares the GP journal in `zbnv`; no new flash region.
+# shares the GP journal in `zbnv`; no new flash region. A commissioning tool
+# can pair GPDs and retarget their commands with GP Pairing Configuration and
+# GP Translation Table Update; translations live in the same journal record.
 combo-light = [
     "status-led",
     "green-power-bidirectional",
     "router-app/green-power-sink",
+    "router-app/green-power-translation-table",
     "zigbee-runtime/green-power-sink",
+    "zigbee-runtime/green-power-translation-table",
 ]
 # Persist ZCL Configure Reporting state in `zbnv` (sleepy sensor images).
 reporting-persist = []
