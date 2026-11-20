@@ -286,31 +286,36 @@ plus append records. It lives in the hub's data partition (below): a raw
 region, or a preallocated file pair in a power-loss-safe filesystem
 (LittleFS). ESP-IDF NVS is acceptable if it meets the durability rule of 8.8.
 
-**S3 flash layout** (decision N9). Retail Thread BR boards carry 8 MB; early
-samples carry 4 MB (the hwlab board: Zbit 5e4016). The hub detects the size
-at boot and uses the matching partition table; a table that does not match
-the detected size is a fatal configuration error. **The S3 stores no NCP
-images** (decision N6, amended 2026-11-18): NCP rollback is on the H2 (8.9).
+**S3 flash layout** (decision N9, amended 2026-11-20). Retail Thread BR
+boards carry 8 MB; early samples carry 4 MB (the hwlab board: Zbit 5e4016).
+**8 MB is the product**: two 3 MiB app slots with A/B OTA. **4 MB samples
+get a development layout**: one app slot, no OTA (flashing and recovery
+over USB-Serial-JTAG). The hub detects the size at boot and checks that the
+partition table matches it; a hub table for another size, or partitions
+beyond the end of flash, is a fatal configuration error. **The S3 stores no
+NCP images** (decision N6, amended 2026-11-18): NCP rollback is on the H2
+(8.9).
 
-| Partition | 4 MB | 8 MB |
+| Partition | 8 MB (product) | 4 MB (development) |
 |---|---|---|
 | Bootloader | 0x000000, 32 KiB | same |
 | Partition table | 0x008000, 4 KiB | same |
 | `nvs` (Wi-Fi, PHY calibration, small settings) | 0x009000, 24 KiB | same |
-| `otadata` | 0x00F000, 8 KiB | same |
-| `phy_init` | 0x011000, 4 KiB | same |
-| Reserved (optional core dump) | 0x012000, 56 KiB | same |
-| Hub app `ota_0` | 0x020000, **1.5 MiB** | 0x020000, 3 MiB |
-| Hub app `ota_1` | 0x1A0000, **1.5 MiB** | 0x320000, 3 MiB |
-| `hubdata` (LittleFS or log-structured store) | 0x320000, **896 KiB** | 0x620000, 1 920 KiB |
+| `otadata` | 0x00F000, 8 KiB | — |
+| `phy_init` | 0x011000, 4 KiB | 0x00F000, 4 KiB |
+| Core dump | 0x012000, 56 KiB | 0x2F0000, 64 KiB |
+| Hub app | `ota_0` 0x020000 and `ota_1` 0x320000, **3 MiB each** | `factory` 0x010000, **2 944 KiB** |
+| `hubdata` (LittleFS or log-structured store) | 0x620000, 1 920 KiB | 0x300000, 1 MiB |
 
-- **Hub app ≤ 1.5 MiB** on 4 MB boards. The hub CI enforces the limit.
-  The stock `esp_ot_br` (Wi-Fi, OpenThread, web server) is 1.6 MB; the hub
-  has no OpenThread.
+- **Hub app size.** The hub CI checks the app against both slots (3 MiB and
+  2 944 KiB); there is no 1.5 MiB target. The application build (definition
+  engine, ZRHP host, Wi-Fi, WebSocket API) is about 2.1 MiB. The stock
+  `esp_ot_br` (Wi-Fi, OpenThread, web server) is 1.6 MB; the hub has no
+  OpenThread.
 - **`hubdata` (4 MB)**: host store journal 128 KiB, configuration 32 KiB,
   device-converter database 2 × 256 KiB (active + staged, swapped
-  atomically), the rest (224 KiB, 25 %) free for copy-on-write and wear
-  levelling.
+  atomically), local definitions 64 KiB; the rest is free for
+  copy-on-write and wear levelling.
 - **Converter database.** Device definitions are **declarative data**
   (compact CBOR records: model and manufacturer ids, exposes, cluster and
   attribute mappings, reporting, references to generic handlers built into
@@ -3231,10 +3236,11 @@ N2).
 **Partitions** (decision N9; full tables in 3.4). The hub detects the S3
 flash size at boot:
 
-- **4 MB:** hub app ×2 at **1.5 MiB**; one 896 KiB `hubdata` partition with
-  the host store journal (128 KiB), configuration (32 KiB) and the
-  declarative converter database (2 × 256 KiB, active + staged).
-- **8 MB:** hub app ×2 at 3 MiB; `hubdata` 1 920 KiB.
+- **8 MB (product):** hub app ×2 at 3 MiB with A/B OTA; `hubdata` 1 920 KiB.
+- **4 MB (development):** one 2 944 KiB hub app slot, no OTA; one 1 MiB
+  `hubdata` partition with the host store journal (128 KiB), configuration
+  (32 KiB) and the declarative converter database (2 × 256 KiB, active +
+  staged).
 - **No NCP image partition.** NCP rollback is on the H2's A/B slots
   (8.9, decision N6 amended 2026-11-18).
 
@@ -3484,7 +3490,7 @@ This is simulation-level evidence, not hardware evidence.
 | H9 | **PTA coexistence:** Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on. The hub's automatic enable/disable follows Wi-Fi up/down, including Ethernet-only. GP TempMaster reply behaviour with grant denied. |
 | H10 | **GP combo on the NCP:** direct and proxy-tunnelled commissioning into the NCP sink with zigpy as shadow, including an unsecured (level-0) FlowerX GP / BGT1 GP; a bidirectional GPD with the NCP as its own TempMaster; Sink Table across an NCP reboot (seamless resume) and across backup/restore. |
 | H11 | **Z2M end to end:** zigbee-herdsman adapter with 10+ real devices; Z2M backup → restore on a fresh NCP. |
-| H12 | **Embedded hub:** S3 hub with a synthetic 2 000-device store (PSRAM budget of 3.4), paging forced by a reduced NCP cache, power cuts during writebacks, store journal recovery. Candidate NCP image that fails its trial (no `FW_CONFIRM`) → the H2 bootloader returns to the previous slot, network state retained; an image larger than the H2 slot refused with `TOO_LARGE` before any erase. Hub app within 1.5 MiB on a 4 MB S3. |
+| H12 | **Embedded hub:** S3 hub with a synthetic 2 000-device store (PSRAM budget of 3.4), paging forced by a reduced NCP cache, power cuts during writebacks, store journal recovery. Candidate NCP image that fails its trial (no `FW_CONFIRM`) → the H2 bootloader returns to the previous slot, network state retained; an image larger than the H2 slot refused with `TOO_LARGE` before any erase. Hub app within its slot (3 MiB on 8 MB, 2 944 KiB on the 4 MB development layout). |
 
 ---
 
@@ -3547,7 +3553,7 @@ two requirements. Each decision is applied in the sections listed.
 | N6 | ~~The S3 stores known-good + candidate NCP images, with rollback through the H2 ROM bootloader.~~ **Amended 2026-11-18:** rollback lives on the **H2**: A/B application slots on the H2 flash, `FW_*` writes the inactive slot, trial boot, host `FW_CONFIRM`, H2 bootloader rollback of an unconfirmed image. The S3 stores **no** NCP images. The H2 ROM-bootloader path is a manual/development recovery path with an operator-supplied image. | 7.9, 8.9, 11.5, 12.4, H12 |
 | N7 | PTA **disabled by default**; the hub enables it automatically while Wi-Fi is active (off with Ethernet-only). | 7.1, 11.5, 12.4, H9 |
 | N8 | USB identity: **keep Espressif's VID/PID**. | 4.3, 11.3, H1 |
-| N9 | (2026-11-18) S3 flash: **detect 4 MB / 8 MB at boot, one partition table per size.** 4 MB: hub app ×2 at 1.5 MiB + one 896 KiB data partition (host store, configuration, declarative converter database); no NCP image partition. | 3.4, 12.4, H12 |
+| N9 | (2026-11-18, amended 2026-11-20) S3 flash: **detect 4 MB / 8 MB at boot, one partition table per size.** 8 MB is the product: hub app ×2 at 3 MiB (A/B OTA) + `hubdata` 1 920 KiB. 4 MB samples: development layout, one 2 944 KiB app slot without OTA + 1 MiB `hubdata` (host store, configuration, declarative converter database); no 1.5 MiB app target (superseded). No NCP image partition. | 3.4, 12.4, H12 |
 | N10 | (2026-11-19, proposal) BR board UART: **921 600 with RTS/CTS** on the reserved links R19/R20 by default (verified fitted; RX stalls lose nothing with flow control and lose data without it at every rate), 2 000 000 allowed, 460 800 without flow control as the fallback. Supersedes the UART part of N4. | 4.1, 4.4, 11.5, H8 |
 
 **Open questions.** None block the start of implementation. The remaining
