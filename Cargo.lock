@@ -429,6 +429,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1454db4f2edb7f0e8fe0c5b375b0c978fc63244cc9f010d160e417eb10139aa8"
 
 [[package]]
+name = "efr32-gbl"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "efr32mg1-hal"
 version = "0.1.0"
 dependencies = [

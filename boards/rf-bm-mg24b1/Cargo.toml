@@ -1,0 +1,16 @@
+[package]
+name = "rf-bm-mg24b1"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for an RF-star RF-BM-MG24B1 module (EFR32MG24A410F1536IM48) wired as a development board"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[features]
+# Interrupt-driven USART0 host link (`efr32s2-hal` `usart0-host`): defines
+# the USART0 interrupt handlers, so only images that use it enable it.
+host-uart = ["efr32s2-hal/usart0-host"]
+
+[dependencies]
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg24-pa10", "hfxo-39mhz"] }

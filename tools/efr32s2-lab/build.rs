@@ -5,10 +5,12 @@ use std::{env, path::PathBuf};
 fn main() {
     let wstk = env::var_os("CARGO_FEATURE_WSTK").is_some();
     let zbt1 = env::var_os("CARGO_FEATURE_ZBT1").is_some();
-    let (board, chip) = match (wstk, zbt1) {
-        (true, false) => ("wstk-brd4183a", "efr32mg22"),
-        (false, true) => ("zbt1", "efr32mg21"),
-        _ => panic!("enable exactly one of the `wstk` or `zbt1` features"),
+    let rfbm = env::var_os("CARGO_FEATURE_RFBM").is_some();
+    let (board, chip) = match (wstk, zbt1, rfbm) {
+        (true, false, false) => ("wstk-brd4183a", "efr32mg22"),
+        (false, true, false) => ("zbt1", "efr32mg21"),
+        (false, false, true) => ("rf-bm-mg24b1", "efr32mg24"),
+        _ => panic!("enable exactly one of the `wstk`, `zbt1` or `rfbm` features"),
     };
     let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     println!(

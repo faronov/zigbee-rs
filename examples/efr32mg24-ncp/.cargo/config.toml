@@ -1,0 +1,14 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = [
+    "-L", "../../efr32s2-hal/link/efr32mg24",
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=--nmagic",
+    # Panic locations cost several KiB of strings; the panic message stays.
+    "-Zlocation-detail=none",
+]
+
+[unstable]
+build-std = ["core"]

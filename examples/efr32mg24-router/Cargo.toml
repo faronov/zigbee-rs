@@ -1,0 +1,54 @@
+[package]
+name = "efr32mg24-router"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+autobins = false
+
+# zigbee-rs Router (HA Range Extender + Green Power Proxy Basic) for
+# EFR32MG24 boards; logs go out on the board's host USART (TX only).
+#   cargo build --release                                    # RF-BM-MG24B1
+#   cargo build --release --no-default-features --features sonoff-dongle-m \
+#     --target-dir target/dongle-m
+# Same memory map as the NCP (above the resident Gecko bootloader);
+# `tools/efr32-gbl` turns the ELF into the raw image and a GBL.
+[[bin]]
+name = "efr32mg24-router"
+path = "src/main.rs"
+
+[features]
+default = ["rf-bm-mg24b1"]
+rf-bm-mg24b1 = ["efr32mg24-product/rf-bm-mg24b1", "dep:rf-bm-mg24b1"]
+sonoff-dongle-m = ["efr32mg24-product/sonoff-dongle-m", "dep:sonoff-dongle-m"]
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+# The chip and PA variant come from the board crate.
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["rt", "time-driver", "isr-ack"] }
+rf-bm-mg24b1 = { path = "../../boards/rf-bm-mg24b1", optional = true }
+sonoff-dongle-m = { path = "../../boards/sonoff-dongle-m", optional = true }
+efr32mg24-product = { path = "../../products/efr32mg24", default-features = false, features = ["router"] }
+router-app = { path = "../../apps/router", default-features = false, features = ["router", "green-power"] }
+zigbee-mac = { path = "../../zigbee-mac", features = ["efr32mg24"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["router"] }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
+embassy-time = "0.5"
+embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
+log = { version = "0.4", features = ["max_level_info", "release_max_level_info"] }
+static_cell = "2"
+
+[profile.dev]
+opt-level = "s"
+debug = true
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+lto = true
+debug = true
+panic = "abort"
