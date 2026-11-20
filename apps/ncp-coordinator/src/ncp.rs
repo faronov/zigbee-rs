@@ -29,7 +29,7 @@ use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagGetCountersRsp, DiagR
 use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord, LogConfig};
 use zigbee_zrhp::msg::network::{
     EvtDeviceJoined, EvtDeviceLeft, EvtNetworkState, NwkAddEndpoint, NwkForm, NwkGetInfoRsp,
-    NwkInit, NwkInitRsp, NwkLeaveReset, NwkPermitJoin,
+    NwkGroupMembership, NwkInit, NwkInitRsp, NwkLeaveReset, NwkPermitJoin,
 };
 use zigbee_zrhp::msg::security::{
     EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey,
@@ -756,6 +756,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 if port.install_codes_supported() {
                     ncp_caps |= caps::INSTALL_CODES;
                 }
+                if port.groups_supported() {
+                    ncp_caps |= caps::GROUP_MEMBERSHIP;
+                }
                 if platform.fw_supported() {
                     ncp_caps |= caps::NCP_FW_UPDATE;
                 }
@@ -1133,6 +1136,22 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                         Err(EndpointError::Unsupported) => Status::UnsupportedCommand,
                     },
                     None => Status::InvalidParameter,
+                };
+                status_only(queues, status);
+            }
+            ids::NWK_GROUP_MEMBERSHIP => {
+                let request = decode!(NwkGroupMembership);
+                let status = if !port.groups_supported() {
+                    Status::UnsupportedCommand
+                } else if port.state() != NetworkState::Up {
+                    Status::InvalidState
+                } else {
+                    match port.group_membership(request.op, request.group, request.ep) {
+                        Ok(()) => Status::Success,
+                        Err(EndpointError::InvalidParameter) => Status::InvalidParameter,
+                        Err(EndpointError::NoSpace) => Status::NoSpace,
+                        Err(EndpointError::Unsupported) => Status::UnsupportedCommand,
+                    }
                 };
                 status_only(queues, status);
             }

@@ -8,7 +8,7 @@ use ncp_coordinator_app::platform::{
     FwBegin, FwImage, FwSlot, NcpPlatform, PlatformError, slot_state,
 };
 use ncp_coordinator_app::port::CoordinatorPort;
-use ncp_coordinator_app::tc::TcPort;
+use ncp_coordinator_app::tc::{TcApp, TcPort};
 use ncp_coordinator_app::transport::{HostTransport, TransportInfo};
 use ncp_coordinator_app::{LogRing, Ncp, NcpIdentity, PlatformRequest};
 use router_app::{
@@ -42,7 +42,7 @@ use zigbee_zrhp::msg::diag::{
 use zigbee_zrhp::msg::firmware::{
     FwActivate, FwBegin as FwBeginReq, FwBeginRsp, FwFinishRsp, FwGetSlotsRsp, FwWrite, FwWriteRsp,
 };
-use zigbee_zrhp::msg::network::{NwkForm, NwkGetInfoRsp, NwkLeaveReset};
+use zigbee_zrhp::msg::network::{NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkLeaveReset};
 use zigbee_zrhp::msg::security::{
     SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecGetFrameCountersRsp,
     SecGetNetworkKey, SecGetNetworkKeyRsp,
@@ -482,6 +482,7 @@ macro_rules! setup {
             caps::NCP_FW_UPDATE,
             caps::IEEE_REWRITABLE,
             caps::PTA_COEX,
+            caps::GROUP_MEMBERSHIP,
         ] {
             assert_ne!(negotiated.ncp_caps & bit, 0, "capability {bit:#x}");
         }
@@ -1490,4 +1491,63 @@ fn a_reset_due_during_a_queued_operation_is_kept() {
     host.pump(now, &mut pipe);
     assert_eq!(host.response(reset).status(), 0);
     assert_eq!(host.response(set).status(), 0);
+}
+
+#[test]
+fn group_membership_edits_the_aps_group_table() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let early = host.request(&NwkGroupMembership {
+        op: 1,
+        group: 0x0B84,
+        ep: 242,
+    });
+    exchange!();
+    assert_eq!(host.response(early).status(), Status::InvalidState.to_u8());
+    let form = host.request(&form_request(0x1A62, 1 << 20));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+
+    macro_rules! run {
+        ($op:expr, $group:expr, $ep:expr) => {{
+            let request = host.request(&NwkGroupMembership {
+                op: $op,
+                group: $group,
+                ep: $ep,
+            });
+            exchange!();
+            host.response(request).status()
+        }};
+    }
+    assert_eq!(
+        run!(1, 0x0B84, 242),
+        0,
+        "the GP endpoint joins the sink group"
+    );
+    assert_eq!(run!(1, 0x1234, 1), 0);
+    assert_eq!(run!(1, 0x1234, 1), 0, "idempotent");
+    assert_eq!(run!(1, 0x1234, 2), 0);
+    assert_eq!(run!(1, 0x1234, 241), Status::InvalidParameter.to_u8());
+    assert_eq!(run!(1, 0xFFF8, 1), Status::InvalidParameter.to_u8());
+    assert_eq!(run!(9, 0x1234, 1), Status::InvalidParameter.to_u8());
+    {
+        let groups = TcApp::device(port.app()).aps().group_table();
+        assert!(groups.is_member(0x0B84, 242));
+        assert!(groups.is_member(0x1234, 1) && groups.is_member(0x1234, 2));
+    }
+    assert_eq!(run!(2, 0x1234, 2), 0);
+    assert_eq!(run!(2, 0x1234, 2), 0, "removing a non-member is a no-op");
+    assert_eq!(run!(3, 0, 1), 0, "endpoint 1 leaves every group");
+    {
+        let groups = TcApp::device(port.app()).aps().group_table();
+        assert!(!groups.is_member(0x1234, 1) && !groups.is_member(0x1234, 2));
+        assert!(groups.is_member(0x0B84, 242));
+    }
+    let mut status = 0;
+    for group in 1..=32u16 {
+        status = run!(1, group, 1);
+        if status != 0 {
+            break;
+        }
+    }
+    assert_eq!(status, Status::NoSpace.to_u8(), "a full table says so");
 }

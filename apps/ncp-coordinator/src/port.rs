@@ -278,6 +278,18 @@ pub trait CoordinatorPort {
     }
     /// Forget every host endpoint (`NWK_LEAVE_RESET` without flags bit1).
     fn clear_endpoints(&mut self) {}
+    /// `GROUP_MEMBERSHIP` capability: [`Self::group_membership`] works.
+    fn groups_supported(&self) -> bool {
+        false
+    }
+    /// `NWK_GROUP_MEMBERSHIP` on the running network's APS group table
+    /// (persisted with it): `op` 1 adds `endpoint` to `group`, 2 removes it
+    /// (idempotent), 3 removes `endpoint` from every group. `NoSpace` when
+    /// the table is full.
+    fn group_membership(&mut self, op: u8, group: u16, endpoint: u8) -> Result<(), EndpointError> {
+        let _ = (op, group, endpoint);
+        Err(EndpointError::Unsupported)
+    }
 
     // ── Network images, Trust Center devices (formation parameters,
     //    TABLES, BACKUP) ──────────────────────────────────────────────

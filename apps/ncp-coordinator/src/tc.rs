@@ -1205,6 +1205,32 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         self.host_endpoints.clear();
     }
 
+    fn groups_supported(&self) -> bool {
+        true
+    }
+
+    fn group_membership(&mut self, op: u8, group: u16, endpoint: u8) -> Result<(), EndpointError> {
+        // Host endpoints and the NCP-owned GP endpoint (H5: GP
+        // Notifications groupcast to the sink group).
+        if !(1..=240).contains(&endpoint) && endpoint != 242 || group > 0xFFF7 {
+            return Err(EndpointError::InvalidParameter);
+        }
+        let groups = self.app.device_mut().aps_mut().group_table_mut();
+        match op {
+            1 if groups.add_group(group, endpoint) => Ok(()),
+            1 => Err(EndpointError::NoSpace),
+            2 => {
+                groups.remove_group(group, endpoint);
+                Ok(())
+            }
+            3 => {
+                groups.remove_all_groups(endpoint);
+                Ok(())
+            }
+            _ => Err(EndpointError::InvalidParameter),
+        }
+    }
+
     fn gp(&mut self) -> Option<&mut dyn crate::gp::GpPort> {
         Some(self)
     }
