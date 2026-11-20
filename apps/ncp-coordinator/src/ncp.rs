@@ -297,8 +297,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         next
     }
 
-    /// One non-blocking pass. Returns a request the platform must carry out.
-    /// A product without platform services ([`NoPlatform`]).
+    /// One non-blocking pass. Returns a request the platform must carry out
+    /// (repeated on every pass until it is). A product without platform
+    /// services ([`NoPlatform`]).
     pub fn service<T: HostTransport, C: CoordinatorPort>(
         &mut self,
         now_us: u64,
@@ -329,9 +330,11 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         self.transmit(now_us, transport);
         self.flush_deferred();
         self.release_credits();
+        // Stays armed once due: the platform reboots and never returns, and
+        // a result dropped by a caller (the products ignore it inside their
+        // drive loop) is handed out again on the next pass.
         match self.pending_reset {
             Some((mode, at)) if now_us >= at && self.tx_len == 0 => {
-                self.pending_reset = None;
                 Some(PlatformRequest::Reset { mode })
             }
             _ => None,

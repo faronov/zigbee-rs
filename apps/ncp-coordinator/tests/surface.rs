@@ -49,7 +49,7 @@ use zigbee_zrhp::msg::security::{
 };
 use zigbee_zrhp::msg::system::{
     ConfigValue, SysGetConfig, SysGetConfigRsp, SysGetInfoRsp, SysGetStatusRsp, SysNegotiateReq,
-    SysNegotiateRsp, SysSetConfig, SysSetConfigRsp, SysSetIeee, caps, config,
+    SysNegotiateRsp, SysReset, SysSetConfig, SysSetConfigRsp, SysSetIeee, caps, config,
 };
 use zigbee_zrhp::msg::tables::{
     EvtTblEpochChanged, TableKey, TblInvalidate, TblPush, TblPushRsp, TblRead, TblReadRsp,
@@ -1413,4 +1413,42 @@ fn install_codes_and_link_keys_are_provisioned() {
         .collect();
     assert!(keys.contains(&(CODE_DEVICE, DERIVED, 1)), "{keys:?}");
     assert!(keys.contains(&(KEY_DEVICE, DEVICE_KEY, 3)), "{keys:?}");
+}
+
+/// A reboot that falls due while the product drives a queued operation is
+/// not lost: the composition roots ignore the `service` result inside their
+/// drive loop, so the request stays armed until the outer `service` takes
+/// it (a lost one left `SYS_RESET` unanswered until the host reset the NCP
+/// by its lines).
+#[test]
+fn a_reset_due_during_a_queued_operation_is_kept() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let reset = host.request(&SysReset {
+        mode: 0,
+        confirm: 0,
+    });
+    let set = host.request(&SysSetIeee {
+        ieee: Ieee(OTHER_IEEE),
+    });
+    now += 1_000;
+    host.pump(now, &mut pipe);
+    assert_eq!(
+        ncp.service_with(now, &mut pipe, &mut port, &mut platform, &log),
+        None
+    );
+    // The operation runs after the reset delay; the product loop drops the
+    // in-loop `service` result.
+    now += 100_000;
+    while pollster::block_on(ncp.drive_with(&mut port, &mut platform, || 0)) {
+        let _ = ncp.service_with(now, &mut pipe, &mut port, &mut platform, &log);
+    }
+    host.pump(now, &mut pipe);
+    now += 1_000;
+    assert_eq!(
+        ncp.service_with(now, &mut pipe, &mut port, &mut platform, &log),
+        Some(PlatformRequest::Reset { mode: 0 })
+    );
+    host.pump(now, &mut pipe);
+    assert_eq!(host.response(reset).status(), 0);
+    assert_eq!(host.response(set).status(), 0);
 }
