@@ -145,6 +145,15 @@ cargo test --manifest-path apps/ncp-coordinator/Cargo.toml
 cargo run -p zrhp-host -- --hwlab uart/<port> smoke [--form]
 ```
 
+`examples/ncp_sim.rs` runs this NCP on the host (the Trust Center
+coordinator on a mock MAC) with ZRHP on stdin/stdout, for host-library
+conformance tests; `zigpy-zrhp` drives it with `ZRHP_NCP_SIM` pointing at the
+binary:
+
+```text
+cargo build --manifest-path apps/ncp-coordinator/Cargo.toml --example ncp_sim
+```
+
 The crate is excluded from the root workspace: its runtime features
 (`global-aps-counter`, `host-passthrough`) must not unify into the workspace
 test graph.
