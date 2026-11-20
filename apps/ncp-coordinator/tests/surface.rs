@@ -1180,3 +1180,116 @@ fn restoring_an_old_backup_never_lowers_the_outgoing_counters() {
     assert!(after.nwk_current >= used.nwk_limit);
     assert!(after.aps_current >= used.aps_limit);
 }
+
+/// One NCP boot over `security` (the persistent store): negotiates and
+/// runs `body` with the NCP, host and an `exchange` closure-like macro.
+macro_rules! boot {
+    ($security:ident, |$ncp:ident, $host:ident, $port:ident, $platform:ident, $pipe:ident,
+      $log:ident, $now:ident| $body:block) => {{
+        let mut gp_store = zigbee_runtime::gp_store::RamGpProxyStore::new();
+        let mut profile = profile();
+        let mut device = device(&profile);
+        let node = ZigbeeNode::new(&mut device, &mut $security, &mut profile);
+        let mut app = TrustCenterCoordinatorApp::new(
+            node,
+            PersistentChildren::new(RamChildTableStore::new()),
+            RamTrustCenterDeviceStore::new(),
+            &POLICY,
+            RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+        )
+        .unwrap();
+        app.set_green_power_store(&mut gp_store);
+        let mut $port = TcPort::new(app, IEEE, clock_ms);
+        let $log = LogRing::<8>::new();
+        let mut $pipe = Pipe::default();
+        let mut $platform = FakePlatform::default();
+        let mut $now = 1_000u64;
+        let mut $ncp = Ncp::<8>::new(identity(), 0xC0FF_EE05, $now);
+        let mut $host = Host::new($now);
+        exchange(
+            &mut $ncp,
+            &mut $host,
+            &mut $port,
+            &mut $platform,
+            &mut $pipe,
+            &$log,
+            &mut $now,
+        );
+        assert!($host.event(ids::EVT_NCP_READY).is_some());
+        let negotiate = $host.request(&SysNegotiateReq {
+            major_min: 1,
+            major_max: 1,
+            host_caps: 0,
+            name: Bytes8(b"surface"),
+        });
+        exchange(
+            &mut $ncp,
+            &mut $host,
+            &mut $port,
+            &mut $platform,
+            &mut $pipe,
+            &$log,
+            &mut $now,
+        );
+        let _: SysNegotiateRsp = $host.response(negotiate).body();
+        $body
+    }};
+}
+
+/// Spec 7.2 / 7.11 step 4 (zigpy Z11): after a reboot and before
+/// `NWK_INIT`, `NWK_GET_INFO` reports the committed network's identity
+/// with `state` 1 (formed, not up) instead of an empty NIB.
+#[test]
+fn network_info_after_a_reboot_reports_the_stored_identity() {
+    let mut security = RamSecurityStateStore::new();
+    boot!(security, |ncp, host, port, platform, pipe, log, now| {
+        let form = host.request(&form_request(0x1A62, 1 << 20));
+        exchange(
+            &mut ncp,
+            &mut host,
+            &mut port,
+            &mut platform,
+            &mut pipe,
+            &log,
+            &mut now,
+        );
+        assert_eq!(host.response(form).status(), 0);
+    });
+    boot!(security, |ncp, host, port, platform, pipe, log, now| {
+        let info = host.request_raw(ids::NWK_GET_INFO, &[]);
+        exchange(
+            &mut ncp,
+            &mut host,
+            &mut port,
+            &mut platform,
+            &mut pipe,
+            &log,
+            &mut now,
+        );
+        let info = host.response(info);
+        let info: NwkGetInfoRsp = info.body();
+        assert_eq!(
+            (info.state, info.pan_id, info.ext_pan_id, info.channel),
+            (1, 0x1A62, EPID, 20)
+        );
+        assert_eq!((info.key_seq, info.nwk_update_id), (3, 2));
+        assert_eq!(info.ieee.0, IEEE);
+    });
+    // A factory-new NCP still reports nothing.
+    let mut empty = RamSecurityStateStore::new();
+    boot!(empty, |ncp, host, port, platform, pipe, log, now| {
+        let info = host.request_raw(ids::NWK_GET_INFO, &[]);
+        exchange(
+            &mut ncp,
+            &mut host,
+            &mut port,
+            &mut platform,
+            &mut pipe,
+            &log,
+            &mut now,
+        );
+        let info = host.response(info);
+        let info: NwkGetInfoRsp = info.body();
+        assert_eq!(info.state, 0);
+    });
+}

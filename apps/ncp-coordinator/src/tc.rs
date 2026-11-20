@@ -312,7 +312,9 @@ enum AckState {
 pub struct TcPort<A: TcApp> {
     app: A,
     running: bool,
-    formed: bool,
+    /// The committed network (formed), read from the store at boot and
+    /// after every formation, install and wipe.
+    stored: Option<StoredNetwork>,
     events: Deque<DeviceEvent, 8>,
     clock_ms: fn() -> u32,
     ieee: [u8; 8],
@@ -359,12 +361,12 @@ impl<A: TcApp> TcPort<A> {
     /// `ieee`: the radio's EUI-64 (the NIB only learns it at start);
     /// `clock_ms`: monotonic milliseconds for indication timestamps.
     pub fn new(mut app: A, ieee: [u8; 8], clock_ms: fn() -> u32) -> Self {
-        let formed = commissioned(&mut app);
+        let stored = stored_network(&mut app);
         crate::gp::reset_defaults(&mut app);
         Self {
             app,
             running: false,
-            formed,
+            stored,
             events: Deque::new(),
             clock_ms,
             ieee,
@@ -680,13 +682,29 @@ fn left_event(event: TrustCenterHostEvent, own: [u8; 8]) -> Option<DeviceEvent> 
     }
 }
 
-fn commissioned<A: TcApp>(app: &mut A) -> bool {
+/// The committed network's identity, as `NWK_GET_INFO` reports it while
+/// the network is formed but not running (spec 7.2, 7.11 step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoredNetwork {
+    pan_id: u16,
+    ext_pan_id: [u8; 8],
+    channel: u8,
+    update_id: u8,
+    key_seq: u8,
+}
+
+/// The committed network in the security store, if any.
+#[inline(never)]
+fn stored_network<A: TcApp>(app: &mut A) -> Option<StoredNetwork> {
     let (_, store) = app.device_and_store_mut();
-    store
-        .load()
-        .ok()
-        .flatten()
-        .is_some_and(|state| state.commissioned)
+    let state = store.load().ok().flatten()?;
+    state.commissioned.then_some(StoredNetwork {
+        pan_id: state.pan_id,
+        ext_pan_id: state.extended_pan_id,
+        channel: state.channel,
+        update_id: state.update_id,
+        key_seq: state.key_sequence,
+    })
 }
 
 impl<A: TcApp> CoordinatorPort for TcPort<A> {
@@ -697,7 +715,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
     fn state(&self) -> NetworkState {
         if self.running && self.app.device().is_joined() {
             NetworkState::Up
-        } else if self.formed {
+        } else if self.stored.is_some() {
             NetworkState::FormedDown
         } else {
             NetworkState::None
@@ -708,6 +726,24 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         let device = self.app.device();
         let nwk = device.aps().nwk();
         let nib = nwk.nib();
+        let state = self.state();
+        if let (NetworkState::FormedDown, Some(stored)) = (state, self.stored) {
+            // Formed but not started (after a reboot, before `NWK_INIT`):
+            // the committed identity, flagged by `state`.
+            return NetworkInfo {
+                state,
+                pan_id: stored.pan_id,
+                ext_pan_id: stored.ext_pan_id,
+                channel: stored.channel,
+                channel_mask: device.bdb().attributes().primary_channel_set.0,
+                short: 0x0000,
+                ieee: self.ieee,
+                nwk_update_id: stored.update_id,
+                nwk_manager: 0x0000,
+                key_seq: stored.key_seq,
+                tx_power: 0x7F,
+            };
+        }
         NetworkInfo {
             state: self.state(),
             pan_id: nib.pan_id.0,
@@ -791,7 +827,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
 
     async fn init(&mut self, nwk_fc_floor: u32, aps_fc_floor: u32) -> Result<(), OpError> {
         if !self.running {
-            if !commissioned(&mut self.app) {
+            if stored_network(&mut self.app).is_none() {
                 return Err(OpError::NotFormed);
             }
             self.raise_nwk_floor(nwk_fc_floor)?;
@@ -810,7 +846,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
     }
 
     async fn form(&mut self, params: FormParams) -> Result<(), OpError> {
-        if self.running || commissioned(&mut self.app) {
+        if self.running || stored_network(&mut self.app).is_some() {
             return Err(OpError::InvalidState);
         }
         if !params.ncp_chosen_identity() {
@@ -827,7 +863,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             .initialize()
             .await
             .map_err(|_| OpError::Zigbee(0x01))?;
-        self.formed = commissioned(&mut self.app);
+        self.stored = stored_network(&mut self.app);
         if !self.app.device().is_joined() {
             // Formation failed: no stack to step; the host may retry.
             return Err(OpError::Zigbee(0x01));
@@ -962,7 +998,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
     }
 
     async fn leave_reset(&mut self) -> Result<(), OpError> {
-        if self.formed {
+        if self.stored.is_some() {
             self.retain_counter_bounds()?;
         }
         self.app.wipe().await.map_err(|_| OpError::Storage)?;
@@ -975,7 +1011,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         while self.app.take_tc_event().is_some() {}
         self.fail_pending_acks();
         self.running = false;
-        self.formed = false;
+        self.stored = None;
         Ok(())
     }
 
@@ -1071,11 +1107,11 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         // next may reuse the same keys (a restore of its own backup), so it
         // starts above them whatever the image says.
         self.retain_counter_bounds()?;
-        if self.formed {
+        if self.stored.is_some() {
             // The previous network's NWK, child, APS and Trust Center state.
             self.app.wipe().await.map_err(|_| OpError::Storage)?;
             host_passthrough::clear();
-            self.formed = false;
+            self.stored = None;
         }
         let mut state = PersistentSecurityState::empty();
         state.commissioned = true;
@@ -1098,7 +1134,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             let (_, store) = self.app.device_and_store_mut();
             store.store(&state).map_err(|_| OpError::Storage)?;
         }
-        self.formed = true;
+        self.stored = stored_network(&mut self.app);
         if !children.is_empty() {
             // Written before the resume, which restores them like after a
             // reboot (same short address, no rejoin).
