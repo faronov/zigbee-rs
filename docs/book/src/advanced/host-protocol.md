@@ -826,6 +826,31 @@ message-level status `BUSY` and advertised in advance as a capacity
 (`max_aps_inflight`, 6.6). This lets hosts size their semaphores so that
 `BUSY` is rare.
 
+**Responses are never dropped (Z1).** Every request gets exactly one
+response (6.2), but a burst of small requests can ask for more response
+bytes than the NCP's per-endpoint transmit queue holds (a 64-byte
+`SYS_ECHO` answers with 72 bytes, so four full frames of them already
+exceed 1.5 KB). The NCP therefore:
+
+- takes a request only when the upper bound of its response fits in the
+  queue's free space less what is already owed; otherwise it answers
+  `BUSY` at once (an 8-byte status response, which always has a reserved
+  place) and the host retries;
+- keeps status responses and APS confirms that it could not queue in a
+  small ordered backlog and sends them before anything newer;
+- returns frame credits to the host only while its queue is at least half
+  free and nothing is owed (`auto_credit` off), so a host that keeps
+  sending is slowed by credits before it sees `BUSY`.
+
+The capacity `host_response_bytes` (ID 19, 6.6) is the response budget per
+endpoint: the queue size less one largest response (896 B on the ESP32
+NCP, 384 B with the compact tier). A host that keeps the total expected
+response size of its outstanding requests per endpoint within it sees
+`BUSY` for this reason only while events queued on the same endpoint
+(indications on `ZIGBEE`) take the room; it retries after the next
+confirm or response. Hosts take the smaller of their own budget and this
+capacity.
+
 ### 5.11 Keepalive, link failure and recovery
 
 - If nothing has been sent for `keepalive_ms`, send `ACK | POLL` (with all
@@ -1066,6 +1091,7 @@ Capacities (`{u8 id, u32 value}` list):
 | 7 | `fc_stride` (reservation size) | 14 | `max_source_route_relays` |
 | 15 | `gp_sink_table` | 16 | `gp_proxy_table` |
 | 17 | `max_ncp_requests` (outstanding NCP → host requests, default 8) | 18 | `max_tc_devices` (TC-device cache incl. pinned) |
+| 19 | `host_response_bytes` (response budget per endpoint, 5.10) | 20–255 | reserved |
 
 ### 6.7 Endpoint assignment
 
@@ -1167,16 +1193,16 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | `0x0101` | `NWK_INIT` | `u32 nwk_fc_floor, u32 aps_fc_floor` (host checkpoint floors, 0 = none) | `u8 network_state`; `NOT_FORMED` if NV has no network. Completes with `EVT_NETWORK_STATE`. | E (`CoordinatorApp`/`TrustCenterCoordinatorApp::initialize` persisted path) + N (floors) |
 | `0x0102` | `NWK_FORM` | `u32 channel_mask, u16 pan_id (FFFF = random), [8] ext_pan_id (0 = random), [16] network_key (0 = random), u8 key_seq, u8 nwk_update_id, i8 tx_power, u16 nwk_manager` | accepted; `EVT_NETWORK_STATE` follows | E (BDB formation; host-supplied parameters install the network directly on the quietest channel of the mask) |
 | `0x0103` | `NWK_LEAVE_RESET` | `u8 flags (bit0 keep IEEE override, bit1 keep host-endpoint registrations)` | — | E (`urgent_factory_reset_and_recommission`; a new network can follow in the same session) |
-| `0x0104` | `NWK_GET_INFO` | — | `u8 state, u16 pan_id, [8] ext_pan_id, u8 channel, u32 channel_mask, u16 short, [8] ieee, u8 nwk_update_id, u16 nwk_manager, u8 key_seq, u8 security_level, i8 tx_power, u8 stack_profile` | P |
+| `0x0104` | `NWK_GET_INFO` | — | `u8 state, u16 pan_id, [8] ext_pan_id, u8 channel, u32 channel_mask, u16 short, [8] ieee, u8 nwk_update_id, u16 nwk_manager, u8 key_seq, u8 security_level, i8 tx_power, u8 stack_profile`. With `state` 1 (formed, not started: after a reboot, before `NWK_INIT`) the fields are the stored network's identity: PAN ID, EPID, channel, update ID and key sequence from NV, `short` 0x0000, `nwk_manager` 0x0000, `tx_power` unknown (Z11) | E |
 | `0x0105` | `NWK_PERMIT_JOIN` | `u8 duration_s, u16 target (0xFFFC all routers + NCP, 0x0000 NCP only, else a router), u8 flags (bit0 TC significance)` | — | E (`nlme_permit_joining`, `mgmt_permit_joining_req`) |
 | `0x0106` | `NWK_ENERGY_SCAN` | `u32 channel_mask, u8 duration_exp, u8 count` | accepted; `EVT_ENERGY_SCAN_RESULT` follows | P (`nlme_ed_scan` exists; running it on an active coordinator must pause TX/RX and is N) |
-| `0x0107` | `NWK_CHANGE_CHANNEL` | `u8 channel, u8 nwk_update_id (0 = current+1)` | accepted; `EVT_CHANNEL_CHANGED` follows | P (`nlme_set_channel` and Mgmt_NWK_Update codec exist; the broadcast plus delayed local switch plus persistence is N) |
+| `0x0107` | `NWK_CHANGE_CHANNEL` | `u8 channel, u8 nwk_update_id (0 = current+1)` | accepted; `EVT_CHANNEL_CHANGED` follows. Needs the network up. The NCP broadcasts `Mgmt_NWK_Update_req{ScanChannels = 1 << channel, ScanDuration 0xFE, update ID}` to `0xFFFD`, commits the channel and update ID to NV (a reboot from then on resumes on the new channel), answers, and tunes the radio `nwkNetworkBroadcastDeliveryTime` (9 s) later; then `EVT_CHANNEL_CHANGED`. The current channel completes at once without a broadcast. `BUSY` while a change is pending; `INVALID_PARAMETER` outside 11–26. Sleepy end devices find the network again by their rejoin scan. | E (ESP32/CC26x2 NCP: broadcast through the data path, `nlme_set_channel`) |
 | `0x0108` | `NWK_SET_TX_POWER` | `i8 dbm` | `i8 applied_dbm` | E (MAC PIB `PhyTransmitPower`) |
 | `0x0109` | `NWK_CONCENTRATOR` | `u8 mode (0 off, 1 low-RAM, 2 high-RAM), u16 min_s, u16 max_s, u8 radius` | — | P (NWK concentrator state exists) |
 | `0x010A` | `NWK_ACTIVE_SCAN` | `u32 channel_mask, u8 duration_exp` | `u8 n, n×{u8 channel, u16 pan, [8] epid, u16 src, u8 lqi, i8 rssi, u8 permit, u8 stack_profile, u8 update_id}` | P (`nlme_network_discovery`) |
 | `0x010B` | `NWK_ADD_ENDPOINT` | `u8 ep, u16 profile, u16 device_id, u8 version, u8 n_in, n_in×u16, u8 n_out, n_out×u16` | — (`NO_SPACE` beyond `max_host_endpoints`; `INVALID_PARAMETER` for `ep` outside 1..=240 or more than 16 clusters in a list) | E (`ZigbeeDevice::register_host_endpoint`: the ZDO registry the server answers from; `max_host_endpoints` = 8; registering an endpoint again replaces it, including the product profile's endpoint with that number; registrations are RAM only and cleared by `NWK_LEAVE_RESET` without flags bit1) |
 | `0x010C` | `NWK_SET_MANUFACTURER_CODE` | `u16 code` | — | P (node descriptor field) |
-| `0x010D` | `NWK_GROUP_MEMBERSHIP` | `u8 op (1 add, 2 remove, 3 clear), u16 group, u8 ep` | — | E (APS group table, 16 groups × 8 endpoints) |
+| `0x010D` | `NWK_GROUP_MEMBERSHIP` | `u8 op (1 add, 2 remove, 3 clear), u16 group, u8 ep` | — Needs the network up. `ep` 1..=240 or the GP endpoint 242, `group` ≤ `0xFFF7`. Remove is idempotent; clear removes `ep` from every group (`group` ignored). `NO_SPACE` when the table is full. Persisted with the APS tables. | E (APS group table, 16 groups × 8 endpoints; capability bit 17) |
 | `0x010E` | `NWK_REMOVE_DEVICE` | `u16 nwk, [8] ieee, u8 flags (bit0 rejoin, bit1 remove children, bit2 TC remove via parent)` | — | E (TC Remove-Device/leave journal) + P |
 | `0x0180` | `EVT_NETWORK_STATE` | `u8 state (0 down, 1 forming, 2 up, 3 leaving), u8 reason, u8 zb_status, u16 req_tid` | event | N |
 | `0x0181` | `EVT_DEVICE_JOINED` | `u16 nwk, [8] ieee, u16 parent_nwk, u8 join_type (0 association, 1 secured rejoin, 2 unsecured/TC rejoin, 3 direct), u8 capability, u8 decision (0 admitted, 1 denied)` | event | E (`TrustCenterHostEvent::Joined`: one event per Trust Center Update-Device join decision, through any parent including the NCP itself; `capability` is reconstructed from the neighbour entry for a child of the NCP and 0 for a device that joined through another parent; `parent_nwk` `0xFFFF` when unknown. `Device_annce` is forwarded as an indication, not as this event) |
@@ -1187,7 +1213,7 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | `0x0186` | `EVT_NWK_STATUS` | `u16 dst, u8 nwk_status, u16 reporter` | event | P |
 | `0x0187` | `EVT_PAN_ID_CONFLICT` | `u16 conflicting_pan, u8 count` | event | P (`conflict.rs`) |
 | `0x0188` | `EVT_PERMIT_JOIN_STATE` | `u8 remaining_s` | event | N |
-| `0x0189` | `EVT_CHANNEL_CHANGED` | `u8 channel, u8 nwk_update_id, u16 req_tid` | event | N |
+| `0x0189` | `EVT_CHANNEL_CHANGED` | `u8 channel, u8 nwk_update_id, u16 req_tid` | event (`channel` is the one the radio is on; a failed tune reports the old channel, NV already holds the new one) | E |
 | `0x018A` | `EVT_ENERGY_SCAN_RESULT` | `u16 req_tid, u8 status, u8 n, n×{u8 channel, i8 max_rssi_dbm, u8 energy}` | event | N |
 
 **RF front-end modules (external PA/LNA).** Every power and level on this
@@ -1339,8 +1365,8 @@ Go hub's generic interviewer already do.
 |---|---|---|---|---|
 | `0x0401` | `SEC_GET_NETWORK_KEY` | `u8 which (0 active, 1 alternate)` | `[16] key, u8 seq, u32 nwk_fc_limit` (`ACCESS_DENIED` if export is locked) | P (`SecurityStateJournal` holds it; the read API is N) |
 | `0x0402` | `SEC_SET_TC_POLICY` | `u8 allow_join (0 deny, 1 global TCLK, 2 install code only), u8 require_tclk_update, u8 allow_tc_rejoin, u8 allow_app_link_keys, u16 join_timeout_s` | — | P (BDB TC fields, `allow/deny_application_key_request`) |
-| `0x0403` | `SEC_ADD_INSTALL_CODE` | `[8] ieee, u8 len (8/10/14/18), code[]` (includes CRC, little-endian) | `[16] derived_key`; the host stores it (section 8) | E (`provision_install_code`, `derive_install_code_key`) |
-| `0x0404` | `SEC_ADD_LINK_KEY` | `[8] ieee, [16] key, u8 key_type (1 TCLK unique, 3 application), u8 attrs, u32 rx_floor, u8 flags (bit0 temporary until join)` | — | E (`provision_link_key`) + N (floors/attributes import) |
+| `0x0403` | `SEC_ADD_INSTALL_CODE` | `[8] ieee, u8 len (8/10/14/18), code[]` (includes CRC, little-endian) | `[16] derived_key`; the host stores it (section 8). Needs the network up; a wrong length or CRC is `INVALID_PARAMETER`. Capability bit 3. | E (`provision_install_code`, `derive_install_code_key`) |
+| `0x0404` | `SEC_ADD_LINK_KEY` | `[8] ieee, [16] key, u8 key_type (1 TCLK unique, 3 application), u8 attrs, u32 rx_floor, u8 flags (bit0 temporary until join)` | — Needs the network up. The ESP32/CC26x2 NCP takes `key_type` 1 with `rx_floor` 0 (origin "imported"); type 3 or a floor is `UNSUPPORTED_COMMAND` (`TBL_PUSH` and restore carry them). It has no temporary keys: bit0 keeps the key like any provisioned one until `TBL_INVALIDATE` or a wipe. | E (`provision_link_key`) + N (floors/attributes import) |
 | `0x0405` | `SEC_REMOVE_LINK_KEY` | `[8] ieee` | — | P |
 | `0x0406` | `SEC_ROTATE_NETWORK_KEY` | `[16] key (0 = random), u8 mode (0 broadcast, 1 unicast to routers), u16 switch_delay_s` | accepted; `EVT_NETWORK_KEY_SWITCHED` follows | E (`prepare/commit/activate/complete_network_key_rotation`) |
 | `0x0407` | `SEC_GET_LINK_KEY` | `[8] ieee` | `[16] key, u8 type, u8 attrs, u32 tx (global limit), u32 rx_floor` | P |
@@ -1401,9 +1427,9 @@ Section 9 defines these commands.
 |---|---|---|---|---|
 | `0x0701` | `DIAG_GET_COUNTERS` | `u8 group_mask` (bit0 link, bit1 MAC, bit2 NWK, bit3 APS, bit4 security, bit5 tables, bit6 queues, bit7 Green Power) | `u8 n, n×{u16 id, u32 value}` | P (several counters exist, e.g. `replay_table_full`, `frame_pending_acks`; a registry is N) |
 | `0x0702` | `DIAG_RESET_COUNTERS` | `u8 group_mask` | — | N |
-| `0x0703` | `DIAG_GET_NEIGHBORS` | `u8 start` | `u8 total, u8 n, n×{[8] ieee, u16 nwk, u8 type, u8 rx_on, u8 relationship, u8 lqi, u8 outgoing_cost, u8 age}` | P |
-| `0x0704` | `DIAG_GET_ROUTES` | `u8 start` | `u8 total, u8 n, n×{u16 dst, u16 next_hop, u8 status, u8 flags}` | P |
-| `0x0705` | `DIAG_GET_CHILDREN` | `u8 start` | `u8 total, u8 n, n×{[8] ieee, u16 nwk, u8 capability, u8 timeout_exp, u32 last_poll_ms}` | P |
+| `0x0703` | `DIAG_GET_NEIGHBORS` | `u8 start` | `u8 total, u8 n, n×{[8] ieee, u16 nwk, u8 type, u8 rx_on, u8 relationship, u8 lqi, u8 outgoing_cost, u8 age}` (Mgmt_Lqi codes: type 0 coordinator, 1 router, 2 end device; relationship 0 parent, 1 child, 2 sibling, 4 previous child, 5 unauthenticated child; up to 16 per page) | E |
+| `0x0704` | `DIAG_GET_ROUTES` | `u8 start` | `u8 total, u8 n, n×{u16 dst, u16 next_hop, u8 status, u8 flags}` (Mgmt_Rtg status codes; flags bit1 many-to-one, bit2 route record required) | E |
+| `0x0705` | `DIAG_GET_CHILDREN` | `u8 start` | `u8 total, u8 n, n×{[8] ieee, u16 nwk, u8 capability, u8 timeout_exp, u32 last_poll_ms}` (`last_poll_ms` `0xFFFFFFFF` when unknown) | E |
 | `0x0706` | `DIAG_GET_SOURCE_ROUTES` | `u8 start` | `u8 total, u8 n, n×{u16 dst, u8 k, k×u16}` (cache only) | P |
 
 Counter ID groups:
@@ -2310,10 +2336,16 @@ Notes: 1 `HOST_BACKED` (key not cached on the NCP; the host must hold it),
 
 Rules:
 
-1. `BEGIN` stops the Zigbee network (radio quiet, no beacons) and opens a
-   staging area. The previous network stays in NV until `COMMIT`. `ABORT`,
-   a session reset or a reboot discards the staging area and restores the
-   previous state. Restore requires capability bit 15.
+1. `BEGIN` opens a staging area; it is accepted with the network up,
+   formed but down, or absent. The previous network stays in NV, and a
+   running one keeps serving, until `COMMIT`. `COMMIT`, once `END` and the
+   records are checked, stops and wipes a running network like
+   `NWK_LEAVE_RESET` (its outgoing counters are retained, so a restore of
+   the same keys starts above them) and then installs the restored one.
+   `ABORT`, a session reset or a reboot discards the staging area and
+   leaves the previous state untouched. Restore requires capability
+   bit 15. (Z3: staging is RAM-only, so stopping the radio at `BEGIN` only
+   lengthened the outage and needed a restart path for `ABORT`.)
 2. Records are validated as they arrive. Violations fail the PUT with
    `INVALID_PARAMETER` and abort the transaction: security level ≠ 5, node
    NWK ≠ `0x0000`, a channel outside 11–26, an all-zero network key, a PAN
@@ -2366,14 +2398,27 @@ radio actually uses.
 | `0x0602` | `BKP_EXPORT_READ` | `u16 txn, u16 max_bytes` | `u8 more, records…` (the stream ends with `END`) |
 | `0x0603` | `BKP_EXPORT_END` | `u16 txn` | — |
 
+- `BEGIN` needs the network up (`network_state` 2); otherwise
+  `INVALID_STATE`, and a host that finds the NCP formed but down sends
+  `NWK_INIT` first (Z2). The export reports durable counter limits and the
+  live tables, which exist only once the stack has resumed and reserved
+  its counters; an export read from NV before that could under-report a
+  counter.
+- The NCP keeps **one** export transaction. A second `BEGIN` replaces the
+  first, whose `READ` and `END` then answer `NOT_FOUND`; hosts serialize
+  exports (Z12). A session reset ends it too.
 - The snapshot is consistent. It is taken under the stack lock in one cycle
   and then streamed from a RAM or flash copy.
 - Counters are exported as **durable limits**. The NWK value equals the last
   `EVT_FC_CHECKPOINT`, so a backup never under-reports a counter.
 - `DEVICE` records cover children and cached entries. The host merges them
-  with its own store: for each device, the NCP record wins if its `rev` is
-  newer; otherwise the host's record is used. Every link-key `tx_counter` is
-  then set to the exported APS limit.
+  with its own store. Export records carry no `rev` (Z4): `rev` belongs to
+  `TBL_*` entries (8.5) of an NCP that pages its tables to the host. A
+  standalone NCP (no paging, `TBL_READ` entries with `rev` 0) is
+  authoritative for what it exports, so the presence rule applies: a record
+  with a link block replaces the host's key for that device; a record
+  without one keeps the host's key (keys not exported, or held only by the
+  host). Every link-key `tx_counter` is then set to the exported APS limit.
 - Without bit0 (or when export is locked), keys are omitted and the host
   produces an **incomplete** backup. zigpy's `is_complete()` then rejects
   it. The UI must say so instead of storing an unusable backup.
@@ -3004,7 +3049,7 @@ transient link loss from zigpy whenever the NCP state can be reconciled:
 | 1. Detect | One of: `PEER_RESTARTED` (new NCP link cookie); `LINK_DOWN`; the serial port disappearing (USJ re-enumeration). | — |
 | 2. Hold | New `send_packet` calls wait, bounded by zigpy's concurrency limit, within the **resume budget** (default 20 s; 60 s while an NCP firmware update is activating). In-flight requests: after `PEER_RESYNC` they are re-sent with `RETRY` (6.5); after a restart they fail with `DeliveryError("NCP restarted, delivery unknown")`. | — |
 | 3. Reconnect | Reopen the port by stable identity (11.3). Handshake, then `SYS_NEGOTIATE`. A newer firmware is fine; a different major version is not. | `connection_lost` |
-| 4. Reconcile | `EVT_NCP_READY` and `NWK_GET_INFO` must match zigpy's `state.node_info` / `state.network_info`: IEEE, PAN ID, EPID, channel, security level, `nwk_update_id` ≥ known, key sequence ≥ known. `network_state` must be formed (1/2) and `table_epoch` must equal the sidecar's; when formed-down, `NWK_INIT` comes first because the NCP reports the network only once it is up (Z11). A higher key sequence or update ID (rotation or channel change that completed during the outage) is accepted and copied into zigpy's state. | `connection_lost` (zigpy re-initializes and may restore from backup) |
+| 4. Reconcile | `EVT_NCP_READY` and `NWK_GET_INFO` must match zigpy's `state.node_info` / `state.network_info`: IEEE, PAN ID, EPID, channel, security level, `nwk_update_id` ≥ known, key sequence ≥ known. `network_state` must be formed (1/2) and `table_epoch` must equal the sidecar's; when formed-down, `NWK_GET_INFO` reports the stored identity (7.2) and `NWK_INIT` follows; NCP images before the Z11 fix report the network only once it is up, so `NWK_INIT` comes first with them. A higher key sequence or update ID (rotation or channel change that completed during the outage) is accepted and copied into zigpy's state. | `connection_lost` (zigpy re-initializes and may restore from backup) |
 | 5. Replay | `NWK_INIT` with checkpoint floors (if not up). Then: `SEC_SET_TC_POLICY`, `NWK_ADD_ENDPOINT` ×n, `NWK_GROUP_MEMBERSHIP`, `NWK_SET_TX_POWER`, `NWK_CONCENTRATOR`, `NWK_SET_MANUFACTURER_CODE`, `GP_SINK_CONFIG`, the open permit-join and GP-commissioning remainders, `SEC_LOCK_KEY_EXPORT` if the user configured the lock, `TBL_SYNC`, and the GP shadow check. | `connection_lost` |
 | 6. Release | Resume queued calls. Log the event and increment `state.counters["zrhp"]["ncp_resumed"]`. If the port did not come back within the budget, try the USJ hard reset (11.3) once before giving up. | `connection_lost` |
 
@@ -3030,6 +3075,47 @@ Each item is what the library does today and a proposed spec change.
 | Z12 | The NCP keeps one backup export transaction; a second `BKP_EXPORT_BEGIN` replaces the first, whose `READ` then returns `NOT_FOUND`. zigpy's periodic backup and a manual one ran concurrently on hardware. | Exports and restores are serialized in the host. | State in 9.5 that there is one export transaction per NCP and that BEGIN aborts a running one (or return `BUSY`). |
 | Z13 | The H2 NCP image answers `DIAG_GET_NEIGHBORS` and `DIAG_GET_CHILDREN` with `UNSUPPORTED_COMMAND`. | The local ZDO responder answers Mgmt_Lqi_req / Mgmt_Rtg_req for the coordinator with status `NOT_SUPPORTED` (allowed for Mgmt_Lqi on constrained devices; zigpy's topology scan skips it). | Implementation gap (as Z10, H6); needed for a network map. |
 | Z14 | Behind the S3 bridge (CDC 0, `tbr-bridge` 0.2.2, 921 600 + RTS/CTS on the bridge side) the link sometimes stays silent for a whole 5 s handshake: 0 bytes received, although `RESET_REQ` is retransmitted. A DTR/RTS reset within the same open did not help; closing and reopening the port did, at once and without a reset (NCP cookie unchanged). Seen about 1 in 5 starts, mostly after the previous host process had failed or been killed; idle gaps up to 150 s and `kill -9` alone did not reproduce it. The bridge showed no restart, no UART errors, EN/BOOT high. Root cause unknown (bridge USB/CDC state or macOS tty). | Connect retries the configured rate with a fresh open, then a hard reset, then the fallback rate; no fallback once valid frames were received; the failure reports the receive counters. | Add to 5.5 (host open): "if no frame arrives within the handshake timeout, close and reopen the port before resetting the NCP". Investigate on the bridge: log `uart->usb`/`usb->uart` counters and line state across a silent open. |
+
+**NCP status after `ncp-host-gaps`** (ESP32 H2/C6 and CC26x2 NCP,
+host-tested; hardware gates open):
+
+- Z1 fixed (5.10): no response is dropped; `BUSY` at admission, an
+  ordered backlog for owed statuses and confirms, credits held while the
+  queue is more than half full. The budget is capacity 19
+  (`host_response_bytes`, 896 B; 384 B compact), below the library's
+  1 024 B: hosts use the smaller value.
+- Z2: kept and specified (9.5); `NWK_INIT` first is the correct host
+  behaviour.
+- Z3 fixed (9.4 rule 1): `BEGIN` with the network up is accepted and
+  `COMMIT` stops it; the host-side `NWK_LEAVE_RESET` still works.
+- Z4: presence rule specified (9.5).
+- Z10: `NWK_GROUP_MEMBERSHIP` and `NWK_CHANGE_CHANNEL` implemented;
+  `NWK_ENERGY_SCAN` and `SEC_SET_TC_POLICY` are still
+  `UNSUPPORTED_COMMAND`.
+- Z11 fixed: with `network_state` 1, `NWK_GET_INFO` returns the stored
+  identity (7.2), so reconcile can compare before `NWK_INIT`.
+- Z12: one export transaction, specified (9.5).
+- Z13: `DIAG_GET_NEIGHBORS`, `DIAG_GET_ROUTES` and `DIAG_GET_CHILDREN`
+  implemented. The local ZDO responder still answers Mgmt_Lqi_req /
+  Mgmt_Rtg_req with `NOT_SUPPORTED`.
+- Z14, analysis (not reproduced; needs the BR board). The NCP cookie stayed
+  the same and an H2 reset within the same open was silent too, so the
+  NCP was not the one holding the bytes: the S3's UART → USB direction
+  was. In `tbr-bridge` 0.2.2 `uart_to_usb` keeps retrying `usb::write` for
+  as long as flow control is on and DTR is high. If the CDC IN FIFO stops
+  draining, the thread never returns to the UART: RTS stays deasserted,
+  the H2 pauses, and nothing reaches the host until DTR drops, which is
+  what closing the port does. Proposed bridge change: bound the no-progress
+  wait (e.g. 200 ms), then clear the CDC TX FIFO and count a stall; clear
+  it as well on a DTR rising edge (a new session never needs the previous
+  session's bytes). To confirm, read the bridge console `info` during a
+  silent episode: `UART_TO_USB` should be stuck and the `Uart2Usb` mark
+  should be inside the write.
+- `SYS_RESET` taking about 28 s: a reset that fell due while the NCP ran a
+  queued operation was handed to the product's drive loop, which ignored
+  it, so the NCP kept running until the host reset it by its lines. Fixed:
+  the request stays armed until carried out. This is the likely cause; it
+  was not reproduced on hardware.
 
 **Sidecar store** (decision 4).
 
@@ -3250,6 +3336,14 @@ does today and a proposed change.
 | H8 | herdsman adds no NWK margin itself (zigpy adds 10 000), and its backups carry no TCLK counter unless the adapter writes `metadata.internal.network`. | `nwk_margin = 10 000`; APS 10 000 when the file has a TCLK counter **or** `stack_specific.zigbee_rs.aps_frame_counter_limit`, 2²⁰ otherwise (Z5). The adapter's own backups carry `internal.network.tc_link_key` (herdsman's pass-through of unknown `internal` keys, part of the fork). | Fold into 9.4 rule 6. |
 | H9 | Native USB re-enumeration after an NCP reset changes the device node; a Docker `--device` mapping does not follow it. | Reopens the port by path for the resume budget (20 s), then reports `disconnected` (Z2M stops; a container restart policy recovers). | Add to 11.3: hosts in containers map `/dev/serial/by-id` paths and expect a restart after an NCP reset. |
 | H10 | The response budget of Z1 also matters for herdsman (many parallel requests from Z2M at start). | Same 1 024-byte per-endpoint budget as the zigpy library. | As Z1. |
+
+After `ncp-host-gaps` (host-tested): H5, `NWK_GROUP_MEMBERSHIP{add, 0x0B84,
+242}` is accepted (the NCP itself does not yet join 242 to
+`GP_SINK_CONFIG.group` in `HOST_SINK`). H6: `NWK_CHANGE_CHANNEL`,
+`DIAG_GET_NEIGHBORS` / `DIAG_GET_ROUTES` and `SEC_ADD_INSTALL_CODE` /
+`SEC_ADD_LINK_KEY` (type 1) are implemented. `NWK_SET_TX_POWER` and
+`NWK_PERMIT_JOIN` with a router target are still `UNSUPPORTED_COMMAND`.
+H10: use capacity 19, as in Z1.
 
 ### 12.4 Embedded hub (`faronov/zigbee-rs-hub`, ESP32-S3)
 
