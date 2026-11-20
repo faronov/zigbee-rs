@@ -378,12 +378,11 @@ impl<A: TcApp> TcPort<A> {
     /// `ieee`: the radio's EUI-64 (the NIB only learns it at start);
     /// `clock_ms`: monotonic milliseconds for indication timestamps.
     pub fn new(mut app: A, ieee: [u8; 8], clock_ms: fn() -> u32) -> Self {
-        let stored = stored_network(&mut app);
         crate::gp::reset_defaults(&mut app);
-        Self {
+        let mut port = Self {
             app,
             running: false,
-            stored,
+            stored: None,
             events: Deque::new(),
             clock_ms,
             ieee,
@@ -395,7 +394,11 @@ impl<A: TcApp> TcPort<A> {
                 armed: true,
                 ..PreEraseSchedule::default()
             },
-        }
+        };
+        // Probed after construction so that the port is built in place in
+        // the caller's frame (the boot chain).
+        port.stored = stored_network(&mut port.app);
+        port
     }
 
     pub fn app(&self) -> &A {
