@@ -229,7 +229,7 @@ is not part of ZRHP and is not specified here.
 | Aspect | Desktop host (D) | Embedded host (E) |
 |---|---|---|
 | Examples | zigpy (HA), Go hub, zigbee-herdsman (Z2M) on Linux/macOS/Windows | `zigbee-rs-hub` on ESP32-S3-WROOM-1 (8 MB flash, or 4 MB on early boards; 2 MB PSRAM) |
-| Transport | USB-Serial-JTAG CDC (H2/C6 native USB), or UART through a USB-UART bridge with RTS/CTS (default 921 600) | Board UART to the H2 (Thread BR board: 460 800 default, RTS/CTS optional on the reserved lines, 11.5) |
+| Transport | USB-Serial-JTAG CDC (H2/C6 native USB), or UART through a USB-UART bridge with RTS/CTS (default 921 600) | Board UART to the H2 (Thread BR board: 921 600 with RTS/CTS on the reserved lines by default, 11.5) |
 | NCP reset / update | USJ DTR/RTS reset (11.3); firmware update via `FW_*` over BULK | `FW_*` over BULK (normal path); H2 ROM bootloader through host-driven EN/BOOT GPIOs (recovery and provisioning, 11.5) |
 | Host store | SQLite (zigpy sidecar, Go hub DB) or a sidecar file (herdsman) | Raw-flash log-structured journal partition. No filesystem assumed. |
 | Store sizing for 1000+ devices | Unbounded | ≈ 64 B/device in PSRAM: 2 000 devices ≈ 128 KiB (3.4) |
@@ -342,7 +342,8 @@ USB-Serial-JTAG CDC-ACM and UART.
 
 - **Format.** 8N1. Defaults:
   - **921 600 baud** with RTS/CTS for desktop hosts behind a USB-UART bridge;
-  - **460 800 baud** on the Espressif Thread BR board (11.5).
+  - **921 600 baud** with RTS/CTS on the Espressif Thread BR board, over
+    its reserved 0 Ω links (11.5, decision N10).
 
   Supported rates are 460 800, 921 600, 2 000 000 and 3 000 000 (C6 only),
   subject to 4.4. The NCP does not autobaud.
@@ -392,7 +393,7 @@ No network transport is planned (decision 2026-11-18).
 |---|---|---|
 | RTS/CTS on both sides | 2 000 000 on the H2 (3 M if gate H2 passes); 3 000 000 on the C6 | Bridge supports the rate (for example CP2102N up to 3 M) |
 | No RTS/CTS, both sides DMA or IRAM-ISR RX into a ring ≥ `rx_window × 656` | 921 600 | Gate H8: `rx_overflow = 0` under host and NCP flash-write load |
-| No RTS/CTS, any side without DMA/IRAM RX | 460 800, ARQ recovers losses at a goodput cost | Espressif's own RCP link default on the BR board |
+| No RTS/CTS, any side without DMA/IRAM RX | 460 800, ARQ recovers losses at a goodput cost | Espressif's own RCP link default on the BR board (not the ZRHP default there since N10) |
 
 The worst-case FIFO-free time at 921 600 with a 128-byte FIFO and an RX
 threshold of 64 bytes is 64 × 10.85 µs ≈ 0.69 ms. An IRAM ISR meets this.
@@ -737,7 +738,7 @@ keepalive.
 host's scheduling slack. Its default is 10 ms, and it should be raised to
 30 ms for Python on busy hosts.
 
-| Timer / constant | Formula | 460 800 (BR board) | 921 600 | 2 M | 3 M | USB-Serial-JTAG | Range |
+| Timer / constant | Formula | 460 800 (BR fallback) | 921 600 | 2 M | 3 M | USB-Serial-JTAG | Range |
 |---|---|---:|---:|---:|---:|---:|---|
 | `T_frame_max` | 656·T_byte | 14.2 ms | 7.1 ms | 3.3 ms | 2.2 ms | ≤ 11 ms (11 × 64 B packets at 1 packet per 1 ms frame, worst case) | — |
 | `ack_delay` | ≤ T_frame_max/2, ≤ 2 ms | 2 ms | 1 ms | 1 ms | 0.5 ms | 1 ms | 0.2–5 ms |
@@ -2397,7 +2398,7 @@ UART (10 bits/byte):
 
 | Link | Bytes/s | Indications/s unbatched | Indications/s batched |
 |---|---:|---:|---:|
-| 460 800 baud (Thread BR board default) | 46 080 | 731 | 917 |
+| 460 800 baud (Thread BR fallback) | 46 080 | 731 | 917 |
 | 921 600 baud | 92 160 | 1 463 | 1 835 |
 | 2 000 000 baud | 200 000 | 3 175 | 3 982 |
 | 3 000 000 baud | 300 000 | 4 762 | 5 972 |
@@ -2436,15 +2437,15 @@ broadcasts (three transmissions each) cut this substantially.
 
 A 1000-device network therefore produces the following load:
 
-| Load | Reports/s | Air utilisation near the coordinator | Link utilisation at 460 800 (BR board) | at 921 600 (63 B frames) | at USJ worst case |
+| Load | Reports/s | Air utilisation near the coordinator | Link utilisation at 460 800 (BR fallback) | at 921 600 (63 B frames) | at USJ worst case |
 |---|---:|---:|---:|---:|---:|
 | 1 report / 5 min / device | 3.3 | 1.5 % | 0.5 % | 0.2 % | 0.3 % |
 | 1 report / 60 s / device | 16.7 | 7.3 % | 2.3 % | 1.1 % | 1.6 % |
 | 1 report / 10 s / device | 100 | 44 % (saturating in practice) | 13.7 % | 6.8 % | 9.8 % |
 | Air-limit burst | ~228 | 100 % | 31 % | 15.6 % | 22 % |
 
-Even the slowest configuration, the BR board's 460 800 baud without flow
-control, has more than 3 times the serial capacity the radio can produce. ZRHP's speed requirement is therefore about:
+Even the slowest configuration, 460 800 baud without flow control (the BR
+board's fallback), has more than 3 times the serial capacity the radio can produce. ZRHP's speed requirement is therefore about:
 
 - **latency under concurrency**: many requests in flight, no lock-step;
 - **burst absorption**: after a power outage, every device rejoins,
@@ -2647,39 +2648,97 @@ Sources: [ESP-TBR-HW] and the board schematic v1.3 [ESP-TBR-SCH].
 | PTA priority | GPIO10 | GPIO2 | Coexistence (optional) |
 | PTA grant | GPIO13 | GPIO1 | Coexistence (optional) |
 | PTA tx_line | GPIO11 | GPIO3 | Coexistence; the S3 needs the 4th wire |
-| Reserved (R18, 0 Ω) | GPIO6 | GPIO12 | Unused by ZRHP v1 |
-| Reserved (R19, 0 Ω) | GPIO5 | GPIO4 | **Optional H2 RTS → S3 CTS** |
-| Reserved (R20, 0 Ω) | GPIO4 | GPIO5 | **Optional S3 RTS → H2 CTS** |
+| Reserved (R18, 0 Ω) | GPIO6 | GPIO12 | Unused by ZRHP v1 (spare) |
+| Reserved (R19, 0 Ω) | GPIO5 (U1CTS, pull-down) | GPIO4 (U0RTS) | **H2 RTS → S3 CTS** |
+| Reserved (R20, 0 Ω) | GPIO4 (U1RTS) | GPIO5 (U0CTS, pull-down) | **S3 RTS → H2 CTS** |
 
-**Flow control on this board.**
+**Flow control on this board** (decision N10, measured 2026-11-19).
 
-- **No dedicated RTS/CTS lines.** The documentation lists none, and the
-  board's default RCP link runs TX/RX only at 460 800.
-- **ZRHP default:** 460 800 baud, no hardware flow control. Credits bound
-  each direction to `window × 656` bytes.
-- **Required on both sides:** a DMA or IRAM RX path (4.1).
-  - NCP: zigbee-rs UART driver with UHCI RX (new HAL work).
-  - S3 hub: ESP-IDF UART driver with `CONFIG_UART_ISR_IN_IRAM` or UHCI,
-    with the ring buffer in internal RAM.
-- **921 600 without flow control** is allowed after gate H8 shows no
-  overflow while both chips write flash.
-- **Default** (decision N4): 460 800 without flow control. The DMA/IRAM RX
-  path above is **mandatory** on both sides.
-- **Hardware flow control: optional board modification.** This is
-  documented, not a default. The schematic's three populated "Reserved"
-  0 Ω links (R18–R20) can carry RTS/CTS, routed through both chips' GPIO
-  matrices:
-  - H2 `U0RTS` → GPIO4 → S3 GPIO5 as `U1CTS`;
-  - S3 `U1RTS` → GPIO4 → H2 GPIO5 as `U0CTS`.
+- **RTS/CTS on the reserved links.** Espressif documents no flow-control
+  lines (its RCP link runs TX/RX only at 460 800), but the schematic's
+  "Reserved" 0 Ω links R18–R20 are populated. On the hwlab board all three
+  were verified both ways: each S3 pin driven while the H2 ROM loader read
+  `GPIO_IN`, and each H2 pin driven while the S3 sensed it. Routing through
+  both GPIO matrices:
+  - H2 `U0RTS` → H2 GPIO4 → R19 → S3 GPIO5 as `U1CTS`;
+  - S3 `U1RTS` → S3 GPIO4 → R20 → H2 GPIO5 as `U0CTS`.
+- **Pin safety.** H2 GPIO4/5 are the MTCK/MTDI pads: inputs in the ROM
+  loader, not strapping pins (ESP32-H2 strapping pins are GPIO8, GPIO9 and
+  GPIO25), and pad JTAG is not selected by default (USB-JTAG is), so the ROM
+  recovery path of this section is unaffected. S3 GPIO4/5 are not strapping,
+  flash, PSRAM or USB pins.
+- **ZRHP default: 921 600 baud with RTS/CTS.** RX flow threshold about 96
+  (H2) / 100 (S3) of the 128-byte FIFO.
+- **Both CTS inputs have a pull-down,** so an image without flow control
+  (pin undriven) never blocks the other side. A side with flow control off
+  drives its RTS low ("ready"). A mixed pair therefore degrades to no flow
+  control instead of stalling.
+- **2 000 000 baud with RTS/CTS** is allowed (4.4).
+- **460 800 without flow control** stays as the fallback, for images built
+  without the board feature and for Espressif's RCP. The DMA/IRAM RX path
+  (4.1) remains mandatory then:
+  - NCP: zigbee-rs UART driver with UHCI RX (new HAL work);
+  - S3 hub: ESP-IDF UART driver with `CONFIG_UART_ISR_IN_IRAM` or UHCI, with
+    the ring buffer in internal RAM.
+- **Measurements** (S3 bridge `faronov/zigbee-rs-hub` 0.2.2 with UART1
+  RTS/CTS; a RAM-only H2 test program; 128 KiB with the H2 not reading for
+  30 ms every 4 KiB, interrupts off, as during a flash erase):
 
-  This is enabled only when **both** images are built for it (board
-  feature `rtscts-reserved-lines`), and up to 2 Mbaud then applies (4.4).
-  Points to verify on the physical board (gate H8): R18–R20 are fitted on
-  the delivered revision; H2 GPIO4/5 are the pad-JTAG MTMS/MTDI pins, and
-  using them as GPIO disables pad JTAG while USB-JTAG still works.
-- **Mismatch handling.** A misconfigured pair (only one side using CTS) can
-  stall. The hub checks `SYS_GET_INFO.uart_flow` at session start and
-  disables its CTS if the NCP reports none.
+  | Baud | Flow control off | RTS/CTS |
+  |---:|---|---|
+  | 460 800 | 30 018 B lost (27 RX FIFO overflows) | 0 lost |
+  | 921 600 | 50 063 B lost (20 overflows) | 0 lost |
+  | 2 000 000 | 76 296 B lost (13 overflows) | 0 lost |
+
+  Bulk 256 KiB in each direction lost nothing at any rate, with or without
+  flow control: 43.9 / 87.7 / 176 KiB/s S3→H2 and 45 / 90 / 196 KiB/s
+  H2→S3. The 128-byte H2 FIFO lasts 2.8 ms at 460 800 and 0.64 ms at
+  2 Mbaud, so without RTS/CTS any longer RX stall loses data and relies on
+  ARQ.
+- **Board feature.** Both images enable it with the board feature
+  `rtscts-reserved-lines`; it is the default for the Thread BR board
+  profile.
+- **Mismatch handling.** The hub checks `SYS_GET_INFO.uart_flow` at session
+  start. If the NCP reports no flow control, the hub turns its own off
+  (RTS held low, CTS ignored) and uses 460 800.
+- **ESP32-H2 NCP implementation** (`examples/esp32-ncp`, branch
+  `ncp-br-flow`, 2026-11-20):
+  - The board crate routes `U0RTS` to GPIO4 and `U0CTS` from GPIO5 through
+    the GPIO matrix. The CTS pad gets its pull-down before `with_cts`
+    freezes the signal.
+  - `esp-serial-stream` enables RTS (threshold 96) and CTS together.
+  - With flow control off, the UART would hold RTS high from its reset
+    `CONF0.SW_RTS` value and block a peer whose flow control is on. This
+    was seen on the board: the host's frames stopped after
+    `SYS_SET_UART(921 600, flow 0)`. The stream now asserts RTS ("ready")
+    whenever flow control is off.
+  - A `SYS_SET_UART` switch that finds the DMA transmitter busy is retried
+    instead of dropped (host test).
+- **Measured with the real NCP** (S3 bridge 0.2.2, flow on; host echo flood
+  of 64-byte `SYS_ECHO`s, 16 in flight; NCP and host link counters):
+
+  | Image / line | Run | Echoes ok | Bad frames (NCP) | RX overflows (NCP) |
+  |---|---|---:|---:|---:|
+  | RTS/CTS, 921 600 | 70 s flood | 68 328 | 0 | 0 |
+  | RTS/CTS, 2 000 000 (`SYS_SET_UART`) | 60 s flood | 101 840 | 0 | 0 |
+  | RTS/CTS, 460 800 (`SYS_SET_UART`) | 60 s flood | 31 832 | 0 | 0 |
+  | flow off, 921 600 (`SYS_SET_UART`) | 60 s flood | 58 744 | 0 | 0 |
+  | RTS/CTS, 921 600 | 3 C6 join/leave cycles (2 factory-new; 17 and 9 sector erases of 26–40 ms during the flood) | 285 472 | 0 | 0 |
+  | RTS/CTS, 2 000 000 | 1 factory-new join (17 erases) and a leave session | 159 760 | 0 | 0 |
+  | fallback image (no flow control), 460 800 | 2 × 30 s flood (bridge flow control on, then off) | 27 936 | 0 | 0 |
+  | fallback image (no flow control), 460 800 | 2 factory-new C6 join/leave cycles | 101 744 | 0 | 0 |
+
+  Echo throughput was about 61 KiB/s each way at 921 600 and 106 KiB/s at
+  2 Mbaud. Retransmissions remained (up to 45 per run near line
+  saturation, `rx_duplicate` on the receiver): ARQ timeouts while the
+  peer was slow to acknowledge. They were not data loss. The UHCI DMA
+  receive keeps running through a flash erase, so the H2 never needed
+  to deassert RTS in these runs. RTS/CTS covers longer stalls.
+- **Found on the way:** esp-hal 1.0/1.1's `DmaRxStreamBuf` read a partly
+  filled *last* descriptor from the wrong offset. About one host frame in
+  a few hundred arrived CRC-bad (130 in 70 s at 921 600). There was no UART
+  line error or overflow. Fixed in the vendored esp-hal
+  (`vendor/esp-hal/LOCAL-PATCHES.md`); 0 since.
 
 **Flash size** (decision N4). Both partition tables of 8.9 (2 MB and 4 MB)
 are kept, and the size is detected at runtime:
@@ -3294,7 +3353,7 @@ This is simulation-level evidence, not hardware evidence.
 | H5 | **ZBT-1 hashed-TCLK verification** (decision 8): read a device's derived TCLK from the user's ZBT-1 (EZSP key export of a device that completed a TCLK update) and compare it with both candidates in `ezsp_hashed_tclk.json` computed from that network's `hashed_tclk`. The match becomes the normative vector and enables capability bit 14. Then migrate ZBT-1 → H2 → ZBT-1 with real devices, checking APS-secured exchanges (Verify-Key, network-key rotation) with a hashed-key device after each move. |
 | H6 | NCP firmware update with trial boot, confirm, rollback and retained network state. |
 | H7 | 24 h soak with noise injection on the UART variant (921 600, RTS/CTS). |
-| H8 | **Thread BR board UART:** 460 800 (default) and 921 600 without flow control, with both chips writing flash (`rx_overflow = 0`). Optional board mod: RTS/CTS on R19/R20 (fitted? H2 GPIO4/5 usable?) up to 2 Mbaud. Identify the H2 module's flash size (2 MB or 4 MB) via JEDEC ID, and check the NCP's layout-mismatch refusal. ROM-path recovery via S3 GPIO7/8 with `zbnv` preserved. |
+| H8 | **Thread BR board UART:** 921 600 (default) and 2 000 000 with RTS/CTS on R19/R20, and the 460 800 fallback without flow control, with both chips writing flash (`rx_overflow = 0`) under the real NCP and hub (R18–R20 fitting and an RX-stall test through the phase-0 bridge passed on 2026-11-19, 11.5; the real NCP with the H2 writing flash through the phase-0 bridge passed on 2026-11-20, 11.5; the real hub with the S3 writing flash is still open). Identify the H2 module's flash size (2 MB or 4 MB) via JEDEC ID, and check the NCP's layout-mismatch refusal. ROM-path recovery via S3 GPIO7/8 with `zbnv` preserved. |
 | H9 | **PTA coexistence:** Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on. The hub's automatic enable/disable follows Wi-Fi up/down, including Ethernet-only. GP TempMaster reply behaviour with grant denied. |
 | H10 | **GP combo on the NCP:** direct and proxy-tunnelled commissioning into the NCP sink with zigpy as shadow, including an unsecured (level-0) FlowerX GP / BGT1 GP; a bidirectional GPD with the NCP as its own TempMaster; Sink Table across an NCP reboot (seamless resume) and across backup/restore. |
 | H11 | **Z2M end to end:** zigbee-herdsman adapter with 10+ real devices; Z2M backup → restore on a fresh NCP. |
@@ -3356,12 +3415,13 @@ two requirements. Each decision is applied in the sections listed.
 | N1 | NCP GP sink `gpsSecurityLevel` = **0x00** (zigpy-compatible): unsecured GPDs such as FlowerX GP / BGT1 GP are accepted. | 7.11, 12.4, 13, 14.3, H10, `messages.json` (`gp_sink_config_zigpy`) |
 | N2 | The **"sink on radio" hook** and all zigpy / `zigpy-zrhp` work live in **our fork** (`faronov/zigpy`, `faronov/zigpy-zrhp`). No upstream zigpy PR for now; upstreaming is a later step that needs the user's approval. The Go hub and zigbee-herdsman move to `NCP_SINK` later; v1 keeps `HOST_SINK` there (roadmap). | 3, 7.11, 12.2, 12.3, 14.3, 15 |
 | N3 | **No derived TCLKs** for new networks: random per-device TCLKs only. Hashed mode exists only for EZSP migration. | 7.5 |
-| N4 | BR board UART: **460 800 without flow control** by default, DMA/IRAM RX mandatory; RTS/CTS via R19/R20 documented as an optional board mod. H2 module flash size unknown: both 2 MB/4 MB partition tables kept, size detected at runtime (checked when the board is on hwlab). | 11.5, 8.9, H8 |
+| N4 | BR board UART: **460 800 without flow control** by default (UART part superseded by N10, 2026-11-19), DMA/IRAM RX mandatory; RTS/CTS via R19/R20 documented as an optional board mod. H2 module flash size unknown: both 2 MB/4 MB partition tables kept, size detected at runtime (checked when the board is on hwlab). | 11.5, 8.9, H8 |
 | N5 | zigbee-herdsman: **maintained fork**, no upstream PR plan for v1. | 3, 12.3, 15 |
 | N6 | ~~The S3 stores known-good + candidate NCP images, with rollback through the H2 ROM bootloader.~~ **Amended 2026-11-18:** rollback lives on the **H2**: A/B application slots on the H2 flash, `FW_*` writes the inactive slot, trial boot, host `FW_CONFIRM`, H2 bootloader rollback of an unconfirmed image. The S3 stores **no** NCP images. The H2 ROM-bootloader path is a manual/development recovery path with an operator-supplied image. | 7.9, 8.9, 11.5, 12.4, H12 |
 | N7 | PTA **disabled by default**; the hub enables it automatically while Wi-Fi is active (off with Ethernet-only). | 7.1, 11.5, 12.4, H9 |
 | N8 | USB identity: **keep Espressif's VID/PID**. | 4.3, 11.3, H1 |
 | N9 | (2026-11-18) S3 flash: **detect 4 MB / 8 MB at boot, one partition table per size.** 4 MB: hub app ×2 at 1.5 MiB + one 896 KiB data partition (host store, configuration, declarative converter database); no NCP image partition. | 3.4, 12.4, H12 |
+| N10 | (2026-11-19, proposal) BR board UART: **921 600 with RTS/CTS** on the reserved links R19/R20 by default (verified fitted; RX stalls lose nothing with flow control and lose data without it at every rate), 2 000 000 allowed, 460 800 without flow control as the fallback. Supersedes the UART part of N4. | 4.1, 4.4, 11.5, H8 |
 
 **Open questions.** None block the start of implementation. The remaining
 unknowns are hardware facts tracked as gates:
@@ -3369,7 +3429,7 @@ unknowns are hardware facts tracked as gates:
 - the USJ VID/PID and serial-number behaviour on H2/C6 (H1);
 - the H2 UART maximum rate (H2);
 - the EZSP hashed-TCLK byte order (H5);
-- the BR board's flash variant and R19/R20 fitting (H8);
+- the BR board's UART under real flash-write load (H8; the flash variant and the R18–R20 fitting are known since 2026-11-18/19);
 - PTA behaviour under Wi-Fi load (H9).
 
 ## 17. References

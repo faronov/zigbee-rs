@@ -9,7 +9,10 @@ publish = false
 # the ESP32-H2, with an ESP32-C6 lab variant:
 #   cargo build --release                                            # H2, USJ
 #   cargo build --release --no-default-features --features esp32c6,transport-usj
-#   cargo build --release --no-default-features --features esp32h2,transport-uart,thread-br-h2
+# Thread BR board (default: 921 600 with RTS/CTS on the reserved links,
+# ZRHP decision N10; without `rtscts-reserved-lines` the 460 800 fallback
+# without flow control):
+#   cargo build --release --no-default-features --features esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines
 [[bin]]
 name = "esp32-ncp"
 path = "src/main.rs"

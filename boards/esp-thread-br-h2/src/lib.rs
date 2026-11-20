@@ -9,15 +9,17 @@
 //! |---|---|---|
 //! | host → H2 (U0RXD) | GPIO18 | GPIO23 |
 //! | H2 → host (U0TXD) | GPIO17 | GPIO24 |
-//! | H2 RTS → S3 CTS (reserved R19, optional mod) | GPIO5 | GPIO4 |
-//! | S3 RTS → H2 CTS (reserved R20, optional mod) | GPIO4 | GPIO5 |
+//! | H2 RTS → S3 CTS (reserved 0 Ω R19) | GPIO5 | GPIO4 |
+//! | S3 RTS → H2 CTS (reserved 0 Ω R20) | GPIO4 | GPIO5 |
 //! | PTA request / grant / priority / tx_line | 12 / 13 / 10 / 11 | 0 / 1 / 2 / 3 |
 //! | RCP RESET / BOOT (host-driven) | 7 / 8 | EN / GPIO9 |
 //!
-//! RTS/CTS exist only with the optional board modification on the reserved
-//! 0 Ω links (feature `rtscts-reserved-lines`); H2 GPIO4/5 are then lost as
-//! pad-JTAG pins. Whether R19/R20 are fitted on a delivered board, and the
-//! H2 module's flash size (2 or 4 MB), are hardware gate H8.
+//! RTS/CTS run over the schematic's "Reserved" 0 Ω links R19/R20 (feature
+//! `rtscts-reserved-lines`, the Thread BR profile's default since ZRHP
+//! decision N10). They are fitted on the hwlab board (verified both ways,
+//! 2026-11-19); H2 GPIO4/5 (MTCK/MTDI) are then UART pins, not pad JTAG
+//! (USB-JTAG stays). The H2's CTS input has a pull-down, so a host that
+//! does not drive its RTS never blocks the H2's transmitter.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -63,7 +65,9 @@ pub const THREAD_BR_H2_PTA: PtaWiring = PtaWiring {
 };
 
 /// The configured host UART of the Thread BR board's H2 (UART0 on
-/// GPIO24/23, RTS on GPIO4 and CTS on GPIO5 with the board mod).
+/// GPIO24/23; with `rtscts-reserved-lines` RTS on GPIO4 and CTS, pulled
+/// down, on GPIO5, both through the GPIO matrix). Whether flow control is
+/// enabled is the UART configuration's (product) decision.
 #[cfg(target_os = "none")]
 pub fn thread_br_h2_uart(
     uart0: esp_hal::peripherals::UART0<'static>,
@@ -76,8 +80,14 @@ pub fn thread_br_h2_uart(
     let uart = esp_hal::uart::Uart::new(uart0, config)?
         .with_tx(tx)
         .with_rx(rx);
+    // The pull-down is set first and the signal frozen, so `with_cts` keeps
+    // it: an undriven host RTS reads as "ready" instead of stalling TX.
     #[cfg(feature = "rtscts-reserved-lines")]
-    let uart = uart.with_rts(rts).with_cts(cts);
+    let uart = {
+        use esp_hal::gpio::{Input, InputConfig, Pull};
+        let cts = Input::new(cts, InputConfig::default().with_pull(Pull::Down));
+        uart.with_rts(rts).with_cts(cts.peripheral_input())
+    };
     Ok(uart)
 }
 

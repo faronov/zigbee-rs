@@ -858,10 +858,15 @@ The sniffer was in use by another session.
 The C6's steady-state polling with the old image (extended-source fallback
 after every empty poll) was measured on the same NCP: 10.4 Data Requests per
 minute, 3.6 of them answered with frame pending (7 minutes, reporting 10–60 s,
-`2026-11-19T202000Z-ncp-radio-flash-dr-old-c6`). The new image sends one
-Data Request per empty joined poll (host-tested). Its hardware count was
-interrupted: the Thread BR board's S3 was reflashed by another session
-during the run.
+`2026-11-19T202000Z-ncp-radio-flash-dr-old-c6`). The new image (one Data
+Request per empty joined poll), with the same reporting configuration
+(10–60 s), made 6.6 Data Requests per minute, 3.6 of them answered with
+frame pending (5 minutes, `2026-11-19T215526Z-ncp-br-flow-dr-new-c6`).
+Empty polls fell from 6.8 to 3.0 per minute.
+The same run showed recovery: while the NCP was unreachable (bridge
+reflash), the sensor's polls failed and it fell back to secure rejoins
+(extended-source fallback on). After the NCP came back, a reset sensor
+rejoined at once as `0x01F7` and kept reporting.
 
 Open hardware gates:
 

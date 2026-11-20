@@ -250,14 +250,22 @@ jobs:
             manifest: boards/esp-thread-br-h2/Cargo.toml
             workspace: boards/esp-thread-br-h2
             features: ""
+          - name: ESP Thread Border Router H2 board (RTS/CTS)
+            manifest: boards/esp-thread-br-h2/Cargo.toml
+            workspace: boards/esp-thread-br-h2
+            features: rtscts-reserved-lines
           - name: ESP32-H2 NCP product (USB-Serial-JTAG)
             manifest: products/esp32-zigbee-ncp/Cargo.toml
             workspace: products/esp32-zigbee-ncp
             features: esp32h2,transport-usj
-          - name: ESP32-H2 NCP product (Thread BR UART, 2 MB)
+          - name: ESP32-H2 NCP product (Thread BR UART RTS/CTS, 2 MB)
             manifest: products/esp32-zigbee-ncp/Cargo.toml
             workspace: products/esp32-zigbee-ncp
-            features: esp32h2,transport-uart,thread-br-h2,flash-2mb
+            features: esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines,flash-2mb
+          - name: ESP32-H2 NCP product (Thread BR UART fallback, no flow control)
+            manifest: products/esp32-zigbee-ncp/Cargo.toml
+            workspace: products/esp32-zigbee-ncp
+            features: esp32h2,transport-uart,thread-br-h2
           - name: ESP32-C6 NCP product (USB-Serial-JTAG)
             manifest: products/esp32-zigbee-ncp/Cargo.toml
             workspace: products/esp32-zigbee-ncp
@@ -1725,19 +1733,25 @@ jobs:
             chip: esp32h2
             features: esp32h2,transport-usj
             csv: esp32h2-ncp-4mb.csv
+          # Thread BR board: 921 600 with RTS/CTS on the reserved links
+          # (decision N10); `-noflow` is the 460 800 fallback without them.
           - name: h2-thread-br
+            chip: esp32h2
+            features: esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines
+            csv: esp32h2-ncp-4mb.csv
+          - name: h2-thread-br-noflow
             chip: esp32h2
             features: esp32h2,transport-uart,thread-br-h2
             csv: esp32h2-ncp-4mb.csv
           - name: h2-thread-br-2mb
             chip: esp32h2
-            features: esp32h2,transport-uart,thread-br-h2,flash-2mb
+            features: esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines,flash-2mb
             csv: esp32h2-ncp-2mb.csv
           # PTA coexistence follower (`pta`; off until the host sets
           # coex_enable). Not yet proven on hardware.
           - name: h2-thread-br-pta
             chip: esp32h2
-            features: esp32h2,transport-uart,thread-br-h2,pta
+            features: esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines,pta
             csv: esp32h2-ncp-4mb.csv
           - name: c6-usj
             chip: esp32c6

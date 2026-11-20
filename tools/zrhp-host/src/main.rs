@@ -37,6 +37,16 @@
 //! --listen SECS --device 0xNWK [--ep N]
 //!                  read the device's Basic attributes and print every
 //!                  event and indication for SECS (no join window)
+//! --set-uart BAUD[,flow]
+//!                  SYS_SET_UART (flow 1 = RTS/CTS), then switch the host
+//!                  port and confirm with SYS_ECHO (runs before the steps
+//!                  below; the Thread BR bridge follows the host's rate)
+//! --echo-load      keep SYS_ECHO requests in flight during --join/--listen
+//!                  and check every echo (link stress during the Trust
+//!                  Center's journal writes)
+//! --stress SECS [--echo-size N (≤ 64, the NCP's echo limit)]
+//!                  SYS_ECHO flood for SECS; prints throughput, mismatches
+//!                  and the NCP's and the host's link counters
 //! ```
 
 use std::process::Command;
@@ -60,6 +70,7 @@ use zigbee_zrhp::msg::network::{
 use zigbee_zrhp::msg::security::SecGetFrameCountersRsp;
 use zigbee_zrhp::msg::system::{
     EvtNcpReady, SysEcho, SysGetInfoRsp, SysGetStatusRsp, SysNegotiateReq, SysNegotiateRsp,
+    SysSetUart,
 };
 use zigbee_zrhp::msg::tables::{TblRead, TblReadRsp, TblStats, TblStatsRsp, TblSync, TblSyncRsp};
 use zigbee_zrhp::msg::{Batch, Kind, MessageDef, MsgHeader, RawMessage, ids};
@@ -72,6 +83,10 @@ trait ByteStream {
     fn write(&mut self, data: &[u8]) -> Result<(), String>;
     /// Bytes received within `timeout`.
     fn read(&mut self, timeout: Duration) -> Result<Vec<u8>, String>;
+    /// Change the line rate (serial ports only).
+    fn set_baud(&mut self, _baud: u32) -> Result<(), String> {
+        Err("this stream has no line rate".into())
+    }
 }
 
 /// Serial port through `hwlab invoke` (one process per call).
@@ -162,6 +177,10 @@ impl Serial {
 }
 
 impl ByteStream for Serial {
+    fn set_baud(&mut self, baud: u32) -> Result<(), String> {
+        self.port.set_baud_rate(baud).map_err(|e| e.to_string())
+    }
+
     fn write(&mut self, data: &[u8]) -> Result<(), String> {
         use std::io::Write;
         self.port.write_all(data).map_err(|e| e.to_string())
@@ -189,6 +208,10 @@ impl ByteStream for Serial {
 }
 
 impl ByteStream for Box<dyn ByteStream> {
+    fn set_baud(&mut self, baud: u32) -> Result<(), String> {
+        (**self).set_baud(baud)
+    }
+
     fn write(&mut self, data: &[u8]) -> Result<(), String> {
         if std::env::var_os("ZRHP_TRACE").is_some() {
             eprintln!(
@@ -257,6 +280,51 @@ struct Host<S: ByteStream> {
     inbox: Vec<Received>,
     epoch: Instant,
     junk: usize,
+    /// Background SYS_ECHO load (`--echo-load`, `--stress`).
+    echo: Option<EchoLoad>,
+}
+
+/// SYS_ECHO requests kept in flight; every echo is checked.
+#[derive(Debug, Default)]
+struct EchoLoad {
+    size: usize,
+    depth: usize,
+    /// `(tid, pattern seed, sent at)`.
+    outstanding: Vec<(u16, u8, Instant)>,
+    seed: u8,
+    sent: u64,
+    ok: u64,
+    mismatched: u64,
+    refused: u64,
+    bytes: u64,
+    worst_rtt: Duration,
+}
+
+impl EchoLoad {
+    fn new(size: usize, depth: usize) -> Self {
+        Self {
+            size,
+            depth,
+            ..Self::default()
+        }
+    }
+
+    fn pattern(seed: u8, size: usize) -> Vec<u8> {
+        (0..size).map(|i| seed.wrapping_add(i as u8)).collect()
+    }
+
+    fn summary(&self, elapsed: Duration) -> String {
+        format!(
+            "echo: sent {} ok {} mismatched {} refused {} in flight {} worst RTT {:?}, {:.1} KiB/s each way",
+            self.sent,
+            self.ok,
+            self.mismatched,
+            self.refused,
+            self.outstanding.len(),
+            self.worst_rtt,
+            self.bytes as f64 / 1024.0 / elapsed.as_secs_f64().max(1e-3)
+        )
+    }
 }
 
 impl<S: ByteStream> Host<S> {
@@ -273,6 +341,7 @@ impl<S: ByteStream> Host<S> {
             inbox: Vec::new(),
             epoch,
             junk: 0,
+            echo: None,
         }
     }
 
@@ -327,7 +396,46 @@ impl<S: ByteStream> Host<S> {
             }
         }
         self.junk = self.link.counters().rx_bad_frame as usize;
+        self.service_echo();
         Ok(())
+    }
+
+    /// Check answered echoes and top the load up again.
+    fn service_echo(&mut self) {
+        let Some(mut load) = self.echo.take() else {
+            return;
+        };
+        let mut index = 0;
+        while index < self.inbox.len() {
+            let message = &self.inbox[index];
+            let Some(slot) = load
+                .outstanding
+                .iter()
+                .position(|(tid, _, _)| message.kind == Kind::Response && message.tid == *tid)
+            else {
+                index += 1;
+                continue;
+            };
+            let message = self.inbox.remove(index);
+            let (_, seed, sent) = load.outstanding.swap_remove(slot);
+            load.worst_rtt = load.worst_rtt.max(sent.elapsed());
+            if message.payload.first() != Some(&0) {
+                load.refused += 1;
+            } else if message.payload[1..] == EchoLoad::pattern(seed, load.size)[..] {
+                load.ok += 1;
+                load.bytes += load.size as u64;
+            } else {
+                load.mismatched += 1;
+            }
+        }
+        while load.outstanding.len() < load.depth {
+            load.seed = load.seed.wrapping_add(17);
+            let data = EchoLoad::pattern(load.seed, load.size);
+            let tid = self.request(&SysEcho { data: Rest(&data) });
+            load.outstanding.push((tid, load.seed, Instant::now()));
+            load.sent += 1;
+        }
+        self.echo = Some(load);
     }
 
     fn request<'a, T: Wire<'a> + MessageDef>(&mut self, body: &T) -> u16 {
@@ -441,10 +549,12 @@ fn smoke<S: ByteStream>(host: &mut Host<S>, form: bool, floors: (u32, u32)) -> R
     let rsp = host.response(tid)?;
     let info: SysGetInfoRsp = body(&rsp)?;
     println!(
-        "SYS_GET_INFO: ieee {:02X?} flash {} transport {} board {:?} product {:?}",
+        "SYS_GET_INFO: ieee {:02X?} flash {} transport {} uart {} flow {} board {:?} product {:?}",
         info.ieee_active.0,
         info.flash_size,
         info.transport,
+        info.uart_baud,
+        info.uart_flow,
         info.board.as_str(),
         info.product.as_str()
     );
@@ -554,6 +664,112 @@ fn smoke<S: ByteStream>(host: &mut Host<S>, form: bool, floors: (u32, u32)) -> R
     );
     if host.link.state() != LinkState::Established {
         return Err("link not established at the end".into());
+    }
+    Ok(())
+}
+
+/// The NCP's link counters (DIAG group LINK) as `(id, value)`.
+fn ncp_link_counters<S: ByteStream>(host: &mut Host<S>) -> Result<Vec<(u16, u32)>, String> {
+    let tid = host.request(&DiagGetCounters { group_mask: 0x01 });
+    let rsp = host.response(tid)?;
+    let counters: DiagGetCountersRsp = body(&rsp)?;
+    Ok(counters.counters.iter().map(|c| (c.id, c.value)).collect())
+}
+
+/// Print what changed in the NCP's and the host's link counters.
+fn print_link_delta<S: ByteStream>(
+    host: &mut Host<S>,
+    before: &[(u16, u32)],
+    host_before: (u32, u32, u32, u32),
+) -> Result<(), String> {
+    let after = ncp_link_counters(host)?;
+    let changed: Vec<String> = after
+        .iter()
+        .filter_map(|(id, value)| {
+            let old = before.iter().find(|(o, _)| o == id).map_or(0, |(_, v)| *v);
+            (*value != old).then(|| format!("0x{id:04X}+{}", value.wrapping_sub(old)))
+        })
+        .collect();
+    println!("NCP link counters changed: {}", changed.join(" "));
+    let own = host.link.counters();
+    println!(
+        "host link delta: retx {} bad {} dup {} rx overflow {}",
+        own.tx_retransmissions - host_before.0,
+        own.rx_bad_frame - host_before.1,
+        own.rx_duplicate - host_before.2,
+        own.rx_overflow - host_before.3
+    );
+    Ok(())
+}
+
+fn host_link_snapshot<S: ByteStream>(host: &Host<S>) -> (u32, u32, u32, u32) {
+    let own = host.link.counters();
+    (
+        own.tx_retransmissions,
+        own.rx_bad_frame,
+        own.rx_duplicate,
+        own.rx_overflow,
+    )
+}
+
+/// `SYS_SET_UART`, then switch the host port after the apply delay and
+/// confirm the new rate with an echo (the NCP reverts after 3 s without a
+/// valid frame).
+fn set_uart<S: ByteStream>(host: &mut Host<S>, baud: u32, flow: bool) -> Result<(), String> {
+    const APPLY_DELAY_MS: u16 = 200;
+    let tid = host.request(&SysSetUart {
+        baud,
+        flow: u8::from(flow),
+        apply_delay_ms: APPLY_DELAY_MS,
+    });
+    let rsp = host.response(tid)?;
+    println!("SYS_SET_UART {baud} flow {flow}: {:?}", rsp.status());
+    if !rsp.status().is_success() {
+        return Err(format!("SYS_SET_UART refused: {:?}", rsp.status()));
+    }
+    std::thread::sleep(Duration::from_millis(u64::from(APPLY_DELAY_MS) + 50));
+    host.stream.set_baud(baud)?;
+    let started = Instant::now();
+    let tid = host.request(&SysEcho {
+        data: Rest(b"rate switch"),
+    });
+    host.response(tid)?;
+    println!(
+        "host now at {baud}; first echo after {:?}",
+        started.elapsed()
+    );
+    Ok(())
+}
+
+/// SYS_ECHO flood for `secs`.
+fn stress<S: ByteStream>(host: &mut Host<S>, secs: u64, size: usize) -> Result<(), String> {
+    let before = ncp_link_counters(host)?;
+    let host_before = host_link_snapshot(host);
+    host.echo = Some(EchoLoad::new(size, 16));
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(secs) {
+        host.round(Duration::from_millis(20))?;
+        for message in host.inbox.iter().filter(|m| m.kind == Kind::Event) {
+            if message.msg_id == ids::EVT_LOG_RECORD
+                && let Ok(log) = message
+                    .raw()
+                    .decode::<zigbee_zrhp::msg::log::EvtLogRecord>()
+            {
+                println!(
+                    "LOG [{} ms L{}] {}",
+                    log.time_ms,
+                    log.level,
+                    log.text.as_str().unwrap_or("<invalid UTF-8>")
+                );
+            }
+        }
+        host.inbox.retain(|m| m.kind != Kind::Event);
+    }
+    let load = host.echo.take().unwrap_or_default();
+    println!("{}", load.summary(started.elapsed()));
+    print_link_delta(host, &before, host_before)?;
+    if load.mismatched != 0 || load.refused != 0 {
+        return Err("echo errors".into());
     }
     Ok(())
 }
@@ -1151,6 +1367,27 @@ fn main() {
     };
     let floors = (floor("--nwk-floor"), floor("--aps-floor"));
     let result = smoke(&mut host, form, floors).and_then(|()| {
+        if let Some(spec) = value("--set-uart") {
+            let (baud, flow) = spec.split_once(',').unwrap_or((spec.as_str(), "0"));
+            let baud = baud.parse().map_err(|_| "--set-uart BAUD[,flow]")?;
+            set_uart(&mut host, baud, flow == "1")?;
+        }
+        if let Some(secs) = value("--stress") {
+            let size = value("--echo-size").map_or(Ok(64), |v| v.parse());
+            stress(
+                &mut host,
+                secs.parse().map_err(|_| "--stress SECS")?,
+                size.map_err(|_| "--echo-size N")?,
+            )?;
+        }
+        let load_started = Instant::now();
+        let load_counters = if args.iter().any(|a| a == "--echo-load") {
+            let snapshot = (ncp_link_counters(&mut host)?, host_link_snapshot(&host));
+            host.echo = Some(EchoLoad::new(64, 8));
+            Some(snapshot)
+        } else {
+            None
+        };
         if let Some(path) = value("--restore") {
             backup_restore(&mut host, &path)?;
         }
@@ -1217,6 +1454,14 @@ fn main() {
                 .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
                 .ok_or("--fw-version 0xMMmmrrrr required")?;
             fw_update(&mut host, &path, version)?;
+        }
+        if let Some((before, host_before)) = load_counters {
+            let load = host.echo.take().unwrap_or_default();
+            println!("{}", load.summary(load_started.elapsed()));
+            print_link_delta(&mut host, &before, host_before)?;
+            if load.mismatched != 0 || load.refused != 0 {
+                return Err("echo errors".into());
+            }
         }
         Ok(())
     });

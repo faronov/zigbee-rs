@@ -195,6 +195,10 @@ fn main() -> ! {
         peripherals.UART0,
         peripherals.GPIO24,
         peripherals.GPIO23,
+        #[cfg(feature = "rtscts-reserved-lines")]
+        peripherals.GPIO4,
+        #[cfg(feature = "rtscts-reserved-lines")]
+        peripherals.GPIO5,
         peripherals.UHCI0,
         peripherals.DMA_CH0,
     );
@@ -276,6 +280,8 @@ fn uart_host(
     uart0: esp_hal::peripherals::UART0<'static>,
     tx: esp_hal::peripherals::GPIO24<'static>,
     rx: esp_hal::peripherals::GPIO23<'static>,
+    #[cfg(feature = "rtscts-reserved-lines")] rts: esp_hal::peripherals::GPIO4<'static>,
+    #[cfg(feature = "rtscts-reserved-lines")] cts: esp_hal::peripherals::GPIO5<'static>,
     uhci: esp_hal::peripherals::UHCI0<'static>,
     dma: esp_hal::peripherals::DMA_CH0<'static>,
 ) -> &'static mut product::host::Host {
@@ -285,8 +291,17 @@ fn uart_host(
         flow_control: product::transport::UART_DEFAULT_FLOW,
     };
     let config = esp_hal::uart::Config::default().with_baudrate(line.baud);
-    let uart =
-        esp_thread_br_h2::thread_br_h2_uart(uart0, tx, rx, config).unwrap_or_else(|_| halt());
+    let uart = esp_thread_br_h2::thread_br_h2_uart(
+        uart0,
+        tx,
+        rx,
+        #[cfg(feature = "rtscts-reserved-lines")]
+        rts,
+        #[cfg(feature = "rtscts-reserved-lines")]
+        cts,
+        config,
+    )
+    .unwrap_or_else(|_| halt());
     static MEMORY: ConstStaticCell<UartDmaMemory> = ConstStaticCell::new(UartDmaMemory::new());
     let stream = UartDmaStream::new(uart, UartPort::Uart0, uhci, dma, 0, MEMORY.take(), line)
         .unwrap_or_else(|_| halt());
@@ -459,6 +474,8 @@ async fn run(
         lab::tick(host);
         radio_watch(now_us());
         radio_stats(now_us());
+        #[cfg(feature = "transport-uart")]
+        uart_stats(now_us(), host);
         // Trial window without FW_CONFIRM: the previous image is selected
         // (or the next boot's check selects it); restart into it.
         if let TrialPoll::Expired { .. } = platform.poll_trial(now_ms()) {
@@ -593,6 +610,34 @@ fn radio_stats(now_us: u64) {
             stats.acked_tx,
             stats.tx_no_ack,
             stats.tx_errors
+        );
+    }
+}
+
+/// Host UART counters once a minute when the receive side saw faults
+/// (LOG endpoint): line errors (framing/parity/glitch) and overflows (FIFO
+/// overflow or DMA restart: bytes lost). With RTS/CTS both stay 0.
+#[cfg(feature = "transport-uart")]
+#[inline(never)]
+fn uart_stats(now_us: u64, host: &product::host::Host) {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    use portable_atomic::AtomicU64;
+    const PERIOD_US: u64 = 60_000_000;
+    static NEXT_US: AtomicU64 = AtomicU64::new(PERIOD_US);
+    static LAST_FAULTS: AtomicU32 = AtomicU32::new(0);
+    if now_us < NEXT_US.load(Relaxed) {
+        return;
+    }
+    NEXT_US.store(now_us + PERIOD_US, Relaxed);
+    let c = host.counters();
+    let faults = c.rx_line_errors.wrapping_add(c.rx_overflow);
+    if LAST_FAULTS.swap(faults, Relaxed) != faults {
+        log::info!(
+            "[UART] rx {} tx {} line-errors {} overflow {}",
+            c.rx_bytes,
+            c.tx_bytes,
+            c.rx_line_errors,
+            c.rx_overflow
         );
     }
 }

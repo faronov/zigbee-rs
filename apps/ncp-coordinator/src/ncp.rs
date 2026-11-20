@@ -1503,12 +1503,17 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         let rx_frames = self.link.counters().rx_frames;
         match switch.applied_rx_frames {
             None if now_us >= switch.apply_at_us && self.tx_len == 0 => {
-                if transport.apply_uart(switch.baud, switch.flow).is_ok() {
-                    switch.applied_rx_frames = Some(rx_frames);
-                    switch.applied_at_us = now_us;
-                    self.uart_switch = Some(switch);
-                } else {
-                    self.uart_switch = None;
+                match transport.apply_uart(switch.baud, switch.flow) {
+                    Ok(()) => {
+                        switch.applied_rx_frames = Some(rx_frames);
+                        switch.applied_at_us = now_us;
+                        self.uart_switch = Some(switch);
+                    }
+                    // A transmit transfer is still draining at the old
+                    // rate: switch on a later pass (the host has switched
+                    // already, so giving up would strand it).
+                    Err(UartChangeError::Busy) => {}
+                    Err(_) => self.uart_switch = None,
                 }
             }
             Some(at_switch) if rx_frames != at_switch => self.uart_switch = None,

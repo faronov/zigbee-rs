@@ -88,11 +88,8 @@ impl HostTransport for Host {
     }
 
     fn take_line_faults(&mut self) -> LineFaults {
-        let errors = self.stream.take_line_faults();
-        LineFaults {
-            errors,
-            overruns: 0,
-        }
+        let (errors, overruns) = self.stream.take_line_faults();
+        LineFaults { errors, overruns }
     }
 
     fn info(&self) -> TransportInfo {

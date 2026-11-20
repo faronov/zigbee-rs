@@ -161,6 +161,20 @@ link could never change its rate. The ZRHP NCP's `SYS_SET_UART` needs it
 images that do not call it link no new code. The rate switch itself on a
 running link is a hardware gate (H2/H8).
 
+## DMA RX stream: last descriptor's data offset (`dma-rx-stream-last-chunk`)
+
+`DmaRxStreamBufView::peek` (and so `pop`) returned the *last* descriptor's
+data as `buffer[buffer.len() - length..]`, i.e. the final `length` bytes of
+the whole buffer. That is only right when the chunk is full. A partly filled
+last chunk, which a UART idle EOF closes, was read from the wrong bytes.
+The ZRHP NCP's UHCI receive (`esp-serial-stream`, 128 × 128-byte chunks)
+lost about one host frame in a few hundred under an echo flood at 921 600
+baud: CRC-bad frames without a UART line error or overflow, recovered by
+ARQ. After the fix: 0 bad frames in 17,089 received (70 s,
+Thread BR board, 2026-11-20). The slice now starts at the last chunk plus
+the read offset (`buffer.len() - last.size() + offset`, length `length`).
+Still present in esp-hal 1.1.2; to be reported upstream.
+
 ## H2 sleep entry superseded (pending removal)
 
 The product no longer calls the H2 light/deep sleep entry points of this
