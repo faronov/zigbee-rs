@@ -1,7 +1,11 @@
-//! Polled asynchronous (UART) mode of the Series 2 USART.
+//! Asynchronous (UART) mode of the Series 2 USART: a polled transmitter
+//! for logs and, with the `usart0-host` feature, the interrupt-driven
+//! [`host`] link of network co-processor images.
 //!
-//! Register offsets are identical on xG21 and xG22; only the peripheral base
-//! addresses and GPIO route offsets differ (see [`crate::chip`]).
+//! Register offsets are identical on xG21, xG22 and xG24; only the
+//! peripheral base addresses and GPIO route offsets differ (see
+//! [`crate::chip`]). xG24 has a single USART (USART0); its EUSARTs are a
+//! different block and not supported here.
 
 use crate::chip::{BusClock, base, route};
 use crate::gpio::{Pin, PushPull};
@@ -16,8 +20,8 @@ const TXDATA: u32 = 0x3C;
 
 const CMD_RXDIS: u32 = 1 << 1;
 const CMD_TXEN: u32 = 1 << 2;
-const CMD_CLEARTX: u32 = 1 << 11;
-const CMD_CLEARRX: u32 = 1 << 10;
+const CMD_CLEARTX: u32 = 1 << 10;
+const CMD_CLEARRX: u32 = 1 << 11;
 const STATUS_TXC: u32 = 1 << 5;
 const STATUS_TXBL: u32 = 1 << 6;
 /// 8 data bits, no parity, 1 stop bit.
@@ -28,12 +32,13 @@ const ROUTEEN_TXPEN: u32 = 1 << 4;
 const TXROUTE_FROM_ROUTEEN: u32 = 0x18;
 
 /// USART PCLK after [`crate::clock::ClockControl::configure_hfxo`].
-pub const PCLK_HZ: u32 = 38_400_000;
+pub const PCLK_HZ: u32 = crate::clock::HFXO_HZ;
 
 /// Which USART instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Instance {
     Usart0,
+    #[cfg(not(feature = "efr32mg24"))]
     Usart1,
 }
 
@@ -41,6 +46,7 @@ impl Instance {
     const fn base(self) -> u32 {
         match self {
             Self::Usart0 => base::USART0,
+            #[cfg(not(feature = "efr32mg24"))]
             Self::Usart1 => base::USART1,
         }
     }
@@ -48,12 +54,14 @@ impl Instance {
         base::GPIO
             + match self {
                 Self::Usart0 => route::USART0_ROUTEEN,
+                #[cfg(not(feature = "efr32mg24"))]
                 Self::Usart1 => route::USART1_ROUTEEN,
             }
     }
     const fn clock(self) -> BusClock {
         match self {
             Self::Usart0 => BusClock::USART0,
+            #[cfg(not(feature = "efr32mg24"))]
             Self::Usart1 => BusClock::USART1,
         }
     }
@@ -151,6 +159,9 @@ impl core::fmt::Write for UartTx {
     }
 }
 
+#[cfg(feature = "usart0-host")]
+pub mod host;
+
 #[inline]
 unsafe fn read(address: u32) -> u32 {
     unsafe { core::ptr::read_volatile(address as *const u32) }
@@ -180,6 +191,27 @@ mod tests {
             Instance::Usart1.routeen() + TXROUTE_FROM_ROUTEEN,
             0x4003_C654
         );
+    }
+
+    #[test]
+    #[cfg(feature = "efr32mg24")]
+    fn xg24_route_addresses() {
+        // GSDK 4.5.0 efr32mg24a410f1536im48.h / efr32mg24_gpio.h.
+        assert_eq!(Instance::Usart0.base(), 0x4005_C000);
+        assert_eq!(Instance::Usart0.routeen(), 0x4003_C720);
+        assert_eq!(
+            Instance::Usart0.routeen() + TXROUTE_FROM_ROUTEEN,
+            0x4003_C738
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "hfxo-39mhz")]
+    fn clkdiv_at_39mhz() {
+        // round(32 * 39e6 / (16 * 460800)) = 169 -> (169 - 32) * 8.
+        assert_eq!(clkdiv(39_000_000, 460_800), 1096);
+        assert_eq!(clkdiv(39_000_000, 115_200), 5160);
+        assert_eq!(clkdiv(39_000_000, 921_600), 424);
     }
 
     #[test]

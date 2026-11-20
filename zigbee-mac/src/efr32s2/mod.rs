@@ -1,4 +1,4 @@
-//! EFR32 Series 2 (EFR32MG21 / EFR32MG22) [`RadioPhy`] for [`SoftMacCore`].
+//! EFR32 Series 2 (EFR32MG21 / MG22 / MG24) [`RadioPhy`] for [`SoftMacCore`].
 //!
 //! The radio itself is `efr32s2_hal::radio`: a pure-Rust driver that programs
 //! RAC/FRC/MODEM/AGC/SYNTH/BUFC directly from GSDK-verified register values
@@ -374,9 +374,9 @@ impl<const D: i8> PlatformServices for Efr32s2RadioPhy<D> {
         Timer::after_micros(u64::from(duration_us)).await;
     }
 
-    /// No TRNG driver yet; the HAL's xorshift is not cryptographic.
-    fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
-        Err(MacError::Unsupported)
+    /// xG24: Secure Engine TRNG; xG21/xG22: none (never the xorshift).
+    fn fill_random(&mut self, output: &mut [u8]) -> Result<(), MacError> {
+        fill_random(output)
     }
 }
 
@@ -462,4 +462,22 @@ mod tests {
         );
         assert_eq!(map_radio_error(RadioError::SynthLock), PhyError::Hardware);
     }
+}
+
+// Entropy source per die (appended so the lines above, which end up in log
+// and panic locations of the MG21/MG22 images, keep their numbers).
+
+/// The HAL's xorshift is not cryptographic, and xG21/xG22 have no TRNG
+/// driver yet: entropy is unavailable and callers fail explicitly.
+#[cfg(not(feature = "efr32mg24"))]
+#[inline(always)]
+fn fill_random(_output: &mut [u8]) -> Result<(), MacError> {
+    Err(MacError::Unsupported)
+}
+
+/// xG24: the Secure Engine TRNG over the SE mailbox (not yet run on
+/// hardware); a mailbox error is reported, never replaced.
+#[cfg(feature = "efr32mg24")]
+fn fill_random(output: &mut [u8]) -> Result<(), MacError> {
+    efr32s2_hal::se::fill_random(output).map_err(|_| MacError::Unsupported)
 }

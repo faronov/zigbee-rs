@@ -439,6 +439,274 @@ mod table {
     ];
 }
 
+#[cfg(feature = "efr32mg24")]
+mod table {
+    /// Number of external interrupts on EFR32MG24 (IRQ 15 and 64 are reserved).
+    pub const IRQ_COUNT: usize = 76;
+
+    /// External interrupt numbers (GSDK `IRQn_Type`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u16)]
+    #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+    pub enum Interrupt {
+        SMU_SECURE = 0,
+        SMU_S_PRIVILEGED = 1,
+        SMU_NS_PRIVILEGED = 2,
+        EMU = 3,
+        TIMER0 = 4,
+        TIMER1 = 5,
+        TIMER2 = 6,
+        TIMER3 = 7,
+        TIMER4 = 8,
+        USART0_RX = 9,
+        USART0_TX = 10,
+        EUSART0_RX = 11,
+        EUSART0_TX = 12,
+        EUSART1_RX = 13,
+        EUSART1_TX = 14,
+        ICACHE0 = 16,
+        BURTC = 17,
+        LETIMER0 = 18,
+        SYSCFG = 19,
+        MPAHBRAM = 20,
+        LDMA = 21,
+        LFXO = 22,
+        LFRCO = 23,
+        ULFRCO = 24,
+        GPIO_ODD = 25,
+        GPIO_EVEN = 26,
+        I2C0 = 27,
+        I2C1 = 28,
+        EMUDG = 29,
+        AGC = 30,
+        BUFC = 31,
+        FRC_PRI = 32,
+        FRC = 33,
+        MODEM = 34,
+        PROTIMER = 35,
+        RAC_RSM = 36,
+        RAC_SEQ = 37,
+        HOSTMAILBOX = 38,
+        SYNTH = 39,
+        ACMP0 = 40,
+        ACMP1 = 41,
+        WDOG0 = 42,
+        WDOG1 = 43,
+        HFXO0 = 44,
+        HFRCO0 = 45,
+        HFRCOEM23 = 46,
+        CMU = 47,
+        AES = 48,
+        IADC = 49,
+        MSC = 50,
+        DPLL0 = 51,
+        EMUEFP = 52,
+        DCDC = 53,
+        PCNT0 = 54,
+        SW0 = 55,
+        SW1 = 56,
+        SW2 = 57,
+        SW3 = 58,
+        KERNEL0 = 59,
+        KERNEL1 = 60,
+        M33CTI0 = 61,
+        M33CTI1 = 62,
+        FPUEXH = 63,
+        SEMBRX = 65,
+        SEMBTX = 66,
+        SYSRTC_APP = 67,
+        SYSRTC_SEQ = 68,
+        KEYSCAN = 69,
+        RFECA0 = 70,
+        RFECA1 = 71,
+        VDAC0 = 72,
+        VDAC1 = 73,
+        AHB2AHB0 = 74,
+        AHB2AHB1 = 75,
+    }
+
+    #[cfg(feature = "rt")]
+    unsafe extern "C" {
+        fn SMU_SECURE();
+        fn SMU_S_PRIVILEGED();
+        fn SMU_NS_PRIVILEGED();
+        fn EMU();
+        fn TIMER0();
+        fn TIMER1();
+        fn TIMER2();
+        fn TIMER3();
+        fn TIMER4();
+        fn USART0_RX();
+        fn USART0_TX();
+        fn EUSART0_RX();
+        fn EUSART0_TX();
+        fn EUSART1_RX();
+        fn EUSART1_TX();
+        fn ICACHE0();
+        fn BURTC();
+        fn LETIMER0();
+        fn SYSCFG();
+        fn MPAHBRAM();
+        fn LDMA();
+        fn LFXO();
+        fn LFRCO();
+        fn ULFRCO();
+        fn GPIO_ODD();
+        fn GPIO_EVEN();
+        fn I2C0();
+        fn I2C1();
+        fn EMUDG();
+        fn AGC();
+        fn BUFC();
+        fn FRC_PRI();
+        fn FRC();
+        fn MODEM();
+        fn PROTIMER();
+        fn RAC_RSM();
+        fn RAC_SEQ();
+        fn HOSTMAILBOX();
+        fn SYNTH();
+        fn ACMP0();
+        fn ACMP1();
+        fn WDOG0();
+        fn WDOG1();
+        fn HFXO0();
+        fn HFRCO0();
+        fn HFRCOEM23();
+        fn CMU();
+        fn AES();
+        fn IADC();
+        fn MSC();
+        fn DPLL0();
+        fn EMUEFP();
+        fn DCDC();
+        fn PCNT0();
+        fn SW0();
+        fn SW1();
+        fn SW2();
+        fn SW3();
+        fn KERNEL0();
+        fn KERNEL1();
+        fn M33CTI0();
+        fn M33CTI1();
+        fn FPUEXH();
+        fn SEMBRX();
+        fn SEMBTX();
+        fn SYSRTC_APP();
+        fn SYSRTC_SEQ();
+        fn KEYSCAN();
+        fn RFECA0();
+        fn RFECA1();
+        fn VDAC0();
+        fn VDAC1();
+        fn AHB2AHB0();
+        fn AHB2AHB1();
+    }
+
+    #[cfg(feature = "rt")]
+    #[doc(hidden)]
+    #[unsafe(link_section = ".vector_table.interrupts")]
+    #[unsafe(no_mangle)]
+    pub static __INTERRUPTS: [super::Vector; 76] = [
+        super::Vector {
+            handler: SMU_SECURE,
+        },
+        super::Vector {
+            handler: SMU_S_PRIVILEGED,
+        },
+        super::Vector {
+            handler: SMU_NS_PRIVILEGED,
+        },
+        super::Vector { handler: EMU },
+        super::Vector { handler: TIMER0 },
+        super::Vector { handler: TIMER1 },
+        super::Vector { handler: TIMER2 },
+        super::Vector { handler: TIMER3 },
+        super::Vector { handler: TIMER4 },
+        super::Vector { handler: USART0_RX },
+        super::Vector { handler: USART0_TX },
+        super::Vector {
+            handler: EUSART0_RX,
+        },
+        super::Vector {
+            handler: EUSART0_TX,
+        },
+        super::Vector {
+            handler: EUSART1_RX,
+        },
+        super::Vector {
+            handler: EUSART1_TX,
+        },
+        super::Vector { _reserved: 0 },
+        super::Vector { handler: ICACHE0 },
+        super::Vector { handler: BURTC },
+        super::Vector { handler: LETIMER0 },
+        super::Vector { handler: SYSCFG },
+        super::Vector { handler: MPAHBRAM },
+        super::Vector { handler: LDMA },
+        super::Vector { handler: LFXO },
+        super::Vector { handler: LFRCO },
+        super::Vector { handler: ULFRCO },
+        super::Vector { handler: GPIO_ODD },
+        super::Vector { handler: GPIO_EVEN },
+        super::Vector { handler: I2C0 },
+        super::Vector { handler: I2C1 },
+        super::Vector { handler: EMUDG },
+        super::Vector { handler: AGC },
+        super::Vector { handler: BUFC },
+        super::Vector { handler: FRC_PRI },
+        super::Vector { handler: FRC },
+        super::Vector { handler: MODEM },
+        super::Vector { handler: PROTIMER },
+        super::Vector { handler: RAC_RSM },
+        super::Vector { handler: RAC_SEQ },
+        super::Vector {
+            handler: HOSTMAILBOX,
+        },
+        super::Vector { handler: SYNTH },
+        super::Vector { handler: ACMP0 },
+        super::Vector { handler: ACMP1 },
+        super::Vector { handler: WDOG0 },
+        super::Vector { handler: WDOG1 },
+        super::Vector { handler: HFXO0 },
+        super::Vector { handler: HFRCO0 },
+        super::Vector { handler: HFRCOEM23 },
+        super::Vector { handler: CMU },
+        super::Vector { handler: AES },
+        super::Vector { handler: IADC },
+        super::Vector { handler: MSC },
+        super::Vector { handler: DPLL0 },
+        super::Vector { handler: EMUEFP },
+        super::Vector { handler: DCDC },
+        super::Vector { handler: PCNT0 },
+        super::Vector { handler: SW0 },
+        super::Vector { handler: SW1 },
+        super::Vector { handler: SW2 },
+        super::Vector { handler: SW3 },
+        super::Vector { handler: KERNEL0 },
+        super::Vector { handler: KERNEL1 },
+        super::Vector { handler: M33CTI0 },
+        super::Vector { handler: M33CTI1 },
+        super::Vector { handler: FPUEXH },
+        super::Vector { _reserved: 0 },
+        super::Vector { handler: SEMBRX },
+        super::Vector { handler: SEMBTX },
+        super::Vector {
+            handler: SYSRTC_APP,
+        },
+        super::Vector {
+            handler: SYSRTC_SEQ,
+        },
+        super::Vector { handler: KEYSCAN },
+        super::Vector { handler: RFECA0 },
+        super::Vector { handler: RFECA1 },
+        super::Vector { handler: VDAC0 },
+        super::Vector { handler: VDAC1 },
+        super::Vector { handler: AHB2AHB0 },
+        super::Vector { handler: AHB2AHB1 },
+    ];
+}
+
 pub use table::*;
 
 /// One entry of the external interrupt vector table.

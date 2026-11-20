@@ -23,9 +23,11 @@ const TIMER_CMD_START: u32 = 1;
 const TIMER_STATUS_RUNNING: u32 = 1;
 const TIMER_STATUS_SYNCBUSY: u32 = 1 << 6;
 
-/// HCLK after [`crate::clock::ClockControl::configure_hfxo`].
-pub const HCLK_HZ: u32 = 38_400_000;
-/// Time-base cycles per ten microseconds at [`HCLK_HZ`] (38.4 cycles/us exactly).
+/// HCLK after [`crate::clock::ClockControl::configure_hfxo`] (38.4 MHz, or
+/// 39 MHz with `hfxo-39mhz`).
+pub const HCLK_HZ: u32 = crate::clock::HFXO_HZ;
+/// Time-base cycles per ten microseconds at [`HCLK_HZ`] (38.4 or 39
+/// cycles/us exactly).
 pub const CYCLES_PER_10_US: u32 = HCLK_HZ / 100_000;
 
 /// Start the TIMER0 time base (idempotent). Requires the HFXO to be
@@ -159,6 +161,15 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "hfxo-39mhz")]
+    fn conversions_39mhz() {
+        assert_eq!(CYCLES_PER_10_US, 390);
+        assert_eq!(us_to_cycles(192), 7488);
+        assert_eq!(cycles_to_us(7488), 192);
+    }
+
+    #[test]
+    #[cfg(not(feature = "hfxo-39mhz"))]
     fn conversions() {
         assert_eq!(CYCLES_PER_10_US, 384);
         assert_eq!(us_to_cycles(192), 7373);

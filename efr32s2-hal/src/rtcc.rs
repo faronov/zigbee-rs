@@ -14,6 +14,13 @@
 //! The LFRCO is the uncalibrated RC oscillator (datasheet: ±3 % over
 //! temperature in normal mode). That is ample for SED poll scheduling; a
 //! product that needs wall-clock accuracy should add an LFXO source.
+//!
+//! xG24 has no RTCC: the same API runs on SYSRTC0 group 0 (GSDK 4.5.0
+//! `efr32mg24_sysrtc.h`, `sl_sleeptimer_hal_sysrtc.c`), with compare 0/1
+//! in place of CC0/CC1, `GRP0_IF`/`GRP0_IEN` flags OVF/CMP0/CMP1 at bits
+//! 0/1/2, compares enabled in `GRP0_CTRL` when armed, and the clock
+//! selected in `CMU_SYSRTC0CLKCTRL` (same offset `0x240`, `LFRCO = 1`). The
+//! xG24 path is built from those sources and not yet hardware-proven.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -24,24 +31,64 @@ pub const RTCC_HZ: u32 = 32_768;
 
 const CMU_LOCK: u32 = base::CMU + 0x010;
 const CMU_LOCK_UNLOCK: u32 = 0x93F7;
+/// `CMU_RTCCCLKCTRL` (xG21/xG22) or `CMU_SYSRTC0CLKCTRL` (xG24).
 const CMU_RTCCCLKCTRL: u32 = base::CMU + 0x240;
 const CMU_RTCCCLKCTRL_LFRCO: u32 = 1;
 
-const RTCC_EN: u32 = base::RTCC + 0x04;
-const RTCC_CFG: u32 = base::RTCC + 0x08;
-const RTCC_CMD: u32 = base::RTCC + 0x0C;
-const RTCC_STATUS: u32 = base::RTCC + 0x10;
-const RTCC_IF: u32 = base::RTCC + 0x14;
-const RTCC_IEN: u32 = base::RTCC + 0x18;
-const RTCC_CNT: u32 = base::RTCC + 0x20;
-const RTCC_SYNCBUSY: u32 = base::RTCC + 0x28;
-const RTCC_LOCK: u32 = base::RTCC + 0x2C;
-/// `CC[n]` is `{CTRL, OCVALUE, ICVALUE}` at `0x30 + 12 n`.
-const fn rtcc_cc_ctrl(channel: usize) -> u32 {
-    base::RTCC + 0x30 + 12 * channel as u32
+#[cfg(not(feature = "efr32mg24"))]
+use rtcc_regs::*;
+#[cfg(feature = "efr32mg24")]
+use sysrtc_regs::*;
+
+#[cfg(not(feature = "efr32mg24"))]
+mod rtcc_regs {
+    use super::base;
+
+    pub const RTCC_EN: u32 = base::RTCC + 0x04;
+    pub const RTCC_CFG: u32 = base::RTCC + 0x08;
+    pub const RTCC_CMD: u32 = base::RTCC + 0x0C;
+    pub const RTCC_STATUS: u32 = base::RTCC + 0x10;
+    pub const RTCC_IF: u32 = base::RTCC + 0x14;
+    pub const RTCC_IEN: u32 = base::RTCC + 0x18;
+    pub const RTCC_CNT: u32 = base::RTCC + 0x20;
+    pub const RTCC_SYNCBUSY: u32 = base::RTCC + 0x28;
+    pub const RTCC_LOCK: u32 = base::RTCC + 0x2C;
+    /// `CC[n]` is `{CTRL, OCVALUE, ICVALUE}` at `0x30 + 12 n`.
+    pub const fn rtcc_cc_ctrl(channel: usize) -> u32 {
+        base::RTCC + 0x30 + 12 * channel as u32
+    }
+    pub const fn rtcc_cc_ocvalue(channel: usize) -> u32 {
+        rtcc_cc_ctrl(channel) + 4
+    }
 }
-const fn rtcc_cc_ocvalue(channel: usize) -> u32 {
-    rtcc_cc_ctrl(channel) + 4
+
+/// SYSRTC0 (xG24) under the RTCC names this module uses.
+#[cfg(feature = "efr32mg24")]
+mod sysrtc_regs {
+    use super::base;
+
+    pub const RTCC_EN: u32 = base::SYSRTC0 + 0x04;
+    pub const SYSRTC_SWRST: u32 = base::SYSRTC0 + 0x08;
+    pub const RTCC_CFG: u32 = base::SYSRTC0 + 0x0C;
+    pub const RTCC_CMD: u32 = base::SYSRTC0 + 0x10;
+    pub const RTCC_STATUS: u32 = base::SYSRTC0 + 0x14;
+    pub const RTCC_CNT: u32 = base::SYSRTC0 + 0x18;
+    pub const RTCC_SYNCBUSY: u32 = base::SYSRTC0 + 0x1C;
+    pub const RTCC_LOCK: u32 = base::SYSRTC0 + 0x20;
+    pub const RTCC_IF: u32 = base::SYSRTC0 + 0x40;
+    pub const RTCC_IEN: u32 = base::SYSRTC0 + 0x44;
+    pub const SYSRTC_GRP0_CTRL: u32 = base::SYSRTC0 + 0x48;
+    /// `GRP0_CMP0VALUE` / `GRP0_CMP1VALUE`.
+    pub const fn rtcc_cc_ocvalue(channel: usize) -> u32 {
+        base::SYSRTC0 + 0x4C + 4 * channel as u32
+    }
+    /// `GRP0_CTRL.CMPnEN`.
+    pub const fn grp0_ctrl_cmpen(channel: usize) -> u32 {
+        1 << channel
+    }
+    /// `EN.DISABLING`, `SWRST.RESETTING`.
+    pub const SYSRTC_EN_DISABLING: u32 = 1 << 1;
+    pub const SYSRTC_SWRST_RESETTING: u32 = 1 << 1;
 }
 
 const SET: u32 = 0x1000;
@@ -50,7 +97,11 @@ const CLR: u32 = 0x2000;
 const RTCC_CMD_START: u32 = 1 << 0;
 const RTCC_CMD_STOP: u32 = 1 << 1;
 const RTCC_STATUS_RUNNING: u32 = 1 << 0;
+#[cfg(not(feature = "efr32mg24"))]
 const RTCC_LOCK_UNLOCK: u32 = 0xAEE8;
+#[cfg(feature = "efr32mg24")]
+const RTCC_LOCK_UNLOCK: u32 = 0x4776;
+#[cfg(not(feature = "efr32mg24"))]
 const RTCC_CC_CTRL_MODE_OUTPUTCOMPARE: u32 = 2;
 
 /// `RTCC_IF` overflow flag.
@@ -75,6 +126,15 @@ pub const IF_CC0: u32 = 1 << 4;
 pub const IF_CC1: u32 = 1 << 6;
 #[cfg(all(test, feature = "efr32mg22"))]
 const IF_CC2: u32 = 1 << 8;
+/// `SYSRTC_GRP0_IF` compare-0 flag (Embassy time driver).
+#[cfg(feature = "efr32mg24")]
+pub const IF_CC0: u32 = 1 << 1;
+/// `SYSRTC_GRP0_IF` compare-1 flag (blocking EM2 sleep).
+#[cfg(feature = "efr32mg24")]
+pub const IF_CC1: u32 = 1 << 2;
+/// `SYSRTC_GRP0_IF` capture-0 flag (unused; checks the layout).
+#[cfg(all(test, feature = "efr32mg24"))]
+const IF_CC2: u32 = 1 << 3;
 const IF_OWNED: u32 = IF_OF | IF_CC0 | IF_CC1;
 
 const START_TIMEOUT_ITERATIONS: u32 = 1_000_000;
@@ -208,6 +268,7 @@ impl RtccToken {
     /// Mirrors GSDK `sleeptimer_hal_init_timer` + `RTCC_Init`: compare
     /// channels in output-compare mode with interrupts disabled, all flags
     /// cleared, prescaler DIV1, `DEBUGRUN = 0`.
+    #[cfg(not(feature = "efr32mg24"))]
     pub fn start(self) -> Result<Rtcc, RtccError> {
         crate::clock::enable_bus_clock(BusClock::LFRCO);
         crate::clock::enable_bus_clock(BusClock::RTCC);
@@ -246,6 +307,68 @@ impl RtccToken {
         WRAPS.store(0, Ordering::Relaxed);
         Ok(Rtcc { _token: self })
     }
+
+    /// Clock SYSRTC0 from the LFRCO and start it at zero (xG24).
+    ///
+    /// Mirrors GSDK `sleeptimer_hal_init_timer` (SYSRTC): `sl_hal_sysrtc_init`
+    /// (stop and disable a running counter, `DEBUGRUN = 0`), group 0 with
+    /// both compares disabled, interrupts off and flags cleared, then
+    /// enable, start and zero the counter.
+    #[cfg(feature = "efr32mg24")]
+    pub fn start(self) -> Result<Rtcc, RtccError> {
+        crate::clock::enable_bus_clock(BusClock::LFRCO);
+        crate::clock::enable_bus_clock(BusClock::RTCC);
+        unsafe {
+            write(CMU_LOCK, CMU_LOCK_UNLOCK);
+            write(CMU_RTCCCLKCTRL, CMU_RTCCCLKCTRL_LFRCO);
+            write(RTCC_LOCK, RTCC_LOCK_UNLOCK);
+            wait_ready()?;
+            if read(RTCC_EN) & 1 != 0 {
+                wait_sync()?;
+                write(RTCC_CMD, RTCC_CMD_STOP);
+                wait_sync()?;
+                write(RTCC_EN + CLR, 1);
+                wait_ready()?;
+            }
+            write(RTCC_CFG, 0);
+            write(SYSRTC_GRP0_CTRL, 0);
+            write(RTCC_IEN, 0);
+            write(RTCC_IF + CLR, u32::MAX);
+            write(RTCC_EN + SET, 1);
+            write(RTCC_CMD, RTCC_CMD_START);
+            wait_sync()?;
+            write(RTCC_CNT, 0);
+            wait_sync()?;
+            let mut running = false;
+            for _ in 0..START_TIMEOUT_ITERATIONS {
+                if read(RTCC_STATUS) & RTCC_STATUS_RUNNING != 0 {
+                    running = true;
+                    break;
+                }
+            }
+            if !running {
+                return Err(RtccError::StartTimeout);
+            }
+        }
+        WRAPS.store(0, Ordering::Relaxed);
+        Ok(Rtcc { _token: self })
+    }
+}
+
+/// `sl_hal_sysrtc_wait_ready`: no reset, disable or sync in progress.
+#[cfg(feature = "efr32mg24")]
+unsafe fn wait_ready() -> Result<(), RtccError> {
+    for _ in 0..START_TIMEOUT_ITERATIONS {
+        let busy = unsafe {
+            read(SYSRTC_SWRST) & SYSRTC_SWRST_RESETTING != 0
+                || read(RTCC_EN) & SYSRTC_EN_DISABLING != 0
+                || read(RTCC_SYNCBUSY) != 0
+        };
+        if !busy {
+            return Ok(());
+        }
+    }
+    Err(RtccError::StartTimeout)
 }
 
 /// Running RTCC. The free functions in this module operate on it.
@@ -308,6 +431,8 @@ pub fn arm(channel: Channel, ticks: u32) -> u32 {
     unsafe {
         write(rtcc_cc_ocvalue(channel as usize), compare_value(deadline));
         write(RTCC_IF + CLR, channel.flag());
+        #[cfg(feature = "efr32mg24")]
+        write(SYSRTC_GRP0_CTRL + SET, grp0_ctrl_cmpen(channel as usize));
         write(RTCC_IEN + SET, channel.flag());
     }
     deadline
@@ -316,6 +441,10 @@ pub fn arm(channel: Channel, ticks: u32) -> u32 {
 /// Disable the compare interrupt of `channel`.
 pub fn disarm(channel: Channel) {
     unsafe { write(RTCC_IEN + CLR, channel.flag()) };
+    #[cfg(feature = "efr32mg24")]
+    unsafe {
+        write(SYSRTC_GRP0_CTRL + CLR, grp0_ctrl_cmpen(channel as usize))
+    };
 }
 
 /// Enable the overflow interrupt (needed for [`now64`] across wraps).
@@ -365,6 +494,20 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "efr32mg24")]
+    fn sysrtc_map_matches_gsdk_offsets() {
+        // offsetof() from GSDK 4.5.0 efr32mg24_sysrtc.h / _cmu.h.
+        assert_eq!(RTCC_CNT, 0x400A_8018);
+        assert_eq!(RTCC_SYNCBUSY, 0x400A_801C);
+        assert_eq!(RTCC_IF, 0x400A_8040);
+        assert_eq!(SYSRTC_GRP0_CTRL, 0x400A_8048);
+        assert_eq!(rtcc_cc_ocvalue(0), 0x400A_804C);
+        assert_eq!(rtcc_cc_ocvalue(1), 0x400A_8050);
+        assert_eq!(CMU_RTCCCLKCTRL, 0x4000_8240);
+    }
+
+    #[test]
+    #[cfg(not(feature = "efr32mg24"))]
     fn register_map_matches_gsdk_offsets() {
         // offsetof() from GSDK 4.5.0 efr32mg2{1,2}_rtcc.h / _cmu.h.
         assert_eq!(rtcc_cc_ctrl(0), 0x4800_0030);
@@ -381,6 +524,8 @@ mod tests {
         assert_eq!((IF_CC0, IF_CC1, IF_CC2), (0x04, 0x08, 0x10));
         #[cfg(feature = "efr32mg22")]
         assert_eq!((IF_CC0, IF_CC1, IF_CC2), (0x10, 0x40, 0x100));
+        #[cfg(feature = "efr32mg24")]
+        assert_eq!((IF_CC0, IF_CC1, IF_CC2), (0x02, 0x04, 0x08));
     }
 
     #[test]

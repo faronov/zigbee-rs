@@ -3,7 +3,7 @@ name = "efr32s2-hal"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Pure-Rust EFR32 Series 2 (EFR32MG21 / EFR32MG22) peripheral and radio support"
+description = "Pure-Rust EFR32 Series 2 (EFR32MG21 / EFR32MG22 / EFR32MG24) peripheral and radio support"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
@@ -11,6 +11,18 @@ publish = false
 # Exactly one chip must be selected.
 efr32mg21 = []
 efr32mg22 = []
+# EFR32MG24 (xG24, Series 2 config 4). The die alone is not enough: select
+# the PA variant of the part too (it sets the HFXO fixed-capacitor default,
+# GSDK [PM-5131], and the radio's PA tables).
+efr32mg24 = []
+# EFR32MG24 parts with the 10 dBm medium-power PA (e.g. A410/B210/B310).
+efr32mg24-pa10 = ["efr32mg24"]
+# EFR32MG24 parts with the 20 dBm high-power PA (e.g. A420/B220).
+efr32mg24-pa20 = ["efr32mg24"]
+# The board's HFXO crystal is 39 MHz instead of the default 38.4 MHz
+# (selected by the board crate; the radio tables and every cycle-based
+# delay depend on it). Only EFR32MG24 boards use it so far.
+hfxo-39mhz = []
 # Provide `__INTERRUPTS` for cortex-m-rt's `device` feature.
 rt = []
 # Embassy time driver on the RTCC (32,768 Hz, runs in EM2). Defines the
@@ -23,6 +35,10 @@ time-driver = ["dep:embassy-time-driver", "dep:embassy-time-queue-utils"]
 # interrupt handler, so firmware builds need `rt` too (host tests do not).
 # End-device images leave it off.
 isr-ack = []
+# Interrupt-driven USART0 host link (`usart::host`): receive and transmit
+# rings serviced by the `USART0_RX` / `USART0_TX` handlers, for network
+# co-processor images. Defines both handlers, so firmware builds need `rt`.
+usart0-host = []
 
 [dependencies]
 cortex-m = "0.7"

@@ -45,7 +45,7 @@ const SDAROUTE: u32 = 0x08;
 const CLEAR_ALIAS_OFFSET: u32 = 0x2000;
 
 /// I2C0 runs from LSPCLK = PCLK / 2 on both dies.
-pub const LSPCLK_HZ: u32 = 19_200_000;
+pub const LSPCLK_HZ: u32 = crate::clock::HFXO_HZ / 2;
 /// Per-byte timeout (100 kHz byte = 90 us; allow clock stretching).
 const BYTE_TIMEOUT_US: u32 = 5_000;
 

@@ -1,4 +1,9 @@
-//! EFR32 Series 2 (xG21/xG22) MSC flash controller.
+//! EFR32 Series 2 (xG21/xG22/xG24) MSC flash controller.
+//!
+//! Offsets are relative to the main-flash base ([`crate::chip::FLASH_BASE`]:
+//! `0x0` on xG21/xG22, `0x0800_0000` on xG24); the MSC is programmed with
+//! bus addresses. The MSC register block and command bits are identical on
+//! the three dies (GSDK 4.5.0 `efr32mg2{1,2,4}_msc.h`).
 //!
 //! Sequencing follows GSDK 4.5 `em_msc.c` (`writeBurst`, `mscStatusWait`):
 //! `STATUS.TIMEOUT` only reports that a burst ended because `WDATA` arrived
@@ -7,6 +12,7 @@
 //! is still reported. Hardware-proven on EFR32MG22 (BRD4183A) by the
 //! security journal of `examples/efr32mg22-sensor`.
 
+use crate::chip::FLASH_BASE;
 use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
 };
@@ -15,9 +21,17 @@ use embedded_storage::nor_flash::{
 /// MG21 devkit product also confines itself to this range. Also the
 /// conservative bound when DEVINFO does not report a plausible size, and
 /// the host-build capacity.
+#[cfg(not(feature = "efr32mg24"))]
 pub const FLASH_CAPACITY: usize = 512 * 1024;
+/// EFR32MG24: the smallest part (F768), [`crate::chip::FLASH_SIZE`].
+#[cfg(feature = "efr32mg24")]
+pub const FLASH_CAPACITY: usize = crate::chip::FLASH_SIZE as usize;
 /// Largest main flash in the supported families (EFR32MG21 F1024).
+#[cfg(not(feature = "efr32mg24"))]
 pub const MAX_FLASH_CAPACITY: usize = 1024 * 1024;
+/// Largest main flash of the EFR32MG24 family (F1536).
+#[cfg(feature = "efr32mg24")]
+pub const MAX_FLASH_CAPACITY: usize = 1536 * 1024;
 pub const FLASH_PAGE_SIZE: usize = 8192;
 /// `DEVINFO.MSIZE`: `FLASH[15:0]` in KiB, `SRAM[26:16]` in KiB.
 #[cfg(target_os = "none")]
@@ -111,7 +125,9 @@ impl ReadNorFlash for Efr32s2Flash {
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
         Self::validate_range(offset, bytes.len())?;
         for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = unsafe { core::ptr::read_volatile((offset + index as u32) as *const u8) };
+            *byte = unsafe {
+                core::ptr::read_volatile((FLASH_BASE + offset + index as u32) as *const u8)
+            };
         }
         Ok(())
     }
@@ -245,7 +261,8 @@ impl<const START: u32, const SIZE: usize> NorFlash for FlashPartition<START, SIZ
 fn verify(offset: u32, bytes: &[u8]) -> Result<(), FlashError> {
     #[cfg(all(target_arch = "arm", target_os = "none"))]
     for (index, expected) in bytes.iter().enumerate() {
-        let actual = unsafe { core::ptr::read_volatile((offset + index as u32) as *const u8) };
+        let actual =
+            unsafe { core::ptr::read_volatile((FLASH_BASE + offset + index as u32) as *const u8) };
         if actual != *expected {
             return Err(FlashError::Controller);
         }
@@ -264,7 +281,7 @@ fn erase_page_ram(offset: u32) -> Result<(), FlashError> {
         core::ptr::write_volatile(MSC_LOCK as *mut u32, MSC_LOCK_LOCKKEY_UNLOCK);
         let writectrl = core::ptr::read_volatile(MSC_WRITECTRL as *const u32);
         core::ptr::write_volatile(MSC_WRITECTRL as *mut u32, writectrl | MSC_WRITECTRL_WREN);
-        core::ptr::write_volatile(MSC_ADDRB as *mut u32, offset);
+        core::ptr::write_volatile(MSC_ADDRB as *mut u32, FLASH_BASE + offset);
 
         let mut result =
             if core::ptr::read_volatile(MSC_STATUS as *const u32) & MSC_STATUS_INVADDR != 0 {
@@ -295,7 +312,7 @@ fn program_burst_ram(offset: u32, bytes: &[u8]) -> Result<(), FlashError> {
         core::ptr::write_volatile(MSC_LOCK as *mut u32, MSC_LOCK_LOCKKEY_UNLOCK);
         let writectrl = core::ptr::read_volatile(MSC_WRITECTRL as *const u32);
         core::ptr::write_volatile(MSC_WRITECTRL as *mut u32, writectrl | MSC_WRITECTRL_WREN);
-        core::ptr::write_volatile(MSC_ADDRB as *mut u32, offset);
+        core::ptr::write_volatile(MSC_ADDRB as *mut u32, FLASH_BASE + offset);
 
         let mut result =
             if core::ptr::read_volatile(MSC_STATUS as *const u32) & MSC_STATUS_INVADDR != 0 {
