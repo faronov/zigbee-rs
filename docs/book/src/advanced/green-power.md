@@ -42,8 +42,8 @@
 | GPD bidirectional mode (`gpd-app/bidirectional`, MG22 example feature `bidirectional`, product `BIDIRECTIONAL` policy) | implemented, opt-in | host tests: reply in the window → Success and channel persisted; replies at both edges of the spec window (20 ms and 25 ms + GPDF airtime after the GPDF start) and at the measured IKEA offset received; no reply → stays uncommissioned without counter reuse; wrong security level rejected; delivered key replaces the GPD key; invalid policy rejected. Lab-tested on hardware 2026-11-14 (182b358, `lab-tx-power` build): commissioned into ZHA through IKEA 0x43FD as TempMaster, Success accepted, reports in HA, Resumed after reset with channel and counter (§6.9). **Not yet through our proxy** |
 | Full proxy (`zigbee-gp/proxy-full`, `zigbee-runtime/green-power-full-proxy`) | in progress, opt-in (§2 row (b)) | host tests |
 | Combo / Sink (`zigbee-gp/sink`, `zigbee-runtime/green-power-sink`, router-app `green-power-sink`): Sink Table, sink commissioning mode, GPD commissioning (direct and Commissioning Notification, bidirectional through a TempMaster), Notification processing, Notification Response, Sink Table Request, sink attributes, built-in GPD → ZCL translation to one local endpoint, Sink Table in the GP journal | implemented, opt-in (not in any default image) | host tests (`zigbee-gp` sink unit tests, zigpy golden vectors, `gp_store` sink journal tests, runtime end-to-end `gp_combo_commissions_a_switch_and_toggles_the_local_light`); ESP32-H2 and nRF52840 router builds (§4.5); first product: Waveshare ESP32-H2-Zero combo light (`combo-light`, On/Off Light endpoint on the WS2812, BOOT opens sink commissioning, TempMaster included; §3.7). **Lab-tested on the H2-Zero (2026-11-15/16, §6.10)**: BOOT window, direct commissioning of a unidirectional GP switch, Toggles to the light, Sink Table across a power cycle. Adaptive counters across a power cycle and the 180 s BOOT timeout: lab-tested 2026-11-17. Bidirectional GPD directly into the sink with the combo as its own TempMaster: **proven on hardware on the ESP32-H2 2026-11-17**: 3 of 3 rounds with the reply started from the radio interrupts (7b2d6ca), after the fixes for zigpy's Response cancelling the combo's reply, the reply ordering and the busy radio (§6.10) |
-| GP Pairing Configuration and Translation Table on the sink (`zigbee-gp/translation-table`, `zigbee-runtime/green-power-translation-table`, router-app `green-power-translation-table`; in `combo-light`): Pairing Configuration actions no action / extend / replace / remove pairing / remove GPD with the "send GP Pairing" flag, all communication modes with pre-commissioned group lists, security fields, paired endpoints, application information (validated, not stored); Translation Table Update (add/replace/remove) and Request/Response, per-GPD translations to any local endpoint with a fixed, derived (`0xFE`) or copied (`0xFF`) payload, pass-to-application (`0xFC`); built-in translation kept when no explicit entry exists; gpsFunctionality bits 11 and 18; translations and paired endpoints in the GP journal's sink record (§3.8) | implemented, opt-in (2026-11-19) | host tests: `zigbee_gp::config` codec vectors (gecko_sdk field layout), `zigbee_gp::translation_table`, sink behaviour (`sink::configuration::tests`), journal migration / interrupted write / unknown section (`gp_store::translations`), runtime end to end `gp_translation_tests::pairing_configuration_and_translation_update_retarget_a_gpd_toggle` (unicast Pairing Configuration and Translation Table Update from a coordinator, Default Responses, Translation Table Response, GPD Toggle driving endpoint 2 with On, reboot), `locally_issued_configuration_retargets_a_paired_gpd_without_a_tool`. ESP32-H2-Zero `combo-light` builds. **Lab-tested on the H2-Zero in the ZHA network (2026-11-19, §6.11)** with a locally issued Pairing Configuration (Extend) and Translation Table Update (`lab-gp-translation` image): journal migration from the previous firmware, the MG22 switch's Toggle driving On, the translation across a reset, its removal, and the previous firmware resuming on the journal afterwards (a journal still holding a translation section under older firmware is host-tested only). Remote configuration over the air (NCP → sink) is not yet run on hardware |
-| Remote GP provisioning on the ZRHP NCP (`GP_PAIRING_CONFIGURATION`, `GP_SEND_PAIRING`, `GP_TRANSLATION_UPDATE`/`REQUEST`, `GP_REMOTE_SINK_TABLE_REQUEST`, `GP_REMOTE_PROXY_TABLE_REQUEST`, `EVT_GP_REMOTE_*`, [ZRHP 7.11](host-protocol.md#711-green-power-0x0axx-endpoint-2)) | implemented (2026-11-19) | host tests: zigbee-zrhp vectors (`generate.py --check`), NCP request mapping, NCP end to end against a second zigbee-rs router stack (`remote_provisioning_reaches_another_proxy_and_sink`). H2 NCP image builds and passes the stack gate. **Not run on hardware** |
+| GP Pairing Configuration and Translation Table on the sink (`zigbee-gp/translation-table`, `zigbee-runtime/green-power-translation-table`, router-app `green-power-translation-table`; in `combo-light`): Pairing Configuration actions no action / extend / replace / remove pairing / remove GPD with the "send GP Pairing" flag, all communication modes with pre-commissioned group lists, security fields, paired endpoints, application information (validated, not stored); Translation Table Update (add/replace/remove) and Request/Response, per-GPD translations to any local endpoint with a fixed, derived (`0xFE`) or copied (`0xFF`) payload, pass-to-application (`0xFC`); built-in translation kept when no explicit entry exists; gpsFunctionality bits 11 and 18; translations and paired endpoints in the GP journal's sink record (§3.8) | implemented, opt-in (2026-11-19) | host tests: `zigbee_gp::config` codec vectors (gecko_sdk field layout), `zigbee_gp::translation_table`, sink behaviour (`sink::configuration::tests`), journal migration / interrupted write / unknown section (`gp_store::translations`), runtime end to end `gp_translation_tests::pairing_configuration_and_translation_update_retarget_a_gpd_toggle` (unicast Pairing Configuration and Translation Table Update from a coordinator, Default Responses, Translation Table Response, GPD Toggle driving endpoint 2 with On, reboot), `locally_issued_configuration_retargets_a_paired_gpd_without_a_tool`. ESP32-H2-Zero `combo-light` builds. **Lab-tested on the H2-Zero in the ZHA network (2026-11-19, §6.11)** with a locally issued Pairing Configuration (Extend) and Translation Table Update (`lab-gp-translation` image): journal migration from the previous firmware, the MG22 switch's Toggle driving On, the translation across a reset, its removal, and the previous firmware resuming on the journal afterwards (a journal still holding a translation section under older firmware is host-tested only). **Over the air from the ZRHP NCP, lab-tested on an ESP32-C6 combo (2026-11-20, §6.12)**: Pairing Configuration Extend and Remove GPD, Translation Table Update add/remove, Sink and Translation Table Requests, the translation across a reset, an MG22 switch's Toggle driving On |
+| Remote GP provisioning on the ZRHP NCP (`GP_PAIRING_CONFIGURATION`, `GP_SEND_PAIRING`, `GP_TRANSLATION_UPDATE`/`REQUEST`, `GP_REMOTE_SINK_TABLE_REQUEST`, `GP_REMOTE_PROXY_TABLE_REQUEST`, `EVT_GP_REMOTE_*`, [ZRHP 7.11](host-protocol.md#711-green-power-0x0axx-endpoint-2)) | implemented (2026-11-19) | host tests: zigbee-zrhp vectors (`generate.py --check`), NCP request mapping, NCP end to end against a second zigbee-rs router stack (`remote_provisioning_reaches_another_proxy_and_sink`). H2 NCP image builds and passes the stack gate. **Lab-tested on hardware 2026-11-20 (§6.12)**: master 2ab8ac0 NCP on the Thread BR board's H2 (921 600, RTS/CTS) provisioned an ESP32-C6 combo over the air with `GP_PAIRING_CONFIGURATION`, `GP_TRANSLATION_UPDATE`, `GP_TRANSLATION_REQUEST` and `GP_REMOTE_SINK_TABLE_REQUEST`, each answered (`EVT_GP_REMOTE_*`) within 50–85 ms; host tool `tools/zrhp-host` `--gp-*`. `GP_SEND_PAIRING` and `GP_REMOTE_PROXY_TABLE_REQUEST` not run on hardware |
 | Adaptive frame-counter persistence (`zigbee_gp::counter`, Proxy and Sink Table, exact flag in the GP journal's counter records) | implemented, in every GP image | host tests (§3.3); lab-tested on the H2-Zero combo 2026-11-17: after a power cycle the switch's first presses toggled the light, none dropped (§6.10) |
 | GP combo on the ZRHP coordinator NCP (`zigbee-runtime/green-power-ncp` with `ncp-capacity`, `apps/ncp-coordinator` `gp`, `examples/esp32-ncp`): Proxy Basic + sink (Sink Table 16, Proxy Table 8) + TempMaster, sink authority switchable at runtime (`NCP_SINK` / `HOST_SINK`), NCP default `gpsSecurityLevel` 0x00 with no translation endpoint, GP journal in the NCP's `zbnv` window (2 × 8 KiB), all GREEN POWER commands and events of [ZRHP 7.11](host-protocol.md#711-green-power-0x0axx-endpoint-2) | implemented (2026-11-19) | host tests: `zigbee-gp` import/quiet-removal unit tests, runtime `green_power::ncp` unit tests, NCP end-to-end `apps/ncp-coordinator/tests/gp.rs` over the host link (commissioning of a level-3 GPD heard directly, reports, a proxy's GP Notification, table read/put/remove, `CONFLICT`, key-export lock, `HOST_SINK` raw frames and local proxy output), journal geometry tests in `products/esp32-zigbee-ncp`; H2 and C6 NCP images build and pass the stack gate. **Not run on hardware** (ZRHP gate H10) |
 
@@ -2268,10 +2268,86 @@ field; the committed hook keeps it in a static so the production
 are unchanged.
 
 Not covered here: Pairing Configuration and Translation Table commands
-received over the air from a commissioning tool (the NCP's
-`GP_PAIRING_CONFIGURATION` / `GP_TRANSLATION_UPDATE`, ZRHP 7.11), and
-older firmware reading a journal that still holds a translation section
+received over the air from a commissioning tool (§6.12), and older
+firmware reading a journal that still holds a translation section
 (host-tested in `gp_store::translations`).
+
+### 6.12 Remote GP provisioning over the air: NCP → C6 combo (2026-11-20)
+
+Goal: the GP binding end to end over the air: the hub's path (ZRHP host →
+NCP → GP Pairing Configuration / Translation Table Update on endpoint 242)
+configures a sink it does not run, and a real GPD then drives the sink's
+light through the translation. Everything ran in the NCP's lab network
+(PAN 0x1C06, channel 17); the user's ZHA network was not touched.
+
+Setup:
+
+- **NCP:** the Thread BR board's H2, master 2ab8ac0
+  (`esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines`, 921 600
+  with RTS/CTS), app-only write to `ota_0` through the S3 bridge after a
+  full backup (two identical reads, `ef81f503…ccb`); it resumed its network
+  (`Resuming formed PAN=0x1C06 ch=17`).
+- **Sink:** the ESP32-C6 DevKit, the new lab `combo-light` router image of
+  `examples/esp32c6-sensor` (`router` + the product's GP Combo light with
+  the Translation Table; no BOOT commissioning window) built with
+  `ZIGBEE_LAB_CHANNEL=17` (the router image now honours it too). Backup
+  `44d31b8e…ab17`. The role change cleared its network state as designed
+  (`cleared network state: role changed`, counter limits kept); it joined
+  through an NCP-only permit join as router 0x00A4. Lab image 600,704 B
+  as an app image (`.text` 508,232, `.bss` 71,944) against 539,120 B
+  (`.text` 450,450, `.bss` 68,372) for the C6 `router` image, which stays
+  byte-identical to master in every allocated section; so do the MG22
+  sensor and switch images without `lab-gpd-channel`.
+- **GPD:** the MG22 switch (`efr32mg22-gpd-switch`, `lab-switch-cycle` +
+  the new `lab-gpd-channel` with `ZIGBEE_LAB_CHANNEL=17`: every frame on
+  channel 17, journal untouched, so the switch's commissioned channel 15
+  stays as it was). Backup `9b311b26…d560`. Its key and counter were never
+  given to the C6 by commissioning: the C6 learned them only from the
+  Pairing Configuration.
+- **Host:** `tools/zrhp-host --serial … --baud 921600 smoke --form
+  --gp-sink 0x00A4 --gp-src 0x7A6B9879 --gp-pair KEY:150 --gp-translate
+  22:01:0006:01 --gp-tables --gp-watch 100` (key read from the H2-Zero's
+  Sink Table backup into a local file, never logged).
+- **Evidence:** C6 and MG22 console logs, the NCP's logs over ZRHP, and the
+  nRF sniffer on channel 17 (hwlab session `…072911Z-gp-phaseb-air-ch17`).
+
+Results:
+
+- **Provisioning (07:29:27):** `GP_PAIRING_CONFIGURATION` Extend → C6
+  `sink cmd 0x09 from 0x0000: Commissioned`, Default Response SUCCESS
+  (`EVT_GP_REMOTE_STATUS` after 82 ms); `GP_TRANSLATION_UPDATE` add Toggle
+  → ep 1 On/Off On → SUCCESS (83 ms); `GP_REMOTE_SINK_TABLE_REQUEST` by
+  GPD ID → `EVT_GP_REMOTE_SINK_TABLE` with the entry (derived groupcast,
+  level 3, key present, counter 150; 48 ms); `GP_TRANSLATION_REQUEST` →
+  `EVT_GP_REMOTE_TRANSLATION_TABLE` with the translation (48 ms). On air:
+  each command, its APS ACK and the Default Response or table response.
+- **Translation:** the switch's frames fc 176–178: Off → `cmd 0x00`, On →
+  `cmd 0x01`, Toggle (fc 178) → `cmd 0x01 to endpoint 1`; the C6 reported
+  OnOff = 1 to the NCP. Each GPDF seen twice on air (the GPD's repeat).
+- **Reset:** after a system reset the C6 resumed (`1 GP proxy table
+  entries restored`: the sink record) and Toggles fc 181 and 184 still
+  became `cmd 0x01`.
+- **Remove translation:** `GP_TRANSLATION_UPDATE` remove → SUCCESS; the
+  Translation Table Response is NOT_FOUND (0x8B, total 0); the sink entry
+  remains (counter 184); Toggle fc 187 → built-in `cmd 0x02`.
+- **Remove GPD:** `GP_PAIRING_CONFIGURATION` Remove GPD → SUCCESS,
+  `Decommissioned`; Sink and Translation Table Requests → NOT_FOUND;
+  On fc 189 and Toggle fc 190 were no longer delivered.
+- **Restore:** C6 back to its sensor image (original `ota_0` bytes; it
+  rejoined through an NCP-only permit join as 0x00A4); MG22 back to the
+  sensor app (read-back identical to the original, resumed SrcID
+  0x293C9879 at counter 10800, 10752 before). The BR H2 keeps the master
+  NCP.
+
+Wireshark 4.1 and master mark every GP Pairing Configuration with
+`NumberOfPairedEndpoints` 0xFD–0xFF as malformed: the dissector sizes the
+"Paired Endpoints" subtree as `n + 1` bytes before it checks for those
+special values. All fields before that byte decode as sent (gecko_sdk
+layout), and the C6 accepted both frames.
+
+Not run on hardware: `GP_SEND_PAIRING`, `GP_REMOTE_PROXY_TABLE_REQUEST`,
+groupcast-addressed (broadcast) Pairing Configuration and pre-commissioned
+groupcast, and a GPD heard only through a remote proxy.
 
 ## 7. Open questions for the user
 

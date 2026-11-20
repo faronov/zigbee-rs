@@ -88,7 +88,7 @@ async fn run(app: &'static mut App, mut trigger: CommissioningTrigger) -> ! {
             let permit_join = app.node().device().bdb().zdo().nwk().nib().permit_joining;
             app.parts_mut().status.refresh(permit_join);
         }
-        if Instant::now() >= next_summary {
+        if combo::service(app) && Instant::now() >= next_summary {
             next_summary += SUMMARY_PERIOD;
             log_summary(app);
         }
@@ -124,7 +124,7 @@ fn compose(
         .date_code(product::DATE_CODE)
         .sw_build(FIRMWARE_VERSION_STR)
         .power_source(PowerSource::MainsSinglePhase)
-        .channels(ChannelMask::ALL_2_4GHZ)
+        .channels(STEERING_CHANNELS)
         .endpoint(
             profile.endpoint(),
             profile.profile_id(),
@@ -165,7 +165,7 @@ fn compose(
         app.set_green_power_store(GP_STORE.init(product::router::gp_proxy_table_store()));
         app
     };
-    APP.init(app)
+    combo::configure(APP.init(app))
 }
 
 /// Neighbour/child table, Frame Pending and TX health on the console.
@@ -206,5 +206,96 @@ fn log_summary(app: &App) {
             stats.sent,
             stats.cancelled
         );
+    }
+}
+
+/// Steering channels: all of 2.4 GHz, or only `ZIGBEE_LAB_CHANNEL` (11–26)
+/// when a lab build sets it (as in the sensor image), so a factory-new lab
+/// router cannot join another network that permits joining on an earlier
+/// channel. A bad value fails the build.
+const STEERING_CHANNELS: ChannelMask = match option_env!("ZIGBEE_LAB_CHANNEL") {
+    None => ChannelMask::ALL_2_4GHZ,
+    Some(value) => {
+        let digits = value.as_bytes();
+        assert!(
+            digits.len() == 2 && digits[0].is_ascii_digit() && digits[1].is_ascii_digit(),
+            "ZIGBEE_LAB_CHANNEL: a channel number 11..=26"
+        );
+        let channel = (digits[0] - b'0') * 10 + (digits[1] - b'0');
+        assert!(
+            matches!(channel, 11..=26),
+            "ZIGBEE_LAB_CHANNEL: a channel number 11..=26"
+        );
+        ChannelMask(1 << channel)
+    }
+};
+
+/// Without `combo-light` the hooks compile to nothing.
+#[cfg(not(feature = "combo-light"))]
+mod combo {
+    use super::App;
+
+    #[inline(always)]
+    pub fn configure(app: &'static mut App) -> &'static mut App {
+        app
+    }
+
+    #[inline(always)]
+    pub fn service(_app: &mut App) -> bool {
+        true
+    }
+}
+
+/// Lab GP Combo light (`combo-light`): the router endpoint is the product's
+/// HA On/Off Light (shown on the WS2812) and the GP Combo sink delivers
+/// paired GPD commands to it. No BOOT commissioning window: a commissioning
+/// tool pairs GPDs with GP Pairing Configuration (the lab target for remote
+/// GP provisioning through the ZRHP NCP).
+#[cfg(feature = "combo-light")]
+mod combo {
+    use super::App;
+    use embassy_time::{Duration, Instant};
+    use portable_atomic::{AtomicU64, Ordering};
+
+    /// OnTime/OffWaitTime tick (ZCL: 1/10 s).
+    const DECISECOND: Duration = Duration::from_millis(100);
+    /// Next tick, in embassy ticks (0: not started).
+    static NEXT_TICK: AtomicU64 = AtomicU64::new(0);
+
+    /// Translated GPD commands go to the On/Off Light endpoint.
+    pub fn configure(app: &'static mut App) -> &'static mut App {
+        app.node_mut().device_mut().gp_sink_set_endpoint(Some(
+            esp32_zigbee_devkit_product::router::COMBO_SINK_ENDPOINT,
+        ));
+        app
+    }
+
+    /// Once per run-loop step: sink events to the console, the light's
+    /// timers, its state on the LED. Always `true`.
+    #[inline(never)]
+    pub fn service(app: &mut App) -> bool {
+        let device = app.node_mut().device_mut();
+        while let Some(event) = device.gp_sink_take_event() {
+            log::info!("[ESP32-C6] GP sink {:?}", event);
+        }
+        let now = Instant::now();
+        let next = match NEXT_TICK.load(Ordering::Relaxed) {
+            0 => now + DECISECOND,
+            ticks => Instant::from_ticks(ticks),
+        };
+        let next = if now >= next {
+            let elapsed = (now - next).as_ticks() / DECISECOND.as_ticks() + 1;
+            app.node_mut()
+                .profile_mut()
+                .component_mut()
+                .tick_by(elapsed as u32);
+            next + DECISECOND * elapsed as u32
+        } else {
+            next
+        };
+        NEXT_TICK.store(next.as_ticks(), Ordering::Relaxed);
+        let on = app.node().profile().component().is_on();
+        app.parts_mut().status.set_light(on);
+        true
     }
 }

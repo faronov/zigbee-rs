@@ -91,6 +91,12 @@ green-power = [
     "router-app/green-power",
     "esp32-zigbee-devkit-product/green-power",
 ]
+# Lab GP Combo light (with `router`; lab target for remote GP provisioning
+# through the ZRHP NCP): the router endpoint is an HA On/Off Light on the
+# WS2812 and a GP Combo sink with the Translation Table delivers paired GPD
+# commands to it. GPDs are paired with GP Pairing Configuration only (no
+# BOOT commissioning window). Never a shipped image.
+combo-light = ["router", "esp32-zigbee-devkit-product/combo-light"]
 # Retained light sleep for the sleepy sensor only.
 light-sleep = ["esp32-zigbee-devkit-product/light-sleep"]
 # Accept only signed MCUboot envelopes over OTA (see the product's

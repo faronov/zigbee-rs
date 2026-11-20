@@ -30,7 +30,7 @@ use zigbee_mac::efr32s2::Efr32s2RadioPhy;
 #[allow(unused_imports)]
 use efr32s2_hal::vectors::__INTERRUPTS;
 
-type Device = GpdDevice<Efr32s2RadioPhy, product::GpdStore>;
+type Device = GpdDevice<crate::lab_channel::Phy, product::GpdStore>;
 
 /// Longest EM2 sleep of an idle device (RTCC ticks fit `u32`).
 const IDLE_SLEEP_MS: u32 = 3_600_000;
@@ -121,7 +121,7 @@ pub async fn run(profile: GpdProfile) -> ! {
         halt()
     }
     let (mut device, provisioning) = Device::open(
-        phy,
+        crate::lab_channel::wrap(phy),
         product::gpd_store(flash, profile.kind),
         profile,
         eui64,

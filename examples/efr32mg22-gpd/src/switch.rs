@@ -12,3 +12,6 @@ mod vcom_log;
 async fn main(_spawner: embassy_executor::Spawner) {
     gpd_main::run(efr32mg22_gpd_product::SWITCH).await
 }
+
+/// LAB ONLY channel pin (`lab-gpd-channel`); the identity otherwise.
+mod lab_channel;
