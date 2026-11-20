@@ -554,6 +554,14 @@ paths are unchanged (router 14,568 B, ED 19,112 B, sensor 20,644 B). Inlining
 the helper into the CSMA loop would have pushed the sensor and ED rejoin
 stack chains over their gates, so it stays out of line.
 
+The production image with the fix (no lab log) then ran for 39 minutes as
+0x045B after an application-only reflash. It resumed from its journals
+without a new association. With a capture on the same channel, it received
+25,080 valid frames, with 15 queue overflows (all broadcasts, none
+evicted), no withheld ACK and 1 channel-access failure in 1,160
+transmissions. It relayed 95.5 % of the broadcasts heard with radius above 1
+(soak: 95.3 %). No unicast was sent to or by the router in that window.
+
 One `hwlab target identify` (or `flash info`) on the running router
 left its CPU stalled in flash code until a hard reset, probably because the
 flash JEDEC read runs while the CPU executes from flash. RAM reads are safe.
