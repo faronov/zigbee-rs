@@ -1,4 +1,5 @@
 name: NCP release artifacts
+run-name: NCP images from ${{ inputs.ref || github.ref_name }}
 
 # Flashable ZRHP NCP images for testers (not a release): ESP32-H2 and ESP32-C6 DevKits over their native
 # USB-Serial-JTAG port, plus the Espressif Thread Border Router board (H2 side, UART 921 600 RTS/CTS).
@@ -11,6 +12,9 @@ name: NCP release artifacts
 #   FLASHING.txt, SHA256SUMS
 # The bootloader is espflash's bundled ESP-IDF bootloader (no A/B rollback; FW_* rollback needs
 # products/esp32-zigbee-ncp/bootloader, built with ESP-IDF v5.5.1).
+#
+# Testers of the herdsman adapter use a run of `ncp-host-gaps` until that branch is merged:
+#   gh workflow run ncp-release-artifacts.yml --ref ncp-release-artifacts -f ref=ncp-host-gaps
 
 on:
     push:
