@@ -1611,6 +1611,16 @@ fn channel_change_announces_commits_then_switches() {
         (stored.channel, stored.update_id),
         (25, update_id.wrapping_add(1))
     );
+    // A security checkpoint inside the delivery interval keeps the new
+    // channel (the NWK holds it as pending).
+    let stored = {
+        let (device, store) = TcApp::device_and_store_mut(port.app_mut());
+        device.refresh_security_state(store).unwrap();
+        zigbee_runtime::security_store::SecurityStateStore::load(store)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(stored.channel, 25);
     assert_eq!(port.info().channel, 20);
     assert_eq!(port.info().nwk_update_id, update_id.wrapping_add(1));
     assert!(host.event(ids::EVT_CHANNEL_CHANGED).is_none());

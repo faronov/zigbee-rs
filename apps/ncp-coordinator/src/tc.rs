@@ -1228,12 +1228,13 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             return Err(OpError::InvalidState);
         }
         commit_channel(&mut self.app, channel, update_id)?;
-        self.app
-            .device_mut()
-            .aps_mut()
-            .nwk_mut()
-            .nib_mut()
-            .set_nwk_update_id(update_id);
+        // The NWK holds the pending channel too: the security checkpoints
+        // then persist it (not the current one) until the switch, and its
+        // maintenance retunes after the delivery time even if the NCP loop
+        // is late.
+        let nwk = self.app.device_mut().aps_mut().nwk_mut();
+        nwk.nib_mut().set_nwk_update_id(update_id);
+        nwk.arm_channel_change(channel);
         self.stored = stored_network(&mut self.app);
         Ok(())
     }
@@ -1242,11 +1243,13 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         if !self.running {
             return Err(OpError::InvalidState);
         }
-        self.app
-            .device_mut()
-            .aps_mut()
-            .nwk_mut()
-            .nlme_set_channel(channel)
+        let nwk = self.app.device_mut().aps_mut().nwk_mut();
+        if nwk.pending_channel_change().is_none() && nwk.nib().logical_channel == channel {
+            // The NWK maintenance already retuned.
+            return Ok(());
+        }
+        nwk.cancel_channel_change();
+        nwk.nlme_set_channel(channel)
             .await
             .map_err(|status| OpError::Zigbee(status as u8))
     }
