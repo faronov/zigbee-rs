@@ -13,8 +13,11 @@
 > hardware gates H1–H12 has passed. The zigpy library
 > ([`faronov/zigpy-zrhp`](https://github.com/faronov/zigpy-zrhp)) is tested
 > against the vectors, a Python NCP simulator and the Rust NCP on the host
-> (12.1.1), not yet on hardware. The Go adapter, zigbee-herdsman adapter and
-> embedded hub described here do not exist yet.
+> (12.1.1), not yet on hardware. The zigbee-herdsman adapter
+> ([`faronov/zigbee-herdsman`](https://github.com/faronov/zigbee-herdsman/tree/zrhp),
+> branch `zrhp`) is tested against the vectors, a scriptable NCP, the Rust NCP
+> simulator and Zigbee2MQTT on that simulator (12.3.1), not yet on hardware.
+> The Go adapter and the embedded hub described here do not exist yet.
 > Byte layouts are normative for v1. The golden vectors in
 > [`host-protocol-vectors/`](host-protocol-vectors/generate.py) are generated
 > from these layouts by a small Python script. The script is a vector
@@ -3214,6 +3217,28 @@ N2).
 - a Z2M round trip: Z2M backup → zigbee-rs → Z2M `coordinator_backup.json`
   → zigpy import (14.3);
 - hardware gate H11 (14.6).
+
+#### 12.3.1 Notes from the zigbee-herdsman adapter (proposals, 2026-11-20)
+
+Found while writing `src/adapter/zrhp` in `faronov/zigbee-herdsman` (branch
+`zrhp`) against this chapter, the Rust NCP and `examples/ncp_sim.rs`. The
+adapter's CI runs every vector file, the ARQ traces, link fault tests, the
+adapter against the simulator, and Zigbee2MQTT 2.14.3 end to end on the
+simulator over a PTY (bare metal and Docker). Each item is what the adapter
+does today and a proposed change.
+
+| # | Gap | Adapter behaviour | Proposal |
+|---:|---|---|---|
+| H1 | Extended PAN ID byte order in herdsman's `coordinator_backup.json` is adapter-specific, and 9.1 does not list it. The `ember` adapter writes the EZSP byte array, i.e. on-air order (its `getNetworkParameters` reverses it for display); `zstack` writes the reversed NIB value, i.e. big-endian as OCB requires. herdsman only compares `extended_pan_id` with `networkOptions.extendedPanID` byte for byte. | Treats the OCB hex as big-endian (OCB), and `extendedPanID` in the same order; on air it sends the reverse. | Add the quirk to the 9.1 table ("Z2M ember backups: EPID in on-air order") once a real ember-written file confirms it. A ZRHP host importing a herdsman file with `internal.ezspVersion` should then reverse the EPID, or ask. |
+| H2 | 12.3 needs a Zigbee2MQTT change too, not only herdsman: Z2M validates `serial.adapter` against an enum in `lib/util/settings.schema.json` and types it as a union in `lib/types/api.ts`, so stock Z2M neither accepts nor compiles `adapter: zrhp`. | `scripts/zrhp/build-z2m.sh` and `docker/zrhp-z2m` add `zrhp` to the enum and the union, and make the fork the only zigbee-herdsman of the tree (pnpm override, also for zigbee-herdsman-converters). | Mention the Z2M schema patch in 12.3 "Placement". |
+| H3 | USB discovery by VID/PID (12.3): `303a:1001` and the product string "USB JTAG/serial debug unit" are fixed by the ESP32 silicon for every USB-Serial-JTAG firmware, so they cannot identify a ZRHP NCP. | No USB fingerprint; `adapter: zrhp` and `port` are required. | Drop VID/PID discovery from 12.3, or define discovery as a ZRHP probe (`RESET_REQ` → `RESET_ACK`, 12.2) on Espressif ports only. |
+| H4 | `EVT_DEVICE_JOINED` is emitted at the Trust Center decision, before the key exchange, while herdsman starts the interview on `deviceJoined`. | Emits `deviceJoined` on `EVT_DEVICE_AUTHORIZED` (or 5 s after the join, or at once for a secured rejoin). | State in 7.2 that hosts should start device traffic after `EVT_DEVICE_AUTHORIZED`, and whether it is guaranteed for joins through a router and for TC rejoins. |
+| H5 | `HOST_SINK` (7.11): GP Notifications groupcast to `0x0B84` reach the host only if the GP endpoint is in that group, which the NCP does only for groups of its own Proxy Table; `NWK_GROUP_MEMBERSHIP` is `UNSUPPORTED_COMMAND`. Proxies paired by an earlier sink (or before the NCP's own proxy saw the Pairing) are not heard. | Sends `GP_SINK_CONFIG{mode 0, group 0x0B84}` and `NWK_GROUP_MEMBERSHIP{add, 0x0B84, 242}` (tolerating `UNSUPPORTED_COMMAND`). | In `HOST_SINK`, the NCP joins endpoint 242 to `GP_SINK_CONFIG.group` (and implement `NWK_GROUP_MEMBERSHIP`). |
+| H6 | Commands herdsman needs that the NCP answers `UNSUPPORTED_COMMAND`: `NWK_CHANGE_CHANNEL` (Z2M changes the channel when `channel` differs from the NCP at a `resumed` start), `DIAG_GET_NEIGHBORS`/`DIAG_GET_ROUTES` (the coordinator's Mgmt_Lqi/Mgmt_Rtg for the network map), `SEC_ADD_INSTALL_CODE`/`SEC_ADD_LINK_KEY`, `NWK_SET_TX_POWER`, `NWK_PERMIT_JOIN` with a router target. | Channel change fails with an explicit error; empty coordinator tables; install codes fall back to `TBL_PUSH` of a pinned `DEVICE` record with the derived key; permit join on one router is sent as ZDO Mgmt_Permit_Joining_req to it. | Implementation gaps (as Z10); `NWK_CHANGE_CHANNEL` first, since a Z2M configuration change triggers it. |
+| H7 | Restore when the backup's coordinator IEEE differs and the NCP lacks `IEEE_REWRITABLE` (the simulator; any product without the identity item): zigpy refuses (`CannotWriteNetworkSettings`), herdsman has no such step. | Restores under the NCP's own IEEE and moves `tc_address` with it (`NODE.flags` bit0 clear), with a warning; herdsman then updates the coordinator's IEEE in its database. | Say in 9.4 rule 7 what a host without a refusal path does. |
+| H8 | herdsman adds no NWK margin itself (zigpy adds 10 000), and its backups carry no TCLK counter unless the adapter writes `metadata.internal.network`. | `nwk_margin = 10 000`; APS 10 000 when the file has a TCLK counter **or** `stack_specific.zigbee_rs.aps_frame_counter_limit`, 2²⁰ otherwise (Z5). The adapter's own backups carry `internal.network.tc_link_key` (herdsman's pass-through of unknown `internal` keys, part of the fork). | Fold into 9.4 rule 6. |
+| H9 | Native USB re-enumeration after an NCP reset changes the device node; a Docker `--device` mapping does not follow it. | Reopens the port by path for the resume budget (20 s), then reports `disconnected` (Z2M stops; a container restart policy recovers). | Add to 11.3: hosts in containers map `/dev/serial/by-id` paths and expect a restart after an NCP reset. |
+| H10 | The response budget of Z1 also matters for herdsman (many parallel requests from Z2M at start). | Same 1 024-byte per-endpoint budget as the zigpy library. | As Z1. |
 
 ### 12.4 Embedded hub (`faronov/zigbee-rs-hub`, ESP32-S3)
 
