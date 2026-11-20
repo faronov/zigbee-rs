@@ -875,7 +875,19 @@ reflash), the sensor's polls failed and it fell back to secure rejoins
 (extended-source fallback on). After the NCP came back, a reset sensor
 rejoined at once as `0x01F7` and kept reporting.
 
-Open hardware gates:
+Restored sleepy child after an NCP restart (branch
+`ncp-poll-estimate-restore`, 2026-11-20). In 4 rounds: a factory-new C6
+joined, settled into its 30 s long poll, and the NCP was reset (`h2 reset`,
+`NWK_INIT`). The host then sent a Read Basic and a Mgmt_Leave. Both were
+delivered at the child's next poll, 15–16 s and 12–13 s after the request,
+one copy each, with no poll failures
+(`2026-11-20T082149Z-ncp-poll-seed-restart-rounds-2`).
+A control round on the master image also passed: an APS retry happened to
+land in the poll. The earlier NO_ACK after 38 s needs a poll phase that
+misses all four 8 s copies, and these rounds could not force that. The
+host tests are the discriminating evidence.
+
+Open hardware gates:Open hardware gates:
 
 - The C6 router uses the same patch but has not been rerun on hardware.
 - No sleepy child has polled an ESP router for a long run, so Frame Pending

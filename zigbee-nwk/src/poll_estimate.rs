@@ -14,6 +14,17 @@
 //! hold, and a child that permanently polls faster drops to it once the
 //! window has passed without a long interval. Holding a frame longer than
 //! needed costs only the queue slot: it still goes out at the next poll.
+//!
+//! The estimates live in RAM. A child restored from the durable child table
+//! after a reboot is seeded instead ([`PollEstimates::seed`]): until it is
+//! heard to long-poll again, its frames are held up to its End Device
+//! Timeout (capped by [`MAX_HOLD_SECS`]). Zigbee leaves a parent's
+//! buffering time to its `macTransactionPersistenceTime`; the only bound a
+//! sleepy child guarantees is its End Device Timeout, within which it must
+//! poll (R21+ keepalive) or be aged out, so a frame held that long reaches
+//! a live child at its next poll. Without the seed every frame to a
+//! long-polling child after a parent restart expired after the default
+//! 8 s, and APS retries spaced by that hold all missed its 30 s polls.
 
 use zigbee_types::ShortAddress;
 
@@ -37,6 +48,21 @@ struct Estimate {
     /// Largest poll interval (ms) seen since `max_since_us` (0 = one poll).
     interval_ms: u32,
     max_since_us: u32,
+    /// `last_poll_us` is a real poll (not the seeding time).
+    polled: bool,
+    /// Conservative seed of a restored child, kept until a long poll is
+    /// measured or a whole window passed.
+    seeded: bool,
+}
+
+/// Seed interval of a restored child: holds of [`MAX_HOLD_SECS`], bounded
+/// by its End Device Timeout.
+const SEED_INTERVAL_MS: u32 = MAX_HOLD_SECS as u32 * 1_000;
+
+/// Hold for a measured poll interval: the interval plus a quarter and one
+/// second (whole seconds), before the timeout/cap bounds.
+const fn wanted_hold_secs(interval_ms: u32) -> u32 {
+    (interval_ms + interval_ms / 4) / 1_000 + 1
 }
 
 /// Per-child poll-interval estimates.
@@ -54,8 +80,25 @@ impl PollEstimates {
     /// Record one Data Request from `child` at `now_us`.
     pub fn note_poll(&mut self, child: ShortAddress, now_us: u32) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.child == child) {
+            if !entry.polled {
+                // The first poll after seeding: no interval yet.
+                entry.last_poll_us = now_us;
+                entry.polled = true;
+                return;
+            }
             let interval_ms = now_us.wrapping_sub(entry.last_poll_us) / 1_000;
-            if interval_ms >= entry.interval_ms
+            if entry.seeded {
+                // A fast-poll burst does not replace the seed; the first
+                // long poll (one that needs more than the default hold) or
+                // a whole window without one does.
+                if wanted_hold_secs(interval_ms) > u32::from(DEFAULT_HOLD_SECS)
+                    || now_us.wrapping_sub(entry.max_since_us) >= WINDOW_US
+                {
+                    entry.seeded = false;
+                    entry.interval_ms = interval_ms;
+                    entry.max_since_us = now_us;
+                }
+            } else if interval_ms >= entry.interval_ms
                 || now_us.wrapping_sub(entry.max_since_us) >= WINDOW_US
             {
                 entry.interval_ms = interval_ms;
@@ -64,12 +107,35 @@ impl PollEstimates {
             entry.last_poll_us = now_us;
             return;
         }
-        let estimate = Estimate {
+        self.insert(Estimate {
             child,
             last_poll_us: now_us,
             interval_ms: 0,
             max_since_us: now_us,
-        };
+            polled: true,
+            seeded: false,
+        });
+    }
+
+    /// Seed a child restored after a reboot (nothing learned this power
+    /// cycle): hold its frames up to its End Device Timeout until it is heard
+    /// to long-poll. Replaces any estimate of that address. Out of line: it
+    /// runs once per restored child and stays off its callers' frames.
+    #[inline(never)]
+    pub fn seed(&mut self, child: ShortAddress, now_us: u32) {
+        self.forget(child);
+        self.insert(Estimate {
+            child,
+            last_poll_us: now_us,
+            interval_ms: SEED_INTERVAL_MS,
+            max_since_us: now_us,
+            polled: false,
+            seeded: true,
+        });
+    }
+
+    fn insert(&mut self, estimate: Estimate) {
+        let now_us = estimate.last_poll_us;
         if self.entries.push(estimate).is_err() {
             // Full: replace the child heard from least recently.
             if let Some(oldest) = self
@@ -97,7 +163,7 @@ impl PollEstimates {
             .iter()
             .find(|entry| entry.child == child)
             .map_or(0, |entry| entry.interval_ms);
-        let wanted = (interval_ms + interval_ms / 4) / 1_000 + 1;
+        let wanted = wanted_hold_secs(interval_ms);
         let hold = wanted
             .min(timeout_secs)
             .clamp(u32::from(DEFAULT_HOLD_SECS), u32::from(MAX_HOLD_SECS));
@@ -151,6 +217,49 @@ mod tests {
         // Polling only fast for a whole window drops back to the default.
         while now < 30_000_000 + WINDOW_US + 1_000_000 {
             now += 250_000;
+            estimates.note_poll(CHILD, now);
+        }
+        assert_eq!(estimates.hold_secs(CHILD, 60 << 14), DEFAULT_HOLD_SECS);
+    }
+
+    /// A child restored after a reboot is held up to its End Device Timeout
+    /// (capped) until it is heard to long-poll; fast polls do not undo the
+    /// seed, the first long poll replaces it.
+    #[test]
+    fn a_restored_child_is_held_until_its_long_poll_is_relearned() {
+        let mut estimates = PollEstimates::new();
+        estimates.seed(CHILD, 5_000_000);
+        assert_eq!(estimates.hold_secs(CHILD, 60 << 14), MAX_HOLD_SECS);
+        assert_eq!(estimates.hold_secs(CHILD, 20), 20, "End Device Timeout");
+        assert_eq!(estimates.hold_secs(CHILD, 2), DEFAULT_HOLD_SECS);
+        // First poll 50 s after the restore: no interval measured from the
+        // seeding time.
+        let mut now = 55_000_000;
+        estimates.note_poll(CHILD, now);
+        assert_eq!(estimates.hold_secs(CHILD, 60 << 14), MAX_HOLD_SECS);
+        // A fast-poll burst keeps the seed.
+        for _ in 0..20 {
+            now += 250_000;
+            estimates.note_poll(CHILD, now);
+        }
+        assert_eq!(estimates.hold_secs(CHILD, 60 << 14), MAX_HOLD_SECS);
+        // The first 30 s long poll is learned.
+        now += 30_000_000;
+        estimates.note_poll(CHILD, now);
+        assert_eq!(estimates.hold_secs(CHILD, 60 << 14), 38);
+        // From then on the usual window rules: a burst keeps 38 s.
+        now += 250_000;
+        estimates.note_poll(CHILD, now);
+        assert_eq!(estimates.hold_secs(CHILD, 60 << 14), 38);
+    }
+
+    #[test]
+    fn a_restored_child_that_only_fast_polls_drops_the_seed_after_a_window() {
+        let mut estimates = PollEstimates::new();
+        estimates.seed(CHILD, 0);
+        let mut now = 0;
+        while now < WINDOW_US + 1_000_000 {
+            now += 1_000_000;
             estimates.note_poll(CHILD, now);
         }
         assert_eq!(estimates.hold_secs(CHILD, 60 << 14), DEFAULT_HOLD_SECS);

@@ -7233,7 +7233,11 @@ mod tests {
             aps.nwk_mut()
                 .restore_child([0x60; 8], CHILD, false, true, false, 8)
         );
-        let hold_us = u32::from(zigbee_nwk::poll_estimate::DEFAULT_HOLD_SECS) * 1_000_000;
+        // A child restored after a reboot is held at the conservative bound
+        // (its End Device Timeout, capped) until its long poll is relearned.
+        let hold_secs = aps.nwk().sleepy_child_hold_secs(CHILD).unwrap();
+        assert_eq!(hold_secs, zigbee_nwk::poll_estimate::MAX_HOLD_SECS);
+        let hold_us = u32::from(hold_secs) * 1_000_000;
         aps.register_ack_pending(0x42, CHILD.0, &[0xAA])
             .expect("a free ACK slot");
         aps.register_ack_pending(0x43, 0x1234, &[0xBB])

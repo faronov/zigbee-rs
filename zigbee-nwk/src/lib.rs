@@ -1452,6 +1452,11 @@ impl<M: MacDriver> NwkLayer<M> {
     /// liveness). Returns whether the child was installed.
     ///
     /// [`Child`]: neighbor::Relationship::Child
+    ///
+    /// Out of line with `adaptive-indirect` (the NCP): its network
+    /// activation runs it once per restored child beside a deeper journal
+    /// path, so the inlined poll-estimate seed would deepen that frame.
+    #[cfg_attr(feature = "adaptive-indirect", inline(never))]
     pub fn restore_child(
         &mut self,
         ieee: IeeeAddress,
@@ -1505,7 +1510,23 @@ impl<M: MacDriver> NwkLayer<M> {
         if device_type == neighbor::NeighborDeviceType::EndDevice {
             entry.refresh_end_device_timeout();
         }
-        self.neighbors.add_or_update(entry).is_ok()
+        let installed = self.neighbors.add_or_update(entry).is_ok();
+        // Nothing is known of a restored sleepy child's polling this power
+        // cycle: hold its frames up to its End Device Timeout until a long
+        // poll is measured again (see `poll_estimate`).
+        #[cfg(feature = "adaptive-indirect")]
+        if installed && !rx_on_when_idle && !is_router {
+            self.seed_restored_child_poll(short);
+        }
+        installed
+    }
+
+    /// Out of line so the restore loop's frame does not grow.
+    #[cfg(feature = "adaptive-indirect")]
+    #[inline(never)]
+    fn seed_restored_child_poll(&mut self, short: ShortAddress) {
+        let now_us = self.mac.monotonic_micros();
+        self.poll_estimates.seed(short, now_us);
     }
 
     /// Remove a child and every piece of coupled per-child state consistently.
@@ -1516,6 +1537,8 @@ impl<M: MacDriver> NwkLayer<M> {
     /// aging and Parent Announce pruning.
     fn evict_child(&mut self, short: ShortAddress, ieee: &IeeeAddress) {
         self.indirect.remove_all(short);
+        #[cfg(feature = "adaptive-indirect")]
+        self.poll_estimates.forget(short);
         self.routing.remove(short);
         self.security.clear_frame_counters_for_source(ieee);
         let _ = self
