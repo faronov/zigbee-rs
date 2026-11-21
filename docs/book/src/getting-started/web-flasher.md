@@ -14,11 +14,39 @@ Every image comes from a tagged GitHub release, never from a CI artifact:
 | ESP32-H2 DevKit | ZRHP NCP (`examples/esp32-ncp`, USB-Serial-JTAG) | `ncp-v*` (zigbee-rs) | the DevKit's "USB" port |
 | ESP32-C6 DevKit | ZRHP NCP (USB-Serial-JTAG) | `ncp-v*` | the DevKit's "USB" port |
 | Espressif Thread Border Router board, H2 | ZRHP NCP (UART 921 600, RTS/CTS on R19/R20) | `ncp-v*` | flash through the H2's own port USB1 |
-| Espressif Thread Border Router board, S3, 8 MB | `tbr-hub` (A/B production layout) | `hub-v*` (zigbee-rs-hub) | retail boards |
-| Espressif Thread Border Router board, S3, 4 MB | `tbr-hub` (dev layout, no OTA) | `hub-v*` | early samples |
+| Espressif Thread Border Router board, S3 (4 MB or 8 MB, detected) | `tbr-hub`: A/B production layout on 8 MB, dev layout without OTA on 4 MB | `hub-v*` (zigbee-rs-hub) | one entry; the image follows the chip's flash size |
 
 There is no ESP32-C5 NCP image (the C5 port has router and sensor examples
 only).
+
+## Boards with several flash sizes
+
+An image for a larger flash than the chip has does not boot at all (the
+Thread Border Router board's S3 ships with 4 MB on early samples and 8 MB on
+retail boards). Boards of one release that differ only in flash size (same
+product, firmware, chip and host link) therefore appear as **one entry**,
+and installing takes one more step:
+
+1. *Connect and read the flash size*: the page opens the port with
+   esptool-js (vendored, pinned), checks the chip family, reads the SPI flash
+   ID (`RDID`; size = 2^((ID >> 16) & 0xFF): `0x16` = 4 MB, `0x17` = 8 MB,
+   `0x18` = 16 MB) and the partition table at `0x8000`.
+2. It selects the largest image whose flash size fits. Images for a larger
+   flash are disabled; a smaller one can be chosen by hand. An unreadable ID
+   (all 0 or all 1, implausible size) or a flash smaller than every image
+   blocks the install.
+3. If the chip's partition table differs from the chosen image's (another
+   layout, e.g. 4 MB dev → 8 MB A/B, other firmware, or an erased chip), the
+   install is forced to erase, with a warning to back up first (for the hub:
+   its network backup in the web UI or the `network/backup` API call).
+4. *Install* hands the same port to ESP Web Tools (no second port prompt), so
+   the measured chip is the one written. After the install the chip reboots;
+   the next install reads the flash again.
+
+`tools/flasher_site.py` marks these groups (`size_group`,
+`size_group_title`; a release manifest may set them itself). For checking
+the selection without hardware, `?board=<group>&selftest=<MB>&table=<4MB|8MB|erased|other>`
+simulates a detection (installing stays blocked).
 
 ## Keep or erase
 
@@ -54,7 +82,7 @@ from its backup.
   S3's USB port shows the bridge's two serial ports. The flasher's *Switch
   the S3 to USB-Serial-JTAG* button opens the second (console) port at
   1200 bps, the same as the console command `s3 usj`; the S3's own
-  USB-Serial-JTAG port appears and Install can use it.
+  USB-Serial-JTAG port appears and the flash-size detection can use it.
 - If no port shows up or the connection fails: hold BOOT, press and release
   RESET, release BOOT, try again.
 - Close other programs on the port first (Zigbee2MQTT, Home Assistant, serial
@@ -66,7 +94,9 @@ The flasher lists the newest five releases of each repository; pre-releases
 are marked and the newest stable release is preselected. Each version shows
 its date, commit, `build_id`, ZRHP protocol version, the release notes
 (changelog) and the SHA-256 of every image. Links can pin a board and a
-version: `…/flasher/?board=esp32h2-devkit-ncp&version=ncp-v0.1.0`.
+version: `…/flasher/?board=esp32h2-devkit-ncp&version=ncp-v0.1.0` (for a size group
+the group id, e.g. `thread-br-s3-hub`; a member id preselects that image if
+it fits).
 
 ## Without a browser
 
@@ -160,7 +190,8 @@ The Pages build copies them onto the site instead:
   repository that carry a `release-manifest.json`, downloads the parts,
   verifies size and SHA-256, and writes one ESP Web Tools manifest per board
   and mode plus `releases.json` for the page. ESP Web Tools itself is
-  vendored from npm (pinned version, integrity-checked).
+  vendored from npm (pinned version, integrity-checked), and so is
+  esptool-js for the flash-size detection.
 - `ci.yml` calls it on every run: deployed on master pushes, a preview
   artifact (`github-pages`) on pull requests.
 - `site-refresh.yml` rebuilds the live site's revision with the current

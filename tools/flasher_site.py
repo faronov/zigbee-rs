@@ -150,6 +150,40 @@ def esp_web_tools_manifest(manifest: dict, board: dict, erase: bool) -> dict:
     }
 
 
+def flash_bytes(size: str) -> int:
+    m = re.fullmatch(r"(\d+)\s*([KM])B", str(size).strip().upper())
+    if m is None:
+        raise SiteError(f"bad flash size {size!r}")
+    return int(m.group(1)) << (10 if m.group(2) == "K" else 20)
+
+
+def mark_size_groups(boards: list[dict], product_name: str) -> None:
+    """Boards of one release that differ only in flash size (same product,
+    firmware, chip and host link) form a size group: the page reads the
+    chip's flash ID and offers only images that fit, the largest first.
+    A release manifest may name the group itself (`size_group`,
+    `size_group_title`)."""
+    keyed: dict[str, list[dict]] = {}
+    for board in boards:
+        key = board.get("size_group") or "|".join(
+            str(board.get(k) or "") for k in ("product", "firmware", "chip_family", "transport", "features"))
+        keyed.setdefault(key, []).append(board)
+    for members in keyed.values():
+        sizes = {flash_bytes(b["flash_size"]) for b in members}
+        if len(members) < 2 or len(sizes) != len(members):
+            continue
+        ids = os.path.commonprefix([b["id"] for b in members]).rstrip("-")
+        titles = os.path.commonprefix([b["title"] for b in members]).rstrip(" (:,")
+        label = " / ".join(f"{n >> 20} MB" for n in sorted(sizes))
+        group = members[0].get("size_group") or ids or members[0]["id"]
+        title = members[0].get("size_group_title") or f"{titles} ({label}, detected): {product_name}"
+        for board in members:
+            board["size_group"] = group
+            board["size_group_title"] = title
+    for board in boards:
+        board["flash_bytes"] = flash_bytes(board["flash_size"])
+
+
 def fingerprint(entries: list[tuple[str, str, str]]) -> str:
     """Identity of the published release set: (repo, tag, manifest SHA-256)."""
     return hashlib.sha256(json.dumps(sorted(entries)).encode()).hexdigest()
@@ -213,6 +247,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 "fw_update": fw and {**fw, "download": downloads.get(fw["file"]["name"])},
                 "manifests": manifests,
             })
+        mark_size_groups(boards, manifest["name"])
         product = products.setdefault(manifest["product"], {
             "product": manifest["product"], "name": manifest["name"], "repository": repo, "releases": []})
         product["releases"].append({

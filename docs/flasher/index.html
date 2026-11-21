@@ -79,6 +79,11 @@
     <section class="card">
       <h2>1. Board</h2>
       <select id="board"></select>
+      <div id="layout-box" class="hidden" style="margin-top:.8rem">
+        <label for="layout" class="muted" style="font-size:.9rem">Image (chosen from the detected flash size, step 4)</label>
+        <select id="layout" disabled></select>
+        <p id="layout-note" class="muted" style="font-size:.85rem;margin:.4rem 0 0"></p>
+      </div>
       <dl id="board-info"></dl>
     </section>
 
@@ -101,6 +106,7 @@
     <section class="card">
       <h2>3. Keep or erase</h2>
       <label class="check"><input type="checkbox" id="erase"> Erase the whole chip first (factory reset)</label>
+      <div id="layout-change"></div>
       <div id="mode-text"></div>
     </section>
 
@@ -111,9 +117,16 @@
         <p style="margin-top:0">If the S3 already runs tbr-hub or tbr-bridge, its USB port shows the bridge's two
           serial ports instead of the S3's own USB-Serial-JTAG. Switch it over first: pick the <em>second</em>
           (console) port below. The bridge ports disappear and the USB-Serial-JTAG port appears within a second
-          (console command <code>s3 usj</code> does the same). Then click Install and pick the new port.</p>
+          (console command <code>s3 usj</code> does the same). Use the new port in the next step.</p>
         <button class="button secondary" id="s3-usj">Switch the S3 to USB-Serial-JTAG (1200 bps touch)</button>
         <span id="s3-usj-result" class="muted"></span>
+      </div>
+      <div id="detect-box" class="hidden note">
+        <p style="margin-top:0">This board comes with different flash sizes, and an image for a larger flash does not
+          boot at all. The flasher first reads the chip's flash ID and partition table, then offers only images that
+          fit (the largest by default). Install then uses the same port.</p>
+        <button class="button secondary" id="detect">Connect and read the flash size</button>
+        <div id="detect-result" class="muted" style="font-size:.9rem;margin-top:.5rem"></div>
       </div>
       <div class="install" style="margin-top:1rem">
         <esp-web-install-button id="install">
@@ -122,7 +135,8 @@
           <span slot="not-allowed">Web Serial needs HTTPS: open https://faronov.github.io/zigbee-rs/flasher/.</span>
         </esp-web-install-button>
       </div>
-      <p class="muted" style="font-size:.85rem">ESP Web Tools then asks for the serial port, checks that the chip
+      <p class="muted" style="font-size:.85rem">ESP Web Tools then asks for the serial port (not for boards with a
+        detected flash size: it uses the detected port), checks that the chip
         matches the board (a wrong chip is refused before anything is written), writes the images and resets the
         chip. Close any other program that holds the port (Zigbee2MQTT, Home Assistant, a serial monitor) first.
         On Windows the native USB ports use the built-in driver; no extra driver is needed.</p>
@@ -183,8 +197,20 @@
     },
   };
 
+  // Switching between flash layouts of a size group (e.g. 4 MB dev -> 8 MB A/B) rewrites the partition table.
+  const LAYOUT_CHANGE = {
+    'zigbee-rs-hub': `Back up first: the hub's network backup (web UI, or the <code>network/backup</code> API call).
+      Wi-Fi credentials, the API token, device names and settings in <code>hubdata</code> are lost; the H2 keeps its
+      network and the hub adopts it again.`,
+  };
+
   let index;
-  const boards = new Map();       // board id -> {board, product, releases: [{release, board}]}
+  // Picker entries: a board id, or a size group (one entry, the image picked from the detected flash).
+  const entries = new Map();      // key -> {product, title, group, releases: [{release, boards: [...]}]}
+  let detection = null;           // {port, chipFamily, flashId, flashBytes, table}
+  let preferredLayout = null;     // board id chosen by hand (or from the URL)
+  let userErase = false;
+  const tableCache = new Map();   // partition table URL -> Uint8Array
 
   function bySemver(a, b) {
     const parse = (v) => v.split(/[-+]/)[0].split('.').map(Number);
@@ -192,13 +218,19 @@
     for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return y[i] - x[i];
     return (b.release.published || '').localeCompare(a.release.published || '');
   }
+  const mb = (n) => `${n / 1048576} MB`;
 
   function fillBoards() {
     for (const product of index.products) {
       for (const release of product.releases) {
         for (const board of release.boards) {
-          if (!boards.has(board.id)) boards.set(board.id, {product, releases: []});
-          boards.get(board.id).releases.push({release, board});
+          const key = board.size_group || board.id;
+          if (!entries.has(key)) entries.set(key, {product, title: board.size_group_title || board.title, group: !!board.size_group, releases: []});
+          const entry = entries.get(key);
+          let r = entry.releases.find((x) => x.release === release);
+          if (!r) entry.releases.push(r = {release, boards: []});
+          r.boards.push(board);
+          r.boards.sort((a, b) => b.flash_bytes - a.flash_bytes);
         }
       }
     }
@@ -206,12 +238,12 @@
     for (const product of index.products) {
       const group = document.createElement('optgroup');
       group.label = product.name;
-      for (const [id, entry] of boards) {
+      for (const [key, entry] of entries) {
         if (entry.product !== product) continue;
         entry.releases.sort(bySemver);
         const opt = document.createElement('option');
-        opt.value = id;
-        opt.textContent = entry.releases[0].board.title;
+        opt.value = key;
+        opt.textContent = entry.title;
         group.appendChild(opt);
       }
       if (group.children.length) select.appendChild(group);
@@ -219,7 +251,7 @@
   }
 
   function fillVersions() {
-    const entry = boards.get($('board').value);
+    const entry = entries.get($('board').value);
     const select = $('version');
     select.innerHTML = '';
     const stable = entry.releases.findIndex((r) => !r.release.prerelease);
@@ -235,19 +267,87 @@
     select.selectedIndex = stable < 0 ? 0 : stable;
   }
 
+  function partitionTableUrl(release, board) {
+    const f = board.files.find((x) => x.role === 'partition_table');
+    return f && `releases/${release.tag}/${f.name}`;
+  }
+
+  async function loadTables(release, boards) {
+    await Promise.all(boards.map(async (b) => {
+      const url = partitionTableUrl(release, b);
+      if (url && !tableCache.has(url)) {
+        const rsp = await fetch(url);
+        if (rsp.ok) tableCache.set(url, new Uint8Array(await rsp.arrayBuffer()));
+      }
+    }));
+  }
+
+  const sameBytes = (chip, image) => image && chip && image.length <= chip.length && image.every((v, i) => v === chip[i]);
+
+  // The image for this release: the only board, or for a size group the chosen fitting variant (null = refuse).
+  function choose(entry, r) {
+    if (!entry.group) return {board: r.boards[0]};
+    const select = $('layout');
+    select.innerHTML = '';
+    for (const b of r.boards) {
+      const opt = document.createElement('option');
+      opt.value = b.id;
+      const fits = detection && b.flash_bytes <= detection.flashBytes;
+      opt.textContent = `${b.flash_size}: ${b.layout}` + (detection && !fits ? `  (needs ${mb(b.flash_bytes)}, the chip has ${mb(detection.flashBytes)})` : '');
+      opt.disabled = !!detection && !fits;
+      select.appendChild(opt);
+    }
+    select.disabled = !detection;
+    if (!detection) {
+      $('layout-note').textContent = 'Read the flash size first (step 4); until then nothing can be installed.';
+      return {board: r.boards[0], blocked: 'Read the flash size first'};
+    }
+    const fitting = r.boards.filter((b) => b.flash_bytes <= detection.flashBytes);
+    if (!fitting.length) {
+      $('layout-note').textContent = `The chip has ${mb(detection.flashBytes)} of flash; no image of this release fits.`;
+      return {board: r.boards[r.boards.length - 1], blocked: 'No image fits this flash'};
+    }
+    const board = fitting.find((b) => b.id === preferredLayout) || fitting[0];
+    select.value = board.id;
+    $('layout-note').textContent = `Detected ${mb(detection.flashBytes)} of flash: ` +
+      (board === fitting[0] ? 'the largest image that fits is selected.' : 'a smaller image, chosen by hand.');
+    return {board};
+  }
+
   function current() {
-    const entry = boards.get($('board').value);
-    const pick = entry.releases.find((r) => r.release.tag === $('version').value) || entry.releases[0];
-    return {product: entry.product, ...pick};
+    const entry = entries.get($('board').value);
+    const r = entry.releases.find((x) => x.release.tag === $('version').value) || entry.releases[0];
+    return {entry, product: entry.product, release: r.release, r};
   }
 
   function render() {
-    const {product, release, board} = current();
+    const {entry, product, release, r} = current();
+    $('layout-box').classList.toggle('hidden', !entry.group);
+    $('detect-box').classList.toggle('hidden', !entry.group);
+    const {board, blocked} = choose(entry, r);
+
+    // A different partition table on the chip than the chosen image's: erase is the only safe install.
+    let layoutChange = '';
+    if (entry.group && detection && !blocked) {
+      const mine = tableCache.get(partitionTableUrl(release, board));
+      if (!sameBytes(detection.table, mine)) {
+        const holder = r.boards.find((b) => sameBytes(detection.table, tableCache.get(partitionTableUrl(release, b))));
+        const erased = detection.table.every((v) => v === 0xff);
+        const now = holder ? `the <code>${esc(holder.layout)}</code> layout` : erased ? 'no partition table (erased)' : 'another layout or firmware';
+        layoutChange = `<div class="danger"><strong>Layout change: erase required.</strong> The chip holds ${now};
+          the chosen image uses <code>${esc(board.layout)}</code>. ${erased ? '' : LAYOUT_CHANGE[product.product] || ''}</div>`;
+      }
+    }
+    $('layout-change').innerHTML = layoutChange;
+    const forced = !!layoutChange;
+    $('erase').disabled = forced;
+    $('erase').checked = forced || userErase;
     const erase = $('erase').checked;
+
     const repo = `https://github.com/${product.repository}`;
     $('board-info').innerHTML = `
-      <dt>Chip</dt><dd>${esc(board.chip_family)}, ${esc(board.flash_size)} flash</dd>
-      <dt>Layout</dt><dd><code>${esc(board.layout)}</code></dd>
+      <dt>Chip</dt><dd>${esc(board.chip_family)}, ${esc(board.flash_size)} flash${entry.group ? ' (selected image)' : ''}</dd>
+      <dt>Layout</dt><dd><code>${esc(board.layout)}</code>${board.note ? ` · ${esc(board.note)}` : ''}</dd>
       ${board.transport ? `<dt>Host link</dt><dd>${esc(board.transport)}</dd>` : ''}
       <dt>Firmware</dt><dd>${esc(product.name)}</dd>`;
     const fw = board.fw_update;
@@ -281,13 +381,87 @@
     const button = $('install');
     button.setAttribute('manifest', board.manifests[erase ? 'erase' : 'update']);
     button.classList.toggle('erase', erase);
-    $('install-label').textContent = `${erase ? 'Erase and install' : 'Install'} ${release.version} on ${board.chip_family}`;
+    button.dataset.blocked = blocked || '';
+    $('install-label').disabled = !!blocked;
+    $('install-label').textContent = blocked ? blocked :
+      `${erase ? 'Erase and install' : 'Install'} ${release.version} (${board.flash_size}) on ${board.chip_family}`;
 
     const url = new URL(location.href);
-    url.searchParams.set('board', board.id);
+    url.searchParams.set('board', entry.group ? board.size_group : board.id);
     url.searchParams.set('version', release.tag);
     history.replaceState(null, '', url);
   }
+
+  async function detect() {
+    const out = $('detect-result');
+    const {entry, release, r} = current();
+    const family = r.boards[0].chip_family;
+    let port;
+    try {
+      port = await navigator.serial.requestPort();
+    } catch (e) {
+      out.textContent = `No port selected: ${e.message}`;
+      return;
+    }
+    detection = null;
+    render();
+    out.textContent = 'Connecting to the ROM loader…';
+    const {ESPLoader, Transport} = await import('./vendor/esptool-js/bundle.js');
+    const transport = new Transport(port, false);
+    const terminal = {clean() {}, write() {}, writeLine(line) { out.textContent = line; }};
+    const loader = new ESPLoader({transport, baudrate: 115200, romBaudrate: 115200, terminal});
+    try {
+      await loader.main();
+      const chipFamily = loader.chip.CHIP_NAME;
+      if (chipFamily !== family) {
+        out.innerHTML = `<span style="color:var(--red)">This is an ${esc(chipFamily)}, the board needs an ${esc(family)}.</span>
+          On the Thread Border Router board the bridge's first port leads to the H2: switch the S3 to USB-Serial-JTAG first.`;
+        return;
+      }
+      const flashId = await loader.readFlashId();
+      const capacity = (flashId >> 16) & 0xff;
+      if (flashId === 0 || flashId === 0xffffff || capacity < 0x12 || capacity > 0x1a) {
+        out.innerHTML = `<span style="color:var(--red)">Cannot read the flash size (flash ID ${hex(flashId)}): not installing.</span>`;
+        return;
+      }
+      const table = await loader.readFlash(0x8000, 0xc00);
+      await loadTables(release, r.boards);
+      detection = {port, chipFamily, flashId, flashBytes: 2 ** capacity, table};
+      out.innerHTML = `Connected: ${esc(chipFamily)}, flash ID <code>${hex(flashId)}</code>, <strong>${mb(detection.flashBytes)}</strong> of flash.`;
+    } catch (e) {
+      out.innerHTML = `<span style="color:var(--red)">Detection failed: ${esc(e.message || e)}</span>. Hold BOOT, press and release RESET, release BOOT, then try again.`;
+    } finally {
+      try { await transport.disconnect(); } catch { /* already closed */ }
+      render();
+    }
+  }
+
+  // Size groups: ESP Web Tools must flash the port that was measured, so its port request returns that port once.
+  $('install-label').addEventListener('click', (ev) => {
+    if (!entries.get($('board').value).group) return;
+    if ($('install').dataset.blocked || !detection || detection.selftest) {
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      return;
+    }
+    const port = detection.port;
+    Object.defineProperty(navigator.serial, 'requestPort', {
+      configurable: true, writable: true,
+      value: async () => { delete navigator.serial.requestPort; return port; },
+    });
+    setTimeout(() => { delete navigator.serial.requestPort; }, 3000);
+  });
+
+  navigator.serial?.addEventListener('disconnect', (ev) => {
+    if (detection && ev.target === detection.port) {
+      detection = null;
+      $('detect-result').textContent = 'The port went away (the chip rebooted or was unplugged): read the flash size again before the next install.';
+      render();
+    }
+  });
+
+  $('detect').addEventListener('click', detect);
+  $('layout').addEventListener('change', () => { preferredLayout = $('layout').value; render(); });
 
   $('s3-usj').addEventListener('click', async () => {
     const out = $('s3-usj-result');
@@ -295,7 +469,7 @@
       const port = await navigator.serial.requestPort({filters: [{usbVendorId: 0x303a}]});
       await port.open({baudRate: 1200});
       await port.close();
-      out.textContent = 'Done: now click Install and pick the new USB JTAG/serial port.';
+      out.textContent = 'Done: continue with the new USB JTAG/serial port.';
     } catch (e) {
       out.textContent = `Not switched: ${e.message}`;
     }
@@ -311,17 +485,38 @@
   $('loading').classList.add('hidden');
   $('generated').textContent = (index.generated || '').replace('T', ' ').replace('Z', ' UTC');
   fillBoards();
-  if (!boards.size) {
+  if (!entries.size) {
     $('empty').classList.remove('hidden');
   } else {
     $('app').classList.remove('hidden');
     const params = new URLSearchParams(location.search);
-    if (boards.has(params.get('board'))) $('board').value = params.get('board');
+    const wanted = params.get('board');
+    for (const [key, entry] of entries) {
+      if (key === wanted) $('board').value = key;
+      else if (entry.group && entry.releases.some((r) => r.boards.some((b) => b.id === wanted))) {
+        $('board').value = key;
+        preferredLayout = wanted;
+      }
+    }
     fillVersions();
     if ([...$('version').options].some((o) => o.value === params.get('version'))) $('version').value = params.get('version');
-    $('board').addEventListener('change', () => { fillVersions(); render(); });
-    $('version').addEventListener('change', render);
-    $('erase').addEventListener('change', render);
+    $('board').addEventListener('change', () => { detection = null; preferredLayout = null; $('detect-result').textContent = ''; fillVersions(); render(); });
+    $('version').addEventListener('change', async () => {
+      if (detection) { const {release, r} = current(); await loadTables(release, r.boards); }
+      render();
+    });
+    $('erase').addEventListener('change', () => { if (!$('erase').disabled) userErase = $('erase').checked; render(); });
+    // ?selftest=<flash MB>&table=<flash size of the variant whose table the chip holds | erased | other>:
+    // a simulated detection (no port, install stays blocked), for checking the selection without hardware.
+    if (params.has('selftest') && entries.get($('board').value).group) {
+      const {release, r} = current();
+      await loadTables(release, r.boards);
+      const holder = r.boards.find((b) => b.flash_size === params.get('table'));
+      const table = holder ? tableCache.get(partitionTableUrl(release, holder)).slice() :
+        new Uint8Array(0xc00).fill(params.get('table') === 'erased' ? 0xff : 0x42);
+      detection = {port: null, chipFamily: r.boards[0].chip_family, flashId: 0, flashBytes: Number(params.get('selftest')) << 20, table, selftest: true};
+      $('detect-result').textContent = `Self-test: simulated ${params.get('selftest')} MB flash, table ${params.get('table')}.`;
+    }
     render();
   }
 </script>

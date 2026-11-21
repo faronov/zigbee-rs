@@ -43,6 +43,9 @@ on:
 env:
     ESP_WEB_TOOLS_VERSION: 10.5.2
     ESP_WEB_TOOLS_SHA512: i5qsHv1bnrb/9gmKEN7qIaDTMOMy6OctrgFVXStrU2s79erY2Z7IKydveNk0eDhQTarfwyR4eXspOUIF6kYawg==
+    # The flash-size detection of multi-size boards (the version ESP Web Tools bundles).
+    ESPTOOL_JS_VERSION: 0.7.1
+    ESPTOOL_JS_SHA512: vw1isT5ROHgpRmMG3y6B81dceeZ7O1WhF1x05qFbAlH8N0N/pOQqODzJLA+36lCbOXCw06iA4CWctyrQQ7VeSA==
 
 jobs:
     build:
@@ -91,15 +94,22 @@ jobs:
                   python3 tools/flasher_site.py fetch --out "$RUNNER_TEMP/releases"
                   python3 tools/flasher_site.py check "$RUNNER_TEMP/releases"
 
-            - name: ESP Web Tools ${{ env.ESP_WEB_TOOLS_VERSION }}
+            - name: ESP Web Tools ${{ env.ESP_WEB_TOOLS_VERSION }}, esptool-js ${{ env.ESPTOOL_JS_VERSION }}
               run: |
                   set -euo pipefail
                   cd "$RUNNER_TEMP"
-                  curl -fsSL --retry 3 -o ewt.tgz "https://registry.npmjs.org/esp-web-tools/-/esp-web-tools-${ESP_WEB_TOOLS_VERSION}.tgz"
-                  [ "$(openssl dgst -sha512 -binary ewt.tgz | base64 -w0)" = "$ESP_WEB_TOOLS_SHA512" ] \
-                    || { echo "::error::esp-web-tools tarball integrity mismatch"; exit 1; }
-                  tar xzf ewt.tgz package/dist/web package/LICENSE
-                  cp package/LICENSE package/dist/web/LICENSE
+                  fetch() {  # name version sha512 -> extracted into ./$1
+                    curl -fsSL --retry 3 -o "$1.tgz" "https://registry.npmjs.org/$1/-/$1-$2.tgz"
+                    [ "$(openssl dgst -sha512 -binary "$1.tgz" | base64 -w0)" = "$3" ] \
+                      || { echo "::error::$1 tarball integrity mismatch"; exit 1; }
+                    mkdir "$1" && tar xzf "$1.tgz" -C "$1"
+                  }
+                  fetch esp-web-tools "$ESP_WEB_TOOLS_VERSION" "$ESP_WEB_TOOLS_SHA512"
+                  fetch esptool-js "$ESPTOOL_JS_VERSION" "$ESPTOOL_JS_SHA512"
+                  mkdir -p vendor/esptool-js
+                  cp -r esp-web-tools/package/dist/web vendor/esp-web-tools
+                  cp esp-web-tools/package/LICENSE vendor/esp-web-tools/LICENSE
+                  cp esptool-js/package/bundle.js esptool-js/package/LICENSE vendor/esptool-js/
 
             - name: Assemble site
               env:
@@ -113,7 +123,7 @@ jobs:
                   python3 tools/prepare-pages.py \
                     --book docs/book/book --flasher docs/flasher \
                     --firmware "$RUNNER_TEMP/pages-firmware" --output _site \
-                    --releases "$RUNNER_TEMP/releases" --esp-web-tools "$RUNNER_TEMP/package/dist/web" \
+                    --releases "$RUNNER_TEMP/releases" --vendor "$RUNNER_TEMP/vendor" \
                     --revision "${{ inputs.revision }}" --run-id "$run_id" \
                     --esp32c6-result "$C6_RESULT" --esp32h2-result "$H2_RESULT" \
                     --bl702-result "$BL702_RESULT"

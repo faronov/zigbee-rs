@@ -30,14 +30,16 @@ class PagesTests(unittest.TestCase):
         (self.releases / "releases" / "ncp-v0.1.0").mkdir(parents=True)
         (self.releases / "releases" / "ncp-v0.1.0" / "app.bin").write_bytes(b"release")
         (self.releases / "releases.json").write_text('{"schema": 1, "products": []}')
-        self.esp_web_tools = self.root / "ewt"
-        self.esp_web_tools.mkdir()
-        (self.esp_web_tools / "install-button.js").write_text("// bundle")
+        self.vendor = self.root / "vendor"
+        (self.vendor / "esp-web-tools").mkdir(parents=True)
+        (self.vendor / "esp-web-tools" / "install-button.js").write_text("// bundle")
+        (self.vendor / "esptool-js").mkdir()
+        (self.vendor / "esptool-js" / "bundle.js").write_text("// bundle")
 
     def prepare(self, output, results):
         PAGES.prepare(
             self.book, self.template, self.firmware, output, REVISION, 123, results,
-            self.releases, self.esp_web_tools,
+            self.releases, self.vendor,
         )
 
     def test_all_result_combinations_fail_closed(self):
@@ -56,6 +58,7 @@ class PagesTests(unittest.TestCase):
                 self.assertIn(REVISION, (site / "index.html").read_text())
                 self.assertEqual((site / "releases/ncp-v0.1.0/app.bin").read_bytes(), b"release")
                 self.assertTrue((site / "vendor/esp-web-tools/install-button.js").is_file())
+                self.assertTrue((site / "vendor/esptool-js/bundle.js").is_file())
                 self.assertTrue((site / "releases.json").is_file())
                 self.assertEqual(metadata["firmware_available"], available)
                 self.assertEqual(metadata["firmware_jobs"], results)

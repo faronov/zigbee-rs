@@ -141,6 +141,26 @@ class FlasherSiteTests(unittest.TestCase):
                 with self.assertRaisesRegex(SITE.SiteError, message):
                     SITE.validate_manifest(m, "ncp-v0.1.0")
 
+    def test_flash_size_variants_form_a_group(self):
+        def board(bid, title, size, transport=None):
+            return {"id": bid, "title": title, "product": "zigbee-rs-hub", "firmware": "tbr-hub",
+                    "chip_family": "ESP32-S3", "flash_size": size, "transport": transport}
+        boards = [
+            board("thread-br-s3-hub-8mb", "Thread BR board, S3 (8 MB): hub", "8MB"),
+            board("thread-br-s3-hub-4mb-dev", "Thread BR board, S3 (4 MB early sample): hub", "4MB"),
+            board("other-s3", "Other S3", "4MB", transport="uart"),
+        ]
+        SITE.mark_size_groups(boards, "zigbee-rs hub")
+        self.assertEqual(boards[0]["size_group"], "thread-br-s3-hub")
+        self.assertEqual(boards[1]["size_group"], "thread-br-s3-hub")
+        self.assertEqual(boards[0]["size_group_title"], "Thread BR board, S3 (4 MB / 8 MB, detected): zigbee-rs hub")
+        self.assertNotIn("size_group", boards[2])
+        self.assertEqual([b["flash_bytes"] for b in boards], [8 << 20, 4 << 20, 4 << 20])
+        # Same size twice is not a size choice (e.g. two transports).
+        same = [board("a-usj", "A", "4MB"), board("a-br", "B", "4MB")]
+        SITE.mark_size_groups(same, "ncp")
+        self.assertNotIn("size_group", same[0])
+
     def test_fingerprint_ignores_order_and_tracks_content(self):
         a = [("o/r", "ncp-v0.1.0", "1" * 64), ("o/h", "hub-v0.1.0", "2" * 64)]
         self.assertEqual(SITE.fingerprint(a), SITE.fingerprint(list(reversed(a))))
