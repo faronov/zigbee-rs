@@ -30,8 +30,7 @@ use heapless::Vec;
 use zigbee_gp::cluster::{client_cmd, server_cmd};
 use zigbee_gp::proxy::{MAX_SINK_GROUPS, ProxyEntry, SinkGroup};
 use zigbee_gp::sink::{
-    ImportError, SinkCommissioningExit, SinkConfig, SinkEntry, SinkEvent, SinkStats,
-    exit_mode_attr,
+    ImportError, SinkCommissioningExit, SinkConfig, SinkEntry, SinkEvent, SinkStats, exit_mode_attr,
 };
 use zigbee_gp::types::{CommunicationMode, GpdId, KeyType, SecurityLevel};
 use zigbee_gp::{GP_CLUSTER_ID, GP_ENDPOINT, GP_PROFILE_ID};
@@ -1015,7 +1014,10 @@ mod tests {
         assert_eq!(bad(|r| r.mode = 2), Some(Status::InvalidParameter));
         assert_eq!(bad(|r| r.group = 0xFFFF), Some(Status::InvalidParameter));
         assert_eq!(bad(|r| r.exit_mode = 0x08), Some(Status::InvalidParameter));
-        assert_eq!(bad(|r| r.security_level = 0x18), Some(Status::InvalidParameter));
+        assert_eq!(
+            bad(|r| r.security_level = 0x18),
+            Some(Status::InvalidParameter)
+        );
         // InvolveTC is accepted: the NCP is the Trust Center.
         let mut r = request.clone();
         r.security_level = 0x08;
