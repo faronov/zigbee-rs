@@ -45,12 +45,13 @@ use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent};
 use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataIndication};
 use zigbee_zrhp::msg::diag::{DiagGetCounters, DiagGetCountersRsp};
 use zigbee_zrhp::msg::gp::{
-    EvtGpCommissioned, EvtGpCommissioning, EvtGpDecommissioned, EvtGpFrame, EvtGpRemoteProxyTable,
-    EvtGpRemoteSinkTable, EvtGpRemoteStatus, GpGroup, GpPairingConfiguration, GpProxyTableRead,
-    GpProxyTableReadRsp, GpRemoteProxyTableRequest, GpRemoteRsp, GpRemoteSinkTableRequest,
-    GpSendPairing, GpSetSharedKey, GpSinkCommissioning, GpSinkConfig, GpSinkRemove, GpSinkTablePut,
-    GpSinkTablePutRsp, GpSinkTableRead, GpSinkTableReadRsp, GpTranslationRequest, frame_origin,
-    frame_result, paired_endpoints, pairing_config_flags, send_pairing_flags, sink_mode,
+    EvtGpAppDescription, EvtGpCommissioned, EvtGpCommissioning, EvtGpDecommissioned, EvtGpFrame,
+    EvtGpRemoteProxyTable, EvtGpRemoteSinkTable, EvtGpRemoteStatus, GpGroup,
+    GpPairingConfiguration, GpProxyTableRead, GpProxyTableReadRsp, GpRemoteProxyTableRequest,
+    GpRemoteRsp, GpRemoteSinkTableRequest, GpSendPairing, GpSetSharedKey, GpSinkCommissioning,
+    GpSinkConfig, GpSinkRemove, GpSinkTablePut, GpSinkTablePutRsp, GpSinkTableRead,
+    GpSinkTableReadRsp, GpTranslationRequest, frame_origin, frame_result, paired_endpoints,
+    pairing_config_flags, send_pairing_flags, sink_mode,
 };
 use zigbee_zrhp::msg::network::{EvtNetworkState, NwkForm};
 use zigbee_zrhp::msg::security::SecLockKeyExport;
@@ -1425,4 +1426,149 @@ fn remote_provisioning_reaches_another_proxy_and_sink() {
     receive(&mut port, from_proxy_tx(&proxy, pan_id));
     exchange!();
     assert!(host.event(ids::EVT_GP_REMOTE_STATUS).is_none());
+}
+
+/// Temperature report 0 and humidity report 1 of a multi-sensor GPD's
+/// Application Description (zigbee-gp `app_description` test vectors).
+const TEMPERATURE_REPORT: [u8; 13] = [
+    0x00, 0x01, 0x3C, 0x00, 0x08, 0x08, 0x02, 0x04, 0x00, 0x00, 0x29, 0x11, 0x00,
+];
+const HUMIDITY_REPORT: [u8; 11] = [
+    0x01, 0x00, 0x08, 0x08, 0x05, 0x04, 0x00, 0x00, 0x21, 0x11, 0x00,
+];
+
+#[test]
+fn application_description_reaches_the_host_before_the_pairing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut security = RamSecurityStateStore::new();
+    let mut gp_store = RamGpProxyStore::new();
+    let log = LogRing::<8>::new();
+    let mut now = 1_000u64;
+    let mut profile = profile();
+    let mut device = device(&profile);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let mut app = TrustCenterCoordinatorApp::new(
+        node,
+        PersistentChildren::new(RamChildTableStore::new()),
+        RamTrustCenterDeviceStore::new(),
+        &POLICY,
+        RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+    )
+    .unwrap();
+    app.set_green_power_store(&mut gp_store);
+    let mut port = TcPort::new(app, IEEE, clock_ms);
+    let mut pipe = Pipe::default();
+    let mut ncp = Ncp::<8>::new(identity(), 1, now);
+    let mut host = Host::new(now);
+    negotiate(&mut ncp, &mut host, &mut port, &mut pipe, &log, &mut now);
+    macro_rules! exchange {
+        () => {
+            exchange(&mut ncp, &mut host, &mut port, &mut pipe, &log, &mut now)
+        };
+    }
+    let form = host.request(&NwkForm {
+        channel_mask: 1 << 15,
+        pan_id: 0xFFFF,
+        ext_pan_id: [0; 8],
+        network_key: [0; 16],
+        key_seq: 0,
+        nwk_update_id: 0,
+        tx_power: 0,
+        nwk_manager: 0,
+    });
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let enter = host.request(&GpSinkCommissioning {
+        action: 1,
+        flags: 0x02,
+        window_s: 60,
+    });
+    exchange!();
+    assert_eq!(host.response(enter).status(), 0);
+    steps(&mut port, 2);
+    exchange!();
+    host.events(ids::EVT_GP_FRAME);
+
+    // Commissioning announcing "application description follows".
+    let gpd = GpdId::SrcId(SRC);
+    let wrapped = security::wrap_key(
+        &mut MockMac::new([0; 8]),
+        &DEFAULT_TC_LINK_KEY,
+        &gpd,
+        Direction::FromGpd,
+        0,
+        &GPD_KEY,
+    )
+    .unwrap();
+    let p = CommissioningPayload {
+        device_id: 0x07,
+        mac_seq_num_capability: true,
+        rx_on_capability: false,
+        pan_id_request: false,
+        security_key_request: false,
+        fixed_location: true,
+        security: Some(CommissioningSecurity {
+            level: SecurityLevel::Encrypted,
+            key_type: KeyType::IndividualKey,
+            key: Some((wrapped.key, Some(u32::from_le_bytes(wrapped.mic)))),
+            outgoing_counter: Some(10),
+        }),
+        app_info: Some(zigbee_gp::commissioning::ApplicationInfo {
+            app_description_follows: true,
+            ..Default::default()
+        }),
+    };
+    let mut b = [0u8; 64];
+    let n = p.encode(&mut b).unwrap();
+    receive(&mut port, gpdf(SecurityLevel::None, 1, 0xE0, &b[..n]));
+    exchange!();
+    let r1 = host.event(ids::EVT_GP_FRAME).unwrap();
+    let frame: EvtGpFrame = r1.event();
+    assert_eq!(
+        (frame.command_id, frame.result),
+        (0xE0, frame_result::COMMISSIONING_STEP)
+    );
+    assert!(host.event(ids::EVT_GP_COMMISSIONED).is_none());
+
+    // Two Application Description frames, protected with the new key.
+    let mut adcf = vec![2, 1];
+    adcf.extend_from_slice(&TEMPERATURE_REPORT);
+    receive(&mut port, gpdf(SecurityLevel::Encrypted, 11, 0xE4, &adcf));
+    exchange!();
+    let r2 = host.event(ids::EVT_GP_FRAME).unwrap();
+    let frame: EvtGpFrame = r2.event();
+    assert_eq!(
+        (frame.command_id, frame.result),
+        (0xE4, frame_result::COMMISSIONING_STEP)
+    );
+    let description = host.event(ids::EVT_GP_APP_DESCRIPTION).unwrap();
+    let description: EvtGpAppDescription = description.event();
+    assert_eq!(description.gpd_id, zigbee_zrhp::records::GpdId::SrcId(SRC));
+    assert_eq!(
+        (description.total_reports, description.report_count),
+        (2, 1)
+    );
+    assert_eq!(description.reports.0, &TEMPERATURE_REPORT);
+    assert!(host.event(ids::EVT_GP_COMMISSIONED).is_none());
+
+    let mut adcf = vec![2, 1];
+    adcf.extend_from_slice(&HUMIDITY_REPORT);
+    receive(&mut port, gpdf(SecurityLevel::Encrypted, 12, 0xE4, &adcf));
+    exchange!();
+    let r3 = host.event(ids::EVT_GP_FRAME).unwrap();
+    let frame: EvtGpFrame = r3.event();
+    assert_eq!(
+        (frame.command_id, frame.result),
+        (0xE4, frame_result::COMMISSIONED)
+    );
+    let description = host.event(ids::EVT_GP_APP_DESCRIPTION).unwrap();
+    let description: EvtGpAppDescription = description.event();
+    assert_eq!(description.reports.0, &HUMIDITY_REPORT);
+    let r4 = host.event(ids::EVT_GP_COMMISSIONED).unwrap();
+    let commissioned: EvtGpCommissioned = r4.event();
+    assert_eq!(commissioned.device_id, 0x07);
+    let Record::GpSink(record) = commissioned.record else {
+        panic!("not R_GP_SINK");
+    };
+    assert_eq!((record.security_level, record.key), (3, Some(GPD_KEY)));
 }

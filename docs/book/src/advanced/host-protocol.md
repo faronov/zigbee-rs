@@ -1595,7 +1595,7 @@ Behaviour in `HOST_SINK` mode:
 | `0x0A80` | `EVT_GP_FRAME` | `u8 origin (1 direct GPDF, 2 GP Notification, 3 GP Commissioning Notification), u8 result (0 translated, 1 passed through, 2 commissioned, 3 Commissioning Reply sent, 4 decommissioned, 5 commissioning step accepted), gpd_id, u8 device_id, u8 command_id, u32 frame_counter, u8 security_level, u8 key_type, u8 flags (bit0 rxAfterTx, bit1 payload decrypted, bit2 key in payload was TC-LK wrapped), u16 proxy_nwk (FFFF = direct), u8 gpp_gpd_link, i8 rssi, u8 lqi, u8 len, payload[]` | event | P (`SinkOutcome`, `SinkEvent::GpdCommand`; the surface is N) |
 | `0x0A81` | `EVT_GP_COMMISSIONING` | `u8 state (1 entered, 0 left), u16 window_s (FFFF none), u8 involve_proxies, u8 exit_reason (1 explicit, 2 first pairing, 3 timeout)` | event | E (`SinkEvent::CommissioningEntered/Left`) |
 | `0x0A82` | `EVT_GP_COMMISSIONED` | `gpd_id, u8 device_id, u8 flags (bit0 bidirectional, bit1 key present), R_GP_SINK record` | event | E (`SinkEvent::Commissioned`) + N |
-| `0x0A83` | `EVT_GP_COMMISSIONING_FAILED` | `gpd_id, u8 reason` (`SinkDrop`: 1 Invalid, 2 NotCommissioning, 3 NoEntry, 4 SecurityMismatch, 5 AuthFailed, 6 Stale, 7 Duplicate, 8 SecurityPolicy, 9 NoKey, 10 NoTempMaster, 11 TableFull, 12 Unsupported, 13 QueueFull) | event | E |
+| `0x0A83` | `EVT_GP_COMMISSIONING_FAILED` | `gpd_id, u8 reason` (`SinkDrop`: 1 Invalid, 2 NotCommissioning, 3 NoEntry, 4 SecurityMismatch, 5 AuthFailed, 6 Stale, 7 Duplicate, 8 SecurityPolicy, 9 NoKey, 10 NoTempMaster, 11 TableFull, 12 Unsupported, 13 QueueFull, 15 DescriptionTimeout) | event | E |
 | `0x0A84` | `EVT_GP_DECOMMISSIONED` | `gpd_id` | event | E |
 | `0x0A08` | `GP_PAIRING_CONFIGURATION` | `u16 dst, u8 actions, gpd_id, u8 device_id, u8 communication_mode, u8 flags (bit0 MAC seq capable, bit1 rx-on capable, bit2 fixed location, bit3 security, bit4 assigned alias), u16 assigned_alias, u8 groupcast_radius, u8 security_level, u8 key_type, [16] key, u32 frame_counter, u8 n, n×(u16 group, u16 alias), u8 paired (0x00 none, 0x01 listed, 0xFE sink derives, 0xFF all), u8 n, n×u8 endpoint, u8 app_info (bits 0-3), u16 manufacturer_id, u16 model_id, u8 n, n×u8 gpd_command, u8 n, n×u16 server_cluster, u8 n, n×u16 client_cluster` | `u8 zcl_tsn` | N (remote provisioning, below) |
 | `0x0A09` | `GP_SEND_PAIRING` | `u16 dst, u8 flags (bit0 add sink, bit1 remove GPD, bit2 GPD fixed, bit3 MAC seq capable, bit4 key, bit5 assigned alias, bit6 frame counter, bit7 groupcast radius), gpd_id, u8 communication_mode, u8 security_level, u8 key_type, [8] sink_ieee, u16 sink_nwk, u16 sink_group, u8 device_id, u32 frame_counter, [16] key, u16 assigned_alias, u8 groupcast_radius` | `u8 zcl_tsn` (`CONFLICT`) | N |
@@ -1607,6 +1607,7 @@ Behaviour in `HOST_SINK` mode:
 | `0x0A86` | `EVT_GP_REMOTE_SINK_TABLE` | `u16 src_nwk, u8 zcl_tsn, u8 status, u8 total, u8 start_index, u8 flags (bit0 entries omitted), u8 n, n×R_GP_SINK record` | event | N |
 | `0x0A87` | `EVT_GP_REMOTE_PROXY_TABLE` | `u16 src_nwk, u8 zcl_tsn, u8 status, u8 total, u8 start_index, u8 flags, u8 n, n×R_GP_PROXY record` | event | N |
 | `0x0A88` | `EVT_GP_REMOTE_TRANSLATION_TABLE` | `u16 src_nwk, u8 zcl_tsn, u8 status, u8 total, u8 start_index, u8 flags, u8 n, n×R_GP_TRANSLATION record` | event | N |
+| `0x0A89` | `EVT_GP_APP_DESCRIPTION` | `gpd_id, u8 total_reports, u8 report_count, u8 len, reports[]` (report descriptors in the GP Application Description format, only those not reported before) | event | E (`SinkEvent::ApplicationDescription`) |
 
 - `gpd_id` is `u8 app_id` (0 SrcID, 2 IEEE), followed by `u32 src_id`, or by
   `[8] ieee, u8 endpoint`.
@@ -1803,7 +1804,16 @@ itself has no GP fields.
 - `GP_SET_SHARED_KEY` is `UNSUPPORTED_COMMAND`: the sink provisions no
   shared GPD key (`zigbee_gp::sink`).
 - `EVT_GP_FRAME.result` follows the sink outcome: 0–4 as listed. Result 5
-  is not emitted by this build. A bidirectional commissioning reports the
+  reports a Commissioning or Application Description frame of a GPD whose
+  Application Description is still being collected (the pairing completes
+  with result 2 on the frame that delivers the last report, or with result
+  3 when that frame asks for a Commissioning Reply).
+- `EVT_GP_APP_DESCRIPTION` hands the host each Application Description's
+  new report descriptors as received (collected for 20 s after the
+  Commissioning; reason 15 `DescriptionTimeout` in
+  `EVT_GP_COMMISSIONING_FAILED` when they do not complete). The NCP does
+  not interpret them: the host parses them (`zigbee_gp::app_description`)
+  to decode the GPD's Compact Attribute Reports. A bidirectional commissioning reports the
   Commissioning frame with result 3 and the completing frame (Success)
   with result 2; `EVT_GP_COMMISSIONED` carries the full `R_GP_SINK`
   (key, counter). `rssi` is -128 (the MAC reports none); `lqi` is the
@@ -1827,7 +1837,7 @@ itself has no GP fields.
   GP endpoint is a member of (the NCP sink's or the proxy's; there is no
   host group-membership command yet).
 - Counters (`DIAG_GET_COUNTERS` group bit 7, IDs `0x08xx`): `0x0801`–
-  `0x080D` sink drops by `SinkDrop` reason (duplicates `0x0807`, stale
+  `0x080F` sink drops by `SinkDrop` reason code (duplicates `0x0807`, stale
   `0x0806`, unknown GPD `0x0803`), `0x0810` reports lost to a full queue,
   `0x0811` local proxy copies, `0x0812` frames handed to a host sink,
   `0x0813` `CONFLICT` refusals.

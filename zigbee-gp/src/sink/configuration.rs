@@ -37,7 +37,7 @@ use super::{
 use crate::cluster::{Pairing, PairingSink, server_cmd};
 use crate::config::{
     PASS_TO_APPLICATION, PairingConfiguration, TranslationTableRequest, TranslationTableUpdate,
-    app_info, paired_endpoints, pairing_action,
+    paired_endpoints, pairing_action,
 };
 use crate::proxy::{GroupChange, MAX_SINK_GROUPS, MAX_TX_PAYLOAD, SinkGroup};
 use crate::translation::{self, Translation};
@@ -169,7 +169,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             }
             REMOVE_PAIRING => self.remove_pairing(pc),
             EXTEND | REPLACE => self.configure_pairing(pc),
-            APPLICATION_DESCRIPTION => (FAILURE, None),
+            APPLICATION_DESCRIPTION => self.configured_description(pc),
             _ => (zcl_status::INVALID_FIELD, None),
         }
     }
@@ -227,7 +227,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         if policy & security_level_attr::INVOLVE_TC != 0
             || pc
                 .application_information
-                .is_some_and(|a| a.bits & app_info::APPLICATION_DESCRIPTION != 0)
+                .is_some_and(|a| self.refuses_description(&a))
         {
             return (FAILURE, None);
         }
@@ -324,7 +324,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             gpd_id: pc.gpd_id,
             device_id: pc.device_id,
         });
-        (zcl_status::SUCCESS, Some(SinkOutcome::Commissioned))
+        self.configured_with_description(pc)
     }
 
     /// Insert or replace a configured entry: GPEP groups follow it, the

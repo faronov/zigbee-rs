@@ -70,8 +70,9 @@ pub const REPORT_QUEUE_LEN: usize = 6;
 /// Largest local proxy frame copied to the host: ZCL header and the GP
 /// command.
 pub const MAX_LOCAL_FRAME: usize = 3 + MAX_TX_PAYLOAD;
-/// [`SinkDrop`] reasons, numbered 1..=13 as in `EVT_GP_COMMISSIONING_FAILED`.
-pub const SINK_DROP_REASONS: usize = 13;
+/// [`SinkDrop`] reason codes 1..=15 as in `EVT_GP_COMMISSIONING_FAILED`
+/// (counters `0x0801`–`0x080F`; codes a build cannot produce stay zero).
+pub const SINK_DROP_REASONS: usize = 15;
 /// Largest remote GP response payload kept for the host (after the ZCL
 /// header).
 pub const MAX_REMOTE_PAYLOAD: usize = 100;
@@ -198,6 +199,8 @@ pub const fn sink_result(outcome: SinkOutcome) -> Option<u8> {
         SinkOutcome::Commissioned => Some(2),
         SinkOutcome::CommissioningReplySent => Some(3),
         SinkOutcome::Decommissioned => Some(4),
+        #[cfg(feature = "green-power-app-description")]
+        SinkOutcome::CommissioningStep => Some(5),
         SinkOutcome::Dropped(_) => None,
     }
 }
@@ -218,6 +221,9 @@ pub const fn sink_drop_code(reason: SinkDrop) -> u8 {
         SinkDrop::TableFull => 11,
         SinkDrop::Unsupported => 12,
         SinkDrop::QueueFull => 13,
+        // 14 is InvolveTc (`green-power-involve-tc`).
+        #[cfg(feature = "green-power-app-description")]
+        SinkDrop::DescriptionTimeout => 15,
     }
 }
 
@@ -630,6 +636,9 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             .entries()
             .iter()
             .find(|e| e.gpd_id.matches(&gpd_id));
+        // An Application Description arrives before the pairing completes.
+        #[cfg(feature = "green-power-app-description")]
+        let entry = entry.or_else(|| self.green_power.sink.pending_entry(&gpd_id));
         let key_type = match entry {
             Some(e) if level.is_protected() => e.key_type,
             _ if !level.is_protected() => KeyType::NoKey,
@@ -862,10 +871,15 @@ mod tests {
         assert_eq!(sink_result(SinkOutcome::Dropped(SinkDrop::Stale)), None);
         assert_eq!(sink_drop_code(SinkDrop::Invalid), 1);
         assert_eq!(sink_drop_code(SinkDrop::Duplicate), 7);
-        assert_eq!(
-            usize::from(sink_drop_code(SinkDrop::QueueFull)),
-            SINK_DROP_REASONS
-        );
+        assert_eq!(sink_drop_code(SinkDrop::QueueFull), 13);
+        #[cfg(feature = "green-power-app-description")]
+        {
+            assert_eq!(sink_result(SinkOutcome::CommissioningStep), Some(5));
+            assert_eq!(
+                usize::from(sink_drop_code(SinkDrop::DescriptionTimeout)),
+                SINK_DROP_REASONS
+            );
+        }
     }
 
     #[test]

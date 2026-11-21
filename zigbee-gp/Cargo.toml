@@ -37,6 +37,12 @@ sink = ["proxy"]
 # endpoint, paired endpoints) on top of the sink. Off by default: sinks
 # without it are unchanged.
 translation-table = ["sink"]
+# GPD Application Description (0xE4): the sink collects the report
+# descriptors a multi-sensor / Compact Attribute Reporting GPD announces in
+# its Commissioning command before it completes the pairing, and hands them
+# to the application ([`sink::SinkEvent::ApplicationDescription`]); with
+# `translation-table` also GP Pairing Configuration action 0b101.
+app-description = ["sink"]
 # A 4-entry Translation Table instead of 16 (a sink whose large Sink Table
 # leaves little persistent room, e.g. the 16-entry ZRHP NCP sink).
 compact-translation-table = []

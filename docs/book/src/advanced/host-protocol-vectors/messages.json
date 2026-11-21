@@ -475,5 +475,18 @@
     },
     "payload_hex": "877c0600020000020c0d000079986b7a22010401060000000c0d000079986b7a32010401080006fe",
     "message_hex": "80880a19002800877c0600020000020c0d000079986b7a22010401060000000c0d000079986b7a32010401080006fe"
+  },
+  {
+    "name": "evt_gp_app_description",
+    "endpoint": 2,
+    "kind": 2,
+    "msg_id": "0x0a89",
+    "tid": 26,
+    "note": "Application Description of SrcID 0x0badcafe: report 0 of 2 (temperature, offset 0)",
+    "fields": {
+      "report_hex": "00013c00080802040000291100"
+    },
+    "payload_hex": "00fecaad0b02010d00013c00080802040000291100",
+    "message_hex": "80890a1a00150000fecaad0b02010d00013c00080802040000291100"
   }
 ]

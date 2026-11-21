@@ -242,6 +242,8 @@ pub const EVT_GP_REMOTE_SINK_TABLE: u16 = 0x0A86;
 pub const EVT_GP_REMOTE_PROXY_TABLE: u16 = 0x0A87;
 /// `EVT_GP_REMOTE_TRANSLATION_TABLE`
 pub const EVT_GP_REMOTE_TRANSLATION_TABLE: u16 = 0x0A88;
+/// `EVT_GP_APP_DESCRIPTION`
+pub const EVT_GP_APP_DESCRIPTION: u16 = 0x0A89;
 
 /// Every v1 request ID (both directions).
 pub const REQUESTS: &[u16] = &[
@@ -359,6 +361,7 @@ pub const EVENTS: &[u16] = &[
     EVT_GP_REMOTE_SINK_TABLE,
     EVT_GP_REMOTE_PROXY_TABLE,
     EVT_GP_REMOTE_TRANSLATION_TABLE,
+    EVT_GP_APP_DESCRIPTION,
 ];
 
 /// Requests that the NCP originates (host must answer them).

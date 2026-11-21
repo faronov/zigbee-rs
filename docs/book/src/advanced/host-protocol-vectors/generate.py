@@ -152,6 +152,7 @@ GP_PAIRING_CONFIGURATION, GP_SEND_PAIRING, GP_TRANSLATION_UPDATE = 0x0A08, 0x0A0
 GP_TRANSLATION_REQUEST, GP_REMOTE_SINK_TABLE_REQUEST = 0x0A0B, 0x0A0C
 EVT_GP_FRAME, EVT_GP_COMMISSIONED = 0x0A80, 0x0A82
 EVT_GP_REMOTE_STATUS, EVT_GP_REMOTE_TRANSLATION_TABLE = 0x0A85, 0x0A88
+EVT_GP_APP_DESCRIPTION = 0x0A89
 LOG_RECORD = 0x0980
 TBL_LOOKUP, TBL_WRITEBACK = 0x0501, 0x0502
 BKP_RESTORE_BEGIN, BKP_RESTORE_PUT, BKP_RESTORE_COMMIT = 0x0611, 0x0612, 0x0613
@@ -752,6 +753,13 @@ def build_messages():
         struct.pack("<HBBBBBB", 0x7C87, 6, 0x00, 2, 0, 0, len(tt_records)) + b"".join(tt_records),
         "GP Translation Table Response: 2 of 2 entries from index 0 as R_GP_TRANSLATION records",
         {"records_hex": [hx(r) for r in tt_records]})
+    # Report 0 of 2 of a multi-sensor GPD: Temperature Measurement server,
+    # MeasuredValue (int16) at offset 0, timeout 60 s.
+    temperature_report = bytes.fromhex("00013c00080802040000291100")
+    add("evt_gp_app_description", EP_ZIGBEE, K_EVENT, EVT_GP_APP_DESCRIPTION, 0x001A,
+        struct.pack("<BIBBB", 0, 0x0BADCAFE, 2, 1, len(temperature_report)) + temperature_report,
+        "Application Description of SrcID 0x0badcafe: report 0 of 2 (temperature, offset 0)",
+        {"report_hex": hx(temperature_report)})
     return out
 
 
