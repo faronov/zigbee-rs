@@ -145,6 +145,33 @@ fn device(profile: &Profile) -> ZigbeeDevice<MockMac, Router> {
             energy: if channel == 15 { 10 } else { 120 },
         });
     }
+    // A neighbouring Zigbee PRO network on channel 25 (coordinator and one
+    // router) for `NWK_ACTIVE_SCAN`.
+    for src in [0x0000, 0x5A17] {
+        use zigbee_mac::primitives::{PanDescriptor, SuperframeSpec, ZigbeeBeaconPayload};
+        use zigbee_types::{MacAddress, PanId, ShortAddress};
+        mac.add_beacon(PanDescriptor {
+            channel: 25,
+            coord_address: MacAddress::Short(PanId(0x4D2A), ShortAddress(src)),
+            superframe_spec: SuperframeSpec {
+                pan_coordinator: src == 0x0000,
+                ..Default::default()
+            },
+            lqi: 180,
+            security_use: false,
+            zigbee_beacon: ZigbeeBeaconPayload {
+                protocol_id: 0,
+                stack_profile: 2,
+                protocol_version: 2,
+                router_capacity: true,
+                device_depth: u8::from(src != 0x0000),
+                end_device_capacity: true,
+                extended_pan_id: [0xDD, 0xCC, 0xBB, 0xAA, 0x44, 0x33, 0x22, 0x11],
+                tx_offset: [0xFF; 3],
+                update_id: 1,
+            },
+        });
+    }
     ZigbeeDevice::builder(mac)
         .power_mode(PowerMode::AlwaysOn)
         .channels(ChannelMask::ALL_2_4GHZ)

@@ -420,6 +420,25 @@ pub trait CoordinatorPort {
         let _ = (channel, duration_exp);
         Err(OpError::Unsupported)
     }
+    /// `ACTIVE_SCAN` capability: [`Self::active_scan`] works, with or
+    /// without a running network.
+    fn active_scan_supported(&self) -> bool {
+        false
+    }
+    /// One MLME-SCAN (active) of `channel` for `(2^duration_exp + 1)`
+    /// superframe periods: a beacon request, then every beacon heard, each
+    /// passed to `sink` (one per coordinator/router and EPID). The radio
+    /// returns to the operating channel afterwards; other traffic is not
+    /// received meanwhile. No beacon is `Ok`.
+    async fn active_scan(
+        &mut self,
+        channel: u8,
+        duration_exp: u8,
+        sink: &mut dyn FnMut(&Beacon),
+    ) -> Result<(), OpError> {
+        let _ = (channel, duration_exp, sink);
+        Err(OpError::Unsupported)
+    }
     /// Program the radio's transmit power (`PhyTransmitPower`, a value the
     /// platform's radio supports). Volatile.
     async fn set_tx_power(&mut self, dbm: i8) -> Result<(), OpError> {
@@ -441,6 +460,21 @@ pub trait CoordinatorPort {
     fn reset_counters(&mut self, group_mask: u8) {
         let _ = group_mask;
     }
+}
+
+/// One beacon of an active scan (`NWK_ACTIVE_SCAN`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Beacon {
+    pub channel: u8,
+    pub pan: u16,
+    /// Extended PAN ID in air byte order.
+    pub epid: [u8; 8],
+    /// The sender's short address.
+    pub src: u16,
+    pub lqi: u8,
+    pub permit: bool,
+    pub stack_profile: u8,
+    pub update_id: u8,
 }
 
 /// A device link key carried by a backup (`DEVICE` record with a link

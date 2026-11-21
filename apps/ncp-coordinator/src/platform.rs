@@ -160,6 +160,12 @@ pub trait NcpPlatform {
     fn energy_to_dbm(&self, _energy: u8) -> i8 {
         i8::MIN
     }
+    /// The received power a frame's LQI stands for (the inverse of the
+    /// radio's RSSI-to-LQI mapping), for `NWK_ACTIVE_SCAN.rssi`. `i8::MIN`
+    /// when the platform does not know it.
+    fn lqi_to_dbm(&self, _lqi: u8) -> i8 {
+        i8::MIN
+    }
 
     // ── Counters (spec 7.8) ─────────────────────────────────────────
 

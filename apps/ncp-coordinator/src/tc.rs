@@ -1245,6 +1245,56 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             .ok_or(OpError::Zigbee(0x01))
     }
 
+    fn active_scan_supported(&self) -> bool {
+        true
+    }
+
+    async fn active_scan(
+        &mut self,
+        channel: u8,
+        duration_exp: u8,
+        sink: &mut dyn FnMut(&crate::port::Beacon),
+    ) -> Result<(), OpError> {
+        use zigbee_mac::{MacError, MlmeScanRequest, ScanType};
+        use zigbee_types::MacAddress;
+        // MLME-SCAN (active) of the one channel; the MAC returns to the
+        // operating channel and address filter afterwards.
+        let result = self
+            .app
+            .device_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .mlme_scan(MlmeScanRequest {
+                scan_type: ScanType::Active,
+                channel_mask: zigbee_types::ChannelMask(1 << channel),
+                scan_duration: duration_exp,
+            })
+            .await;
+        let confirm = match result {
+            Ok(confirm) => confirm,
+            Err(MacError::NoBeacon) => return Ok(()),
+            Err(_) => return Err(OpError::Zigbee(0xEA)),
+        };
+        for pd in confirm.pan_descriptors.iter() {
+            let (pan, src) = match pd.coord_address {
+                MacAddress::Short(pan, short) => (pan.0, short.0),
+                MacAddress::Extended(pan, _) => (pan.0, 0xFFFF),
+            };
+            sink(&crate::port::Beacon {
+                channel: pd.channel,
+                pan,
+                epid: pd.zigbee_beacon.extended_pan_id,
+                src,
+                lqi: pd.lqi,
+                permit: pd.superframe_spec.association_permit,
+                stack_profile: pd.zigbee_beacon.stack_profile,
+                update_id: pd.zigbee_beacon.update_id,
+            });
+        }
+        Ok(())
+    }
+
     async fn set_tx_power(&mut self, dbm: i8) -> Result<(), OpError> {
         self.app
             .device_mut()

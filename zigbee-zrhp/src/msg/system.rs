@@ -52,6 +52,8 @@ pub mod caps {
     pub const PTA_COEX: u64 = 1 << 21;
     /// RTS/CTS active on this link.
     pub const UART_FLOW_CONTROL: u64 = 1 << 22;
+    /// `NWK_ACTIVE_SCAN`.
+    pub const ACTIVE_SCAN: u64 = 1 << 23;
 }
 
 /// Host capability bits (`host_caps`, 8.8).

@@ -30,9 +30,9 @@ use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagResetCounters};
 use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord, LogConfig};
 use zigbee_zrhp::msg::network::{
     EvtChannelChanged, EvtDeviceJoined, EvtDeviceLeft, EvtEnergyScanResult, EvtNetworkState,
-    EvtPermitJoinState, NwkAddEndpoint, NwkChangeChannel, NwkEnergyScan, NwkForm, NwkGetInfoRsp,
-    NwkGroupMembership, NwkInit, NwkInitRsp, NwkLeaveReset, NwkPermitJoin, NwkSetTxPower,
-    NwkSetTxPowerRsp,
+    EvtPermitJoinState, NwkActiveScan, NwkActiveScanRsp, NwkAddEndpoint, NwkChangeChannel,
+    NwkEnergyScan, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkInit, NwkInitRsp, NwkLeaveReset,
+    NwkPermitJoin, NwkSetTxPower, NwkSetTxPowerRsp,
 };
 use zigbee_zrhp::msg::security::{
     EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey,
@@ -150,6 +150,8 @@ fn response_bound(id: u16, request_len: usize) -> usize {
         | ids::LOG_CONFIG
         | ids::DIAG_RESET_COUNTERS => STATUS_RESPONSE,
         ids::NWK_ENERGY_SCAN => STATUS_RESPONSE,
+        // Sent when the scan completes; taken only while that fits.
+        ids::NWK_ACTIVE_SCAN => STATUS_RESPONSE + 1 + 18 * crate::radio::MAX_ACTIVE_SCAN_RESULTS,
         ids::NWK_INIT | ids::NWK_SET_TX_POWER => STATUS_RESPONSE + 1,
         ids::SEC_ADD_INSTALL_CODE => STATUS_RESPONSE + 16,
         _ => MAX_RESPONSE,
@@ -292,6 +294,8 @@ pub struct Ncp<const LOG_N: usize> {
     permit_join_report: bool,
     /// The running `NWK_ENERGY_SCAN`.
     energy_scan: Option<crate::radio::EnergyScan>,
+    /// The running `NWK_ACTIVE_SCAN` (one scan of either kind at a time).
+    active_scan: Option<crate::radio::ActiveScan>,
     /// Applied `NWK_SET_TX_POWER` (volatile): re-applied after `NWK_INIT`
     /// and a formation with `tx_power` 0.
     tx_power_request: Option<i8>,
@@ -342,6 +346,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             permit_join_seen: None,
             permit_join_report: false,
             energy_scan: None,
+            active_scan: None,
             tx_power_request: None,
             tx_power: None,
         }
@@ -454,6 +459,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         // One energy-scan channel per pass, then a pass for the queued
         // operations and the stack.
         if self.energy_scan.is_some() && await_out_of_line!(self.step_energy_scan(port, platform)) {
+            return true;
+        }
+        if self.active_scan.is_some() && await_out_of_line!(self.step_active_scan(port, platform)) {
             return true;
         }
         let Some((op, accepted_us)) = self.ops.pop_front() else {
@@ -727,6 +735,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                                 coex: &mut self.coex,
                                 host_caps: &mut self.host_caps,
                                 energy_scan: &mut self.energy_scan,
+                                active_scan: &mut self.active_scan,
                                 tx_power: self.tx_power,
                             };
                             for message in batch.iter() {
@@ -922,6 +931,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 }
                 if port.energy_scan_supported() {
                     ncp_caps |= caps::ENERGY_SCAN;
+                }
+                if port.active_scan_supported() {
+                    ncp_caps |= caps::ACTIVE_SCAN;
                 }
                 if platform.tx_power_step(0).is_some() {
                     ncp_caps |= caps::TX_POWER;
@@ -1328,11 +1340,32 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 } else {
                     match crate::radio::EnergyScan::new(tid, &request) {
                         Err(status) => status,
-                        Ok(_) if state.energy_scan.is_some() => Status::InProgress,
+                        Ok(_) if state.energy_scan.is_some() || state.active_scan.is_some() => {
+                            Status::InProgress
+                        }
                         // EVT_ENERGY_SCAN_RESULT follows from `drive`.
                         Ok(scan) => {
                             *state.energy_scan = Some(scan);
                             Status::Success
+                        }
+                    }
+                };
+                status_only(queues, status);
+            }
+            ids::NWK_ACTIVE_SCAN => {
+                let request = decode!(NwkActiveScan);
+                let status = if !port.active_scan_supported() {
+                    Status::UnsupportedCommand
+                } else {
+                    match crate::radio::ActiveScan::new(tid, &request) {
+                        Err(status) => status,
+                        Ok(_) if state.energy_scan.is_some() || state.active_scan.is_some() => {
+                            Status::InProgress
+                        }
+                        Ok(scan) => {
+                            // Answered by `drive` once every channel is done.
+                            *state.active_scan = Some(scan);
+                            return;
                         }
                     }
                 };
@@ -1753,6 +1786,45 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         if self.event(Endpoint::Zigbee, &event) {
             self.energy_scan = None;
         } else if let Some(scan) = self.energy_scan.as_mut() {
+            // Queue full: retry after the host drained it.
+            scan.yielded = true;
+        }
+        true
+    }
+
+    /// `NWK_ACTIVE_SCAN`: scan the next channel, or answer. `false`: this
+    /// pass is left to the queued operations and the stack.
+    async fn step_active_scan<C: CoordinatorPort, P: NcpPlatform>(
+        &mut self,
+        port: &mut C,
+        platform: &P,
+    ) -> bool {
+        let Some(scan) = self.active_scan.as_mut() else {
+            return false;
+        };
+        if core::mem::replace(&mut scan.yielded, false) {
+            return false;
+        }
+        if let Some(channel) = scan.next_channel() {
+            let duration_exp = scan.duration_exp();
+            let mut sink =
+                |beacon: &crate::port::Beacon| scan.record(beacon, platform.lqi_to_dbm(beacon.lqi));
+            let result = await_out_of_line!(port.active_scan(channel, duration_exp, &mut sink));
+            scan.finish_channel(channel, result);
+            scan.yielded = true;
+            return true;
+        }
+        let (status, results) = scan.response();
+        let response = NwkActiveScanRsp {
+            results: List::new(results),
+        };
+        if self
+            .queues
+            .response(scan.tid, status, Some(&response))
+            .is_ok()
+        {
+            self.active_scan = None;
+        } else {
             // Queue full: retry after the host drained it.
             scan.yielded = true;
         }
@@ -2370,6 +2442,7 @@ struct DispatchState<'s> {
     identity: &'s NcpIdentity,
     boot_us: u64,
     energy_scan: &'s mut Option<crate::radio::EnergyScan>,
+    active_scan: &'s mut Option<crate::radio::ActiveScan>,
     tx_power: Option<i8>,
 }
 
@@ -2497,6 +2570,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 permit_join_seen: _,
                 permit_join_report: _,
                 energy_scan: _,
+                active_scan: _,
                 tx_power_request: _,
                 tx_power: _,
             } = ncp;
@@ -2545,6 +2619,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             addr_of_mut!((*slot).permit_join_seen).write(None);
             addr_of_mut!((*slot).permit_join_report).write(false);
             addr_of_mut!((*slot).energy_scan).write(None);
+            addr_of_mut!((*slot).active_scan).write(None);
             addr_of_mut!((*slot).tx_power_request).write(None);
             addr_of_mut!((*slot).tx_power).write(None);
             let ncp = &mut *slot;

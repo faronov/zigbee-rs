@@ -1,13 +1,14 @@
-//! `NWK_ENERGY_SCAN` (spec 7.2): an energy scan the NCP runs one channel at
-//! a time between stack steps, so that the host link and the running
-//! network are served while it lasts. The result follows the response as
-//! `EVT_ENERGY_SCAN_RESULT`.
+//! `NWK_ENERGY_SCAN` and `NWK_ACTIVE_SCAN` (spec 7.2): scans the NCP runs
+//! one channel at a time between stack steps, so that the host link and the
+//! running network are served while they last. The energy scan's result
+//! follows its response as `EVT_ENERGY_SCAN_RESULT`; the active scan answers
+//! when it is complete.
 
 use heapless::Vec;
-use zigbee_zrhp::msg::network::{EnergyResult, NwkEnergyScan};
+use zigbee_zrhp::msg::network::{EnergyResult, NwkActiveScan, NwkEnergyScan, ScanResult};
 use zigbee_zrhp::types::Status;
 
-use crate::port::OpError;
+use crate::port::{Beacon, OpError};
 
 /// Zigbee 2.4 GHz channels 11..=26.
 const CHANNELS: u32 = 0x07FF_F800;
@@ -123,6 +124,89 @@ impl EnergyScan {
     }
 }
 
+/// Largest `NWK_ACTIVE_SCAN.duration_exp`: 16 channels × 65 × 15.36 ms
+/// ≈ 16 s.
+pub const MAX_ACTIVE_SCAN_DURATION_EXP: u8 = 6;
+
+/// Beacons one `NWK_ACTIVE_SCAN` response carries (18 B each); further
+/// beacons are dropped.
+pub const MAX_ACTIVE_SCAN_RESULTS: usize = 25;
+
+/// An accepted active scan.
+#[derive(Debug, Clone)]
+pub struct ActiveScan {
+    pub tid: u16,
+    remaining: u32,
+    duration_exp: u8,
+    results: Vec<ScanResult, MAX_ACTIVE_SCAN_RESULTS>,
+    status: Status,
+    /// The last pass scanned a channel: let the stack run before the next.
+    pub yielded: bool,
+}
+
+impl ActiveScan {
+    /// Validate a request: a non-empty mask of channels 11..=26 and
+    /// `duration_exp` ≤ [`MAX_ACTIVE_SCAN_DURATION_EXP`].
+    pub fn new(tid: u16, request: &NwkActiveScan) -> Result<Self, Status> {
+        let mask = request.channel_mask;
+        if mask == 0 || mask & !CHANNELS != 0 || request.duration_exp > MAX_ACTIVE_SCAN_DURATION_EXP
+        {
+            return Err(Status::InvalidParameter);
+        }
+        Ok(Self {
+            tid,
+            remaining: mask,
+            duration_exp: request.duration_exp,
+            results: Vec::new(),
+            status: Status::Success,
+            yielded: false,
+        })
+    }
+
+    /// The next channel to scan, `None` when the scan is complete.
+    pub fn next_channel(&self) -> Option<u8> {
+        (self.remaining != 0).then(|| self.remaining.trailing_zeros() as u8)
+    }
+
+    pub fn duration_exp(&self) -> u8 {
+        self.duration_exp
+    }
+
+    /// A beacon heard, with the received power `rssi` (dBm at the antenna).
+    pub fn record(&mut self, beacon: &Beacon, rssi: i8) {
+        let _ = self.results.push(ScanResult {
+            channel: beacon.channel,
+            pan: beacon.pan,
+            epid: beacon.epid,
+            src: beacon.src,
+            lqi: beacon.lqi,
+            rssi,
+            permit: u8::from(beacon.permit),
+            stack_profile: beacon.stack_profile,
+            update_id: beacon.update_id,
+        });
+    }
+
+    /// `channel` is done. A failed scan ends the whole scan with its status;
+    /// the beacons heard so far are reported.
+    pub fn finish_channel(&mut self, channel: u8, result: Result<(), OpError>) {
+        self.remaining &= !(1 << channel);
+        if let Err(error) = result {
+            self.status = match error {
+                OpError::Unsupported => Status::UnsupportedCommand,
+                OpError::InvalidState => Status::InvalidState,
+                _ => Status::Failure,
+            };
+            self.remaining = 0;
+        }
+    }
+
+    /// The response: status and the beacons in the order heard.
+    pub fn response(&self) -> (Status, &[ScanResult]) {
+        (self.status, &self.results)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +276,74 @@ mod tests {
                 .map(|r| r.channel)
                 .collect::<std::vec::Vec<_>>(),
             [11]
+        );
+    }
+
+    fn beacon(channel: u8, src: u16) -> Beacon {
+        Beacon {
+            channel,
+            pan: 0x1A2B,
+            epid: [1, 2, 3, 4, 5, 6, 7, 8],
+            src,
+            lqi: 200,
+            permit: true,
+            stack_profile: 2,
+            update_id: 3,
+        }
+    }
+
+    #[test]
+    fn active_scan_requests_are_bounded() {
+        let ok = |mask, duration_exp| {
+            ActiveScan::new(
+                1,
+                &NwkActiveScan {
+                    channel_mask: mask,
+                    duration_exp,
+                },
+            )
+            .map(|_| ())
+        };
+        assert_eq!(ok(CHANNELS, 3), Ok(()));
+        assert_eq!(ok(CHANNELS, 6), Ok(()));
+        for (mask, exp) in [(CHANNELS, 7), (0, 3), (1 << 10, 3), (1 << 27, 3)] {
+            assert_eq!(
+                ok(mask, exp),
+                Err(Status::InvalidParameter),
+                "{mask:#x} {exp}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_scan_keeps_every_beacon_up_to_the_cap_and_stops_on_failure() {
+        let mut scan = ActiveScan::new(
+            9,
+            &NwkActiveScan {
+                channel_mask: (1 << 11) | (1 << 15) | (1 << 20),
+                duration_exp: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(scan.next_channel(), Some(11));
+        for src in 0..30 {
+            scan.record(&beacon(11, src), -60);
+        }
+        scan.finish_channel(11, Ok(()));
+        assert_eq!(scan.next_channel(), Some(15));
+        scan.finish_channel(15, Err(OpError::Zigbee(0xEA)));
+        assert_eq!(scan.next_channel(), None);
+        let (status, results) = scan.response();
+        assert_eq!(status, Status::Failure);
+        assert_eq!(results.len(), MAX_ACTIVE_SCAN_RESULTS);
+        assert_eq!(
+            (
+                results[0].src,
+                results[0].rssi,
+                results[0].permit,
+                results[0].epid
+            ),
+            (0, -60, 1, [1, 2, 3, 4, 5, 6, 7, 8])
         );
     }
 }
