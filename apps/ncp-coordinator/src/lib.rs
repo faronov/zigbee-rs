@@ -39,6 +39,7 @@ pub mod log_ring;
 pub mod ncp;
 pub mod platform;
 pub mod port;
+pub mod radio;
 pub mod retry;
 pub mod tables;
 pub mod tc;

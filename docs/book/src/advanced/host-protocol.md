@@ -1191,13 +1191,13 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
 | `0x0101` | `NWK_INIT` | `u32 nwk_fc_floor, u32 aps_fc_floor` (host checkpoint floors, 0 = none) | `u8 network_state`; `NOT_FORMED` if NV has no network. Completes with `EVT_NETWORK_STATE`. | E (`CoordinatorApp`/`TrustCenterCoordinatorApp::initialize` persisted path) + N (floors) |
-| `0x0102` | `NWK_FORM` | `u32 channel_mask, u16 pan_id (FFFF = random), [8] ext_pan_id (0 = random), [16] network_key (0 = random), u8 key_seq, u8 nwk_update_id, i8 tx_power, u16 nwk_manager` | accepted; `EVT_NETWORK_STATE` follows | E (BDB formation; host-supplied parameters install the network directly on the quietest channel of the mask) |
+| `0x0102` | `NWK_FORM` | `u32 channel_mask, u16 pan_id (FFFF = random), [8] ext_pan_id (0 = random), [16] network_key (0 = random), u8 key_seq, u8 nwk_update_id, i8 tx_power (0 = keep the current power: the product default, or the last `NWK_SET_TX_POWER` of this power cycle; set exactly 0 dBm with `NWK_SET_TX_POWER` after the formation), u16 nwk_manager` | accepted; `EVT_NETWORK_STATE` follows | E (BDB formation; host-supplied parameters install the network directly on the quietest channel of the mask) |
 | `0x0103` | `NWK_LEAVE_RESET` | `u8 flags (bit0 keep IEEE override, bit1 keep host-endpoint registrations)` | — | E (`urgent_factory_reset_and_recommission`; a new network can follow in the same session) |
-| `0x0104` | `NWK_GET_INFO` | — | `u8 state, u16 pan_id, [8] ext_pan_id, u8 channel, u32 channel_mask, u16 short, [8] ieee, u8 nwk_update_id, u16 nwk_manager, u8 key_seq, u8 security_level, i8 tx_power, u8 stack_profile`. With `state` 1 (formed, not started: after a reboot, before `NWK_INIT`) the fields are the stored network's identity: PAN ID, EPID, channel, update ID and key sequence from NV, `short` 0x0000, `nwk_manager` 0x0000, `tx_power` unknown (Z11) | E |
+| `0x0104` | `NWK_GET_INFO` | — | `u8 state, u16 pan_id, [8] ext_pan_id, u8 channel, u32 channel_mask, u16 short, [8] ieee, u8 nwk_update_id, u16 nwk_manager, u8 key_seq, u8 security_level, i8 tx_power, u8 stack_profile`. With `state` 1 (formed, not started: after a reboot, before `NWK_INIT`) the fields are the stored network's identity: PAN ID, EPID, channel, update ID and key sequence from NV, `short` 0x0000, `nwk_manager` 0x0000, `tx_power` unknown (Z11). Otherwise `tx_power` is the antenna output the radio is programmed with (as `NWK_SET_TX_POWER.applied_dbm`), `0x7F` while unknown | E |
 | `0x0105` | `NWK_PERMIT_JOIN` | `u8 duration_s, u16 target (0xFFFC all routers + NCP, 0x0000 NCP only, else a router), u8 flags (bit0 TC significance)` | — | E (`nlme_permit_joining`, `mgmt_permit_joining_req`) |
-| `0x0106` | `NWK_ENERGY_SCAN` | `u32 channel_mask, u8 duration_exp, u8 count` | accepted; `EVT_ENERGY_SCAN_RESULT` follows | P (`nlme_ed_scan` exists; running it on an active coordinator must pause TX/RX and is N) |
+| `0x0106` | `NWK_ENERGY_SCAN` | `u32 channel_mask, u8 duration_exp, u8 count` | accepted; `EVT_ENERGY_SCAN_RESULT` follows strictly after the response. Works with or without a network. `channel_mask` non-empty within channels 11–26, `duration_exp` ≤ 14, `count` ≥ 1 and at most 60 s in total (`count` × channels × (2^`duration_exp` + 1) × 15.36 ms), else `INVALID_PARAMETER`; `IN_PROGRESS` while a scan runs. Each channel is one MLME-SCAN (ED) of `(2^duration_exp + 1)` superframe periods; the radio returns to the operating channel after each, and the NCP serves the link and the stack between channels. Frames sent to the NCP while it measures another channel are lost (MAC retries, SED polls); hub default `duration_exp` 4, `count` 1: 16 × 261 ms | E (capability bit 9; ESP32 and CC26x2 NCPs) |
 | `0x0107` | `NWK_CHANGE_CHANNEL` | `u8 channel, u8 nwk_update_id (0 = current+1)` | accepted; `EVT_CHANNEL_CHANGED` follows. Needs the network up. The NCP broadcasts `Mgmt_NWK_Update_req{ScanChannels = 1 << channel, ScanDuration 0xFE, update ID}` to `0xFFFD`, commits the channel and update ID to NV (a reboot from then on resumes on the new channel), answers, and tunes the radio `nwkNetworkBroadcastDeliveryTime` (9 s) later; then `EVT_CHANNEL_CHANGED`. The current channel completes at once without a broadcast. `BUSY` while a change is pending; `INVALID_PARAMETER` outside 11–26. Sleepy end devices find the network again by their rejoin scan. | E (ESP32/CC26x2 NCP: broadcast through the data path, `nlme_set_channel`) |
-| `0x0108` | `NWK_SET_TX_POWER` | `i8 dbm` | `i8 applied_dbm` | E (MAC PIB `PhyTransmitPower`) |
+| `0x0108` | `NWK_SET_TX_POWER` | `i8 dbm` | `i8 applied_dbm`: the antenna output the radio produces, clamped to the product range and rounded down to a radio step (ESP32-H2 −24…+20 dBm, ESP32-C6 −15…+20 dBm, 3 dB steps from the minimum, ESP-IDF `ieee802154_txpower_convert`). Volatile: kept across `NWK_INIT`, `NWK_LEAVE_RESET` and formations with `tx_power` 0, lost at an NCP reset (the host replays it, 12.4). With or without a network | E (MAC PIB `PhyTransmitPower`; capability bit 18 when the platform knows its steps: ESP32 NCPs, not yet CC26x2) |
 | `0x0109` | `NWK_CONCENTRATOR` | `u8 mode (0 off, 1 low-RAM, 2 high-RAM), u16 min_s, u16 max_s, u8 radius` | — | P (NWK concentrator state exists) |
 | `0x010A` | `NWK_ACTIVE_SCAN` | `u32 channel_mask, u8 duration_exp` | `u8 n, n×{u8 channel, u16 pan, [8] epid, u16 src, u8 lqi, i8 rssi, u8 permit, u8 stack_profile, u8 update_id}` | P (`nlme_network_discovery`) |
 | `0x010B` | `NWK_ADD_ENDPOINT` | `u8 ep, u16 profile, u16 device_id, u8 version, u8 n_in, n_in×u16, u8 n_out, n_out×u16` | — (`NO_SPACE` beyond `max_host_endpoints`; `INVALID_PARAMETER` for `ep` outside 1..=240 or more than 16 clusters in a list) | E (`ZigbeeDevice::register_host_endpoint`: the ZDO registry the server answers from; `max_host_endpoints` = 8; registering an endpoint again replaces it, including the product profile's endpoint with that number; registrations are RAM only and cleared by `NWK_LEAVE_RESET` without flags bit1) |
@@ -1214,7 +1214,7 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | `0x0187` | `EVT_PAN_ID_CONFLICT` | `u16 conflicting_pan, u8 count` | event | P (`conflict.rs`) |
 | `0x0188` | `EVT_PERMIT_JOIN_STATE` | `u8 remaining_s` | event: the NCP's own permit-join window (0 closed, 255 no time limit). Sent when it opens or closes (host request, expiry, a `Mgmt_Permit_Joining_req` from the network), when it is re-armed (the remaining time grows), after every successful `NWK_PERMIT_JOIN`, and once per session while it is open. The per-second countdown is not sent. | E |
 | `0x0189` | `EVT_CHANNEL_CHANGED` | `u8 channel, u8 nwk_update_id, u16 req_tid` | event (`channel` is the one the radio is on; a failed tune reports the old channel, NV already holds the new one) | E |
-| `0x018A` | `EVT_ENERGY_SCAN_RESULT` | `u16 req_tid, u8 status, u8 n, n×{u8 channel, i8 max_rssi_dbm, u8 energy}` | event | N |
+| `0x018A` | `EVT_ENERGY_SCAN_RESULT` | `u16 req_tid, u8 status, u8 n, n×{u8 channel, i8 max_rssi_dbm, u8 energy}` | event: channels in ascending order, the highest value of the `count` passes. `energy` is the IEEE 802.15.4 ED scale (0..255); `max_rssi_dbm` its dBm value by the radio's mapping (ESP32: linear −100…+5 dBm), `-128` when the platform does not know it (CC26x2). A failed measurement ends the scan: `status` `FAILURE` with the channels measured so far | E |
 
 **RF front-end modules (external PA/LNA).** Every power and level on this
 interface is **antenna-referred**, with or without a FEM, so no capability
@@ -1425,8 +1425,8 @@ Section 9 defines these commands.
 
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
-| `0x0701` | `DIAG_GET_COUNTERS` | `u8 group_mask` (bit0 link, bit1 MAC, bit2 NWK, bit3 APS, bit4 security, bit5 tables, bit6 queues, bit7 Green Power) | `u8 n, n×{u16 id, u32 value}` | P (several counters exist, e.g. `replay_table_full`, `frame_pending_acks`; a registry is N) |
-| `0x0702` | `DIAG_RESET_COUNTERS` | `u8 group_mask` | — | N |
+| `0x0701` | `DIAG_GET_COUNTERS` | `u8 group_mask` (bit0 link, bit1 MAC, bit2 NWK, bit3 APS, bit4 security, bit5 tables, bit6 queues, bit7 Green Power) | `u8 n, n×{u16 id, u32 value}`: every counter of every requested group the NCP keeps (at most 64), groups in bit order; groups it does not keep are absent | E (the registry below) |
+| `0x0702` | `DIAG_RESET_COUNTERS` | `u8 group_mask` | — (zeroes the counters of those groups only) | E |
 | `0x0703` | `DIAG_GET_NEIGHBORS` | `u8 start` | `u8 total, u8 n, n×{[8] ieee, u16 nwk, u8 type, u8 rx_on, u8 relationship, u8 lqi, u8 outgoing_cost, u8 age}` (Mgmt_Lqi codes: type 0 coordinator, 1 router, 2 end device; relationship 0 parent, 1 child, 2 sibling, 4 previous child, 5 unauthenticated child; up to 16 per page) | E |
 | `0x0704` | `DIAG_GET_ROUTES` | `u8 start` | `u8 total, u8 n, n×{u16 dst, u16 next_hop, u8 status, u8 flags}` (Mgmt_Rtg status codes; flags bit1 many-to-one, bit2 route record required) | E |
 | `0x0705` | `DIAG_GET_CHILDREN` | `u8 start` | `u8 total, u8 n, n×{[8] ieee, u16 nwk, u8 capability, u8 timeout_exp, u32 last_poll_ms}` (`last_poll_ms` `0xFFFFFFFF` when unknown) | E |
@@ -1448,6 +1448,36 @@ Counter ID groups:
 - `0x07xx`: queues (APS queue high-water, `BUSY` responses, host-absent
   drops, indirect queue full).
 - `0x08xx` (group bit 7): Green Power (7.11).
+
+Registered counters (`u32`, wrapping; zeroed at boot and by
+`DIAG_RESET_COUNTERS`). Only counters a stack keeps anyway are reported; the
+other kinds above stay reserved until a cheap source exists.
+
+| ID | Name | Meaning | Kept by |
+|---|---|---|---|
+| `0x0201` | `mac_tx` | Transmissions started (every CSMA-CA attempt, broadcast or unicast) | ESP32 |
+| `0x0202` | `mac_tx_ack_requested` | Of those, with an ACK request | ESP32 |
+| `0x0203` | `mac_tx_no_ack` | Of those, no ACK within the ACK window | ESP32 |
+| `0x0204` | `mac_tx_errors` | Starts that failed (radio busy past the bound, no TX-done); retried as a busy channel | ESP32 |
+| `0x0205` | `mac_tx_deferred` | Starts that waited for a reception or automatic ACK to end (not failures) | ESP32 |
+| `0x0206` | `mac_data_requests` | Child Data Requests acknowledged by the radio | ESP32 |
+| `0x0207` | `frame_pending_acks` | Of those, ACKs with Frame Pending set | ESP32 |
+| `0x0208` | `mac_ack_stall_recoveries` | Stalled automatic ACKs the radio driver recovered | ESP32 |
+| `0x0301` | `nwk_secured_rx` | Secured NWK frames received | all |
+| `0x0302` | `nwk_decrypt_failures` | Of those, MIC/decrypt failures | all |
+| `0x0303` | `nwk_missing_key` | Of those, no key for the key sequence | all |
+| `0x0304` | `nwk_replay_rejects` | Of those, rejected as replays | all |
+| `0x0305` | `replay_table_full` | New sources refused because the replay table was full | all |
+| `0x0306` | `nwk_security_header_errors` | Unparsable auxiliary security headers | all |
+| `0x0401` | `aps_tx` | `APS_DATA_REQUEST`s completed (confirm sent) | all |
+| `0x0402` | `aps_tx_failed` | Of those, failed | all |
+| `0x0403` | `aps_rx` | `EVT_APS_DATA_INDICATION`s sent to the host | all |
+| `0x0501` | `joins_admitted` | Trust Center join decisions: admitted | all |
+| `0x0502` | `joins_denied` | … denied | all |
+| `0x0503` | `devices_authorized` | Network key delivered or TCLK verified | all |
+| `0x0504` | `authorization_failures` | TCLK verification failed | all |
+| `0x0505` | `devices_left` | `EVT_DEVICE_LEFT` reports | all |
+| `0x0701`–`0x0705` | queues | APS queue high-water, `BUSY` responses, indications dropped, log records dropped, malformed batches | all |
 
 ### 7.9 FIRMWARE (`0x08xx`, endpoint 4)
 
@@ -3090,8 +3120,8 @@ host-tested; hardware gates open):
   `COMMIT` stops it; the host-side `NWK_LEAVE_RESET` still works.
 - Z4: presence rule specified (9.5).
 - Z10: `NWK_GROUP_MEMBERSHIP` and `NWK_CHANGE_CHANNEL` implemented;
-  `NWK_ENERGY_SCAN` and `SEC_SET_TC_POLICY` are still
-  `UNSUPPORTED_COMMAND`.
+  `NWK_ENERGY_SCAN` implemented (`ncp-hub-gaps`, host-tested);
+  `SEC_SET_TC_POLICY` is still `UNSUPPORTED_COMMAND`.
 - Z11 fixed: with `network_state` 1, `NWK_GET_INFO` returns the stored
   identity (7.2), so reconcile can compare before `NWK_INIT`.
 - Z12: one export transaction, specified (9.5).
@@ -3341,8 +3371,9 @@ After `ncp-host-gaps` (host-tested): H5, `NWK_GROUP_MEMBERSHIP{add, 0x0B84,
 242}` is accepted (the NCP itself does not yet join 242 to
 `GP_SINK_CONFIG.group` in `HOST_SINK`). H6: `NWK_CHANGE_CHANNEL`,
 `DIAG_GET_NEIGHBORS` / `DIAG_GET_ROUTES` and `SEC_ADD_INSTALL_CODE` /
-`SEC_ADD_LINK_KEY` (type 1) are implemented. `NWK_SET_TX_POWER` and
-`NWK_PERMIT_JOIN` with a router target are still `UNSUPPORTED_COMMAND`.
+`SEC_ADD_LINK_KEY` (type 1) are implemented. `NWK_SET_TX_POWER` is
+implemented on the ESP32 NCPs (`ncp-hub-gaps`, host-tested).
+`NWK_PERMIT_JOIN` with a router target is still `UNSUPPORTED_COMMAND`.
 H10: use capacity 19, as in Z1.
 
 ### 12.4 Embedded hub (`faronov/zigbee-rs-hub`, ESP32-S3)

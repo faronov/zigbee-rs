@@ -144,7 +144,36 @@ pub trait NcpPlatform {
     fn set_pta(&mut self, _enable: bool, _priority_mask: u8) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
     }
+
+    // ── Radio (spec 7.2) ────────────────────────────────────────────
+
+    /// The antenna-referred output the radio really produces for a
+    /// `NWK_SET_TX_POWER` request of `dbm`: clamped to the product's range
+    /// and rounded down to a supported step (the value then programmed).
+    /// `None`: transmit power is not settable (`TX_POWER` capability off).
+    fn tx_power_step(&self, _dbm: i8) -> Option<i8> {
+        None
+    }
+    /// `max_rssi_dbm` of an energy-scan result: the inverse of the radio's
+    /// mapping from channel power to the 0..=255 ED value. `i8::MIN` when
+    /// the platform does not know it.
+    fn energy_to_dbm(&self, _energy: u8) -> i8 {
+        i8::MIN
+    }
+
+    // ── Counters (spec 7.8) ─────────────────────────────────────────
+
+    /// Platform counters of the `DIAG_GET_COUNTERS` groups in `group_mask`
+    /// (MAC/radio, group bit 1, `0x02xx`).
+    fn append_counters(&self, _group_mask: u8, _out: &mut Counters) {}
+    /// `DIAG_RESET_COUNTERS` for the groups in `group_mask`.
+    fn reset_counters(&mut self, _group_mask: u8) {}
 }
+
+pub use zigbee_zrhp::msg::diag::Counter;
+
+/// The counters of one `DIAG_GET_COUNTERS` response.
+pub type Counters = heapless::Vec<Counter, { crate::ncp::MAX_COUNTERS }>;
 
 /// A product with none of the optional services.
 #[derive(Debug, Default, Clone, Copy)]

@@ -46,6 +46,7 @@ pub mod host;
 pub mod identity;
 pub mod layout;
 pub mod platform;
+pub mod radio;
 // The devkit product's MMU running-slot evidence, compiled against this
 // product's `crate::layout` (the NCP slot addresses). The file also carries
 // ESP32-C5 paths behind a feature this product does not have.

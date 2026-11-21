@@ -28,9 +28,10 @@ use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataConfirm, EvtApsDa
 use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagGetCountersRsp, DiagResetCounters};
 use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord, LogConfig};
 use zigbee_zrhp::msg::network::{
-    EvtChannelChanged, EvtDeviceJoined, EvtDeviceLeft, EvtNetworkState, EvtPermitJoinState,
-    NwkAddEndpoint, NwkChangeChannel, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkInit,
-    NwkInitRsp, NwkLeaveReset, NwkPermitJoin,
+    EvtChannelChanged, EvtDeviceJoined, EvtDeviceLeft, EvtEnergyScanResult, EvtNetworkState,
+    EvtPermitJoinState, NwkAddEndpoint, NwkChangeChannel, NwkEnergyScan, NwkForm, NwkGetInfoRsp,
+    NwkGroupMembership, NwkInit, NwkInitRsp, NwkLeaveReset, NwkPermitJoin, NwkSetTxPower,
+    NwkSetTxPowerRsp,
 };
 use zigbee_zrhp::msg::security::{
     EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey,
@@ -56,6 +57,9 @@ use zigbee_zrhp::msg::tables::EvtTblEpochChanged;
 
 /// Link slots (spec 8.9: 16 × 652 B each direction; 8 with `compact`).
 pub const WINDOW: usize = [16, 8][cfg!(feature = "compact") as usize];
+/// Counters one `DIAG_GET_COUNTERS` response carries (all groups of this
+/// NCP fit: link 26, MAC 8, NWK 6, APS 3, security 5, queues 5, GP 9).
+pub const MAX_COUNTERS: usize = 64;
 /// Bytes of queued outgoing messages per endpoint.
 pub const QUEUE_BYTES: usize = [1536, 1024][cfg!(feature = "compact") as usize];
 /// `max_aps_inflight`: accepted, not yet confirmed `APS_DATA_REQUEST`s.
@@ -143,7 +147,8 @@ fn response_bound(id: u16, request_len: usize) -> usize {
         | ids::SEC_ADD_LINK_KEY
         | ids::LOG_CONFIG
         | ids::DIAG_RESET_COUNTERS => STATUS_RESPONSE,
-        ids::NWK_INIT => STATUS_RESPONSE + 1,
+        ids::NWK_ENERGY_SCAN => STATUS_RESPONSE,
+        ids::NWK_INIT | ids::NWK_SET_TX_POWER => STATUS_RESPONSE + 1,
         ids::SEC_ADD_INSTALL_CODE => STATUS_RESPONSE + 16,
         _ => MAX_RESPONSE,
     }
@@ -200,6 +205,47 @@ struct QueueCounters {
     indications_dropped: u32,
     log_dropped: u32,
     bad_batches: u32,
+    /// APS group (spec 7.8 `0x04xx`).
+    aps: [u32; 3],
+    /// Security / TC group (`0x05xx`).
+    security: [u32; 5],
+}
+
+/// `0x0401..`: APS data requests completed, of those failed, indications
+/// delivered to the host.
+const APS_TX: usize = 0;
+const APS_TX_FAILED: usize = 1;
+const APS_RX: usize = 2;
+/// `0x0501..`: TC join decisions admitted / denied, devices authorized
+/// (key delivered or TCLK verified), TCLK verification failures, devices
+/// left.
+const SEC_JOIN_ADMITTED: usize = 0;
+const SEC_JOIN_DENIED: usize = 1;
+const SEC_AUTHORIZED: usize = 2;
+const SEC_AUTH_FAILED: usize = 3;
+const SEC_LEFT: usize = 4;
+
+impl QueueCounters {
+    fn bump(counter: &mut u32) {
+        *counter = counter.wrapping_add(1);
+    }
+
+    /// `DIAG_RESET_COUNTERS` of the groups this struct holds.
+    fn reset(&mut self, group_mask: u8) {
+        if group_mask & 0x08 != 0 {
+            self.aps = [0; 3];
+        }
+        if group_mask & 0x10 != 0 {
+            self.security = [0; 5];
+        }
+        if group_mask & 0x40 != 0 {
+            *self = Self {
+                aps: self.aps,
+                security: self.security,
+                ..Self::default()
+            };
+        }
+    }
 }
 
 /// The NCP.
@@ -242,6 +288,13 @@ pub struct Ncp<const LOG_N: usize> {
     /// Report the permit-join state on the next pass (`NWK_PERMIT_JOIN`
     /// completed).
     permit_join_report: bool,
+    /// The running `NWK_ENERGY_SCAN`.
+    energy_scan: Option<crate::radio::EnergyScan>,
+    /// Applied `NWK_SET_TX_POWER` (volatile): re-applied after `NWK_INIT`
+    /// and a formation with `tx_power` 0.
+    tx_power_request: Option<i8>,
+    /// The radio's programmed transmit power as last read.
+    tx_power: Option<i8>,
 }
 
 impl<const LOG_N: usize> Ncp<LOG_N> {
@@ -286,6 +339,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             pending_channel: None,
             permit_join_seen: None,
             permit_join_report: false,
+            energy_scan: None,
+            tx_power_request: None,
+            tx_power: None,
         }
     }
 
@@ -393,6 +449,11 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             self.finish_channel_change(port, pending).await;
             return true;
         }
+        // One energy-scan channel per pass, then a pass for the queued
+        // operations and the stack.
+        if self.energy_scan.is_some() && await_out_of_line!(self.step_energy_scan(port, platform)) {
+            return true;
+        }
         let Some((op, accepted_us)) = self.ops.pop_front() else {
             return false;
         };
@@ -441,6 +502,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     platform,
                 )
                 .await;
+                await_out_of_line!(self.restore_tx_power(port, false));
                 if installed {
                     // 9.4 rule 5: cached host table state is stale.
                     let event = EvtTblEpochChanged {
@@ -456,11 +518,33 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 aps_fc_floor,
             } => {
                 let result = port.init(nwk_fc_floor, aps_fc_floor).await;
+                await_out_of_line!(self.restore_tx_power(port, result.is_ok()));
                 self.network_outcome(tid, result, port);
             }
             Op::Form { tid, params } => {
+                let keep_power = params.tx_power == 0;
                 let result = port.form(params).await;
+                if !keep_power {
+                    self.tx_power_request = None;
+                }
+                await_out_of_line!(self.restore_tx_power(port, result.is_ok() && keep_power));
                 self.network_outcome(tid, result, port);
+            }
+            Op::SetTxPower { tid, dbm } => {
+                let result = await_out_of_line!(port.set_tx_power(dbm));
+                if result.is_ok() {
+                    self.tx_power_request = Some(dbm);
+                }
+                self.tx_power = await_out_of_line!(port.tx_power());
+                match result {
+                    Ok(()) => {
+                        let response = NwkSetTxPowerRsp { applied_dbm: dbm };
+                        let _ = self.queues.response(tid, Status::Success, Some(&response));
+                    }
+                    Err(error) => {
+                        self.respond_status(ids::NWK_SET_TX_POWER, tid, op_status(Err(error)))
+                    }
+                }
             }
             // Turned into its broadcast above.
             Op::ChangeChannel { .. } => {}
@@ -475,6 +559,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     port.clear_endpoints();
                 }
                 let wiped = result.is_ok();
+                await_out_of_line!(self.restore_tx_power(port, wiped));
                 let status = op_status(result);
                 self.respond_status(ids::NWK_LEAVE_RESET, accepted_tid(accepted_us), status);
                 if wiped {
@@ -518,6 +603,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                         },
                     ),
                 };
+                self.count_aps_confirm(confirm.zb_status | status);
                 let event = EvtApsDataConfirm {
                     req_tid: request.req_tid,
                     status,
@@ -638,6 +724,8 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                                 backup: &mut self.backup,
                                 coex: &mut self.coex,
                                 host_caps: &mut self.host_caps,
+                                energy_scan: &mut self.energy_scan,
+                                tx_power: self.tx_power,
                             };
                             for message in batch.iter() {
                                 let header = message.header;
@@ -737,7 +825,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         }
         // DIAG_GET_COUNTERS needs the link, free again here.
         while let Some((tid, mask)) = self.pending_diag.pop_front() {
-            let counters = self.counters_response(mask);
+            let counters = self.counters_response(mask, port, platform);
             let response = DiagGetCountersRsp {
                 counters: List::new(&counters),
             };
@@ -833,6 +921,12 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 }
                 if platform.pta_supported() {
                     ncp_caps |= caps::PTA_COEX;
+                }
+                if port.energy_scan_supported() {
+                    ncp_caps |= caps::ENERGY_SCAN;
+                }
+                if platform.tx_power_step(0).is_some() {
+                    ncp_caps |= caps::TX_POWER;
                 }
                 *state.host_caps = request.host_caps;
                 let capacities = [
@@ -1119,7 +1213,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             ids::DIAG_RESET_COUNTERS => {
                 let request = decode!(DiagResetCounters);
                 crate::gp::reset_counters(request.group_mask);
-                *state.counters = QueueCounters::default();
+                state.counters.reset(request.group_mask);
+                port.reset_counters(request.group_mask);
+                platform.reset_counters(request.group_mask);
                 status_only(queues, Status::Success);
             }
             ids::NWK_INIT => {
@@ -1227,6 +1323,39 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 };
                 status_only(queues, status);
             }
+            ids::NWK_ENERGY_SCAN => {
+                let request = decode!(NwkEnergyScan);
+                let status = if !port.energy_scan_supported() {
+                    Status::UnsupportedCommand
+                } else {
+                    match crate::radio::EnergyScan::new(tid, &request) {
+                        Err(status) => status,
+                        Ok(_) if state.energy_scan.is_some() => Status::InProgress,
+                        // EVT_ENERGY_SCAN_RESULT follows from `drive`.
+                        Ok(scan) => {
+                            *state.energy_scan = Some(scan);
+                            Status::Success
+                        }
+                    }
+                };
+                status_only(queues, status);
+            }
+            ids::NWK_SET_TX_POWER => {
+                let request = decode!(NwkSetTxPower);
+                match platform.tx_power_step(request.dbm) {
+                    None => status_only(queues, Status::UnsupportedCommand),
+                    Some(dbm) => {
+                        if state
+                            .ops
+                            .push_back((Op::SetTxPower { tid, dbm }, now_us))
+                            .is_err()
+                        {
+                            status_only(queues, Status::Busy);
+                        }
+                        // Responded by `drive`.
+                    }
+                }
+            }
             ids::NWK_GROUP_MEMBERSHIP => {
                 let request = decode!(NwkGroupMembership);
                 let status = if !port.groups_supported() {
@@ -1257,7 +1386,11 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     nwk_manager: info.nwk_manager,
                     key_seq: info.key_seq,
                     security_level: 5,
-                    tx_power: info.tx_power,
+                    // Before NWK_INIT (state 1) unknown (Z11).
+                    tx_power: match (info.state, state.tx_power) {
+                        (NetworkState::FormedDown, _) | (_, None) => info.tx_power,
+                        (_, Some(dbm)) => platform.tx_power_step(dbm).unwrap_or(dbm),
+                    },
                     stack_profile: 2,
                 };
                 let _ = queues.response(tid, Status::Success, Some(&response));
@@ -1581,6 +1714,61 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
 
     // ── Outgoing events ─────────────────────────────────────────────
 
+    /// After `NWK_INIT`, `NWK_LEAVE_RESET` or a formation (`reapply`: it
+    /// succeeded and the host asked to keep the power), or a restore: program
+    /// the last `NWK_SET_TX_POWER` again, then read back what the radio
+    /// uses.
+    async fn restore_tx_power<C: CoordinatorPort>(&mut self, port: &mut C, reapply: bool) {
+        if let (true, Some(dbm)) = (reapply, self.tx_power_request) {
+            let _ = await_out_of_line!(port.set_tx_power(dbm));
+        }
+        self.tx_power = await_out_of_line!(port.tx_power());
+    }
+
+    /// `NWK_ENERGY_SCAN`: measure the next channel, or report the result.
+    /// `false`: this pass is left to the queued operations and the stack.
+    async fn step_energy_scan<C: CoordinatorPort, P: NcpPlatform>(
+        &mut self,
+        port: &mut C,
+        platform: &P,
+    ) -> bool {
+        let Some(scan) = self.energy_scan.as_mut() else {
+            return false;
+        };
+        if core::mem::replace(&mut scan.yielded, false) {
+            return false;
+        }
+        if let Some(channel) = scan.next_channel() {
+            let result = await_out_of_line!(port.energy_detect(channel, scan.duration_exp()));
+            if let Some(scan) = self.energy_scan.as_mut() {
+                scan.record(channel, result);
+                scan.yielded = true;
+            }
+            return true;
+        }
+        let (status, results) = scan.results(|energy| platform.energy_to_dbm(energy));
+        let event = EvtEnergyScanResult {
+            req_tid: scan.tid,
+            status: status.to_u8(),
+            results: List::new(&results),
+        };
+        if self.event(Endpoint::Zigbee, &event) {
+            self.energy_scan = None;
+        } else if let Some(scan) = self.energy_scan.as_mut() {
+            // Queue full: retry after the host drained it.
+            scan.yielded = true;
+        }
+        true
+    }
+
+    /// APS group: a completed data request and whether it failed.
+    fn count_aps_confirm(&mut self, zb_status: u8) {
+        QueueCounters::bump(&mut self.counters.aps[APS_TX]);
+        if zb_status != 0 {
+            QueueCounters::bump(&mut self.counters.aps[APS_TX_FAILED]);
+        }
+    }
+
     fn event<'a, T: zigbee_zrhp::codec::Wire<'a> + zigbee_zrhp::msg::MessageDef>(
         &mut self,
         _endpoint: Endpoint,
@@ -1856,6 +2044,13 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     capability,
                     decision,
                 } => {
+                    QueueCounters::bump(
+                        &mut self.counters.security[if decision == 0 {
+                            SEC_JOIN_ADMITTED
+                        } else {
+                            SEC_JOIN_DENIED
+                        }],
+                    );
                     self.event(
                         Endpoint::Zigbee,
                         &EvtDeviceJoined {
@@ -1874,6 +2069,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     flags,
                     reason,
                 } => {
+                    QueueCounters::bump(&mut self.counters.security[SEC_LEFT]);
                     self.event(
                         Endpoint::Zigbee,
                         &EvtDeviceLeft {
@@ -1890,6 +2086,13 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     result,
                     link_key_type,
                 } => {
+                    QueueCounters::bump(
+                        &mut self.counters.security[if result == 2 {
+                            SEC_AUTH_FAILED
+                        } else {
+                            SEC_AUTHORIZED
+                        }],
+                    );
                     self.event(
                         Endpoint::Zigbee,
                         &zigbee_zrhp::msg::network::EvtDeviceAuthorized {
@@ -1908,6 +2111,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 break;
             };
             let confirm = deferred.confirm;
+            self.count_aps_confirm(confirm.zb_status);
             let event = EvtApsDataConfirm {
                 req_tid: deferred.req_tid,
                 status: u8::from(confirm.zb_status != 0),
@@ -1963,6 +2167,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 rx_time_ms: indication.rx_time_ms,
                 asdu: Bytes16(&indication.asdu),
             };
+            QueueCounters::bump(&mut self.counters.aps[APS_RX]);
             self.event(Endpoint::Zigbee, &event);
         }
         // Green Power reports and events (spec 7.11).
@@ -2113,11 +2318,29 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     /// Answer `DIAG_GET_COUNTERS` (link group from the link, queue group
     /// from the NCP). Called from `dispatch` through `service` because the
     /// link is borrowed while frames are delivered.
-    fn counters_response(&self, group_mask: u8) -> Vec<Counter, 48> {
+    fn counters_response<C: CoordinatorPort, P: NcpPlatform>(
+        &self,
+        group_mask: u8,
+        port: &C,
+        platform: &P,
+    ) -> Vec<Counter, MAX_COUNTERS> {
         let mut out = Vec::new();
         if group_mask & 0x01 != 0 {
             for (id, value) in self.link.counters().entries() {
                 let _ = out.push(Counter { id, value });
+            }
+        }
+        platform.append_counters(group_mask, &mut out);
+        port.append_counters(group_mask, &mut out);
+        let groups = [
+            (0x08, 0x0401, &self.counters.aps[..]),
+            (0x10, 0x0501, &self.counters.security[..]),
+        ];
+        for (bit, first, values) in groups {
+            if group_mask & bit != 0 {
+                for (id, value) in (first..).zip(values) {
+                    let _ = out.push(Counter { id, value: *value });
+                }
             }
         }
         if group_mask & 0x40 != 0 {
@@ -2152,6 +2375,8 @@ struct DispatchState<'s> {
     counters: &'s mut QueueCounters,
     identity: &'s NcpIdentity,
     boot_us: u64,
+    energy_scan: &'s mut Option<crate::radio::EnergyScan>,
+    tx_power: Option<i8>,
 }
 
 fn next_seq(seqs: &mut [u16; Endpoint::COUNT], endpoint: Endpoint) -> u16 {
@@ -2277,6 +2502,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 pending_channel: _,
                 permit_join_seen: _,
                 permit_join_report: _,
+                energy_scan: _,
+                tx_power_request: _,
+                tx_power: _,
             } = ncp;
         };
         let reason = match identity.reset_reason {
@@ -2322,6 +2550,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             addr_of_mut!((*slot).pending_channel).write(None);
             addr_of_mut!((*slot).permit_join_seen).write(None);
             addr_of_mut!((*slot).permit_join_report).write(false);
+            addr_of_mut!((*slot).energy_scan).write(None);
+            addr_of_mut!((*slot).tx_power_request).write(None);
+            addr_of_mut!((*slot).tx_power).write(None);
             let ncp = &mut *slot;
             ncp.link.open(now_us, reason);
             ncp

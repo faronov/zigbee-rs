@@ -211,6 +211,7 @@ fn main() -> ! {
         &mut factory_ieee,
     );
     platform.set_factory_ieee(factory_ieee);
+    platform.attach_mac_counters(mac_counters);
     #[cfg(feature = "pta")]
     attach_pta(
         platform,
@@ -612,6 +613,21 @@ fn radio_stats(now_us: u64) {
             stats.tx_errors
         );
     }
+}
+
+/// `DIAG_GET_COUNTERS` MAC group (`product::radio::MacCounters` order).
+fn mac_counters() -> product::radio::MacCounters {
+    let stats = zigbee_mac::esp::parent_stats();
+    [
+        stats.raw_tx,
+        stats.acked_tx,
+        stats.tx_no_ack,
+        stats.tx_errors,
+        stats.tx_deferred,
+        stats.data_requests,
+        stats.frame_pending_acks,
+        esp_radio::ieee802154::tx_ack_recoveries(),
+    ]
 }
 
 /// Host UART counters once a minute when the receive side saw faults

@@ -35,6 +35,8 @@ use zigbee_runtime::settings_journal::SettingsStore;
 
 use crate::fw::{self, FwPolicy, FwUpdate};
 use crate::identity::{IdentityError, IdentityItem};
+use crate::radio::MacCounters;
+use ncp_coordinator_app::platform::{Counter, Counters};
 
 /// Spec 7.9 default trial window.
 pub const TRIAL_WINDOW_MS: u64 = 10 * 60 * 1_000;
@@ -90,6 +92,9 @@ pub struct Platform<F: OtaFlash, S: SettingsStore> {
     trial_deadline_ms: Option<u64>,
     factory_ieee: Option<[u8; 8]>,
     coex: Option<&'static mut dyn CoexControl>,
+    /// Free-running MAC counters of the radio backend and their values at
+    /// the last `DIAG_RESET_COUNTERS`.
+    mac_counters: Option<(fn() -> MacCounters, MacCounters)>,
 }
 
 impl<F: OtaFlash, S: SettingsStore> Platform<F, S> {
@@ -142,6 +147,7 @@ impl<F: OtaFlash, S: SettingsStore> Platform<F, S> {
                 trial_deadline_ms,
                 factory_ieee: None,
                 coex: None,
+                mac_counters: None,
             },
             outcome,
         )
@@ -162,6 +168,11 @@ impl<F: OtaFlash, S: SettingsStore> Platform<F, S> {
     /// The board's PTA lines (`PTA_COEX`).
     pub fn attach_coex(&mut self, coex: &'static mut dyn CoexControl) {
         self.coex = Some(coex);
+    }
+
+    /// The radio backend's MAC counters (`DIAG_GET_COUNTERS` MAC group).
+    pub fn attach_mac_counters(&mut self, read: fn() -> MacCounters) {
+        self.mac_counters = Some((read, [0; 8]));
     }
 
     /// Why the identity item could not be read at boot, if it could not.
@@ -279,6 +290,31 @@ impl<F: OtaFlash, S: SettingsStore> NcpPlatform for Platform<F, S> {
         match self.coex.as_mut() {
             Some(coex) => coex.set(enable, priority_mask),
             None => Err(PlatformError::Unsupported),
+        }
+    }
+
+    fn tx_power_step(&self, dbm: i8) -> Option<i8> {
+        Some(crate::radio::tx_power_step(dbm))
+    }
+
+    fn energy_to_dbm(&self, energy: u8) -> i8 {
+        crate::radio::energy_to_dbm(energy)
+    }
+
+    fn append_counters(&self, group_mask: u8, out: &mut Counters) {
+        if let (true, Some((read, base))) = (group_mask & 0x02 != 0, self.mac_counters) {
+            for ((id, now), base) in (0x0201..).zip(read()).zip(base) {
+                let _ = out.push(Counter {
+                    id,
+                    value: now.wrapping_sub(base),
+                });
+            }
+        }
+    }
+
+    fn reset_counters(&mut self, group_mask: u8) {
+        if let (true, Some((read, base))) = (group_mask & 0x02 != 0, self.mac_counters.as_mut()) {
+            *base = read();
         }
     }
 
