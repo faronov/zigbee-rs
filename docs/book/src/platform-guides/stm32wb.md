@@ -457,9 +457,10 @@ network on channel 15):
 - after a ZHA remove (Mgmt_Leave) it rejoined after the 300 s
   recommission delay: NWK key, Request-Key, TC link key, Verify-Key and
   Confirm-Key SUCCESS, and ZHA interviewed it again (Basic, Identify on
-  EP1). The first attempt's Request-Key went unanswered for 15 s while the
-  Trust Center was interviewing the node; the stack reported
-  `TrustCenterLinkKeyExchangeFailure` and the automatic retry succeeded;
+  EP1). The first attempt's Request-Key went unanswered for 15 s; the
+  stack reported `TrustCenterLinkKeyExchangeFailure` and the automatic
+  retry succeeded. The cause is not AES1 (see "Unanswered Request-Key
+  after an abandoned association" below);
 - after a system reset it resumed at the same address without a rescan
   and kept answering ZCL reads.
 
@@ -544,3 +545,60 @@ Also open:
   `Stm32wbMacStats`;
 - OTA;
 - runs longer than 30 minutes.
+
+### Unanswered Request-Key after an abandoned association
+
+On the ZHA network (EmberZNet Trust Center through bellows), a fresh join
+of the Nucleo-WB55 sometimes fails the unique-TCLK exchange: all three
+Request-Keys (5 s apart, BDB `bdbcTCLinkKeyExchangeTimeout`) go
+unanswered, the stack reports `TrustCenterLinkKeyExchangeFailure`, leaves
+and recommissions, and the next join normally succeeds. In 14 fresh joins
+that reached the exchange (7 with the AES1 image, 7 with a software-AES
+build of the same router) it failed 4 times, 1 with AES1 and 3 with
+software AES, so AES1 is not the cause. The sniffer decrypted every
+Request-Key with a valid MIC and saw the coordinator's neighbour relay
+each one towards the coordinator. The Transport-Key that should answer it
+never reached the last hop to the node. The node handles a received
+Transport-Key in 8-35 ms with both AES backends.
+
+Every failed exchange followed an abandoned association on the same join
+attempt:
+
+1. The node sends an Association Request to a TLSR8258 zigbee-rs router.
+   The router ACKs it and then ACKs the node's Data Request (Frame
+   Pending set) about 40-80 µs later than any other router on the
+   network. CPU2's MAC 1.24.0 does not accept these late ACKs. It
+   retransmits the Data Request three times and reports `NO_ACK`.
+2. The node gives up and associates with the next candidate. About 15 ms
+   later the TLSR router sends its Association Response anyway, keeps the
+   node as a child under a second short address, and sends Update-Device
+   to the Trust Center. The Trust Center sends the NWK key to that ghost
+   address.
+3. The Trust Center's route requests then show where it maps the node's
+   EUI-64. In the failed runs the node's real address appears without the
+   EUI-64 and the ghost address appears with it. In the successful runs
+   the real address appears with the EUI-64. The unique-TCLK
+   Transport-Key is addressed by EUI-64, so it follows the stale ghost
+   mapping and is lost.
+
+All 7 ghost-free joins had their first Request-Key answered within
+67-290 ms. Of the 7 joins that left a ghost:
+
+- 4 failed;
+- 1 lost only its first Request-Key;
+- 2 succeeded, because the Trust Center had already moved the EUI-64 to
+  the real address.
+
+Our retry policy stays as it is. BDB v3.0.1 already defines 3 attempts
+with 5 s timeouts. More Request-Keys do not help while the Trust Center
+holds the stale mapping, and the recommission after the failure already
+recovers. The fix belongs at the source:
+
+- the TLSR8258 software-ACK path should send the Data Request ACK at
+  aTurnaroundTime even when it has to look up Frame Pending, for example
+  by deciding Frame Pending before the frame ends;
+- possibly, a joiner should retry the same parent once after an ambiguous
+  association `NO_ACK`, so that the parent reuses the child entry instead
+  of leaving a ghost.
+
+Both changes need hardware validation and have not been made.
