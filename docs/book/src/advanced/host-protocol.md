@@ -1828,7 +1828,7 @@ itself has no GP fields.
   GP endpoint is a member of (the NCP sink's or the proxy's; there is no
   host group-membership command yet).
 - Counters (`DIAG_GET_COUNTERS` group bit 7, IDs `0x08xx`): `0x0801`–
-  `0x080D` sink drops by `SinkDrop` reason (duplicates `0x0807`, stale
+  `0x080E` sink drops by `SinkDrop` reason (duplicates `0x0807`, stale
   `0x0806`, unknown GPD `0x0803`), `0x0810` reports lost to a full queue,
   `0x0811` local proxy copies, `0x0812` frames handed to a host sink,
   `0x0813` `CONFLICT` refusals.
