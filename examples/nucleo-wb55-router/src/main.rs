@@ -85,9 +85,17 @@ async fn main(spawner: Spawner) {
         ),
     ];
 
+    let clk48 = stm32wb_router_app::claim_clk48(stm32wb_hal::clk48::Clk48Use::Rng);
     let transport = stm32wb_router_app::mac_started(
         spawner,
-        stm32wb_hal::mac::start(p.IPCC, Irqs, p.RNG, stm32wb_router_app::aes_engine()).await,
+        stm32wb_hal::mac::start(
+            p.IPCC,
+            Irqs,
+            p.RNG,
+            stm32wb_router_app::aes_engine(),
+            &clk48,
+        )
+        .await,
     );
     let (app, _settings) = router::compose(
         &CELLS,

@@ -72,7 +72,7 @@ pub fn usb(
 /// 64 MHz, LSE), the tree CPU2's radio requires, with the USB kernel clock
 /// (CLK48) from HSI48 trimmed by the CRS from the USB SOF packets, ST's
 /// recommended USB clock on STM32WB. The composition root must then claim
-/// CLK48 with `stm32wb_hal::clk48::claim_for_usb` before CPU2 boots
+/// CLK48 with `stm32wb_hal::clk48::claim(Clk48Use::Usb)` before CPU2 boots
 /// (AN5289 semaphore 5).
 pub fn rcc_config() -> rcc::Config {
     let mut config = rcc::Config::new_wpan();

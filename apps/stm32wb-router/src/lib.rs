@@ -48,6 +48,16 @@ pub fn aes_engine() -> AesEngine {
     })
 }
 
+/// Claim CLK48 (HSEM 5) for `usage` before CPU2 boots; halts with the
+/// reason on the log when the clock tree does not match. Pass the claim to
+/// [`stm32wb_hal::mac::start`].
+pub fn claim_clk48(usage: stm32wb_hal::clk48::Clk48Use) -> stm32wb_hal::clk48::Clk48Claim {
+    stm32wb_hal::clk48::claim(usage).unwrap_or_else(|error| {
+        ::log::error!("[WB] CLK48 unavailable: {error:?}");
+        platform::halt()
+    })
+}
+
 /// Hand back CPU2's started MAC transport after spawning its memory
 /// manager; halts (with the reason on the log) when the coprocessor did not
 /// come up. Call it on the result of [`stm32wb_hal::mac::start`].

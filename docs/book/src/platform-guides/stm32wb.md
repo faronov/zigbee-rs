@@ -181,13 +181,17 @@ CRS from the USB SOF packets, ST's recommended USB clock on STM32WB
 (`wb55_usb_dongle::rcc_config`). CLK48 is also the RNG kernel clock, which
 CPU2's wireless firmware uses, and AN5289 assigns hardware semaphore 5 to
 its configuration. Before CPU2 boots, the composition root calls
-`stm32wb_hal::clk48::claim_for_usb`, which takes semaphore 5 until reset
+`stm32wb_hal::clk48::claim(Clk48Use::Usb)`, which takes semaphore 5 until reset
 and refuses to continue unless HSI48 is ready, selected as CLK48 and
 trimmed by the CRS from USB. The first image ran USB from PLLQ without the
 semaphore and never enumerated: macOS reported "failed to address device"
 on every attempt. With HSI48 + CRS and the claim, the port enumerates
 (hardware, MB1293C, 2026-11-21). The Nucleo-WB55 and STM32WB5MM-DK log
-through the ST-LINK VCP and do not use USB.
+through the ST-LINK VCP and do not use USB, but CPU1's RNG runs on CLK48
+on every board: they claim it with `Clk48Use::Rng` (HSI48 ready and
+selected; no CRS), so CPU2 cannot switch HSI48 off under CPU1's RNG.
+`stm32wb_hal::mac::start` takes the claim as an argument, so no image can
+boot CPU2 without it.
 
 The router log prints a network summary 10 s after start and then every
 60 s: short address, PAN, channel, update id, active key sequence and the
