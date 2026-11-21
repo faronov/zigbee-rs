@@ -335,7 +335,7 @@ impl<F: OtaFlash, S: SettingsStore> NcpPlatform for Platform<F, S> {
                 (0x0221, coex.ack_rx_denied),
                 (0x0222, coex.ack_tx_denied),
             ] {
-                let _ = out.push(Counter { id, value });
+                sink(id, value);
             }
         }
     }

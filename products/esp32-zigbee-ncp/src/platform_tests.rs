@@ -275,7 +275,7 @@ fn factory_ieee_and_attached_pta_are_platform_services() {
 }
 
 fn mac_group<F: OtaFlash, S: SettingsStore>(platform: &Platform<F, S>) -> Vec<(u16, u32)> {
-    let mut out = Counters::new();
-    platform.append_counters(0x02, &mut out);
-    out.iter().map(|c| (c.id, c.value)).collect()
+    let mut out = Vec::new();
+    platform.visit_counters(0x02, &mut |id, value| out.push((id, value)));
+    out
 }

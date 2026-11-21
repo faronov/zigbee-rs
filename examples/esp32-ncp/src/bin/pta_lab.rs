@@ -25,6 +25,7 @@
 //! | C | on | 0x00 | pull-down (denied, if the S3 does not drive GPIO13) |
 //! | D | on | 0x08 | pull-up (all TX `High`) |
 //! | F | on | 0x08 | pull-down (all TX `High`, denied) |
+//! | H, I, J | on | 0x00, 0x08, 0x00 | up, up, down; tx_line pulled up (leader Wi-Fi TX) |
 //! | E | on | 0x00 | no pull (the S3 leader drives grant) |
 //! | R | refusals: mask 0x04 and 0x10 must be refused, state unchanged |
 //!
@@ -163,6 +164,23 @@ fn main() -> ! {
             mask::ALL,
             Pull::Down,
         );
+        // tx_line is the leader's Wi-Fi TX indication: pulled up, the
+        // "leader" transmits.
+        set_pull(TX_LINE, Pull::Up);
+        run("H on, grant pull-up, tx_line pull-up", true, 0, Pull::Up);
+        run(
+            "I on mask 0x08 (all High), grant pull-up, tx_line pull-up",
+            true,
+            mask::ALL,
+            Pull::Up,
+        );
+        run(
+            "J on, grant pull-down, tx_line pull-up",
+            true,
+            0,
+            Pull::Down,
+        );
+        set_pull(TX_LINE, Pull::None);
         run("E on, S3 drives grant", true, 0, Pull::None);
         refusals(&mut pta);
         let off = pta.set(false, 0);
