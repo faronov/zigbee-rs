@@ -449,6 +449,10 @@ jobs:
             manifest: products/cc26x2-dongle/Cargo.toml
             workspace: products/cc26x2-dongle
             features: "cc2652p7-dongle"
+          - name: CC26x2 dongle product (ZBDongle-P, Green Power)
+            manifest: products/cc26x2-dongle/Cargo.toml
+            workspace: products/cc26x2-dongle
+            features: "zbdongle-p,green-power"
           - name: CC26x2 NCP product (CC2652P7)
             manifest: products/cc26x2-ncp/Cargo.toml
             workspace: products/cc26x2-ncp
@@ -2798,25 +2802,47 @@ jobs:
         working-directory: examples/cc26x2-router
         run: |
           cargo build --release --locked
-          cargo build --release --locked --no-default-features --features cc2652p7-dongle --target-dir target/p7
+          cargo build --release --locked --no-default-features --features cc2652p7-dongle,info-log --target-dir target/p7
+      # Green Power Proxy Basic: the CC2652P image needs quiet logs and the
+      # immediate-abort `release-compact` profile to fit its 280 KiB window.
+      - name: Build CC26x2 Green Power router images
+        working-directory: examples/cc26x2-router
+        run: |
+          cargo build --profile release-compact --locked --no-default-features \
+            --features zbdongle-p,green-power,quiet-log --target-dir target/gp
+          cargo build --release --locked --no-default-features \
+            --features cc2652p7-dongle,info-log,green-power --target-dir target/p7gp
       - name: Clippy CC26x2 images
         working-directory: examples/cc26x2-router
         run: |
           cargo clippy --release --locked --target thumbv7em-none-eabihf -- -D warnings
           cargo clippy --release --locked --target thumbv7em-none-eabihf \
-            --no-default-features --features cc2652p7-dongle --target-dir target/p7 -- -D warnings
+            --no-default-features --features cc2652p7-dongle,info-log --target-dir target/p7 -- -D warnings
+          cargo clippy --profile release-compact --locked --target thumbv7em-none-eabihf \
+            --no-default-features --features zbdongle-p,green-power,quiet-log --target-dir target/gp -- -D warnings
       - name: Layout, CCFG and role-symbol gates
         run: |
           DIR=examples/cc26x2-router/target
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
+          GP="$DIR/gp/thumbv7em-none-eabihf/release-compact"
+          P7GP="$DIR/p7gp/thumbv7em-none-eabihf/release"
           for bin in cc26x2-router cc26x2-lab; do
             python3 examples/cc26x2-router/tools/verify-layout.py --chip cc2652p "$DIR/thumbv7em-none-eabihf/release/$bin"
             python3 examples/cc26x2-router/tools/verify-layout.py --chip cc2652p7 "$DIR/p7/thumbv7em-none-eabihf/release/$bin"
+            python3 examples/cc26x2-router/tools/verify-layout.py --chip cc2652p "$GP/$bin"
+            python3 examples/cc26x2-router/tools/verify-layout.py --chip cc2652p7 "$P7GP/$bin"
           done
-          NM="$NM" ./tools/check-role-symbols.sh parent "$DIR/thumbv7em-none-eabihf/release/cc26x2-router" "$DIR/p7/thumbv7em-none-eabihf/release/cc26x2-router"
+          NM="$NM" ./tools/check-role-symbols.sh parent "$DIR/thumbv7em-none-eabihf/release/cc26x2-router" "$DIR/p7/thumbv7em-none-eabihf/release/cc26x2-router" "$GP/cc26x2-router" "$P7GP/cc26x2-router"
+          # The GP images carry the proxy and its Proxy Table journal.
+          for ELF in "$GP/cc26x2-router" "$P7GP/cc26x2-router"; do
+            if ! "$NM" --demangle "$ELF" | grep -q 'GpProxyJournal'; then
+              echo "$ELF is missing the GP Proxy Table journal" >&2
+              exit 1
+            fi
+          done
           # NWK/APS AES runs on the CRYPTO engine; no software AES may link.
-          for ELF in "$DIR/thumbv7em-none-eabihf/release/cc26x2-router" "$DIR/p7/thumbv7em-none-eabihf/release/cc26x2-router"; do
+          for ELF in "$DIR/thumbv7em-none-eabihf/release/cc26x2-router" "$DIR/p7/thumbv7em-none-eabihf/release/cc26x2-router" "$GP/cc26x2-router" "$P7GP/cc26x2-router"; do
             SYMS="$("$NM" --demangle "$ELF")"
             if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
               echo "$ELF still links software AES" >&2
@@ -2827,7 +2853,7 @@ jobs:
               exit 1
             fi
           done
-          for variant in "zbdongle-p:$DIR/thumbv7em-none-eabihf/release" "cc2652p7:$DIR/p7/thumbv7em-none-eabihf/release"; do
+          for variant in "zbdongle-p:$DIR/thumbv7em-none-eabihf/release" "cc2652p7:$DIR/p7/thumbv7em-none-eabihf/release" "zbdongle-p-gp:$GP" "cc2652p7-gp:$P7GP"; do
             name=${variant%%:*}; path=${variant#*:}
             "$OBJCOPY" -O ihex "$path/cc26x2-router" "$DIR/cc26x2-router-$name.hex"
             ./tools/firmware-size-report.sh "cc26x2-router-$name" "$path/cc26x2-router" "$DIR/cc26x2-router-$name.size.json"

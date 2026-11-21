@@ -2762,6 +2762,34 @@ pub(crate) mod tests {
             assert_eq!(loaded.sink_len(), 0);
         }
     }
+
+    #[test]
+    fn foreign_bytes_in_both_sectors_are_erased_before_use() {
+        // A window that held the tail of a larger application image or a
+        // test pattern: nothing loads, and every sector is erased before
+        // the journal writes into it.
+        let mut flash = MockFlash::new();
+        for (i, byte) in flash.data.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(31) ^ 0x5A;
+        }
+        let mut journal = journal(flash);
+        assert!(load(&mut journal).is_none());
+        let first = capture(&[entry(7, 100)]);
+        journal.store(&first).unwrap();
+        assert_eq!(load(&mut journal).unwrap().payload(), first.payload());
+        // Roll over into the second (foreign) sector.
+        let slots = SECTOR / GP_PROXY_JOURNAL_SLOT_SIZE + 1;
+        for radius in 0..slots as u8 {
+            journal
+                .store(&capture(&[entry_radius(7, 200, radius)]))
+                .unwrap();
+        }
+        let last = capture(&[entry_radius(7, 200, slots as u8 - 1)]);
+        let flash = journal.into_storage();
+        assert!(flash.erases >= 2);
+        let mut reopened = GpProxyJournal::<_, SECTOR>::new(flash, 0, SECTOR as u32);
+        assert_eq!(load(&mut reopened).unwrap().payload(), last.payload());
+    }
 }
 
 #[cfg(feature = "green-power-translation-table")]

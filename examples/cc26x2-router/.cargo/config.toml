@@ -12,3 +12,14 @@ rustflags = [
 
 [unstable]
 build-std = ["core"]
+# Required by the `immediate-abort` panic strategy of `release-compact`.
+panic-immediate-abort = true
+
+# `release` with every panic site reduced to a single `udf` trap (no panic
+# message, `Location` or formatting machinery; ~11 KiB on the router). The
+# trap enters the `HardFault` handler, which logs the faulting PC (the panic
+# site, resolvable with the ELF) and halts like the panic handler does. Used
+# for the CC2652P Green Power image, which does not fit 280 KiB otherwise.
+[profile.release-compact]
+inherits = "release"
+panic = "immediate-abort"
