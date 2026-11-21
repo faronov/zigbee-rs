@@ -150,11 +150,13 @@ fn start() -> Started {
     log::set_max_level(log::LevelFilter::Info);
     cc26x2_hal::time_driver::init(rtc);
     let identity = Identity::read();
-    if trim.is_err()
-        || cc26x2_hal::setup::start_xosc_hf().is_err()
-        || cc26x2_hal::setup::wait_lf_clock(50_000_000).is_err()
-    {
+    if trim.is_err() || cc26x2_hal::setup::start_xosc_hf().is_err() {
         halt()
+    }
+    // XOSC_LF, or RCOSC_LF when the crystal does not qualify in time.
+    match cc26x2_hal::setup::start_lf_clock(cc26x2_hal::setup::XOSC_LF_TIMEOUT_MS) {
+        Ok(lf) => log::info!("LF clock {:?}", lf),
+        Err(_) => halt(),
     }
     let uart = host_uart
         .open(product::transport::UART_DEFAULT_BAUD)

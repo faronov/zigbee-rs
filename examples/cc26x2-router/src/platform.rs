@@ -99,7 +99,9 @@ pub fn start(banner: &str) -> Started {
         log::error!("[CC26X2] XOSC_HF start failed: {error:?}");
         halt()
     }
-    let lf = cc26x2_hal::setup::wait_lf_clock(50_000_000);
+    // One image for every dongle: XOSC_LF from the CCFG, RCOSC_LF when the
+    // crystal does not qualify in time (some ZBDongle-P V1.3 units).
+    let lf = cc26x2_hal::setup::start_lf_clock(cc26x2_hal::setup::XOSC_LF_TIMEOUT_MS);
     log::info!(
         "[CC26X2] {} on {} ({}, PG{} pkg {} {} KiB, PA20 {}), LF {:?}",
         banner,
@@ -111,6 +113,8 @@ pub fn start(banner: &str) -> Started {
         identity.high_pa,
         lf
     );
+    // The banner names the source (`RcOscFallback` when the crystal did
+    // not qualify in time) and the RCOSC_LF compensation.
     if lf.is_err() {
         halt()
     }
