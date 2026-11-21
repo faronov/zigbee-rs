@@ -35,7 +35,7 @@ key-file    = keys/own.xy.hex
 """
 
 KEY_XY = bytes(range(64))
-IDENTITY = ota.Identity(0x1234, 0x0022, 0x25010203)
+IDENTITY = ota.Identity(0x6D6B, 0x0022, 0x25010203)
 
 
 def layout(text: str = LAYOUT) -> ota.Layout:
@@ -157,15 +157,23 @@ class OtaFileTest(unittest.TestCase):
         header, parsed = bl702_ota.parse_ota_file(data)
         self.assertEqual(parsed, image)
         self.assertEqual((header.manufacturer, header.image_type, header.file_version),
-                         (0x1234, 0x0022, 0x25010203))
+                         (0x6D6B, 0x0022, 0x25010203))
         self.assertIn("image 1.2.3", ota.check(data, layout(), IDENTITY))
+
+    def test_transition_file_carries_the_legacy_code(self):
+        data = ota.ota_file(signed_image(), IDENTITY, header_manufacturer=0x1234)
+        header, _ = bl702_ota.parse_ota_file(data)
+        self.assertEqual((header.manufacturer, header.image_type), (0x1234, 0x0022))
+        self.assertIn("manufacturer 0x1234", ota.check(data, layout(), IDENTITY, 0x1234))
+        with self.assertRaisesRegex(ota.ToolError, "not the application's"):
+            ota.check(data, layout(), IDENTITY)
 
     def test_identity_mismatch_is_rejected(self):
         data = ota.ota_file(signed_image(), IDENTITY)
         with self.assertRaisesRegex(ota.ToolError, "not the application's"):
-            ota.check(data, layout(), ota.Identity(0x1234, 0x0702, IDENTITY.file_version))
+            ota.check(data, layout(), ota.Identity(0x6D6B, 0x0702, IDENTITY.file_version))
         with self.assertRaisesRegex(ota.ToolError, "file version"):
-            ota.check(data, layout(), ota.Identity(0x1234, 0x0022, 0x25010204))
+            ota.check(data, layout(), ota.Identity(0x6D6B, 0x0022, 0x25010204))
 
     def test_version_mismatch_is_rejected(self):
         data = ota.ota_file(signed_image(version=(1, 2, 4)), IDENTITY)

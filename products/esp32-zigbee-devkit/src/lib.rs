@@ -181,9 +181,13 @@ pub mod role {
 pub const RECOMMISSION_AFTER_LEAVE_MS: u64 = 5 * 60 * 1000;
 
 /// Manufacturer code advertised in `QueryNextImageRequest` and stamped into
-/// the OTA container by `tools/create-ota.py`. ZHA matches images on this
-/// pair, so the two must stay in sync.
-pub const OTA_MANUFACTURER_CODE: u16 = 0x1234;
+/// the OTA container by `tools/create-esp32-ota.py`. ZHA matches images on
+/// this pair, so the two must stay in sync. The zigbee-rs manufacturer code (D8 of the zigbee-rs hub; not a CSA
+/// assignment). Firmware before it used the placeholder `0x1234`: those
+/// devices take only OTA files whose header carries `0x1234`, so the first
+/// update to this firmware is packaged with `0x1234` (see the OTA tools'
+/// legacy-manufacturer option).
+pub const OTA_MANUFACTURER_CODE: u16 = 0x6D6B;
 /// OTA image type assigned to the selected chip.
 #[cfg(feature = "esp32c6")]
 pub const OTA_IMAGE_TYPE: u16 = 0x0001;

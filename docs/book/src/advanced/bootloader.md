@@ -582,7 +582,7 @@ from the EFR32 `gecko-recovery` option below.
   `router-core,zrs-boot` is the same router without it. The product module `boot` (`products/ha-connect-zbt1/src/
   boot.rs`) owns the flash split (a `StagingFlash` view below the GP
   journal: writes only to the secondary slot and the trial log), the loader
-  channel, the identity (`0x1234`/`0x2101`, file version `0x25MMmmpp`,
+  channel, the identity (`0x6D6B`/`0x2101`, file version `0x25MMmmpp`,
   ELF symbol `ZRS_OTA_IDENTITY`) and `TrialConfirm`. The router confirms
   once per boot when its status is `Online` **and** it has decrypted at
   least one NWK-secured frame. There is no Zigbee OTA client in this
@@ -759,7 +759,8 @@ product-specific:
   - Confirms through the writer: `SensorApp` calls `confirm_image` on
     the first APS-acknowledged report after the rejoin.
 - **`products/efr32mg22-sensor::ota`** (product).
-  - Identity: manufacturer `0x1234`, image type `0x0022`.
+  - Identity: manufacturer `0x6D6B`, image type `0x0022` (`0x1234` before
+    the [manufacturer code change](./ota.md#manufacturer-code-and-image-types)).
   - File version `0x25MMmmpp`, generated from the package version by
     `zrs-boot-layout::ReleaseVersion`. The TEST-ONLY
     `EFR32MG22_OTA_VERSION_OVERRIDE` marks the image `TEST-ONLY` in its
