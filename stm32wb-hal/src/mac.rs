@@ -152,7 +152,9 @@ pub enum StartError {
 /// used (typically from a dedicated Embassy task).
 ///
 /// The RNG is claimed before CPU2 boots, so its reset cannot disturb a
-/// running coprocessor.
+/// running coprocessor. `clk48` proves that CPU1 already holds the CLK48
+/// configuration (HSEM 5, [`crate::clk48::claim`]), so CPU2 cannot stop the
+/// RNG's kernel clock.
 ///
 /// `aes` becomes the transport's [`ForwardAesProvider`](zigbee_mac::ForwardAesProvider)
 /// backend for NWK/APS CCM* and AES-MMO. Its known-answer test runs first;
@@ -164,7 +166,9 @@ pub async fn start(
     + Binding<IPCC_C1_TX, TransmitInterruptHandler>,
     rng: Peri<'static, RNG>,
     mut aes: AesEngine,
+    clk48: &crate::clk48::Clk48Claim,
 ) -> Result<(WbTransport, MemoryManager<'static>), StartError> {
+    let _ = clk48.usage();
     if BUFFERS_TAKEN.swap(true, Ordering::AcqRel) {
         return Err(StartError::AlreadyStarted);
     }

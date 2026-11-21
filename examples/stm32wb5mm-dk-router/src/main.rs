@@ -89,6 +89,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(sensing::run(started.sensor_bus).unwrap_or_else(|_| wb_platform::halt()));
     #[cfg(feature = "mic")]
     spawner.spawn(sound::run(started.mic).unwrap_or_else(|_| wb_platform::halt()));
+    let clk48 = stm32wb_router_app::claim_clk48(stm32wb_hal::clk48::Clk48Use::Rng);
     let transport = stm32wb_router_app::mac_started(
         spawner,
         stm32wb_hal::mac::start(
@@ -96,6 +97,7 @@ async fn main(spawner: Spawner) {
             platform::Irqs,
             started.rng,
             stm32wb_router_app::aes_engine(),
+            &clk48,
         )
         .await,
     );

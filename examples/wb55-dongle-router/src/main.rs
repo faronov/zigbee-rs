@@ -69,10 +69,15 @@ async fn main(spawner: Spawner) {
     config.rcc = wb55_usb_dongle::rcc_config();
     let p = embassy_stm32::init(config);
 
+    // CLK48 (USB and RNG) stays CPU1's before CPU2 boots (HSEM 5).
+    #[cfg(feature = "usb-log")]
+    let clk48 =
+        stm32wb_hal::clk48::claim(stm32wb_hal::clk48::Clk48Use::Usb).unwrap_or_else(|_| halt());
+    #[cfg(not(feature = "usb-log"))]
+    let clk48 = stm32wb_router_app::claim_clk48(stm32wb_hal::clk48::Clk48Use::Rng);
+
     #[cfg(feature = "usb-log")]
     {
-        // USB runs on HSI48 + CRS; keep CPU2 off the CLK48 configuration.
-        stm32wb_hal::clk48::claim_for_usb().unwrap_or_else(|_| halt());
         let driver = wb55_usb_dongle::usb(p.USB, p.PA12, p.PA11, Irqs);
         let (device, class) = stm32wb_router_app::usb_log::build(
             driver,
@@ -109,7 +114,14 @@ async fn main(spawner: Spawner) {
 
     let transport = stm32wb_router_app::mac_started(
         spawner,
-        stm32wb_hal::mac::start(p.IPCC, Irqs, p.RNG, stm32wb_router_app::aes_engine()).await,
+        stm32wb_hal::mac::start(
+            p.IPCC,
+            Irqs,
+            p.RNG,
+            stm32wb_router_app::aes_engine(),
+            &clk48,
+        )
+        .await,
     );
     let (app, _settings) = router::compose(
         &CELLS,

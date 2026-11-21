@@ -12,10 +12,15 @@
 //! that runs USB therefore takes semaphore 5 before CPU2 boots and keeps it
 //! for as long as USB runs (for these images: until reset).
 //!
-//! [`claim_for_usb`] takes the semaphore (bounded) and checks the clock tree
-//! the board's RCC configuration set up: HSI48 ready, CLK48SEL = HSI48 and
-//! the CRS trimming from the USB SOF. Any mismatch is an error; the claim is
-//! never silently accepted.
+//! CPU1's RNG (`mac::start`, `fill_random`) uses CLK48 too, on every board:
+//! if CPU2 switched HSI48 off, CPU1's RNG would stop delivering. So every
+//! STM32WB image claims CLK48 before CPU2 boots, and `mac::start` takes the
+//! [`Clk48Claim`] as proof.
+//!
+//! [`claim`] takes the semaphore (bounded) and checks the clock tree the
+//! board's RCC configuration set up: HSI48 ready and CLK48SEL = HSI48, plus
+//! (for [`Clk48Use::Usb`]) the CRS trimming from the USB SOF. Any mismatch is
+//! an error; the claim is never silently accepted.
 
 #[cfg(feature = "_chip")]
 use embassy_stm32::pac;
@@ -41,11 +46,28 @@ pub enum Clk48Error {
     CrsNotSyncedToUsb,
 }
 
-/// Proof that CPU1 owns the CLK48 configuration for USB. It cannot be
-/// dropped: semaphore 5 stays taken until reset.
+/// Proof that CPU1 owns the CLK48 configuration. It cannot be dropped:
+/// semaphore 5 stays taken until reset.
 #[cfg(feature = "_chip")]
-pub struct Clk48UsbClaim {
-    _private: (),
+pub struct Clk48Claim {
+    usage: Clk48Use,
+}
+
+#[cfg(feature = "_chip")]
+impl Clk48Claim {
+    /// What the claim was validated for.
+    pub fn usage(&self) -> Clk48Use {
+        self.usage
+    }
+}
+
+/// What CPU1 runs on CLK48.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clk48Use {
+    /// The RNG only (boards that log through the ST-LINK VCP).
+    Rng,
+    /// USB and the RNG: HSI48 must also be trimmed by the CRS from USB.
+    Usb,
 }
 
 /// Snapshot of the registers [`check`] validates.
@@ -58,15 +80,15 @@ pub struct Clk48State {
     pub crs_sync_usb: bool,
 }
 
-/// Validate a CLK48 snapshot for USB use.
-pub fn check(state: &Clk48State) -> Result<(), Clk48Error> {
+/// Validate a CLK48 snapshot for `usage`.
+pub fn check(state: &Clk48State, usage: Clk48Use) -> Result<(), Clk48Error> {
     if !state.hsi48_ready {
         return Err(Clk48Error::Hsi48NotReady);
     }
     if !state.clk48_is_hsi48 {
         return Err(Clk48Error::NotHsi48);
     }
-    if !(state.crs_enabled && state.crs_autotrim && state.crs_sync_usb) {
+    if usage == Clk48Use::Usb && !(state.crs_enabled && state.crs_autotrim && state.crs_sync_usb) {
         return Err(Clk48Error::CrsNotSyncedToUsb);
     }
     Ok(())
@@ -84,18 +106,19 @@ fn read_state() -> Clk48State {
     }
 }
 
-/// Take semaphore 5 for good and check that CLK48 is HSI48 trimmed by the
-/// CRS from USB. Call after `embassy_stm32::init` and before CPU2 boots
-/// (`mac::start`). On error the semaphore is released again.
+/// Take semaphore 5 for good and check that CLK48 is HSI48 (trimmed by the
+/// CRS from USB for [`Clk48Use::Usb`]). Call after `embassy_stm32::init`
+/// and before CPU2 boots (`mac::start`). On error the semaphore is released
+/// again.
 #[cfg(feature = "_chip")]
-pub fn claim_for_usb() -> Result<Clk48UsbClaim, Clk48Error> {
+pub fn claim(usage: Clk48Use) -> Result<Clk48Claim, Clk48Error> {
     hsem::enable();
     let guard = hsem::Guard::acquire(hsem::CLK48_CONFIG, CLAIM_ATTEMPTS)
         .ok_or(Clk48Error::SemaphoreBusy)?;
-    check(&read_state())?;
-    // Keep semaphore 5 until reset: CPU2 must not touch CLK48 while USB runs.
+    check(&read_state(), usage)?;
+    // Keep semaphore 5 until reset: CPU2 must not change or stop CLK48.
     core::mem::forget(guard);
-    Ok(Clk48UsbClaim { _private: () })
+    Ok(Clk48Claim { usage })
 }
 
 #[cfg(test)]
@@ -112,23 +135,30 @@ mod tests {
 
     #[test]
     fn hsi48_with_crs_from_usb_is_accepted() {
-        assert_eq!(check(&GOOD), Ok(()));
+        assert_eq!(check(&GOOD, Clk48Use::Usb), Ok(()));
+        assert_eq!(check(&GOOD, Clk48Use::Rng), Ok(()));
     }
 
     #[test]
-    fn untrimmed_or_wrong_sources_are_rejected() {
+    fn untrimmed_or_wrong_sources_are_rejected_per_use() {
         assert_eq!(
-            check(&Clk48State {
-                hsi48_ready: false,
-                ..GOOD
-            }),
+            check(
+                &Clk48State {
+                    hsi48_ready: false,
+                    ..GOOD
+                },
+                Clk48Use::Rng,
+            ),
             Err(Clk48Error::Hsi48NotReady)
         );
         assert_eq!(
-            check(&Clk48State {
-                clk48_is_hsi48: false,
-                ..GOOD
-            }),
+            check(
+                &Clk48State {
+                    clk48_is_hsi48: false,
+                    ..GOOD
+                },
+                Clk48Use::Rng,
+            ),
             Err(Clk48Error::NotHsi48)
         );
         for state in [
@@ -145,7 +175,12 @@ mod tests {
                 ..GOOD
             },
         ] {
-            assert_eq!(check(&state), Err(Clk48Error::CrsNotSyncedToUsb));
+            assert_eq!(
+                check(&state, Clk48Use::Usb),
+                Err(Clk48Error::CrsNotSyncedToUsb)
+            );
+            // The RNG does not need the CRS (no USB SOF to trim from).
+            assert_eq!(check(&state, Clk48Use::Rng), Ok(()));
         }
     }
 }
