@@ -64,17 +64,19 @@ runs recorded in their platform guides.
 | TLSR8258 | AES-128 ECB | CPU only | ZHA |
 | BL702 (sensor, ED, router) | SEC_ENG AES | CPU only; the parent PHY delegates to the wrapped radio's engine | silicon KAT + secured ZHA join (sensor); silent reset/resume pending |
 | EFR32MG1 | CRYPTO | Gecko Bootloader may gate CRYPTO: clock restore re-runs the KAT | ZHA |
-| EFR32MG21 / ZBT-1 | Secure Engine (HSE) mailbox, `AES_ENCRYPT` ECB | mailbox shared with the Gecko Bootloader API (sequential only); a timed-out command disables the engine until reset | host, build |
+| EFR32MG21 / ZBT-1 | Secure Engine (HSE) mailbox, `AES_ENCRYPT` ECB | mailbox shared with the Gecko Bootloader API (sequential only); a timed-out command disables the engine until reset | **software AES on master**; engine on branch `aes-hw-efr32mg21` (host, build), waiting for a hardware run |
 | EFR32MG22 | CRYPTOACC (BA411E) with descriptor DMA | clocks shared with the CRYPTOACC TRNG through a holder count | ZHA |
-| EFR32MG24 | Secure Engine (HSE) mailbox | mailbox and disable flag shared with the SE TRNG | host, build |
-| STM32WB55 | AES1 (CPU1) | AES2 belongs to CPU2; AES1 has no HSEM and CPU2 never uses it (MAC requests are unsecured) | ZHA |
-| CC2340R5 | LAES | radio (LRF) does not use it; registers reloaded per block | host, build |
+| EFR32MG24 | Secure Engine (HSE) mailbox | mailbox and disable flag shared with the SE TRNG | branch `aes-hw-efr32mg24` (host, build) |
+| STM32WB55 | AES1 (CPU1) | AES2 belongs to CPU2; AES1 has no HSEM and CPU2 never uses it (MAC requests are unsecured) | ZHA (Nucleo-WB55); DK and dongle build |
+| CC2340R5 | LAES | radio (LRF) does not use it; registers reloaded per block | **software AES on master**; engine on branch `aes-hw-cc2340` (host, build), waiting for a hardware run |
 | CC26x2 / CC13x2 | CRYPTO | see the CC26x2 guide | see guide |
-| PHY6222 / PHY6252 | LL AES block, single (ECB) mode | BLE LL not used; clock gated per block; completion is a fixed cycle wait until the status bit is measured | host, build |
+| PHY6222 / PHY6252 | LL AES block, single (ECB) mode | BLE LL not used; clock gated per block; completion is a fixed cycle wait until the status bit is measured | **software AES on master**; engine on branch `aes-hw-phy62x2` (host, build), waiting for a hardware run |
 | Mock simulators | software | host only | — |
 
-No supported chip lacks a usable AES engine, so no production image keeps
-software AES.
+No supported chip lacks a usable AES engine. Images still marked
+*software AES on master* switch to their engine once the engine has passed a
+hardware run; until then their CI gates require the software core, so a
+half-wired image cannot slip through.
 
 ## CI symbol gates
 
