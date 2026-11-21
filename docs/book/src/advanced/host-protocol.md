@@ -1425,7 +1425,7 @@ Section 9 defines these commands.
 
 | ID | Name | Request payload | Response after `status` | Map |
 |---|---|---|---|---|
-| `0x0701` | `DIAG_GET_COUNTERS` | `u8 group_mask` (bit0 link, bit1 MAC, bit2 NWK, bit3 APS, bit4 security, bit5 tables, bit6 queues, bit7 Green Power) | `u8 n, n×{u16 id, u32 value}`: every counter of every requested group the NCP keeps (at most 64), groups in bit order; groups it does not keep are absent | E (the registry below) |
+| `0x0701` | `DIAG_GET_COUNTERS` | `u8 group_mask` (bit0 link, bit1 MAC, bit2 NWK, bit3 APS, bit4 security, bit5 tables, bit6 queues, bit7 Green Power) | `u8 n, n×{u16 id, u32 value}`: every counter of every requested group the NCP keeps (at most 100, 6 B each, so the response fits one frame), groups in bit order; groups it does not keep are absent | E (the registry below) |
 | `0x0702` | `DIAG_RESET_COUNTERS` | `u8 group_mask` | — (zeroes the counters of those groups only) | E |
 | `0x0703` | `DIAG_GET_NEIGHBORS` | `u8 start` | `u8 total, u8 n, n×{[8] ieee, u16 nwk, u8 type, u8 rx_on, u8 relationship, u8 lqi, u8 outgoing_cost, u8 age}` (Mgmt_Lqi codes: type 0 coordinator, 1 router, 2 end device; relationship 0 parent, 1 child, 2 sibling, 4 previous child, 5 unauthenticated child; up to 16 per page) | E |
 | `0x0704` | `DIAG_GET_ROUTES` | `u8 start` | `u8 total, u8 n, n×{u16 dst, u16 next_hop, u8 status, u8 flags}` (Mgmt_Rtg status codes; flags bit1 many-to-one, bit2 route record required) | E |

@@ -38,7 +38,7 @@ use zigbee_gp::{GP_CLUSTER_ID, GP_ENDPOINT, GP_PROFILE_ID};
 use zigbee_runtime::green_power::ncp::{self as rt, GpFrameReport, GpLocalFrame, GpNcpEvent};
 use zigbee_zrhp::codec::{Bytes8, Bytes16, CodecError, List, Reader, Wire, Writer};
 use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataIndication};
-use zigbee_zrhp::msg::diag::Counter;
+
 use zigbee_zrhp::msg::gp::{
     EvtGpCommissioned, EvtGpCommissioning, EvtGpCommissioningFailed, EvtGpDecommissioned,
     EvtGpFrame, GpProxyTableRead, GpSetSharedKey, GpSinkCommissioning, GpSinkConfig, GpSinkRemove,
@@ -841,16 +841,13 @@ pub fn local_indication(frame: &GpLocalFrame, ieee: [u8; 8]) -> EvtApsDataIndica
 /// by reason (1 Invalid … 13 QueueFull, duplicates are `0x0807`), `0x0810`
 /// reports lost, `0x0811` local proxy copies, `0x0812` frames handed to a
 /// host sink, `0x0813` host transmissions refused with `CONFLICT`.
-pub(crate) fn append_counters<const N: usize>(group_mask: u8, out: &mut Vec<Counter, N>) {
+pub(crate) fn visit_counters(group_mask: u8, sink: &mut dyn FnMut(u16, u32)) {
     if group_mask & DIAG_GROUP_GP == 0 {
         return;
     }
     let counters = rt::counters();
     for (index, value) in counters.sink_drops.iter().enumerate() {
-        let _ = out.push(Counter {
-            id: 0x0801 + index as u16,
-            value: *value,
-        });
+        sink(0x0801 + index as u16, *value);
     }
     for (id, value) in [
         (0x0810, counters.reports_dropped),
@@ -858,7 +855,7 @@ pub(crate) fn append_counters<const N: usize>(group_mask: u8, out: &mut Vec<Coun
         (0x0812, counters.host_sink_frames),
         (0x0813, counters.conflicts),
     ] {
-        let _ = out.push(Counter { id, value });
+        sink(id, value);
     }
 }
 
