@@ -71,6 +71,8 @@ async fn main(spawner: Spawner) {
 
     #[cfg(feature = "usb-log")]
     {
+        // USB runs on HSI48 + CRS; keep CPU2 off the CLK48 configuration.
+        stm32wb_hal::clk48::claim_for_usb().unwrap_or_else(|_| halt());
         let driver = wb55_usb_dongle::usb(p.USB, p.PA12, p.PA11, Irqs);
         let (device, class) = stm32wb_router_app::usb_log::build(
             driver,
