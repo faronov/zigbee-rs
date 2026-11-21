@@ -418,25 +418,32 @@ pub fn start_lf_clock(xosc_timeout_ms: u32) -> Result<LfClock, SetupError> {
 
 /// Count CPU cycles (DWT CYCCNT, XOSC_HF) over [`LF_MEASURE_CYCLES`]
 /// SCLK_LF periods, edge to edge (each period advances the RTC `SUBSEC`).
+/// `SUBSEC` is latched by a read of `SEC`, so every poll reads both; a poll
+/// takes a few AON bus cycles, far below the ~30.5 µs SCLK_LF period.
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 fn measure_lf() -> Option<(u32, i32)> {
     const DEMCR: u32 = 0xE000_EDFC;
     const DWT_CTRL: u32 = 0xE000_1000;
     const DWT_CYCCNT: u32 = 0xE000_1004;
+    const SEC: u32 = crate::mmio::AON_RTC_BASE + 0x08;
     const SUBSEC: u32 = crate::mmio::AON_RTC_BASE + 0x0C;
+    let read = || {
+        let _ = mmio::read(SEC);
+        mmio::read(SUBSEC)
+    };
     mmio::modify(DEMCR, 0, 1 << 24);
     mmio::modify(DWT_CTRL, 0, 1);
     let edge = |last: u32| -> Option<u32> {
         // Bounded: one SCLK_LF period is ~1500 CPU cycles.
         for _ in 0..100_000u32 {
-            let now = mmio::read(SUBSEC);
+            let now = read();
             if now != last {
                 return Some(now);
             }
         }
         None
     };
-    let mut value = edge(mmio::read(SUBSEC))?;
+    let mut value = edge(read())?;
     let start = mmio::read(DWT_CYCCNT);
     for _ in 0..LF_MEASURE_CYCLES {
         value = edge(value)?;
