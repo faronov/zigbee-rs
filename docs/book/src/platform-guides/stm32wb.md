@@ -181,13 +181,44 @@ CRS from the USB SOF packets, ST's recommended USB clock on STM32WB
 (`wb55_usb_dongle::rcc_config`). CLK48 is also the RNG kernel clock, which
 CPU2's wireless firmware uses, and AN5289 assigns hardware semaphore 5 to
 its configuration. Before CPU2 boots, the composition root calls
-`stm32wb_hal::clk48::claim_for_usb`, which takes semaphore 5 until reset
+`stm32wb_hal::clk48::claim(Clk48Use::Usb)`, which takes semaphore 5 until reset
 and refuses to continue unless HSI48 is ready, selected as CLK48 and
 trimmed by the CRS from USB. The first image ran USB from PLLQ without the
 semaphore and never enumerated: macOS reported "failed to address device"
 on every attempt. With HSI48 + CRS and the claim, the port enumerates
 (hardware, MB1293C, 2026-11-21). The Nucleo-WB55 and STM32WB5MM-DK log
-through the ST-LINK VCP and do not use USB.
+through the ST-LINK VCP and do not use USB, but CPU1's RNG runs on CLK48
+on every board: they claim it with `Clk48Use::Rng` (HSI48 ready and
+selected; no CRS), so CPU2 cannot switch HSI48 off under CPU1's RNG.
+`stm32wb_hal::mac::start` takes the claim as an argument, so no image can
+boot CPU2 without it.
+
+HSE crystal tuning. The 32 MHz HSE clocks the radio and, through the PLL,
+the system clock. Its load capacitance is on-chip (`RCC_HSECR.HSETUNE`,
+6 bits, reset value 0 = minimum capacitance), and ST stores the
+per-board value found at production in the OTP area: the newest 8-byte
+record with id 0 at `0x1FFF_7000..0x1FFF_7400` is `OTP_ID0_t
+{ bd_address[6], hse_tuning, id }` (STM32CubeWB `otp.c`, `OTP_Read`).
+Like ST's `Config_HSE()`, every composition root calls
+`stm32wb_hal::hse::apply_otp_tuning()` first thing in `main`, before
+`embassy_stm32::init` starts HSE, and logs the result once the logger
+runs (`[WB] HSE tuning 20 from OTP (was 0, reads 1/1)`). The register is
+key-protected (`0xCAFE_CAFE` unlocks one write); the HAL polls both the
+unlock and the read-back within a bound, because one Nucleo boot read the
+old value back right after the write. A missing record leaves the reset
+value (logged as a warning); an out-of-range newest record (> 63) or a
+write that never reads back is reported and not retried with an older
+record. The OTP search and the register sequence are host-tested against
+models (`stm32wb-hal/src/hse.rs`).
+
+How the effect was measured. The embassy time driver runs on TIM2 from
+the PLL, i.e. from HSE, and the router's 15 s Link Status grid counts
+whole seconds of that clock without accumulating loop latency. A linear
+fit of the Link Status timestamps against the 15 s grid therefore
+measures the HSE frequency against the capturing clock (residual jitter
+about 6 ms, ±1.1 ppm over 30 minutes). The nRF sniffer gives no carrier
+offset, so this timing method is the only one used; see the validation
+status for the result.
 
 The router log prints a network summary 10 s after start and then every
 60 s: short address, PAN, channel, update id, active key sequence and the
@@ -482,6 +513,28 @@ network on channel 15):
 
 The STM32WB5MM-DK and USB dongle images build with the same AES1 backend
 but have not been run on hardware with it.
+
+HSE tuning on the Nucleo-WB55 (2026-11-21):
+
+- the OTP holds one id-0 record (BD address 00:80:E1:05:13:55,
+  `hse_tuning` 20); `RCC_HSECR` read 0x30 (HSETUNE 0) under the old image
+  and after a reset, and 0x1430 (HSETUNE 20) after the new image booted;
+- the image logged `HSE tuning 20 from OTP (was 0, reads 1/1)` on four
+  boots, resumed at 0x97CC without a rescan and kept answering ZHA reads.
+  An earlier build that checked only one read-back logged a rejection on
+  one boot although a debugger then read HSETUNE 20; the HAL now polls;
+- Link Status timing over two 30-minute captures, against the host clock:
+  untuned −21.1 ± 1.2 ppm, tuned −1.5 ± 1.1 ppm (negative = the board's
+  15 s is short, i.e. its HSE runs fast), so the tuning lowered the HSE
+  frequency by 19.6 ppm. Against the sniffer's own crystal the values are
+  −15.5 and +4.4 ppm (same 19.9 ppm shift). An untouched router in the
+  same captures (the USB dongle, untuned) stayed at −35.4 and −35.8 ppm,
+  so the references were stable. The absolute value depends on the host
+  clock's accuracy, which was not checked; the shift does not.
+
+The USB dongle runs untuned firmware (it measured about 35 ppm fast); its
+OTP has not been read (no SWD; reading it needs a DFU session). The
+STM32WB5MM-DK image applies the same code but has not been run with it.
 
 Peripheral image (all features), on the same DK:
 

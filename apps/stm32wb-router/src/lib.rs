@@ -30,6 +30,7 @@ pub mod usb_log;
 use embassy_executor::Spawner;
 use stm32wb_hal::aes::AesEngine;
 use stm32wb_hal::embassy_stm32_wpan::sub::mm::MemoryManager;
+use stm32wb_hal::hse::{HseTuneError, HseTuning};
 use stm32wb_hal::mac::WbTransport;
 
 /// Returns mailbox buffers to CPU2; must run for the life of the MAC.
@@ -44,6 +45,44 @@ async fn run_memory_manager(mut memory_manager: MemoryManager<'static>) {
 pub fn aes_engine() -> AesEngine {
     AesEngine::take().unwrap_or_else(|error| {
         ::log::error!("[WB] AES1 unavailable: {error:?}");
+        platform::halt()
+    })
+}
+
+/// Log the outcome of [`stm32wb_hal::hse::apply_otp_tuning`], which the
+/// composition root runs before `embassy_stm32::init` (before the logger
+/// exists). A missing or rejected OTP value is not fatal: HSE then keeps
+/// its reset load capacitance, as before the tuning was applied.
+pub fn log_hse_tuning(tuning: &Result<HseTuning, HseTuneError>) {
+    match tuning {
+        Ok(HseTuning::Applied {
+            tuning,
+            previous,
+            hse_was_running,
+            unlock_reads,
+            verify_reads,
+        }) => ::log::info!(
+            "[WB] HSE tuning {tuning} from OTP (was {previous}, reads {unlock_reads}/{verify_reads}{})",
+            if *hse_was_running { ", HSE on" } else { "" }
+        ),
+        Ok(HseTuning::NoOtpRecord { current }) => {
+            ::log::warn!("[WB] no OTP HSE tuning; HSETUNE {current}")
+        }
+        Err(HseTuneError::OutOfRange { offset, value }) => {
+            ::log::warn!("[WB] OTP HSE tuning {value} at +{offset} invalid")
+        }
+        Err(HseTuneError::WriteRejected { wanted, read_back }) => {
+            ::log::warn!("[WB] HSECR rejected tuning {wanted} (reads {read_back})")
+        }
+    }
+}
+
+/// Claim CLK48 (HSEM 5) for `usage` before CPU2 boots; halts with the
+/// reason on the log when the clock tree does not match. Pass the claim to
+/// [`stm32wb_hal::mac::start`].
+pub fn claim_clk48(usage: stm32wb_hal::clk48::Clk48Use) -> stm32wb_hal::clk48::Clk48Claim {
+    stm32wb_hal::clk48::claim(usage).unwrap_or_else(|error| {
+        ::log::error!("[WB] CLK48 unavailable: {error:?}");
         platform::halt()
     })
 }

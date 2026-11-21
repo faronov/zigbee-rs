@@ -94,6 +94,12 @@ pub fn button_sw3(pin: Peri<'static, peripherals::PD1>) -> Input<'static> {
 /// 64 MHz, LSE), the tree CPU2's radio requires.
 ///
 /// [`rcc::Config::new_wpan`]: stm32wb_hal::embassy_stm32::rcc::Config::new_wpan
+///
+/// CLK48 (the RNG kernel clock, shared with CPU2) is HSI48; the composition
+/// root claims it with `stm32wb_hal::clk48::claim` before CPU2 boots.
 pub fn rcc_config() -> stm32wb_hal::embassy_stm32::rcc::Config {
-    stm32wb_hal::embassy_stm32::rcc::Config::new_wpan()
+    use stm32wb_hal::embassy_stm32::rcc;
+    let mut config = rcc::Config::new_wpan();
+    config.mux.clk48sel = rcc::mux::Clk48sel::Hsi48;
+    config
 }

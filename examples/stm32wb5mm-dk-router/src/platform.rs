@@ -34,6 +34,8 @@ pub struct Started {
 /// the radio wake-up timer (plus the SAI1 clock with `mic`), and the VCOM
 /// log.
 pub fn start(spawner: Spawner, model: &str) -> Started {
+    // Factory HSE tuning before the clock tree starts HSE.
+    let hse = stm32wb_hal::hse::apply_otp_tuning();
     let mut config = embassy_stm32::Config::default();
     config.rcc = stm32wb5mm_dk::rcc_config();
     let p = embassy_stm32::init(config);
@@ -42,6 +44,7 @@ pub fn start(spawner: Spawner, model: &str) -> Started {
     stm32wb_router_app::log::init();
     spawner.spawn(drain_log(vcom).unwrap_or_else(|_| halt()));
     log::info!("[WB] {model} on STM32WB5MM-DK");
+    stm32wb_router_app::log_hse_tuning(&hse);
 
     Started {
         ipcc: p.IPCC,

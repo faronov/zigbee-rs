@@ -49,6 +49,8 @@ async fn status_leds(leds: StatusLeds) {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // Factory HSE tuning before the clock tree starts HSE.
+    let hse = stm32wb_hal::hse::apply_otp_tuning();
     let mut config = embassy_stm32::Config::default();
     config.rcc = nucleo_wb55::rcc_config();
     let p = embassy_stm32::init(config);
@@ -57,6 +59,7 @@ async fn main(spawner: Spawner) {
     stm32wb_router_app::log::init();
     spawner.spawn(drain_log(vcom).unwrap_or_else(|_| halt()));
     log::info!("[WB] {} on Nucleo-WB55", product::ROUTER_MODEL);
+    stm32wb_router_app::log_hse_tuning(&hse);
 
     spawner.spawn(
         status_leds(StatusLeds {
@@ -85,9 +88,17 @@ async fn main(spawner: Spawner) {
         ),
     ];
 
+    let clk48 = stm32wb_router_app::claim_clk48(stm32wb_hal::clk48::Clk48Use::Rng);
     let transport = stm32wb_router_app::mac_started(
         spawner,
-        stm32wb_hal::mac::start(p.IPCC, Irqs, p.RNG, stm32wb_router_app::aes_engine()).await,
+        stm32wb_hal::mac::start(
+            p.IPCC,
+            Irqs,
+            p.RNG,
+            stm32wb_router_app::aes_engine(),
+            &clk48,
+        )
+        .await,
     );
     let (app, _settings) = router::compose(
         &CELLS,

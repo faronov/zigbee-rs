@@ -89,9 +89,12 @@ pub fn button_b2(pin: Peri<'static, peripherals::PC13>) -> Input<'static> {
 /// microphone is enabled.
 ///
 /// [`rcc::Config::new_wpan`]: stm32wb_hal::embassy_stm32::rcc::Config::new_wpan
+///
+/// CLK48 (the RNG kernel clock, shared with CPU2) is HSI48; the composition
+/// root claims it with `stm32wb_hal::clk48::claim` before CPU2 boots.
 pub fn rcc_config() -> stm32wb_hal::embassy_stm32::rcc::Config {
-    #[allow(unused_mut)]
     let mut rcc = stm32wb_hal::embassy_stm32::rcc::Config::new_wpan();
+    rcc.mux.clk48sel = stm32wb_hal::embassy_stm32::rcc::mux::Clk48sel::Hsi48;
     #[cfg(feature = "mic")]
     {
         rcc.mux.sai1sel = stm32wb_hal::embassy_stm32::pac::rcc::vals::Sai1sel::Pll1P;
