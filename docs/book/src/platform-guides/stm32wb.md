@@ -176,6 +176,23 @@ On the dongle, the log enumerates as `1209:0001`, the pid.codes test
 VID/PID pair. The manufacturer string is "Zigbee-RS", the product string
 is the model identifier, and the serial number is the EUI-64.
 
+USB clock. The dongle's USB kernel clock (CLK48) is HSI48 trimmed by the
+CRS from the USB SOF packets, ST's recommended USB clock on STM32WB
+(`wb55_usb_dongle::rcc_config`). CLK48 is also the RNG kernel clock, which
+CPU2's wireless firmware uses, and AN5289 assigns hardware semaphore 5 to
+its configuration. Before CPU2 boots, the composition root calls
+`stm32wb_hal::clk48::claim_for_usb`, which takes semaphore 5 until reset
+and refuses to continue unless HSI48 is ready, selected as CLK48 and
+trimmed by the CRS from USB. The first image ran USB from PLLQ without the
+semaphore and never enumerated: macOS reported "failed to address device"
+on every attempt. With HSI48 + CRS and the claim, the port enumerates
+(hardware, MB1293C, 2026-11-21). The Nucleo-WB55 and STM32WB5MM-DK log
+through the ST-LINK VCP and do not use USB.
+
+The router log prints a network summary 10 s after start and then every
+60 s: short address, PAN, channel, update id, active key sequence and the
+NWK outgoing frame counter with its durable reservation limit.
+
 | Button | Short press | Hold 3 s |
 |---|---|---|
 | SW1 (both) | factory-new: start commissioning; joined: open this router for joining for 180 s | journal-aware factory reset |

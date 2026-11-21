@@ -26,6 +26,9 @@ pub mod word_flash;
 #[cfg(any(feature = "_chip", test))]
 pub mod aes;
 
+#[cfg(any(feature = "_chip", test))]
+pub mod clk48;
+
 #[cfg(feature = "_chip")]
 pub mod flash;
 #[cfg(feature = "_chip")]

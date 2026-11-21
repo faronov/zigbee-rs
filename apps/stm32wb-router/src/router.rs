@@ -47,6 +47,8 @@ pub type App<P> = ParentRouterApp<
 pub const ARCHETYPE: NodeArchetype = NodeArchetype::ParentRouter;
 /// Period of the neighbour/child/coprocessor summary on the log.
 pub const SUMMARY_PERIOD: Duration = Duration::from_secs(60);
+/// Delay of the first summary after start.
+pub const FIRST_SUMMARY_DELAY: Duration = Duration::from_secs(10);
 
 /// Basic-cluster identity of a product.
 pub struct Identity {
@@ -251,6 +253,17 @@ pub fn permit_join_open<P: ApplicationProfile>(app: &App<P>) -> bool {
 #[inline(never)]
 pub fn log_summary<P: ApplicationProfile>(app: &App<P>) {
     let nwk = app.node().device().bdb().zdo().nwk();
+    let nib = nwk.nib();
+    log::info!(
+        "[WB] nwk addr 0x{:04X} pan 0x{:04X} ch {} upd {} key {} fc {}/{}",
+        nib.network_address.0,
+        nib.pan_id.0,
+        nib.logical_channel,
+        nib.update_id,
+        nib.active_key_seq_number,
+        nib.outgoing_frame_counter,
+        nib.outgoing_frame_counter_limit,
+    );
     let neighbors = nwk.neighbor_table();
     log::info!(
         "[WB] neighbours {} children {} routes {} logdrop {}",
@@ -336,7 +349,8 @@ pub async fn run<P: ApplicationProfile>(app: &mut App<P>, buttons: &mut [Button]
         platform::fatal(app.parts_mut(), ARCHETYPE, error);
     }
     let mut awaiting_since: Option<Instant> = None;
-    let mut next_summary = Instant::now() + SUMMARY_PERIOD;
+    // The first summary comes early so a fresh log shows the network state.
+    let mut next_summary = Instant::now() + FIRST_SUMMARY_DELAY;
     let mut step_errors = platform::StepErrors::new();
     loop {
         let now_ms = Instant::now().as_millis();

@@ -7,6 +7,8 @@ use embassy_stm32::pac;
 
 /// RNG ownership (CPU1 and CPU2 both draw from the one RNG).
 pub const RNG: u8 = 0;
+/// CLK48 (USB/RNG kernel clock) configuration, `CFG_HW_CLK48_CONFIG_SEMID`.
+pub const CLK48_CONFIG: u8 = 5;
 /// Flash controller ownership for program and erase.
 pub const FLASH: u8 = 2;
 /// Held by CPU2 while it must not be disturbed by a CPU1 flash operation;
