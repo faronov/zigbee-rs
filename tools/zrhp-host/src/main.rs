@@ -1523,6 +1523,30 @@ fn main() {
             }
             checks::install_code(&mut host, ieee)?;
         }
+        if let Some(spec) = value("--energy-scan") {
+            // 0xMASK[,EXP[,COUNT]]
+            let parts: Vec<&str> = spec.split(',').collect();
+            let mask = u32::from_str_radix(parts[0].trim_start_matches("0x"), 16)
+                .map_err(|_| "--energy-scan 0xMASK[,EXP[,COUNT]]")?;
+            let exp = parts
+                .get(1)
+                .map_or(Ok(4), |v| v.parse())
+                .map_err(|_| "EXP")?;
+            let count = parts
+                .get(2)
+                .map_or(Ok(1), |v| v.parse())
+                .map_err(|_| "COUNT")?;
+            checks::energy_scan(&mut host, mask, exp, count)?;
+        }
+        if let Some(dbm) = value("--tx-power") {
+            let dbm = dbm.parse().map_err(|_| "--tx-power DBM")?;
+            checks::tx_power(&mut host, dbm)?;
+        }
+        if let Some(mask) = value("--counters") {
+            let mask = u8::from_str_radix(mask.trim_start_matches("0x"), 16)
+                .map_err(|_| "--counters 0xMASK")?;
+            checks::counters(&mut host, mask)?;
+        }
         if let Some(channel) = value("--change-channel") {
             let channel = channel.parse().map_err(|_| "--change-channel CH")?;
             checks::change_channel(&mut host, channel)?;

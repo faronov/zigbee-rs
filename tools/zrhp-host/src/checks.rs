@@ -7,8 +7,12 @@ use zigbee_zrhp::msg::diag::{
     DiagGetChildren, DiagGetChildrenRsp, DiagGetNeighbors, DiagGetNeighborsRsp, DiagGetRoutes,
     DiagGetRoutesRsp,
 };
+use zigbee_zrhp::msg::diag::{DiagGetCounters, DiagGetCountersRsp};
 use zigbee_zrhp::msg::ids;
-use zigbee_zrhp::msg::network::{EvtChannelChanged, NwkChangeChannel, NwkGroupMembership};
+use zigbee_zrhp::msg::network::{
+    EvtChannelChanged, EvtEnergyScanResult, NwkChangeChannel, NwkEnergyScan, NwkGetInfoRsp,
+    NwkGroupMembership, NwkSetTxPower, NwkSetTxPowerRsp,
+};
 use zigbee_zrhp::msg::security::{SecAddInstallCode, SecAddInstallCodeRsp};
 use zigbee_zrhp::msg::system::{EvtNcpReady, SysEcho, SysReset};
 use zigbee_zrhp::types::Ieee;
@@ -251,4 +255,77 @@ pub fn identify<S: ByteStream>(
         println!("-> Identify Query");
     }
     watch(host, secs.saturating_sub(15))
+}
+
+/// `NWK_ENERGY_SCAN` of `channel_mask`, then its `EVT_ENERGY_SCAN_RESULT`.
+pub fn energy_scan<S: ByteStream>(
+    host: &mut Host<S>,
+    channel_mask: u32,
+    duration_exp: u8,
+    count: u8,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let tid = host.request(&NwkEnergyScan {
+        channel_mask,
+        duration_exp,
+        count,
+    });
+    let rsp = host.response(tid)?;
+    println!(
+        "NWK_ENERGY_SCAN 0x{channel_mask:08X} exp {duration_exp} x{count}: {:?} after {:?}",
+        rsp.status(),
+        started.elapsed()
+    );
+    if !rsp.status().is_success() {
+        return Err("energy scan refused".into());
+    }
+    let event = host.event(ids::EVT_ENERGY_SCAN_RESULT, Duration::from_secs(70))?;
+    let event: EvtEnergyScanResult = event.raw().decode().map_err(|e| format!("{e:?}"))?;
+    println!(
+        "EVT_ENERGY_SCAN_RESULT: req_tid {} status {} after {:?}",
+        event.req_tid,
+        event.status,
+        started.elapsed()
+    );
+    for r in event.results.iter() {
+        println!(
+            "  channel {:2}: energy {:3} max_rssi {:4} dBm",
+            r.channel, r.energy, r.max_rssi_dbm
+        );
+    }
+    if event.req_tid != tid || event.status != 0 {
+        return Err("energy scan failed".into());
+    }
+    Ok(())
+}
+
+/// `NWK_SET_TX_POWER{dbm}`, then `NWK_GET_INFO.tx_power`.
+pub fn tx_power<S: ByteStream>(host: &mut Host<S>, dbm: i8) -> Result<(), String> {
+    let tid = host.request(&NwkSetTxPower { dbm });
+    let rsp = host.response(tid)?;
+    let applied: NwkSetTxPowerRsp = body(&rsp)?;
+    println!(
+        "NWK_SET_TX_POWER {dbm}: applied {} dBm",
+        applied.applied_dbm
+    );
+    let tid = host.request_raw(ids::NWK_GET_INFO, &[]);
+    let rsp = host.response(tid)?;
+    let info: NwkGetInfoRsp = body(&rsp)?;
+    println!("NWK_GET_INFO: tx_power {} dBm", info.tx_power);
+    if info.tx_power != applied.applied_dbm {
+        return Err("NWK_GET_INFO does not report the applied power".into());
+    }
+    Ok(())
+}
+
+/// `DIAG_GET_COUNTERS{group_mask}`.
+pub fn counters<S: ByteStream>(host: &mut Host<S>, group_mask: u8) -> Result<(), String> {
+    let tid = host.request(&DiagGetCounters { group_mask });
+    let rsp = host.response(tid)?;
+    let counters: DiagGetCountersRsp = body(&rsp)?;
+    println!("DIAG_GET_COUNTERS 0x{group_mask:02X}:");
+    for c in counters.counters.iter() {
+        println!("  0x{:04X} = {}", c.id, c.value);
+    }
+    Ok(())
 }
