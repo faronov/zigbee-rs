@@ -30,7 +30,7 @@ use sensor_sed_app::{
     SensorSedParts, SleepDepth, Supervisor, WaitRequest, WakeController, WakeReason,
 };
 use static_cell::StaticCell;
-use zigbee_mac::efr32s2::{Efr32s2RadioPhy, Efr32s2SoftMac};
+use zigbee_mac::efr32s2::Efr32s2SoftMac;
 use zigbee_runtime::{ZigbeeDevice, node::ZigbeeNode, profile::ApplicationProfile};
 use zigbee_types::ChannelMask;
 use zigbee_zcl::clusters::basic::PowerSource;
@@ -57,7 +57,9 @@ async fn main(_spawner: Spawner) {
     // Representative EM2 current unless the lab feature asks for SWD/RTT
     // access while asleep.
     power::set_em2_debug(cfg!(feature = "em2-debug"));
-    compose(started.radio, started.flash).run().await
+    compose(started.radio, started.crypto, started.flash)
+        .run()
+        .await
 }
 
 /// Build MAC, device, store and app into static storage. Not inlined, so
@@ -65,15 +67,15 @@ async fn main(_spawner: Spawner) {
 #[inline(never)]
 fn compose(
     radio: efr32s2_hal::radio::RadioToken,
+    crypto: efr32s2_hal::crypto::Crypto,
     flash: efr32s2_hal::flash::Efr32s2Flash,
 ) -> &'static mut App {
-    let mac: Mac = Efr32s2RadioPhy::new(radio)
-        .map_err(|error| log::error!("[ZBT1] radio init failed: {error:?}"))
-        .and_then(|phy| {
-            phy.into_soft_mac()
-                .map_err(|error| log::error!("[ZBT1] MAC init failed: {error:?}"))
-        })
-        .unwrap_or_else(|()| halt());
+    let mac: Mac = platform::radio_with_aes(radio, crypto)
+        .into_soft_mac()
+        .unwrap_or_else(|error| {
+            log::error!("[ZBT1] MAC init failed: {error:?}");
+            halt()
+        });
     let ieee = mac.pib().extended_address();
     platform::check_ieee(ieee);
 

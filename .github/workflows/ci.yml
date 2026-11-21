@@ -2681,8 +2681,19 @@ jobs:
             "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
             ./tools/firmware-size-report.sh "$image" "${ELF}.bin" "${ELF}.size.json"
             python3 examples/efr32mg21-sensor/tools/verify-layout.py "$ELF"
-            if ! "$NM" --demangle "$ELF" | grep -Eq 'SoftwareAes128|aes::soft'; then
-              echo "$image is missing its currently supported software AES backend" >&2
+          done
+          # Every image, including the loader-linked roles, encrypts on the
+          # Secure Engine mailbox only; the RustCrypto core must be absent.
+          for ELF in "$DIR/efr32mg21-sensor" "$DIR/efr32mg21-ed" "$DIR/efr32mg21-router" \
+              examples/efr32mg21-sensor/target/zrs-boot/thumbv8m.main-none-eabihf/release/efr32mg21-sensor \
+              examples/efr32mg21-sensor/target/zrs-boot/thumbv8m.main-none-eabihf/release/efr32mg21-ed; do
+            SYMS="$("$NM" --demangle "$ELF")"
+            if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
+              echo "$ELF still links software AES" >&2
+              exit 1
+            fi
+            if ! grep -q 'efr32s2_hal::crypto::se::SE_DMA' <<<"$SYMS"; then
+              echo "$ELF is missing the Secure Engine AES backend" >&2
               exit 1
             fi
           done
@@ -2788,6 +2799,20 @@ jobs:
             "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
             ./tools/firmware-size-report.sh "$image" "${ELF}.bin" "${ELF}.size.json"
             python3 examples/ha-connect-zbt1/tools/verify-layout.py "$ELF"
+          done
+          # Every role, including the loader-linked router, encrypts on the
+          # Secure Engine mailbox only; the RustCrypto core must be absent.
+          for ELF in "$DIR/ha-connect-zbt1-ed" "$DIR/ha-connect-zbt1-router" "$DIR/ha-connect-zbt1-sed" \
+              examples/ha-connect-zbt1/target/zrs-boot/thumbv8m.main-none-eabihf/release/ha-connect-zbt1-router; do
+            SYMS="$("$NM" --demangle "$ELF")"
+            if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
+              echo "$ELF still links software AES" >&2
+              exit 1
+            fi
+            if ! grep -q 'efr32s2_hal::crypto::se::SE_DMA' <<<"$SYMS"; then
+              echo "$ELF is missing the Secure Engine AES backend" >&2
+              exit 1
+            fi
           done
           # Leaf images must compile out the parent MAC and router lifecycle;
           # the router is the positive control for the symbol pattern.

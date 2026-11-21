@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use efr32s2_hal::{
     clock::ClockControl,
+    crypto::Crypto,
     gpio::{Disabled, Level, Pin, Pull},
     peripherals::Peripherals,
     radio::RadioToken,
@@ -31,6 +32,9 @@ pub struct BoardResources {
     /// Raw, exclusive internal-flash controller. Product code bounds it to
     /// its selected partitions before using it for persistence.
     pub flash: Efr32s2Flash,
+    /// On-chip AES-128 engine (`efr32s2_hal::crypto`). The product installs
+    /// it as the MAC's only AES provider.
+    pub crypto: Crypto,
 }
 
 impl BoardResources {
@@ -74,6 +78,7 @@ impl BoardResources {
             radio: peripherals.radio,
             rtcc: peripherals.rtcc,
             flash: peripherals.flash,
+            crypto: peripherals.crypto,
         })
     }
 }
