@@ -1801,6 +1801,14 @@ jobs:
             echo "::error::esp-println is linked into the NCP image"
             exit 1
           fi
+          # Trust Center AES-MMO (Verify-Key, install codes) and all CCM*
+          # must run on the ESP AES engine: no software AES core.
+          SYMS="$("$NM" --demangle "$ELF")"
+          if grep -Eq 'aes::soft|SoftwareAes128|SoftwareAesProvider' <<<"$SYMS" ||
+            ! grep -Eq 'EspHardwareAes128|EspAesEngine' <<<"$SYMS"; then
+            echo "::error::the NCP image does not use the hardware AES backend alone"
+            exit 1
+          fi
           "$NM" -S --size-sort -C "$ELF" | tail -n 12
           # Static stack budget (boot composition, executor, Trust Center
           # chains and nested interrupts) against the RAM left above .bss.

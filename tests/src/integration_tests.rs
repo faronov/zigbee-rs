@@ -68,7 +68,13 @@ fn test_tc_join_acceptance() {
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
         0x88, 0xD4, 0x90,
     ];
-    let key = tc.provision_install_code(dev, &install_code).unwrap();
+    let key = tc
+        .provision_install_code(
+            &mut zigbee::crypto::SoftwareAesProvider::new(),
+            dev,
+            &install_code,
+        )
+        .unwrap();
     assert_eq!(
         key,
         [
