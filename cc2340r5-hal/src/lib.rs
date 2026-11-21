@@ -3,7 +3,8 @@
 //! This crate owns everything that is a property of the chip rather than of
 //! a board: power/clock configuration, standby, the tickless Embassy time
 //! driver, interrupt dispatch, BATMON, internal flash, factory identity,
-//! reset, GPIO/IOC pin ownership, and the I2C, ADC and LGPT PWM drivers.
+//! reset, GPIO/IOC pin ownership, the `LAES` AES-128 engine, and the I2C,
+//! ADC and LGPT PWM drivers.
 //! Board crates map physical wiring onto it through `take_core`. It does
 //! not link TI Drivers, RCL, FreeRTOS, or ZBOSS; the register sequences
 //! mirror the TI SimpleLink Low Power F3 SDK sources cited in each module.
@@ -23,6 +24,7 @@
 )]
 
 pub mod adc;
+pub mod aes;
 pub mod batmon;
 pub mod clkctl;
 pub mod flash;
@@ -68,6 +70,8 @@ pub struct Core {
     pub adc0: adc::Adc0,
     /// `LGPT1` timer (clock gated until used).
     pub lgpt1: lgpt::Lgpt1,
+    /// `LAES` AES-128 core (clock gated until an [`aes::AesEngine`] owns it).
+    pub aes: aes::Aes,
 }
 
 #[cfg(target_os = "none")]
@@ -103,6 +107,7 @@ pub fn take_core(regulator: VddrRegulator) -> Option<Core> {
         i2c0: i2c::I2c0::new(),
         adc0: adc::Adc0::new(),
         lgpt1: lgpt::Lgpt1::new(),
+        aes: aes::Aes::new(),
     })
 }
 
@@ -152,9 +157,16 @@ mod tests {
 
     #[test]
     fn manifest_has_no_zigbee_or_application_dependency() {
+        // Every dependency table that can reach firmware; only the
+        // `[dev-dependencies]` (host KAT oracle) may name a Zigbee crate.
         let manifest = include_str!("../Cargo.toml");
-        let dependencies = &manifest[manifest.find("[dependencies]").unwrap()..];
-        assert!(!dependencies.contains("zigbee"));
-        assert!(!dependencies.contains("sensor-sed-app"));
+        let dev = manifest.find("[dev-dependencies]").unwrap();
+        let shipped = &manifest[manifest.find("[dependencies]").unwrap()..dev];
+        let target = &manifest[manifest.find("[target.").unwrap()..];
+        for dependencies in [shipped, target] {
+            assert!(!dependencies.contains("zigbee"));
+            assert!(!dependencies.contains("sensor-sed-app"));
+        }
+        assert!(manifest[dev..].find("[target.").is_some());
     }
 }

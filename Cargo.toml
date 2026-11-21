@@ -32,6 +32,7 @@ members = [
 ]
 exclude = [
     "cc26x2-hal",
+    "cc2340r5-hal",
     "boards/cc26x2-dongle",
     "products/cc26x2-dongle",
     "examples/cc26x2-router",

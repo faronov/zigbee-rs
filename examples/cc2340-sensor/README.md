@@ -36,7 +36,10 @@ Compile-stub time and “IOC pending” descriptions are obsolete.
 
 ## Security and commissioning gate
 
-The image currently uses software AES and reserves:
+Zigbee AES runs only on the CC2340R52 `LAES` hardware engine: the
+composition root installs it with `Cc2340RadioPhy::install_aes_engine` and
+halts if its startup self-test fails; no software AES is linked (silicon
+validation is still open). The image reserves:
 
 ```text
 0x00000000..0x0007E000  application

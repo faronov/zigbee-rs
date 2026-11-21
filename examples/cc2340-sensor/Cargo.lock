@@ -671,6 +671,7 @@ dependencies = [
 name = "zigbee-mac"
 version = "0.1.0"
 dependencies = [
+ "cc2340r5-hal",
  "embassy-futures",
  "embassy-sync",
  "embassy-time 0.4.0",

@@ -32,6 +32,7 @@ pub struct Started {
     pub led: Led1,
     pub button: Button1,
     pub reset: SystemReset,
+    pub aes: board::aes::Aes,
 }
 
 /// RTT, the board (DC/DC, LF clock, SYSTIM time driver), LED1, BTN1
@@ -58,6 +59,7 @@ pub fn start(model: &str) -> Started {
         button1,
         flash,
         reset,
+        aes,
         ..
     } = resources;
     led1.off();
@@ -77,16 +79,24 @@ pub fn start(model: &str) -> Started {
         led: led1,
         button: button1,
         reset,
+        aes,
     }
 }
 
-/// Bring the radio up; the fallback (no TI SDK) build stops here with a
-/// distinct diagnostic, like the sensor.
-pub fn radio(ieee: zigbee_types::IeeeAddress) -> Cc2340RadioPhy {
+/// Install the `LAES` AES engine (halt if its self-test fails: Zigbee
+/// security has no software fall-back), then bring the radio up; the
+/// fallback (no TI SDK) build stops there with a distinct diagnostic, like
+/// the sensor.
+pub fn radio(ieee: zigbee_types::IeeeAddress, aes: board::aes::Aes) -> Cc2340RadioPhy {
     let mut phy = Cc2340RadioPhy::new(ieee).unwrap_or_else(|error| {
         rtt_target::rprintln!("[CC2340] rejected factory identity: {:?}", error);
         halt()
     });
+    if let Err(error) = phy.install_aes_engine(aes) {
+        rtt_target::rprintln!("[CC2340] LAES AES-128 self-test failed: {:?}", error);
+        halt()
+    }
+    rtt_target::rprintln!("[CC2340] LAES AES-128 self-test passed");
     if let Err(error) = phy.initialize_radio() {
         match error {
             RadioError::FirmwareUnavailable => {

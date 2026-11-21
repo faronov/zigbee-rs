@@ -10,7 +10,7 @@
 #![no_std]
 
 pub use cc2340r5_hal::{MCU_CLOCK_HZ, TARGET_PART};
-pub use cc2340r5_hal::{batmon, flash, identity, power, standby, timebase};
+pub use cc2340r5_hal::{aes, batmon, flash, identity, power, standby, timebase};
 #[cfg(target_os = "none")]
 pub use cc2340r5_hal::{interrupts, reset};
 
@@ -36,6 +36,9 @@ pub struct Resources {
     /// On-die VDDS and temperature monitor, measuring continuously.
     pub batmon: batmon::Batmon,
     pub reset: reset::SystemReset,
+    /// On-chip `LAES` AES-128 core token (not board wiring; passed through
+    /// so the product's composition root can hand it to the MAC).
+    pub aes: aes::Aes,
 }
 
 /// Claim and initialize the board exactly once.
@@ -53,6 +56,7 @@ pub fn take() -> Option<Resources> {
         flash,
         batmon,
         reset,
+        aes,
         ..
     } = cc2340r5_hal::take_core(VDDR_REGULATOR)?;
 
@@ -64,6 +68,7 @@ pub fn take() -> Option<Resources> {
         flash,
         batmon,
         reset,
+        aes,
     })
 }
 

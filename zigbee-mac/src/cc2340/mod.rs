@@ -18,6 +18,15 @@
 //!          └── polling FIFO TX/RX, timer-paced so the CPU sleeps between polls
 //! ```
 //!
+//! # Hardware AES
+//!
+//! [`Cc2340RadioPhy`] is the image's [`zigbee_crypto::ForwardAesProvider`]:
+//! the composition root hands it the `LAES` token with
+//! [`Cc2340RadioPhy::install_aes_engine`] (known-answer self-test on
+//! silicon) and must not start Zigbee if that fails. Every NWK/APS CCM*
+//! and AES-MMO block then runs on the `LAES` core ([`aes`]); no software
+//! AES is linked and nothing falls back to it.
+//!
 //! # Hardware filtering and acknowledgement
 //!
 //! The PBE does the time-critical parts of IEEE 802.15.4 itself, configured
@@ -53,6 +62,7 @@
 //! pending = 0, such a held frame is reported as frame pending so that the
 //! MAC's poll reads it.
 
+pub mod aes;
 mod config;
 pub mod driver;
 mod fifo;
@@ -172,6 +182,9 @@ pub struct Cc2340RadioPhy {
     holds_frame: bool,
     last_rx: Option<LastRx>,
     stats: PhyStats,
+    /// Validated `LAES` engine; `None` until the composition root installs
+    /// it, in which case every cipher operation fails closed.
+    aes_engine: Option<aes::AesEngine>,
 }
 
 impl Cc2340RadioPhy {
@@ -198,7 +211,23 @@ impl Cc2340RadioPhy {
                 duplicates: 0,
                 fifo_evictions: 0,
             },
+            aes_engine: None,
         })
+    }
+
+    /// Take ownership of the `LAES` core, enable its clock and run the
+    /// two-key FIPS-197 self-test on silicon before accepting it as this
+    /// image's only AES-128 implementation.
+    ///
+    /// On error nothing is installed and every cipher operation keeps
+    /// failing with [`aes::Cc2340AesError::NotInstalled`]; the caller must
+    /// not start Zigbee.
+    #[cfg(target_os = "none")]
+    pub fn install_aes_engine(&mut self, token: aes::AesPeripheral) -> Result<(), aes::AesError> {
+        let mut engine = aes::AesEngine::new(token, aes::AesEngine::DEFAULT_TIMEOUT_ITERATIONS)?;
+        engine.self_test()?;
+        self.aes_engine = Some(engine);
+        Ok(())
     }
 
     /// Build the end-device [`Cc2340SoftMac`] on top of this PHY.
@@ -505,7 +534,15 @@ impl RadioPhy for Cc2340RadioPhy {
     }
 }
 
-impl zigbee_crypto::ForwardAesProvider for Cc2340RadioPhy {}
+impl zigbee_crypto::ForwardAesProvider for Cc2340RadioPhy {
+    fn forward_cipher(
+        &mut self,
+        key: &zigbee_crypto::AesKey,
+    ) -> impl zigbee_crypto::Aes128Forward + '_ {
+        aes::Cc2340HardwareAes128::new(self.aes_engine.as_mut(), key)
+    }
+}
+
 impl PlatformServices for Cc2340RadioPhy {
     fn monotonic_micros(&self) -> u32 {
         Instant::now().as_micros() as u32
