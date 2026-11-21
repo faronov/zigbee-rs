@@ -1,6 +1,7 @@
 //! The ESP32 NCP's [`NcpPlatform`]: firmware update (`FW_*`, spec 7.9),
 //! the persisted IEEE override (`SYS_SET_IEEE`, 9.4 rule 7) and the trial
-//! boot window. PTA coexistence is not implemented (no PTA lines driven).
+//! boot window, the PTA coexistence follower a board attaches
+//! ([`Platform::attach_coex`], spec 11.5) and the radio's MAC counters.
 //!
 //! # Boot sequence (composition root)
 //!
@@ -80,6 +81,23 @@ pub trait CoexControl {
     /// Enable/disable with `coex_tx_priority_mask`; validates the mask even
     /// when disabling.
     fn set(&mut self, enable: bool, priority_mask: u8) -> Result<(), PlatformError>;
+    /// Radio operations the arbiter broke off since boot or the last reset.
+    fn counters(&self) -> CoexCounters;
+    /// Zero [`Self::counters`].
+    fn reset_counters(&mut self);
+}
+
+/// Radio operations the PTA arbiter broke off (`DIAG_GET_COUNTERS` MAC
+/// group, spec 7.8 `0x0220..=0x0222`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CoexCounters {
+    /// `coex_denied`: transmissions refused for lack of grant (each failed
+    /// as a busy channel and retried by CSMA-CA, or a timed reply missed).
+    pub tx_denied: u32,
+    /// `coex_ack_rx_denied`: ACK receptions broken off after a transmission.
+    pub ack_rx_denied: u32,
+    /// `coex_ack_tx_denied`: automatic ACKs broken off.
+    pub ack_tx_denied: u32,
 }
 
 /// The product platform over an OTA flash `F` and the identity journal `S`.
@@ -310,11 +328,27 @@ impl<F: OtaFlash, S: SettingsStore> NcpPlatform for Platform<F, S> {
                 sink(id, now.wrapping_sub(base));
             }
         }
+        if let (true, Some(coex)) = (group_mask & 0x02 != 0, self.coex.as_ref()) {
+            let coex = coex.counters();
+            for (id, value) in [
+                (0x0220, coex.tx_denied),
+                (0x0221, coex.ack_rx_denied),
+                (0x0222, coex.ack_tx_denied),
+            ] {
+                let _ = out.push(Counter { id, value });
+            }
+        }
     }
 
     fn reset_counters(&mut self, group_mask: u8) {
-        if let (true, Some((read, base))) = (group_mask & 0x02 != 0, self.mac_counters.as_mut()) {
+        if group_mask & 0x02 == 0 {
+            return;
+        }
+        if let Some((read, base)) = self.mac_counters.as_mut() {
             *base = read();
+        }
+        if let Some(coex) = self.coex.as_mut() {
+            coex.reset_counters();
         }
     }
 

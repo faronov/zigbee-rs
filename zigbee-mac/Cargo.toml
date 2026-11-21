@@ -79,6 +79,12 @@ rx-rssi = []
 # time-stamps every received frame in the RX_DONE interrupt
 # (vendor/esp-radio/LOCAL-PATCHES.md).
 timed-tx = ["esp-radio?/ieee802154-rx-timestamp", "esp-radio?/ieee802154-triggered-tx"]
+# External (PTA) coexistence on ESP32-H2 (esp-radio `ieee802154-extcoex`):
+# a transmission the arbiter refuses (no grant) fails at once as a busy
+# channel (CSMA-CA backs off; a timed transmission reports `Missed`)
+# instead of surfacing as the 10 ms TX-done timeout. Off by default; images
+# without it are unchanged.
+esp-extcoex = ["esp-radio?/ieee802154-extcoex"]
 
 # Platform backends
 esp32c6 = [

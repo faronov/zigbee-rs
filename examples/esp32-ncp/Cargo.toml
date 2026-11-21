@@ -93,9 +93,10 @@ flash-2mb = ["esp32-zigbee-ncp-product/flash-2mb"]
 # Development firmware policy (never in shipped images): FW_* accepts
 # unsigned images and, with FW_BEGIN flags bit0, downgrades.
 dev-unsigned-fw = ["esp32-zigbee-ncp-product/dev-unsigned-fw"]
-# PTA coexistence follower (product `pta::Pta`; adds the radio's
-# external-coexistence hooks). Not yet driven by `main.rs`.
-pta = ["thread-br-h2", "esp32-zigbee-ncp-product/pta"]
+# PTA coexistence follower (product `pta::Pta`, attached in `main.rs`;
+# adds the radio's external-coexistence hooks; an arbiter refusal fails the
+# transmission as a busy channel, `zigbee-mac/esp-extcoex`).
+pta = ["thread-br-h2", "esp32-zigbee-ncp-product/pta", "zigbee-mac/esp-extcoex"]
 # `pta_lab` binary (src/bin/pta_lab.rs).
 pta-lab = ["pta", "dep:esp-println"]
 # Lab: boot markers, panic/stage/transport records across resets and a

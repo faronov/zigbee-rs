@@ -552,6 +552,8 @@ impl<'a> EspRadioPhy<'a> {
         padded[..frame.len()].copy_from_slice(frame);
 
         TX_COMPLETE.store(false, Ordering::Release);
+        #[cfg(feature = "esp-extcoex")]
+        self.driver.clear_tx_coex_denied();
         let started = esp_hal::time::Instant::now();
         while let Err(error) = self
             .driver
@@ -573,6 +575,12 @@ impl<'a> EspRadioPhy<'a> {
                 return Err(PhyError::ChannelBusy);
             }
             core::hint::spin_loop();
+        }
+        // The external arbiter refused the frame (no grant): nothing went
+        // on air; CSMA-CA backs off as from a busy channel.
+        #[cfg(feature = "esp-extcoex")]
+        if self.driver.take_tx_coex_denied() {
+            return Err(PhyError::ChannelBusy);
         }
         // On the normal path the ISR already put us back into RX
         // (`rx_when_idle`); calling `start_receive()` here could abort an ACK
@@ -598,6 +606,8 @@ impl<'a> EspRadioPhy<'a> {
         padded[..frame.len()].copy_from_slice(frame);
 
         TX_COMPLETE.store(false, Ordering::Release);
+        #[cfg(feature = "esp-extcoex")]
+        self.driver.clear_tx_coex_denied();
         // Check before every attempt, including the first; a Busy retry may
         // have been delayed past the deadline since the preceding check.
         crate::phy::transmit_with_deadline(
@@ -622,6 +632,12 @@ impl<'a> EspRadioPhy<'a> {
                 return Err(PhyError::Hardware);
             }
             core::hint::spin_loop();
+        }
+        // Refused by the external arbiter at the instant: the window is
+        // gone (spec 11.5).
+        #[cfg(feature = "esp-extcoex")]
+        if self.driver.take_tx_coex_denied() {
+            return Err(PhyError::Missed);
         }
         Ok(())
     }

@@ -183,6 +183,7 @@ mod hw {
         GPIO, GPIO0, GPIO1, GPIO2, GPIO3, IO_MUX, MODEM_LPCON, MODEM_SYSCON,
     };
     use esp_radio::ieee802154::{CoexPriority, CoexPti, set_coex_pti};
+    pub(super) use esp_radio::ieee802154::{coex_breaks, reset_coex_breaks};
     use esp_thread_br_h2::THREAD_BR_H2_PTA as WIRING;
 
     use super::{Priority, PtaError, ScenePriorities, priorities};
@@ -520,5 +521,18 @@ impl crate::platform::CoexControl for Pta<'static> {
                 PtaError::Arbiter(_) => PlatformError::Hardware,
             }
         })
+    }
+
+    fn counters(&self) -> crate::platform::CoexCounters {
+        let breaks = hw::coex_breaks();
+        crate::platform::CoexCounters {
+            tx_denied: breaks.tx,
+            ack_rx_denied: breaks.ack_rx,
+            ack_tx_denied: breaks.ack_tx,
+        }
+    }
+
+    fn reset_counters(&mut self) {
+        hw::reset_coex_breaks();
     }
 }

@@ -1487,6 +1487,9 @@ other kinds above stay reserved until a cheap source exists.
 | `0x0206` | `mac_data_requests` | Child Data Requests acknowledged by the radio | ESP32 |
 | `0x0207` | `frame_pending_acks` | Of those, ACKs with Frame Pending set | ESP32 |
 | `0x0208` | `mac_ack_stall_recoveries` | Stalled automatic ACKs the radio driver recovered | ESP32 |
+| `0x0220` | `coex_denied` | Transmissions the PTA arbiter refused (no grant); failed as a busy channel (11.5) | ESP32-H2 with PTA |
+| `0x0221` | `coex_ack_rx_denied` | ACK receptions the arbiter broke off | ESP32-H2 with PTA |
+| `0x0222` | `coex_ack_tx_denied` | Automatic ACKs the arbiter broke off | ESP32-H2 with PTA |
 | `0x0301` | `nwk_secured_rx` | Secured NWK frames received | all |
 | `0x0302` | `nwk_decrypt_failures` | Of those, MIC/decrypt failures | all |
 | `0x0303` | `nwk_missing_key` | Of those, no key for the key sequence | all |
@@ -3046,20 +3049,32 @@ are kept, and the size is detected at runtime:
   configured on the S3 with ESP-IDF's external-coexistence GPIO API. The H2
   is the follower. Espressif disables it by default
   (`EXTERNAL_COEX_ENABLE`).
-- **NCP follower behaviour (new MAC work, N).** The zigbee-rs ESP MAC has no
-  external-coexistence support today. In v1 it implements:
-  - assert *request*, and *priority* when the frame class is in
-    `coex_tx_priority_mask`, before every CSMA-CA attempt;
-  - transmit only on *grant*, otherwise back off as a busy channel and count
-    `coex_denied`;
-  - drive *tx_line* for the duration of each TX.
+- **NCP follower behaviour** (ESP32-H2 `pta` image: `products/esp32-zigbee-ncp`
+  `pta.rs`, esp-radio local patch `ieee802154-extcoex`). The arbitration is
+  the radio's coexistence hardware, configured as ESP-IDF v5.5.1 does for
+  `EXTERNAL_COEX_FOLLOWER_ROLE`, 4 wires:
+  - *request* (H2 out) is raised by the hardware for every radio operation;
+    *priority* (H2 out) reflects the PTI of the current radio scene;
+  - *grant* (H2 in) gates the radio. A transmission without grant ends in
+    the hardware abort `TxCoexBreak`: the NCP fails it at once as a busy
+    channel (CSMA-CA backs off and retries) and counts `coex_denied`
+    (`0x0220`); ACK receptions and automatic ACKs the arbiter breaks off
+    count `0x0221`/`0x0222` (7.8);
+  - *tx_line* is an **input** on the follower: the S3 leader's Wi-Fi TX
+    indication (ESP-IDF `SOC_EXTERNAL_COEX_LEADER_TX_LINE`). The H2 does
+    not drive it.
+- **Priority classes** (`coex_tx_priority_mask`, config `0x000A`). The radio
+  has one PTI per scene (idle, RX, TX, timed TX, automatic ACK), not per
+  frame: bit0 raises the automatic-ACK PTI, bit1 the timed-TX PTI (the GP
+  TempMaster reply), bit3 every TX. Bit 2 (TC/key transport) alone cannot be
+  honoured and is refused with `UNSUPPORTED_COMMAND`; together with bit 3 it
+  is covered. Bits 4–7 are `INVALID_PARAMETER`.
 - **Frames that cannot wait for grant.**
-  - MAC ACKs are sent by the radio's automatic ACK path; priority is
-    asserted around expected ACK windows.
-  - The GP TempMaster reply, a timed TX at +20 ms armed in the radio,
-    requests early with high priority. If grant is denied at the
-    transmission instant, the reply is reported `Missed` and counted. The
-    GPD retries commissioning.
+  - MAC ACKs are sent by the radio's automatic ACK path with the ACK PTI.
+  - The GP TempMaster reply, a timed TX at +20 ms armed in the radio, uses
+    the timed-TX PTI from the transmission instant; there is no early
+    request ahead of it. If the arbiter refuses it, the reply is reported
+    `Missed` (busy) and counted; the GPD retries commissioning.
 - **Enabling it** (decision N7).
   - PTA is **disabled by default**. `coex_enable` (config `0x0009`) is
     volatile and reads 0 after every NCP boot.
