@@ -21181,3 +21181,13 @@ mod gp_translation_tests;
 #[cfg(feature = "green-power-translation-table")]
 #[path = "green_power/local_config.rs"]
 mod gp_local_config;
+
+/// GPD Channel Request on a combo, end to end.
+#[cfg(all(
+    test,
+    feature = "router",
+    feature = "green-power-channel-request",
+    feature = "green-power-bidirectional"
+))]
+#[path = "green_power/channel_request_tests.rs"]
+mod gp_channel_request_tests;

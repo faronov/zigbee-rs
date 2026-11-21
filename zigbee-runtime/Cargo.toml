@@ -148,6 +148,11 @@ green-power-sink = ["green-power", "zigbee-gp/sink"]
 # endpoints are persisted in the GP journal's sink record. Off by default:
 # images built without it are unchanged.
 green-power-translation-table = ["green-power-sink", "zigbee-gp/translation-table"]
+# The sink answers a GPD's Channel Request during commissioning with a
+# Channel Configuration (GP Response through a TempMaster; a combo that
+# hears the GPD directly is its own TempMaster with
+# `green-power-bidirectional`).
+green-power-channel-request = ["green-power-sink", "zigbee-gp/channel-request"]
 # ZRHP network co-processor integration of the GP combo (spec 7.11,
 # `green_power::ncp`): one sink authority switchable at runtime between the
 # runtime's sink (NCP_SINK) and the host's (HOST_SINK: GP server frames and
