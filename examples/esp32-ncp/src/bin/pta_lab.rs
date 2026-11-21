@@ -11,6 +11,11 @@
 //! espflash flash --monitor target/riscv32imac-unknown-none-elf/release/pta_lab   # H2 USB-C port
 //! ```
 //!
+//! Without a USB host on the H2 (esp-println `auto`) the output goes to
+//! UART0 at 115 200, which the S3 bridge forwards to CDC 0; the S3 console
+//! (`pta`, `pta grant high|low|in`, `pta sample <ms>`) drives grant and
+//! samples request/priority from the leader's side.
+//!
 //! Phases (repeated):
 //!
 //! | Phase | PTA | mask | GPIO1 (grant) pad |
@@ -81,6 +86,7 @@ enum Pull {
 #[derive(Default)]
 struct Stats {
     sent: u32,
+    denied: u32,
     timed_out: u32,
     refused: u32,
     samples: u32,
@@ -185,9 +191,17 @@ fn phase(
         .read()
         .bits()
         .wrapping_sub(breaks_before);
+    let coex = esp_radio::ieee802154::coex_breaks();
     println!(
-        "tx: sent {} timed_out {} refused {} | TX_BREAK_COEX_CNT +{}",
-        stats.sent, stats.timed_out, stats.refused, breaks
+        "tx: sent {} denied {} timed_out {} refused {} | TX_BREAK_COEX_CNT +{} | coex_breaks tx {} ack_rx {} ack_tx {}",
+        stats.sent,
+        stats.denied,
+        stats.timed_out,
+        stats.refused,
+        breaks,
+        coex.tx,
+        coex.ack_rx,
+        coex.ack_tx
     );
     println!(
         "pad samples during TX: {} | request {} grant {} priority {} tx_line {}",
@@ -236,7 +250,12 @@ fn transmit_one(radio: &mut Ieee802154<'_>, seq: &mut u8, stats: &mut Stats) {
         stats.priority_high += pads >> PRIORITY & 1;
         stats.tx_line_high += pads >> TX_LINE & 1;
         if TX_DONE.load(Ordering::Acquire) {
-            stats.sent += 1;
+            // esp-radio `ieee802154-extcoex`: a TxCoexBreak completes too.
+            if radio.take_tx_coex_denied() {
+                stats.denied += 1;
+            } else {
+                stats.sent += 1;
+            }
             return;
         }
         if Instant::now() > deadline {
@@ -253,9 +272,10 @@ fn dump(pta: &Pta<'_>) {
     let coex =
         |offset: usize| unsafe { core::ptr::read_volatile((0x600A_D000 + offset) as *const u32) };
     println!(
-        "enabled={} mask={:#04x} | coex 49C={:08x} 4A0={:08x} 4A4={:08x} 4D0={:08x} 4D8={:08x}",
+        "enabled={} mask={:#04x} adapter(sem, timer calls, arena, alloc fails)={:?} | coex 49C={:08x} 4A0={:08x} 4A4={:08x} 4D0={:08x} 4D8={:08x}",
         pta.enabled(),
         pta.priority_mask(),
+        esp32_zigbee_ncp_product::pta::adapter_stats(),
         coex(0x49C),
         coex(0x4A0),
         coex(0x4A4),
