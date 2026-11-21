@@ -852,7 +852,18 @@ impl<M: MacDriver> NwkLayer<M> {
                     .neighbors
                     .find_by_ieee(&ieee_addr)
                     .map(|entry| (entry.relationship, entry.is_router()));
-                if !matches!(
+                if matches!(relation, Some((UnauthenticatedChild, _))) {
+                    // The device now holds a network address it was not
+                    // given by us: its association with this router never
+                    // completed (e.g. it missed our ACKs and joined through
+                    // another parent, even though its MAC acknowledged our
+                    // Association Response). Drop the provisional child at
+                    // once instead of waiting for the unauthenticated-child
+                    // timeout, so frames for the stale address stop being
+                    // queued or routed to it.
+                    self.remove_unauthenticated_child(&ieee_addr, previous);
+                    self.routing.remove_through(previous);
+                } else if !matches!(
                     relation,
                     Some((Parent | UnauthenticatedChild, _) | (Child, false))
                 ) {
