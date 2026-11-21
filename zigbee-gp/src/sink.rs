@@ -772,6 +772,14 @@ enum Out {
     },
     /// `Device_annce` for an alias.
     DeviceAnnce(u16),
+    /// GP Pairing answering a GP Pairing Search, to the searching proxy.
+    #[cfg(feature = "pairing-search")]
+    PairingSearchResponse {
+        gpd_id: GpdId,
+        dst: u16,
+        frame_counter: bool,
+        key: bool,
+    },
     /// GP Response carrying a Commissioning Reply.
     Response {
         gpd_id: GpdId,
@@ -1069,6 +1077,24 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                     client_cmd::PAIRING,
                     None,
                     self.pairing(e).encode(&mut payload),
+                )
+            }
+            #[cfg(feature = "pairing-search")]
+            Out::PairingSearchResponse {
+                gpd_id,
+                dst,
+                frame_counter,
+                key,
+            } => {
+                let e = &self.table[self.find(&gpd_id)?];
+                let mut pairing = self.pairing(e);
+                pairing.frame_counter = pairing.frame_counter.filter(|_| frame_counter);
+                pairing.key = pairing.key.filter(|_| key);
+                (
+                    unicast(dst),
+                    client_cmd::PAIRING,
+                    None,
+                    pairing.encode(&mut payload),
                 )
             }
             Out::PairingRemove {
@@ -1544,6 +1570,8 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             server_cmd::TRANSLATION_TABLE_UPDATE
             | server_cmd::TRANSLATION_TABLE_REQUEST
             | server_cmd::PAIRING_CONFIGURATION => self.on_configuration_command(command),
+            #[cfg(feature = "pairing-search")]
+            server_cmd::PAIRING_SEARCH => self.on_pairing_search(src_nwk, payload),
             // Proxy → sink commands with nothing for a sink to do (gecko_sdk
             // handles neither) and, without `translation-table`, the
             // configuration commands.
@@ -3757,3 +3785,6 @@ mod import_tests {
 mod configuration;
 #[cfg(feature = "translation-table")]
 pub use configuration::{SINK_TRANSLATION_ENTRIES, SinkTranslationTable};
+
+#[cfg(feature = "pairing-search")]
+mod pairing_search;

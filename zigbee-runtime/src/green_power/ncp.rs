@@ -558,7 +558,7 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
     /// host, and one addressed to this node is only copied.
     pub(super) fn gp_proxy_poll(&mut self, now_ms: u32) -> Option<GpTx> {
         loop {
-            let tx = self.green_power.proxy.poll(now_ms)?;
+            let tx = super::pairing_search::poll(&mut self.green_power, now_ms)?;
             if !host_sink() {
                 return Some(tx);
             }

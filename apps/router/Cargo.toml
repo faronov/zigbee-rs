@@ -44,6 +44,13 @@ green-power-translation-table = [
     "green-power-sink",
     "zigbee-runtime/green-power-translation-table",
 ]
+# The sink answers GP Pairing Search; the proxy searches for GPDs it has no
+# entry for (rate-limited). Product images must opt in explicitly.
+green-power-sink-pairing-search = [
+    "green-power-sink",
+    "zigbee-runtime/green-power-sink-pairing-search",
+]
+green-power-pairing-search = ["green-power", "zigbee-runtime/green-power-pairing-search"]
 
 [dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }
