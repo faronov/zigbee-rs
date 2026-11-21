@@ -49,6 +49,7 @@ use zigbee_mac::stm32wb::{MAX_INDIRECT_IN_FLIGHT, WbMacTransport, status};
 use zigbee_mac::{MacError, PlatformServices};
 use zigbee_types::{MacAddress, PanId, ShortAddress};
 
+use crate::aes::{AesEngine, AesError, HardwareAes128};
 use crate::hsem;
 
 /// MSDU buffers: every indirect frame the backend may have in flight plus
@@ -137,6 +138,11 @@ pub enum StartError {
     MacInit,
     /// CPU1 could not take the RNG semaphore.
     RngBusy,
+    /// The AES1 start-up known-answer test failed; Zigbee must not start.
+    AesSelfTest(AesError),
+    /// The full AES1 known-answer suite failed (lab builds, feature `kat`).
+    #[cfg(feature = "kat")]
+    AesKnownAnswerSuite(zigbee_crypto::kat::KatFailure),
 }
 
 /// Boot CPU2 and start its 802.15.4 MAC.
@@ -147,15 +153,25 @@ pub enum StartError {
 ///
 /// The RNG is claimed before CPU2 boots, so its reset cannot disturb a
 /// running coprocessor.
+///
+/// `aes` becomes the transport's [`ForwardAesProvider`](zigbee_mac::ForwardAesProvider)
+/// backend for NWK/APS CCM* and AES-MMO. Its known-answer test runs first;
+/// on a failure CPU2 is not started and no frame is ever secured (there is
+/// no software AES fall-back).
 pub async fn start(
     ipcc: Peri<'static, IPCC>,
     irqs: impl Binding<IPCC_C1_RX, ReceiveInterruptHandler>
     + Binding<IPCC_C1_TX, TransmitInterruptHandler>,
     rng: Peri<'static, RNG>,
+    mut aes: AesEngine,
 ) -> Result<(WbTransport, MemoryManager<'static>), StartError> {
     if BUFFERS_TAKEN.swap(true, Ordering::AcqRel) {
         return Err(StartError::AlreadyStarted);
     }
+    aes.self_test().map_err(StartError::AesSelfTest)?;
+    #[cfg(feature = "kat")]
+    aes.known_answer_suite()
+        .map_err(StartError::AesKnownAnswerSuite)?;
     hsem::enable();
     let rng = {
         let _owner =
@@ -177,6 +193,7 @@ pub async fn start(
         WbTransport {
             controller: ControllerAdapter::new(mac),
             rng,
+            aes,
             buffers,
             msdu_handles: [None; MSDU_SLOTS],
             pan_id: PanId(0xFFFF),
@@ -190,6 +207,8 @@ pub async fn start(
 pub struct WbTransport {
     controller: ControllerAdapter<'static>,
     rng: Rng<'static, Blocking>,
+    /// CPU1's AES1, the only AES backend of this transport.
+    aes: AesEngine,
     buffers: &'static mut SharedBuffers,
     /// MSDU handle owning each slot until its DATA/PURGE confirm.
     msdu_handles: [Option<u8>; MSDU_SLOTS],
@@ -286,7 +305,16 @@ fn zigbee_address(mode: AddressMode, pan: WpanPanId, address: WpanAddress) -> Op
 
 const NO_KEY_SOURCE: [u8; 8] = [0; 8];
 
-impl zigbee_mac::ForwardAesProvider for WbTransport {}
+/// NWK/APS CCM* and AES-MMO run on AES1. Hardware errors surface as the
+/// cipher's error (the stack drops the frame); there is no software path.
+impl zigbee_mac::ForwardAesProvider for WbTransport {
+    fn forward_cipher(
+        &mut self,
+        key: &zigbee_crypto::AesKey,
+    ) -> impl zigbee_crypto::Aes128Forward + '_ {
+        HardwareAes128::new(&mut self.aes, *key)
+    }
+}
 
 impl PlatformServices for WbTransport {
     fn monotonic_micros(&self) -> u32 {
