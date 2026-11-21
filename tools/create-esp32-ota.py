@@ -197,6 +197,11 @@ def build_elf(
     command += ["build", "--release", "--locked", "-Z", "build-std=core,alloc"]
     if bin_name:
         command += ["--bin", bin_name]
+    if example_dir.name == "esp32c6-sensor" and "light-sleep" in features.split(","):
+        # The C6 sensor's default Identify LED (RMT) is not combined with
+        # retained light sleep: that image is built from `sed` alone.
+        command += ["--no-default-features"]
+        features = ",".join(["sed", features])
     if features:
         command += ["--features", features]
     run(command, cwd=example_dir, env=env)

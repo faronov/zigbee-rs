@@ -1474,32 +1474,16 @@ jobs:
           for elf in "$DIR/esp32c6-sensor" "$DIR/esp32c6-ed" "$DIR/esp32c6-router" \
             "$LED_DIR/esp32c6-ed"; do
             SYMS="$("$NM" --demangle "$elf")"
-            if [[ "$elf" == "$LED_DIR"/* || "$elf" == */esp32c6-router ]]; then
+            # The sensor drives the WS2812 for Identify (`identify-led`,
+            # default); the ED links it only with `status-led`.
+            if [[ "$elf" == "$LED_DIR"/* || "$elf" == */esp32c6-router || "$elf" == */esp32c6-sensor ]]; then
               grep -q 'esp_hal::rmt::' <<<"$SYMS" ||
-                { echo "$elf is missing the RMT status LED driver" >&2; exit 1; }
+                { echo "$elf is missing the RMT LED driver" >&2; exit 1; }
             elif grep -q 'esp_hal::rmt::' <<<"$SYMS"; then
               echo "$elf links the RMT status LED driver without status-led" >&2
               exit 1
             fi
           done
-          # Opt-in Identify LED on the sleepy sensor (`identify-led`).
-          ID_DIR=target/identify-led/riscv32imac-unknown-none-elf/release
-          cargo build --release --locked -Z build-std=core,alloc --target-dir target/identify-led \
-            --features identify-led
-          cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/identify-led \
-            --features identify-led -- -D warnings
-          espflash save-image --skip-update-check --chip esp32c6 \
-            --partition-table "$CSV" --target-app-partition ota_0 \
-            "$ID_DIR/esp32c6-sensor" "$ID_DIR/esp32c6-sensor.app.bin"
-          espflash save-image --skip-update-check --chip esp32c6 \
-            --merge --skip-padding --flash-size 4mb \
-            --partition-table "$CSV" --target-app-partition ota_0 \
-            "$ID_DIR/esp32c6-sensor" "$ID_DIR/esp32c6-sensor.bin"
-          python3 ../../products/esp32-zigbee-devkit/partitions/check-app-image-size.py \
-            --chip esp32c6 --slot ota_0 --merged "$ID_DIR/esp32c6-sensor.bin" \
-            "$ID_DIR/esp32c6-sensor.app.bin"
-          "$NM" --demangle "$ID_DIR/esp32c6-sensor" | grep -q 'esp_hal::rmt::' ||
-            { echo "identify-led image is missing the RMT driver" >&2; exit 1; }
       - name: Check ESP32-C6 hardware AES and role split
         run: |
           ELF=examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
@@ -1868,8 +1852,6 @@ jobs:
             --no-default-features --features ed,status-led -- -D warnings
           cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/variants \
             --no-default-features --features router,green-power-bidirectional -- -D warnings
-          cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/variants \
-            --features identify-led -- -D warnings
           DIR=target/riscv32imac-unknown-none-elf/release
           CSV=../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv
           for image in esp32c5-sensor esp32c5-ed esp32c5-router; do
@@ -1955,7 +1937,18 @@ jobs:
           tool: espflash@${{ env.ESPFLASH_VERSION }}
       - name: Link retained-sleep firmware
         working-directory: examples/${{ matrix.chip }}-sensor
-        run: cargo build --release --locked --features light-sleep -Z build-std=core,alloc
+        run: |
+          # Without the defaults: the C6's default Identify LED (RMT) is not
+          # combined with retained light sleep; for both chips this is the
+          # former `--features light-sleep` image (default was `sed`).
+          cargo build --release --locked --no-default-features --features sed,light-sleep \
+            -Z build-std=core,alloc
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          ELF=target/riscv32imac-unknown-none-elf/release/${{ matrix.chip }}-sensor
+          if "$NM" --demangle "$ELF" | grep -q 'esp_hal::rmt::'; then
+            echo "$ELF links the RMT driver with light-sleep" >&2
+            exit 1
+          fi
       - name: Validate actual application and OTA corpus and report size
         env:
           CHIP: ${{ matrix.chip }}

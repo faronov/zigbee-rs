@@ -183,23 +183,24 @@ Both images provide a concrete
 | build selection (both chips) | fast wait | slow wait | slow parent poll |
 |---|---|---|---|
 | default | `Active` | `Active` | 30 s |
-| `--features light-sleep` (experimental) | `Active` | retained `Idle` | 5 s |
+| `light-sleep` (experimental; H2 `--features light-sleep`, C6 `--no-default-features --features sed,light-sleep`) | `Active` | retained `Idle` | 5 s |
 
-Neither SED image shows a status: the C6 has no LED adapter, and the H2
-sensor's active-low GPIO8 output cannot light the board's WS2812. It is
-kept unchanged so the validated image stays byte-identical; the
-`status-led` driver above is for the mains roles only.
+The SED images show no lifecycle status: the H2 sensor's active-low GPIO8
+output cannot light the board's WS2812 (kept unchanged so the validated
+image stays byte-identical), and the C6/C5 sensors light theirs for
+Identify only (below); the `status-led` palette is for the mains roles.
 
-**Identify on the sleepy C6/C5 (`identify-led`, opt-in).** The stack's
+**Identify on the C6/C5 sensors (`identify-led`, default).** The stack's
 Identify cluster always runs (IdentifyTime countdown, Identify Query
 response, Trigger Effect); the lifecycle keeps the radio on the fast poll
 while it identifies and records each Identify command as
-`DiagnosticEvent::Identify`. With `--features identify-led` the board's
-WS2812 (GPIO8 on the C6, GPIO27 on the C5) blinks magenta while the device
-identifies or shows a Trigger Effect (blink 1 s, breathe 15 s, okay 2 s,
-channel change 8 s; Finish/Stop end it) and stays dark otherwise. It links
-the RMT driver, so it is not part of the default image and is refused
-together with `light-sleep` (pad isolation and RMT not measured together).
+`DiagnosticEvent::Identify`. The default sensor images drive the board's
+WS2812 (GPIO8 on the C6, GPIO27 on the C5) through RMT: magenta blinks while
+the device identifies or shows a Trigger Effect (blink 1 s, breathe 15 s,
+okay 2 s, channel change 8 s; Finish/Stop end it), dark otherwise. The C6
+`light-sleep` image is built without it (`--no-default-features --features
+sed,light-sleep`; its pads stay isolated, no RMT links, the pair is not
+measured) and is byte-identical to the image before the LED.
 
 `Active`/`Active` describes the radio/SoC policy, not a continuously spinning
 CPU. The executor uses `WFI` while its root future is pending. SYSTIMER alarm 0
@@ -579,8 +580,10 @@ cd ../esp32h2-sensor
 cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc
 ```
 
-To build the retained-sleep variant in either example directory, add
-`--features light-sleep`. This feature does not change partitions, OTA identity
+To build the retained-sleep variant, add `--features light-sleep` in the H2
+example; in the C6 example use `--no-default-features --features
+sed,light-sleep` (the default Identify LED is not combined with it;
+`create-esp32-ota.py` does this itself). This feature does not change partitions, OTA identity
 or network persistence. CI links both opt-in images and runs the real-image
 OTA corpus separately from the default images. Size reports measure the
 artifacts without enforcing artificial regression budgets; physical OTA-slot

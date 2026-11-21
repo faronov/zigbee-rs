@@ -65,7 +65,7 @@ opt-level = "s"
 lto = true
 
 [features]
-default = ["sed"]
+default = ["sed", "identify-led"]
 # Sleepy environmental sensor. No retained light sleep on the C5 (the
 # product rejects `light-sleep` for this chip): the CPU idles in WFI.
 sed = ["dep:sensor-sed-app", "esp32-zigbee-devkit-product/sed"]
@@ -87,7 +87,7 @@ router-core = [
 # WS2812 status LED on GPIO27 (RMT) for the mains roles: always on in the
 # router, opt-in for the ED (`--features ed,status-led`).
 status-led = ["esp32-zigbee-devkit-product/status-led"]
-# Sleepy sensor, opt-in: Identify (ZCL Identify time / Trigger Effect)
+# Default for the sensor: Identify (ZCL Identify time / Trigger Effect)
 # blinks the board's WS2812 (GPIO27); dark otherwise. Links the RMT driver.
 identify-led = ["sed", "esp32-zigbee-devkit-product/identify-led"]
 # Lab only, never in shipped images: red, green, blue for 3 s each when the

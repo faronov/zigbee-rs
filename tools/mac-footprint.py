@@ -109,7 +109,10 @@ def _uf2(board: str, feature: str) -> Image:
 
 def _esp(chip: str, light_sleep: bool) -> Image:
     args = ["-Z", "build-std=core,alloc"]
-    if light_sleep:
+    if light_sleep and chip == "esp32c6":
+        # Without the C6's default Identify LED (see examples/esp32c6-sensor).
+        args += ["--no-default-features", "--features", "sed,light-sleep"]
+    elif light_sleep:
         args += ["--features", "light-sleep"]
     return Image(
         f"{chip}-sensor{'-light-sleep' if light_sleep else ''}",
