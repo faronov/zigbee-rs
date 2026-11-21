@@ -8,8 +8,8 @@ use zigbee_aps::apsme::{
     ApsRequestKeyType, ApsUpdateDeviceStatus, ApsmeRequestKeyIndication,
     ApsmeUpdateDeviceIndication, ApsmeVerifyKeyIndication,
 };
-use zigbee_aps::security::{AesKey, DEFAULT_TC_LINK_KEY, derive_verify_key_hash};
-use zigbee_crypto::{InstallCodeError, derive_install_code_key};
+use zigbee_aps::security::{AesKey, DEFAULT_TC_LINK_KEY, derive_verify_key_hash_with};
+use zigbee_crypto::{ForwardAesProvider, InstallCodeError, derive_install_code_key_with};
 use zigbee_types::{IeeeAddress, ShortAddress};
 
 /// Trust Center device table size: 32, or 256 for the coordinator NCP
@@ -160,6 +160,9 @@ pub enum TrustCenterError {
     DeviceTableFull,
     DeviceNotFound,
     RequestNotPermitted,
+    /// The platform AES engine failed while hashing or deriving a key. The
+    /// operation is rejected; there is no software fall-back.
+    CipherFailure,
 }
 
 pub struct TrustCenterTable {
@@ -252,16 +255,21 @@ impl TrustCenterTable {
         self.pending_link_key_mask = [0; PENDING_MASK_WORDS];
     }
 
-    pub fn provision_install_code(
+    /// Derive the install-code link key with the platform AES provider
+    /// `aes` (normally the MAC) and provision it for `address`.
+    pub fn provision_install_code<P: ForwardAesProvider>(
         &mut self,
+        aes: &mut P,
         address: IeeeAddress,
         install_code: &[u8],
     ) -> Result<AesKey, TrustCenterError> {
         // 48-, 64-, 96- or 128-bit codes with their CRC-16 (BDB 3.0.1
-        // §10.1, R22 4.6.3.4): `derive_install_code_key` checks the length
-        // (8/10/14/18 bytes) and the CRC.
-        let key =
-            derive_install_code_key(install_code).map_err(TrustCenterError::InvalidInstallCode)?;
+        // §10.1, R22 4.6.3.4): `derive_install_code_key_with` checks the
+        // length (8/10/14/18 bytes) and the CRC.
+        let key = derive_install_code_key_with(aes, install_code).map_err(|error| match error {
+            InstallCodeError::CipherFailure => TrustCenterError::CipherFailure,
+            other => TrustCenterError::InvalidInstallCode(other),
+        })?;
         self.provision_link_key(address, key, TrustCenterKeyOrigin::InstallCode)?;
         Ok(key)
     }
@@ -486,8 +494,11 @@ impl TrustCenterTable {
         Ok(())
     }
 
-    pub fn handle_verify_key(
+    /// Check a Verify-Key hash with the platform AES provider `aes`
+    /// (normally the MAC) and commit a pending replacement key on success.
+    pub fn handle_verify_key<P: ForwardAesProvider>(
         &mut self,
+        aes: &mut P,
         indication: ApsmeVerifyKeyIndication,
     ) -> Result<TrustCenterAction, TrustCenterError> {
         let index = self
@@ -504,7 +515,8 @@ impl TrustCenterTable {
             }
             (device.link_key, false)
         };
-        let expected = derive_verify_key_hash(&key);
+        let expected =
+            derive_verify_key_hash_with(aes, &key).ok_or(TrustCenterError::CipherFailure)?;
         let success = constant_time_eq(&expected, &indication.hash);
         if success && commits_replacement {
             let device = self.devices[index]
@@ -713,6 +725,8 @@ mod tests {
     use zigbee_aps::apsme::{
         ApsmeRequestKeyIndication, ApsmeUpdateDeviceIndication, ApsmeVerifyKeyIndication,
     };
+    use zigbee_aps::security::derive_verify_key_hash;
+    use zigbee_crypto::SoftwareAesProvider;
 
     const TC: IeeeAddress = [0x10; 8];
     const PARENT: IeeeAddress = [0x20; 8];
@@ -810,11 +824,14 @@ mod tests {
             .install_generated_trust_center_link_key(DEVICE, unique, 15)
             .unwrap();
         let bad = table
-            .handle_verify_key(ApsmeVerifyKeyIndication {
-                source_address: DEVICE,
-                key_type: 0x04,
-                hash: [0u8; 16],
-            })
+            .handle_verify_key(
+                &mut SoftwareAesProvider::new(),
+                ApsmeVerifyKeyIndication {
+                    source_address: DEVICE,
+                    key_type: 0x04,
+                    hash: [0u8; 16],
+                },
+            )
             .unwrap();
         assert_eq!(
             bad,
@@ -838,11 +855,14 @@ mod tests {
         );
 
         let good = table
-            .handle_verify_key(ApsmeVerifyKeyIndication {
-                source_address: DEVICE,
-                key_type: 0x04,
-                hash: derive_verify_key_hash(&unique),
-            })
+            .handle_verify_key(
+                &mut SoftwareAesProvider::new(),
+                ApsmeVerifyKeyIndication {
+                    source_address: DEVICE,
+                    key_type: 0x04,
+                    hash: derive_verify_key_hash(&unique),
+                },
+            )
             .unwrap();
         assert_eq!(
             good,
@@ -909,7 +929,9 @@ mod tests {
         );
         assert!(table.device(&DEVICE).is_none());
 
-        let key = table.provision_install_code(DEVICE, &INSTALL_CODE).unwrap();
+        let key = table
+            .provision_install_code(&mut SoftwareAesProvider::new(), DEVICE, &INSTALL_CODE)
+            .unwrap();
         assert_eq!(key, INSTALL_CODE_KEY);
         assert!(matches!(
             table
@@ -935,7 +957,7 @@ mod tests {
             let crc = zigbee_crypto::install_code_crc(&code[..len]);
             code[len..len + 2].copy_from_slice(&crc.to_le_bytes());
             let key = table
-                .provision_install_code(DEVICE, &code[..len + 2])
+                .provision_install_code(&mut SoftwareAesProvider::new(), DEVICE, &code[..len + 2])
                 .unwrap();
             assert_eq!(
                 Ok(key),
@@ -943,7 +965,11 @@ mod tests {
             );
             code[0] ^= 1;
             assert_eq!(
-                table.provision_install_code(DEVICE, &code[..len + 2]),
+                table.provision_install_code(
+                    &mut SoftwareAesProvider::new(),
+                    DEVICE,
+                    &code[..len + 2]
+                ),
                 Err(TrustCenterError::InvalidInstallCode(
                     InstallCodeError::InvalidCrc
                 ))
@@ -951,7 +977,7 @@ mod tests {
         }
         let mut table = TrustCenterTable::new();
         assert_eq!(
-            table.provision_install_code(DEVICE, &[0u8; 16]),
+            table.provision_install_code(&mut SoftwareAesProvider::new(), DEVICE, &[0u8; 16]),
             Err(TrustCenterError::InvalidInstallCode(
                 InstallCodeError::InvalidLength
             ))
@@ -961,7 +987,9 @@ mod tests {
     #[test]
     fn idle_preprovisioned_install_code_survives_ticks() {
         let mut table = TrustCenterTable::new();
-        table.provision_install_code(DEVICE, &INSTALL_CODE).unwrap();
+        table
+            .provision_install_code(&mut SoftwareAesProvider::new(), DEVICE, &INSTALL_CODE)
+            .unwrap();
 
         assert_eq!(table.tick(1), TrustCenterAction::None);
         assert_eq!(table.tick(u8::MAX), TrustCenterAction::None);
@@ -975,7 +1003,9 @@ mod tests {
     #[test]
     fn initial_install_code_key_is_not_a_completed_replacement_exchange() {
         let mut table = TrustCenterTable::new();
-        table.provision_install_code(DEVICE, &INSTALL_CODE).unwrap();
+        table
+            .provision_install_code(&mut SoftwareAesProvider::new(), DEVICE, &INSTALL_CODE)
+            .unwrap();
         let mut no_replacement = policy();
         no_replacement.require_link_key_update = false;
 
@@ -993,11 +1023,14 @@ mod tests {
             }
         ));
         assert_eq!(
-            table.handle_verify_key(ApsmeVerifyKeyIndication {
-                source_address: DEVICE,
-                key_type: 0x04,
-                hash: derive_verify_key_hash(&INSTALL_CODE_KEY),
-            }),
+            table.handle_verify_key(
+                &mut SoftwareAesProvider::new(),
+                ApsmeVerifyKeyIndication {
+                    source_address: DEVICE,
+                    key_type: 0x04,
+                    hash: derive_verify_key_hash(&INSTALL_CODE_KEY),
+                }
+            ),
             Err(TrustCenterError::RequestNotPermitted)
         );
 
@@ -1037,11 +1070,14 @@ mod tests {
 
         assert_eq!(
             table
-                .handle_verify_key(ApsmeVerifyKeyIndication {
-                    source_address: DEVICE,
-                    key_type: 0x04,
-                    hash: derive_verify_key_hash(&replacement),
-                })
+                .handle_verify_key(
+                    &mut SoftwareAesProvider::new(),
+                    ApsmeVerifyKeyIndication {
+                        source_address: DEVICE,
+                        key_type: 0x04,
+                        hash: derive_verify_key_hash(&replacement),
+                    }
+                )
                 .unwrap(),
             TrustCenterAction::ConfirmKey {
                 device_address: DEVICE,
@@ -1080,11 +1116,14 @@ mod tests {
             TrustCenterKeyAttributes::Provisional
         );
         assert_eq!(
-            table.handle_verify_key(ApsmeVerifyKeyIndication {
-                source_address: DEVICE,
-                key_type: 0x04,
-                hash: derive_verify_key_hash(&DEFAULT_TC_LINK_KEY),
-            }),
+            table.handle_verify_key(
+                &mut SoftwareAesProvider::new(),
+                ApsmeVerifyKeyIndication {
+                    source_address: DEVICE,
+                    key_type: 0x04,
+                    hash: derive_verify_key_hash(&DEFAULT_TC_LINK_KEY),
+                }
+            ),
             Err(TrustCenterError::RequestNotPermitted)
         );
         assert!(matches!(
@@ -1248,11 +1287,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             table
-                .handle_verify_key(ApsmeVerifyKeyIndication {
-                    source_address: DEVICE,
-                    key_type: 0x04,
-                    hash: derive_verify_key_hash(&key),
-                })
+                .handle_verify_key(
+                    &mut SoftwareAesProvider::new(),
+                    ApsmeVerifyKeyIndication {
+                        source_address: DEVICE,
+                        key_type: 0x04,
+                        hash: derive_verify_key_hash(&key),
+                    }
+                )
                 .unwrap(),
             TrustCenterAction::ConfirmKey {
                 device_address: DEVICE,
@@ -1434,11 +1476,14 @@ mod tests {
             .install_generated_trust_center_link_key(DEVICE, unique, 15)
             .unwrap();
         table
-            .handle_verify_key(ApsmeVerifyKeyIndication {
-                source_address: DEVICE,
-                key_type: 0x04,
-                hash: derive_verify_key_hash(&unique),
-            })
+            .handle_verify_key(
+                &mut SoftwareAesProvider::new(),
+                ApsmeVerifyKeyIndication {
+                    source_address: DEVICE,
+                    key_type: 0x04,
+                    hash: derive_verify_key_hash(&unique),
+                },
+            )
             .unwrap();
         assert_eq!(table.device(&DEVICE).unwrap().link_key, unique);
 

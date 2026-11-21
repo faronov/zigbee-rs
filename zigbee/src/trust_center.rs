@@ -7,7 +7,7 @@
 //! - Handling key updates and switching
 //! - Device removal and key revocation
 
-use zigbee_crypto::{InstallCodeError, derive_install_code_key};
+use zigbee_crypto::{ForwardAesProvider, InstallCodeError, derive_install_code_key_with};
 use zigbee_types::IeeeAddress;
 
 /// Well-known default Trust Center link key (ZigBeeAlliance09).
@@ -163,8 +163,12 @@ impl TrustCenter {
     /// Shorter Smart Energy legacy formats remain available through
     /// [`zigbee_crypto::derive_install_code_key`], but BDB Zigbee 3.0
     /// commissioning requires the full 18-byte value.
-    pub fn provision_install_code(
+    ///
+    /// The AES-MMO hash runs on `aes`, the platform AES provider (normally
+    /// the MAC, which uses the hardware engine where one is installed).
+    pub fn provision_install_code<P: ForwardAesProvider>(
         &mut self,
+        aes: &mut P,
         ieee: IeeeAddress,
         install_code: &[u8],
     ) -> Result<[u8; 16], TrustCenterError> {
@@ -173,8 +177,8 @@ impl TrustCenter {
                 InstallCodeError::InvalidLength,
             ));
         }
-        let key =
-            derive_install_code_key(install_code).map_err(TrustCenterError::InvalidInstallCode)?;
+        let key = derive_install_code_key_with(aes, install_code)
+            .map_err(TrustCenterError::InvalidInstallCode)?;
         self.set_link_key(ieee, key, TcKeyType::InstallCode)?;
         Ok(key)
     }
