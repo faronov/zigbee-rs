@@ -320,7 +320,8 @@ impl<B: SeBus> SeAes<B> {
 
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 mod hw {
-    /// `SEMAILBOX_S_HOST_BASE` (efr32mg21a010f1024im32.h; same on xG24).
+    /// `SEMAILBOX_S_HOST_BASE` (efr32mg21a010f1024im32.h,
+    /// efr32mg24a410f1536im48.h).
     const SEMAILBOX_HOST_BASE: u32 = 0x4C00_0000;
 
     pub(crate) struct Mmio;
@@ -336,6 +337,26 @@ mod hw {
         }
         fn bus_address(&self, ptr: *const u8) -> u32 {
             ptr as u32
+        }
+        #[cfg(feature = "efr32mg24")]
+        fn enable_clock(&mut self) {
+            crate::clock::enable_bus_clock(crate::chip::BusClock::SEMAILBOXHOST);
+        }
+        /// xG24: the SE TRNG (`crate::se`) is the other mailbox client.
+        #[cfg(feature = "efr32mg24")]
+        fn lock(&mut self) -> Result<(), super::AesError> {
+            crate::se::lock_mailbox().map_err(|error| match error {
+                crate::se::SeError::Poisoned => super::AesError::Poisoned,
+                _ => super::AesError::MailboxBusy,
+            })
+        }
+        #[cfg(feature = "efr32mg24")]
+        fn unlock(&mut self) {
+            crate::se::unlock_mailbox();
+        }
+        #[cfg(feature = "efr32mg24")]
+        fn poison_mailbox(&mut self) {
+            crate::se::poison_mailbox();
         }
     }
 }

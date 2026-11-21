@@ -3,11 +3,12 @@
 //! Each Series 2 chip has a different crypto block, so the engine behind
 //! `AesEngine` is selected by the chip feature:
 //!
-//! - **xG21** (`se`): the HSE Secure Engine. The host never touches the
+//! - **xG21, xG24** (`se`): the HSE Secure Engine. The host never touches the
 //!   AES core; it posts an `AES_ENCRYPT | MODE_ECB` command with a plaintext
 //!   key through the `SEMAILBOX_HOST` FIFO and the SE fetches key and block
 //!   from RAM with its own DMA (GSDK 4.5 `sl_se_aes_crypt_ecb`,
-//!   `em_se.c SE_executeCommand`). The same mailbox exists on xG24.
+//!   `em_se.c SE_executeCommand`). On xG24 the mailbox is shared with the
+//!   SE TRNG (`crate::se`) through one lock and one poisoned flag.
 //! - **xG22** (`cryptoacc`): CRYPTOACC, a Silex BA411E AES core behind the
 //!   CRYPTOMASTER scatter/gather DMA (GSDK 4.5 `sl_cryptoacc_library`
 //!   `sx_blk_cipher_ecb` / `cryptodma_internal.c`). The xG22 VSE mailbox is
@@ -50,16 +51,20 @@
 
 #[cfg(feature = "efr32mg22")]
 pub mod cryptoacc;
-#[cfg(feature = "efr32mg21")]
+#[cfg(any(feature = "efr32mg21", feature = "efr32mg24"))]
 pub mod se;
 
 #[cfg(all(feature = "efr32mg22", target_arch = "arm", target_os = "none"))]
 pub use cryptoacc::AesEngine;
-#[cfg(all(feature = "efr32mg21", target_arch = "arm", target_os = "none"))]
+#[cfg(all(
+    any(feature = "efr32mg21", feature = "efr32mg24"),
+    target_arch = "arm",
+    target_os = "none"
+))]
 pub use se::AesEngine;
 
-/// Exclusive ownership of the chip's AES engine (xG21: the AES service of
-/// the Secure Engine mailbox; xG22: the CRYPTOACC AES core and its DMA).
+/// Exclusive ownership of the chip's AES engine (xG21/xG24: the AES service
+/// of the Secure Engine mailbox; xG22: the CRYPTOACC AES core and its DMA).
 ///
 /// Created once by [`crate::peripherals::Peripherals::take`].
 pub struct Crypto {

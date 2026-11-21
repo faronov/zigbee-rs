@@ -114,6 +114,7 @@ async fn main(_spawner: Spawner) {
         rtcc,
         wdog: _,
         flash,
+        crypto,
     } = BoardResources::take().unwrap_or_else(|| halt());
     if product::board::init_clocks(clocks).is_err() {
         halt()
@@ -145,7 +146,7 @@ async fn main(_spawner: Spawner) {
         halt()
     }
 
-    let app = compose(radio, flash);
+    let app = compose(radio, crypto, flash);
     if let Err(error) = app.initialize().await {
         fatal(app.parts_mut(), error);
     }
@@ -176,12 +177,17 @@ async fn main(_spawner: Spawner) {
 #[inline(never)]
 fn compose(
     radio: efr32s2_hal::radio::RadioToken,
+    crypto: efr32s2_hal::crypto::Crypto,
     flash: efr32s2_hal::flash::Efr32s2Flash,
 ) -> &'static mut App {
     // Fails with `Unsupported` until the xG24 radio tables are captured.
     let mac: Mac = Efr32s2RadioPhy::new(radio)
         .map_err(|error| log::error!("[MG24] radio init failed: {error:?}"))
-        .and_then(|phy| {
+        .and_then(|mut phy| {
+            // Secure Engine AES with its on-silicon KAT; no software AES.
+            phy.install_aes_engine(crypto)
+                .map_err(|error| log::error!("[MG24] AES engine failed: {error:?}"))?;
+            log::info!("[MG24] AES_KAT_PASS SE mailbox");
             phy.into_parent_mac()
                 .map_err(|error| log::error!("[MG24] MAC init failed: {error:?}"))
         })

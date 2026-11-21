@@ -27,6 +27,12 @@
 //! completion only writes memory nobody uses, and its response cannot be
 //! taken for the answer to a later command. Nothing is published from a
 //! failed request: the caller's buffer is zeroed.
+//!
+//! The AES engine (`crate::crypto::se`) is the other client of this
+//! mailbox and follows the same discipline: it takes the lock through
+//! `lock_mailbox`, keeps its descriptors and data in its own owned static
+//! area (`SE_DMA`) and poisons the mailbox for both clients through
+//! `poison_mailbox` when one of its commands is not answered.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -128,6 +134,27 @@ impl MailboxLock {
 /// The image's only SE mailbox. Thread mode only.
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 static MAILBOX: MailboxLock = MailboxLock::new();
+
+/// Take the mailbox for one request of another SE client (the AES engine,
+/// `crate::crypto::se`). The client must keep every DMA area it hands to
+/// the SE in owned static memory, like `TRNG_DMA`.
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+pub(crate) fn lock_mailbox() -> Result<(), SeError> {
+    MAILBOX.lock()
+}
+
+/// Release the mailbox after [`lock_mailbox`].
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+pub(crate) fn unlock_mailbox() {
+    MAILBOX.unlock();
+}
+
+/// A client's command was not answered (or not accepted): refuse every
+/// later request of every client until reset.
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+pub(crate) fn poison_mailbox() {
+    MAILBOX.poison();
+}
 
 /// `SE_DataTransfer_t`.
 #[repr(C)]

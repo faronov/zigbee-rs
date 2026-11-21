@@ -2979,6 +2979,7 @@ jobs:
         run: |
           OUT=target/efr32mg24
           mkdir -p "$OUT"
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           for example in ncp router; do
             for board in rf-bm-mg24b1 sonoff-dongle-m; do
               if [ "$board" = rf-bm-mg24b1 ]; then
@@ -2990,6 +2991,16 @@ jobs:
               FLAGS=()
               if [ "$example" = ncp ]; then FLAGS=(--ncp); fi
               python3 examples/efr32mg24-ncp/tools/verify-layout.py "${FLAGS[@]}" "$ELF"
+              # Secure Engine AES only; the RustCrypto core must be absent.
+              SYMS="$("$NM" --demangle "$ELF")"
+              if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
+                echo "$ELF still links software AES" >&2
+                exit 1
+              fi
+              if ! grep -q 'efr32s2_hal::crypto::se::SE_DMA' <<<"$SYMS"; then
+                echo "$ELF is missing the Secure Engine AES backend" >&2
+                exit 1
+              fi
               NAME="efr32mg24-$example-$board"
               cargo run --quiet --locked -p efr32-gbl -- app --elf "$ELF" --out "$OUT/$NAME"
               cargo run --quiet --locked -p efr32-gbl -- parse "$OUT/$NAME.gbl"

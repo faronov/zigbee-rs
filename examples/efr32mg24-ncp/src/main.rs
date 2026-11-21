@@ -143,6 +143,7 @@ fn reset_reason(cause: ResetCause) -> u8 {
 struct Started {
     host: Host,
     radio: efr32s2_hal::radio::RadioToken,
+    crypto: efr32s2_hal::crypto::Crypto,
     flash: efr32s2_hal::flash::Efr32s2Flash,
 }
 
@@ -156,6 +157,7 @@ fn start() -> Started {
         rtcc,
         wdog: _,
         flash,
+        crypto,
     } = BoardResources::take().unwrap_or_else(|| halt());
     // SAFETY: called once before anything logs.
     unsafe { log::set_logger_racy(&LOGGER) }.ok();
@@ -175,6 +177,7 @@ fn start() -> Started {
     Started {
         host: Host::new(uart),
         radio,
+        crypto,
         flash,
     }
 }
@@ -185,7 +188,12 @@ async fn main(_spawner: Spawner) {
     let _ =
         unsafe { core::ptr::read_volatile(&product::gecko::APPLICATION_PROPERTIES.struct_version) };
     let (cause, _raw) = take_reset_cause();
-    let Started { host, radio, flash } = start();
+    let Started {
+        host,
+        radio,
+        crypto,
+        flash,
+    } = start();
     static HOST: StaticCell<Host> = StaticCell::new();
     let host = HOST.init(host);
 
@@ -203,7 +211,7 @@ async fn main(_spawner: Spawner) {
         let mixed = low ^ efr32s2_hal::delay::cycles() ^ efr32s2_hal::rtcc::now().rotate_left(16);
         if mixed == 0 { 1 } else { mixed }
     };
-    let (port, opened) = compose(radio, flash);
+    let (port, opened) = compose(radio, crypto, flash);
     match opened {
         Opened::Existing => log::info!("NV journals preserved"),
         Opened::Fresh => log::warn!("blank/foreign NV erased"),
@@ -240,6 +248,7 @@ async fn main(_spawner: Spawner) {
 #[inline(never)]
 fn compose(
     radio: efr32s2_hal::radio::RadioToken,
+    crypto: efr32s2_hal::crypto::Crypto,
     flash: efr32s2_hal::flash::Efr32s2Flash,
 ) -> (Port, Opened) {
     static PROFILE: StaticCell<Profile> = StaticCell::new();
@@ -249,7 +258,7 @@ fn compose(
         DeviceId::COMBINED_INTERFACE,
         RangeExtender,
     ));
-    let (device, ieee) = compose_device(radio, profile);
+    let (device, ieee) = compose_device(radio, crypto, profile);
     let (stores, opened) = stores::open(flash, product::ROLE_TAG).unwrap_or_else(|_| halt());
     let stores::Stores {
         security,
@@ -283,13 +292,22 @@ fn compose(
 #[inline(never)]
 fn compose_device(
     radio: efr32s2_hal::radio::RadioToken,
+    crypto: efr32s2_hal::crypto::Crypto,
     profile: &Profile,
 ) -> (&'static mut ZigbeeDevice<Mac, Router>, [u8; 8]) {
     static DEVICE: StaticCell<ZigbeeDevice<Mac, Router>> = StaticCell::new();
     // Fails with `Unsupported` until the xG24 radio tables are captured.
     let mac: Mac = Efr32s2RadioPhy::new(radio)
         .ok()
-        .and_then(|phy| phy.into_parent_mac().ok())
+        .and_then(|mut phy| {
+            // Secure Engine AES with its on-silicon KAT; no software AES.
+            if let Err(error) = phy.install_aes_engine(crypto) {
+                log::error!("AES engine failed: {error:?}");
+                return None;
+            }
+            log::info!("AES_KAT_PASS SE mailbox");
+            phy.into_parent_mac().ok()
+        })
         .unwrap_or_else(|| halt());
     let ieee = mac.pib().extended_address();
     if ieee == [0; 8] || ieee == [0xFF; 8] {

@@ -526,6 +526,7 @@ or lacks the engine symbols.
 | Chip | Engine | Reference |
 | --- | --- | --- |
 | xG21 (BRD4181A, ZBT-1) | HSE Secure Engine: `AES_ENCRYPT \| MODE_ECB` command with a plaintext AES-128 keyspec (`0x10`) through the `SEMAILBOX_HOST` FIFO; the SE reads key and block by DMA from a static descriptor area | GSDK 4.5 `sl_se_aes_crypt_ecb`, `sli_se_key_to_keyspec`, `em_se.c SE_executeCommand`, `efr32mg21_semailbox.h` |
+| xG24 (RF-BM-MG24B1, Dongle-M) | Same Secure Engine command as xG21; the `SEMAILBOXHOST` bus clock is opened per request and the mailbox lock is shared with the SE TRNG (`efr32s2_hal::se`) | as xG21, `efr32mg24_semailbox.h`, `efr32mg24_cmu.h` |
 | xG22 (BRD4183A) | CRYPTOACC Silex BA411E behind the CRYPTOMASTER scatter/gather DMA: config, key and block fetch descriptors, one push descriptor | GSDK 4.5 `sx_blk_cipher_ecb`, `cryptodma_internal.c`, `ba411e_config.h`, `cryptoacc_management.c` |
 
 Code: `efr32s2-hal/src/crypto/{mod,se,cryptoacc}.rs` (mechanism, bounded
@@ -549,6 +550,13 @@ Ownership and conflicts:
   mailbox for the image's other SE clients) until reset, because its late
   response would be read as the answer to the next command. An unread
   response left by an earlier client is drained before each request.
+- **SE mailbox on xG24.** The SE TRNG and the AES engine are two clients
+  of one mailbox with one discipline: `se::MailboxLock` serializes them,
+  each keeps its DMA descriptors and buffers in its own owned static area
+  (`se::TRNG_DMA`, `crypto::se::SE_DMA`) that it only touches while holding
+  the lock, and a submitted command that is not answered (or is rejected
+  with `TXERROR`) in either one poisons the mailbox for both until reset.
+  A late SE completion therefore only writes an area nobody reads again.
 - **CRYPTOACC (xG22).** The TRNG (`efr32s2_hal::trng`, BA431 block, used by
   the Green Power Device for key provisioning) and the AES core share the
   CRYPTOACC bus/AES/PK clock gates. `clock::cryptoacc_acquire/release` keep
@@ -576,6 +584,10 @@ Validation level:
   per-request clock gating. Built and gated only: the always-on ED, the
   loader-linked images and the GPD switch. EM2 current with the engine was
   not measured.
+- **xG24 Secure Engine: compiles and host-tested only** (same model as
+  xG21). The NCP and Router images still stop at `Efr32s2RadioPhy::new`
+  (no xG24 radio tables yet), before the engine is installed, and no MG24
+  board was attached.
 - **xG21 Secure Engine: compiles and host-tested only.** The mailbox
   protocol, descriptor lists and fault handling run against a behavioural
   model with the shared `zigbee-crypto` KAT suite, but no MG21 or ZBT-1
