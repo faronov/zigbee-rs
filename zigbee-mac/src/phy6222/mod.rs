@@ -11,7 +11,11 @@
 //!   probes. `LL_IRQ` owns the Imm-Ack but has no Frame Pending table, so
 //!   [`RadioPhy::set_ack_frame_pending`] stays `Unsupported` and indirect
 //!   delivery fails explicitly;
-//! - the factory EUI-64 (chip MADDR or the `OWN_PUBLIC_ADDR_LOC` record).
+//! - the factory EUI-64 (chip MADDR or the `OWN_PUBLIC_ADDR_LOC` record);
+//! - [`Phy6222Aes`]: the mandatory AES-128 block backend. The composition
+//!   root installs it with [`Phy6222RadioPhy::install_aes_engine`] (startup
+//!   known-answer test); without a validated engine no MAC is built, and
+//!   NWK/APS CCM*, AES-MMO and the Trust Center never use software AES.
 //!
 //! All radio configuration uses direct register access in [`driver`]; the
 //! register values are transcribed from the PHYPLUS PHY62xx SDK
@@ -30,6 +34,7 @@
 //!   the interrupt starts each ACK itself with a tuned TX settle delay. The
 //!   frame-pending bit is always clear (end device only).
 
+pub mod aes;
 pub mod driver;
 
 use crate::pib::MacPib;
@@ -37,6 +42,7 @@ use crate::{
     AckResult, AckWaitTx, MacError, MacRole, Parent, PhyAddressFilter, PhyCapabilities, PhyError,
     PhyRxFrame, PlatformServices, RadioPhy, SoftMacCore,
 };
+pub use aes::{Phy6222Aes, Phy6222AesError};
 use driver::{Phy6222Driver, RadioConfig, RadioError};
 use embassy_time::{Duration, Instant, Timer};
 use zigbee_types::IeeeAddress;
@@ -44,6 +50,8 @@ use zigbee_types::IeeeAddress;
 /// PHY62x2 radio exposed through the portable PHY contract.
 pub struct Phy6222RadioPhy {
     driver: Phy6222Driver,
+    /// Validated AES block; `None` until [`Self::install_aes_engine`].
+    aes: Option<Phy6222Aes>,
 }
 
 /// Shared software MAC (end-device role) over the PHY62x2 radio.
@@ -93,7 +101,27 @@ impl Phy6222RadioPhy {
             ieee[6],
             ieee[7]
         );
-        Some(Self { driver })
+        Some(Self { driver, aes: None })
+    }
+
+    /// Take ownership of the AES block after its known-answer test passes.
+    ///
+    /// On failure the engine is dropped (the block stays unowned for this
+    /// boot) and the MAC constructors keep refusing; the composition root
+    /// must not start Zigbee.
+    pub fn install_aes_engine(&mut self, mut aes: Phy6222Aes) -> Result<(), Phy6222AesError> {
+        aes.self_test()?;
+        self.aes = Some(aes);
+        Ok(())
+    }
+
+    /// `SecurityError` unless a validated AES engine is installed.
+    fn require_aes(&self) -> Result<(), MacError> {
+        if self.aes.is_some() {
+            Ok(())
+        } else {
+            Err(MacError::SecurityError)
+        }
     }
 
     /// Factory EUI-64 in over-the-air (little-endian) order.
@@ -108,18 +136,24 @@ impl Phy6222RadioPhy {
     /// generator). From here on the PIB owns the channel and
     /// `phyTransmitPower` (0 dBm by default), so `RadioConfig::tx_power`
     /// only applies until the MAC takes over.
+    ///
+    /// Fails with `SecurityError` unless [`Self::install_aes_engine`]
+    /// succeeded.
     #[inline(never)]
     pub fn into_soft_mac(self) -> Result<Phy6222SoftMac, MacError> {
+        self.require_aes()?;
         let pib = MacPib::new(self.extended_address(), 0, 0);
         SoftMacCore::new(self, pib)
     }
 
     /// Build a parent-role MAC, normally [`Phy6222RouterMac`], with the same
-    /// PIB as [`Self::into_soft_mac`]. Kept out of line like it.
+    /// PIB and AES requirement as [`Self::into_soft_mac`]. Kept out of line
+    /// like it.
     #[inline(never)]
     pub fn into_parent_mac<R: MacRole, const RX: usize>(
         self,
     ) -> Result<SoftMacCore<Self, R, RX>, MacError> {
+        self.require_aes()?;
         let pib = MacPib::new(self.extended_address(), 0, 0);
         SoftMacCore::new_custom(self, pib)
     }
@@ -318,7 +352,19 @@ impl RadioPhy for Phy6222RadioPhy {
     }
 }
 
-impl zigbee_crypto::ForwardAesProvider for Phy6222RadioPhy {}
+/// Every CCM*/AES-MMO block runs on the installed AES block; there is no
+/// software fallback. Engine errors propagate (the frame is dropped).
+impl zigbee_crypto::ForwardAesProvider for Phy6222RadioPhy {
+    fn forward_cipher(
+        &mut self,
+        key: &zigbee_crypto::AesKey,
+    ) -> impl zigbee_crypto::Aes128Forward + '_ {
+        aes::Phy6222HardwareAes128 {
+            engine: self.aes.as_mut(),
+            key: *key,
+        }
+    }
+}
 
 impl PlatformServices for Phy6222RadioPhy {
     fn monotonic_micros(&self) -> u32 {

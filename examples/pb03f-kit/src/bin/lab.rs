@@ -1,7 +1,10 @@
 //! PB-03F-Kit hardware lab: proves ROM boot, the 48 MHz clock switch, the
 //! CH340 UART console, the five LEDs, the user button, internal-flash
 //! erase/program/read on a spare sector and the ADC supply monitor (P14
-//! driven high), independently of the Zigbee stack.
+//! driven high), independently of the Zigbee stack. It also runs the
+//! AES-128 block's known-answer test and samples its status register around
+//! one single-mode block (`zigbee_mac::phy6222::Phy6222Aes`), to prove the
+//! completion semantics the production engine does not rely on yet.
 //!
 //! Results are printed on the console and mirrored into `LAB_RESULT` so they
 //! can also be read over SWD.
@@ -14,6 +17,7 @@ use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use panic_halt as _;
 use pb03f_kit::{Resources, time};
 use phy6222_hal::clock;
+use zigbee_mac::phy6222::{Phy6222Aes, Phy6222AesError};
 
 /// Spare sector below the product security journal (0x7e000..0x80000).
 const FLASH_TEST_OFFSET: u32 = 0x0007_d000;
@@ -30,6 +34,17 @@ pub struct LabResult {
     flash_status: u32,
     /// Last supply reading in mV (`u32::MAX` = ADC error).
     supply_mv: u32,
+    /// 0 = AES-128 KAT passed, 1 = engine already taken, 2 = clock
+    /// unavailable, 0x10 + n = vector n mismatched.
+    aes_kat: u32,
+    /// Status register (`0x4004_0014`) samples around one block: before
+    /// start, right after start, after the fixed wait, after stop.
+    aes_status: [u32; 4],
+    /// Status reads until the single-mode done bit (`u32::MAX`: never).
+    aes_polls_until_done: u32,
+    /// Smallest completion wait (CPU cycles) that passed the KAT in the
+    /// sweep (`u32::MAX`: none).
+    aes_min_wait_cycles: u32,
     loops: u32,
 }
 
@@ -44,6 +59,10 @@ pub static mut LAB_RESULT: LabResult = LabResult {
     hclk_hz: 0,
     flash_status: 0,
     supply_mv: 0,
+    aes_kat: u32::MAX,
+    aes_status: [0; 4],
+    aes_polls_until_done: 0,
+    aes_min_wait_cycles: u32::MAX,
     loops: 0,
 };
 
@@ -87,6 +106,53 @@ fn flash_test(flash: &mut pb03f_kit::InternalFlash) -> u32 {
         return 5;
     }
     0
+}
+
+fn aes_code(result: Result<(), Phy6222AesError>) -> u32 {
+    match result {
+        Ok(()) => 0,
+        Err(Phy6222AesError::ClockUnavailable) => 2,
+        Err(Phy6222AesError::KnownAnswerTestFailed(vector)) => 0x10 + u32::from(vector),
+        Err(_) => 3,
+    }
+}
+
+/// AES-128 block: production KAT, status probe, and a completion-wait
+/// sweep (smallest passing wait), ending with the production wait and a
+/// passing KAT again.
+fn aes_test(r: &mut LabResult, uart: &mut impl Write) {
+    let Some(mut aes) = Phy6222Aes::take() else {
+        r.aes_kat = 1;
+        return;
+    };
+    r.aes_kat = aes_code(aes.self_test());
+    if let Ok(probe) = aes.completion_probe() {
+        r.aes_status = [
+            probe.status_before_start,
+            probe.status_after_start,
+            probe.status_after_wait,
+            probe.status_after_stop,
+        ];
+        r.aes_polls_until_done = probe.polls_until_done.unwrap_or(u32::MAX);
+        let _ = writeln!(uart, "AES probe: {:?}", probe);
+    }
+    for cycles in [8, 16, 32, 64, 128, 256, 512] {
+        if aes.set_completion_cycles(cycles).is_ok() && aes.self_test().is_ok() {
+            r.aes_min_wait_cycles = cycles;
+            break;
+        }
+    }
+    let restored = aes
+        .set_completion_cycles(zigbee_mac::phy6222::aes::COMPLETION_WAIT_CYCLES)
+        .and_then(|()| aes.self_test());
+    if restored.is_err() {
+        r.aes_kat = aes_code(restored);
+    }
+    let _ = writeln!(
+        uart,
+        "AES-128 KAT: {} (0 = pass), min passing wait {} cycles",
+        r.aes_kat, r.aes_min_wait_cycles
+    );
 }
 
 #[cortex_m_rt::entry]
@@ -137,6 +203,9 @@ fn main() -> ! {
         FLASH_TEST_OFFSET, r.flash_status
     );
     r.magic = 0x1ab0_0004;
+
+    aes_test(r, &mut uart);
+    r.magic = 0x1ab0_0005;
 
     let mut supply = supply_monitor.into_monitor();
 

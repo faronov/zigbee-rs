@@ -2360,10 +2360,7 @@ jobs:
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           sh examples/phy6222-sensor/check-layout.sh "$ELF"
           SYMS="$("$NM" --demangle "$ELF")"
-          if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
-            echo "PHY6222 image is missing its currently supported software AES backend" >&2
-            exit 1
-          fi
+          tools/check-phy62x2-aes.sh "$ELF"
           PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
           if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
             echo "PHY6222 sensor links parent/router maintenance symbols:" >&2
@@ -2400,6 +2397,7 @@ jobs:
           cargo build --release --locked --no-default-features --features phy6252 \
             --target-dir target/phy6252
           sh check-layout.sh target/phy6252/thumbv6m-none-eabi/release/phy6222-sensor
+          ../../tools/check-phy62x2-aes.sh target/phy6252/thumbv6m-none-eabi/release/phy6222-sensor
       # Role template: always-on End Devices fit; the Routers exceed the XIP
       # slot and their links are rejected by the product linker scripts.
       - name: PHY62x2 End Devices build, Routers are rejected at link time
@@ -2410,6 +2408,7 @@ jobs:
               --features "production,$chip,ed" --bin phy6222-ed --target-dir "target/$chip-ed"
             ELF="target/$chip-ed/thumbv6m-none-eabi/release/phy6222-ed"
             sh check-layout.sh "$ELF"
+            ../../tools/check-phy62x2-aes.sh "$ELF"
             ../../tools/check-role-symbols.sh leaf "$ELF"
           done
           ../../tools/check-role-symbols.sh leaf \
@@ -2459,12 +2458,13 @@ jobs:
       # products/pb03f-kit/link/memory.x: XIP slot 0x10100..0x40fff
       # (200,448 B). The radio lab has no flash-write path and is not
       # subject to the SRAM flash-operation checks.
-      - name: Check PB-03F-Kit layout
+      - name: Check PB-03F-Kit layout and AES backend
         run: |
           for BIN in pb03f-zigbee pb03f-lab; do
             XIP_SLOT_BYTES=200448 sh examples/phy6222-sensor/check-layout.sh \
               "examples/pb03f-kit/target/thumbv6m-none-eabi/release/$BIN"
           done
+          tools/check-phy62x2-aes.sh examples/pb03f-kit/target/thumbv6m-none-eabi/release/pb03f-zigbee
       # Role template: the always-on End Device fits; the Router exceeds the
       # 200,448 B XIP slot and its link is rejected.
       - name: PB-03F-Kit End Device builds, Router is rejected at link time
@@ -2474,6 +2474,7 @@ jobs:
             --bin pb03f-ed --target-dir target/ed
           ELF=target/ed/thumbv6m-none-eabi/release/pb03f-ed
           XIP_SLOT_BYTES=200448 sh ../phy6222-sensor/check-layout.sh "$ELF"
+          ../../tools/check-phy62x2-aes.sh "$ELF"
           ../../tools/check-role-symbols.sh leaf "$ELF" \
             target/thumbv6m-none-eabi/release/pb03f-zigbee
           if cargo build --release --locked --no-default-features --features router \
