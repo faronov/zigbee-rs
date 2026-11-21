@@ -551,10 +551,13 @@ cargo install mdbook --version 0.5.4 --locked
 mdbook build docs/book
 ```
 
-The CI `deploy-site` job publishes this book to GitHub Pages, together with the
-ESP web flasher (`docs/flasher/index.html`, assembled by
-`tools/prepare-pages.py`). Deployment is intentionally gated to pushes on
-`main`/`master`.
+The CI `deploy-site` job (`.github/workflows/site.yml`) publishes this book to
+GitHub Pages, together with the release web flasher (`docs/flasher/index.html`,
+images of tagged releases, see the book's "Web Flasher" chapter) and the CI
+sensor flasher (`docs/flasher/sensor.html` at `/flasher/sensor/`), assembled by
+`tools/prepare-pages.py`. Deployment is intentionally gated to pushes on
+`main`/`master`; other runs build the site as a preview artifact.
+`site-refresh.yml` republishes it when releases change.
 Documentation can deploy after its core/code checks succeed even when a
 required firmware job fails, but prebuilt binaries and one-click installation
 require successful firmware jobs. Removing artificial size budgets does not

@@ -3,436 +3,327 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Zigbee-RS ESP Web Flasher</title>
+  <title>zigbee-rs web flasher</title>
   <style>
     :root {
-      --bg: #0d1117;
-      --surface: #161b22;
-      --border: #30363d;
-      --text: #e6edf3;
-      --muted: #8b949e;
-      --accent: #58a6ff;
-      --green: #3fb950;
-      --red: #f85149;
-      --orange: #d29922;
+      --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #e6edf3;
+      --muted: #8b949e; --accent: #58a6ff; --green: #3fb950; --red: #f85149; --orange: #d29922;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+    * { box-sizing: border-box; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      padding: 2rem 1rem;
+      background: var(--bg); color: var(--text); margin: 0; padding: 2rem 1rem;
+      display: flex; flex-direction: column; align-items: center; line-height: 1.45;
     }
-    h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
-    .subtitle { color: var(--muted); margin-bottom: 2rem; }
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 2rem;
-      max-width: 520px;
-      width: 100%;
-    }
-    .card h2 { font-size: 1.1rem; margin-bottom: 1rem; }
-    .step {
-      display: flex;
-      align-items: flex-start;
-      gap: 1rem;
-      margin-bottom: 1.5rem;
-    }
-    .step-num {
-      background: var(--accent);
-      color: var(--bg);
-      width: 28px;
-      height: 28px;
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 700;
-      font-size: 0.85rem;
-      flex-shrink: 0;
-    }
-    .step-content { flex: 1; }
-    .step-content label { display: block; font-weight: 600; margin-bottom: 0.4rem; }
-    .step-content p { color: var(--muted); font-size: 0.85rem; line-height: 1.4; }
-    select, input[type="file"] {
-      width: 100%;
-      padding: 0.6rem 0.8rem;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      background: var(--bg);
-      color: var(--text);
-      font-size: 0.9rem;
-      margin-top: 0.4rem;
-    }
-    select:focus, input[type="file"]:focus { outline: 2px solid var(--accent); }
-    button {
-      padding: 0.7rem 1.5rem;
-      border: none;
-      border-radius: 6px;
-      font-size: 1rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: opacity 0.2s;
-      width: 100%;
-    }
-    button:hover { opacity: 0.85; }
-    button:disabled { opacity: 0.4; cursor: not-allowed; }
-    .btn-connect {
-      background: var(--accent);
-      color: var(--bg);
-      margin-bottom: 0.8rem;
-    }
-    .btn-flash {
-      background: var(--green);
-      color: var(--bg);
-    }
-    .btn-disconnect {
-      background: var(--border);
-      color: var(--text);
-      margin-bottom: 0.8rem;
-    }
-    #log {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 1rem;
-      margin-top: 1.5rem;
-      max-height: 300px;
-      overflow-y: auto;
-      font-family: 'SF Mono', 'Fira Code', monospace;
-      font-size: 0.8rem;
-      line-height: 1.6;
-      white-space: pre-wrap;
-      word-break: break-all;
-    }
-    .log-info { color: var(--accent); }
-    .log-ok { color: var(--green); }
-    .log-err { color: var(--red); }
-    .log-warn { color: var(--orange); }
-    .progress-bar {
-      width: 100%;
-      height: 6px;
-      background: var(--border);
-      border-radius: 3px;
-      margin-top: 0.8rem;
-      overflow: hidden;
-      display: none;
-    }
-    .progress-fill {
-      height: 100%;
-      background: var(--green);
-      border-radius: 3px;
-      width: 0%;
-      transition: width 0.3s;
-    }
-    .chip-info {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 0.8rem;
-      margin-bottom: 1rem;
-      display: none;
-    }
-    .chip-info span { color: var(--green); font-weight: 600; }
-    .warning {
-      background: rgba(210, 153, 34, 0.1);
-      border: 1px solid var(--orange);
-      border-radius: 6px;
-      padding: 0.8rem;
-      font-size: 0.85rem;
-      color: var(--orange);
-      margin-top: 1.5rem;
-      line-height: 1.4;
-    }
+    main { max-width: 760px; width: 100%; }
+    h1 { font-size: 1.7rem; margin: 0 0 .3rem; }
+    h2 { font-size: 1.05rem; margin: 0 0 .7rem; }
+    .subtitle, .muted { color: var(--muted); }
+    .subtitle { margin: 0 0 1.5rem; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.3rem 1.5rem; margin-bottom: 1rem; }
+    select { width: 100%; padding: .55rem .7rem; border: 1px solid var(--border); border-radius: 6px;
+      background: var(--bg); color: var(--text); font-size: .95rem; }
+    dl { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; margin: .8rem 0 0; font-size: .9rem; }
+    dt { color: var(--muted); }
+    dd { margin: 0; word-break: break-word; }
+    code, .mono { font-family: 'SF Mono', 'Fira Code', Consolas, monospace; font-size: .82rem; }
+    table { width: 100%; border-collapse: collapse; font-size: .82rem; margin-top: .6rem; }
+    th, td { text-align: left; padding: .3rem .4rem; border-top: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; }
+    td.hash { word-break: break-all; }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .footer { margin-top: 2rem; color: var(--muted); font-size: 0.8rem; }
-    .unsupported {
-      text-align: center;
-      padding: 3rem;
-      color: var(--red);
+    .note, .warn, .danger { border-radius: 6px; padding: .7rem .9rem; font-size: .9rem; margin-top: .8rem; }
+    .note { border: 1px solid var(--border); background: var(--bg); }
+    .warn { border: 1px solid var(--orange); background: rgba(210,153,34,.1); }
+    .danger { border: 1px solid var(--red); background: rgba(248,81,73,.1); }
+    .warn strong { color: var(--orange); }
+    .danger strong { color: var(--red); }
+    label.check { display: flex; gap: .6rem; align-items: flex-start; cursor: pointer; font-weight: 600; }
+    label.check input { margin-top: .3rem; transform: scale(1.2); }
+    .badge { display: inline-block; font-size: .72rem; padding: .05rem .45rem; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); margin-left: .4rem; }
+    .badge.pre { border-color: var(--orange); color: var(--orange); }
+    .install { text-align: center; }
+    esp-web-install-button button, .button {
+      background: var(--green); color: var(--bg); border: none; border-radius: 6px;
+      padding: .8rem 1.6rem; font-size: 1rem; font-weight: 600; cursor: pointer;
     }
-    .quick-install {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 2rem;
-      max-width: 520px;
-      width: 100%;
-      margin-bottom: 1.5rem;
-      text-align: center;
-    }
-    .quick-install h2 { font-size: 1.1rem; margin-bottom: 1rem; }
-    .quick-install p { color: var(--muted); font-size: 0.85rem; margin-top: 0.8rem; }
-    .install-row {
-      display: flex;
-      gap: 1rem;
-      justify-content: center;
-      flex-wrap: wrap;
-    }
-    esp-web-install-button {
-      display: inline-block;
-    }
-    esp-web-install-button button {
-      background: var(--green);
-      color: var(--bg);
-      border: none;
-      border-radius: 6px;
-      padding: 0.8rem 1.5rem;
-      font-size: 1rem;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    esp-web-install-button button:hover { opacity: 0.85; }
-    .divider {
-      max-width: 520px;
-      width: 100%;
-      text-align: center;
-      color: var(--muted);
-      font-size: 0.85rem;
-      margin-bottom: 1.5rem;
-      display: flex;
-      align-items: center;
-      gap: 1rem;
-    }
-    .divider::before, .divider::after {
-      content: '';
-      flex: 1;
-      border-top: 1px solid var(--border);
-    }
+    esp-web-install-button.erase button { background: var(--red); }
+    .button.secondary { background: var(--border); color: var(--text); font-size: .9rem; padding: .5rem 1rem; }
+    ol { padding-left: 1.2rem; margin: .4rem 0; }
+    li { margin: .25rem 0; }
+    .hidden { display: none; }
+    footer { color: var(--muted); font-size: .8rem; margin-top: 1.5rem; text-align: center; }
   </style>
 </head>
 <body>
-  <h1>⚡ Zigbee-RS ESP Web Flasher</h1>
-  <p class="subtitle">Flash Zigbee firmware to ESP32-C6 / ESP32-H2 from your browser</p>
+<main>
+  <h1>zigbee-rs web flasher</h1>
+  <p class="subtitle">Released firmware for the ZRHP NCP (zigbee-rs as a Zigbee coordinator for zigpy/ZHA,
+    Zigbee2MQTT and the zigbee-rs hub) and for the hub itself. Every image comes from a tagged
+    <a href="https://github.com/faronov/zigbee-rs/releases">GitHub release</a>.
+    Needs Chrome or Edge on a desktop (Web Serial).</p>
 
-  <!-- Quick install with pre-built firmware (ESP Web Tools) -->
-  <div class="quick-install" id="quick-install">
-    <h2>🚀 One-click install (CI-qualified build)</h2>
-    <div class="install-row">
-      <!-- PREBUILT_INSTALL_START -->
-      <button disabled>Prebuilt firmware unavailable</button>
-      <!-- PREBUILT_INSTALL_END -->
-    </div>
-    <p id="firmware-status">
-      <!-- PREBUILT_STATUS_START -->
-      Prebuilt firmware is enabled only by a site publication with passing firmware checks.
-      <!-- PREBUILT_STATUS_END -->
-    </p>
+  <div id="unsupported" class="card danger hidden">
+    <strong>This browser has no Web Serial.</strong> Use Chrome or Edge (version 89 or later) on Windows, macOS or Linux.
+    Firefox and Safari cannot flash. The images and esptool commands are on the release pages.
   </div>
 
-  <div class="divider">or flash a custom .bin file</div>
-
-  <div class="card" id="main-card">
-    <div id="unsupported" class="unsupported" style="display:none">
-      <h2>Browser Not Supported</h2>
-      <p style="margin-top:1rem; color:var(--muted)">
-        Web Serial API is required. Please use <strong>Chrome 89+</strong> or <strong>Edge 89+</strong> on desktop.
-      </p>
-    </div>
-
-    <div id="app">
-      <div class="chip-info" id="chip-info">
-        Connected: <span id="chip-name">—</span>
-      </div>
-
-      <div class="step">
-        <div class="step-num">1</div>
-        <div class="step-content">
-          <label for="offset">Flash address</label>
-          <select id="offset">
-            <option value="0x0" selected>0x0 — Direct boot / merged image</option>
-            <option value="0x10000">0x10000 — App partition (with bootloader)</option>
-          </select>
-          <p>Use 0x0 for the product's merged image. An application-only image at
-            0x10000 requires the matching bootloader and partition table.</p>
-        </div>
-      </div>
-
-      <div class="step">
-        <div class="step-num">2</div>
-        <div class="step-content">
-          <label for="firmware">Select firmware (.bin)</label>
-          <input type="file" id="firmware" accept=".bin">
-          <p>Download .bin from <a href="https://github.com/faronov/zigbee-rs/actions" target="_blank">CI artifacts</a> or build locally.
-            Custom files are not validated by this page; check the platform's build and hardware status.</p>
-        </div>
-      </div>
-
-      <div class="step">
-        <div class="step-num">3</div>
-        <div class="step-content">
-          <label>Connect &amp; Flash</label>
-          <button class="btn-connect" id="btn-connect">🔌 Connect to ESP device</button>
-          <button class="btn-disconnect" id="btn-disconnect" style="display:none">Disconnect</button>
-          <button class="btn-flash" id="btn-flash" disabled>⚡ Flash firmware</button>
-          <div class="progress-bar" id="progress-bar">
-            <div class="progress-fill" id="progress-fill"></div>
-          </div>
-        </div>
-      </div>
-
-      <div id="log"></div>
-
-      <div class="warning">
-        ⚠️ Hold the <strong>BOOT</strong> button on your ESP board while clicking Connect
-        if the device doesn't enter download mode automatically.
-      </div>
-    </div>
+  <div id="loading" class="card">Loading releases…</div>
+  <div id="empty" class="card hidden">
+    <strong>No releases yet.</strong> Firmware appears here once a release tagged
+    <code>ncp-v*</code> (zigbee-rs) or <code>hub-v*</code> (zigbee-rs-hub) is published.
   </div>
 
-  <p class="footer">
-    <a href="https://github.com/faronov/zigbee-rs" target="_blank">zigbee-rs</a> •
-    Powered by <a href="https://esphome.github.io/esp-web-tools/" target="_blank">ESP Web Tools</a>
-    &amp; <a href="https://github.com/nicholasgasior/esptool-js" target="_blank">esptool-js</a> •
-    Requires Chrome/Edge 89+
-  </p>
+  <div id="app" class="hidden">
+    <section class="card">
+      <h2>1. Board</h2>
+      <select id="board"></select>
+      <dl id="board-info"></dl>
+    </section>
 
-  <!-- ESP Web Tools for one-click install -->
-  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+    <section class="card">
+      <h2>2. Version</h2>
+      <select id="version"></select>
+      <dl id="version-info"></dl>
+      <details style="margin-top:.8rem">
+        <summary>Images and SHA-256</summary>
+        <table>
+          <thead><tr><th>Image</th><th>Offset</th><th>Size</th><th>SHA-256</th></tr></thead>
+          <tbody id="files"></tbody>
+        </table>
+        <p class="muted" style="font-size:.85rem">The flasher writes the rows marked ●. Other files are for esptool and
+          for updates over ZRHP. Check downloads against <a id="sha256sums" href="#">SHA256SUMS</a>; every image is
+          described in <a id="release-manifest" href="#">release-manifest.json</a>.</p>
+      </details>
+    </section>
 
-  <script type="module">
-    // esptool-js ESM import from CDN
-    import { ESPLoader, Transport } from 'https://unpkg.com/esptool-js@0.5.0/bundle.js';
+    <section class="card">
+      <h2>3. Keep or erase</h2>
+      <label class="check"><input type="checkbox" id="erase"> Erase the whole chip first (factory reset)</label>
+      <div id="mode-text"></div>
+    </section>
 
-    const logEl = document.getElementById('log');
-    const btnConnect = document.getElementById('btn-connect');
-    const btnDisconnect = document.getElementById('btn-disconnect');
-    const btnFlash = document.getElementById('btn-flash');
-    const fileInput = document.getElementById('firmware');
-    const offsetSelect = document.getElementById('offset');
-    const chipInfoEl = document.getElementById('chip-info');
-    const chipNameEl = document.getElementById('chip-name');
-    const progressBar = document.getElementById('progress-bar');
-    const progressFill = document.getElementById('progress-fill');
+    <section class="card">
+      <h2>4. Connect and install</h2>
+      <ol id="connect-steps"></ol>
+      <div id="s3-prepare" class="hidden note">
+        <p style="margin-top:0">If the S3 already runs tbr-hub or tbr-bridge, its USB port shows the bridge's two
+          serial ports instead of the S3's own USB-Serial-JTAG. Switch it over first: pick the <em>second</em>
+          (console) port below. The bridge ports disappear and the USB-Serial-JTAG port appears within a second
+          (console command <code>s3 usj</code> does the same). Then click Install and pick the new port.</p>
+        <button class="button secondary" id="s3-usj">Switch the S3 to USB-Serial-JTAG (1200 bps touch)</button>
+        <span id="s3-usj-result" class="muted"></span>
+      </div>
+      <div class="install" style="margin-top:1rem">
+        <esp-web-install-button id="install">
+          <button slot="activate" id="install-label">Install</button>
+          <span slot="unsupported">Web Serial is not available in this browser: use Chrome or Edge.</span>
+          <span slot="not-allowed">Web Serial needs HTTPS: open https://faronov.github.io/zigbee-rs/flasher/.</span>
+        </esp-web-install-button>
+      </div>
+      <p class="muted" style="font-size:.85rem">ESP Web Tools then asks for the serial port, checks that the chip
+        matches the board (a wrong chip is refused before anything is written), writes the images and resets the
+        chip. Close any other program that holds the port (Zigbee2MQTT, Home Assistant, a serial monitor) first.
+        On Windows the native USB ports use the built-in driver; no extra driver is needed.</p>
+    </section>
+  </div>
 
-    let transport = null;
-    let esploader = null;
-    let connected = false;
+  <footer>
+    <a href="https://faronov.github.io/zigbee-rs/getting-started/web-flasher.html">How the web flasher works</a> ·
+    <a href="./sensor/">CI sensor builds (not releases)</a> ·
+    <a href="https://github.com/faronov/zigbee-rs/releases">zigbee-rs releases</a> ·
+    <a href="https://github.com/faronov/zigbee-rs-hub/releases">hub releases</a><br>
+    Site revision <code>@REVISION@</code> (<a href="@RUN_URL@">CI</a>) · releases indexed <span id="generated"></span> ·
+    powered by <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>
+  </footer>
+</main>
 
-    // Check Web Serial support
-    if (!('serial' in navigator)) {
-      document.getElementById('app').style.display = 'none';
-      document.getElementById('unsupported').style.display = 'block';
-    }
+<script type="module" src="./vendor/esp-web-tools/install-button.js"></script>
+<script type="module">
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+  const hex = (n) => '0x' + n.toString(16).toUpperCase();
+  const kib = (n) => n >= 1048576 ? (n / 1048576).toFixed(2) + ' MiB' : (n / 1024).toFixed(1) + ' KiB';
 
-    function log(msg, cls = 'log-info') {
-      const line = document.createElement('div');
-      line.className = cls;
-      line.textContent = msg;
-      logEl.appendChild(line);
-      logEl.scrollTop = logEl.scrollHeight;
-    }
+  if (!('serial' in navigator)) $('unsupported').classList.remove('hidden');
 
-    function updateButtons() {
-      btnConnect.style.display = connected ? 'none' : 'block';
-      btnDisconnect.style.display = connected ? 'block' : 'none';
-      btnFlash.disabled = !connected || !fileInput.files.length;
-    }
+  // What "keep" preserves and "erase" destroys, per product.
+  const PRODUCT_TEXT = {
+    'zrhp-ncp': {
+      keep: `<div class="warn"><strong>Keeps the Zigbee network.</strong> Writes only the bootloader, the partition
+        table, a blank <code>otadata</code> and the application; the <code>zbnv</code> partition (network, Trust Center
+        keys and link keys of joined devices, NCP identity and IEEE override) stays. The blank <code>otadata</code>
+        makes the new application in <code>ota_0</code> boot even if an earlier over-ZRHP update had switched to
+        <code>ota_1</code>.
+        <ol>
+          <li>In the ESP Web Tools dialog, leave <em>Erase device</em> <strong>unticked</strong>.</li>
+          <li>Only for a chip that already runs the zigbee-rs NCP (same partition layout). Anything else on the chip
+            (stock or other firmware): erase.</li>
+          <li>A downgrade to a release older than the stored network format makes the NCP start factory-new;
+            the host (zigpy/ZHA, Zigbee2MQTT, the hub) then restores the network from its backup.</li>
+        </ol></div>`,
+      erase: `<div class="danger"><strong>Erases everything, including the Zigbee network.</strong> The NCP forgets the
+        network key, PAN ID, channel, Trust Center link keys and its frame counters. Unless the host restores its
+        network backup onto the NCP (zigpy/ZHA and Zigbee2MQTT can), every device has to be paired again.
+        Use it for a first install over other firmware or to start from scratch.</div>`,
+    },
+    'zigbee-rs-hub': {
+      keep: `<div class="warn"><strong>Keeps the hub's data.</strong> Writes only the bootloader, the partition table,
+        a blank <code>otadata</code> (8 MB layout) and the application; <code>nvs</code> (Wi-Fi credentials, boot mode,
+        API token) and <code>hubdata</code> (devices, settings, ZRHP host store with the network backup) stay.
+        <ol>
+          <li>In the ESP Web Tools dialog, leave <em>Erase device</em> <strong>unticked</strong>.</li>
+          <li>Only when the board already runs tbr-hub with the same layout. The first install over Espressif's
+            firmware or tbr-bridge on the stock layout must erase.</li>
+        </ol></div>`,
+      erase: `<div class="danger"><strong>Erases the hub.</strong> Wi-Fi credentials, the API token, the device registry
+        and the ZRHP host store (the hub's copy of the network) are gone. The H2 keeps its own network, so the hub
+        adopts it again, but device names and settings are lost. The H2 itself is not touched.</div>`,
+    },
+  };
 
-    fileInput.addEventListener('change', updateButtons);
+  let index;
+  const boards = new Map();       // board id -> {board, product, releases: [{release, board}]}
 
-    btnConnect.addEventListener('click', async () => {
-      try {
-        log('Requesting serial port…');
-        const port = await navigator.serial.requestPort();
-        transport = new Transport(port, true);
-        esploader = new ESPLoader({
-          transport,
-          baudrate: 115200,
-          romBaudrate: 115200,
-        });
+  function bySemver(a, b) {
+    const parse = (v) => v.split(/[-+]/)[0].split('.').map(Number);
+    const [x, y] = [parse(a.release.version), parse(b.release.version)];
+    for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return y[i] - x[i];
+    return (b.release.published || '').localeCompare(a.release.published || '');
+  }
 
-        log('Connecting to ESP ROM bootloader…');
-        const chip = await esploader.main();
-        log(`✓ Connected: ${chip}`, 'log-ok');
-
-        chipNameEl.textContent = chip;
-        chipInfoEl.style.display = 'block';
-        connected = true;
-        updateButtons();
-
-        // Try to increase baudrate for faster flashing
-        try {
-          await esploader.changeBaud(921600);
-          log('Baudrate increased to 921600', 'log-info');
-        } catch {
-          log('Using default baudrate 115200', 'log-warn');
+  function fillBoards() {
+    for (const product of index.products) {
+      for (const release of product.releases) {
+        for (const board of release.boards) {
+          if (!boards.has(board.id)) boards.set(board.id, {product, releases: []});
+          boards.get(board.id).releases.push({release, board});
         }
-      } catch (e) {
-        log(`✗ Connection failed: ${e.message}`, 'log-err');
       }
-    });
-
-    btnDisconnect.addEventListener('click', async () => {
-      try {
-        await transport.disconnect();
-      } catch { /* ignore */ }
-      connected = false;
-      chipInfoEl.style.display = 'none';
-      progressBar.style.display = 'none';
-      updateButtons();
-      log('Disconnected', 'log-info');
-    });
-
-    btnFlash.addEventListener('click', async () => {
-      if (!esploader || !fileInput.files.length) return;
-
-      const file = fileInput.files[0];
-      const offset = parseInt(offsetSelect.value, 16);
-
-      log(`Reading ${file.name} (${(file.size / 1024).toFixed(1)} KB)…`);
-      const data = await file.arrayBuffer();
-      const binaryStr = Array.from(new Uint8Array(data))
-        .map(b => String.fromCharCode(b))
-        .join('');
-
-      progressBar.style.display = 'block';
-      progressFill.style.width = '0%';
-      btnFlash.disabled = true;
-
-      try {
-        log(`Erasing flash at 0x${offset.toString(16)}…`);
-
-        await esploader.writeFlash({
-          fileArray: [{ data: binaryStr, address: offset }],
-          flashSize: 'keep',
-          flashMode: 'keep',
-          flashFreq: 'keep',
-          eraseAll: false,
-          compress: true,
-          reportProgress: (fileIndex, written, total) => {
-            const pct = Math.round((written / total) * 100);
-            progressFill.style.width = pct + '%';
-            if (pct % 25 === 0) {
-              log(`  ${pct}% (${(written / 1024).toFixed(0)} / ${(total / 1024).toFixed(0)} KB)`);
-            }
-          },
-        });
-
-        progressFill.style.width = '100%';
-        log('✓ Flash complete!', 'log-ok');
-        log('Resetting device…');
-
-        try {
-          await esploader.hardReset();
-          log('✓ Device reset — firmware running', 'log-ok');
-        } catch {
-          log('Manual reset may be needed (press RST button)', 'log-warn');
-        }
-      } catch (e) {
-        log(`✗ Flash failed: ${e.message}`, 'log-err');
-        progressFill.style.width = '0%';
-      } finally {
-        btnFlash.disabled = false;
+    }
+    const select = $('board');
+    for (const product of index.products) {
+      const group = document.createElement('optgroup');
+      group.label = product.name;
+      for (const [id, entry] of boards) {
+        if (entry.product !== product) continue;
+        entry.releases.sort(bySemver);
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = entry.releases[0].board.title;
+        group.appendChild(opt);
       }
+      if (group.children.length) select.appendChild(group);
+    }
+  }
+
+  function fillVersions() {
+    const entry = boards.get($('board').value);
+    const select = $('version');
+    select.innerHTML = '';
+    const stable = entry.releases.findIndex((r) => !r.release.prerelease);
+    entry.releases.forEach((r, i) => {
+      const opt = document.createElement('option');
+      opt.value = r.release.tag;
+      const tags = [];
+      if (i === (stable < 0 ? 0 : stable)) tags.push('recommended');
+      if (r.release.prerelease) tags.push('pre-release');
+      opt.textContent = `${r.release.version}  (${(r.release.date || '').slice(0, 10)})${tags.length ? '  ' + tags.join(', ') : ''}`;
+      select.appendChild(opt);
     });
-  </script>
+    select.selectedIndex = stable < 0 ? 0 : stable;
+  }
+
+  function current() {
+    const entry = boards.get($('board').value);
+    const pick = entry.releases.find((r) => r.release.tag === $('version').value) || entry.releases[0];
+    return {product: entry.product, ...pick};
+  }
+
+  function render() {
+    const {product, release, board} = current();
+    const erase = $('erase').checked;
+    const repo = `https://github.com/${product.repository}`;
+    $('board-info').innerHTML = `
+      <dt>Chip</dt><dd>${esc(board.chip_family)}, ${esc(board.flash_size)} flash</dd>
+      <dt>Layout</dt><dd><code>${esc(board.layout)}</code></dd>
+      ${board.transport ? `<dt>Host link</dt><dd>${esc(board.transport)}</dd>` : ''}
+      <dt>Firmware</dt><dd>${esc(product.name)}</dd>`;
+    const fw = board.fw_update;
+    $('version-info').innerHTML = `
+      <dt>Version</dt><dd>${esc(release.version)}${release.prerelease ? '<span class="badge pre">pre-release</span>' : ''}
+        (firmware reports <code>${esc(board.app_version)}</code>)</dd>
+      <dt>Released</dt><dd>${esc((release.date || '').replace('T', ' ').replace('Z', ' UTC'))}</dd>
+      <dt>Commit</dt><dd><a class="mono" href="${repo}/commit/${esc(release.commit)}">${esc(release.commit.slice(0, 12))}</a>
+        ${release.build_id ? `· build_id <code>${esc(release.build_id)}</code>` : ''}</dd>
+      ${release.zrhp ? `<dt>ZRHP</dt><dd>protocol ${esc(release.zrhp.protocol)}</dd>` : ''}
+      ${release.components ? `<dt>Components</dt><dd>${Object.entries(release.components).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(', ')}</dd>` : ''}
+      <dt>Changes</dt><dd><a href="${esc(release.url)}">release notes and changelog</a></dd>
+      ${fw ? `<dt>FW_* update</dt><dd><a href="${esc(fw.download)}">${esc(fw.file.name)}</a>
+        ${fw.signed ? '(signed)' : '<span class="badge pre">unsigned</span> accepted only by development NCP builds; flash over USB instead'}</dd>` : ''}`;
+    const written = new Set(board.flash.map((role) => board.files.find((f) => f.role === role).name));
+    $('files').innerHTML = board.files.map((f) => `<tr>
+        <td>${written.has(f.name) ? '● ' : ''}<a href="${esc(f.download)}">${esc(f.name)}</a></td>
+        <td class="mono">${f.offset === undefined ? '' : hex(f.offset)}</td>
+        <td>${kib(f.size)}</td><td class="hash mono">${esc(f.sha256)}</td></tr>`).join('');
+    $('sha256sums').href = release.sha256sums_download || release.url;
+    $('release-manifest').href = release.manifest_download || release.url;
+
+    const text = PRODUCT_TEXT[product.product] || PRODUCT_TEXT['zrhp-ncp'];
+    const kept = (board.preserved || []).map((p) => `<code>${esc(p.name)}</code> at ${hex(p.offset)} (${esc(p.what)})`).join('; ');
+    $('mode-text').innerHTML = (erase ? text.erase : text.keep) + (kept && !erase ? `<p class="muted" style="font-size:.85rem">Kept: ${kept}.</p>` : '');
+
+    $('connect-steps').innerHTML = [board.connect, ...(board.connect_steps || [])].filter(Boolean).map((s) => `<li>${esc(s)}</li>`).join('') +
+      '<li>If no port appears or the connection fails: hold BOOT, press and release RESET, release BOOT, then try again.</li>';
+    $('s3-prepare').classList.toggle('hidden', board.chip_family !== 'ESP32-S3');
+
+    const button = $('install');
+    button.setAttribute('manifest', board.manifests[erase ? 'erase' : 'update']);
+    button.classList.toggle('erase', erase);
+    $('install-label').textContent = `${erase ? 'Erase and install' : 'Install'} ${release.version} on ${board.chip_family}`;
+
+    const url = new URL(location.href);
+    url.searchParams.set('board', board.id);
+    url.searchParams.set('version', release.tag);
+    history.replaceState(null, '', url);
+  }
+
+  $('s3-usj').addEventListener('click', async () => {
+    const out = $('s3-usj-result');
+    try {
+      const port = await navigator.serial.requestPort({filters: [{usbVendorId: 0x303a}]});
+      await port.open({baudRate: 1200});
+      await port.close();
+      out.textContent = 'Done: now click Install and pick the new USB JTAG/serial port.';
+    } catch (e) {
+      out.textContent = `Not switched: ${e.message}`;
+    }
+  });
+
+  try {
+    const response = await fetch('./releases.json', {cache: 'no-cache'});
+    index = await response.json();
+  } catch (e) {
+    $('loading').textContent = `Cannot load releases.json: ${e.message}`;
+    throw e;
+  }
+  $('loading').classList.add('hidden');
+  $('generated').textContent = (index.generated || '').replace('T', ' ').replace('Z', ' UTC');
+  fillBoards();
+  if (!boards.size) {
+    $('empty').classList.remove('hidden');
+  } else {
+    $('app').classList.remove('hidden');
+    const params = new URLSearchParams(location.search);
+    if (boards.has(params.get('board'))) $('board').value = params.get('board');
+    fillVersions();
+    if ([...$('version').options].some((o) => o.value === params.get('version'))) $('version').value = params.get('version');
+    $('board').addEventListener('change', () => { fillVersions(); render(); });
+    $('version').addEventListener('change', render);
+    $('erase').addEventListener('change', render);
+    render();
+  }
+</script>
 </body>
 </html>

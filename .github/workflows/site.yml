@@ -1,0 +1,170 @@
+name: Site
+
+# Builds the GitHub Pages site and, with `deploy`, publishes it:
+#   /                  the mdBook (docs/book)
+#   /flasher/          the release web flasher: images of the newest tagged
+#                      releases of faronov/zigbee-rs (ncp-v*) and
+#                      faronov/zigbee-rs-hub (hub-v*) (tools/flasher_site.py),
+#                      copied onto the site because release downloads have
+#                      no CORS headers
+#   /flasher/sensor/   the CI sensor flasher (artifacts of `sensor_run_id`)
+#
+# Called by ci.yml (preview on pull requests, deploy on master pushes) and by
+# site-refresh.yml (a new release, or the schedule).
+
+on:
+    workflow_call:
+        inputs:
+            revision:
+                description: Commit whose book, flasher page and tools are published
+                type: string
+                required: true
+            sensor_run_id:
+                description: CI run holding the sensor firmware artifacts (0 = none)
+                type: string
+                required: true
+            esp32c6_result:
+                type: string
+                default: skipped
+            esp32h2_result:
+                type: string
+                default: skipped
+            bl702_result:
+                type: string
+                default: skipped
+            deploy:
+                type: boolean
+                default: false
+            expect_live_revision:
+                description: Deploy only while the live site still has this revision (refreshes must not overwrite a newer CI deploy)
+                type: string
+                default: ''
+
+env:
+    ESP_WEB_TOOLS_VERSION: 10.5.2
+    ESP_WEB_TOOLS_SHA512: i5qsHv1bnrb/9gmKEN7qIaDTMOMy6OctrgFVXStrU2s79erY2Z7IKydveNk0eDhQTarfwyR4eXspOUIF6kYawg==
+
+jobs:
+    build:
+        name: Build site
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            actions: read
+        steps:
+            - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+              with:
+                  ref: ${{ inputs.revision }}
+
+            - name: Install mdBook
+              uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+              with:
+                  tool: mdbook@0.5.4
+
+            - name: Build book
+              run: mdbook build docs/book
+
+            - name: Sensor firmware (this run)
+              if: inputs.sensor_run_id == format('{0}', github.run_id) && inputs.esp32c6_result == 'success' && inputs.esp32h2_result == 'success' && inputs.bl702_result == 'success'
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  pattern: esp32{c6,h2}-sensor-firmware
+                  merge-multiple: true
+                  path: ${{ runner.temp }}/pages-firmware
+
+            - name: Sensor firmware (earlier CI run)
+              id: sensor
+              if: inputs.sensor_run_id != '0' && inputs.sensor_run_id != format('{0}', github.run_id) && inputs.esp32c6_result == 'success' && inputs.esp32h2_result == 'success' && inputs.bl702_result == 'success'
+              continue-on-error: true
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  pattern: esp32{c6,h2}-sensor-firmware
+                  merge-multiple: true
+                  path: ${{ runner.temp }}/pages-firmware
+                  run-id: ${{ inputs.sensor_run_id }}
+                  github-token: ${{ github.token }}
+
+            - name: Release images
+              env:
+                  GITHUB_TOKEN: ${{ github.token }}
+              run: |
+                  python3 tools/flasher_site.py fetch --out "$RUNNER_TEMP/releases"
+                  python3 tools/flasher_site.py check "$RUNNER_TEMP/releases"
+
+            - name: ESP Web Tools ${{ env.ESP_WEB_TOOLS_VERSION }}
+              run: |
+                  set -euo pipefail
+                  cd "$RUNNER_TEMP"
+                  curl -fsSL --retry 3 -o ewt.tgz "https://registry.npmjs.org/esp-web-tools/-/esp-web-tools-${ESP_WEB_TOOLS_VERSION}.tgz"
+                  [ "$(openssl dgst -sha512 -binary ewt.tgz | base64 -w0)" = "$ESP_WEB_TOOLS_SHA512" ] \
+                    || { echo "::error::esp-web-tools tarball integrity mismatch"; exit 1; }
+                  tar xzf ewt.tgz package/dist/web package/LICENSE
+                  cp package/LICENSE package/dist/web/LICENSE
+
+            - name: Assemble site
+              env:
+                  C6_RESULT: ${{ steps.sensor.outcome == 'failure' && 'skipped' || inputs.esp32c6_result }}
+                  H2_RESULT: ${{ steps.sensor.outcome == 'failure' && 'skipped' || inputs.esp32h2_result }}
+                  BL702_RESULT: ${{ steps.sensor.outcome == 'failure' && 'skipped' || inputs.bl702_result }}
+                  SENSOR_RUN_ID: ${{ inputs.sensor_run_id }}
+              run: |
+                  run_id="$SENSOR_RUN_ID"
+                  [ "$run_id" = 0 ] && run_id="$GITHUB_RUN_ID"
+                  python3 tools/prepare-pages.py \
+                    --book docs/book/book --flasher docs/flasher \
+                    --firmware "$RUNNER_TEMP/pages-firmware" --output _site \
+                    --releases "$RUNNER_TEMP/releases" --esp-web-tools "$RUNNER_TEMP/package/dist/web" \
+                    --revision "${{ inputs.revision }}" --run-id "$run_id" \
+                    --esp32c6-result "$C6_RESULT" --esp32h2-result "$H2_RESULT" \
+                    --bl702-result "$BL702_RESULT"
+                  python3 tools/flasher_site.py check _site/flasher
+                  du -sh _site _site/flasher
+
+            - name: Upload Pages artifact
+              uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+              with:
+                  path: _site
+
+    deploy:
+        name: Deploy
+        needs: build
+        if: inputs.deploy
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            pages: write
+            id-token: write
+        # Only one Pages deploy at a time; never cancel one already running.
+        concurrency:
+            group: pages
+            cancel-in-progress: false
+        environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+        steps:
+            - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+              if: inputs.expect_live_revision != ''
+              with:
+                  ref: ${{ inputs.revision }}
+                  sparse-checkout: tools/flasher_site.py
+                  sparse-checkout-cone-mode: false
+            - name: Live site unchanged since this build started
+              id: live
+              if: inputs.expect_live_revision != ''
+              env:
+                  EXPECTED: ${{ inputs.expect_live_revision }}
+              run: |
+                  live=$(python3 tools/flasher_site.py live)
+                  if [ "$live" != "$EXPECTED" ]; then
+                    echo "::notice::the live site moved to ${live:-?} (a newer CI deploy); it already carries the releases of its own build, not deploying $EXPECTED"
+                    echo "skip=true" >>"$GITHUB_OUTPUT"
+                  fi
+
+            - name: Setup Pages
+              if: steps.live.outputs.skip != 'true'
+              uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+            - name: Deploy to GitHub Pages
+              if: steps.live.outputs.skip != 'true'
+              id: deployment
+              uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

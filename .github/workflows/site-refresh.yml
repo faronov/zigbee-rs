@@ -1,0 +1,97 @@
+name: Site refresh
+
+# Rebuilds the Pages site when the set of published releases changes, on the
+# base (book revision, CI sensor artifacts) the live site already has.
+#
+# Triggers:
+#   - ncp-release.yml in this repository dispatches it after publishing
+#     (a release published with GITHUB_TOKEN raises no `release` event);
+#   - `release: published` for releases published by hand (redirected to
+#     master: the github-pages environment only deploys from master);
+#   - `repository_dispatch` (type `flasher-release`) from
+#     faronov/zigbee-rs-hub's release workflow, when that repository has a
+#     token for it (secret FLASHER_DISPATCH_TOKEN there);
+#   - every 6 hours, which picks up hub releases without that token: it
+#     compares the live releases.json fingerprint and does nothing when the
+#     release set is unchanged;
+#   - by hand (`force` rebuilds even when unchanged).
+
+on:
+    release:
+        types: [published]
+    repository_dispatch:
+        types: [flasher-release]
+    schedule:
+        - cron: '23 */6 * * *'
+    workflow_dispatch:
+        inputs:
+            reason:
+                description: Why (shown in the run)
+                required: false
+                default: manual
+            force:
+                description: Rebuild even if the release set is unchanged
+                type: boolean
+                default: false
+
+permissions:
+    contents: read
+
+concurrency:
+    group: site-refresh
+    cancel-in-progress: false
+
+jobs:
+    redirect:
+        name: Redirect to master
+        if: github.event_name == 'release'
+        runs-on: ubuntu-latest
+        permissions:
+            actions: write
+        steps:
+            - env:
+                  GH_TOKEN: ${{ github.token }}
+              run: gh workflow run site-refresh.yml -R "$GITHUB_REPOSITORY" --ref master -f reason="release ${{ github.event.release.tag_name }}"
+
+    resolve:
+        name: Release set changed?
+        if: github.event_name != 'release' && github.ref == 'refs/heads/master'
+        runs-on: ubuntu-latest
+        outputs:
+            changed: ${{ steps.resolve.outputs.changed }}
+            revision: ${{ steps.resolve.outputs.revision }}
+            sensor_run_id: ${{ steps.resolve.outputs.sensor_run_id }}
+            esp32c6_result: ${{ steps.resolve.outputs.esp32c6_result }}
+            esp32h2_result: ${{ steps.resolve.outputs.esp32h2_result }}
+            bl702_result: ${{ steps.resolve.outputs.bl702_result }}
+        steps:
+            - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+              with:
+                  sparse-checkout: tools/flasher_site.py
+                  sparse-checkout-cone-mode: false
+            - id: resolve
+              env:
+                  GITHUB_TOKEN: ${{ github.token }}
+                  FORCE: ${{ inputs.force && '--force' || '' }}
+              run: |
+                  echo "event: $GITHUB_EVENT_NAME ${{ inputs.reason }}${{ github.event.client_payload.tag }}"
+                  python3 tools/flasher_site.py resolve $FORCE
+
+    site:
+        name: Site
+        needs: resolve
+        if: needs.resolve.outputs.changed == 'true'
+        permissions:
+            contents: read
+            actions: read
+            pages: write
+            id-token: write
+        uses: ./.github/workflows/site.yml
+        with:
+            revision: ${{ needs.resolve.outputs.revision }}
+            sensor_run_id: ${{ needs.resolve.outputs.sensor_run_id }}
+            esp32c6_result: ${{ needs.resolve.outputs.esp32c6_result }}
+            esp32h2_result: ${{ needs.resolve.outputs.esp32h2_result }}
+            bl702_result: ${{ needs.resolve.outputs.bl702_result }}
+            deploy: true
+            expect_live_revision: ${{ needs.resolve.outputs.revision }}
