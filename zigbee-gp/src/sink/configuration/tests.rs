@@ -562,7 +562,13 @@ fn refusals_change_nothing() {
         actions: pairing_action::APPLICATION_DESCRIPTION,
         ..Pc::default()
     };
-    assert_eq!(configure(&mut s, &pc).0, 0x01);
+    // With `app-description` the action is supported but has no reports.
+    let status = if cfg!(feature = "app-description") {
+        zcl_status::INVALID_FIELD
+    } else {
+        0x01
+    };
+    assert_eq!(configure(&mut s, &pc).0, status);
     let pc = Pc {
         app_info: Some(crate::config::ApplicationInformation {
             bits: crate::config::app_info::APPLICATION_DESCRIPTION,

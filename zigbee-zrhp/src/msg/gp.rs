@@ -228,6 +228,22 @@ wire_struct! {
 }
 
 wire_struct! {
+    /// `EVT_GP_APP_DESCRIPTION`: report descriptors of a GPD's Application
+    /// Description the sink had not reported before.
+    pub struct EvtGpAppDescription<'a> {
+        /// GPD.
+        pub gpd_id: GpdId,
+        /// Reports the GPD describes in total.
+        pub total_reports: u8,
+        /// Report descriptors in `reports`.
+        pub report_count: u8,
+        /// Report descriptors as received (GP Application Description
+        /// format, back to back).
+        pub reports: Bytes8<'a>,
+    }
+}
+
+wire_struct! {
     /// `EVT_GP_DECOMMISSIONED`.
     pub struct EvtGpDecommissioned {
         /// GPD.
@@ -552,4 +568,5 @@ message_def! {
     EvtGpCommissioned<'a> = ids::EVT_GP_COMMISSIONED, Event;
     EvtGpCommissioningFailed = ids::EVT_GP_COMMISSIONING_FAILED, Event;
     EvtGpDecommissioned = ids::EVT_GP_DECOMMISSIONED, Event;
+    EvtGpAppDescription<'a> = ids::EVT_GP_APP_DESCRIPTION, Event;
 }

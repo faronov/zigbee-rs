@@ -86,3 +86,6 @@ pub enum Error {
 
 /// Result type used throughout the crate.
 pub type Result<T> = core::result::Result<T, Error>;
+
+#[cfg(feature = "app-description")]
+pub mod app_description;

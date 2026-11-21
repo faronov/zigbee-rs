@@ -46,6 +46,7 @@
 | GPD Channel Request on the sink (`zigbee-gp/channel-request`, `zigbee-runtime/green-power-channel-request`, router-app `green-power-channel-request`; in `combo-light` and the ZRHP NCP): in commissioning mode a Channel Request heard directly, or tunnelled in a GP Commissioning Notification / GP Notification from SrcID 0 with rxAfterTx, is answered with a GP Response carrying a Channel Configuration (operational channel, Basic) for the TempMaster; repeats within 1 s share one GP Response; gpsFunctionality bit 12 (GPD maintenance); `EVT_GP_FRAME` result 6 on the NCP (§3.9) | implemented, opt-in (2026-11-21) | host tests: `sink::maintenance` (direct, Commissioning Notification and Notification paths, refusals, repeat suppression, gpsFunctionality), runtime end to end `gp_channel_request_tests` (combo as its own TempMaster delivers the Channel Configuration by timed TX in the GPD's window). **Not run on hardware** |
 | gpsSecurityLevel InvolveTC (`zigbee-gp/involve-tc`, `zigbee-runtime/green-power-involve-tc`, router-app `green-power-involve-tc`; in `combo-light` and the ZRHP NCP): the bit is writable; `gp_sink_derive_involve_tc` sets it after an install-code join, clears it in a distributed network and keeps it after a default-key join (gecko_sdk `writeInvolveTCBit`); while set a sink refuses GP Sink Commissioning Mode (UNSUP_COMMAND), local commissioning and Commissioning GPDFs (`SinkDrop::InvolveTc`, `EVT_GP_COMMISSIONING_FAILED` reason 14); a sink that is the Trust Center (the NCP) is not stopped (§3.10) | implemented, opt-in (2026-11-21) | host tests: `sink::involve_tc` (write, refusal paths, Trust Center sink, derivation), runtime `gp_involve_tc` (install-code join, default-key join, Trust Center), NCP `GP_SINK_CONFIG` accepts bit 3. **Not run on hardware** |
 | GPD key provisioning on the sink (`zigbee-gp/key-provisioning`, `zigbee-runtime/green-power-key-provisioning`, router-app `green-power-key-provisioning`; in `combo-light` and the ZRHP NCP): gpSharedSecurityKeyType / gpSharedSecurityKey (write-only key) / gpLinkKey (write-only), the shared key handed to a GPD that asks for one in a bidirectional commissioning (network key, NWK-key derived group key, GPD group key, derived individual key, as gecko_sdk `sendCommissioningReply`), protected with gpLinkKey when the GPD uses key encryption or gpsSecurityLevel requires it, the network key always protected; out-of-band keys for GPDs that commission without sending theirs, and a re-commissioning without a key keeps the entry's key; `GP_SET_SHARED_KEY` on the NCP (§3.11) | implemented, opt-in (2026-11-21) | host tests: `sink::keys` (GP spec vectors A.1.5.7.1, A.1.5.7.2, A.1.5.12.1 and A.1.5.8.3 from gecko_sdk, attributes, provided key with TC-LK protection and Success under the new key, own key kept without a request, out-of-band keys), runtime end to end `gp_key_provisioning_tests` (the combo hands the network key, protected, by timed TX), NCP `GP_SET_SHARED_KEY`. **Not run on hardware** |
+| GPD Application Description on the sink (`zigbee-gp/app-description`, `zigbee-runtime/green-power-app-description`; in the ZRHP NCP, not in `combo-light`): a GPD whose Commissioning announces "application description follows" waits (20 s) until all its report descriptors arrive in Application Description commands (direct or in GP Commissioning Notifications), then pairs, with a Commissioning Reply when the last report asked for one; new descriptors become `SinkEvent::ApplicationDescription` and, on the NCP, `EVT_GP_APP_DESCRIPTION`; with `translation-table` also GP Pairing Configuration action 0b101 and Extend/Replace carrying descriptors (§3.12) | implemented, opt-in (2026-11-21) | host tests: `zigbee_gp::app_description` codec, `sink::descriptions` (collection, timeout, repetitions, refusals, bidirectional reply, Pairing Configuration), NCP end to end `application_description_reaches_the_host_before_the_pairing`, zigbee-zrhp vector `evt_gp_app_description`. **Not run on hardware** (no multi-sensor GPD in the lab) |
 | Remote GP provisioning on the ZRHP NCP (`GP_PAIRING_CONFIGURATION`, `GP_SEND_PAIRING`, `GP_TRANSLATION_UPDATE`/`REQUEST`, `GP_REMOTE_SINK_TABLE_REQUEST`, `GP_REMOTE_PROXY_TABLE_REQUEST`, `EVT_GP_REMOTE_*`, [ZRHP 7.11](host-protocol.md#711-green-power-0x0axx-endpoint-2)) | implemented (2026-11-19) | host tests: zigbee-zrhp vectors (`generate.py --check`), NCP request mapping, NCP end to end against a second zigbee-rs router stack (`remote_provisioning_reaches_another_proxy_and_sink`). H2 NCP image builds and passes the stack gate. **Lab-tested on hardware 2026-11-20 (§6.12)**: master 2ab8ac0 NCP on the Thread BR board's H2 (921 600, RTS/CTS) provisioned an ESP32-C6 combo over the air with `GP_PAIRING_CONFIGURATION`, `GP_TRANSLATION_UPDATE`, `GP_TRANSLATION_REQUEST` and `GP_REMOTE_SINK_TABLE_REQUEST`, each answered (`EVT_GP_REMOTE_*`) within 50–85 ms; host tool `tools/zrhp-host` `--gp-*`. `GP_SEND_PAIRING` and `GP_REMOTE_PROXY_TABLE_REQUEST` not run on hardware |
 | Adaptive frame-counter persistence (`zigbee_gp::counter`, Proxy and Sink Table, exact flag in the GP journal's counter records) | implemented, in every GP image | host tests (§3.3); lab-tested on the H2-Zero combo 2026-11-17: after a power cycle the switch's first presses toggled the light, none dropped (§6.10) |
 | GP combo on the ZRHP coordinator NCP (`zigbee-runtime/green-power-ncp` with `ncp-capacity`, `apps/ncp-coordinator` `gp`, `examples/esp32-ncp`): Proxy Basic + sink (Sink Table 16, Proxy Table 8) + TempMaster, sink authority switchable at runtime (`NCP_SINK` / `HOST_SINK`), NCP default `gpsSecurityLevel` 0x00 with no translation endpoint, GP journal in the NCP's `zbnv` window (2 × 8 KiB), all GREEN POWER commands and events of [ZRHP 7.11](host-protocol.md#711-green-power-0x0axx-endpoint-2) | implemented (2026-11-19) | host tests: `zigbee-gp` import/quiet-removal unit tests, runtime `green_power::ncp` unit tests, NCP end-to-end `apps/ncp-coordinator/tests/gp.rs` over the host link (commissioning of a level-3 GPD heard directly, reports, a proxy's GP Notification, table read/put/remove, `CONFLICT`, key-export lock, `HOST_SINK` raw frames and local proxy output), journal geometry tests in `products/esp32-zigbee-ncp`; H2 and C6 NCP images build and pass the stack gate. **Not run on hardware** (ZRHP gate H10) |
@@ -1128,6 +1129,69 @@ module `keys`, following gecko_sdk `sendCommissioningReply`,
   (A.1.5.7.2, A.1.5.12.1) and the protected Commissioning Reply key
   (A.1.5.8.3).
 
+### 3.12 GPD Application Description on the sink (opt-in)
+
+A multi-sensor or Compact Attribute Reporting (CAR) GPD describes its
+reports before it is paired: its Commissioning command sets "application
+description follows" (Application Information bit 5) and Application
+Description commands (`0xE4`) follow, each with the total number of reports
+and one or more report descriptors (report ID, optional timeout, data point
+descriptors: cluster, server/client, optional manufacturer, attribute
+records with ID, type, offset in the report and optional fixed value). The
+format is decoded by `zigbee_gp::app_description` (strict: every
+descriptor is validated, `MIN_REPORT_LEN` 10 as gecko_sdk).
+
+**Sink behaviour** (`zigbee_gp::sink` module `descriptions`, feature
+`app-description`; gecko_sdk `gpCommissioningNotificationApplicationDescriptionGpdf`
+and `saveReportDescriptor`):
+
+- A unidirectional Commissioning with the flag does not pair at once: its
+  entry waits in the pending list and the sink collects descriptors for
+  `APP_DESCRIPTION_TIMEOUT_MS` (20 s, gecko_sdk's multi-sensor timeout).
+  Repeated Commissioning frames keep what was collected. One GPD is
+  collected at a time (gecko_sdk has one timer); another GPD's collection
+  replaces it. rxAfterTx together with the flag stays refused, as in
+  gecko_sdk.
+- Application Description commands are accepted directly or in GP
+  Commissioning Notifications (not in GP Notifications), authenticated
+  with the pending entry's key when protected. Report IDs must be below the
+  total (at most `MAX_REPORTS` 32), the total must not change. Each frame
+  with reports not seen before becomes one
+  `SinkEvent::ApplicationDescription` (GPD, total, the new descriptors as
+  received); repetitions add nothing.
+- When all reports are known the pairing completes (GP Pairing, events as
+  any commissioning). If the frame that completed it had rxAfterTx, the
+  sink sends a Commissioning Reply through that TempMaster and pairs on
+  the GPD's Success (gecko_sdk `lastReportIdHasRxAfterTx`). Other GPD
+  commands do not complete a collecting commissioning.
+- After the timeout the pending entry is dropped and
+  `SinkEvent::CommissioningFailed` reports `SinkDrop::DescriptionTimeout`
+  (ZRHP reason 15). Leaving commissioning mode ends the collection.
+- The sink does not interpret the descriptors (no CAR translation): the
+  application or the ZRHP host does, from the events. CAR frames of the
+  paired GPD reach the host as before (`EVT_GP_FRAME`).
+- With `translation-table`: GP Pairing Configuration Extend / Replace with
+  application information bit 5 is accepted when its descriptors are well
+  formed (and reported as an event after the pairing); action 0b101 adds
+  descriptors to the GPD being collected (completing its pairing) or
+  reports them for a paired GPD, `NOT_FOUND` for an unknown GPD,
+  `INVALID_FIELD` without descriptors. gecko_sdk's own 0b101 broadcast
+  omits the application-information bit its decoder requires; such a frame
+  is `INVALID_FIELD` here.
+
+**Deviation:** gecko_sdk keeps the descriptors in RAM to build CAR
+translations; this sink keeps only the received-report bitmap and hands
+the descriptors out, so nothing grows the GP journal.
+
+**NCP.** The ZRHP NCP enables it: `EVT_GP_APP_DESCRIPTION` (`0x0A89`)
+carries each event, a frame that only advanced the collection is
+`EVT_GP_FRAME` result 5 (decrypted with the pending entry's key), and the
+completing frame result 2 with `EVT_GP_COMMISSIONED`.
+
+**Images.** Hooks in `sink.rs` / `sink/configuration.rs` are line-neutral
+`#[inline(always)]` calls into `sink/descriptions.rs`; the
+`combo-light` image (without the feature) is byte-identical (§4.10).
+
 ## 4. Size estimates
 
 §4.1 has the measured Proxy Basic cost; the rest of this section is the
@@ -1445,6 +1509,21 @@ The growth is the HMAC-AES-MMO derivation, the key attributes, the reply
 key protection and the out-of-band store (4 keys); the RAM is the key
 store and the larger Commissioning Reply in the sink's queue. The NCP's
 stack gate still passes (serve chain 30,704 of 30,720 B).
+
+### 4.10 Measured: GPD Application Description (2026-11-21)
+
+Release builds in one checkout path, nightly-2026-08-01, master dd1ce41 →
+`gp-app-description` (file-backed flash = `.text` + `.rodata` + `.data`):
+
+| Image | Flash | `.bss` | Note |
+|---|---:|---:|---|
+| ESP32-H2 ZRHP NCP (`thread-br-h2`) | 730,624 → 734,272 (+3,648) | 176,232 → 176,312 (+80) | feature on; stack gate passes (serve 30,704 / 30,720 B) |
+| ESP32-H2-Zero `combo-light` | byte-identical | | feature off |
+| ESP32-H2-Zero router | byte-identical | | |
+
+The NCP growth is the descriptor codec (≈0.6 KB), the collection and reply
+path in the sink (≈1.8 KB, partly inlined into `Sink::process`) and the
+ZRHP event (≈0.6 KB).
 
 ## 5. Risks
 

@@ -660,6 +660,12 @@ fn message_vectors() {
                     assert_eq!(t.gpd_id, GpdId::SrcId(0x7A6B_9879));
                 }
             }
+            "evt_gp_app_description" => {
+                let e: EvtGpAppDescription = rt(&m, &whole);
+                assert_eq!(e.gpd_id, GpdId::SrcId(0x0BAD_CAFE));
+                assert_eq!((e.total_reports, e.report_count), (2, 1));
+                assert_eq!(hex(e.reports.0), fields.at("report_hex").str());
+            }
             other => panic!("vector {other} has no codec test"),
         }
     }

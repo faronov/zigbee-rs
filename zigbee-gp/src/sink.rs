@@ -639,8 +639,7 @@ pub struct ServerCommand<'a> {
 pub enum SinkDrop {
     /// Frame towards a GPD, reserved GPD ID or malformed payload.
     Invalid,
-    /// Commissioning frame outside sink commissioning mode (or tunnelled
-    /// in a GP Notification).
+    /// Commissioning frame outside commissioning mode or in a GP Notification.
     NotCommissioning,
     /// No Sink Table entry for the GPD.
     NoEntry,
@@ -668,6 +667,9 @@ pub enum SinkDrop {
     /// not the Trust Center (`involve-tc`).
     #[cfg(feature = "involve-tc")]
     InvolveTc,
+    /// The Application Description did not complete in time.
+    #[cfg(feature = "app-description")]
+    DescriptionTimeout,
 }
 
 /// Result of feeding a frame to the sink.
@@ -687,6 +689,9 @@ pub enum SinkOutcome {
     /// Channel Configuration (`channel-request`).
     #[cfg(feature = "channel-request")]
     ChannelConfigurationSent,
+    /// Application Description accepted; the pairing completes later.
+    #[cfg(feature = "app-description")]
+    CommissioningStep,
     /// The frame was dropped.
     Dropped(SinkDrop),
 }
@@ -733,8 +738,7 @@ pub enum SinkEvent {
         /// GPD identity.
         gpd_id: GpdId,
     },
-    /// A GPD command without a built-in translation (attribute reports,
-    /// scenes, generic switch, ...), already authenticated and fresh.
+    /// An authenticated, fresh GPD command without a built-in translation.
     GpdCommand {
         /// GPD identity.
         gpd_id: GpdId,
@@ -745,6 +749,9 @@ pub enum SinkEvent {
         /// GPD command payload.
         payload: heapless::Vec<u8, { crate::frame::MAX_GPD_PAYLOAD }>,
     },
+    /// Report descriptors of a GPD's Application Description.
+    #[cfg(feature = "app-description")]
+    ApplicationDescription(descriptions::ApplicationDescriptionReports),
 }
 
 /// A translated command for the local application endpoint.
@@ -758,9 +765,8 @@ pub struct SinkCommand {
     pub translation: Translation,
 }
 
-/// A network frame of the sink. All GP cluster commands it sends are
-/// server → client; `tsn` is the ZCL transaction sequence number of the
-/// request a response answers (`None`: the caller picks one).
+/// A sink network frame; its GP cluster commands are server → client. `tsn` is the ZCL
+/// transaction sequence number of the request a response answers (`None`: caller picks).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkTx {
     /// The frame.
@@ -776,8 +782,7 @@ pub struct SinkStats {
     pub tx_dropped: u32,
     /// Events dropped because the application did not take them.
     pub events_dropped: u32,
-    /// Explicit translations skipped: a copied GPD payload too long, or a
-    /// derived payload the GPD command has no default translation for.
+    /// Explicit translations skipped (payload too long, or none to derive).
     #[cfg(feature = "translation-table")]
     pub translations_dropped: u32,
 }
@@ -790,8 +795,7 @@ struct CommissioningState {
     proxies_have_window: bool,
 }
 
-/// A queued network frame; [`Sink::poll`] encodes it (a GP Pairing from
-/// the GPD's Sink Table entry at that time), which keeps the queue small.
+/// A queued network frame, encoded by [`Sink::poll`] (GP Pairing from the current entry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Out {
     ProxyCommissioningMode(ProxyCommissioningMode),
@@ -861,13 +865,11 @@ struct Pending {
     entry: SinkEntry,
 }
 
+/// Where a GPD command came from: this node, a GP Notification or a GP Commissioning Notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
-    /// GPDF received by this node.
     Direct,
-    /// GP Notification from a proxy.
     Notification,
-    /// GP Commissioning Notification from a proxy.
     Commissioning,
 }
 
@@ -889,8 +891,7 @@ fn due(now: u32, deadline: u32) -> bool {
     now.wrapping_sub(deadline) < 0x8000_0000
 }
 
-/// The Green Power sink with `N` Sink Table entries and `Q` queued network
-/// transmissions.
+/// The Green Power sink: `N` Sink Table entries, `Q` queued network transmissions.
 pub struct Sink<const N: usize, const Q: usize> {
     config: SinkConfig,
     own_nwk: u16,
@@ -901,7 +902,7 @@ pub struct Sink<const N: usize, const Q: usize> {
     table: heapless::Vec<SinkEntry, N>,
     dup: DuplicateFilter<8>,
     commissioning: Option<CommissioningState>,
-    pending: heapless::Vec<Pending, MAX_PENDING_COMMISSIONING>,
+    pending: descriptions::PendingState,
     /// First GP Notification sender per (GPD, counter), for FirstToForward.
     first_forwarders: heapless::Deque<(GpdId, u32, u16), 4>,
     tx: heapless::Deque<Out, Q>,
@@ -937,7 +938,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             table: heapless::Vec::new(),
             dup: DuplicateFilter::new(crate::dup::DUPLICATE_TIMEOUT_MS),
             commissioning: None,
-            pending: heapless::Vec::new(),
+            pending: descriptions::PendingState::new(),
             first_forwarders: heapless::Deque::new(),
             tx: heapless::Deque::new(),
             commands: heapless::Deque::new(),
@@ -984,8 +985,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         self.pan_id = pan_id;
     }
 
-    /// Update the network's IEEE 802.15.4 channel (11..=26), used as the
-    /// TempMaster transmit channel of GP Responses.
+    /// Set the network channel (11..=26), the TempMaster channel of GP Responses.
     pub fn set_operational_channel(&mut self, channel: u8) {
         self.operational_channel = channel;
     }
@@ -1090,13 +1090,13 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
 
     /// Next timer deadline (commissioning window), if any.
     pub fn next_deadline(&self) -> Option<u32> {
-        self.commissioning.and_then(|c| c.deadline_ms)
+        self.description_deadline(self.commissioning.and_then(|c| c.deadline_ms))
     }
 
     /// Process timers and return the next network frame, if any. Call
     /// repeatedly until it returns `None`.
     pub fn poll(&mut self, now_ms: u32) -> Option<SinkTx> {
-        if let Some(c) = self.commissioning
+        if let Some(c) = *self.description_timers(now_ms)
             && c.deadline_ms.is_some_and(|d| due(now_ms, d))
         {
             self.leave_commissioning(SinkCommissioningExit::Timeout);
@@ -1886,9 +1886,9 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             // this point (`channel-request`); with a real GPD ID it is
             // invalid.
             cmd::CHANNEL_REQUEST | cmd::APPLICATION_DESCRIPTION => {
-                SinkOutcome::Dropped(Unsupported)
+                self.on_application_description(rx)
             }
-            _ if self.commissioning.is_some() && self.pending_index(&rx.gpd).is_some() => {
+            _ if self.commissioning.is_some() && self.completable_index(&rx.gpd).is_some() => {
                 self.complete_pending(rx)
             }
             cmd::SUCCESS => SinkOutcome::Dropped(NoEntry),
@@ -2091,7 +2091,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             let _ = entry.groups.push(SinkGroup { group, alias: None });
         }
         if !rx.rx_after_tx {
-            return self.finalize(entry);
+            return self.finish_unidirectional(entry, &p, rx);
         }
         // Bidirectional: GP Response with a Commissioning Reply through the
         // TempMaster (gecko_sdk `sendCommissioningReply`); the pairing
@@ -3954,3 +3954,6 @@ pub use involve_tc::JoinKind;
 mod keys;
 #[cfg(feature = "key-provisioning")]
 pub use keys::{MAX_OOB_KEYS, derive_shared_key};
+mod descriptions;
+#[cfg(feature = "app-description")]
+pub use descriptions::{APP_DESCRIPTION_TIMEOUT_MS, ApplicationDescriptionReports, MAX_REPORTS};

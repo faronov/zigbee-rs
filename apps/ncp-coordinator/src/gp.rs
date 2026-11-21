@@ -40,9 +40,9 @@ use zigbee_zrhp::codec::{Bytes8, Bytes16, CodecError, List, Reader, Wire, Writer
 use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataIndication};
 
 use zigbee_zrhp::msg::gp::{
-    EvtGpCommissioned, EvtGpCommissioning, EvtGpCommissioningFailed, EvtGpDecommissioned,
-    EvtGpFrame, GpProxyTableRead, GpSetSharedKey, GpSinkCommissioning, GpSinkConfig, GpSinkRemove,
-    GpSinkTablePut, GpSinkTablePutRsp, GpSinkTableRead, sink_mode,
+    EvtGpAppDescription, EvtGpCommissioned, EvtGpCommissioning, EvtGpCommissioningFailed,
+    EvtGpDecommissioned, EvtGpFrame, GpProxyTableRead, GpSetSharedKey, GpSinkCommissioning,
+    GpSinkConfig, GpSinkRemove, GpSinkTablePut, GpSinkTablePutRsp, GpSinkTableRead, sink_mode,
 };
 use zigbee_zrhp::msg::system::caps;
 use zigbee_zrhp::msg::{Kind, MessageDef, RawMessage, ids};
@@ -795,6 +795,15 @@ pub(crate) fn emit_gp_events<C: CoordinatorPort>(
             GpNcpEvent::Sink(SinkEvent::Decommissioned { gpd_id }) => {
                 let event = EvtGpDecommissioned {
                     gpd_id: zrhp_gpd_id(&gpd_id),
+                };
+                crate::ncp::push_event(queues, seqs, &event);
+            }
+            GpNcpEvent::Sink(SinkEvent::ApplicationDescription(d)) => {
+                let event = EvtGpAppDescription {
+                    gpd_id: zrhp_gpd_id(&d.gpd_id),
+                    total_reports: d.total_reports,
+                    report_count: d.report_count,
+                    reports: Bytes8(&d.reports),
                 };
                 crate::ncp::push_event(queues, seqs, &event);
             }

@@ -161,6 +161,12 @@ green-power-involve-tc = ["green-power-sink", "zigbee-gp/involve-tc"]
 # gpLinkKey, keys handed to GPDs that ask for one at commissioning,
 # out-of-band GPD keys (zigbee-gp `key-provisioning`).
 green-power-key-provisioning = ["green-power-sink", "zigbee-gp/key-provisioning"]
+# GPD Application Description (0xE4) on the sink: a GPD announcing one is
+# paired once its report descriptors are collected, which reach the
+# application (and a ZRHP host as `EVT_GP_APP_DESCRIPTION`) as
+# `SinkEvent::ApplicationDescription`. Off by default: images built without
+# it are unchanged.
+green-power-app-description = ["green-power-sink", "zigbee-gp/app-description"]
 # ZRHP network co-processor integration of the GP combo (spec 7.11,
 # `green_power::ncp`): one sink authority switchable at runtime between the
 # runtime's sink (NCP_SINK) and the host's (HOST_SINK: GP server frames and
