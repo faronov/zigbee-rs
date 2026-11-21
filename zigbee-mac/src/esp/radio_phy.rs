@@ -551,9 +551,7 @@ impl<'a> EspRadioPhy<'a> {
         let mut padded = [0u8; MAX_PHY_FRAME_LEN + 2];
         padded[..frame.len()].copy_from_slice(frame);
 
-        TX_COMPLETE.store(false, Ordering::Release);
-        #[cfg(feature = "esp-extcoex")]
-        self.driver.clear_tx_coex_denied();
+        arm_tx(&mut self.driver);
         let started = esp_hal::time::Instant::now();
         while let Err(error) = self
             .driver
@@ -576,16 +574,10 @@ impl<'a> EspRadioPhy<'a> {
             }
             core::hint::spin_loop();
         }
-        // The external arbiter refused the frame (no grant): nothing went
-        // on air; CSMA-CA backs off as from a busy channel.
-        #[cfg(feature = "esp-extcoex")]
-        if self.driver.take_tx_coex_denied() {
-            return Err(PhyError::ChannelBusy);
-        }
         // On the normal path the ISR already put us back into RX
         // (`rx_when_idle`); calling `start_receive()` here could abort an ACK
         // we are transmitting for a frame that arrived in the meantime.
-        Ok(())
+        tx_outcome(&mut self.driver, PhyError::ChannelBusy)
     }
 
     /// Hand `frame` to the radio now, without CCA, abandoning a frame being
@@ -605,9 +597,7 @@ impl<'a> EspRadioPhy<'a> {
         let mut padded = [0u8; MAX_PHY_FRAME_LEN + 2];
         padded[..frame.len()].copy_from_slice(frame);
 
-        TX_COMPLETE.store(false, Ordering::Release);
-        #[cfg(feature = "esp-extcoex")]
-        self.driver.clear_tx_coex_denied();
+        arm_tx(&mut self.driver);
         // Check before every attempt, including the first; a Busy retry may
         // have been delayed past the deadline since the preceding check.
         crate::phy::transmit_with_deadline(
@@ -633,13 +623,7 @@ impl<'a> EspRadioPhy<'a> {
             }
             core::hint::spin_loop();
         }
-        // Refused by the external arbiter at the instant: the window is
-        // gone (spec 11.5).
-        #[cfg(feature = "esp-extcoex")]
-        if self.driver.take_tx_coex_denied() {
-            return Err(PhyError::Missed);
-        }
-        Ok(())
+        tx_outcome(&mut self.driver, PhyError::Missed)
     }
 
     /// The esp-radio outcome of the armed reply, with its SrcID.
@@ -1206,4 +1190,32 @@ async fn energy_detect(phy: &mut EspRadioPhy<'_>, duration_us: u32) -> Result<u8
         }
         Timer::after_micros(RX_POLL_INTERVAL_US).await;
     }
+}
+
+// Declared last, so that the lines (panic locations) above are those of an
+// image without `esp-extcoex`.
+
+/// Before a transmission: clear the TX-done flag and, with `esp-extcoex`, an
+/// earlier arbiter refusal.
+#[inline(always)]
+fn arm_tx(driver: &mut Ieee802154<'_>) {
+    TX_COMPLETE.store(false, Ordering::Release);
+    #[cfg(feature = "esp-extcoex")]
+    driver.clear_tx_coex_denied();
+    #[cfg(not(feature = "esp-extcoex"))]
+    let _ = driver;
+}
+
+/// After TX-done: `refused` when the external (PTA) arbiter refused the
+/// frame (no grant, nothing on air; `esp-extcoex`): a busy channel for
+/// CSMA-CA, `Missed` for a timed transmission whose instant is gone (spec
+/// 11.5).
+#[inline(always)]
+fn tx_outcome(driver: &mut Ieee802154<'_>, refused: PhyError) -> Result<(), PhyError> {
+    #[cfg(feature = "esp-extcoex")]
+    if driver.take_tx_coex_denied() {
+        return Err(refused);
+    }
+    let _ = (driver, refused);
+    Ok(())
 }
