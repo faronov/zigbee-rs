@@ -167,12 +167,12 @@ struct OutFrame {
 pub struct GreenPowerState {
     proxy: GpProxy,
     clock: GpClock,
-    /// A reply (Proxy Table Response, Read Attributes Response) waiting for
-    /// the next [`ZigbeeDevice::gp_poll`].
+    /// A reply (Proxy Table / Read Attributes Response) for the next [`ZigbeeDevice::gp_poll`].
     reply: Option<OutFrame>,
     tsn: u8,
-    /// Temporary channel the radio was tuned to for a Channel Configuration
-    /// delivery; `None` while on the operational channel.
+    #[cfg(feature = "green-power-pairing-search")]
+    search: pairing_search::SearchState,
+    /// Channel tuned to for a Channel Configuration delivery (`None`: operational).
     #[cfg(feature = "green-power-full-proxy")]
     off_channel: Option<u8>,
     #[cfg(feature = "green-power-bidirectional")]
@@ -191,6 +191,8 @@ impl GreenPowerState {
             clock: GpClock::new(),
             reply: None,
             tsn: 0,
+            #[cfg(feature = "green-power-pairing-search")]
+            search: pairing_search::SearchState::new(),
             #[cfg(feature = "green-power-full-proxy")]
             off_channel: None,
             #[cfg(feature = "green-power-bidirectional")]
@@ -210,10 +212,9 @@ impl GreenPowerState {
 
     /// Initialize `*dst` in place.
     ///
-    /// Out of line on purpose: the device builder writes `ZigbeeDevice` in
-    /// place, and constructing this value inside the builder kept a
-    /// temporary in the builder's frame, which sits on the deepest boot
-    /// stack chain (`compose -> assemble_into -> NwkLayer::write_into`).
+    /// Out of line on purpose: the device builder writes `ZigbeeDevice` in place, and
+    /// constructing this value inside the builder kept a temporary in the builder's frame,
+    /// on the deepest boot stack chain (`compose -> assemble_into -> NwkLayer::write_into`).
     ///
     /// # Safety
     ///
@@ -252,11 +253,10 @@ impl GreenPowerState {
     }
 }
 
-/// Approximate the received RSSI from the 802.15.4 LQI for the GPP-GPD link
-/// byte (the MAC indication carries no RSSI). It inverts the stack-wide
-/// RSSI-derived LQI policy (`zigbee_mac::lqi::from_rssi_dbm`, linear over
-/// −100..−20 dBm), and the Link quality follows the RSSI bands of
-/// [`GppGpdLink::from_rssi`].
+/// Approximate the received RSSI from the 802.15.4 LQI for the GPP-GPD link byte (the
+/// MAC indication carries no RSSI). It inverts the stack-wide RSSI-derived LQI policy
+/// (`zigbee_mac::lqi::from_rssi_dbm`, linear over −100..−20 dBm), and the Link quality
+/// follows the RSSI bands of [`GppGpdLink::from_rssi`].
 fn link_from_lqi(lqi: u8) -> GppGpdLink {
     GppGpdLink::from_rssi(-100 + (i16::from(lqi) * 80 / 255))
 }
@@ -570,7 +570,7 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         self.green_power.proxy.set_own_nwk(own_nwk);
         let link = link_from_lqi(indication.lqi);
         let mac = self.bdb.zdo_mut().aps_mut().nwk_mut().mac_mut();
-        let outcome = self.green_power.proxy.on_gpdf(mac, &frame, link, now_ms);
+        let outcome = pairing_search::on_gpdf(&mut self.green_power, mac, &frame, link, now_ms);
         match outcome {
             GpdfOutcome::Dropped(reason) => {
                 log::debug!("[GP] GPDF {:?} dropped: {:?}", frame.header.gpd_id, reason)
@@ -1633,7 +1633,7 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
     /// The proxy's next due frame.
     #[inline(always)]
     fn gp_proxy_poll(&mut self, now_ms: u32) -> Option<GpTx> {
-        self.green_power.proxy.poll(now_ms)
+        pairing_search::poll(&mut self.green_power, now_ms)
     }
 }
 
@@ -1787,3 +1787,5 @@ mod tests {
         }
     }
 }
+
+mod pairing_search;

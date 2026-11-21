@@ -167,6 +167,13 @@ green-power-key-provisioning = ["green-power-sink", "zigbee-gp/key-provisioning"
 # `SinkEvent::ApplicationDescription`. Off by default: images built without
 # it are unchanged.
 green-power-app-description = ["green-power-sink", "zigbee-gp/app-description"]
+# The sink answers GP Pairing Search with GP Pairing for a matching Sink
+# Table entry (`zigbee-gp/pairing-search`). Off by default.
+green-power-sink-pairing-search = ["green-power-sink", "zigbee-gp/pairing-search"]
+# The proxy broadcasts GP Pairing Search for a GPD it has no Proxy Table
+# entry for (rate-limited: one search per minute, the same GPD again after
+# 15 minutes). Off by default: images built without it are unchanged.
+green-power-pairing-search = ["green-power"]
 # ZRHP network co-processor integration of the GP combo (spec 7.11,
 # `green_power::ncp`): one sink authority switchable at runtime between the
 # runtime's sink (NCP_SINK) and the host's (HOST_SINK: GP server frames and

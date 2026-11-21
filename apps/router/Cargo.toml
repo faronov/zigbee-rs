@@ -54,6 +54,13 @@ green-power-involve-tc = ["green-power-sink", "zigbee-runtime/green-power-involv
 # GPDs that ask for one, out-of-band keys). Product images must opt in
 # explicitly.
 green-power-key-provisioning = ["green-power-sink", "zigbee-runtime/green-power-key-provisioning"]
+# The sink answers GP Pairing Search; the proxy searches for GPDs it has no
+# entry for (rate-limited). Product images must opt in explicitly.
+green-power-sink-pairing-search = [
+    "green-power-sink",
+    "zigbee-runtime/green-power-sink-pairing-search",
+]
+green-power-pairing-search = ["green-power", "zigbee-runtime/green-power-pairing-search"]
 
 [dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }

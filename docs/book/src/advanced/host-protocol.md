@@ -1828,6 +1828,9 @@ itself has no GP fields.
   GPDF's, or the APS frame's for a proxied one. An encrypted frame the sink
   could not decrypt for the report keeps its raw payload, flag bit 1 clear,
   `command_id` 0xFF.
+- The NCP sink answers a proxy's GP Pairing Search with GP Pairing for a
+  matching Sink Table entry, unicast to the proxy, without involving the
+  host (`zigbee_gp::sink` `pairing-search`).
 - `R_GP_SINK` carries one group: a pre-commissioned groupcast entry exports
   its first group. `GP_SINK_TABLE_PUT` and `GP_SINK_REMOVE` need a running
   network (`INVALID_STATE`; the table is restored from NV when the network

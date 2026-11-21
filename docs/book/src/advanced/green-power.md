@@ -47,6 +47,7 @@
 | gpsSecurityLevel InvolveTC (`zigbee-gp/involve-tc`, `zigbee-runtime/green-power-involve-tc`, router-app `green-power-involve-tc`; in `combo-light` and the ZRHP NCP): the bit is writable; `gp_sink_derive_involve_tc` sets it after an install-code join, clears it in a distributed network and keeps it after a default-key join (gecko_sdk `writeInvolveTCBit`); while set a sink refuses GP Sink Commissioning Mode (UNSUP_COMMAND), local commissioning and Commissioning GPDFs (`SinkDrop::InvolveTc`, `EVT_GP_COMMISSIONING_FAILED` reason 14); a sink that is the Trust Center (the NCP) is not stopped (§3.10) | implemented, opt-in (2026-11-21) | host tests: `sink::involve_tc` (write, refusal paths, Trust Center sink, derivation), runtime `gp_involve_tc` (install-code join, default-key join, Trust Center), NCP `GP_SINK_CONFIG` accepts bit 3. **Not run on hardware** |
 | GPD key provisioning on the sink (`zigbee-gp/key-provisioning`, `zigbee-runtime/green-power-key-provisioning`, router-app `green-power-key-provisioning`; in `combo-light` and the ZRHP NCP): gpSharedSecurityKeyType / gpSharedSecurityKey (write-only key) / gpLinkKey (write-only), the shared key handed to a GPD that asks for one in a bidirectional commissioning (network key, NWK-key derived group key, GPD group key, derived individual key, as gecko_sdk `sendCommissioningReply`), protected with gpLinkKey when the GPD uses key encryption or gpsSecurityLevel requires it, the network key always protected; out-of-band keys for GPDs that commission without sending theirs, and a re-commissioning without a key keeps the entry's key; `GP_SET_SHARED_KEY` on the NCP (§3.11) | implemented, opt-in (2026-11-21) | host tests: `sink::keys` (GP spec vectors A.1.5.7.1, A.1.5.7.2, A.1.5.12.1 and A.1.5.8.3 from gecko_sdk, attributes, provided key with TC-LK protection and Success under the new key, own key kept without a request, out-of-band keys), runtime end to end `gp_key_provisioning_tests` (the combo hands the network key, protected, by timed TX), NCP `GP_SET_SHARED_KEY`. **Not run on hardware** |
 | GPD Application Description on the sink (`zigbee-gp/app-description`, `zigbee-runtime/green-power-app-description`; in the ZRHP NCP, not in `combo-light`): a GPD whose Commissioning announces "application description follows" waits (20 s) until all its report descriptors arrive in Application Description commands (direct or in GP Commissioning Notifications), then pairs, with a Commissioning Reply when the last report asked for one; new descriptors become `SinkEvent::ApplicationDescription` and, on the NCP, `EVT_GP_APP_DESCRIPTION`; with `translation-table` also GP Pairing Configuration action 0b101 and Extend/Replace carrying descriptors (§3.12) | implemented, opt-in (2026-11-21) | host tests: `zigbee_gp::app_description` codec, `sink::descriptions` (collection, timeout, repetitions, refusals, bidirectional reply, Pairing Configuration), NCP end to end `application_description_reaches_the_host_before_the_pairing`, zigbee-zrhp vector `evt_gp_app_description`. **Not run on hardware** (no multi-sensor GPD in the lab) |
+| GP Pairing Search (sink side `zigbee-gp/pairing-search`, `zigbee-runtime/green-power-sink-pairing-search`, router-app `green-power-sink-pairing-search`, in `combo-light` and the ZRHP NCP; proxy side `zigbee-runtime/green-power-pairing-search`, router-app `green-power-pairing-search`, in no image): the sink answers a search with GP Pairing for a Sink Table entry in a requested communication mode, unicast to the searching proxy, frame counter and key only when requested; the proxy broadcasts a search for a GPD whose data GPDF it dropped for want of a Proxy Table entry, at most one per minute and the same GPD again after 15 minutes (§3.13) | implemented, opt-in (2026-11-21) | host tests: `sink::pairing_search` (gecko_sdk field layout, request bits, no answer without a match), runtime end to end `pairing_search::tests` (router proxy without an entry searches, the coordinator's sink answers, the proxy stores the pairing and tunnels the next GPDF; rate limits). **Not run on hardware** |
 | Remote GP provisioning on the ZRHP NCP (`GP_PAIRING_CONFIGURATION`, `GP_SEND_PAIRING`, `GP_TRANSLATION_UPDATE`/`REQUEST`, `GP_REMOTE_SINK_TABLE_REQUEST`, `GP_REMOTE_PROXY_TABLE_REQUEST`, `EVT_GP_REMOTE_*`, [ZRHP 7.11](host-protocol.md#711-green-power-0x0axx-endpoint-2)) | implemented (2026-11-19) | host tests: zigbee-zrhp vectors (`generate.py --check`), NCP request mapping, NCP end to end against a second zigbee-rs router stack (`remote_provisioning_reaches_another_proxy_and_sink`). H2 NCP image builds and passes the stack gate. **Lab-tested on hardware 2026-11-20 (§6.12)**: master 2ab8ac0 NCP on the Thread BR board's H2 (921 600, RTS/CTS) provisioned an ESP32-C6 combo over the air with `GP_PAIRING_CONFIGURATION`, `GP_TRANSLATION_UPDATE`, `GP_TRANSLATION_REQUEST` and `GP_REMOTE_SINK_TABLE_REQUEST`, each answered (`EVT_GP_REMOTE_*`) within 50–85 ms; host tool `tools/zrhp-host` `--gp-*`. `GP_SEND_PAIRING` and `GP_REMOTE_PROXY_TABLE_REQUEST` not run on hardware |
 | Adaptive frame-counter persistence (`zigbee_gp::counter`, Proxy and Sink Table, exact flag in the GP journal's counter records) | implemented, in every GP image | host tests (§3.3); lab-tested on the H2-Zero combo 2026-11-17: after a power cycle the switch's first presses toggled the light, none dropped (§6.10) |
 | GP combo on the ZRHP coordinator NCP (`zigbee-runtime/green-power-ncp` with `ncp-capacity`, `apps/ncp-coordinator` `gp`, `examples/esp32-ncp`): Proxy Basic + sink (Sink Table 16, Proxy Table 8) + TempMaster, sink authority switchable at runtime (`NCP_SINK` / `HOST_SINK`), NCP default `gpsSecurityLevel` 0x00 with no translation endpoint, GP journal in the NCP's `zbnv` window (2 × 8 KiB), all GREEN POWER commands and events of [ZRHP 7.11](host-protocol.md#711-green-power-0x0axx-endpoint-2) | implemented (2026-11-19) | host tests: `zigbee-gp` import/quiet-removal unit tests, runtime `green_power::ncp` unit tests, NCP end-to-end `apps/ncp-coordinator/tests/gp.rs` over the host link (commissioning of a level-3 GPD heard directly, reports, a proxy's GP Notification, table read/put/remove, `CONFLICT`, key-export lock, `HOST_SINK` raw frames and local proxy output), journal geometry tests in `products/esp32-zigbee-ncp`; H2 and C6 NCP images build and pass the stack gate. **Not run on hardware** (ZRHP gate H10) |
@@ -227,7 +228,7 @@ panic `Location` line/column fields); §4.1 records the proof.
 |---|---|---|
 | (a) Proxy Basic | `proxy-basic` / `green-power-proxy` / `green-power` | dGP stub (version-3 demux, GPDF codec, security processing for proxy-table entries), proxy table plus journal, duplicate filter, commissioning mode, Commissioning Notification, Notification in derived/pre-commissioned groupcast and lightweight unicast, Pairing, Proxy Commissioning Mode, Proxy Table Request/Response, gppFunctionality attributes, GP 1.1.1 tunnelling delay (A.3.6.3.1). Unidirectional only. |
 | (a+) Basic with bidirectional commissioning | `proxy-bidir-commissioning` | gpTxQueue (≥ 5 entries, one per GPD), GP Response handling in the TempMaster role, timed transmission on the operational channel, Commissioning Reply. *(verify 1.1: possibly mandatory for Basic)* |
-| (b) Full proxy | `proxy-full` (implies the above) | **In progress (M5):** protected IEEE ApplicationID 2 GPDF authentication/forwarding; full-unicast Pairing and Notification Response matching; bounded retries with readable/writable retry attributes; temporary channel switch for a Maintenance Channel Configuration (A.3.9.1 step 8: the radio moves to the GPD's transmit channel, serves only its Channel Request, defers network transmissions and returns after delivery or 5 s); strict GP Tunneling Stop payload codec. gppFunctionality adds full unicast and GPD IEEE address. Tunneling Stop is a GP 1.0 optional command that the Silicon Labs GP 1.1 client neither sends nor handles, so no behaviour is attached to it. Pairing Search and Proxy Table maintenance are deferred: neither zigpy nor the Silicon Labs client uses them. Remaining: Combo/Sink and counter-reservation optimization. |
+| (b) Full proxy | `proxy-full` (implies the above) | **In progress (M5):** protected IEEE ApplicationID 2 GPDF authentication/forwarding; full-unicast Pairing and Notification Response matching; bounded retries with readable/writable retry attributes; temporary channel switch for a Maintenance Channel Configuration (A.3.9.1 step 8: the radio moves to the GPD's transmit channel, serves only its Channel Request, defers network transmissions and returns after delivery or 5 s); strict GP Tunneling Stop payload codec. gppFunctionality adds full unicast and GPD IEEE address. Tunneling Stop is a GP 1.0 optional command that the Silicon Labs GP 1.1 client neither sends nor handles, so no behaviour is attached to it. Pairing Search is opt-in (§3.13); Proxy Table maintenance is deferred: neither zigpy nor the Silicon Labs client uses them. Remaining: Combo/Sink and counter-reservation optimization. |
 | (c) Combo / Sink | `sink` (implies `proxy`) / `green-power-sink` (implies `green-power`) / `green-power-sink` | **Implemented opt-in, host-tested; lab-tested on the ESP32-H2-Zero combo light (§3.7, §6.10):** GP server on GPEP: Sink Table plus journal, sink commissioning mode (local API or GP Sink Commissioning Mode, window, exit on first pairing, GP Proxy Commissioning Mode to the proxies), direct GPDF reception, Notification and Commissioning Notification handling, bidirectional commissioning (GP Response with Commissioning Reply, Success), decommissioning, GP Pairing and alias Device_annce generation, GP Notification Response, Sink Table Request/Response, sink attributes 0x0000–0x0007, built-in translation (Off/On/Toggle → On/Off, Level Control Move/Step/Stop) to one local application endpoint. With `translation-table` / `green-power-translation-table` / `green-power-translation-table` (opt-in, §3.8): GP Pairing Configuration, Translation Table Update/Request and per-GPD translations to any local endpoint. With `channel-request` / `green-power-channel-request` (opt-in, §3.9): GPD Channel Request answered with a Channel Configuration. With `involve-tc` / `green-power-involve-tc` (opt-in, §3.10): gpsSecurityLevel InvolveTC derived from the join. With `key-provisioning` / `green-power-key-provisioning` (opt-in, §3.11): keys handed to GPDs and out-of-band GPD keys. With `app-description` / `green-power-app-description` (opt-in, §3.12): GPD Application Description collected before the pairing and handed to the application. With `pairing-search` / `green-power-sink-pairing-search` (opt-in, §3.13): GP Pairing Search answered with GP Pairing. **Deferred:** GPM commissioning |
 | (d) GPD app | `gpd` (frame builder and security only) + `apps/gpd` | No NWK/APS/ZDO/BDB. Commissioning (uni- and bidirectional), Channel Request, data and attribute reports, switch commands, secure frame-counter journal, sleep between reports |
 
@@ -1192,6 +1193,44 @@ completing frame result 2 with `EVT_GP_COMMISSIONED`.
 `#[inline(always)]` calls into `sink/descriptions.rs`; the
 `combo-light` image (without the feature) is byte-identical (§4.10).
 
+### 3.13 GP Pairing Search (opt-in)
+
+A proxy that hears a GPD it has no Proxy Table entry for (its table was
+lost, or it joined after the GPD was commissioned) can ask the sinks with
+GP Pairing Search (client → server `0x01`: options with the ApplicationID
+and request bits for unicast, derived groupcast and pre-commissioned
+groupcast sinks, the frame counter and the key; then the GPD ID). The codec
+is `zigbee_gp::cluster::PairingSearch` (gecko_sdk `GpPairingSearch`
+layout). Neither gecko_sdk (weak callback only, its client never sends it)
+nor zigpy implements a behaviour; this one is ours:
+
+- **Sink** (`zigbee_gp::sink` module `pairing_search`, feature
+  `pairing-search`): a search for a GPD with a Sink Table entry in one of
+  the requested communication modes is answered with GP Pairing (AddSink)
+  built like the sink's commissioning GP Pairing
+  (`sendGpPairingFromSinkEntry`), sent **unicast to the searching proxy**
+  rather than broadcast (only that proxy lacks the entry); the frame
+  counter and key are included only when requested. Unknown GPDs, other
+  modes and the sink's own looped-back search get no answer.
+- **Proxy** (`zigbee-runtime` `green_power/pairing_search.rs`, feature
+  `green-power-pairing-search`): a data GPDF the proxy dropped with
+  `NoEntry` (outside commissioning mode) queues a broadcast search (every
+  sink kind, counter and key), sent after the proxy's own frames. GPDs of
+  neighbouring networks are heard too, so searches are bounded: one per
+  `SEARCH_GAP_MS` (60 s) from this node, the same GPD again after
+  `SEARCH_REPEAT_MS` (15 min), the last `RECENT` (4) GPDs remembered. The
+  GP Pairing answer is processed as any GP Pairing; the GPD's next GPDF is
+  tunnelled. The state is per device (`GreenPowerState`), not persisted.
+- The sink side is in `combo-light` and the ZRHP NCP. The proxy side is in
+  no image: our proxies persist their tables, the search is a recovery
+  path, and a router image should not broadcast for foreign GPDs unless a
+  product chooses to.
+
+**Images.** The proxy hooks (`pairing_search::on_gpdf` / `poll`, the
+`GreenPowerState` field) are line-neutral and compile to the previous code
+without the feature: the ESP32-H2 and ESP32-C6 router and nRF52840 router
+images are byte-identical (§4.11).
+
 ## 4. Size estimates
 
 §4.1 has the measured Proxy Basic cost; the rest of this section is the
@@ -1524,6 +1563,18 @@ Release builds in one checkout path, nightly-2026-08-01, master dd1ce41 →
 The NCP growth is the descriptor codec (≈0.6 KB), the collection and reply
 path in the sink (≈1.8 KB, partly inlined into `Sink::process`) and the
 ZRHP event (≈0.6 KB).
+
+### 4.11 Measured: GP Pairing Search (2026-11-21)
+
+Release builds in one checkout path, nightly-2026-08-01, master dd1ce41 →
+`gp-pairing-search` (file-backed flash = `.text` + `.rodata` + `.data`):
+
+| Image | Flash | `.bss` | Note |
+|---|---:|---:|---|
+| ESP32-H2-Zero `combo-light` | 583,982 → 584,960 (+978) | ±0 | sink side |
+| ESP32-H2 ZRHP NCP (`thread-br-h2`) | 730,526 → 731,398 (+872) | ±0 | sink side; stack gate passes |
+| ESP32-H2-Zero router + `router-app/green-power-pairing-search` (lab measurement) | 520,474 → 521,668 (+1,194) | +96 | proxy side, not in a product |
+| ESP32-H2-Zero router, ESP32-C6 router, nRF52840 router | byte-identical | | features off |
 
 ## 5. Risks
 

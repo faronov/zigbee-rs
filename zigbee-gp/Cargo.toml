@@ -61,6 +61,10 @@ key-provisioning = ["sink"]
 # to the application ([`sink::SinkEvent::ApplicationDescription`]); with
 # `translation-table` also GP Pairing Configuration action 0b101.
 app-description = ["sink"]
+# GP Pairing Search (client → server 0x01) answered by the sink: a GP
+# Pairing for a matching Sink Table entry, sent to the searching proxy.
+# The proxy-side search is zigbee-runtime `green-power-pairing-search`.
+pairing-search = ["sink"]
 # A 4-entry Translation Table instead of 16 (a sink whose large Sink Table
 # leaves little persistent room, e.g. the 16-entry ZRHP NCP sink).
 compact-translation-table = []
