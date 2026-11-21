@@ -24,6 +24,7 @@
 //! | B | on | 0x00 | pull-up (granted, if the S3 does not drive GPIO13) |
 //! | C | on | 0x00 | pull-down (denied, if the S3 does not drive GPIO13) |
 //! | D | on | 0x08 | pull-up (all TX `High`) |
+//! | F | on | 0x08 | pull-down (all TX `High`, denied) |
 //! | E | on | 0x00 | no pull (the S3 leader drives grant) |
 //! | R | refusals: mask 0x04 and 0x10 must be refused, state unchanged |
 //!
@@ -128,7 +129,14 @@ fn main() -> ! {
     dump(&pta);
 
     let mut seq = 0u8;
+    let mut cycle = 0u32;
     loop {
+        // Second cycle on: also the blob's coex_init + coex_enable.
+        if cycle == 1 {
+            let r = esp32_zigbee_ncp_product::pta::lab_coex_init_enable();
+            println!("pta_lab: coex (pre_init, init, enable) -> {r:?}");
+        }
+        cycle += 1;
         let mut run = |name: &str, enable: bool, priority_mask: u8, pull: Pull| {
             phase(
                 name,
@@ -148,6 +156,12 @@ fn main() -> ! {
             true,
             mask::ALL,
             Pull::Up,
+        );
+        run(
+            "F on mask 0x08 (all High), grant pull-down",
+            true,
+            mask::ALL,
+            Pull::Down,
         );
         run("E on, S3 drives grant", true, 0, Pull::None);
         refusals(&mut pta);

@@ -53,6 +53,17 @@
 //! {tx,rx}_stage` calls and configurable scene PTIs) is the esp-radio local
 //! patch `ieee802154-extcoex` (`vendor/esp-radio/LOCAL-PATCHES.md`).
 //!
+//! # Hardware status (Thread BR board, `pta_lab`, 2026-11-21)
+//!
+//! - Without the adapter registration and `coex_pre_init` the arbiter
+//!   stayed off: no line moved.
+//! - With them the outputs work: `priority` (GPIO2, signal 81) is high for
+//!   every transmission, `request` (GPIO0, signal 82) only for `High`
+//!   PTIs (mask bit 3), and the S3 sees both.
+//! - Grant does **not** gate transmissions yet: with grant pulled low (also
+//!   with request high, and after the blob's `coex_init`/`coex_enable`)
+//!   every frame went out, `TX_BREAK_COEX_CNT` stayed 0. Gate H9 is open.
+//!
 //! # Priority mask (`coex_tx_priority_mask`)
 //!
 //! The only priority control the blob offers is the PTI of each radio
@@ -175,7 +186,7 @@ const fn raise(raised: bool, default: Priority) -> Priority {
 }
 
 #[cfg(target_os = "none")]
-pub use self::hw::{Pta, adapter_stats};
+pub use self::hw::{Pta, adapter_stats, lab_coex_init_enable};
 
 #[cfg(target_os = "none")]
 mod hw {
@@ -235,6 +246,8 @@ mod hw {
         // coex_pre_init();`) whenever external coexistence is configured.
         fn esp_coex_adapter_register(funcs: *mut adapter::CoexAdapterFuncs) -> i32;
         fn coex_pre_init() -> i32;
+        fn coex_init() -> i32;
+        fn coex_enable() -> i32;
         // ESP32-H2 ROM (esp-rom-sys `esp32h2.rom.api.ld`: gpio_matrix_out /
         // gpio_matrix_in at 0x400006a8 / 0x400006a4).
         fn esp_rom_gpio_connect_out_signal(gpio: u32, signal: u32, out_inv: bool, oen_inv: bool);
@@ -376,6 +389,17 @@ mod hw {
             return Err(PtaError::Arbiter(ret));
         }
         Ok(())
+    }
+
+    /// Lab experiment: the blob's `coex_init` and `coex_enable` (ESP-IDF
+    /// runs them only with Wi-Fi or Bluetooth), after the pre-init.
+    pub fn lab_coex_init_enable() -> (i32, i32, i32) {
+        let pre = match pre_init() {
+            Ok(()) => 0,
+            Err(PtaError::Arbiter(e)) => e,
+            Err(_) => -1,
+        };
+        unsafe { (pre, coex_init(), coex_enable()) }
     }
 
     /// Diagnostics of the OS adapter (lab): semaphores created, timer
