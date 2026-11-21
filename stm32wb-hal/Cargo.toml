@@ -19,6 +19,9 @@ default = []
 stm32wb55vg = ["_chip", "embassy-stm32/stm32wb55vg", "embassy-stm32-wpan/stm32wb55vg"]
 stm32wb55rg = ["_chip", "embassy-stm32/stm32wb55rg", "embassy-stm32-wpan/stm32wb55rg"]
 stm32wb55cg = ["_chip", "embassy-stm32/stm32wb55cg", "embassy-stm32-wpan/stm32wb55cg"]
+# Lab builds: `AesEngine::known_answer_suite` runs the full zigbee-crypto
+# known-answer suite on AES1 at start-up instead of the two-block self-test.
+kat = ["zigbee-crypto/kat"]
 _chip = [
     "dep:embassy-stm32",
     "dep:embassy-stm32-wpan",
@@ -30,6 +33,7 @@ _chip = [
 [dependencies]
 zigbee-mac = { path = "../zigbee-mac", features = ["stm32wb"] }
 zigbee-types = { path = "../zigbee-types" }
+zigbee-crypto = { path = "../zigbee-crypto" }
 heapless = "0.9"
 embedded-storage = "0.3"
 log = "0.4"
@@ -42,6 +46,9 @@ embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec07
 embassy-stm32-wpan = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", optional = true, features = ["wb-mac"] }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", optional = true }
 embassy-futures = { git = "https://github.com/embassy-rs/embassy", rev = "7419ec0700f23058e90285a56c62ecd2c0a39b87", optional = true }
+
+[dev-dependencies]
+zigbee-crypto = { path = "../zigbee-crypto", features = ["kat"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

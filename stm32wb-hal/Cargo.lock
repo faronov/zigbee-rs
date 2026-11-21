@@ -668,6 +668,7 @@ dependencies = [
  "embedded-storage",
  "heapless",
  "log",
+ "zigbee-crypto",
  "zigbee-mac",
  "zigbee-types",
 ]

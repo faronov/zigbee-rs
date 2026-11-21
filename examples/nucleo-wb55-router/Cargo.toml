@@ -10,6 +10,7 @@ publish = false
 # see docs/book/src/platform-guides/stm32wb.md.
 #   cargo build --release                        # router + GP proxy
 #   cargo build --release --no-default-features  # router without Green Power
+#   cargo build --release --features lab-aes-kat # LAB ONLY: full AES1 KAT suite
 [workspace]
 
 [features]
@@ -17,6 +18,10 @@ default = ["green-power"]
 # Green Power Proxy Basic: tunnels GPDFs to the sink and journals the Proxy
 # Table at 0x080CF000.
 green-power = ["stm32wb-router-app/green-power"]
+# LAB ONLY: run the full zigbee-crypto known-answer suite (AES blocks,
+# IEEE 802.15.4 and Zigbee CCM*, install-code AES-MMO) on AES1 at start-up
+# instead of the two-block self-test. Never in a shipped image.
+lab-aes-kat = ["stm32wb-hal/kat"]
 
 [dependencies]
 stm32wb-hal = { path = "../../stm32wb-hal", features = ["stm32wb55rg"] }
