@@ -571,6 +571,65 @@ A shared SoftMac duplicate filter (IEEE 802.15.4 §7.5.6.2, one
 source/DSN entry) was measured at +304 B flash, +16 B bss and +16 B stack.
 It fired once in 16 minutes of soak and was not adopted.
 
+#### Imm-ACK turnaround and a joiner that gives up (2026-11-21)
+
+An STM32WB55 (ST CPU2 MAC) often failed to join through 0x045B. The
+router's imm-ACK to the joiner's Data Requests, while an Association
+Response was pending for it, started 216-274 us after the end of the
+frame. Sniffer timestamps put other routers in the same network at
+190-199 us, and 0x045B itself at 142-147 us for every other frame.
+The WB55 accepted ACKs up to 199 us and discarded those from 216 us. It
+kept polling, then associated with another parent. Its MAC still
+acknowledged 0x045B's Association Response, so 0x045B reported the
+device to the Trust Center at an address the device never used. The
+Trust Center then routed the Transport-Key and later the unique TCLK
+there, and Request-Key timed out.
+
+The cause was the frame-pending lookup in the software-ACK path. It is
+in `.ram_code`, but the Data Request parser and the table match it
+called were flash-resident (a derived `Ord` on the 8-byte address
+compares with `memcmp`). Only an extended-address entry (a pending
+Association Response) reached that code, and its XIP cache misses
+delayed the ACK by about 125 us. An nRF radio-lab injection reproduced
+it with no real joiner: an Association Request that asks for no address
+(always refused, so a response is queued) followed by a Data Request
+from the same extended address.
+
+The lookup now parses the polling frame in place in `.ram_code` with no
+out-of-line calls, and only for an unsecured MAC command with PAN ID
+compression, as a Data Request always is. The ACK is now armed 160 us
+after RX done (was 120 us), which places it about 185 us after the frame,
+next to the other vendors and inside aTurnaroundTime (192 us).
+Turnaround measured from the end of the sniffer's own injected frame
+(about 44 us later than for a received frame):
+
+| frame to 0x045B | base | fixed |
+|---|---:|---:|
+| Association Request | 186.5 us (n=14) | 227 us (n=13) |
+| Data | 187 us (n=15) | 227 us (n=15) |
+| Data Request, response pending | 316 us, FP=1 (n=15) | 227 us, FP=1 (n=14) |
+
+Two of the 43 injected frames got no ACK. The base image showed the same
+background rate on the live network (2 of 38 and 3 of 24).
+
+On the NWK side, a provisional (unauthenticated) child whose IEEE
+address is announced, authenticated, at another network address is
+removed at once. Its routes, indirect frames and MAC pending flag go
+with it. The 10 s unauthenticated-child timeout still applies otherwise.
+
+Cost against the base, with every stack and layout gate passing:
+
+| image | flash | `.ram_code` | gap to SVC guard | worst SVC stack |
+|---|---:|---:|---:|---:|
+| router | -756 B | +252 B | 4,628 -> 4,372 B | 14,568 -> 14,528 B |
+| router-core | -756 B | +252 B | 7,244 -> 6,988 B | 14,536 -> 14,496 B |
+| ED | -772 B | -28 B | 23,596 -> 23,984 B | 19,104 -> 19,040 B |
+| sensor | -772 B | -28 B | 22,912 -> 23,300 B | 20,660 -> 20,596 B |
+| sensor-retention | -772 B | -28 B | 20,340 -> 20,724 B | cold 19,284 -> 19,220 B |
+
+On the routers the larger `.ram_code` moves `.data` up by one 256 B
+step.
+
 ### Trust Center rejoin
 
 The `lab-rejoin-trigger` feature (off in production) exposes
