@@ -19,8 +19,9 @@
 //!
 //! The NCP sink defaults to `gpsSecurityLevel` 0x00 (decision N1) and has
 //! no translation endpoint: every accepted GPD command reaches the host as
-//! `EVT_GP_FRAME`. `GP_SET_SHARED_KEY` is answered `UNSUPPORTED_COMMAND`:
-//! the sink provisions no shared GPD key (`zigbee_gp::sink`).
+//! `EVT_GP_FRAME`. `GP_SET_SHARED_KEY` sets gpSharedSecurityKeyType and
+//! gpSharedSecurityKey: a GPD that asks for a key at commissioning gets the
+//! shared (or derived) key (`zigbee_gp::sink` key provisioning).
 //!
 //! [`ncp.rs`](crate::ncp) calls [`dispatch_gp`] for the GREEN POWER IDs,
 //! [`screen_data_request`] before accepting an `APS_DATA_REQUEST`, and
@@ -93,6 +94,8 @@ pub trait GpPort {
     /// Route the response to a remote GP request (unicast to `dst`, ZCL
     /// TSN `tsn`) to the host.
     fn expect_response(&mut self, dst: u16, tsn: u8);
+    /// gpSharedSecurityKeyType and gpSharedSecurityKey of the NCP sink.
+    fn set_shared_key(&mut self, key_type: KeyType, key: [u8; 16]);
 }
 
 impl<A: TcApp> GpPort for TcPort<A> {
@@ -138,6 +141,13 @@ impl<A: TcApp> GpPort for TcPort<A> {
 
     fn remove(&mut self, gpd: &GpdId, announce: bool) -> bool {
         self.app_mut().device_mut().gp_ncp_remove(gpd, announce)
+    }
+
+    fn set_shared_key(&mut self, key_type: KeyType, key: [u8; 16]) {
+        self.app_mut()
+            .device_mut()
+            .gp_sink_mut()
+            .set_shared_key(key_type, key);
     }
 
     fn take_event(&mut self) -> Option<GpNcpEvent> {
@@ -424,8 +434,14 @@ pub(crate) fn dispatch_gp<C: CoordinatorPort>(
             }
         }
         ids::GP_SET_SHARED_KEY => {
-            let _ = decode!(GpSetSharedKey);
-            status(queues, Status::UnsupportedCommand);
+            let request = decode!(GpSetSharedKey);
+            match shared_key_type(request.key_type) {
+                Some(key_type) => {
+                    gp.set_shared_key(key_type, request.key);
+                    status(queues, Status::Success);
+                }
+                None => status(queues, Status::InvalidParameter),
+            }
         }
         ids::GP_SINK_COMMISSIONING => {
             let request = decode!(GpSinkCommissioning);
@@ -579,6 +595,15 @@ fn respond_table<'a, T: Wire<'a> + MessageDef>(
             .queue(endpoint)
             .push_with(|w| w.response_status(T::ID, tid, Status::Busy));
     }
+}
+
+/// The gpSharedSecurityKeyType a `GP_SET_SHARED_KEY` asks for: 0 (no
+/// provisioning), 1 network key, 2 GPD group key, 3 NWK-key derived group
+/// key, 4 individual key, 7 derived individual key.
+fn shared_key_type(value: u8) -> Option<KeyType> {
+    (value & !0x07 == 0)
+        .then(|| KeyType::from_bits(value).ok())
+        .flatten()
 }
 
 /// The NCP sink configuration a `GP_SINK_CONFIG` asks for.

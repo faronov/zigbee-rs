@@ -48,6 +48,13 @@ channel-request = ["sink"]
 # set GPD commissioning is refused, except on a sink that is itself the
 # network's Trust Center (the TC is involved by construction).
 involve-tc = ["sink"]
+# GPD key provisioning on the sink: gpSharedSecurityKeyType /
+# gpSharedSecurityKey / gpLinkKey, the shared (or derived) key handed to a
+# GPD that asks for one in a bidirectional commissioning, protected with
+# gpLinkKey when the GPD uses key encryption (gecko_sdk
+# `sendCommissioningReply`), and out-of-band GPD keys for GPDs that
+# commission without sending theirs.
+key-provisioning = ["sink"]
 # A 4-entry Translation Table instead of 16 (a sink whose large Sink Table
 # leaves little persistent room, e.g. the 16-entry ZRHP NCP sink).
 compact-translation-table = []

@@ -21196,3 +21196,18 @@ mod gp_channel_request_tests;
 #[cfg(feature = "green-power-involve-tc")]
 #[path = "green_power/involve_tc.rs"]
 mod gp_involve_tc;
+
+/// The sink's view of this node (addresses, network key).
+#[cfg(feature = "green-power-sink")]
+#[path = "green_power/sink_keys.rs"]
+mod gp_sink_keys;
+
+/// GPD key provisioning on a combo, end to end.
+#[cfg(all(
+    test,
+    feature = "router",
+    feature = "green-power-key-provisioning",
+    feature = "green-power-bidirectional"
+))]
+#[path = "green_power/key_provisioning_tests.rs"]
+mod gp_key_provisioning_tests;

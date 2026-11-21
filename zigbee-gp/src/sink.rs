@@ -41,13 +41,14 @@
 //! Not implemented (rejected explicitly, not silently accepted): GP
 //! Translation Table Update/Request and GP Pairing Configuration without
 //! `translation-table`, Application Description (multi-sensor report
-//! descriptors), GPD Channel Request handling without `channel-request`,
-//! key provisioning to a GPD
-//! (shared-key attributes, key in the Commissioning Reply), commissioning
-//! through a GP Manager in security or pairing (GPM) and GP Pairing Search.
-//! gpsSecurityLevel InvolveTC refuses commissioning; with `involve-tc` it
-//! is writable, derivable from the join (`involve_tc`) and does not stop a
-//! sink that is itself the Trust Center.
+//! descriptors) without `app-description`, GPD Channel Request handling
+//! without `channel-request`, key provisioning to a GPD without
+//! `key-provisioning` (shared-key attributes, key in the Commissioning
+//! Reply, out-of-band keys: `keys`), GP Pairing Search without
+//! `pairing-search`, and commissioning through a GP Manager in security or
+//! pairing (GPM). gpsSecurityLevel InvolveTC refuses commissioning; with
+//! `involve-tc` it is writable, derivable from the join (`involve_tc`) and
+//! does not stop a sink that is itself the Trust Center.
 
 use zigbee_crypto::{AesKey, ForwardAesProvider};
 
@@ -64,7 +65,9 @@ use crate::proxy::{
     BROADCAST_RX_ON_WHEN_IDLE, DestAddr, GpTx, GroupChange, MAX_GP_COMMAND_LEN, MAX_SINK_GROUPS,
     MAX_TX_PAYLOAD, SinkGroup, TxFrame,
 };
-use crate::security::{self, DEFAULT_TC_LINK_KEY, Direction, GpdPayload, WrappedKey};
+#[cfg(not(feature = "key-provisioning"))]
+use crate::security::DEFAULT_TC_LINK_KEY;
+use crate::security::{self, Direction, GpdPayload, WrappedKey};
 use crate::translation::{self, Translation};
 use crate::types::{
     ApplicationId, CommunicationMode, GpdId, IeeeAddress, KeyType, SecurityLevel, cmd, derive_alias,
@@ -846,7 +849,12 @@ enum Out {
 }
 
 /// Commissioning Reply without a key: options and the optional PAN ID.
+#[cfg(not(feature = "key-provisioning"))]
 const MAX_REPLY_LEN: usize = 3;
+/// Commissioning Reply: options, PAN ID, a TC-LK protected key with its
+/// MIC and frame counter.
+#[cfg(feature = "key-provisioning")]
+const MAX_REPLY_LEN: usize = 1 + 2 + 16 + 4 + 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
@@ -912,6 +920,8 @@ pub struct Sink<const N: usize, const Q: usize> {
     /// This node is the network's Trust Center (`involve-tc`).
     #[cfg(feature = "involve-tc")]
     trust_center: bool,
+    #[cfg(feature = "key-provisioning")]
+    keys: keys::KeyStore,
 }
 
 impl<const N: usize, const Q: usize> Sink<N, Q> {
@@ -947,6 +957,8 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             last_channel_configuration: None,
             #[cfg(feature = "involve-tc")]
             trust_center: false,
+            #[cfg(feature = "key-provisioning")]
+            keys: keys::KeyStore::new(),
         }
     }
 
@@ -1427,6 +1439,12 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 w.u16(GP_CLUSTER_REVISION)?;
                 UINT16
             }
+            #[cfg(feature = "key-provisioning")]
+            _ => match self.read_key_attribute(id, &mut w)? {
+                Some(data_type) => data_type,
+                None => return Ok(None),
+            },
+            #[cfg(not(feature = "key-provisioning"))]
             _ => return Ok(None),
         };
         Ok(Some((data_type, w.len())))
@@ -1441,6 +1459,10 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
     /// reboot.
     pub fn write_attribute(&mut self, id: u16, data_type: u8, value: &[u8]) -> u8 {
         use zcl_status::*;
+        #[cfg(feature = "key-provisioning")]
+        if let Some(status) = self.write_key_attribute(id, data_type, value) {
+            return status;
+        }
         let expected = match id {
             attr::GPS_COMMUNICATION_MODE
             | attr::GPS_COMMISSIONING_EXIT_MODE
@@ -1981,7 +2003,8 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             #[cfg(not(feature = "involve-tc"))]
             return SinkOutcome::Dropped(SecurityPolicy);
         }
-        let (level, key_type, wrapped, outgoing) = match &p.security {
+        #[cfg_attr(not(feature = "key-provisioning"), allow(unused_mut))]
+        let (level, mut key_type, wrapped, outgoing) = match &p.security {
             Some(s) => (s.level, s.key_type, s.key, s.outgoing_counter),
             None => (SecurityLevel::None, KeyType::NoKey, None, None),
         };
@@ -1999,14 +2022,12 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                     key,
                     mic: mic.to_le_bytes(),
                 };
-                match security::unwrap_key(
-                    aes,
-                    &DEFAULT_TC_LINK_KEY,
-                    &rx.gpd,
-                    Direction::FromGpd,
-                    0,
-                    &wrapped,
-                ) {
+                #[cfg(feature = "key-provisioning")]
+                let link_key = *self.gp_link_key();
+                #[cfg(not(feature = "key-provisioning"))]
+                let link_key = DEFAULT_TC_LINK_KEY;
+                match security::unwrap_key(aes, &link_key, &rx.gpd, Direction::FromGpd, 0, &wrapped)
+                {
                     Ok(key) => Some(key),
                     Err(_) => return SinkOutcome::Dropped(AuthFailed),
                 }
@@ -2015,6 +2036,26 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             None => None,
         };
         let protected = level.is_protected();
+        // A protected GPD that sent no key: its out-of-band or stored key;
+        // one that asked for a key in a bidirectional commissioning: the
+        // shared key (`keys`).
+        #[cfg(feature = "key-provisioning")]
+        let key = match key {
+            None if protected => self.stored_key(&rx.gpd, key_type),
+            key => key,
+        };
+        #[cfg(feature = "key-provisioning")]
+        let provided = (protected && rx.rx_after_tx)
+            .then(|| self.key_to_provide(aes, &rx.gpd, key_type, p.security_key_request))
+            .flatten();
+        #[cfg(feature = "key-provisioning")]
+        let key = match provided {
+            Some(pk) => {
+                key_type = pk.key_type;
+                Some(pk.key)
+            }
+            None => key,
+        };
         if protected && key.is_none() {
             return SinkOutcome::Dropped(NoKey);
         }
@@ -2061,11 +2102,30 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         if !(11..=26).contains(&self.operational_channel) {
             return SinkOutcome::Dropped(NoTempMaster);
         }
+        // A provided key is protected with gpLinkKey when the GPD uses key
+        // encryption or gpsSecurityLevel requires protected keys; the
+        // network key itself never goes on air in clear.
+        #[cfg(feature = "key-provisioning")]
+        let reply_key = match provided {
+            Some(pk) => {
+                let encrypt = keys::gpd_key_encryption(rx.payload)
+                    || policy & security_level_attr::PROTECTION_WITH_GP_LINK_KEY != 0
+                    || pk.key_type == KeyType::NwkKey;
+                let Some(k) = self.reply_key(aes, &rx.gpd, &pk.key, encrypt, entry.frame_counter)
+                else {
+                    return SinkOutcome::Dropped(Invalid);
+                };
+                Some(k)
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "key-provisioning"))]
+        let reply_key = None;
         let reply = CommissioningReply {
             pan_id: p.pan_id_request.then_some(self.pan_id),
             security_level: level,
             key_type,
-            key: None,
+            key: reply_key,
         };
         let mut reply_buf = [0u8; MAX_REPLY_LEN];
         let Ok(reply_len) = reply.encode(&mut reply_buf) else {
@@ -2319,6 +2379,8 @@ mod tests {
     use crate::cluster::GppGpdLink;
     use crate::commissioning::{ApplicationInfo, CommissioningSecurity};
     use crate::frame::{parse, parse_mac};
+    #[cfg(feature = "key-provisioning")]
+    use crate::security::DEFAULT_TC_LINK_KEY;
     use zigbee_crypto::SoftwareAesProvider;
 
     const KEY: AesKey = [
@@ -3888,3 +3950,7 @@ mod maintenance;
 mod involve_tc;
 #[cfg(feature = "involve-tc")]
 pub use involve_tc::JoinKind;
+#[cfg(feature = "key-provisioning")]
+mod keys;
+#[cfg(feature = "key-provisioning")]
+pub use keys::{MAX_OOB_KEYS, derive_shared_key};

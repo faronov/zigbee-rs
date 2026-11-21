@@ -93,6 +93,9 @@ green-power-bidirectional = [
 # The sink answers a GPD's Channel Request while in commissioning mode.
 # gpsSecurityLevel InvolveTC follows the join: an install-code join stops GP
 # commissioning (gecko_sdk behaviour).
+# A GPD that asks for a key at commissioning gets the configured shared key
+# (gpSharedSecurityKeyType/Key, written by a tool).
+# The sink answers proxies' GP Pairing Search.
 combo-light = [
     "status-led",
     "green-power-bidirectional",
@@ -100,10 +103,14 @@ combo-light = [
     "router-app/green-power-translation-table",
     "router-app/green-power-channel-request",
     "router-app/green-power-involve-tc",
+    "router-app/green-power-key-provisioning",
+    "router-app/green-power-sink-pairing-search",
     "zigbee-runtime/green-power-sink",
     "zigbee-runtime/green-power-translation-table",
     "zigbee-runtime/green-power-channel-request",
     "zigbee-runtime/green-power-involve-tc",
+    "zigbee-runtime/green-power-key-provisioning",
+    "zigbee-runtime/green-power-sink-pairing-search",
 ]
 # Persist ZCL Configure Reporting state in `zbnv` (sleepy sensor images).
 reporting-persist = []

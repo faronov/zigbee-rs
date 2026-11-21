@@ -1292,7 +1292,7 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
         );
         let bidirectional = self.green_power.proxy.bidirectional();
         let sink = &mut self.green_power.sink;
-        sink.set_own_address(nwk, ieee, pan_id);
+        crate::gp_sink_keys::sync(sink, &self.bdb, nwk, ieee, pan_id);
         sink.set_operational_channel(channel);
         sink.set_direct_bidirectional(bidirectional);
     }

@@ -45,6 +45,7 @@
 | GP Pairing Configuration and Translation Table on the sink (`zigbee-gp/translation-table`, `zigbee-runtime/green-power-translation-table`, router-app `green-power-translation-table`; in `combo-light`): Pairing Configuration actions no action / extend / replace / remove pairing / remove GPD with the "send GP Pairing" flag, all communication modes with pre-commissioned group lists, security fields, paired endpoints, application information (validated, not stored); Translation Table Update (add/replace/remove) and Request/Response, per-GPD translations to any local endpoint with a fixed, derived (`0xFE`) or copied (`0xFF`) payload, pass-to-application (`0xFC`); built-in translation kept when no explicit entry exists; gpsFunctionality bits 11 and 18; translations and paired endpoints in the GP journal's sink record (§3.8) | implemented, opt-in (2026-11-19) | host tests: `zigbee_gp::config` codec vectors (gecko_sdk field layout), `zigbee_gp::translation_table`, sink behaviour (`sink::configuration::tests`), journal migration / interrupted write / unknown section (`gp_store::translations`), runtime end to end `gp_translation_tests::pairing_configuration_and_translation_update_retarget_a_gpd_toggle` (unicast Pairing Configuration and Translation Table Update from a coordinator, Default Responses, Translation Table Response, GPD Toggle driving endpoint 2 with On, reboot), `locally_issued_configuration_retargets_a_paired_gpd_without_a_tool`. ESP32-H2-Zero `combo-light` builds. **Lab-tested on the H2-Zero in the ZHA network (2026-11-19, §6.11)** with a locally issued Pairing Configuration (Extend) and Translation Table Update (`lab-gp-translation` image): journal migration from the previous firmware, the MG22 switch's Toggle driving On, the translation across a reset, its removal, and the previous firmware resuming on the journal afterwards (a journal still holding a translation section under older firmware is host-tested only). **Over the air from the ZRHP NCP, lab-tested on an ESP32-C6 combo (2026-11-20, §6.12)**: Pairing Configuration Extend and Remove GPD, Translation Table Update add/remove, Sink and Translation Table Requests, the translation across a reset, an MG22 switch's Toggle driving On |
 | GPD Channel Request on the sink (`zigbee-gp/channel-request`, `zigbee-runtime/green-power-channel-request`, router-app `green-power-channel-request`; in `combo-light` and the ZRHP NCP): in commissioning mode a Channel Request heard directly, or tunnelled in a GP Commissioning Notification / GP Notification from SrcID 0 with rxAfterTx, is answered with a GP Response carrying a Channel Configuration (operational channel, Basic) for the TempMaster; repeats within 1 s share one GP Response; gpsFunctionality bit 12 (GPD maintenance); `EVT_GP_FRAME` result 6 on the NCP (§3.9) | implemented, opt-in (2026-11-21) | host tests: `sink::maintenance` (direct, Commissioning Notification and Notification paths, refusals, repeat suppression, gpsFunctionality), runtime end to end `gp_channel_request_tests` (combo as its own TempMaster delivers the Channel Configuration by timed TX in the GPD's window). **Not run on hardware** |
 | gpsSecurityLevel InvolveTC (`zigbee-gp/involve-tc`, `zigbee-runtime/green-power-involve-tc`, router-app `green-power-involve-tc`; in `combo-light` and the ZRHP NCP): the bit is writable; `gp_sink_derive_involve_tc` sets it after an install-code join, clears it in a distributed network and keeps it after a default-key join (gecko_sdk `writeInvolveTCBit`); while set a sink refuses GP Sink Commissioning Mode (UNSUP_COMMAND), local commissioning and Commissioning GPDFs (`SinkDrop::InvolveTc`, `EVT_GP_COMMISSIONING_FAILED` reason 14); a sink that is the Trust Center (the NCP) is not stopped (§3.10) | implemented, opt-in (2026-11-21) | host tests: `sink::involve_tc` (write, refusal paths, Trust Center sink, derivation), runtime `gp_involve_tc` (install-code join, default-key join, Trust Center), NCP `GP_SINK_CONFIG` accepts bit 3. **Not run on hardware** |
+| GPD key provisioning on the sink (`zigbee-gp/key-provisioning`, `zigbee-runtime/green-power-key-provisioning`, router-app `green-power-key-provisioning`; in `combo-light` and the ZRHP NCP): gpSharedSecurityKeyType / gpSharedSecurityKey (write-only key) / gpLinkKey (write-only), the shared key handed to a GPD that asks for one in a bidirectional commissioning (network key, NWK-key derived group key, GPD group key, derived individual key, as gecko_sdk `sendCommissioningReply`), protected with gpLinkKey when the GPD uses key encryption or gpsSecurityLevel requires it, the network key always protected; out-of-band keys for GPDs that commission without sending theirs, and a re-commissioning without a key keeps the entry's key; `GP_SET_SHARED_KEY` on the NCP (§3.11) | implemented, opt-in (2026-11-21) | host tests: `sink::keys` (GP spec vectors A.1.5.7.1, A.1.5.7.2, A.1.5.12.1 and A.1.5.8.3 from gecko_sdk, attributes, provided key with TC-LK protection and Success under the new key, own key kept without a request, out-of-band keys), runtime end to end `gp_key_provisioning_tests` (the combo hands the network key, protected, by timed TX), NCP `GP_SET_SHARED_KEY`. **Not run on hardware** |
 | Remote GP provisioning on the ZRHP NCP (`GP_PAIRING_CONFIGURATION`, `GP_SEND_PAIRING`, `GP_TRANSLATION_UPDATE`/`REQUEST`, `GP_REMOTE_SINK_TABLE_REQUEST`, `GP_REMOTE_PROXY_TABLE_REQUEST`, `EVT_GP_REMOTE_*`, [ZRHP 7.11](host-protocol.md#711-green-power-0x0axx-endpoint-2)) | implemented (2026-11-19) | host tests: zigbee-zrhp vectors (`generate.py --check`), NCP request mapping, NCP end to end against a second zigbee-rs router stack (`remote_provisioning_reaches_another_proxy_and_sink`). H2 NCP image builds and passes the stack gate. **Lab-tested on hardware 2026-11-20 (§6.12)**: master 2ab8ac0 NCP on the Thread BR board's H2 (921 600, RTS/CTS) provisioned an ESP32-C6 combo over the air with `GP_PAIRING_CONFIGURATION`, `GP_TRANSLATION_UPDATE`, `GP_TRANSLATION_REQUEST` and `GP_REMOTE_SINK_TABLE_REQUEST`, each answered (`EVT_GP_REMOTE_*`) within 50–85 ms; host tool `tools/zrhp-host` `--gp-*`. `GP_SEND_PAIRING` and `GP_REMOTE_PROXY_TABLE_REQUEST` not run on hardware |
 | Adaptive frame-counter persistence (`zigbee_gp::counter`, Proxy and Sink Table, exact flag in the GP journal's counter records) | implemented, in every GP image | host tests (§3.3); lab-tested on the H2-Zero combo 2026-11-17: after a power cycle the switch's first presses toggled the light, none dropped (§6.10) |
 | GP combo on the ZRHP coordinator NCP (`zigbee-runtime/green-power-ncp` with `ncp-capacity`, `apps/ncp-coordinator` `gp`, `examples/esp32-ncp`): Proxy Basic + sink (Sink Table 16, Proxy Table 8) + TempMaster, sink authority switchable at runtime (`NCP_SINK` / `HOST_SINK`), NCP default `gpsSecurityLevel` 0x00 with no translation endpoint, GP journal in the NCP's `zbnv` window (2 × 8 KiB), all GREEN POWER commands and events of [ZRHP 7.11](host-protocol.md#711-green-power-0x0axx-endpoint-2) | implemented (2026-11-19) | host tests: `zigbee-gp` import/quiet-removal unit tests, runtime `green_power::ncp` unit tests, NCP end-to-end `apps/ncp-coordinator/tests/gp.rs` over the host link (commissioning of a level-3 GPD heard directly, reports, a proxy's GP Notification, table read/put/remove, `CONFLICT`, key-export lock, `HOST_SINK` raw frames and local proxy output), journal geometry tests in `products/esp32-zigbee-ncp`; H2 and C6 NCP images build and pass the stack gate. **Not run on hardware** (ZRHP gate H10) |
@@ -1087,6 +1088,46 @@ that talks to Silicon Labs tools behaves the same way here:
 - Without the feature the bit stays read-only zero in writes
   (INVALID_VALUE) and a configured bit refuses commissioning, as before.
 
+### 3.11 GPD key provisioning (opt-in)
+
+Until now the sink only accepted the key a GPD sent in its Commissioning
+GPDF (in clear or TC-LK protected). With `key-provisioning` it also
+provides keys and accepts keys known out of band (`zigbee_gp::sink`
+module `keys`, following gecko_sdk `sendCommissioningReply`,
+`emberAfGreenPowerServerDeriveSharedKeyFromSinkAttribute` and
+`sli_zigbee_af_gp_key_tc_lk_derivation`):
+
+- **Shared key attributes.** gpSharedSecurityKeyType (0x0020),
+  gpSharedSecurityKey (0x0021) and gpLinkKey (0x0022, default
+  ZigBeeAlliance09) are writable over ZCL; on the NCP the host sets the
+  first two with `GP_SET_SHARED_KEY`. The two keys are write-only: a read
+  returns UNSUPPORTED_ATTRIBUTE (gecko_sdk returns them to any node).
+- **Key for a GPD that asks.** A protected GPD that sets "GP security key
+  request" in a bidirectional Commissioning GPDF gets the shared key in the
+  Commissioning Reply when gpSharedSecurityKeyType is set and differs from
+  the GPD's own key type: type 1 the network's active key (the runtime
+  keeps it current), type 3 HMAC-AES-MMO(network key, "ZGP"), type 2 / 4
+  gpSharedSecurityKey, type 7 HMAC-AES-MMO(gpSharedSecurityKey, SrcID or
+  GPD IEEE). The Sink Table entry takes that key and key type; the
+  pairing completes on the GPD's Success protected with it.
+- **Protection.** The key is TC-LK protected with gpLinkKey and frame
+  counter = the GPD's outgoing counter + 1 (A.1.5.8.3) when the GPD set
+  key encryption in its Commissioning GPDF, when gpsSecurityLevel requires
+  protected keys (bit 2), and always for the network key: gecko_sdk would
+  send the network key in clear to a GPD that did not ask for encryption.
+  gpLinkKey is also used to unwrap a GPD's protected key (gecko_sdk always
+  uses ZigBeeAlliance09).
+- **Out-of-band keys.** `Sink::provision_oob_key` holds up to 4 keys of
+  GPDs whose key is known out of band (label, QR code); a protected GPD
+  that commissions without sending a key uses it once. A GPD that
+  re-commissions without a key keeps its Sink Table entry's key. On the
+  NCP the host imports such a GPD directly with `GP_SINK_TABLE_PUT`.
+- Vectors: the GP spec vectors of gecko_sdk
+  `green-power-security-test-vectors.c` for the NWK-key derived group key
+  (A.1.5.7.1), the derived individual key by SrcID and by IEEE address
+  (A.1.5.7.2, A.1.5.12.1) and the protected Commissioning Reply key
+  (A.1.5.8.3).
+
 ## 4. Size estimates
 
 §4.1 has the measured Proxy Basic cost; the rest of this section is the
@@ -1388,6 +1429,22 @@ Release builds in one checkout path, master dd1ce41 → `gp-involve-tc`:
 | H2-Zero `router,waveshare-h2-zero` | byte-identical | |
 
 Most of the combo's growth is the derivation's log line.
+
+### 4.9 Measured: GPD key provisioning (2026-11-21)
+
+Release builds in one checkout path, master dd1ce41 →
+`gp-key-provisioning`:
+
+| Image | Flash | `.bss` |
+|---|---:|---:|
+| H2-Zero `router,waveshare-h2-zero,combo-light` | 584,160 → 587,610 (+3,450) | 71,880 → 72,128 (+248) |
+| H2 NCP `esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines` | 730,636 → 733,770 (+3,134) | 176,232 → 176,480 (+248) |
+| H2-Zero `router,waveshare-h2-zero` | byte-identical | |
+
+The growth is the HMAC-AES-MMO derivation, the key attributes, the reply
+key protection and the out-of-band store (4 keys); the RAM is the key
+store and the larger Commissioning Reply in the sink's queue. The NCP's
+stack gate still passes (serve chain 30,704 of 30,720 B).
 
 ## 5. Risks
 

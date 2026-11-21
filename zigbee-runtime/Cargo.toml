@@ -157,6 +157,10 @@ green-power-channel-request = ["green-power-sink", "zigbee-gp/channel-request"]
 # (`ZigbeeDevice::gp_sink_derive_involve_tc`), refusing GPD commissioning on
 # a sink that is not the Trust Center.
 green-power-involve-tc = ["green-power-sink", "zigbee-gp/involve-tc"]
+# GPD key provisioning on the sink: gpSharedSecurityKeyType/Key and
+# gpLinkKey, keys handed to GPDs that ask for one at commissioning,
+# out-of-band GPD keys (zigbee-gp `key-provisioning`).
+green-power-key-provisioning = ["green-power-sink", "zigbee-gp/key-provisioning"]
 # ZRHP network co-processor integration of the GP combo (spec 7.11,
 # `green_power::ncp`): one sink authority switchable at runtime between the
 # runtime's sink (NCP_SINK) and the host's (HOST_SINK: GP server frames and

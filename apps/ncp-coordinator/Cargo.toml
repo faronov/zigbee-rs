@@ -30,8 +30,12 @@ zigbee-bdb = { path = "../../zigbee-bdb", default-features = false, features = [
 # commands (spec 7.11), with the 16-entry Sink Table of `ncp-capacity`;
 # `green-power-channel-request`: the sink answers GPD Channel Requests;
 # `green-power-involve-tc`: InvolveTC is accepted (the NCP is the Trust
-# Center).
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["centralized-tclk", "trust-center", "global-aps-counter", "host-passthrough", "ncp-capacity", "green-power-ncp", "green-power-channel-request", "green-power-involve-tc", "journal-pre-erase"] }
+# Center); `green-power-key-provisioning`: GP_SET_SHARED_KEY and keys handed
+# to GPDs that ask for one; `green-power-app-description`: GPD Application
+# Descriptions reach the host as `EVT_GP_APP_DESCRIPTION`;
+# `green-power-sink-pairing-search`: the sink answers proxies' GP Pairing
+# Search.
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["centralized-tclk", "trust-center", "global-aps-counter", "host-passthrough", "ncp-capacity", "green-power-ncp", "green-power-channel-request", "green-power-involve-tc", "green-power-key-provisioning", "green-power-app-description", "green-power-sink-pairing-search", "journal-pre-erase"] }
 router-app = { path = "../router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity", "green-power-sink"] }
 zigbee-gp = { path = "../../zigbee-gp", features = ["sink"] }
 

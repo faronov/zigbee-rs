@@ -619,10 +619,21 @@ fn ncp_sink_commissions_reports_and_hands_over_to_a_host_sink() {
     let proxies_rsp = host.response(proxies);
     let empty: GpProxyTableReadRsp = proxies_rsp.body();
     assert_eq!((empty.total, empty.records.len()), (0, 0));
+    assert_eq!(host.response(shared).status(), 0);
+    // GP_SET_SHARED_KEY sets gpSharedSecurityKeyType (3: NWK-key derived
+    // group key); reserved key types are refused.
     assert_eq!(
-        host.response(shared).status(),
-        Status::UnsupportedCommand.to_u8(),
-        "no shared GPD key in this sink"
+        port.app().device().gp_sink().shared_key_type(),
+        KeyType::NwkKeyDerivedGroupKey
+    );
+    let reserved = host.request(&GpSetSharedKey {
+        key_type: 5,
+        key: [1; 16],
+    });
+    exchange!();
+    assert_eq!(
+        host.response(reserved).status(),
+        Status::InvalidParameter.to_u8()
     );
 
     let before = tx_count(&port);
