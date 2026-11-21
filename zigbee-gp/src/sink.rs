@@ -868,6 +868,18 @@ const MAX_REPLY_LEN: usize = 3;
 #[cfg(feature = "key-provisioning")]
 const MAX_REPLY_LEN: usize = 1 + 2 + 16 + 4 + 4;
 
+/// What a Commissioning Reply carries, fixed by the GPD's Commissioning
+/// command; the reply may go out later, after an Application Description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplyParams {
+    pan_id_request: bool,
+    level: SecurityLevel,
+    key_type: KeyType,
+    /// Key handed to the GPD and whether it is protected with gpLinkKey.
+    #[cfg(feature = "key-provisioning")]
+    provided: Option<(AesKey, bool)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
     entry: SinkEntry,
@@ -1914,7 +1926,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             // this point (`channel-request`); with a real GPD ID it is
             // invalid.
             cmd::CHANNEL_REQUEST | cmd::APPLICATION_DESCRIPTION => {
-                self.on_application_description(rx)
+                self.on_application_description(aes, rx)
             }
             _ if self.commissioning.is_some() && self.completable_index(&rx.gpd).is_some() => {
                 self.complete_pending(rx)
@@ -2072,8 +2084,16 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             None if protected => self.stored_key(&rx.gpd, key_type),
             key => key,
         };
+        // The reply goes out now (rxAfterTx) or after the Application
+        // Description the GPD announced (`descriptions`).
         #[cfg(feature = "key-provisioning")]
-        let provided = (protected && rx.rx_after_tx)
+        let replies = rx.rx_after_tx
+            || (cfg!(feature = "app-description")
+                && p.app_info
+                    .as_ref()
+                    .is_some_and(|a| a.app_description_follows));
+        #[cfg(feature = "key-provisioning")]
+        let provided = (protected && replies)
             .then(|| self.key_to_provide(aes, &rx.gpd, key_type, p.security_key_request))
             .flatten();
         #[cfg(feature = "key-provisioning")]
@@ -2118,28 +2138,48 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             };
             let _ = entry.groups.push(SinkGroup { group, alias: None });
         }
+        // A provided key is protected with gpLinkKey when the GPD uses key
+        // encryption or gpsSecurityLevel requires protected keys; the
+        // network key itself never goes on air in clear.
+        let params = ReplyParams {
+            pan_id_request: p.pan_id_request,
+            level,
+            key_type,
+            #[cfg(feature = "key-provisioning")]
+            provided: provided.map(|pk| {
+                let encrypt = keys::gpd_key_encryption(rx.payload)
+                    || policy & security_level_attr::PROTECTION_WITH_GP_LINK_KEY != 0
+                    || pk.key_type == KeyType::NwkKey;
+                (pk.key, encrypt)
+            }),
+        };
         if !rx.rx_after_tx {
-            return self.finish_unidirectional(entry, &p, rx);
+            return self.finish_unidirectional(entry, &p, rx, &params);
         }
-        // Bidirectional: GP Response with a Commissioning Reply through the
-        // TempMaster (gecko_sdk `sendCommissioningReply`); the pairing
-        // completes on the GPD's Success.
+        self.send_reply(aes, entry, rx, &params)
+    }
+
+    /// Bidirectional commissioning: GP Response with a Commissioning Reply
+    /// through the TempMaster of `rx` (gecko_sdk `sendCommissioningReply`);
+    /// the pairing completes on the GPD's Success.
+    fn send_reply<P: ForwardAesProvider>(
+        &mut self,
+        #[cfg_attr(not(feature = "key-provisioning"), allow(unused_variables))] aes: &mut P,
+        entry: SinkEntry,
+        rx: &Received<'_>,
+        params: &ReplyParams,
+    ) -> SinkOutcome {
+        use SinkDrop::*;
         let Some(temp_master) = rx.temp_master else {
             return SinkOutcome::Dropped(NoTempMaster);
         };
         if !(11..=26).contains(&self.operational_channel) {
             return SinkOutcome::Dropped(NoTempMaster);
         }
-        // A provided key is protected with gpLinkKey when the GPD uses key
-        // encryption or gpsSecurityLevel requires protected keys; the
-        // network key itself never goes on air in clear.
         #[cfg(feature = "key-provisioning")]
-        let reply_key = match provided {
-            Some(pk) => {
-                let encrypt = keys::gpd_key_encryption(rx.payload)
-                    || policy & security_level_attr::PROTECTION_WITH_GP_LINK_KEY != 0
-                    || pk.key_type == KeyType::NwkKey;
-                let Some(k) = self.reply_key(aes, &rx.gpd, &pk.key, encrypt, entry.frame_counter)
+        let reply_key = match params.provided {
+            Some((key, encrypt)) => {
+                let Some(k) = self.reply_key(aes, &rx.gpd, &key, encrypt, entry.frame_counter)
                 else {
                     return SinkOutcome::Dropped(Invalid);
                 };
@@ -2150,9 +2190,9 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         #[cfg(not(feature = "key-provisioning"))]
         let reply_key = None;
         let reply = CommissioningReply {
-            pan_id: p.pan_id_request.then_some(self.pan_id),
-            security_level: level,
-            key_type,
+            pan_id: params.pan_id_request.then_some(self.pan_id),
+            security_level: params.level,
+            key_type: params.key_type,
             key: reply_key,
         };
         let mut reply_buf = [0u8; MAX_REPLY_LEN];

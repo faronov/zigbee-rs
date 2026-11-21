@@ -59,13 +59,17 @@ RingLogger as log::Log>::log$
 
 # Chain budgets: worst depth below (and including) any matching function,
 # measured on the fix build, rounded up to the next 512 B. A regression fails.
+# 2026-11-22: boot 33 248 B and serve 30 704 B sat 32 B and 16 B under
+# their budgets after the GP features; both raised to keep >= 512 B of
+# regression headroom. The stack itself is all RAM above .bss: H2 Thread-BR
+# 70 000 B usable, static worst case 36 848 B, a 33 152 B gap.
 --chain-budget
-boot=^esp32_ncp::compose$=33280
+boot=^esp32_ncp::compose$=33792
 # serve: +1 760 B in the root future's poll frame (2026-11-19) for the
 # operations that install a network from the host (NWK_FORM with host
 # identity, BKP_RESTORE_COMMIT, SYS_SET_IEEE): 30 720 B, all variants.
 --chain-budget
-serve=^esp32_ncp::serve$=30720
+serve=^esp32_ncp::serve$=31744
 # Trust Center: initialization, the step's TC service and persistence. Before
 # the in-place state fix these were 485-576 KiB (whole-state clones).
 --chain-budget

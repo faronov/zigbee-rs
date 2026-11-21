@@ -27,7 +27,11 @@ pub(super) type PendingState = heapless::Vec<Pending, MAX_PENDING_COMMISSIONING>
 #[cfg(not(feature = "app-description"))]
 impl<const N: usize, const Q: usize> Sink<N, Q> {
     #[inline(always)]
-    pub(super) fn on_application_description(&mut self, _rx: &Received<'_>) -> SinkOutcome {
+    pub(super) fn on_application_description<P: ForwardAesProvider>(
+        &mut self,
+        _aes: &mut P,
+        _rx: &Received<'_>,
+    ) -> SinkOutcome {
         SinkOutcome::Dropped(SinkDrop::Unsupported)
     }
 
@@ -37,6 +41,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         entry: SinkEntry,
         _p: &CommissioningPayload,
         _rx: &Received<'_>,
+        _params: &ReplyParams,
     ) -> SinkOutcome {
         self.finalize(entry)
     }
@@ -128,8 +133,9 @@ mod imp {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(in crate::sink) struct Collecting {
         gpd: GpdId,
-        /// Commissioning Reply, sent if the last report asks for one.
-        reply: CommissioningReply,
+        /// Commissioning Reply contents, sent if the last report asks for
+        /// one (with the key a GPD asked for, `key-provisioning`).
+        params: ReplyParams,
         deadline_ms: u32,
         /// `total_reports` of the first Application Description (0: none).
         total: u8,
@@ -190,8 +196,9 @@ mod imp {
         }
 
         /// GPD command 0xE4 (and the unsupported Channel Request).
-        pub(in crate::sink) fn on_application_description(
+        pub(in crate::sink) fn on_application_description<P: ForwardAesProvider>(
             &mut self,
+            aes: &mut P,
             rx: &Received<'_>,
         ) -> SinkOutcome {
             use SinkDrop::*;
@@ -213,11 +220,11 @@ mod imp {
                 Err(drop) => SinkOutcome::Dropped(drop),
                 Ok(false) => SinkOutcome::CommissioningStep,
                 Ok(true) => {
-                    let Some((entry, reply)) = self.take_collected() else {
+                    let Some((entry, params)) = self.take_collected() else {
                         return SinkOutcome::Dropped(NoEntry);
                     };
                     if rx.rx_after_tx {
-                        self.send_reply(entry, rx, &reply)
+                        self.send_reply(aes, entry, rx, &params)
                     } else {
                         self.finalize(entry)
                     }
@@ -232,6 +239,7 @@ mod imp {
             entry: SinkEntry,
             p: &CommissioningPayload,
             rx: &Received<'_>,
+            params: &ReplyParams,
         ) -> SinkOutcome {
             if !p
                 .app_info
@@ -240,18 +248,6 @@ mod imp {
             {
                 return self.finalize(entry);
             }
-            let (security_level, key_type) = p
-                .security
-                .as_ref()
-                .map_or((SecurityLevel::None, KeyType::NoKey), |s| {
-                    (s.level, s.key_type)
-                });
-            let reply = CommissioningReply {
-                pan_id: p.pan_id_request.then_some(self.pan_id),
-                security_level,
-                key_type,
-                key: None,
-            };
             let gpd = entry.gpd_id;
             // A repeated Commissioning keeps the reports collected so far
             // (gecko_sdk resets them only once its timer has expired).
@@ -270,7 +266,7 @@ mod imp {
             let _ = self.pending.push(Pending { entry });
             self.pending.collecting = Some(Collecting {
                 gpd,
-                reply,
+                params: *params,
                 deadline_ms: rx.now_ms.wrapping_add(APP_DESCRIPTION_TIMEOUT_MS),
                 total,
                 received,
@@ -373,46 +369,10 @@ mod imp {
         }
 
         /// End the collection, taking the waiting entry.
-        fn take_collected(&mut self) -> Option<(SinkEntry, CommissioningReply)> {
+        fn take_collected(&mut self) -> Option<(SinkEntry, ReplyParams)> {
             let c = self.pending.collecting.take()?;
             let i = self.pending_index(&c.gpd)?;
-            Some((self.pending.swap_remove(i).entry, c.reply))
-        }
-
-        /// Commissioning Reply through the TempMaster of the frame that
-        /// completed the description; the pairing completes on Success
-        /// (as the end of [`Sink::commission`]).
-        fn send_reply(
-            &mut self,
-            entry: SinkEntry,
-            rx: &Received<'_>,
-            reply: &CommissioningReply,
-        ) -> SinkOutcome {
-            use SinkDrop::*;
-            let Some(temp_master) = rx.temp_master else {
-                return SinkOutcome::Dropped(NoTempMaster);
-            };
-            if !(11..=26).contains(&self.operational_channel) {
-                return SinkOutcome::Dropped(NoTempMaster);
-            }
-            let mut reply_buf = [0u8; MAX_REPLY_LEN];
-            let Ok(reply_len) = reply.encode(&mut reply_buf) else {
-                return SinkOutcome::Dropped(Invalid);
-            };
-            if self.pending.is_full() {
-                self.pending.remove(0);
-            }
-            if !self.queue(Out::Response {
-                gpd_id: rx.gpd,
-                temp_master,
-                tx_channel: self.operational_channel - 11,
-                reply: reply_buf,
-                reply_len: reply_len as u8,
-            }) {
-                return SinkOutcome::Dropped(QueueFull);
-            }
-            let _ = self.pending.push(Pending { entry });
-            SinkOutcome::CommissioningReplySent
+            Some((self.pending.swap_remove(i).entry, c.params))
         }
     }
 

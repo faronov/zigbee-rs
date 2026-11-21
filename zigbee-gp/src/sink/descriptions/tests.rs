@@ -554,3 +554,87 @@ mod pairing_configuration {
         assert_eq!(s.entries()[0].key, Some(KEY));
     }
 }
+
+/// A multi-sensor asking for a key gets it in the Commissioning Reply sent
+/// after its last report (`key-provisioning`).
+#[cfg(feature = "key-provisioning")]
+#[test]
+fn the_reply_after_the_last_report_provides_the_key() {
+    use crate::commissioning::CommissioningReply;
+    use crate::security::WrappedKey;
+
+    let mut s = sink();
+    let shared = [0x3C; 16];
+    s.set_shared_key(KeyType::GpdGroupKey, shared);
+    // L3 individual key (TC-LK wrapped), asks for a key, descriptions follow.
+    let mut p = CommissioningPayload::decode(&commissioning()).unwrap();
+    p.security_key_request = true;
+    let mut b = [0u8; 64];
+    let n = p.encode(&mut b).unwrap();
+    assert_eq!(
+        tunnelled(&mut s, 2, false, cmd::COMMISSIONING, &b[..n]),
+        SinkOutcome::CommissioningStep
+    );
+    let both = adcf(2, &[&TEMPERATURE, &HUMIDITY]);
+    assert_eq!(
+        tunnelled(&mut s, 3, true, cmd::APPLICATION_DESCRIPTION, &both),
+        SinkOutcome::CommissioningReplySent
+    );
+    let tx = s.poll(300).unwrap().tx;
+    let TxFrame::GpCommand { payload, .. } = &tx.frame else {
+        panic!("unexpected frame {:?}", tx.frame);
+    };
+    let r = Response::decode(payload).unwrap();
+    let reply = CommissioningReply::decode(r.payload).unwrap();
+    assert_eq!(reply.key_type, KeyType::GpdGroupKey);
+    // Protected with gpLinkKey like the GPD's own key, counter 10 + 1.
+    let (key, Some((mic, fc))) = reply.key.unwrap() else {
+        panic!("the key must be protected");
+    };
+    assert_eq!(fc, 11);
+    let clear = security::unwrap_key(
+        &mut SoftwareAesProvider,
+        &security::DEFAULT_TC_LINK_KEY,
+        &GPD,
+        Direction::ToGpd,
+        fc,
+        &WrappedKey {
+            key,
+            mic: mic.to_le_bytes(),
+        },
+    )
+    .unwrap();
+    assert_eq!(clear, shared);
+    // The GPD's Success under the provided key completes the pairing.
+    let mut raw = [0u8; 127];
+    let params = GpdfParams {
+        frame_type: FrameType::Data,
+        auto_commissioning: false,
+        src_id: Some(SRC),
+        security_level: SecurityLevel::Encrypted,
+        individual_key: false,
+        rx_after_tx: false,
+        to_gpd: false,
+        frame_counter: 11,
+    };
+    let len = security::build_gpdf(
+        &mut SoftwareAesProvider,
+        Some(&shared),
+        &params,
+        11,
+        cmd::SUCCESS,
+        &[],
+        &mut raw,
+    )
+    .unwrap();
+    let mac = parse_mac(&raw[..len]).unwrap();
+    let gpdf = parse(&raw[mac.payload_offset..len], mac.seq, None).unwrap();
+    assert_eq!(
+        s.on_gpdf(&mut SoftwareAesProvider, &gpdf, 400),
+        SinkOutcome::Commissioned
+    );
+    assert_eq!(
+        (s.entries()[0].key, s.entries()[0].key_type),
+        (Some(shared), KeyType::GpdGroupKey)
+    );
+}

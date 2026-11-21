@@ -1163,7 +1163,10 @@ and `saveReportDescriptor`):
 - When all reports are known the pairing completes (GP Pairing, events as
   any commissioning). If the frame that completed it had rxAfterTx, the
   sink sends a Commissioning Reply through that TempMaster and pairs on
-  the GPD's Success (gecko_sdk `lastReportIdHasRxAfterTx`). Other GPD
+  the GPD's Success (gecko_sdk `lastReportIdHasRxAfterTx`). The reply's
+  contents are fixed by the Commissioning command: with `key-provisioning`
+  a GPD that asked for a key gets it in this deferred reply, protected as
+  in §3.11 with the Commissioning command's counter + 1. Other GPD
   commands do not complete a collecting commissioning.
 - After the timeout the pending entry is dropped and
   `SinkEvent::CommissioningFailed` reports `SinkDrop::DescriptionTimeout`
