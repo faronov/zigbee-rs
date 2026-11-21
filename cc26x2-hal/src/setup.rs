@@ -32,7 +32,12 @@ const OSC_CLOCK_SOURCE_GET: u32 = 0;
 const HAPI_HF_SOURCE_SAFE_SWITCH: u32 = 14;
 
 const OSC_SRC_CLK_HF: u32 = 0x1;
+const OSC_SRC_CLK_LF: u32 = 0x4;
 const OSC_XOSC_HF: u32 = 0x1;
+const OSC_RCOSC_LF: u32 = 0x2;
+// `STAT0.SCLK_LF_SRC` values.
+const LF_SRC_RCOSC_LF: u32 = 2;
+const LF_SRC_XOSC_LF: u32 = 3;
 
 const CCFG_MODE_CONF_1: u32 = CCFG_BASE + 0x1FAC;
 const CCFG_SIZE_AND_DIS_FLAGS: u32 = CCFG_BASE + 0x1FB0;
@@ -61,7 +66,8 @@ pub enum SetupError {
     UnsupportedCcfg,
     /// XOSC_HF never became ready.
     XoscHf,
-    /// The LF clock never switched to the CCFG-selected source.
+    /// SCLK_LF reached neither the crystal nor RCOSC_LF (or the CCFG
+    /// selects another LF option).
     LfClock,
 }
 
@@ -266,38 +272,222 @@ pub fn lf_source() -> u32 {
     (mmio::read(AUX_DDI0_OSC_BASE + DDI_0_OSC_STAT0) >> 29) & 0x3
 }
 
-/// Wait until SCLK_LF runs from the CCFG-selected 32 kHz source (crystal
-/// or RCOSC_LF), then give the RTC its 32.768 kHz increment. `spins`
-/// bounds the wait (the crystal needs up to a few hundred ms).
+/// How long [`start_lf_clock`] waits for the 32.768 kHz crystal before it
+/// falls back to RCOSC_LF, counted on the AON RTC from `trim_device()`
+/// (where the boot ROM's `SetupAfterColdResetWakeupFromShutDownCfg3`
+/// requested XOSC_LF from the CCFG).
+///
+/// TI documents no XOSC_LF start-up time for the CC13x2/CC26x2 and its
+/// Power driver waits without bound (the `LFSRCDONE` oscillator interrupt,
+/// standby disallowed meanwhile); tuning-fork crystals within the
+/// datasheet's ESR/load limits typically qualify within a few hundred ms.
+/// One second covers that with margin, keeps the boot of a board without a
+/// working crystal short, and a crystal that is merely slower only costs LF
+/// accuracy (RCOSC_LF is measured and compensated, see [`LfClock`]).
+pub const XOSC_LF_TIMEOUT_MS: u32 = 1000;
+
+/// SCLK_LF source after [`start_lf_clock`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LfSource {
+    /// The 32.768 kHz crystal (CCFG XOSC_LF).
+    Crystal,
+    /// RCOSC_LF selected by the CCFG.
+    RcOsc,
+    /// RCOSC_LF because XOSC_LF did not qualify within the timeout.
+    RcOscFallback,
+}
+
+/// Result of [`start_lf_clock`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LfClock {
+    pub source: LfSource,
+    /// Milliseconds since `trim_device()` until SCLK_LF switched.
+    pub waited_ms: u32,
+    /// RCOSC_LF only: its frequency offset from 32.768 kHz in ppm, measured
+    /// against the CPU clock (XOSC_HF) and compensated in the RTC
+    /// increment. `None` for the crystal or an implausible measurement
+    /// (then the nominal increment is kept).
+    pub rcosc_ppm: Option<i32>,
+}
+
+/// CPU clock (SCLK_HF from XOSC_HF) used for the RCOSC_LF measurement.
+const CPU_HZ: u32 = 48_000_000;
+/// SCLK_LF periods of the RCOSC_LF measurement (125 ms).
+const LF_MEASURE_CYCLES: u32 = 4096;
+
+/// RTC increment and ppm offset for an RCOSC_LF that ran `lf_cycles`
+/// periods in `cpu_cycles` of a `cpu_hz` clock. `None` outside
+/// 30..36 kHz (RCOSC_LF is trimmed to about 32.8 kHz).
+pub const fn rcosc_compensation(
+    lf_cycles: u32,
+    cpu_cycles: u32,
+    cpu_hz: u32,
+) -> Option<(u32, i32)> {
+    if lf_cycles == 0 || cpu_cycles == 0 {
+        return None;
+    }
+    // f = lf_cycles * cpu_hz / cpu_cycles, in mHz.
+    let f_mhz = (lf_cycles as u64 * cpu_hz as u64 * 1000) / cpu_cycles as u64;
+    if f_mhz < 30_000_000 || f_mhz > 36_000_000 {
+        return None;
+    }
+    // SUBSECINC = 2^38 / f (2^23 at 32.768 kHz).
+    let inc = ((1u64 << 38) * cpu_cycles as u64) / (lf_cycles as u64 * cpu_hz as u64);
+    let ppm = (f_mhz as i64 - 32_768_000) * 1_000_000 / 32_768_000;
+    Some((inc as u32, ppm as i32))
+}
+
+/// Start SCLK_LF and give the RTC the matching increment.
+///
+/// - CCFG XOSC_LF: wait until the crystal qualifies; if it has not within
+///   `xosc_timeout_ms` of `trim_device()` (AON RTC time), select RCOSC_LF
+///   (`OSCClockSourceSet(OSC_SRC_CLK_LF, OSC_RCOSC_LF)`, what the ROM does
+///   for a CCFG RCOSC_LF) and continue on it. A crystal that qualifies
+///   later is not switched back to.
+/// - CCFG RCOSC_LF: wait for it (it switches within milliseconds).
+///
+/// On RCOSC_LF the oscillator is measured once against XOSC_HF and the RTC
+/// increment is compensated, so the Embassy time base stays within the
+/// measurement error at the boot temperature; RCOSC_LF still drifts with
+/// temperature afterwards (about 50 ppm/°C per the datasheet) and is not
+/// recalibrated. Requires XOSC_HF ([`start_xosc_hf`]).
 #[cfg(all(target_arch = "arm", target_os = "none"))]
-pub fn wait_lf_clock(spins: u32) -> Result<u32, SetupError> {
-    let wanted = match (mmio::read(CCFG_MODE_CONF) >> 22) & 0x3 {
-        2 => 3, // XOSC_LF
-        3 => 2, // RCOSC_LF
+pub fn start_lf_clock(xosc_timeout_ms: u32) -> Result<LfClock, SetupError> {
+    let crystal = match (mmio::read(CCFG_MODE_CONF) >> 22) & 0x3 {
+        2 => true,
+        3 => false,
         _ => return Err(SetupError::LfClock),
     };
-    let mut n = 0;
+    let wanted = if crystal {
+        LF_SRC_XOSC_LF
+    } else {
+        LF_SRC_RCOSC_LF
+    };
+    let deadline = u64::from(xosc_timeout_ms) * 32_768 / 1000;
+    let mut source = if crystal {
+        LfSource::Crystal
+    } else {
+        LfSource::RcOsc
+    };
+    // The RTC runs from trim_device() on (31.25 kHz increment while
+    // SCLK_LF is RCOSC_HF-derived), so it is the time base of the wait.
     while lf_source() != wanted {
-        n += 1;
-        if n > spins {
-            return Err(SetupError::LfClock);
+        if crate::aon_rtc::now_ticks() >= deadline {
+            if !crystal {
+                return Err(SetupError::LfClock);
+            }
+            source = LfSource::RcOscFallback;
+            break;
         }
         core::hint::spin_loop();
     }
-    if wanted == 3 {
+    if source == LfSource::RcOscFallback {
         unsafe {
-            call1(
-                mmio::rom_fn(ROM_SETUP_TABLE, SETUP_SUBSECINC),
-                SUBSECINC_32768_HZ,
+            call2(
+                mmio::rom_fn(ROM_OSC_TABLE, OSC_CLOCK_SOURCE_SET),
+                OSC_SRC_CLK_LF,
+                OSC_RCOSC_LF,
             )
         };
         mmio::aon_sync();
+        let limit = crate::aon_rtc::now_ticks() + deadline.max(32_768);
+        while lf_source() != LF_SRC_RCOSC_LF {
+            if crate::aon_rtc::now_ticks() >= limit {
+                return Err(SetupError::LfClock);
+            }
+            core::hint::spin_loop();
+        }
     }
-    Ok(wanted)
+    let waited_ms = (crate::aon_rtc::now_ticks() * 1000 / 32_768) as u32;
+    let mut increment = SUBSECINC_32768_HZ;
+    let mut rcosc_ppm = None;
+    if source != LfSource::Crystal
+        && let Some((inc, ppm)) = measure_lf()
+    {
+        increment = inc;
+        rcosc_ppm = Some(ppm);
+    }
+    unsafe { call1(mmio::rom_fn(ROM_SETUP_TABLE, SETUP_SUBSECINC), increment) };
+    mmio::aon_sync();
+    Ok(LfClock {
+        source,
+        waited_ms,
+        rcosc_ppm,
+    })
+}
+
+/// Count CPU cycles (DWT CYCCNT, XOSC_HF) over [`LF_MEASURE_CYCLES`]
+/// SCLK_LF periods, edge to edge (each period advances the RTC `SUBSEC`).
+/// `SUBSEC` is latched by a read of `SEC`, so every poll reads both; a poll
+/// takes a few AON bus cycles, far below the ~30.5 µs SCLK_LF period.
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+fn measure_lf() -> Option<(u32, i32)> {
+    const DEMCR: u32 = 0xE000_EDFC;
+    const DWT_CTRL: u32 = 0xE000_1000;
+    const DWT_CYCCNT: u32 = 0xE000_1004;
+    const SEC: u32 = crate::mmio::AON_RTC_BASE + 0x08;
+    const SUBSEC: u32 = crate::mmio::AON_RTC_BASE + 0x0C;
+    let read = || {
+        let _ = mmio::read(SEC);
+        mmio::read(SUBSEC)
+    };
+    mmio::modify(DEMCR, 0, 1 << 24);
+    mmio::modify(DWT_CTRL, 0, 1);
+    let edge = |last: u32| -> Option<u32> {
+        // Bounded: one SCLK_LF period is ~1500 CPU cycles.
+        for _ in 0..100_000u32 {
+            let now = read();
+            if now != last {
+                return Some(now);
+            }
+        }
+        None
+    };
+    let mut value = edge(read())?;
+    let start = mmio::read(DWT_CYCCNT);
+    for _ in 0..LF_MEASURE_CYCLES {
+        value = edge(value)?;
+    }
+    let cycles = mmio::read(DWT_CYCCNT).wrapping_sub(start);
+    rcosc_compensation(LF_MEASURE_CYCLES, cycles, CPU_HZ)
 }
 
 /// Software system reset (driverlib `SysCtrlSystemReset` via the CPU).
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 pub fn system_reset() -> ! {
     cortex_m::peripheral::SCB::sys_reset()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rcosc_compensation_matches_the_ti_increments() {
+        // Exactly 32.768 kHz: 4096 periods = 125 ms = 6 000 000 cycles.
+        assert_eq!(
+            rcosc_compensation(4096, 6_000_000, 48_000_000),
+            Some((SUBSECINC_32768_HZ, 0))
+        );
+        // 31.25 kHz gives TI's SUBSECINC_31250_HZ (2^38 / 31250, truncated).
+        let cycles = (4096u64 * 48_000_000 / 31_250) as u32;
+        let (inc, ppm) = rcosc_compensation(4096, cycles, 48_000_000).unwrap();
+        assert!(inc.abs_diff(SUBSECINC_31250_HZ) <= 1, "{inc:#X}");
+        assert_eq!(ppm, -46_325);
+        // RCOSC_LF at its typical 32.8 kHz runs ~977 ppm fast: smaller
+        // increment.
+        let cycles = (4096u64 * 48_000_000 / 32_800) as u32;
+        let (inc, ppm) = rcosc_compensation(4096, cycles, 48_000_000).unwrap();
+        assert!(inc < SUBSECINC_32768_HZ);
+        assert!((970..=980).contains(&ppm), "{ppm}");
+    }
+
+    #[test]
+    fn implausible_measurements_are_rejected() {
+        assert_eq!(rcosc_compensation(4096, 0, 48_000_000), None);
+        assert_eq!(rcosc_compensation(0, 6_000_000, 48_000_000), None);
+        // A stuck SUBSEC (edge wait gave up) or a far-off clock.
+        assert_eq!(rcosc_compensation(4096, 100, 48_000_000), None);
+        assert_eq!(rcosc_compensation(4096, 60_000_000, 48_000_000), None);
+    }
 }

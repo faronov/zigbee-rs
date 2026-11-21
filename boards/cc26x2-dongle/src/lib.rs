@@ -18,7 +18,7 @@
 //! | UART0 TX (to host) | 13 | same |
 //! | ROM BSL backdoor | 15, active low | shipped CCFG `BL_CONFIG` = `0xC5FE0FC5` |
 //! | RESET / backdoor control | CP2102 DTR/RTS | measured: (DTR=0, RTS=1) holds RESET, (DTR=1, RTS=0) pulls DIO15 low |
-//! | 32.768 kHz crystal | — | shipped CCFG `SCLK_LF_OPTION` = XOSC_LF |
+//! | 32.768 kHz crystal | — | shipped CCFG `SCLK_LF_OPTION` = XOSC_LF; not running on some V1.3 units (the images fall back to RCOSC_LF at boot, `cc26x2_hal::setup::start_lf_clock`) |
 //! | RF switch, +20 dBm PA path | 29 (high = PA) | Koenkk Z-Stack adapter table ("RF switch DIO_29: 20dBm PA"); the shipped image is the LAUNCHXL-CC1352P-2 build, which drives it low for receive and the standard PA |
 //!
 //! The RF switch line is driven by [`BoardRadio`]: low for receive and the
