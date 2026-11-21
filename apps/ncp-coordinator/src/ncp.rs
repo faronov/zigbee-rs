@@ -21,11 +21,12 @@
 //! | GREEN POWER | all of spec 7.11, in [`crate::gp`] |
 
 use heapless::{Deque, Vec};
+use zigbee_zrhp::codec::Wire as _;
 use zigbee_zrhp::codec::{Bytes8, Bytes16, List, Rest};
 use zigbee_zrhp::frame::{ResetReason, TX_BUFFER_LEN};
 use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent, LinkState, PeerChange};
 use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataConfirm, EvtApsDataIndication};
-use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagGetCountersRsp, DiagResetCounters};
+use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagResetCounters};
 use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord, LogConfig};
 use zigbee_zrhp::msg::network::{
     EvtChannelChanged, EvtDeviceJoined, EvtDeviceLeft, EvtEnergyScanResult, EvtNetworkState,
@@ -57,9 +58,10 @@ use zigbee_zrhp::msg::tables::EvtTblEpochChanged;
 
 /// Link slots (spec 8.9: 16 × 652 B each direction; 8 with `compact`).
 pub const WINDOW: usize = [16, 8][cfg!(feature = "compact") as usize];
-/// Counters one `DIAG_GET_COUNTERS` response carries (all groups of this
-/// NCP fit: link 26, MAC 8, NWK 6, APS 3, security 5, queues 5, GP 9).
-pub const MAX_COUNTERS: usize = 64;
+/// Counters one `DIAG_GET_COUNTERS` response carries: 6 B each, so that
+/// the response fits a frame (spec 7.8). Every group of this NCP fits (all
+/// groups with PTA: 71).
+pub const MAX_COUNTERS: usize = 100;
 /// Bytes of queued outgoing messages per endpoint.
 pub const QUEUE_BYTES: usize = [1536, 1024][cfg!(feature = "compact") as usize];
 /// `max_aps_inflight`: accepted, not yet confirmed `APS_DATA_REQUEST`s.
@@ -825,11 +827,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         }
         // DIAG_GET_COUNTERS needs the link, free again here.
         while let Some((tid, mask)) = self.pending_diag.pop_front() {
-            let counters = self.counters_response(mask, port, platform);
-            let response = DiagGetCountersRsp {
-                counters: List::new(&counters),
-            };
-            let _ = self.queues.response(tid, Status::Success, Some(&response));
+            self.counters_response(tid, mask, port, platform);
         }
     }
 
@@ -2319,43 +2317,39 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     /// from the NCP). Called from `dispatch` through `service` because the
     /// link is borrowed while frames are delivered.
     fn counters_response<C: CoordinatorPort, P: NcpPlatform>(
-        &self,
+        &mut self,
+        tid: u16,
         group_mask: u8,
         port: &C,
         platform: &P,
-    ) -> Vec<Counter, MAX_COUNTERS> {
-        let mut out = Vec::new();
-        if group_mask & 0x01 != 0 {
-            for (id, value) in self.link.counters().entries() {
-                let _ = out.push(Counter { id, value });
-            }
-        }
-        platform.append_counters(group_mask, &mut out);
-        port.append_counters(group_mask, &mut out);
-        let groups = [
-            (0x08, 0x0401, &self.counters.aps[..]),
-            (0x10, 0x0501, &self.counters.security[..]),
-        ];
-        for (bit, first, values) in groups {
-            if group_mask & bit != 0 {
-                for (id, value) in (first..).zip(values) {
-                    let _ = out.push(Counter { id, value: *value });
-                }
-            }
-        }
-        if group_mask & 0x40 != 0 {
-            for (id, value) in [
-                (0x0701, self.counters.aps_high_water),
-                (0x0702, self.counters.busy_responses),
-                (0x0703, self.counters.indications_dropped),
-                (0x0704, self.counters.log_dropped),
-                (0x0705, self.counters.bad_batches),
-            ] {
-                let _ = out.push(Counter { id, value });
-            }
-        }
-        crate::gp::append_counters(group_mask, &mut out);
-        out
+    ) {
+        // Encoded straight into the queue (no counter array on the stack):
+        // one pass counts, the second writes.
+        let (link, counters) = (&self.link, &self.counters);
+        let visit = |sink: &mut dyn FnMut(u16, u32)| {
+            visit_counters(group_mask, link, counters, port, platform, sink)
+        };
+        let mut total = 0usize;
+        visit(&mut |_, _| total += 1);
+        let n = total.min(MAX_COUNTERS);
+        let Some(endpoint) = home_endpoint(ids::DIAG_GET_COUNTERS) else {
+            return;
+        };
+        let _ = self.queues.queue(endpoint).push_with(|w| {
+            w.push_with(Kind::Response, false, ids::DIAG_GET_COUNTERS, tid, |w| {
+                w.u8(Status::Success.to_u8())?;
+                w.u8(n as u8)?;
+                let mut written = 0;
+                let mut result = Ok(());
+                visit(&mut |id, value| {
+                    if written < n && result.is_ok() {
+                        result = Counter { id, value }.write(w);
+                        written += 1;
+                    }
+                });
+                result
+            })
+        });
     }
 }
 
@@ -2578,4 +2572,45 @@ fn remember_response(cache: &mut crate::retry::RetryCache, queued: &[u8], msg_id
         }
         rest = &rest[end..];
     }
+}
+
+/// Every counter of the groups in `group_mask`, in group then id order
+/// (spec 7.8).
+fn visit_counters<C: CoordinatorPort, P: NcpPlatform>(
+    group_mask: u8,
+    link: &Link<WINDOW, WINDOW>,
+    counters: &QueueCounters,
+    port: &C,
+    platform: &P,
+    sink: &mut dyn FnMut(u16, u32),
+) {
+    if group_mask & 0x01 != 0 {
+        for (id, value) in link.counters().entries() {
+            sink(id, value);
+        }
+    }
+    platform.visit_counters(group_mask, sink);
+    port.visit_counters(group_mask, sink);
+    for (bit, first, values) in [
+        (0x08, 0x0401, &counters.aps[..]),
+        (0x10, 0x0501, &counters.security[..]),
+    ] {
+        if group_mask & bit != 0 {
+            for (id, value) in (first..).zip(values) {
+                sink(id, *value);
+            }
+        }
+    }
+    if group_mask & 0x40 != 0 {
+        for (id, value) in [
+            (0x0701, counters.aps_high_water),
+            (0x0702, counters.busy_responses),
+            (0x0703, counters.indications_dropped),
+            (0x0704, counters.log_dropped),
+            (0x0705, counters.bad_batches),
+        ] {
+            sink(id, value);
+        }
+    }
+    crate::gp::visit_counters(group_mask, sink);
 }

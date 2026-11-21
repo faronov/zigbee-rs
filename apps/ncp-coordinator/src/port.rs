@@ -433,8 +433,9 @@ pub trait CoordinatorPort {
     }
     /// Stack counters of the `DIAG_GET_COUNTERS` groups in `group_mask`
     /// (spec 7.8: bit2 NWK `0x03xx`, bit4 security `0x05xx`).
-    fn append_counters(&self, group_mask: u8, out: &mut crate::platform::Counters) {
-        let _ = (group_mask, out);
+    /// Each as `sink(id, value)` in id order, the same on every call.
+    fn visit_counters(&self, group_mask: u8, sink: &mut dyn FnMut(u16, u32)) {
+        let _ = (group_mask, sink);
     }
     /// `DIAG_RESET_COUNTERS` for the groups in `group_mask`.
     fn reset_counters(&mut self, group_mask: u8) {

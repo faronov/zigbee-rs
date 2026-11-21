@@ -1275,7 +1275,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
     }
 
     /// NWK group (`0x0301..`): the NWK layer's receive-security counters.
-    fn append_counters(&self, group_mask: u8, out: &mut crate::platform::Counters) {
+    fn visit_counters(&self, group_mask: u8, sink: &mut dyn FnMut(u16, u32)) {
         if group_mask & 0x04 == 0 {
             return;
         }
@@ -1288,7 +1288,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             (0x0305, stats.replay_table_full),
             (0x0306, stats.security_header_parse_failures),
         ] {
-            let _ = out.push(zigbee_zrhp::msg::diag::Counter { id, value });
+            sink(id, value);
         }
     }
 

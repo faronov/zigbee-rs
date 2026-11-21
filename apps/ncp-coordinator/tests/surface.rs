@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 
 use ncp_coordinator_app::platform::{
-    Counter, Counters, FwBegin, FwImage, FwSlot, NcpPlatform, PlatformError, slot_state,
+    FwBegin, FwImage, FwSlot, NcpPlatform, PlatformError, slot_state,
 };
 use ncp_coordinator_app::port::CoordinatorPort;
 use ncp_coordinator_app::tc::{TcApp, TcPort};
@@ -363,12 +363,13 @@ impl NcpPlatform for FakePlatform {
     fn energy_to_dbm(&self, energy: u8) -> i8 {
         energy as i8 - 100
     }
-    fn append_counters(&self, group_mask: u8, out: &mut Counters) {
+    fn visit_counters(&self, group_mask: u8, sink: &mut dyn FnMut(u16, u32)) {
         if group_mask & 0x02 != 0 {
-            let _ = out.push(Counter {
-                id: 0x0201,
-                value: self.mac_tx,
-            });
+            // As the ESP32 product: eight MAC counters.
+            sink(0x0201, self.mac_tx);
+            for id in 0x0202..=0x0208 {
+                sink(id, 0);
+            }
         }
     }
     fn reset_counters(&mut self, group_mask: u8) {
@@ -1805,8 +1806,8 @@ fn energy_scan_tx_power_and_stack_counters() {
     assert_eq!(
         ids,
         [
-            0x0201, 0x0301, 0x0302, 0x0303, 0x0304, 0x0305, 0x0306, 0x0401, 0x0402, 0x0403, 0x0501,
-            0x0502, 0x0503, 0x0504, 0x0505
+            0x0201, 0x0202, 0x0203, 0x0204, 0x0205, 0x0206, 0x0207, 0x0208, 0x0301, 0x0302, 0x0303,
+            0x0304, 0x0305, 0x0306, 0x0401, 0x0402, 0x0403, 0x0501, 0x0502, 0x0503, 0x0504, 0x0505
         ]
     );
     assert_eq!(values[0], (0x0201, 9));
@@ -1814,13 +1815,15 @@ fn energy_scan_tx_power_and_stack_counters() {
     exchange!();
     assert_eq!(host.response(reset).status(), 0);
     assert_eq!(platform.mac_tx, 0);
-    // Every counter of every group fits one response.
+    // Every counter of every group fits one response: the last group's
+    // last counter (GP 0x0813) is present.
     let counters = host.request(&DiagGetCounters { group_mask: 0xFF });
     exchange!();
     let all = counter_values(host.response(counters));
-    assert!(
-        all.len() < ncp_coordinator_app::ncp::MAX_COUNTERS,
-        "{}",
-        all.len()
-    );
+    assert!(all.len() > 64, "{}", all.len());
+    assert!(all.len() < ncp_coordinator_app::ncp::MAX_COUNTERS);
+    assert_eq!(all.last().map(|(id, _)| *id), Some(0x0813));
+    let mut ids: Vec<u16> = all.iter().map(|(id, _)| *id).collect();
+    ids.dedup();
+    assert_eq!(ids.len(), all.len());
 }

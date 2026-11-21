@@ -36,7 +36,6 @@ use zigbee_runtime::settings_journal::SettingsStore;
 use crate::fw::{self, FwPolicy, FwUpdate};
 use crate::identity::{IdentityError, IdentityItem};
 use crate::radio::MacCounters;
-use ncp_coordinator_app::platform::{Counter, Counters};
 
 /// Spec 7.9 default trial window.
 pub const TRIAL_WINDOW_MS: u64 = 10 * 60 * 1_000;
@@ -301,13 +300,10 @@ impl<F: OtaFlash, S: SettingsStore> NcpPlatform for Platform<F, S> {
         crate::radio::energy_to_dbm(energy)
     }
 
-    fn append_counters(&self, group_mask: u8, out: &mut Counters) {
+    fn visit_counters(&self, group_mask: u8, sink: &mut dyn FnMut(u16, u32)) {
         if let (true, Some((read, base))) = (group_mask & 0x02 != 0, self.mac_counters) {
             for ((id, now), base) in (0x0201..).zip(read()).zip(base) {
-                let _ = out.push(Counter {
-                    id,
-                    value: now.wrapping_sub(base),
-                });
+                sink(id, now.wrapping_sub(base));
             }
         }
     }

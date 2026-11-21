@@ -164,16 +164,13 @@ pub trait NcpPlatform {
     // ── Counters (spec 7.8) ─────────────────────────────────────────
 
     /// Platform counters of the `DIAG_GET_COUNTERS` groups in `group_mask`
-    /// (MAC/radio, group bit 1, `0x02xx`).
-    fn append_counters(&self, _group_mask: u8, _out: &mut Counters) {}
+    /// (MAC/radio, group bit 1, `0x02xx`), each as `sink(id, value)` in id
+    /// order. Called twice per response (count, then encode): the values
+    /// must not depend on the call.
+    fn visit_counters(&self, _group_mask: u8, _sink: &mut dyn FnMut(u16, u32)) {}
     /// `DIAG_RESET_COUNTERS` for the groups in `group_mask`.
     fn reset_counters(&mut self, _group_mask: u8) {}
 }
-
-pub use zigbee_zrhp::msg::diag::Counter;
-
-/// The counters of one `DIAG_GET_COUNTERS` response.
-pub type Counters = heapless::Vec<Counter, { crate::ncp::MAX_COUNTERS }>;
 
 /// A product with none of the optional services.
 #[derive(Debug, Default, Clone, Copy)]
