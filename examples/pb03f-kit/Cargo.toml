@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-# Hardware lab: boot, clocks, UART console, LEDs, button and flash, without
-# the Zigbee stack. Proves each fitted primitive independently.
+# Hardware lab: boot, clocks, UART console, LEDs, button, flash and the
+# AES-128 block (KAT, status probe, completion-wait sweep), without the
+# Zigbee stack. Proves each primitive independently.
 [[bin]]
 name = "pb03f-lab"
 path = "src/bin/lab.rs"

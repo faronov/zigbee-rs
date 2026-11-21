@@ -11,7 +11,7 @@ use panic_halt as _;
 use phy62x2_evk::Resources;
 use phy62x2_evk_product as product;
 use sensor_sed_app::{BlockingBattery, BlockingEnvironment, NoOta, SensorApp, SensorSedParts};
-use zigbee_mac::phy6222::{Phy6222RadioPhy, Phy6222SoftMac};
+use zigbee_mac::phy6222::{Phy6222Aes, Phy6222AesError, Phy6222RadioPhy, Phy6222SoftMac};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::ApplicationProfile;
@@ -84,10 +84,15 @@ async fn main(_spawner: Spawner) {
 
     let battery = product::battery::SupplyBattery::new(supply_monitor);
 
-    let radio = match Phy6222RadioPhy::take() {
+    let mut radio = match Phy6222RadioPhy::take() {
         Some(radio) => radio,
         None => fault(&mut status),
     };
+    // Zigbee security runs only on the AES block: no start without its KAT.
+    let aes = Phy6222Aes::take().ok_or(Phy6222AesError::NotValidated);
+    if aes.and_then(|aes| radio.install_aes_engine(aes)).is_err() {
+        fault(&mut status);
+    }
     let ieee = match product::identity::validate_ieee_address(radio.extended_address()) {
         Ok(ieee) => ieee,
         Err(_) => fault(&mut status),

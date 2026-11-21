@@ -16,7 +16,7 @@ use router_app::{
     StatusSink, Supervisor,
 };
 use zigbee_mac::MacError;
-use zigbee_mac::phy6222::Phy6222RadioPhy;
+use zigbee_mac::phy6222::{Phy6222Aes, Phy6222AesError, Phy6222RadioPhy};
 
 /// Resources a role composition needs after the board is up.
 pub struct Started {
@@ -27,9 +27,9 @@ pub struct Started {
     pub button: UserButton,
 }
 
-/// Time driver, console, radio interrupt, board resources and the factory
-/// EUI-64. The supply monitor and the other LEDs are dropped unused: the
-/// mains roles own no battery.
+/// Time driver, console, radio interrupt, board resources, the AES block
+/// (startup known-answer test) and the factory EUI-64. The supply monitor
+/// and the other LEDs are dropped unused: the mains roles own no battery.
 pub fn start(model: &str) -> Started {
     pb03f_kit::time::init();
     let Ok(Resources {
@@ -49,9 +49,15 @@ pub fn start(model: &str) -> Started {
     unsafe {
         cortex_m::peripheral::NVIC::unmask(pb03f_kit::vectors::Interrupt::LlIrq);
     }
-    let Some(radio) = Phy6222RadioPhy::take_with_config(product::radio::radio_config()) else {
+    let Some(mut radio) = Phy6222RadioPhy::take_with_config(product::radio::radio_config()) else {
         fault(led, "radio already taken")
     };
+    let aes = Phy6222Aes::take().ok_or(Phy6222AesError::NotValidated);
+    if let Err(error) = aes.and_then(|aes| radio.install_aes_engine(aes)) {
+        log::error!("AES-128 engine: {:?}", error);
+        fault(led, "AES-128 engine rejected")
+    }
+    log::info!("AES-128 engine: known-answer test passed");
     let Ok(ieee) = product::identity::validate_ieee_address(radio.extended_address()) else {
         fault(led, "factory IEEE address missing")
     };

@@ -15,7 +15,7 @@ use panic_halt as _;
 use pb03f_kit::{Resources, console_log, time, vectors};
 use pb03f_kit_product as product;
 use sensor_sed_app::{BlockingBattery, BlockingEnvironment, NoOta, SensorApp, SensorSedParts};
-use zigbee_mac::phy6222::{Phy6222RadioPhy, Phy6222SoftMac};
+use zigbee_mac::phy6222::{Phy6222Aes, Phy6222AesError, Phy6222RadioPhy, Phy6222SoftMac};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_runtime::node::ZigbeeNode;
 use zigbee_runtime::profile::ApplicationProfile;
@@ -94,9 +94,16 @@ async fn main(_spawner: Spawner) {
     unsafe {
         cortex_m::peripheral::NVIC::unmask(vectors::Interrupt::LlIrq);
     }
-    let Some(radio) = Phy6222RadioPhy::take_with_config(product::radio::radio_config()) else {
+    let Some(mut radio) = Phy6222RadioPhy::take_with_config(product::radio::radio_config()) else {
         fault(&mut status, "radio already taken")
     };
+    // Zigbee security runs only on the AES block: no start without its KAT.
+    let aes = Phy6222Aes::take().ok_or(Phy6222AesError::NotValidated);
+    if let Err(error) = aes.and_then(|aes| radio.install_aes_engine(aes)) {
+        log::error!("AES-128 engine: {:?}", error);
+        fault(&mut status, "AES-128 engine rejected")
+    }
+    log::info!("AES-128 engine: known-answer test passed");
     let Ok(ieee) = product::identity::validate_ieee_address(radio.extended_address()) else {
         fault(&mut status, "factory IEEE address missing")
     };

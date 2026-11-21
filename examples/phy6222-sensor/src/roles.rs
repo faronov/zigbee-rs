@@ -23,7 +23,7 @@ use router_app::{
     StatusSink, Supervisor,
 };
 use zigbee_mac::MacError;
-use zigbee_mac::phy6222::Phy6222RadioPhy;
+use zigbee_mac::phy6222::{Phy6222Aes, Phy6222AesError, Phy6222RadioPhy};
 
 /// Resources a role composition needs after the board is up.
 pub struct Started {
@@ -34,7 +34,8 @@ pub struct Started {
     pub button: UserButton,
 }
 
-/// Time driver, radio interrupt, board resources and the factory EUI-64.
+/// Time driver, radio interrupt, board resources, the AES block (startup
+/// known-answer test) and the factory EUI-64.
 /// The supply monitor and the sensor I2C bus are dropped unused: the mains
 /// roles own no sensor and no battery.
 pub fn start() -> Started {
@@ -53,9 +54,13 @@ pub fn start() -> Started {
     };
     let mut led = status_led;
     led.set_on(false);
-    let Some(radio) = Phy6222RadioPhy::take() else {
+    let Some(mut radio) = Phy6222RadioPhy::take() else {
         fault(led)
     };
+    let aes = Phy6222Aes::take().ok_or(Phy6222AesError::NotValidated);
+    if aes.and_then(|aes| radio.install_aes_engine(aes)).is_err() {
+        fault(led)
+    }
     let Ok(ieee) = product::identity::validate_ieee_address(radio.extended_address()) else {
         fault(led)
     };

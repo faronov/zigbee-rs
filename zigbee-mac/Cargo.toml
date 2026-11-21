@@ -211,8 +211,14 @@ hardware-aes-bl702 = [
 # ]
 
 phy6222 = [
+    "hardware-aes-phy6222",
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
+# The PHY62x2 AES-128 ECB block (`phy6222::Phy6222Aes`) is mandatory for the
+# PHY62x2 backend: `Phy6222RadioPhy` builds no MAC without a validated
+# engine and never falls back to software AES. This marker feature is pulled
+# in by `phy6222`; it is not an independently selectable switch.
+hardware-aes-phy6222 = []
 # PHY62x2 radio counters and the RX software FCS cross-check (bring-up/lab
 # builds); without it `RadioStats` counters stay zero and cost no XIP.
 phy6222-diag = ["phy6222"]
@@ -249,6 +255,10 @@ cc26x2 = ["dep:cc26x2-hal", "dep:embassy-time", "dep:embassy-futures"]
 # the IPCC/mailbox transport lives in `stm32wb-hal`, so enabling this adds no
 # crates to any lockfile.
 stm32wb = []
+
+[dev-dependencies]
+# Host tests run platform AES engine models through the shared known answers.
+zigbee-crypto = { version = "0.1.0", path = "../zigbee-crypto", features = ["kat"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("tc32"))'] }

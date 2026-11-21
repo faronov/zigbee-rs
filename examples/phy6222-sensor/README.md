@@ -127,8 +127,8 @@ Occupied-XIP measurements with `nightly-2026-08-01` on macOS:
 
 | feature image | occupied XIP span | hard gate | result |
 |---|---:|---:|---:|
-| PHY6222 (default) | 135,680 | 187,104 | 51,424 bytes free |
-| PHY6252 (`--no-default-features --features phy6252`) | 135,744 | 187,104 | 51,360 bytes free |
+| PHY6222 (default) | 136,576 | 187,104 | 50,528 bytes free |
+| PHY6252 (`--no-default-features --features phy6252`) | 136,832 | 187,104 | 50,272 bytes free |
 
 The PHY target configuration enables linker identical-code folding
 (`--icf=all`) for identical monomorphized functions. Folded functions can share
@@ -143,7 +143,9 @@ removes 3,328 bytes of panic arguments and `Location` records. SRAM placement
 and size are unchanged.
 
 Both measurements are from linked ELFs that pass the layout, AES, and role
-checks. These local measurements do not establish Linux CI or hardware
+checks. Zigbee AES runs on the chip's AES-128 block
+(`zigbee_mac::phy6222::Phy6222Aes`, startup known-answer test before
+Zigbee starts); no software AES is linked. These local measurements do not establish Linux CI or hardware
 qualification.
 
 The packaged PHY6 file includes loader metadata and is not the gate metric. No
