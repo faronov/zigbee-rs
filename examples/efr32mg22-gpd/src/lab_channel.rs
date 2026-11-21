@@ -131,8 +131,13 @@ mod pinned {
         }
     }
 
-    // Software AES, as for the board radio.
-    impl ForwardAesProvider for Phy {}
+    // The board radio's hardware AES engine (CRYPTOACC); no software AES.
+    impl ForwardAesProvider for Phy {
+        #[allow(refining_impl_trait)]
+        fn forward_cipher(&mut self, key: &[u8; 16]) -> zigbee_mac::efr32s2::Efr32s2Aes128<'_> {
+            self.0.forward_cipher(key)
+        }
+    }
 
     impl PlatformServices for Phy {
         fn monotonic_micros(&self) -> u32 {

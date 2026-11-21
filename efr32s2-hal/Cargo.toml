@@ -30,3 +30,7 @@ embedded-hal = "1.0"
 embedded-storage = "0.3"
 embassy-time-driver = { version = "0.2", optional = true }
 embassy-time-queue-utils = { version = "0.1", optional = true }
+
+[dev-dependencies]
+# Host-only: reference AES for the engine models and the shared KAT suite.
+zigbee-crypto = { path = "../zigbee-crypto", features = ["kat"] }
