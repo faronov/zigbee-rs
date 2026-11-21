@@ -37,6 +37,12 @@ sink = ["proxy"]
 # endpoint, paired endpoints) on top of the sink. Off by default: sinks
 # without it are unchanged.
 translation-table = ["sink"]
+# GPD Channel Request on the sink: while in commissioning mode the sink
+# answers a GPD's Channel Request (received directly or tunnelled by a
+# proxy) with a GP Response carrying a Channel Configuration for the
+# operational channel, delivered by a TempMaster (gecko_sdk
+# `handleChannelRequest`). Advertises gpsFunctionality "GPD maintenance".
+channel-request = ["sink"]
 # A 4-entry Translation Table instead of 16 (a sink whose large Sink Table
 # leaves little persistent room, e.g. the 16-entry ZRHP NCP sink).
 compact-translation-table = []

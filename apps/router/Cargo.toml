@@ -44,6 +44,9 @@ green-power-translation-table = [
     "green-power-sink",
     "zigbee-runtime/green-power-translation-table",
 ]
+# The combo's sink answers GPD Channel Requests during commissioning.
+# Product images must opt in explicitly.
+green-power-channel-request = ["green-power-sink", "zigbee-runtime/green-power-channel-request"]
 
 [dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }

@@ -27,8 +27,9 @@ zigbee-bdb = { path = "../../zigbee-bdb", default-features = false, features = [
 # `ncp-capacity`: the NCP table sizes (256 TC devices/link keys, 512 address
 # map, 96 neighbors with 64 children, 128 source routes; spec 8.9).
 # `green-power-ncp`: the GP combo (Proxy Basic + sink) behind the GREEN POWER
-# commands (spec 7.11), with the 16-entry Sink Table of `ncp-capacity`.
-zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["centralized-tclk", "trust-center", "global-aps-counter", "host-passthrough", "ncp-capacity", "green-power-ncp", "journal-pre-erase"] }
+# commands (spec 7.11), with the 16-entry Sink Table of `ncp-capacity`;
+# `green-power-channel-request`: the sink answers GPD Channel Requests.
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = ["centralized-tclk", "trust-center", "global-aps-counter", "host-passthrough", "ncp-capacity", "green-power-ncp", "green-power-channel-request", "journal-pre-erase"] }
 router-app = { path = "../router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity", "green-power-sink"] }
 zigbee-gp = { path = "../../zigbee-gp", features = ["sink"] }
 

@@ -34,10 +34,15 @@
 //! Configuration and GP Translation Table Update/Request from a
 //! commissioning tool (`configuration`, [`crate::translation_table`]).
 //!
+//! With the `channel-request` feature the sink answers a GPD's Channel
+//! Request during commissioning with a Channel Configuration
+//! (`maintenance`).
+//!
 //! Not implemented (rejected explicitly, not silently accepted): GP
 //! Translation Table Update/Request and GP Pairing Configuration without
 //! `translation-table`, Application Description (multi-sensor report
-//! descriptors), GPD Channel Request handling, key provisioning to a GPD
+//! descriptors), GPD Channel Request handling without `channel-request`,
+//! key provisioning to a GPD
 //! (shared-key attributes, key in the Commissioning Reply), commissioning
 //! through a GP Manager in security or pairing (GPM, involve-TC) and GP
 //! Pairing Search.
@@ -177,6 +182,12 @@ pub const CONFIGURATION_FUNCTIONALITY: u32 = functionality::CT_BASED_COMMISSIONI
 /// gpsFunctionality bits of `translation-table` (none without it).
 #[cfg(not(feature = "translation-table"))]
 pub const CONFIGURATION_FUNCTIONALITY: u32 = 0;
+/// gpsFunctionality bit of `channel-request`: GPD maintenance (bit 12).
+#[cfg(feature = "channel-request")]
+pub const MAINTENANCE_FUNCTIONALITY: u32 = functionality::GPD_MAINTENANCE;
+/// gpsFunctionality bit of `channel-request` (none without it).
+#[cfg(not(feature = "channel-request"))]
+pub const MAINTENANCE_FUNCTIONALITY: u32 = 0;
 /// gpsFunctionality bit 6, proximity bidirectional operation.
 pub const PROXIMITY_BIDIRECTIONAL: u32 = 1 << 6;
 /// gpsFunctionality bit 9, proximity commissioning.
@@ -653,6 +664,10 @@ pub enum SinkOutcome {
     CommissioningReplySent,
     /// A GPD was decommissioned.
     Decommissioned,
+    /// A GPD's Channel Request was answered with a GP Response carrying a
+    /// Channel Configuration (`channel-request`).
+    #[cfg(feature = "channel-request")]
+    ChannelConfigurationSent,
     /// The frame was dropped.
     Dropped(SinkDrop),
 }
@@ -796,6 +811,15 @@ enum Out {
         tsn: u8,
         start_index: u8,
     },
+    /// GP Response carrying a Channel Configuration for SrcID 0.
+    #[cfg(feature = "channel-request")]
+    ChannelConfiguration {
+        temp_master: u16,
+        /// GPD receive channel - 11.
+        tx_channel: u8,
+        /// Channel Configuration payload byte.
+        config: u8,
+    },
     /// GP Pairing removing this sink's pairing (group or unicast).
     #[cfg(feature = "translation-table")]
     PairingRemoveSink {
@@ -866,6 +890,9 @@ pub struct Sink<const N: usize, const Q: usize> {
     stats: SinkStats,
     #[cfg(feature = "translation-table")]
     translations: configuration::SinkTranslationTable,
+    /// Last Channel Configuration queued: (TempMaster, channel byte, ms).
+    #[cfg(feature = "channel-request")]
+    last_channel_configuration: Option<(u16, u8, u32)>,
 }
 
 impl<const N: usize, const Q: usize> Sink<N, Q> {
@@ -897,6 +924,8 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             },
             #[cfg(feature = "translation-table")]
             translations: configuration::SinkTranslationTable::new(),
+            #[cfg(feature = "channel-request")]
+            last_channel_configuration: None,
         }
     }
 
@@ -1130,6 +1159,27 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                     r.encode(&mut payload),
                 )
             }
+            #[cfg(feature = "channel-request")]
+            Out::ChannelConfiguration {
+                temp_master,
+                tx_channel,
+                config,
+            } => {
+                let r = Response {
+                    gpd_id: GpdId::SrcId(0),
+                    transmit_on_endpoint_match: false,
+                    temp_master_short: temp_master,
+                    temp_master_tx_channel: tx_channel,
+                    command_id: cmd::CHANNEL_CONFIGURATION,
+                    payload: &[config],
+                };
+                (
+                    broadcast,
+                    client_cmd::RESPONSE,
+                    None,
+                    r.encode(&mut payload),
+                )
+            }
             Out::NotificationResponse { dst, tsn, response } => (
                 unicast(dst),
                 client_cmd::NOTIFICATION_RESPONSE,
@@ -1339,7 +1389,12 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 } else {
                     0
                 };
-                w.u24(SINK_FUNCTIONALITY | CONFIGURATION_FUNCTIONALITY | proximity_bidirectional)?;
+                w.u24(
+                    SINK_FUNCTIONALITY
+                        | CONFIGURATION_FUNCTIONALITY
+                        | MAINTENANCE_FUNCTIONALITY
+                        | proximity_bidirectional,
+                )?;
                 BITMAP24
             }
             attr::GPS_ACTIVE_FUNCTIONALITY => {
@@ -1442,6 +1497,9 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         }
         // Maintenance frames without a SrcID carry only a Channel Request.
         let Some(gpd) = h.gpd_id else {
+            #[cfg(feature = "channel-request")]
+            return self.on_maintenance_gpdf(frame, now_ms);
+            #[cfg(not(feature = "channel-request"))]
             return SinkOutcome::Dropped(Unsupported);
         };
         if gpd.is_reserved() {
@@ -1605,6 +1663,17 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         now_ms: u32,
     ) -> SinkOutcome {
         use SinkDrop::*;
+        #[cfg(feature = "channel-request")]
+        if n.command_id == cmd::CHANNEL_REQUEST {
+            return self.on_tunnelled_channel_request(
+                &n.gpd_id,
+                n.rx_after_tx,
+                n.proxy_info,
+                n.payload,
+                n.frame_counter,
+                now_ms,
+            );
+        }
         if n.gpd_id.is_reserved() {
             return SinkOutcome::Dropped(Invalid);
         }
@@ -1662,6 +1731,17 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
         use SinkDrop::*;
         if self.commissioning.is_none() {
             return SinkOutcome::Dropped(NotCommissioning);
+        }
+        #[cfg(feature = "channel-request")]
+        if n.command_id == cmd::CHANNEL_REQUEST {
+            return self.on_tunnelled_channel_request(
+                &n.gpd_id,
+                n.rx_after_tx,
+                n.proxy_info,
+                n.payload,
+                n.frame_counter,
+                now_ms,
+            );
         }
         if n.gpd_id.is_reserved() {
             return SinkOutcome::Dropped(Invalid);
@@ -1750,6 +1830,9 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 self.remove(&rx.gpd);
                 SinkOutcome::Decommissioned
             }
+            // A Channel Request comes from SrcID 0 and is answered before
+            // this point (`channel-request`); with a real GPD ID it is
+            // invalid.
             cmd::CHANNEL_REQUEST | cmd::APPLICATION_DESCRIPTION => {
                 SinkOutcome::Dropped(Unsupported)
             }
@@ -3266,7 +3349,10 @@ mod tests {
         assert_eq!(read(&s, attr::GPS_SECURITY_LEVEL, &mut out), (BITMAP8, 1));
         assert_eq!(read(&s, attr::GPS_FUNCTIONALITY, &mut out), (BITMAP24, 3));
         let f = u32::from_le_bytes([out[0], out[1], out[2], 0]);
-        assert_eq!(f, SINK_FUNCTIONALITY | CONFIGURATION_FUNCTIONALITY);
+        assert_eq!(
+            f,
+            SINK_FUNCTIONALITY | CONFIGURATION_FUNCTIONALITY | MAINTENANCE_FUNCTIONALITY
+        );
         assert_eq!(f & PROXIMITY_BIDIRECTIONAL, 0);
         s.set_direct_bidirectional(true);
         read(&s, attr::GPS_FUNCTIONALITY, &mut out);
@@ -3757,3 +3843,6 @@ mod import_tests {
 mod configuration;
 #[cfg(feature = "translation-table")]
 pub use configuration::{SINK_TRANSLATION_ENTRIES, SinkTranslationTable};
+
+#[cfg(feature = "channel-request")]
+mod maintenance;

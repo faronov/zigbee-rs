@@ -43,6 +43,7 @@
 | Full proxy (`zigbee-gp/proxy-full`, `zigbee-runtime/green-power-full-proxy`) | in progress, opt-in (§2 row (b)) | host tests |
 | Combo / Sink (`zigbee-gp/sink`, `zigbee-runtime/green-power-sink`, router-app `green-power-sink`): Sink Table, sink commissioning mode, GPD commissioning (direct and Commissioning Notification, bidirectional through a TempMaster), Notification processing, Notification Response, Sink Table Request, sink attributes, built-in GPD → ZCL translation to one local endpoint, Sink Table in the GP journal | implemented, opt-in (not in any default image) | host tests (`zigbee-gp` sink unit tests, zigpy golden vectors, `gp_store` sink journal tests, runtime end-to-end `gp_combo_commissions_a_switch_and_toggles_the_local_light`); ESP32-H2 and nRF52840 router builds (§4.5); first product: Waveshare ESP32-H2-Zero combo light (`combo-light`, On/Off Light endpoint on the WS2812, BOOT opens sink commissioning, TempMaster included; §3.7). **Lab-tested on the H2-Zero (2026-11-15/16, §6.10)**: BOOT window, direct commissioning of a unidirectional GP switch, Toggles to the light, Sink Table across a power cycle. Adaptive counters across a power cycle and the 180 s BOOT timeout: lab-tested 2026-11-17. Bidirectional GPD directly into the sink with the combo as its own TempMaster: **proven on hardware on the ESP32-H2 2026-11-17**: 3 of 3 rounds with the reply started from the radio interrupts (7b2d6ca), after the fixes for zigpy's Response cancelling the combo's reply, the reply ordering and the busy radio (§6.10) |
 | GP Pairing Configuration and Translation Table on the sink (`zigbee-gp/translation-table`, `zigbee-runtime/green-power-translation-table`, router-app `green-power-translation-table`; in `combo-light`): Pairing Configuration actions no action / extend / replace / remove pairing / remove GPD with the "send GP Pairing" flag, all communication modes with pre-commissioned group lists, security fields, paired endpoints, application information (validated, not stored); Translation Table Update (add/replace/remove) and Request/Response, per-GPD translations to any local endpoint with a fixed, derived (`0xFE`) or copied (`0xFF`) payload, pass-to-application (`0xFC`); built-in translation kept when no explicit entry exists; gpsFunctionality bits 11 and 18; translations and paired endpoints in the GP journal's sink record (§3.8) | implemented, opt-in (2026-11-19) | host tests: `zigbee_gp::config` codec vectors (gecko_sdk field layout), `zigbee_gp::translation_table`, sink behaviour (`sink::configuration::tests`), journal migration / interrupted write / unknown section (`gp_store::translations`), runtime end to end `gp_translation_tests::pairing_configuration_and_translation_update_retarget_a_gpd_toggle` (unicast Pairing Configuration and Translation Table Update from a coordinator, Default Responses, Translation Table Response, GPD Toggle driving endpoint 2 with On, reboot), `locally_issued_configuration_retargets_a_paired_gpd_without_a_tool`. ESP32-H2-Zero `combo-light` builds. **Lab-tested on the H2-Zero in the ZHA network (2026-11-19, §6.11)** with a locally issued Pairing Configuration (Extend) and Translation Table Update (`lab-gp-translation` image): journal migration from the previous firmware, the MG22 switch's Toggle driving On, the translation across a reset, its removal, and the previous firmware resuming on the journal afterwards (a journal still holding a translation section under older firmware is host-tested only). **Over the air from the ZRHP NCP, lab-tested on an ESP32-C6 combo (2026-11-20, §6.12)**: Pairing Configuration Extend and Remove GPD, Translation Table Update add/remove, Sink and Translation Table Requests, the translation across a reset, an MG22 switch's Toggle driving On |
+| GPD Channel Request on the sink (`zigbee-gp/channel-request`, `zigbee-runtime/green-power-channel-request`, router-app `green-power-channel-request`; in `combo-light` and the ZRHP NCP): in commissioning mode a Channel Request heard directly, or tunnelled in a GP Commissioning Notification / GP Notification from SrcID 0 with rxAfterTx, is answered with a GP Response carrying a Channel Configuration (operational channel, Basic) for the TempMaster; repeats within 1 s share one GP Response; gpsFunctionality bit 12 (GPD maintenance); `EVT_GP_FRAME` result 6 on the NCP (§3.9) | implemented, opt-in (2026-11-21) | host tests: `sink::maintenance` (direct, Commissioning Notification and Notification paths, refusals, repeat suppression, gpsFunctionality), runtime end to end `gp_channel_request_tests` (combo as its own TempMaster delivers the Channel Configuration by timed TX in the GPD's window). **Not run on hardware** |
 | Remote GP provisioning on the ZRHP NCP (`GP_PAIRING_CONFIGURATION`, `GP_SEND_PAIRING`, `GP_TRANSLATION_UPDATE`/`REQUEST`, `GP_REMOTE_SINK_TABLE_REQUEST`, `GP_REMOTE_PROXY_TABLE_REQUEST`, `EVT_GP_REMOTE_*`, [ZRHP 7.11](host-protocol.md#711-green-power-0x0axx-endpoint-2)) | implemented (2026-11-19) | host tests: zigbee-zrhp vectors (`generate.py --check`), NCP request mapping, NCP end to end against a second zigbee-rs router stack (`remote_provisioning_reaches_another_proxy_and_sink`). H2 NCP image builds and passes the stack gate. **Lab-tested on hardware 2026-11-20 (§6.12)**: master 2ab8ac0 NCP on the Thread BR board's H2 (921 600, RTS/CTS) provisioned an ESP32-C6 combo over the air with `GP_PAIRING_CONFIGURATION`, `GP_TRANSLATION_UPDATE`, `GP_TRANSLATION_REQUEST` and `GP_REMOTE_SINK_TABLE_REQUEST`, each answered (`EVT_GP_REMOTE_*`) within 50–85 ms; host tool `tools/zrhp-host` `--gp-*`. `GP_SEND_PAIRING` and `GP_REMOTE_PROXY_TABLE_REQUEST` not run on hardware |
 | Adaptive frame-counter persistence (`zigbee_gp::counter`, Proxy and Sink Table, exact flag in the GP journal's counter records) | implemented, in every GP image | host tests (§3.3); lab-tested on the H2-Zero combo 2026-11-17: after a power cycle the switch's first presses toggled the light, none dropped (§6.10) |
 | GP combo on the ZRHP coordinator NCP (`zigbee-runtime/green-power-ncp` with `ncp-capacity`, `apps/ncp-coordinator` `gp`, `examples/esp32-ncp`): Proxy Basic + sink (Sink Table 16, Proxy Table 8) + TempMaster, sink authority switchable at runtime (`NCP_SINK` / `HOST_SINK`), NCP default `gpsSecurityLevel` 0x00 with no translation endpoint, GP journal in the NCP's `zbnv` window (2 × 8 KiB), all GREEN POWER commands and events of [ZRHP 7.11](host-protocol.md#711-green-power-0x0axx-endpoint-2) | implemented (2026-11-19) | host tests: `zigbee-gp` import/quiet-removal unit tests, runtime `green_power::ncp` unit tests, NCP end-to-end `apps/ncp-coordinator/tests/gp.rs` over the host link (commissioning of a level-3 GPD heard directly, reports, a proxy's GP Notification, table read/put/remove, `CONFLICT`, key-export lock, `HOST_SINK` raw frames and local proxy output), journal geometry tests in `products/esp32-zigbee-ncp`; H2 and C6 NCP images build and pass the stack gate. **Not run on hardware** (ZRHP gate H10) |
@@ -224,7 +225,7 @@ panic `Location` line/column fields); §4.1 records the proof.
 | (a) Proxy Basic | `proxy-basic` / `green-power-proxy` / `green-power` | dGP stub (version-3 demux, GPDF codec, security processing for proxy-table entries), proxy table plus journal, duplicate filter, commissioning mode, Commissioning Notification, Notification in derived/pre-commissioned groupcast and lightweight unicast, Pairing, Proxy Commissioning Mode, Proxy Table Request/Response, gppFunctionality attributes, GP 1.1.1 tunnelling delay (A.3.6.3.1). Unidirectional only. |
 | (a+) Basic with bidirectional commissioning | `proxy-bidir-commissioning` | gpTxQueue (≥ 5 entries, one per GPD), GP Response handling in the TempMaster role, timed transmission on the operational channel, Commissioning Reply. *(verify 1.1: possibly mandatory for Basic)* |
 | (b) Full proxy | `proxy-full` (implies the above) | **In progress (M5):** protected IEEE ApplicationID 2 GPDF authentication/forwarding; full-unicast Pairing and Notification Response matching; bounded retries with readable/writable retry attributes; temporary channel switch for a Maintenance Channel Configuration (A.3.9.1 step 8: the radio moves to the GPD's transmit channel, serves only its Channel Request, defers network transmissions and returns after delivery or 5 s); strict GP Tunneling Stop payload codec. gppFunctionality adds full unicast and GPD IEEE address. Tunneling Stop is a GP 1.0 optional command that the Silicon Labs GP 1.1 client neither sends nor handles, so no behaviour is attached to it. Pairing Search and Proxy Table maintenance are deferred: neither zigpy nor the Silicon Labs client uses them. Remaining: Combo/Sink and counter-reservation optimization. |
-| (c) Combo / Sink | `sink` (implies `proxy`) / `green-power-sink` (implies `green-power`) / `green-power-sink` | **Implemented opt-in, host-tested; lab-tested on the ESP32-H2-Zero combo light (§3.7, §6.10):** GP server on GPEP: Sink Table plus journal, sink commissioning mode (local API or GP Sink Commissioning Mode, window, exit on first pairing, GP Proxy Commissioning Mode to the proxies), direct GPDF reception, Notification and Commissioning Notification handling, bidirectional commissioning (GP Response with Commissioning Reply, Success), decommissioning, GP Pairing and alias Device_annce generation, GP Notification Response, Sink Table Request/Response, sink attributes 0x0000–0x0007, built-in translation (Off/On/Toggle → On/Off, Level Control Move/Step/Stop) to one local application endpoint. With `translation-table` / `green-power-translation-table` / `green-power-translation-table` (opt-in, §3.8): GP Pairing Configuration, Translation Table Update/Request and per-GPD translations to any local endpoint. **Deferred:** Application Description (refused with FAILURE), Channel Request handling, key provisioning to a GPD, GPM / involve-TC commissioning, GP Pairing Search |
+| (c) Combo / Sink | `sink` (implies `proxy`) / `green-power-sink` (implies `green-power`) / `green-power-sink` | **Implemented opt-in, host-tested; lab-tested on the ESP32-H2-Zero combo light (§3.7, §6.10):** GP server on GPEP: Sink Table plus journal, sink commissioning mode (local API or GP Sink Commissioning Mode, window, exit on first pairing, GP Proxy Commissioning Mode to the proxies), direct GPDF reception, Notification and Commissioning Notification handling, bidirectional commissioning (GP Response with Commissioning Reply, Success), decommissioning, GP Pairing and alias Device_annce generation, GP Notification Response, Sink Table Request/Response, sink attributes 0x0000–0x0007, built-in translation (Off/On/Toggle → On/Off, Level Control Move/Step/Stop) to one local application endpoint. With `translation-table` / `green-power-translation-table` / `green-power-translation-table` (opt-in, §3.8): GP Pairing Configuration, Translation Table Update/Request and per-GPD translations to any local endpoint. With `channel-request` / `green-power-channel-request` (opt-in, §3.9): GPD Channel Request answered with a Channel Configuration. **Deferred:** Application Description (refused with FAILURE), key provisioning to a GPD, GPM / involve-TC commissioning, GP Pairing Search |
 | (d) GPD app | `gpd` (frame builder and security only) + `apps/gpd` | No NWK/APS/ZDO/BDB. Commissioning (uni- and bidirectional), Channel Request, data and attribute reports, switch commands, secure frame-counter journal, sleep between reports |
 
 `security-level-1` is not a separate flag. Level 1 costs a few dozen bytes,
@@ -1015,6 +1016,49 @@ runtime hooks are `cfg` blocks placed where shifted lines move no panic
 a line-neutral constant. The ESP32-H2-Zero, ESP32-C6 and nRF52840 router
 images are byte-identical to master cf12e65 (§4.6).
 
+### 3.9 GPD Channel Request on the sink (opt-in)
+
+A GPD that does not know the network's channel (a factory-new switch
+without a scan, or one that lost its channel) toggles channels and sends
+Channel Request GPDFs: Maintenance frames without a SrcID, one payload byte
+naming the channel it listens on next (low nibble) and the one after (high
+nibble), channel - 11. A sink in commissioning mode answers with a GP
+Response for GPD ID 0 carrying a Channel Configuration (operational channel
+- 11, Basic bit 0x10). The TempMaster transmits it on the GPD's next receive
+channel when the GPD's next Channel Request opens the window; the GPD then
+commissions on that channel.
+
+**Code.** `zigbee_gp::sink` module `maintenance` (feature `channel-request`):
+
+- **Direct reception (combo):** the runtime already passes every GPDF to
+  the sink; a Maintenance frame without a GPD ID now reaches
+  `on_maintenance_gpdf` instead of being dropped. The TempMaster is this
+  node's own proxy, so the combo needs `green-power-bidirectional` (timed
+  TX); without it the request is dropped with `NoTempMaster`.
+- **Through proxies:** a Channel Request tunnelled in a GP Commissioning
+  Notification (or GP Notification) must come from SrcID 0 with rxAfterTx
+  set; the TempMaster is the forwarding proxy (its `ProxyInfo` short
+  address), as gecko_sdk `handleChannelRequest` does. Any other GPD ID is
+  `Invalid`, a missing receive window is `NoTempMaster`.
+- **Policy:** only in sink commissioning mode (gecko_sdk answers tunnelled
+  requests at any time; proxies forward them only in commissioning mode).
+  A GPD repeats its request several times per channel: the same answer for
+  the same TempMaster and channel is not queued again within 1 s
+  (`REPEAT_SUPPRESSION_MS`).
+- **Delivery off the operational channel:** the TempMaster must switch to
+  the GPD's receive channel (`proxy-full`, A.3.9.1 step 8). The combo light
+  has no full proxy: it delivers only when the GPD listens on the
+  operational channel, and leaves other channels to a full-proxy
+  TempMaster.
+- gpsFunctionality adds bit 12 (GPD maintenance). The NCP reports an
+  answered request as `EVT_GP_FRAME` result 6 with SrcID 0.
+
+Proxy forwarding on routers was already in place: a Proxy Basic in
+commissioning mode tunnels a Channel Request in a GP Commissioning
+Notification, and a bidirectional proxy delivers a Channel Configuration
+for SrcID 0 from its gpTxQueue on the GPD's next Channel Request (§3.2,
+`proxy` host tests).
+
 ## 4. Size estimates
 
 §4.1 has the measured Proxy Basic cost; the rest of this section is the
@@ -1291,6 +1335,19 @@ and the `lab-gp-translation` hook added afterwards leave the production
 method is not instantiated unless called). The lab image is 591,504 B as
 an app image (`espflash save-image`), +4,656 B over the 586,848 B
 production app image.
+
+### 4.7 Measured: GPD Channel Request on the sink (2026-11-21)
+
+Release builds in one checkout path, nightly-2026-08-01, master dd1ce41 →
+`gp-channel-request` (file-backed flash = `.text` + `.rodata` + `.data`):
+
+| Image | Flash | `.bss` |
+|---|---:|---:|
+| H2-Zero `router,waveshare-h2-zero,combo-light` | 584,062 → 584,808 (+746) | 71,880 → 71,888 (+8) |
+| H2 NCP `esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines` | 730,634 → 732,016 (+1,382) | 176,232 → 176,248 (+16) |
+| H2-Zero `router,waveshare-h2-zero`, C6 `router` | byte-identical | |
+
+The NCP's stack gate still passes (serve chain 30,704 of 30,720 B).
 
 ## 5. Risks
 

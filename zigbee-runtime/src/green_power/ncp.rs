@@ -198,6 +198,8 @@ pub const fn sink_result(outcome: SinkOutcome) -> Option<u8> {
         SinkOutcome::Commissioned => Some(2),
         SinkOutcome::CommissioningReplySent => Some(3),
         SinkOutcome::Decommissioned => Some(4),
+        #[cfg(feature = "green-power-channel-request")]
+        SinkOutcome::ChannelConfigurationSent => Some(6),
         SinkOutcome::Dropped(_) => None,
     }
 }
@@ -620,9 +622,8 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             accepted => sink_result(accepted).unwrap_or(1),
         };
         let h = &frame.header;
-        let Some(gpd_id) = h.gpd_id else {
-            return;
-        };
+        // A Maintenance frame (Channel Request) carries no GPD ID: SrcID 0.
+        let gpd_id = h.gpd_id.unwrap_or(GpdId::SrcId(0));
         let level = h.security_level;
         let entry = self
             .green_power
