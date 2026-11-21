@@ -12,12 +12,15 @@
 //!   area, presented through [`word_flash::WordPerDoubleWord`] so the
 //!   zigbee-runtime journals work on 64-bit-programmed flash;
 //! - [`hsem`]: the hardware semaphores shared with CPU2;
+//! - [`hse`]: the factory HSE load-capacitor tuning from OTP, applied
+//!   before the clock tree starts HSE;
 //! - [`aes`]: the CPU1 AES1 engine behind Zigbee CCM* and AES-MMO (the
 //!   MAC transport owns it; no software AES is linked).
 //!
-//! Only [`word_flash`] and the AES1 register protocol (host-tested against
-//! a model) are hardware independent; the rest requires one chip
-//! feature (`stm32wb55vg`, `stm32wb55rg`, `stm32wb55cg`).
+//! Only [`word_flash`], the AES1 register protocol and the OTP/`HSECR`
+//! logic of [`hse`] (host-tested against models) are hardware
+//! independent; the rest requires one chip feature (`stm32wb55vg`,
+//! `stm32wb55rg`, `stm32wb55cg`).
 
 #![no_std]
 
@@ -31,6 +34,7 @@ pub mod clk48;
 
 #[cfg(feature = "_chip")]
 pub mod flash;
+pub mod hse;
 #[cfg(feature = "_chip")]
 pub mod hsem;
 #[cfg(feature = "_chip")]
