@@ -25,6 +25,11 @@
 //!   window. With `isr-ack` the interrupt also drops ACKs, frames for
 //!   other nodes and frames it could not acknowledge in time, which keeps
 //!   the (2 KiB) RX buffer drained between receive windows.
+//! - **AES** — xG22: hardware only (`aes`, CRYPTOACC). The composition
+//!   root installs the engine with `install_aes_engine` (on-silicon KAT);
+//!   without it every CCM*/MMO request fails. No software AES is linked.
+//!   xG21: software AES (`zigbee-crypto`) until the Secure Engine backend
+//!   (branch `aes-hw-efr32mg21`) is proven on hardware.
 //!
 //! Validation: on EFR32MG22 (WSTK + BRD4183A) the sleepy sensor joins ZHA,
 //! is interviewed and reports through this PHY. On EFR32MG21 (Home Assistant
@@ -34,6 +39,12 @@
 //! The board/product selects the default `phyTransmitPower` with the const
 //! parameter of [`Efr32s2RadioPhy`] (e.g. a 20 dBm-capable xG21 module that
 //! is certified for less).
+
+#[cfg(feature = "efr32mg22")]
+mod aes;
+
+#[cfg(feature = "efr32mg22")]
+pub use aes::{Efr32s2Aes128, Efr32s2AesError};
 
 use efr32s2_hal::radio::{self, AckFilter, FpAddress, FpError, Radio, RadioError, RadioToken};
 use embassy_futures::yield_now;
@@ -62,6 +73,10 @@ pub struct Efr32s2RadioPhy<const DEFAULT_TX_DBM: i8 = 0> {
     asleep: bool,
     /// Most recent HAL error other than `NoAck`/`ChannelBusy` (diagnostics).
     last_error: Option<RadioError>,
+    /// Hardware AES engine ([`Efr32s2RadioPhy::install_aes_engine`]); the
+    /// only AES this PHY provides.
+    #[cfg(all(feature = "efr32mg22", target_arch = "arm", target_os = "none"))]
+    aes: Option<efr32s2_hal::crypto::AesEngine>,
 }
 
 /// The EFR32 Series 2 MAC: the shared software MAC over [`Efr32s2RadioPhy`].
@@ -95,6 +110,8 @@ impl<const D: i8> Efr32s2RadioPhy<D> {
             rx_on_when_idle: false,
             asleep: false,
             last_error: None,
+            #[cfg(all(feature = "efr32mg22", target_arch = "arm", target_os = "none"))]
+            aes: None,
         })
     }
 
@@ -362,7 +379,8 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
     }
 }
 
-/// Software AES: no EFR32 Series 2 crypto engine backend yet.
+/// xG21: software AES until the Secure Engine backend is proven on hardware.
+#[cfg(feature = "efr32mg21")]
 impl<const D: i8> zigbee_crypto::ForwardAesProvider for Efr32s2RadioPhy<D> {}
 
 impl<const D: i8> PlatformServices for Efr32s2RadioPhy<D> {

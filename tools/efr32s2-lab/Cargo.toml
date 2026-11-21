@@ -38,6 +38,13 @@ name = "s2-trng"
 path = "src/bin/trng.rs"
 required-features = ["wstk"]
 
+[[bin]]
+name = "s2-aes"
+path = "src/bin/aes.rs"
+# xG22 CRYPTOACC only; the xG21 (ZBT-1) Secure Engine gate lives on branch
+# `aes-hw-efr32mg21` until it is proven on hardware.
+required-features = ["wstk"]
+
 [features]
 default = ["wstk"]
 # BRD4001A + BRD4183A (EFR32MG22): VCOM log, LED0, image at 0x0.

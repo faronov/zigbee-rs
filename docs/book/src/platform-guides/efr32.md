@@ -512,6 +512,62 @@ the ZBT-1 Router `0x794A` and the end devices `0xEE0F`, `0x9254` and
 Not run on hardware: the MG22 always-on ED, every BRD4181A image (no board
 in the lab), and the MG21 router on BRD4181A.
 
+### Hardware crypto (Series 2)
+
+Zigbee AES (NWK/APS CCM*, AES-MMO key derivation, install codes,
+Trust Center Verify-Key, Green Power GPDF security) runs only on the
+chip's AES engine on xG22. No MG22 image (sensor, End Device,
+loader-linked builds, both GPDs) links the RustCrypto software core; CI
+fails an MG22 image that contains `aes::soft`/`SoftwareAes128` or lacks
+the CRYPTOACC symbols.
+
+| Chip | Engine | Reference |
+| --- | --- | --- |
+| xG22 (BRD4183A) | CRYPTOACC Silex BA411E behind the CRYPTOMASTER scatter/gather DMA: config, key and block fetch descriptors, one push descriptor | GSDK 4.5 `sx_blk_cipher_ecb`, `cryptodma_internal.c`, `ba411e_config.h`, `cryptoacc_management.c` |
+| xG21 (BRD4181A, ZBT-1) | Still software AES (`zigbee-crypto`), as before. The HSE Secure Engine backend (`AES_ENCRYPT \| MODE_ECB` through the `SEMAILBOX_HOST` mailbox) is pending on branch `aes-hw-efr32mg21` until it is proven on MG21/ZBT-1 silicon. | — |
+
+Code: `efr32s2-hal/src/crypto/{mod,cryptoacc}.rs` (mechanism, bounded
+polls, host model), `zigbee-mac/src/efr32s2/aes.rs` (provider). The
+composition root passes the board's `crypto` token to
+`Efr32s2RadioPhy::install_aes_engine`, which runs a two-vector known-answer
+test on the silicon; on failure the image logs the error and halts before
+Zigbee starts (`AES_KAT_PASS` on success). Without an installed engine every
+cipher request fails, so frames are dropped rather than sent or accepted
+unprotected. After any engine fault the next request re-runs the KAT before
+it may publish output.
+
+Ownership and conflicts (xG22):
+
+- The TRNG (`efr32s2_hal::trng`, BA431 block, used by the Green Power
+  Device for key provisioning) and the AES core share the CRYPTOACC
+  bus/AES/PK clock gates. `clock::cryptoacc_acquire/release` keep a holder
+  set (TRNG, AES), so neither gates the clocks under the other. The AES
+  engine opens them per request, like GSDK. The xG22 VSE mailbox is not
+  used.
+- The 116 B DMA area is a static owned through the singleton token, so a
+  late engine write after a timeout cannot hit reused memory; key and data
+  copies are wiped after every request.
+
+Lab gate: `tools/efr32s2-lab` `s2-aes` (BRD4183A, default `wstk` feature)
+runs the self test, the SP 800-38A ECB vectors and a 1,000-block re-keyed
+chain checked against a host value, and reports cycles per block.
+
+Validation level:
+
+- **xG22 CRYPTOACC: production path proven on hardware** (BRD4183A,
+  2026-11-21). The `efr32mg22-sensor` SED logged `AES_KAT_PASS CRYPTOACC`,
+  joined ZHA from factory-new (Transport-Key, unique TCLK, Verify-Key ->
+  Confirm-Key SUCCESS, Device_annce), finished its reporting configuration
+  and reported; after a reset it resumed as the same node (`0xDFE8`) and
+  kept reporting. The GPD sensor's security level 3 GPDFs were accepted by
+  the ZHA sink. `s2-aes`: KAT, SP 800-38A 4/4 and the 1,000-block chain
+  pass; about 900 CPU cycles (23 µs at 38.4 MHz) per block including the
+  per-request clock gating. Built and gated only: the always-on ED, the
+  loader-linked images and the GPD switch. EM2 current with the engine was
+  not measured.
+- **xG21 / ZBT-1: software AES** (unchanged). The Secure Engine backend on
+  branch `aes-hw-efr32mg21` is compiled and host-tested only.
+
 ### Build
 
 All EFR32 examples use `nightly-2026-03-23`:
