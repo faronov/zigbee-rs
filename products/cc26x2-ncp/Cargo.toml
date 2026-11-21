@@ -27,4 +27,5 @@ zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, feat
     "ncp-capacity",
     "ncp-capacity-compact",
     "green-power-ncp",
+    "tc-platform-aes",
 ] }

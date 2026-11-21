@@ -22,6 +22,7 @@
 //! | [`uart`] | UART0 (blocking TX, interrupt RX ring) |
 //! | [`aon_rtc`] / `time_driver` | AON RTC and the Embassy time driver |
 //! | [`trng`] | TRNG entropy |
+//! | [`crypto`] | CRYPTO engine: AES-128 ECB single block (key store, DMA) |
 //! | [`flash`] | internal flash through the ROM HAPI |
 //! | [`rf`] | RF core doorbell, IEEE 802.15.4 commands, PA tables |
 
@@ -45,6 +46,7 @@ compile_error!(
 pub mod aon_rtc;
 pub mod ccfg;
 pub mod chip;
+pub mod crypto;
 pub mod flash;
 pub mod gpio;
 mod mmio;
@@ -69,6 +71,8 @@ pub struct Peripherals {
     pub uart0: uart::Uart0Token,
     pub rtc: aon_rtc::RtcToken,
     pub trng: trng::TrngToken,
+    /// CRYPTO engine (AES-128).
+    pub crypto: crypto::CryptoToken,
     pub flash: flash::Flash,
     pub radio: rf::RadioToken,
 }
@@ -86,6 +90,7 @@ impl Peripherals {
             uart0: uart::Uart0Token(()),
             rtc: aon_rtc::RtcToken(()),
             trng: trng::TrngToken(()),
+            crypto: crypto::CryptoToken(()),
             flash: flash::Flash::new(),
             radio: rf::RadioToken(()),
         })

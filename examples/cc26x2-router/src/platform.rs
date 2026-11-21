@@ -16,6 +16,7 @@ pub struct Started {
     pub identity: Identity,
     pub radio: cc26x2_dongle::BoardRadio,
     pub trng: cc26x2_hal::trng::TrngToken,
+    pub crypto: cc26x2_hal::crypto::CryptoToken,
     pub flash: cc26x2_hal::flash::Flash,
 }
 
@@ -62,6 +63,16 @@ impl log::Log for UartLogger {
                     record.args()
                 );
             }
+            if LOG_RAM {
+                let _ = writeln!(
+                    RamWriter,
+                    "[{:>7}.{:03}] {:<5} {}",
+                    ms / 1000,
+                    ms % 1000,
+                    record.level(),
+                    record.args()
+                );
+            }
         });
     }
 
@@ -69,6 +80,37 @@ impl log::Log for UartLogger {
 }
 
 static LOGGER: UartLogger = UartLogger;
+
+/// TEST-ONLY (`CC26X2_LOG_RAM=1` at build time): the log is also kept in a
+/// RAM ring (`CC26X2_LOG_RAM`, `CC26X2_LOG_RAM_HEAD`) that a debug probe
+/// reads, for boards whose UART is not connected to the host.
+const LOG_RAM: bool = match option_env!("CC26X2_LOG_RAM") {
+    Some(v) => matches!(v.as_bytes(), [b'1']),
+    None => false,
+};
+const LOG_RAM_LEN: usize = if LOG_RAM { 8192 } else { 1 };
+#[unsafe(no_mangle)]
+static mut CC26X2_LOG_RAM: [u8; LOG_RAM_LEN] = [0; LOG_RAM_LEN];
+#[unsafe(no_mangle)]
+static mut CC26X2_LOG_RAM_HEAD: u32 = 0;
+
+struct RamWriter;
+
+impl Write for RamWriter {
+    // `LOG_RAM_LEN` is 1 when the TEST-ONLY RAM log is off.
+    #[allow(clippy::modulo_one)]
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            // SAFETY: only written with interrupts masked (logger below).
+            unsafe {
+                let head = CC26X2_LOG_RAM_HEAD as usize;
+                (*core::ptr::addr_of_mut!(CC26X2_LOG_RAM))[head % LOG_RAM_LEN] = b;
+                CC26X2_LOG_RAM_HEAD = CC26X2_LOG_RAM_HEAD.wrapping_add(1);
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Trim, RTC/time driver, XOSC_HF, LF clock and the UART log. Halts (with a
 /// raw UART message when possible) if the silicon is not the compiled chip.
@@ -79,6 +121,7 @@ pub fn start(banner: &str) -> Started {
         radio,
         rtc,
         trng,
+        crypto,
         flash,
     } = BoardResources::take().unwrap_or_else(|| halt());
     let uart = host_uart
@@ -122,6 +165,7 @@ pub fn start(banner: &str) -> Started {
         identity,
         radio,
         trng,
+        crypto,
         flash,
     }
 }

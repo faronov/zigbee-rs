@@ -1632,3 +1632,187 @@ mod ncp_capacity_compact_tests {
 /// the line numbers above unchanged).
 #[cfg(feature = "ncp-capacity")]
 const COMPACT_TABLES: bool = cfg!(feature = "ncp-capacity-compact");
+
+/// Verify-Key with the hash keyed through a platform AES engine (declared
+/// last: keeps the line numbers above unchanged). `platform-aes` only, so
+/// images without it compile the table exactly as before.
+#[cfg(feature = "platform-aes")]
+impl TrustCenterTable {
+    /// [`Self::handle_verify_key`] with the expected hash computed through
+    /// `provider` (e.g. the MAC's hardware AES). An AES failure answers the
+    /// device with a failed confirmation and commits nothing.
+    pub fn handle_verify_key_with<P: zigbee_crypto::ForwardAesProvider>(
+        &mut self,
+        provider: &mut P,
+        indication: ApsmeVerifyKeyIndication,
+    ) -> Result<TrustCenterAction, TrustCenterError> {
+        let index = self
+            .device_index(&indication.source_address)
+            .ok_or(TrustCenterError::DeviceNotFound)?;
+        let (key, commits_replacement) = if let Some(pending) = self.pending_link_key(index) {
+            (pending, true)
+        } else {
+            let device = self.devices[index]
+                .as_ref()
+                .ok_or(TrustCenterError::DeviceNotFound)?;
+            if !device.has_verified_replacement_key() {
+                return Err(TrustCenterError::RequestNotPermitted);
+            }
+            (device.link_key, false)
+        };
+        let success = zigbee_aps::security::derive_verify_key_hash_with(provider, &key)
+            .is_some_and(|expected| constant_time_eq(&expected, &indication.hash));
+        if success && commits_replacement {
+            let device = self.devices[index]
+                .as_mut()
+                .ok_or(TrustCenterError::DeviceNotFound)?;
+            device.link_key = key;
+            device.key_origin = TrustCenterKeyOrigin::GeneratedUnique;
+            device.key_attributes = TrustCenterKeyAttributes::Verified;
+            device.join_timeout_remaining_secs = 0;
+            self.clear_pending_link_key(index);
+        }
+        Ok(TrustCenterAction::ConfirmKey {
+            device_address: indication.source_address,
+            status: if success { 0x00 } else { 0xAD },
+        })
+    }
+
+    /// [`Self::provision_install_code`] with the AES-MMO hash computed
+    /// through `provider`.
+    pub fn provision_install_code_with<P: zigbee_crypto::ForwardAesProvider>(
+        &mut self,
+        provider: &mut P,
+        address: IeeeAddress,
+        install_code: &[u8],
+    ) -> Result<AesKey, TrustCenterError> {
+        let key = zigbee_crypto::derive_install_code_key_with(provider, install_code)
+            .map_err(TrustCenterError::InvalidInstallCode)?;
+        self.provision_link_key(address, key, TrustCenterKeyOrigin::InstallCode)?;
+        Ok(key)
+    }
+}
+
+#[cfg(all(test, feature = "platform-aes"))]
+mod verify_key_with_tests {
+    use super::*;
+    use zigbee_crypto::{Aes128Forward, ForwardAesProvider, SoftwareAesProvider};
+
+    const DEVICE: IeeeAddress = [0x42; 8];
+
+    fn table_with_pending_key(pending: AesKey) -> TrustCenterTable {
+        let mut table = TrustCenterTable::new();
+        table
+            .restore_device(TrustCenterDevice {
+                ieee_address: DEVICE,
+                parent_address: [0x11; 8],
+                short_address: ShortAddress(0x1234),
+                link_key: [0x33; 16],
+                key_origin: TrustCenterKeyOrigin::GeneratedUnique,
+                key_attributes: TrustCenterKeyAttributes::Verified,
+                join_timeout_remaining_secs: 0,
+                active: true,
+            })
+            .unwrap();
+        table
+            .install_generated_trust_center_link_key(DEVICE, pending, 5)
+            .unwrap();
+        table
+    }
+
+    /// A provider whose engine always fails (a hardware AES fault).
+    struct FailingAes;
+    struct Fails;
+
+    impl Aes128Forward for Fails {
+        type Error = ();
+        fn encrypt_block(&mut self, _block: &mut [u8; 16]) -> Result<(), ()> {
+            Err(())
+        }
+    }
+
+    impl ForwardAesProvider for FailingAes {
+        fn forward_cipher(&mut self, _key: &AesKey) -> impl Aes128Forward + '_ {
+            Fails
+        }
+    }
+
+    fn indication(hash: AesKey) -> ApsmeVerifyKeyIndication {
+        ApsmeVerifyKeyIndication {
+            source_address: DEVICE,
+            key_type: 0x04,
+            hash,
+        }
+    }
+
+    #[test]
+    fn the_provider_path_matches_the_software_path() {
+        let pending = [0xA5; 16];
+        let hash = derive_verify_key_hash(&pending);
+        let mut a = table_with_pending_key(pending);
+        let mut b = table_with_pending_key(pending);
+        let software = a.handle_verify_key(indication(hash)).unwrap();
+        let provider = b
+            .handle_verify_key_with(&mut SoftwareAesProvider::new(), indication(hash))
+            .unwrap();
+        assert_eq!(software, provider);
+        assert_eq!(
+            provider,
+            TrustCenterAction::ConfirmKey {
+                device_address: DEVICE,
+                status: 0x00
+            }
+        );
+        assert_eq!(b.device(&DEVICE).unwrap().link_key, pending);
+        assert!(!b.has_pending_link_key_for(&DEVICE));
+    }
+
+    #[test]
+    fn an_aes_failure_rejects_and_commits_nothing() {
+        let pending = [0xA5; 16];
+        let mut table = table_with_pending_key(pending);
+        let action = table
+            .handle_verify_key_with(
+                &mut FailingAes,
+                indication(derive_verify_key_hash(&pending)),
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            TrustCenterAction::ConfirmKey {
+                device_address: DEVICE,
+                status: 0xAD
+            }
+        );
+        assert_eq!(table.device(&DEVICE).unwrap().link_key, [0x33; 16]);
+        assert!(table.has_pending_link_key_for(&DEVICE));
+    }
+
+    #[test]
+    fn install_code_through_a_provider_matches_the_software_path() {
+        // Silicon Labs example code with its CRC (zigbee-crypto vector).
+        let code = [
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88, 0xD4, 0x90,
+        ];
+        let mut a = TrustCenterTable::new();
+        let mut b = TrustCenterTable::new();
+        let software = a.provision_install_code(DEVICE, &code);
+        let provider =
+            b.provision_install_code_with(&mut SoftwareAesProvider::new(), DEVICE, &code);
+        assert_eq!(software, provider);
+        assert_eq!(
+            provider,
+            Ok([
+                0xFA, 0x80, 0x81, 0xCA, 0xAA, 0x41, 0xD5, 0xAD, 0xE9, 0xB5, 0x65, 0x87, 0x99, 0x26,
+                0x8B, 0x88,
+            ])
+        );
+        assert_eq!(
+            b.provision_install_code_with(&mut FailingAes, DEVICE, &code),
+            Err(TrustCenterError::InvalidInstallCode(
+                zigbee_crypto::InstallCodeError::CipherFailure
+            ))
+        );
+    }
+}

@@ -2815,6 +2815,18 @@ jobs:
             python3 examples/cc26x2-router/tools/verify-layout.py --chip cc2652p7 "$DIR/p7/thumbv7em-none-eabihf/release/$bin"
           done
           NM="$NM" ./tools/check-role-symbols.sh parent "$DIR/thumbv7em-none-eabihf/release/cc26x2-router" "$DIR/p7/thumbv7em-none-eabihf/release/cc26x2-router"
+          # NWK/APS AES runs on the CRYPTO engine; no software AES may link.
+          for ELF in "$DIR/thumbv7em-none-eabihf/release/cc26x2-router" "$DIR/p7/thumbv7em-none-eabihf/release/cc26x2-router"; do
+            SYMS="$("$NM" --demangle "$ELF")"
+            if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
+              echo "$ELF still links software AES" >&2
+              exit 1
+            fi
+            if ! grep -q 'Cc26x2HardwareAes128' <<<"$SYMS"; then
+              echo "$ELF is missing the CRYPTO engine AES backend" >&2
+              exit 1
+            fi
+          done
           for variant in "zbdongle-p:$DIR/thumbv7em-none-eabihf/release" "cc2652p7:$DIR/p7/thumbv7em-none-eabihf/release"; do
             name=${variant%%:*}; path=${variant#*:}
             "$OBJCOPY" -O ihex "$path/cc26x2-router" "$DIR/cc26x2-router-$name.hex"
@@ -2854,6 +2866,16 @@ jobs:
           ELF=examples/cc26x2-ncp/target/thumbv7em-none-eabihf/release/cc26x2-ncp
           OBJCOPY=$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)
           python3 examples/cc26x2-router/tools/verify-layout.py --chip cc2652p7 --layout ncp "$ELF"
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          SYMS="$("$NM" --demangle "$ELF")"
+          if grep -Eq 'aes::soft|SoftwareAes' <<<"$SYMS"; then
+            echo "CC2652P7 NCP still links software AES" >&2
+            exit 1
+          fi
+          if ! grep -q 'Cc26x2HardwareAes128' <<<"$SYMS"; then
+            echo "CC2652P7 NCP is missing the CRYPTO engine AES backend" >&2
+            exit 1
+          fi
           "$OBJCOPY" -O ihex "$ELF" examples/cc26x2-ncp/target/cc26x2-ncp-cc2652p7.hex
           ./tools/firmware-size-report.sh cc26x2-ncp-cc2652p7 "$ELF" examples/cc26x2-ncp/target/cc26x2-ncp-cc2652p7.size.json
       - name: Upload CC2652P7 NCP firmware

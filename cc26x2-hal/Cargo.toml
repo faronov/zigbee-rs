@@ -42,3 +42,9 @@ embedded-hal = "1.0"
 embedded-storage = "0.3"
 embassy-time-driver = { version = "0.2", optional = true }
 embassy-time-queue-utils = { version = "0.1", optional = true }
+
+[dev-dependencies]
+# Reference AES for the CRYPTO engine model (crypto.rs tests).
+aes = "0.8"
+# Zigbee CCM* through the engine model (crypto.rs tests).
+zigbee-crypto = { path = "../zigbee-crypto" }

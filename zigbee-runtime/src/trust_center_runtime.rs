@@ -495,7 +495,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
     pub fn table(&self) -> &TrustCenterTable {
         &self.table
     }
-
+    #[cfg(not(feature = "tc-platform-aes"))]
     /// Provision and durably install an install-code-derived key before join.
     pub fn provision_install_code<M: MacDriver>(
         &mut self,
@@ -1304,7 +1304,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         }
         Ok(())
     }
-
+    #[cfg(not(feature = "tc-platform-aes"))]
     async fn handle_verify_key<M: MacDriver>(
         &mut self,
         device: &mut ZigbeeDevice<M>,
@@ -2677,6 +2677,50 @@ fn install_key<M: MacDriver>(
         .security_mut()
         .add_key(entry)
         .map_err(|_| TrustCenterRuntimeError::KeyTableFull)
+}
+
+/// `tc-platform-aes`: the Trust Center's Verify-Key and install-code hashes
+/// through the MAC's AES provider (a hardware engine, images without
+/// software AES). Same behaviour as the software versions above, which these
+/// replace (declared after the code above: keeps its line numbers unchanged).
+#[cfg(feature = "tc-platform-aes")]
+impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
+    /// Provision and durably install an install-code-derived key before join.
+    pub fn provision_install_code<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        address: IeeeAddress,
+        install_code: &[u8],
+    ) -> Result<[u8; 16], TrustCenterRuntimeError> {
+        self.require_initialized_network(device)?;
+        let key =
+            self.table
+                .provision_install_code_with(device.mac_mut(), address, install_code)?;
+        self.upsert_table_device(device, &address, false)?;
+        Ok(key)
+    }
+
+    async fn handle_verify_key<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        indication: ApsmeVerifyKeyIndication,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        let action = match self
+            .table
+            .handle_verify_key_with(device.mac_mut(), indication)
+        {
+            Ok(action) => action,
+            Err(error) => {
+                log::warn!(
+                    "[TC] Rejected Verify-Key from {:02X?}: {:?}",
+                    indication.source_address,
+                    error
+                );
+                return Ok(());
+            }
+        };
+        self.execute_action(device, action).await
+    }
 }
 
 #[cfg(test)]

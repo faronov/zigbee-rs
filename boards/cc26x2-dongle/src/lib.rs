@@ -102,6 +102,8 @@ pub struct BoardResources {
     pub radio: BoardRadio,
     pub rtc: cc26x2_hal::aon_rtc::RtcToken,
     pub trng: cc26x2_hal::trng::TrngToken,
+    /// CRYPTO engine (AES-128).
+    pub crypto: cc26x2_hal::crypto::CryptoToken,
     /// Raw internal flash; the product bounds it to its partitions.
     pub flash: cc26x2_hal::flash::Flash,
 }
@@ -147,6 +149,7 @@ impl BoardResources {
             uart0,
             rtc,
             trng,
+            crypto,
             flash,
             radio,
         } = cc26x2_hal::Peripherals::take()?;
@@ -175,6 +178,7 @@ impl BoardResources {
             },
             rtc,
             trng,
+            crypto,
             flash,
         })
     }
