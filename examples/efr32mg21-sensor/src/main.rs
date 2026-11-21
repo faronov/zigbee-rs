@@ -65,6 +65,7 @@ async fn main(_spawner: Spawner) {
         radio,
         rtcc,
         flash,
+        crypto,
     } = BoardResources::take().unwrap_or_else(|| platform::halt());
 
     let clocks = efr32mg21_devkit::init_clocks(clocks);
@@ -99,19 +100,24 @@ async fn main(_spawner: Spawner) {
     // Composition runs in its own (non-inlined) frame so the large
     // temporaries of building the MAC, device and app are released before
     // the run loop (same structure as the 32 KiB MG22 image).
-    compose(radio, flash, button, led).run().await
+    compose(radio, crypto, flash, button, led).run().await
 }
 
 #[inline(never)]
 fn compose(
     radio: efr32s2_hal::radio::RadioToken,
+    crypto: efr32s2_hal::crypto::Crypto,
     flash: efr32s2_hal::flash::Efr32s2Flash,
     button: efr32mg21_devkit::Button0,
     led: efr32mg21_devkit::Led0,
 ) -> &'static mut SharedSensorApp {
     let mac = Efr32s2RadioPhy::new(radio)
         .map_err(|error| log::error!("[MG21] radio init failed: {error:?}"))
-        .and_then(|phy| {
+        .and_then(|mut phy| {
+            // Secure Engine AES with its on-silicon KAT; no software AES.
+            phy.install_aes_engine(crypto)
+                .map_err(|error| log::error!("[MG21] AES engine failed: {error:?}"))?;
+            log::info!("[MG21] AES_KAT_PASS SE mailbox");
             phy.into_soft_mac()
                 .map_err(|error| log::error!("[MG21] MAC init failed: {error:?}"))
         })

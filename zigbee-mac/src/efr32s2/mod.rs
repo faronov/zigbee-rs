@@ -25,6 +25,10 @@
 //!   window. With `isr-ack` the interrupt also drops ACKs, frames for
 //!   other nodes and frames it could not acknowledge in time, which keeps
 //!   the (2 KiB) RX buffer drained between receive windows.
+//! - **AES** — hardware only (`aes`): the Secure Engine mailbox on xG21,
+//!   CRYPTOACC on xG22. The composition root installs the engine with
+//!   `install_aes_engine` (on-silicon KAT); without it every CCM*/MMO
+//!   request fails. No software AES is linked.
 //!
 //! Validation: on EFR32MG22 (WSTK + BRD4183A) the sleepy sensor joins ZHA,
 //! is interviewed and reports through this PHY. On EFR32MG21 (Home Assistant
@@ -34,6 +38,10 @@
 //! The board/product selects the default `phyTransmitPower` with the const
 //! parameter of [`Efr32s2RadioPhy`] (e.g. a 20 dBm-capable xG21 module that
 //! is certified for less).
+
+mod aes;
+
+pub use aes::{Efr32s2Aes128, Efr32s2AesError};
 
 use efr32s2_hal::radio::{self, AckFilter, FpAddress, FpError, Radio, RadioError, RadioToken};
 use embassy_futures::yield_now;
@@ -62,6 +70,10 @@ pub struct Efr32s2RadioPhy<const DEFAULT_TX_DBM: i8 = 0> {
     asleep: bool,
     /// Most recent HAL error other than `NoAck`/`ChannelBusy` (diagnostics).
     last_error: Option<RadioError>,
+    /// Hardware AES engine ([`Efr32s2RadioPhy::install_aes_engine`]); the
+    /// only AES this PHY provides.
+    #[cfg(all(target_arch = "arm", target_os = "none"))]
+    aes: Option<efr32s2_hal::crypto::AesEngine>,
 }
 
 /// The EFR32 Series 2 MAC: the shared software MAC over [`Efr32s2RadioPhy`].
@@ -95,6 +107,8 @@ impl<const D: i8> Efr32s2RadioPhy<D> {
             rx_on_when_idle: false,
             asleep: false,
             last_error: None,
+            #[cfg(all(target_arch = "arm", target_os = "none"))]
+            aes: None,
         })
     }
 
@@ -361,9 +375,6 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
         Ok(())
     }
 }
-
-/// Software AES: no EFR32 Series 2 crypto engine backend yet.
-impl<const D: i8> zigbee_crypto::ForwardAesProvider for Efr32s2RadioPhy<D> {}
 
 impl<const D: i8> PlatformServices for Efr32s2RadioPhy<D> {
     fn monotonic_micros(&self) -> u32 {

@@ -36,6 +36,7 @@ compile_error!("efr32s2-hal: `usart0-host` firmware needs the `rt` feature");
 
 pub mod chip;
 pub mod clock;
+pub mod crypto;
 pub mod delay;
 pub mod devinfo;
 pub mod flash;

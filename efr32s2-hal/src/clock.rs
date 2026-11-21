@@ -311,10 +311,54 @@ pub(crate) fn select_iadc_clock_fsrco() {
     }
 }
 
-/// Open the CRYPTOACC bus clock and its PK/AES engine clocks (xG22), as
-/// GSDK `cryptoacc_management_acquire` does before touching the TRNG.
+/// Users of the xG22 CRYPTOACC clock gates (bus clock `CMU_CLKEN1.CRYPTOACC`
+/// and `CMU_CRYPTOACCCLKCTRL.PKEN | AESEN`).
 #[cfg(feature = "efr32mg22")]
-pub fn enable_cryptoacc() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum CryptoaccUser {
+    /// The BA431 TRNG (`crate::trng::Trng`), for its whole lifetime.
+    Trng = 1 << 0,
+    /// The BA411E AES engine (`crate::crypto::cryptoacc`), per request.
+    Aes = 1 << 1,
+}
+
+/// Bit set of [`CryptoaccUser`]s holding the CRYPTOACC clocks.
+#[cfg(feature = "efr32mg22")]
+static CRYPTOACC_USERS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// `true` if the clocks may be gated once `user` leaves a holder set of
+/// `before`.
+#[cfg(feature = "efr32mg22")]
+const fn cryptoacc_last_user(before: u8, user: CryptoaccUser) -> bool {
+    before & !(user as u8) == 0
+}
+
+/// Take `user`'s reference on the CRYPTOACC clocks and open them, as GSDK
+/// `cryptoacc_management_acquire` does.
+///
+/// The TRNG and the AES engine share these gates; the reference set makes
+/// sure neither user gates the clocks while the other one runs. Both users
+/// are thread-mode only (no CRYPTOACC access from interrupt handlers).
+#[cfg(feature = "efr32mg22")]
+pub(crate) fn cryptoacc_acquire(user: CryptoaccUser) {
+    CRYPTOACC_USERS.fetch_or(user as u8, core::sync::atomic::Ordering::AcqRel);
+    enable_cryptoacc();
+}
+
+/// Drop `user`'s reference; gate the clocks (`cryptoacc_management_release`)
+/// only if no other user holds them.
+#[cfg(feature = "efr32mg22")]
+pub(crate) fn cryptoacc_release(user: CryptoaccUser) {
+    let before = CRYPTOACC_USERS.fetch_and(!(user as u8), core::sync::atomic::Ordering::AcqRel);
+    if cryptoacc_last_user(before, user) {
+        disable_cryptoacc();
+    }
+}
+
+/// Open the CRYPTOACC bus clock and its PK/AES engine clocks (xG22).
+#[cfg(feature = "efr32mg22")]
+fn enable_cryptoacc() {
     #[cfg(all(target_arch = "arm", target_os = "none"))]
     unsafe {
         write(CMU_LOCK, CMU_LOCK_UNLOCK);
@@ -326,9 +370,9 @@ pub fn enable_cryptoacc() {
     }
 }
 
-/// Gate the CRYPTOACC clocks again (`cryptoacc_management_release`).
+/// Gate the CRYPTOACC clocks again.
 #[cfg(feature = "efr32mg22")]
-pub fn disable_cryptoacc() {
+fn disable_cryptoacc() {
     #[cfg(all(target_arch = "arm", target_os = "none"))]
     unsafe {
         write(CMU_LOCK, CMU_LOCK_UNLOCK);
@@ -505,5 +549,20 @@ mod tests {
             }),
             Err(ClockError::CtuneOutOfRange)
         );
+    }
+
+    #[cfg(feature = "efr32mg22")]
+    #[test]
+    fn cryptoacc_clocks_stop_only_after_the_last_user() {
+        use CryptoaccUser::{Aes, Trng};
+        let both = Aes as u8 | Trng as u8;
+        // AES request finishing while the TRNG runs: keep the clocks.
+        assert!(!cryptoacc_last_user(both, Aes));
+        // TRNG release during an AES request: keep the clocks.
+        assert!(!cryptoacc_last_user(both, Trng));
+        assert!(cryptoacc_last_user(Aes as u8, Aes));
+        assert!(cryptoacc_last_user(Trng as u8, Trng));
+        // A release without a matching acquire still gates (fail-safe).
+        assert!(cryptoacc_last_user(0, Aes));
     }
 }

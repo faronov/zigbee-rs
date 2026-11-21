@@ -1,7 +1,8 @@
 //! Shared composition root and event loop of the BRD4183A Green Power
 //! Devices.
 //!
-//! - Boot: clocks, VCOM log, RTCC time driver, radio; the GPD identity is
+//! - Boot: clocks, VCOM log, RTCC time driver, radio and its CRYPTOACC AES
+//!   engine (on-silicon KAT, halt on failure); the GPD identity is
 //!   loaded from the product journal or provisioned with a key from the
 //!   CRYPTOACC TRNG (released again right after).
 //! - Not commissioned: one commissioning attempt at boot (a network must
@@ -74,6 +75,7 @@ pub async fn run(profile: GpdProfile) -> ! {
         rtcc,
         flash,
         supply,
+        crypto,
     } = BoardResources::take().unwrap_or_else(|| halt());
 
     let clocks = efr32mg22_devkit::init_clocks(clocks);
@@ -111,10 +113,17 @@ pub async fn run(profile: GpdProfile) -> ! {
         log::warn!("[GPD] die temperature, SYNTHETIC humidity, battery = AVDD (VMCU)");
     }
 
-    let phy: Efr32s2RadioPhy = Efr32s2RadioPhy::new(radio).unwrap_or_else(|error| {
+    let mut phy: Efr32s2RadioPhy = Efr32s2RadioPhy::new(radio).unwrap_or_else(|error| {
         log::error!("[GPD] radio init failed: {error:?}");
         halt()
     });
+    // GPDF security (AES-CCM*) runs on the CRYPTOACC engine after its
+    // on-silicon KAT; no software AES exists.
+    if let Err(error) = phy.install_aes_engine(crypto) {
+        log::error!("[GPD] AES engine failed: {error:?}");
+        halt()
+    }
+    log::info!("[GPD] AES_KAT_PASS CRYPTOACC");
     let eui64 = phy.extended_address();
     if eui64 == [0; 8] || eui64 == [0xFF; 8] {
         log::error!("[GPD] no valid EUI-64");

@@ -277,6 +277,9 @@ impl<B: Ba431Bus> Ba431<B> {
 }
 
 #[cfg(all(target_arch = "arm", target_os = "none"))]
+use crate::clock::{CryptoaccUser, cryptoacc_acquire, cryptoacc_release};
+
+#[cfg(all(target_arch = "arm", target_os = "none"))]
 mod hw {
     /// `CRYPTOACC_S_RNGCTRL_BASE` (efr32mg22c224f512im40.h).
     const RNGCTRL_BASE: u32 = 0x4C02_1000;
@@ -301,10 +304,12 @@ mod hw {
 /// The CRYPTOACC TRNG.
 ///
 /// Owns the CRYPTOACC random-number block; create at most one. Construction
-/// opens the CRYPTOACC clocks and runs the full GSDK init sequence including
-/// the conditioning known-answer test. [`release`](Self::release) stops the
-/// noise source and gates the clocks again, so a sleepy device pays nothing
-/// once its key material exists.
+/// takes the TRNG's reference on the CRYPTOACC clocks and runs the full GSDK
+/// init sequence including the conditioning known-answer test.
+/// [`release`](Self::release) stops the noise source and drops the
+/// reference, so a sleepy device pays nothing once its key material exists.
+/// The clocks are shared with the AES engine (`crate::crypto`) and only
+/// gated when neither holds them.
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 pub struct Trng {
     inner: Ba431<hw::Mmio>,
@@ -314,11 +319,11 @@ pub struct Trng {
 impl Trng {
     /// Open the CRYPTOACC clocks and initialize the generator.
     pub fn new() -> Result<Self, TrngError> {
-        crate::clock::enable_cryptoacc();
+        cryptoacc_acquire(CryptoaccUser::Trng);
         let mut inner = Ba431::new(hw::Mmio);
         if let Err(e) = inner.init() {
             inner.stop();
-            crate::clock::disable_cryptoacc();
+            cryptoacc_release(CryptoaccUser::Trng);
             return Err(e);
         }
         Ok(Self { inner })
@@ -333,7 +338,7 @@ impl Trng {
     /// Stop the generator and gate the CRYPTOACC clocks.
     pub fn release(mut self) {
         self.inner.stop();
-        crate::clock::disable_cryptoacc();
+        cryptoacc_release(CryptoaccUser::Trng);
     }
 }
 
