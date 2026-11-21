@@ -2245,6 +2245,10 @@ jobs:
             exit 1
           fi
           grep -q 'Ed25519 is not supported on CC2340R5' "$RUNNER_TEMP/cc2340-ed25519.log"
+      - name: Host-test CC2340 LAES AES backend
+        # The HAL register-model KATs run in the standalone-host matrix; this
+        # covers the MAC provider's fail-closed (not installed) path.
+        run: cargo test --locked -p zigbee-mac --features cc2340 --lib cc2340
       - name: Build CC2340 explicit fallback mode
         working-directory: examples/cc2340-sensor
         run: |
@@ -2256,6 +2260,11 @@ jobs:
           fi
           if grep -aFq 'TI SimpleLink Low Power F3 SDK cc23x0r5/rf_patches' "$ELF"; then
             echo "CC2340 fallback image unexpectedly contains the SDK radio marker" >&2
+            exit 1
+          fi
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$("$NM" --demangle "$ELF")"; then
+            echo "CC2340 fallback image still links software AES" >&2
             exit 1
           fi
       - name: Check out pinned TI radio sources
@@ -2311,10 +2320,19 @@ jobs:
             exit 1
           fi
           SYMS="$("$NM" --demangle "$ELF")"
-          if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
-            echo "CC2340 image is missing its currently supported software AES backend" >&2
-            exit 1
-          fi
+          # Zigbee AES runs only on the LAES core in every CC2340 image.
+          for IMAGE in "$ELF" "$(dirname "$ELF")/cc2340-ed"; do
+            IMAGE_SYMS="$("$NM" --demangle "$IMAGE")"
+            if grep -Eq 'aes::soft|SoftwareAes128' <<<"$IMAGE_SYMS"; then
+              echo "$(basename "$IMAGE") still links software AES" >&2
+              exit 1
+            fi
+            if ! grep -q 'Cc2340HardwareAes128' <<<"$IMAGE_SYMS" ||
+               ! grep -q 'cc2340r5_hal::aes::self_test_clocked' <<<"$IMAGE_SYMS"; then
+              echo "$(basename "$IMAGE") is missing the CC2340 LAES AES backend" >&2
+              exit 1
+            fi
+          done
           PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
           if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
             echo "CC2340 sensor links parent/router maintenance symbols:" >&2

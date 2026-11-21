@@ -16,6 +16,9 @@ bl702-hal = { path = "../bl702-hal", optional = true }
 efr32mg1-hal = { path = "../efr32mg1-hal", optional = true }
 efr32s2-hal = { path = "../efr32s2-hal", optional = true }
 cc26x2-hal = { path = "../cc26x2-hal", optional = true }
+# Only the `LAES` AES engine is used (the CC2340 radio driver is in
+# `src/cc2340`); the application runtime stays with the board.
+cc2340r5-hal = { path = "../cc2340r5-hal", optional = true, default-features = false }
 
 # ── ESP32-C6 / H2 / C5 backend ───────────────────────────────
 # Version ranges, not pins: C6/H2 images resolve (and lock) esp-hal 1.0.0 /
@@ -156,8 +159,14 @@ bl702 = [
 ]
 
 cc2340 = [
+    "hardware-aes-cc2340",
     "dep:embassy-sync", "dep:embassy-time", "dep:embassy-futures", "dep:rtt-target",
 ]
+# CC2340R5 `LAES` hardware AES-128 is mandatory for the CC2340 backend:
+# `Cc2340RadioPhy` overrides `ForwardAesProvider::forward_cipher` with the
+# HAL engine installed by the composition root, so no software AES is
+# linked. Marker pulled in by `cc2340`; not an independent switch.
+hardware-aes-cc2340 = ["dep:cc2340r5-hal"]
 
 tlsr8258 = [
     "dep:tlsr8258-hal",

@@ -54,6 +54,7 @@ async fn main(_spawner: Spawner) {
         flash,
         batmon,
         reset,
+        aes,
     } = resources;
     let wake = platform::LaunchPadWake::new(button1, button2);
     let mut status = platform::StatusLeds::new(led1, led2);
@@ -86,7 +87,7 @@ async fn main(_spawner: Spawner) {
     log::info!("[CC2340] guarded factory EUI-64: {:02X?}", ieee);
 
     let mut profile = product::profile::sensor_profile();
-    let device = build_device(ieee, &mut profile, &mut status);
+    let device = build_device(ieee, aes, &mut profile, &mut status);
 
     let mut security_store = product::storage::security_store(flash);
     log::info!(
@@ -141,6 +142,7 @@ async fn main(_spawner: Spawner) {
 #[inline(never)]
 fn build_device(
     ieee: zigbee_types::IeeeAddress,
+    aes: board::aes::Aes,
     profile: &mut product::profile::SensorProfile,
     status: &mut platform::StatusLeds,
 ) -> &'static mut ZigbeeDevice<Cc2340SoftMac> {
@@ -151,6 +153,12 @@ fn build_device(
             fatal(status);
         }
     };
+    // Zigbee security runs only on the LAES core; no software fall-back.
+    if let Err(error) = phy.install_aes_engine(aes) {
+        log::error!("[CC2340] LAES AES-128 self-test failed: {error:?}");
+        fatal(status);
+    }
+    log::info!("[CC2340] LAES AES-128 self-test passed");
     log::warn!(
         "[CC2340] entropy={:?} (fail closed); radio-sleep={:?}",
         phy.entropy_disposition(),
