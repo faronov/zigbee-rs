@@ -6,6 +6,9 @@ use aes::Aes128;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockEncrypt, KeyInit};
 
+#[cfg(any(test, feature = "kat"))]
+pub mod kat;
+
 /// A 128-bit AES key.
 pub type AesKey = [u8; 16];
 

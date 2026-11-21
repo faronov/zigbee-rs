@@ -14,6 +14,10 @@ bl702-hal = { path = "../bl702-hal", optional = true }
 efr32mg1-hal = { path = "../efr32mg1-hal", optional = true }
 
 [features]
+# Known-answer vectors (FIPS-197, IEEE 802.15.4 Annex C, Zigbee CCM*/MMO)
+# for host tests of platform AES engine models. No code is added to images
+# that do not enable it.
+kat = []
 tlsr8258 = ["dep:tlsr8258-hal"]
 bl702 = ["dep:bl702-hal"]
 efr32mg1 = ["dep:efr32mg1-hal"]
