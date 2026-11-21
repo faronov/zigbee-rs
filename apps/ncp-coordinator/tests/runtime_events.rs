@@ -47,7 +47,7 @@ use zigbee_zrhp::codec::{Bytes8, List};
 use zigbee_zrhp::frame::TX_BUFFER_LEN;
 use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent};
 use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataConfirm};
-use zigbee_zrhp::msg::network::{NwkAddEndpoint, NwkLeaveReset};
+use zigbee_zrhp::msg::network::{EvtPermitJoinState, NwkAddEndpoint, NwkLeaveReset, NwkPermitJoin};
 use zigbee_zrhp::msg::system::{SysNegotiateReq, SysNegotiateRsp};
 use zigbee_zrhp::msg::{Batch, Kind, MsgHeader, RawMessage, ids};
 use zigbee_zrhp::queue::EndpointQueues;
@@ -989,4 +989,76 @@ fn the_host_receives_the_deferred_confirm_after_the_aps_ack() {
     let confirm = session.host.event(ids::EVT_APS_DATA_CONFIRM).unwrap();
     let confirm: EvtApsDataConfirm = confirm.raw().decode().unwrap();
     assert_eq!((confirm.req_tid, confirm.flags), (plain, 0));
+}
+
+/// `EVT_PERMIT_JOIN_STATE` (7.2): opening, re-arming (here by the stack,
+/// as a `Mgmt_Permit_Joining_req` from the network does), expiry and every
+/// `NWK_PERMIT_JOIN` are reported; the per-second countdown is not.
+#[test]
+fn permit_join_state_follows_open_rearm_and_expiry() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    formed_port!(port);
+    let mut session = Session::negotiated(&mut port);
+    let states = |session: &mut Session| -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(event) = session.host.event(ids::EVT_PERMIT_JOIN_STATE) {
+            out.push(
+                event
+                    .raw()
+                    .decode::<EvtPermitJoinState>()
+                    .unwrap()
+                    .remaining_s,
+            );
+        }
+        out
+    };
+    assert_eq!(states(&mut session), [0u8; 0], "closed: nothing to report");
+
+    let open = session.host.request(&NwkPermitJoin {
+        duration_s: 5,
+        target: 0x0000,
+        flags: 0,
+    });
+    session.exchange(&mut port);
+    assert_eq!(session.host.status(open), Status::Success.to_u8());
+    assert_eq!(states(&mut session), [5]);
+
+    // Counting down: silent.
+    for _ in 0..2 {
+        pollster::block_on(mac(&mut port).delay_micros(1_000_000));
+        session.exchange(&mut port);
+    }
+    assert!(port.permit_join_remaining_s() < 5);
+    assert_eq!(states(&mut session), [0u8; 0]);
+
+    // Re-armed outside NWK_PERMIT_JOIN (a Mgmt_Permit_Joining_req).
+    pollster::block_on(port.permit_join(30, 0x0000)).unwrap();
+    session.exchange(&mut port);
+    assert_eq!(states(&mut session), [30]);
+
+    // Expiry.
+    for _ in 0..32 {
+        pollster::block_on(mac(&mut port).delay_micros(1_000_000));
+        session.exchange(&mut port);
+    }
+    assert_eq!(port.permit_join_remaining_s(), 0);
+    assert_eq!(states(&mut session), [0]);
+
+    // A host close while closed still answers with the state.
+    let close = session.host.request(&NwkPermitJoin {
+        duration_s: 0,
+        target: 0x0000,
+        flags: 0,
+    });
+    session.exchange(&mut port);
+    assert_eq!(session.host.status(close), Status::Success.to_u8());
+    assert_eq!(states(&mut session), [0]);
+
+    // A new session learns an open window once.
+    pollster::block_on(port.permit_join(60, 0x0000)).unwrap();
+    let mut again = Session::negotiated(&mut port);
+    again.exchange(&mut port);
+    let reported = states(&mut again);
+    assert_eq!(reported.len(), 1);
+    assert!(reported[0] > 50);
 }
