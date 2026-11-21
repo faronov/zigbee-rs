@@ -504,7 +504,9 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         install_code: &[u8],
     ) -> Result<[u8; 16], TrustCenterRuntimeError> {
         self.require_initialized_network(device)?;
-        let key = self.table.provision_install_code(address, install_code)?;
+        let key = self
+            .table
+            .provision_install_code(device.mac_mut(), address, install_code)?;
         self.upsert_table_device(device, &address, false)?;
         Ok(key)
     }
@@ -1310,7 +1312,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         device: &mut ZigbeeDevice<M>,
         indication: ApsmeVerifyKeyIndication,
     ) -> Result<(), TrustCenterRuntimeError> {
-        let action = match self.table.handle_verify_key(indication) {
+        let action = match self.table.handle_verify_key(device.mac_mut(), indication) {
             Ok(action) => action,
             Err(error) => {
                 log::warn!(

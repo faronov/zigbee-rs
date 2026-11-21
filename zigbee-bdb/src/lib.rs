@@ -418,9 +418,15 @@ impl<M: MacDriver> BdbLayer<M> {
     /// Requires the `install-code` feature (AES-MMO derivation); images that
     /// provision the derived key directly can use
     /// [`Self::set_preconfigured_tc_link_key`] instead.
+    ///
+    /// The AES-MMO hash runs on the MAC's AES provider (the platform hardware
+    /// engine where one is installed), never on a separate software path.
     #[cfg(feature = "install-code")]
     pub fn set_install_code(&mut self, code: &[u8]) -> Result<(), zigbee_crypto::InstallCodeError> {
-        let key = zigbee_crypto::derive_install_code_key(code)?;
+        let key = zigbee_crypto::derive_install_code_key_with(
+            self.zdo.aps_mut().nwk_mut().mac_mut(),
+            code,
+        )?;
         self.set_preconfigured_tc_link_key(key);
         Ok(())
     }
