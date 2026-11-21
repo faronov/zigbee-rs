@@ -584,6 +584,15 @@ are unchanged.
 | TRNG | xG22 CRYPTOACC; xG21 none | Secure Engine mailbox `TRNG_GET_RANDOM` (`se`), wired to `PlatformServices::fill_random` on xG24 only |
 | reset cause | — | `reset::take_reset_cause` (`EMU_RSTCAUSE`, same bits on all three dies) |
 
+The SE writes the TRNG output descriptor and buffer by DMA, possibly after
+the bounded wait gave up. Both live in a `static` area that only the holder
+of the mailbox lock (`se::MailboxLock`) touches; a submitted command that is
+not answered in time, or rejected with `TX_STATUS.TXERROR`, poisons the
+mailbox until reset, so a late completion only writes that unused area and
+its response is never taken for a later command's. A failed request zeroes
+the caller's buffer. Host-model tests in `efr32s2_hal::se` cover the late
+completion; host builds have no SE and fail with `SeError::Unavailable`.
+
 Not changed and not yet checked on xG24 silicon: EM2 entry (`power`), DC-DC
 (left in bypass), the LFXO (the RF-BM module has one; the time base still uses
 the LFRCO), I2C and IADC (not used by these products).
