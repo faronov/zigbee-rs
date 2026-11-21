@@ -3122,6 +3122,8 @@ struct BoundRun {
     updates: Vec<sensor_sed_app::AnomalyRecord>,
     joined: bool,
     commissioned: bool,
+    /// Status indications after `stimulus` ran.
+    status: Vec<SensorStatus>,
 }
 
 impl BoundRun {
@@ -3214,6 +3216,7 @@ where
         assert!(app.device().is_joined());
         stimulus(app.device_mut());
         from = waits.borrow().len();
+        status.borrow_mut().clear();
         for step in 0..steps {
             each_step(step, app.device_mut());
             block_on(app.step()).unwrap();
@@ -3233,6 +3236,7 @@ where
         updates,
         joined: device.is_joined(),
         commissioned,
+        status: status.into_inner(),
     }
 }
 
@@ -4452,4 +4456,115 @@ fn announce_retries_after_cold_join(coordinator_contact: bool) -> usize {
 fn coordinator_contact_stops_the_device_announce_retries() {
     assert_eq!(announce_retries_after_cold_join(false), 3);
     assert_eq!(announce_retries_after_cold_join(true), 0);
+}
+
+fn identify_trigger_effect_frame(effect: u8, frame_counter: u32) -> MacFrame {
+    let frame_control = ZclFrameHeader::build_frame_control(
+        ZclFrameType::ClusterSpecific,
+        false,
+        ClusterDirection::ClientToServer,
+        true,
+    );
+    zcl_data_frame(
+        ClusterId::IDENTIFY,
+        frame_control,
+        frame_counter as u8,
+        0x40,
+        &[effect, 0x00],
+        frame_counter,
+    )
+}
+
+/// Identify is served by the stack: the app records it as Identify (not as
+/// an unhandled command) and the status indicator blinks while it runs.
+#[test]
+fn identify_is_recorded_and_blinks_the_status_indicator() {
+    let run = run_bounded(
+        &BASE_POLICY,
+        test_profile(),
+        NoOta,
+        |device| {
+            device
+                .mac_mut()
+                .enqueue_poll_response(identify_frame(3, 0x50))
+        },
+        // 10 ms fast polls: past the 3 s IdentifyTime.
+        500,
+        |_, _| {},
+    );
+    assert!(run.diagnostics.iter().any(|event| matches!(
+        event,
+        DiagnosticEvent::Identify {
+            command_id: 0x00,
+            argument: 3
+        }
+    )));
+    assert!(!run.diagnostics.iter().any(|event| matches!(
+        event,
+        DiagnosticEvent::UnhandledCommand {
+            cluster_id: 0x0003,
+            ..
+        }
+    )));
+    let blinks: Vec<bool> = run
+        .status
+        .iter()
+        .filter_map(|status| match status {
+            SensorStatus::Identifying { on } => Some(*on),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        blinks.contains(&true) && blinks.contains(&false),
+        "{:?}",
+        run.status
+    );
+    assert!(
+        matches!(run.status.last(), Some(SensorStatus::Joined { .. })),
+        "IdentifyTime ran out: {:?}",
+        run.status
+    );
+}
+
+/// Trigger Effect (ZCL 3.5.2.3.3): a breathe is shown with the Identify
+/// blink although IdentifyTime stays 0, and a Stop effect ends it.
+#[test]
+fn trigger_effect_blinks_until_it_ends_or_is_stopped() {
+    let run = run_bounded(
+        &BASE_POLICY,
+        test_profile(),
+        NoOta,
+        |device| {
+            device
+                .mac_mut()
+                .enqueue_poll_response(identify_trigger_effect_frame(0x01, 0x50))
+        },
+        20,
+        |step, device| {
+            if step == 8 {
+                device
+                    .mac_mut()
+                    .enqueue_poll_response(identify_trigger_effect_frame(0xFF, 0x51));
+            }
+        },
+    );
+    assert!(run.diagnostics.iter().any(|event| matches!(
+        event,
+        DiagnosticEvent::Identify {
+            command_id: 0x40,
+            argument: 0x0001
+        }
+    )));
+    let first = run
+        .status
+        .iter()
+        .position(|status| matches!(status, SensorStatus::Identifying { .. }))
+        .expect("the breathe effect blinks");
+    assert!(
+        run.status[first..]
+            .iter()
+            .any(|status| matches!(status, SensorStatus::Joined { .. })),
+        "Stop ended the effect: {:?}",
+        run.status
+    );
 }

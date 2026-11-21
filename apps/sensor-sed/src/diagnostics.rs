@@ -105,6 +105,12 @@ pub enum DiagnosticEvent {
         cluster_id: u16,
         command_id: u8,
     },
+    /// An Identify cluster command served by the stack: `argument` is
+    /// IdentifyTime (Identify) or effect id and variant (Trigger Effect).
+    Identify {
+        command_id: u8,
+        argument: u16,
+    },
     CommissioningComplete {
         success: bool,
     },

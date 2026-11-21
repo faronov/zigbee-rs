@@ -76,7 +76,8 @@ fn classify(event: &DiagnosticEvent) -> Evidence {
         | DiagnosticEvent::ReportingConfigured { .. }
         | DiagnosticEvent::ReportingRejected { .. }
         | DiagnosticEvent::InterviewConfigurationComplete { .. }
-        | DiagnosticEvent::UnhandledCommand { .. } => Evidence::Proven,
+        | DiagnosticEvent::UnhandledCommand { .. }
+        | DiagnosticEvent::Identify { .. } => Evidence::Proven,
         DiagnosticEvent::JoinedOrResumed { .. } => Evidence::Resumed,
         DiagnosticEvent::ZigbeeInitializationFailed
         | DiagnosticEvent::CommissioningFailed { .. }

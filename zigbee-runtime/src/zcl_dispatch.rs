@@ -2994,6 +2994,22 @@ mod tests {
     }
 
     #[test]
+    fn unknown_command_of_a_hosted_cluster_is_unsup_cluster_command() {
+        // ZCL r8 2.5.12.2: an unsupported cluster-specific command is
+        // answered UNSUP_CLUSTER_COMMAND, even with the DDR bit set.
+        let mut fx = Fixture::new(&[ClusterId::IDENTIFY]);
+        let req = cluster_request(0x77, true, &[]);
+        let outcome = fx.dispatch(&mut [], ClusterId::IDENTIFY.0, &req);
+
+        assert!(outcome.event.is_some());
+        assert_eq!(fx.pending.len(), 1);
+        let resp = ZclFrame::parse(fx.pending[0].zcl_data.as_slice()).unwrap();
+        assert_eq!(resp.header.command_id.0, 0x0B);
+        assert_eq!(resp.payload[0], 0x77);
+        assert_eq!(resp.payload[1], ZclStatus::UnsupClusterCommand as u8);
+    }
+
+    #[test]
     fn identify_query_queues_cluster_specific_response_with_remapped_command() {
         let mut fx = Fixture::new(&[ClusterId::IDENTIFY]);
         // Make the endpoint identifying so the query yields a response payload.
