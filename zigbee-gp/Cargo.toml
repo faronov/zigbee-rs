@@ -43,6 +43,11 @@ translation-table = ["sink"]
 # operational channel, delivered by a TempMaster (gecko_sdk
 # `handleChannelRequest`). Advertises gpsFunctionality "GPD maintenance".
 channel-request = ["sink"]
+# gpsSecurityLevel InvolveTC (bit 3) as gecko_sdk handles it: writable,
+# derivable from how the node joined (`Sink::derive_involve_tc`), and while
+# set GPD commissioning is refused, except on a sink that is itself the
+# network's Trust Center (the TC is involved by construction).
+involve-tc = ["sink"]
 # A 4-entry Translation Table instead of 16 (a sink whose large Sink Table
 # leaves little persistent room, e.g. the 16-entry ZRHP NCP sink).
 compact-translation-table = []

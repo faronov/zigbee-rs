@@ -304,12 +304,15 @@ mod combo {
 
     pub struct Combo {
         next_tick: Instant,
+        /// gpsSecurityLevel InvolveTC was derived for the current join.
+        involve_tc_derived: bool,
     }
 
     impl Combo {
         pub fn new() -> Self {
             Self {
                 next_tick: Instant::now() + DECISECOND,
+                involve_tc_derived: false,
             }
         }
 
@@ -317,6 +320,13 @@ mod combo {
         #[inline(never)]
         pub fn service(&mut self, app: &mut App, trigger: &mut CommissioningTrigger) {
             let device = app.node_mut().device_mut();
+            // InvolveTC follows the join (gecko_sdk): an install-code join
+            // stops GP commissioning on this sink.
+            let joined = device.is_joined();
+            if joined && !self.involve_tc_derived {
+                device.gp_sink_derive_involve_tc();
+            }
+            self.involve_tc_derived = joined;
             if trigger.take_press() {
                 if !device.is_joined() {
                     log::info!("[ESP32-H2] BOOT: not joined, no GP sink commissioning");

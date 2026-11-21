@@ -70,8 +70,9 @@ pub const REPORT_QUEUE_LEN: usize = 6;
 /// Largest local proxy frame copied to the host: ZCL header and the GP
 /// command.
 pub const MAX_LOCAL_FRAME: usize = 3 + MAX_TX_PAYLOAD;
-/// [`SinkDrop`] reasons, numbered 1..=13 as in `EVT_GP_COMMISSIONING_FAILED`.
-pub const SINK_DROP_REASONS: usize = 13;
+/// [`SinkDrop`] reason codes 1..=14 as in `EVT_GP_COMMISSIONING_FAILED`
+/// (counters `0x0801`–`0x080E`; codes a build cannot produce stay zero).
+pub const SINK_DROP_REASONS: usize = 14;
 /// Largest remote GP response payload kept for the host (after the ZCL
 /// header).
 pub const MAX_REMOTE_PAYLOAD: usize = 100;
@@ -220,6 +221,8 @@ pub const fn sink_drop_code(reason: SinkDrop) -> u8 {
         SinkDrop::TableFull => 11,
         SinkDrop::Unsupported => 12,
         SinkDrop::QueueFull => 13,
+        #[cfg(feature = "green-power-involve-tc")]
+        SinkDrop::InvolveTc => 14,
     }
 }
 
@@ -288,7 +291,11 @@ pub fn note_conflict() {
 
 fn count_drop(reason: SinkDrop) {
     let index = usize::from(sink_drop_code(reason)) - 1;
-    with(|s| s.counters.sink_drops[index] = s.counters.sink_drops[index].saturating_add(1));
+    with(|s| {
+        if let Some(c) = s.counters.sink_drops.get_mut(index) {
+            *c = c.saturating_add(1);
+        }
+    });
 }
 
 fn push(event: GpNcpEvent) {
@@ -339,6 +346,9 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             s.remote.clear();
         });
         self.green_power.sink.set_config(ncp_sink_config());
+        // The NCP is the Trust Center: InvolveTC does not stop it.
+        #[cfg(feature = "green-power-involve-tc")]
+        self.green_power.sink.set_trust_center(true);
     }
 
     /// Register a unicast remote GP request the host sent to `dst` with ZCL
@@ -863,8 +873,10 @@ mod tests {
         assert_eq!(sink_result(SinkOutcome::Dropped(SinkDrop::Stale)), None);
         assert_eq!(sink_drop_code(SinkDrop::Invalid), 1);
         assert_eq!(sink_drop_code(SinkDrop::Duplicate), 7);
+        assert_eq!(sink_drop_code(SinkDrop::QueueFull), 13);
+        #[cfg(feature = "green-power-involve-tc")]
         assert_eq!(
-            usize::from(sink_drop_code(SinkDrop::QueueFull)),
+            usize::from(sink_drop_code(SinkDrop::InvolveTc)),
             SINK_DROP_REASONS
         );
     }

@@ -1597,7 +1597,7 @@ Behaviour in `HOST_SINK` mode:
 | `0x0A80` | `EVT_GP_FRAME` | `u8 origin (1 direct GPDF, 2 GP Notification, 3 GP Commissioning Notification), u8 result (0 translated, 1 passed through, 2 commissioned, 3 Commissioning Reply sent, 4 decommissioned, 5 commissioning step accepted, 6 Channel Request answered with a Channel Configuration: SrcID 0, NCP built with `green-power-channel-request`), gpd_id, u8 device_id, u8 command_id, u32 frame_counter, u8 security_level, u8 key_type, u8 flags (bit0 rxAfterTx, bit1 payload decrypted, bit2 key in payload was TC-LK wrapped), u16 proxy_nwk (FFFF = direct), u8 gpp_gpd_link, i8 rssi, u8 lqi, u8 len, payload[]` | event | P (`SinkOutcome`, `SinkEvent::GpdCommand`; the surface is N) |
 | `0x0A81` | `EVT_GP_COMMISSIONING` | `u8 state (1 entered, 0 left), u16 window_s (FFFF none), u8 involve_proxies, u8 exit_reason (1 explicit, 2 first pairing, 3 timeout)` | event | E (`SinkEvent::CommissioningEntered/Left`) |
 | `0x0A82` | `EVT_GP_COMMISSIONED` | `gpd_id, u8 device_id, u8 flags (bit0 bidirectional, bit1 key present), R_GP_SINK record` | event | E (`SinkEvent::Commissioned`) + N |
-| `0x0A83` | `EVT_GP_COMMISSIONING_FAILED` | `gpd_id, u8 reason` (`SinkDrop`: 1 Invalid, 2 NotCommissioning, 3 NoEntry, 4 SecurityMismatch, 5 AuthFailed, 6 Stale, 7 Duplicate, 8 SecurityPolicy, 9 NoKey, 10 NoTempMaster, 11 TableFull, 12 Unsupported, 13 QueueFull) | event | E |
+| `0x0A83` | `EVT_GP_COMMISSIONING_FAILED` | `gpd_id, u8 reason` (`SinkDrop`: 1 Invalid, 2 NotCommissioning, 3 NoEntry, 4 SecurityMismatch, 5 AuthFailed, 6 Stale, 7 Duplicate, 8 SecurityPolicy, 9 NoKey, 10 NoTempMaster, 11 TableFull, 12 Unsupported, 13 QueueFull, 14 InvolveTc with `green-power-involve-tc`) | event | E |
 | `0x0A84` | `EVT_GP_DECOMMISSIONED` | `gpd_id` | event | E |
 | `0x0A08` | `GP_PAIRING_CONFIGURATION` | `u16 dst, u8 actions, gpd_id, u8 device_id, u8 communication_mode, u8 flags (bit0 MAC seq capable, bit1 rx-on capable, bit2 fixed location, bit3 security, bit4 assigned alias), u16 assigned_alias, u8 groupcast_radius, u8 security_level, u8 key_type, [16] key, u32 frame_counter, u8 n, n×(u16 group, u16 alias), u8 paired (0x00 none, 0x01 listed, 0xFE sink derives, 0xFF all), u8 n, n×u8 endpoint, u8 app_info (bits 0-3), u16 manufacturer_id, u16 model_id, u8 n, n×u8 gpd_command, u8 n, n×u16 server_cluster, u8 n, n×u16 client_cluster` | `u8 zcl_tsn` | N (remote provisioning, below) |
 | `0x0A09` | `GP_SEND_PAIRING` | `u16 dst, u8 flags (bit0 add sink, bit1 remove GPD, bit2 GPD fixed, bit3 MAC seq capable, bit4 key, bit5 assigned alias, bit6 frame counter, bit7 groupcast radius), gpd_id, u8 communication_mode, u8 security_level, u8 key_type, [8] sink_ieee, u16 sink_nwk, u16 sink_group, u8 device_id, u32 frame_counter, [16] key, u16 assigned_alias, u8 groupcast_radius` | `u8 zcl_tsn` (`CONFLICT`) | N |
@@ -1797,8 +1797,9 @@ itself has no GP fields.
 - The NCP boots in `NCP_SINK` with the defaults above (window 180 s, exit
   on first pairing, derived groupcast). `GP_SINK_CONFIG` is kept in RAM:
   a host sends it at every start. `window_s` 0 selects 180 s; a
-  `security_level` with bit 3 (involve the Trust Center) is
-  `UNSUPPORTED_COMMAND`. `GP_SINK_COMMISSIONING` (enter) also sets
+  `security_level` with bit 3 (involve the Trust Center) is accepted and
+  advertised in gpsSecurityLevel: the NCP is the Trust Center, so the bit
+  does not stop its sink (`green-power-involve-tc`, green-power.md 3.10). `GP_SINK_COMMISSIONING` (enter) also sets
   `gpsCommissioningWindow` (non-zero `window_s`) and the "on first pairing"
   exit bit from its flags; it needs a running network and `NCP_SINK`
   (`INVALID_STATE`).
@@ -1829,7 +1830,7 @@ itself has no GP fields.
   GP endpoint is a member of (the NCP sink's or the proxy's; there is no
   host group-membership command yet).
 - Counters (`DIAG_GET_COUNTERS` group bit 7, IDs `0x08xx`): `0x0801`–
-  `0x080D` sink drops by `SinkDrop` reason (duplicates `0x0807`, stale
+  `0x080E` sink drops by `SinkDrop` reason (duplicates `0x0807`, stale
   `0x0806`, unknown GPD `0x0803`), `0x0810` reports lost to a full queue,
   `0x0811` local proxy copies, `0x0812` frames handed to a host sink,
   `0x0813` `CONFLICT` refusals.

@@ -44,8 +44,10 @@
 //! descriptors), GPD Channel Request handling without `channel-request`,
 //! key provisioning to a GPD
 //! (shared-key attributes, key in the Commissioning Reply), commissioning
-//! through a GP Manager in security or pairing (GPM, involve-TC) and GP
-//! Pairing Search.
+//! through a GP Manager in security or pairing (GPM) and GP Pairing Search.
+//! gpsSecurityLevel InvolveTC refuses commissioning; with `involve-tc` it
+//! is writable, derivable from the join (`involve_tc`) and does not stop a
+//! sink that is itself the Trust Center.
 
 use zigbee_crypto::{AesKey, ForwardAesProvider};
 
@@ -108,7 +110,9 @@ pub mod security_level_attr {
     pub const MINIMAL_LEVEL_MASK: u8 = 0x03;
     /// A GPD key sent at commissioning must be TC-LK protected.
     pub const PROTECTION_WITH_GP_LINK_KEY: u8 = 0x04;
-    /// Involve the Trust Center (not supported: commissioning is refused).
+    /// Involve the Trust Center: GPD commissioning is refused while set,
+    /// unless this sink is the Trust Center (`involve-tc`; without the
+    /// feature it is refused unconditionally and cannot be written).
     pub const INVOLVE_TC: u8 = 0x08;
 }
 
@@ -144,6 +148,14 @@ pub mod zcl_status {
     /// INVALID_DATA_TYPE.
     pub const INVALID_DATA_TYPE: u8 = 0x8D;
 }
+
+/// gpsSecurityLevel bits a write may set: the minimal level and the GP
+/// link key protection, and InvolveTC with `involve-tc`.
+#[cfg(feature = "involve-tc")]
+const WRITABLE_SECURITY_LEVEL_BITS: u8 = 0x0F;
+/// gpsSecurityLevel bits a write may set (InvolveTC needs `involve-tc`).
+#[cfg(not(feature = "involve-tc"))]
+const WRITABLE_SECURITY_LEVEL_BITS: u8 = 0x07;
 
 const BITMAP8: u8 = 0x18;
 const BITMAP24: u8 = 0x1A;
@@ -649,6 +661,10 @@ pub enum SinkDrop {
     Unsupported,
     /// Network transmission queue full.
     QueueFull,
+    /// gpsSecurityLevel asks to involve the Trust Center and this sink is
+    /// not the Trust Center (`involve-tc`).
+    #[cfg(feature = "involve-tc")]
+    InvolveTc,
 }
 
 /// Result of feeding a frame to the sink.
@@ -893,6 +909,9 @@ pub struct Sink<const N: usize, const Q: usize> {
     /// Last Channel Configuration queued: (TempMaster, channel byte, ms).
     #[cfg(feature = "channel-request")]
     last_channel_configuration: Option<(u16, u8, u32)>,
+    /// This node is the network's Trust Center (`involve-tc`).
+    #[cfg(feature = "involve-tc")]
+    trust_center: bool,
 }
 
 impl<const N: usize, const Q: usize> Sink<N, Q> {
@@ -926,6 +945,8 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             translations: configuration::SinkTranslationTable::new(),
             #[cfg(feature = "channel-request")]
             last_channel_configuration: None,
+            #[cfg(feature = "involve-tc")]
+            trust_center: false,
         }
     }
 
@@ -1298,7 +1319,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
     /// (the window is armed with "on window expiration" or no exit
     /// condition at all).
     fn enter(&mut self, now_ms: u32, involve_proxies: bool, local: bool) -> Result<()> {
-        if self.config.security_level & security_level_attr::INVOLVE_TC != 0 {
+        if self.involve_tc_blocks() {
             return Err(Error::Unsupported);
         }
         let em = self.config.exit_mode & 0x07;
@@ -1455,7 +1476,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
                 self.config.exit_mode = byte;
             }
             attr::GPS_SECURITY_LEVEL => {
-                if byte & !0x07 != 0 {
+                if byte & !WRITABLE_SECURITY_LEVEL_BITS != 0 {
                     return INVALID_VALUE;
                 }
                 self.config.security_level = byte;
@@ -1463,6 +1484,15 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             _ => self.config.commissioning_window_s = u16::from_le_bytes([value[0], value[1]]),
         }
         SUCCESS
+    }
+
+    /// Whether gpsSecurityLevel InvolveTC stops GPD commissioning here.
+    fn involve_tc_blocks(&self) -> bool {
+        #[cfg(feature = "involve-tc")]
+        let trust_center = self.trust_center;
+        #[cfg(not(feature = "involve-tc"))]
+        let trust_center = false;
+        self.config.security_level & security_level_attr::INVOLVE_TC != 0 && !trust_center
     }
 
     /// Key for a protected GPDF of `gpd`: the Sink Table entry's or a
@@ -1617,7 +1647,7 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             return zcl_status::NOT_FOUND;
         }
         if m.options & (INVOLVE_GPM_IN_SECURITY | INVOLVE_GPM_IN_PAIRING) != 0
-            || self.config.security_level & security_level_attr::INVOLVE_TC != 0
+            || self.involve_tc_blocks()
         {
             return zcl_status::UNSUP_COMMAND;
         }
@@ -1945,7 +1975,10 @@ impl<const N: usize, const Q: usize> Sink<N, Q> {
             return SinkOutcome::Dropped(Invalid);
         };
         let policy = self.config.security_level;
-        if policy & security_level_attr::INVOLVE_TC != 0 {
+        if self.involve_tc_blocks() {
+            #[cfg(feature = "involve-tc")]
+            return SinkOutcome::Dropped(InvolveTc);
+            #[cfg(not(feature = "involve-tc"))]
             return SinkOutcome::Dropped(SecurityPolicy);
         }
         let (level, key_type, wrapped, outgoing) = match &p.security {
@@ -3209,7 +3242,12 @@ mod tests {
         // Involve-TC is not supported.
         assert_eq!(
             s.write_attribute(attr::GPS_SECURITY_LEVEL, BITMAP8, &[0x08]),
-            zcl_status::INVALID_VALUE
+            // InvolveTC is writable with `involve-tc` (sink::involve_tc).
+            if cfg!(feature = "involve-tc") {
+                zcl_status::SUCCESS
+            } else {
+                zcl_status::INVALID_VALUE
+            }
         );
         s.set_config(SinkConfig {
             security_level: security_level_attr::INVOLVE_TC,
@@ -3846,3 +3884,7 @@ pub use configuration::{SINK_TRANSLATION_ENTRIES, SinkTranslationTable};
 
 #[cfg(feature = "channel-request")]
 mod maintenance;
+#[cfg(feature = "involve-tc")]
+mod involve_tc;
+#[cfg(feature = "involve-tc")]
+pub use involve_tc::JoinKind;

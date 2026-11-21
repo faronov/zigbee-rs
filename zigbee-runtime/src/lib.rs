@@ -21191,3 +21191,8 @@ mod gp_local_config;
 ))]
 #[path = "green_power/channel_request_tests.rs"]
 mod gp_channel_request_tests;
+
+/// gpsSecurityLevel InvolveTC from the join.
+#[cfg(feature = "green-power-involve-tc")]
+#[path = "green_power/involve_tc.rs"]
+mod gp_involve_tc;

@@ -30,8 +30,7 @@ use heapless::Vec;
 use zigbee_gp::cluster::{client_cmd, server_cmd};
 use zigbee_gp::proxy::{MAX_SINK_GROUPS, ProxyEntry, SinkGroup};
 use zigbee_gp::sink::{
-    ImportError, SinkCommissioningExit, SinkConfig, SinkEntry, SinkEvent, SinkStats,
-    exit_mode_attr, security_level_attr,
+    ImportError, SinkCommissioningExit, SinkConfig, SinkEntry, SinkEvent, SinkStats, exit_mode_attr,
 };
 use zigbee_gp::types::{CommunicationMode, GpdId, KeyType, SecurityLevel};
 use zigbee_gp::{GP_CLUSTER_ID, GP_ENDPOINT, GP_PROFILE_ID};
@@ -591,10 +590,6 @@ fn sink_config(request: &GpSinkConfig, current: SinkConfig) -> Result<SinkConfig
     {
         return Err(Status::InvalidParameter);
     }
-    if request.security_level & security_level_attr::INVOLVE_TC != 0 {
-        // Commissioning through the Trust Center is not implemented.
-        return Err(Status::UnsupportedCommand);
-    }
     let communication_mode = CommunicationMode::from_bits(request.communication_mode);
     let group = (request.group != 0xFFFF).then_some(request.group);
     if communication_mode == CommunicationMode::CommissionedGroupcast && group.is_none() {
@@ -1017,8 +1012,15 @@ mod tests {
         assert_eq!(bad(|r| r.group = 0xFFFF), Some(Status::InvalidParameter));
         assert_eq!(bad(|r| r.exit_mode = 0x08), Some(Status::InvalidParameter));
         assert_eq!(
-            bad(|r| r.security_level = 0x08),
-            Some(Status::UnsupportedCommand)
+            bad(|r| r.security_level = 0x18),
+            Some(Status::InvalidParameter)
+        );
+        // InvolveTC is accepted: the NCP is the Trust Center.
+        let mut r = request.clone();
+        r.security_level = 0x08;
+        assert_eq!(
+            sink_config(&r, rt::ncp_sink_config()).map(|c| c.security_level),
+            Ok(0x08)
         );
     }
 

@@ -153,6 +153,10 @@ green-power-translation-table = ["green-power-sink", "zigbee-gp/translation-tabl
 # hears the GPD directly is its own TempMaster with
 # `green-power-bidirectional`).
 green-power-channel-request = ["green-power-sink", "zigbee-gp/channel-request"]
+# gpsSecurityLevel InvolveTC: writable, derived from how the node joined
+# (`ZigbeeDevice::gp_sink_derive_involve_tc`), refusing GPD commissioning on
+# a sink that is not the Trust Center.
+green-power-involve-tc = ["green-power-sink", "zigbee-gp/involve-tc"]
 # ZRHP network co-processor integration of the GP combo (spec 7.11,
 # `green_power::ncp`): one sink authority switchable at runtime between the
 # runtime's sink (NCP_SINK) and the host's (HOST_SINK: GP server frames and
