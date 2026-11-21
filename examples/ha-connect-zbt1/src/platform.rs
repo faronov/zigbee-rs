@@ -21,7 +21,6 @@ use ha_connect_zbt1_product as product;
 /// Resources a role composition needs after clocks and time are running.
 pub struct Started {
     pub radio: efr32s2_hal::radio::RadioToken,
-    pub crypto: efr32s2_hal::crypto::Crypto,
     pub flash: efr32s2_hal::flash::Efr32s2Flash,
 }
 
@@ -34,7 +33,6 @@ pub fn start(model: &str) -> Started {
         radio,
         rtcc,
         flash,
-        crypto,
     } = BoardResources::take().unwrap_or_else(|| halt());
 
     if let Err(error) = ha_connect_zbt1::init_clocks(clocks) {
@@ -62,31 +60,7 @@ pub fn start(model: &str) -> Started {
         log::error!("[ZBT1] DEVINFO flash size {capacity} B, product needs 1 MiB");
         halt()
     }
-    Started {
-        radio,
-        crypto,
-        flash,
-    }
-}
-
-/// The radio with the Secure Engine AES engine installed after its
-/// on-silicon KAT; halts on failure (no software AES exists). The resident
-/// Gecko Bootloader is only entered through a reset, so it never shares the
-/// SE mailbox with a running AES request.
-pub fn radio_with_aes<const D: i8>(
-    radio: efr32s2_hal::radio::RadioToken,
-    crypto: efr32s2_hal::crypto::Crypto,
-) -> zigbee_mac::efr32s2::Efr32s2RadioPhy<D> {
-    let mut phy = zigbee_mac::efr32s2::Efr32s2RadioPhy::new(radio).unwrap_or_else(|error| {
-        log::error!("[ZBT1] radio init failed: {error:?}");
-        halt()
-    });
-    if let Err(error) = phy.install_aes_engine(crypto) {
-        log::error!("[ZBT1] AES engine failed: {error:?}");
-        halt()
-    }
-    log::info!("[ZBT1] AES_KAT_PASS SE mailbox");
-    phy
+    Started { radio, flash }
 }
 
 /// Reject an all-zero/all-ones DEVINFO EUI-64 before it reaches the stack.

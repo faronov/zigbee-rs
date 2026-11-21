@@ -62,7 +62,6 @@ async fn main(_spawner: Spawner) {
         radio,
         rtcc,
         flash,
-        crypto,
     } = BoardResources::take().unwrap_or_else(|| halt());
 
     if let Err(error) = ha_connect_zbt1::init_clocks(clocks) {
@@ -91,7 +90,7 @@ async fn main(_spawner: Spawner) {
         halt()
     }
 
-    let app = compose(radio, crypto, flash);
+    let app = compose(radio, flash);
     if let Err(error) = app.initialize().await {
         fatal(app.parts_mut(), error);
     }
@@ -122,16 +121,11 @@ async fn main(_spawner: Spawner) {
 #[inline(never)]
 fn compose(
     radio: efr32s2_hal::radio::RadioToken,
-    crypto: efr32s2_hal::crypto::Crypto,
     flash: efr32s2_hal::flash::Efr32s2Flash,
 ) -> &'static mut App {
     let mac: Mac = Efr32s2RadioPhy::new(radio)
         .map_err(|error| log::error!("[ZBT1] radio init failed: {error:?}"))
-        .and_then(|mut phy| {
-            // Secure Engine AES with its on-silicon KAT; no software AES.
-            phy.install_aes_engine(crypto)
-                .map_err(|error| log::error!("[ZBT1] AES engine failed: {error:?}"))?;
-            log::info!("[ZBT1] AES_KAT_PASS SE mailbox");
+        .and_then(|phy| {
             phy.into_soft_mac()
                 .map_err(|error| log::error!("[ZBT1] MAC init failed: {error:?}"))
         })

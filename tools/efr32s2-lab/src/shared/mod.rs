@@ -170,7 +170,8 @@ pub struct Lab {
     pub radio: RadioToken,
     pub rtcc: RtccToken,
     pub usart0: Usart,
-    /// Hardware AES engine token (`s2-aes`).
+    /// Hardware AES engine token (`s2-aes`, xG22).
+    #[cfg(feature = "wstk")]
     pub crypto: efr32s2_hal::crypto::Crypto,
     pub led: Led,
     #[cfg(feature = "wstk")]
@@ -209,6 +210,7 @@ pub fn init(name: &str) -> Lab {
         i2c0,
         radio,
         rtcc,
+        #[cfg(feature = "wstk")]
         crypto,
         ..
     } = Peripherals::take().expect("peripherals taken once");
@@ -251,6 +253,7 @@ pub fn init(name: &str) -> Lab {
         radio,
         rtcc,
         usart0,
+        #[cfg(feature = "wstk")]
         crypto,
         led,
         #[cfg(feature = "wstk")]

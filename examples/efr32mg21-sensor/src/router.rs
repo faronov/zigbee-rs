@@ -35,7 +35,7 @@ use router_app::{
     NoObserver, NodeArchetype, ParentRouterApp, PersistentApsTables, PersistentChildren,
 };
 use static_cell::StaticCell;
-use zigbee_mac::efr32s2::{EFR32S2_ROUTER_PENDING_RX, Efr32s2RouterMac};
+use zigbee_mac::efr32s2::{EFR32S2_ROUTER_PENDING_RX, Efr32s2RadioPhy, Efr32s2RouterMac};
 use zigbee_runtime::{
     ZigbeeDevice, node::ZigbeeNode, power::PowerMode, profile::ApplicationProfile, role::Router,
 };
@@ -67,7 +67,7 @@ const SUMMARY_PERIOD: Duration = Duration::from_secs(60);
 async fn main(_spawner: Spawner) {
     let started = roles::start(product::ROUTER_MODEL);
     let mut trigger = CommissioningTrigger::new(started.button);
-    let app = compose(started.radio, started.crypto, started.flash, started.led);
+    let app = compose(started.radio, started.flash, started.led);
     if let Err(error) = app.initialize().await {
         roles::fatal(app.parts_mut(), ARCHETYPE, error);
     }
@@ -94,16 +94,16 @@ async fn main(_spawner: Spawner) {
 #[inline(never)]
 fn compose(
     radio: efr32s2_hal::radio::RadioToken,
-    crypto: efr32s2_hal::crypto::Crypto,
     flash: efr32s2_hal::flash::Efr32s2Flash,
     led: efr32mg21_devkit::Led0,
 ) -> &'static mut App {
-    let mac: Mac = roles::radio_with_aes(radio, crypto)
-        .into_parent_mac()
-        .unwrap_or_else(|error| {
-            log::error!("[MG21] MAC init failed: {error:?}");
-            halt()
-        });
+    let mac: Mac = Efr32s2RadioPhy::new(radio)
+        .map_err(|error| log::error!("[MG21] radio init failed: {error:?}"))
+        .and_then(|phy| {
+            phy.into_parent_mac()
+                .map_err(|error| log::error!("[MG21] MAC init failed: {error:?}"))
+        })
+        .unwrap_or_else(|()| halt());
     let ieee = mac.pib().extended_address();
     roles::check_ieee(ieee);
 

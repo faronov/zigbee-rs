@@ -38,7 +38,7 @@ use router_app::{
     Supervisor,
 };
 use static_cell::StaticCell;
-use zigbee_mac::efr32s2::{EFR32S2_ROUTER_PENDING_RX, Efr32s2RouterMac};
+use zigbee_mac::efr32s2::{EFR32S2_ROUTER_PENDING_RX, Efr32s2RadioPhy, Efr32s2RouterMac};
 use zigbee_runtime::{
     ZigbeeDevice, node::ZigbeeNode, power::PowerMode, profile::ApplicationProfile, role::Router,
 };
@@ -74,7 +74,7 @@ async fn main(_spawner: Spawner) {
     let (flash, mut trial) = loader_trial(started.flash);
     #[cfg(not(feature = "zrs-boot"))]
     let flash = started.flash;
-    let app = compose(started.radio, started.crypto, flash);
+    let app = compose(started.radio, flash);
     if let Err(error) = app.initialize().await {
         fatal(app.parts_mut(), error);
     }
@@ -205,15 +205,15 @@ static ZRS_OTA_IDENTITY: [u32; 2] = product::boot::OTA_IDENTITY;
 #[inline(never)]
 fn compose(
     radio: efr32s2_hal::radio::RadioToken,
-    crypto: efr32s2_hal::crypto::Crypto,
     flash: efr32s2_hal::flash::Efr32s2Flash,
 ) -> &'static mut App {
-    let mac: Mac = platform::radio_with_aes(radio, crypto)
-        .into_parent_mac()
-        .unwrap_or_else(|error| {
-            log::error!("[ZBT1] MAC init failed: {error:?}");
-            halt()
-        });
+    let mac: Mac = Efr32s2RadioPhy::new(radio)
+        .map_err(|error| log::error!("[ZBT1] radio init failed: {error:?}"))
+        .and_then(|phy| {
+            phy.into_parent_mac()
+                .map_err(|error| log::error!("[ZBT1] MAC init failed: {error:?}"))
+        })
+        .unwrap_or_else(|()| halt());
     let ieee = mac.pib().extended_address();
     platform::check_ieee(ieee);
 

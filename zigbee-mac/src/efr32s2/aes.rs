@@ -1,12 +1,12 @@
 //! Hardware AES-128 for the EFR32 Series 2 PHY (NWK/APS CCM*, AES-MMO,
 //! Green Power).
 //!
-//! The engine is `efr32s2_hal::crypto::AesEngine`: the Secure Engine mailbox
-//! on xG21 and the CRYPTOACC BA411E on xG22. The composition root hands the
-//! chip's `Crypto` token to [`Efr32s2RadioPhy::install_aes_engine`], which
-//! runs the on-silicon known-answer test before it accepts the engine. There
-//! is no software AES on this platform: until an engine is installed (and
-//! on host builds, which have no engine) every cipher request fails with
+//! xG22 only. The engine is `efr32s2_hal::crypto::AesEngine`, the CRYPTOACC
+//! BA411E. The composition root hands the chip's `Crypto` token to
+//! [`Efr32s2RadioPhy::install_aes_engine`], which runs the on-silicon
+//! known-answer test before it accepts the engine. There is no software AES
+//! on xG22: until an engine is installed (and on host builds, which have no
+//! engine) every cipher request fails with
 //! [`Efr32s2AesError::NotInstalled`], which the stack turns into a dropped
 //! frame.
 

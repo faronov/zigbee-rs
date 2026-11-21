@@ -1,5 +1,5 @@
-//! Gate: hardware AES-128 engine (xG22 CRYPTOACC BA411E, xG21 Secure Engine
-//! mailbox) through `efr32s2_hal::crypto::AesEngine`.
+//! Gate: hardware AES-128 engine (xG22 CRYPTOACC BA411E) through
+//! `efr32s2_hal::crypto::AesEngine`.
 //!
 //! Runs the engine's two-vector self test, then the SP 800-38A ECB-AES128
 //! vectors and a 1,000-block chained encryption (re-keyed every block, like

@@ -16,6 +16,9 @@ compile_error!("efr32s2-hal: enable one chip feature (`efr32mg21` or `efr32mg22`
 
 pub mod chip;
 pub mod clock;
+/// Hardware AES-128 (xG22 CRYPTOACC). The xG21 Secure Engine backend is
+/// pending on branch `aes-hw-efr32mg21`.
+#[cfg(feature = "efr32mg22")]
 pub mod crypto;
 pub mod delay;
 pub mod devinfo;

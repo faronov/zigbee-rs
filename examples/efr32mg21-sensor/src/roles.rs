@@ -24,7 +24,6 @@ use router_app::{
 /// Resources a role composition needs after clocks and time are running.
 pub struct Started {
     pub radio: efr32s2_hal::radio::RadioToken,
-    pub crypto: efr32s2_hal::crypto::Crypto,
     pub flash: efr32s2_hal::flash::Efr32s2Flash,
     pub led: Led0,
     pub button: Button0,
@@ -40,7 +39,6 @@ pub fn start(model: &str) -> Started {
         radio,
         rtcc,
         flash,
-        crypto,
     } = BoardResources::take().unwrap_or_else(|| halt());
 
     let clocks = efr32mg21_devkit::init_clocks(clocks);
@@ -64,29 +62,10 @@ pub fn start(model: &str) -> Started {
     );
     Started {
         radio,
-        crypto,
         flash,
         led: led0.into_led(),
         button: button0.into_button(),
     }
-}
-
-/// The radio with the Secure Engine AES engine installed after its
-/// on-silicon KAT; halts on failure (no software AES exists).
-pub fn radio_with_aes(
-    radio: efr32s2_hal::radio::RadioToken,
-    crypto: efr32s2_hal::crypto::Crypto,
-) -> zigbee_mac::efr32s2::Efr32s2RadioPhy {
-    let mut phy = zigbee_mac::efr32s2::Efr32s2RadioPhy::new(radio).unwrap_or_else(|error| {
-        log::error!("[MG21] radio init failed: {error:?}");
-        halt()
-    });
-    if let Err(error) = phy.install_aes_engine(crypto) {
-        log::error!("[MG21] AES engine failed: {error:?}");
-        halt()
-    }
-    log::info!("[MG21] AES_KAT_PASS SE mailbox");
-    phy
 }
 
 /// Reject an all-zero/all-ones DEVINFO EUI-64 before it reaches the stack.
