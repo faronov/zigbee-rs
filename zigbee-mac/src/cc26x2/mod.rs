@@ -17,9 +17,15 @@
 //! - **RX** — frames wait in the RF core's data queue
 //!   (`cc26x2_hal::rf::RX_ENTRIES` entries) until [`RadioPhy::receive`]
 //!   polls it from the executor.
+//! - **AES** — AES-128 for NWK/APS CCM* runs on the CRYPTO engine
+//!   (`cc26x2_hal::crypto`), installed by the composition root with
+//!   [`Cc26x2RadioPhy::install_aes_engine`] after two FIPS-197 known-answer
+//!   tests. There is no software fallback: without an installed engine every
+//!   secured frame fails closed with [`Cc26x2AesError::NotInstalled`].
 //!
 //! Validation: see `docs/book/src/platform-guides/cc26x2.md`.
 
+use cc26x2_hal::crypto::{AesEngine, AesError, CryptoToken, Mmio};
 use cc26x2_hal::rf::{self, Csma, Filter, FpAddress, FpError, Radio, RadioError, TxOutcome};
 use cc26x2_hal::trng::Trng;
 use embassy_futures::yield_now;
@@ -50,6 +56,20 @@ pub struct Cc26x2RadioPhy<const DEFAULT_TX_DBM: i8 = 0> {
     pan_coordinator: bool,
     filter: Option<PhyAddressFilter>,
     last_error: Option<RadioError>,
+    aes: Option<AesEngine<Mmio>>,
+}
+
+/// Failure of the CRYPTO-engine AES backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cc26x2AesError {
+    /// The composition root did not install a validated engine.
+    NotInstalled,
+    /// An engine is already installed.
+    AlreadyInstalled,
+    /// Known-answer test `n` produced wrong ciphertext.
+    KnownAnswerTestFailed(u8),
+    /// The engine reported a failure.
+    Engine(AesError),
 }
 
 /// End-device MAC over [`Cc26x2RadioPhy`].
@@ -92,7 +112,29 @@ impl<const D: i8> Cc26x2RadioPhy<D> {
             pan_coordinator: false,
             filter: None,
             last_error: None,
+            aes: None,
         })
+    }
+
+    /// Take the CRYPTO engine as this PHY's AES-128 backend after its
+    /// FIPS-197 known-answer tests. Until this succeeds, secured frames
+    /// fail closed.
+    pub fn install_aes_engine(&mut self, token: CryptoToken) -> Result<(), Cc26x2AesError> {
+        if self.aes.is_some() {
+            return Err(Cc26x2AesError::AlreadyInstalled);
+        }
+        let mut engine = AesEngine::new(token).map_err(Cc26x2AesError::Engine)?;
+        for (index, (key, input, expected)) in crate::aes_kat::AES_128_KATS.iter().enumerate() {
+            let mut block = *input;
+            engine
+                .encrypt_block(key, &mut block)
+                .map_err(Cc26x2AesError::Engine)?;
+            if block != *expected {
+                return Err(Cc26x2AesError::KnownAnswerTestFailed(index as u8));
+            }
+        }
+        self.aes = Some(engine);
+        Ok(())
     }
 
     pub fn extended_address(&self) -> IeeeAddress {
@@ -363,8 +405,35 @@ impl<const D: i8> RadioPhy for Cc26x2RadioPhy<D> {
     }
 }
 
-/// Software AES-128 (the CRYPTO engine backend is not wired yet).
-impl<const D: i8> zigbee_crypto::ForwardAesProvider for Cc26x2RadioPhy<D> {}
+/// AES-128 on the CRYPTO engine, fail-closed when it is not installed.
+impl<const D: i8> zigbee_crypto::ForwardAesProvider for Cc26x2RadioPhy<D> {
+    fn forward_cipher(
+        &mut self,
+        key: &zigbee_crypto::AesKey,
+    ) -> impl zigbee_crypto::Aes128Forward + '_ {
+        Cc26x2HardwareAes128 {
+            engine: self.aes.as_mut(),
+            key: *key,
+        }
+    }
+}
+
+struct Cc26x2HardwareAes128<'engine> {
+    engine: Option<&'engine mut AesEngine<Mmio>>,
+    key: zigbee_crypto::AesKey,
+}
+
+impl zigbee_crypto::Aes128Forward for Cc26x2HardwareAes128<'_> {
+    type Error = Cc26x2AesError;
+
+    fn encrypt_block(&mut self, block: &mut [u8; 16]) -> Result<(), Self::Error> {
+        self.engine
+            .as_deref_mut()
+            .ok_or(Cc26x2AesError::NotInstalled)?
+            .encrypt_block(&self.key, block)
+            .map_err(Cc26x2AesError::Engine)
+    }
+}
 
 impl<const D: i8> PlatformServices for Cc26x2RadioPhy<D> {
     fn monotonic_micros(&self) -> u32 {

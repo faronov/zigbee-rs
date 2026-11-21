@@ -42,6 +42,10 @@ router = ["centralized-tclk", "distributed-security", "formation"]
 # Joiner-side install-code provisioning (`BdbLayer::set_install_code`).
 install-code = ["centralized-tclk", "dep:zigbee-crypto"]
 trust-center = ["router", "install-code", "zigbee-aps/trust-center"]
+# Trust Center Verify-Key and install-code hashes through a caller-supplied
+# AES provider (`handle_verify_key_with`, `provision_install_code_with`), for
+# images whose platform AES is a hardware engine. Off by default.
+platform-aes = ["trust-center"]
 # Coordinator network co-processor capacity (ZRHP spec 8.9): a 256-device
 # Trust Center table and the APS/NWK `ncp-capacity` tables. Off by default.
 ncp-capacity = ["trust-center", "zigbee-aps/ncp-capacity"]

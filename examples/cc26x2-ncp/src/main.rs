@@ -131,6 +131,7 @@ struct Started {
     host: Host,
     radio: cc26x2_dongle::BoardRadio,
     trng: cc26x2_hal::trng::TrngToken,
+    crypto: cc26x2_hal::crypto::CryptoToken,
     flash: cc26x2_hal::flash::Flash,
 }
 
@@ -143,6 +144,7 @@ fn start() -> Started {
         radio,
         rtc,
         trng,
+        crypto,
         flash,
     } = BoardResources::take().unwrap_or_else(|| halt());
     // SAFETY: called once before anything logs.
@@ -166,6 +168,7 @@ fn start() -> Started {
         host: Host::new(uart),
         radio,
         trng,
+        crypto,
         flash,
     }
 }
@@ -180,6 +183,7 @@ async fn main(_spawner: Spawner) {
         host,
         radio,
         trng,
+        crypto,
         flash,
     } = start();
     static HOST: StaticCell<Host> = StaticCell::new();
@@ -194,7 +198,7 @@ async fn main(_spawner: Spawner) {
             break value;
         }
     };
-    let (port, opened) = compose(radio, trng, flash, identity.eui64);
+    let (port, opened) = compose(radio, trng, crypto, flash, identity.eui64);
     match opened {
         Opened::Existing => log::info!("NV journals preserved"),
         Opened::Fresh => log::warn!("blank/foreign NV erased"),
@@ -232,6 +236,7 @@ async fn main(_spawner: Spawner) {
 fn compose(
     radio: cc26x2_dongle::BoardRadio,
     trng: cc26x2_hal::trng::Trng,
+    crypto: cc26x2_hal::crypto::CryptoToken,
     flash: cc26x2_hal::flash::Flash,
     eui64: [u8; 8],
 ) -> (Port, Opened) {
@@ -242,7 +247,7 @@ fn compose(
         DeviceId::COMBINED_INTERFACE,
         RangeExtender,
     ));
-    let (device, ieee) = compose_device(radio, trng, eui64, profile);
+    let (device, ieee) = compose_device(radio, trng, crypto, eui64, profile);
     let (stores, opened) = stores::open(flash, product::ROLE_TAG).unwrap_or_else(|_| halt());
     let stores::Stores {
         security,
@@ -277,15 +282,18 @@ fn compose(
 fn compose_device(
     radio: cc26x2_dongle::BoardRadio,
     trng: cc26x2_hal::trng::Trng,
+    crypto: cc26x2_hal::crypto::CryptoToken,
     eui64: [u8; 8],
     profile: &Profile,
 ) -> (&'static mut ZigbeeDevice<Mac, Router>, [u8; 8]) {
     static DEVICE: StaticCell<ZigbeeDevice<Mac, Router>> = StaticCell::new();
     let radio = radio.init(product::TX_POWER_DBM).unwrap_or_else(|_| halt());
-    let mac: Mac = Cc26x2RadioPhy::new(radio, trng, eui64)
-        .ok()
-        .and_then(|phy| phy.into_parent_mac().ok())
-        .unwrap_or_else(|| halt());
+    let mut phy = Cc26x2RadioPhy::new(radio, trng, eui64).unwrap_or_else(|_| halt());
+    // NWK/APS AES-128 on the CRYPTO engine (no software AES in the image).
+    if phy.install_aes_engine(crypto).is_err() {
+        halt()
+    }
+    let mac: Mac = phy.into_parent_mac().unwrap_or_else(|_| halt());
     let ieee = mac.pib().extended_address();
     if ieee == [0; 8] || ieee == [0xFF; 8] {
         halt()

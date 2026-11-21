@@ -45,7 +45,7 @@ pub mod soft_mac;
     feature = "esp32h2",
     feature = "esp32c5",
     feature = "nrf52840",
-    feature = "nrf52833"
+    any(feature = "nrf52833", feature = "cc26x2")
 ))]
 mod aes_kat;
 

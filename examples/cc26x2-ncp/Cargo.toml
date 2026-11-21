@@ -39,6 +39,7 @@ zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, feat
     "ncp-capacity",
     "ncp-capacity-compact",
     "green-power-ncp",
+    "tc-platform-aes",
 ] }
 # `pan-coordinator`: MLME-START with short address 0x0000; `ncp-capacity`:
 # the NCP table sizes (the CC26x2 RF core source-match tables stay 16 + 16).

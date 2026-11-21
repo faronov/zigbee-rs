@@ -159,6 +159,7 @@ fn compose(started: platform::Started) -> &'static mut App {
         identity,
         radio,
         trng,
+        crypto,
         flash,
     } = started;
     let radio = radio.init(product::TX_POWER_DBM).unwrap_or_else(|error| {
@@ -169,13 +170,19 @@ fn compose(started: platform::Started) -> &'static mut App {
         log::error!("[CC26X2] TRNG start failed: {error:?}");
         halt()
     });
-    let mac: Mac = Cc26x2RadioPhy::new(radio, trng, identity.eui64)
-        .map_err(|error| log::error!("[CC26X2] PHY init failed: {error:?}"))
-        .and_then(|phy| {
-            phy.into_parent_mac()
-                .map_err(|error| log::error!("[CC26X2] MAC init failed: {error:?}"))
-        })
-        .unwrap_or_else(|()| halt());
+    let mut phy = Cc26x2RadioPhy::new(radio, trng, identity.eui64).unwrap_or_else(|error| {
+        log::error!("[CC26X2] PHY init failed: {error:?}");
+        halt()
+    });
+    // NWK/APS AES-128 on the CRYPTO engine (no software AES in the image).
+    if let Err(error) = phy.install_aes_engine(crypto) {
+        log::error!("[CC26X2] AES engine rejected: {error:?}");
+        halt()
+    }
+    let mac: Mac = phy.into_parent_mac().unwrap_or_else(|error| {
+        log::error!("[CC26X2] MAC init failed: {error:?}");
+        halt()
+    });
     let ieee = mac.pib().extended_address();
     if ieee == [0; 8] || ieee == [0xFF; 8] {
         log::error!("[CC26X2] no valid factory EUI-64");
