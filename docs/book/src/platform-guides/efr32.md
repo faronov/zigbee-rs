@@ -545,9 +545,10 @@ Ownership and conflicts:
   thread-mode only and complete (or time out) before returning, so a
   bootloader call between requests is safe; none may run during a request.
   The ZBT-1 enters its Gecko Bootloader only through a reset. An SE command
-  that is not answered within the poll bound poisons the engine until
-  reset, because its late response would be read as the answer to the
-  next command.
+  that is not answered within the poll bound poisons the engine (and the
+  mailbox for the image's other SE clients) until reset, because its late
+  response would be read as the answer to the next command. An unread
+  response left by an earlier client is drained before each request.
 - **CRYPTOACC (xG22).** The TRNG (`efr32s2_hal::trng`, BA431 block, used by
   the Green Power Device for key provisioning) and the AES core share the
   CRYPTOACC bus/AES/PK clock gates. `clock::cryptoacc_acquire/release` keep

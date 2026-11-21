@@ -85,6 +85,9 @@ pub enum AesError {
     Poisoned,
     /// xG21/xG24: the SE mailbox flagged a TX or RX protocol error.
     MailboxError,
+    /// xG24: another Secure Engine client of this image (the SE TRNG) holds
+    /// the mailbox, or a timed-out command left it unusable.
+    MailboxBusy,
     /// xG21/xG24: the Secure Engine rejected the command; the value is the
     /// `SE_RESPONSE_*` code (`RX_HEADER[19:16]`), e.g. 7 = invalid parameter.
     SeResponse(u8),
