@@ -218,6 +218,8 @@ pub const fn sink_drop_code(reason: SinkDrop) -> u8 {
         SinkDrop::TableFull => 11,
         SinkDrop::Unsupported => 12,
         SinkDrop::QueueFull => 13,
+        #[cfg(feature = "green-power-involve-tc")]
+        SinkDrop::InvolveTc => 14,
     }
 }
 
@@ -337,6 +339,9 @@ impl<M: MacDriver, R: DeviceRole> ZigbeeDevice<M, R> {
             s.remote.clear();
         });
         self.green_power.sink.set_config(ncp_sink_config());
+        // The NCP is the Trust Center: InvolveTC does not stop it.
+        #[cfg(feature = "green-power-involve-tc")]
+        self.green_power.sink.set_trust_center(true);
     }
 
     /// Register a unicast remote GP request the host sent to `dst` with ZCL

@@ -21181,3 +21181,8 @@ mod gp_translation_tests;
 #[cfg(feature = "green-power-translation-table")]
 #[path = "green_power/local_config.rs"]
 mod gp_local_config;
+
+/// gpsSecurityLevel InvolveTC from the join.
+#[cfg(feature = "green-power-involve-tc")]
+#[path = "green_power/involve_tc.rs"]
+mod gp_involve_tc;

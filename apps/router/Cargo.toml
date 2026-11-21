@@ -44,6 +44,9 @@ green-power-translation-table = [
     "green-power-sink",
     "zigbee-runtime/green-power-translation-table",
 ]
+# gpsSecurityLevel InvolveTC derived from the join; product images must opt
+# in explicitly.
+green-power-involve-tc = ["green-power-sink", "zigbee-runtime/green-power-involve-tc"]
 
 [dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }
