@@ -383,6 +383,24 @@ wire_struct! {
 }
 
 wire_struct! {
+    /// `EVT_SCAN_PROGRESS` (best effort, after each channel of a host scan).
+    pub struct EvtScanProgress {
+        /// TID of the `NWK_ENERGY_SCAN` / `NWK_ACTIVE_SCAN`.
+        pub req_tid: u16,
+        /// 0 energy, 1 active.
+        pub scan: u8,
+        /// The channel just finished.
+        pub channel: u8,
+        /// Channels done, across passes.
+        pub channels_done: u8,
+        /// Channels × passes.
+        pub channels_total: u8,
+        /// Beacons recorded so far (active scan; 0 for an energy scan).
+        pub networks_found: u8,
+    }
+}
+
+wire_struct! {
     /// `EVT_ENERGY_SCAN_RESULT`.
     pub struct EvtEnergyScanResult<'a> {
         /// Request TID.
@@ -423,4 +441,5 @@ message_def! {
     EvtPermitJoinState = ids::EVT_PERMIT_JOIN_STATE, Event;
     EvtChannelChanged = ids::EVT_CHANNEL_CHANGED, Event;
     EvtEnergyScanResult<'a> = ids::EVT_ENERGY_SCAN_RESULT, Event;
+    EvtScanProgress = ids::EVT_SCAN_PROGRESS, Event;
 }

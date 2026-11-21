@@ -30,9 +30,9 @@ use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagResetCounters};
 use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord, LogConfig};
 use zigbee_zrhp::msg::network::{
     EvtChannelChanged, EvtDeviceJoined, EvtDeviceLeft, EvtEnergyScanResult, EvtNetworkState,
-    EvtPermitJoinState, NwkActiveScan, NwkActiveScanRsp, NwkAddEndpoint, NwkChangeChannel,
-    NwkEnergyScan, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkInit, NwkInitRsp, NwkLeaveReset,
-    NwkPermitJoin, NwkSetTxPower, NwkSetTxPowerRsp,
+    EvtPermitJoinState, EvtScanProgress, NwkActiveScan, NwkActiveScanRsp, NwkAddEndpoint,
+    NwkChangeChannel, NwkEnergyScan, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkInit,
+    NwkInitRsp, NwkLeaveReset, NwkPermitJoin, NwkSetTxPower, NwkSetTxPowerRsp,
 };
 use zigbee_zrhp::msg::security::{
     EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey,
@@ -1774,6 +1774,17 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             if let Some(scan) = self.energy_scan.as_mut() {
                 scan.record(channel, result);
                 scan.yielded = true;
+                let (done, total) = scan.progress();
+                let progress = EvtScanProgress {
+                    req_tid: scan.tid,
+                    scan: 0,
+                    channel,
+                    channels_done: done,
+                    channels_total: total,
+                    networks_found: 0,
+                };
+                // Best effort (no retry when the queue is full).
+                self.event(Endpoint::Zigbee, &progress);
             }
             return true;
         }
@@ -1812,6 +1823,17 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             let result = await_out_of_line!(port.active_scan(channel, duration_exp, &mut sink));
             scan.finish_channel(channel, result);
             scan.yielded = true;
+            let (done, total, found) = scan.progress();
+            let progress = EvtScanProgress {
+                req_tid: scan.tid,
+                scan: 1,
+                channel,
+                channels_done: done,
+                channels_total: total,
+                networks_found: found,
+            };
+            // Best effort (no retry when the queue is full).
+            self.event(Endpoint::Zigbee, &progress);
             return true;
         }
         let (status, results) = scan.response();

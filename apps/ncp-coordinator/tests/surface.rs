@@ -43,9 +43,9 @@ use zigbee_zrhp::msg::firmware::{
     FwActivate, FwBegin as FwBeginReq, FwBeginRsp, FwFinishRsp, FwGetSlotsRsp, FwWrite, FwWriteRsp,
 };
 use zigbee_zrhp::msg::network::{
-    EvtChannelChanged, EvtEnergyScanResult, NwkActiveScan, NwkActiveScanRsp, NwkChangeChannel,
-    NwkEnergyScan, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkLeaveReset, NwkSetTxPower,
-    NwkSetTxPowerRsp,
+    EvtChannelChanged, EvtEnergyScanResult, EvtScanProgress, NwkActiveScan, NwkActiveScanRsp,
+    NwkChangeChannel, NwkEnergyScan, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkLeaveReset,
+    NwkSetTxPower, NwkSetTxPowerRsp,
 };
 use zigbee_zrhp::msg::security::{
     SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecGetFrameCountersRsp,
@@ -1739,6 +1739,36 @@ fn energy_scan_tx_power_and_stack_counters() {
         .position(|m| m.kind == Kind::Event && m.msg_id == ids::EVT_ENERGY_SCAN_RESULT)
         .expect("EVT_ENERGY_SCAN_RESULT");
     assert!(response < event, "the result follows the response");
+    // One EVT_SCAN_PROGRESS per measurement (3 channels × 2 passes), all
+    // before the result.
+    let progress: Vec<(usize, EvtScanProgress)> = host
+        .inbox
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.kind == Kind::Event && m.msg_id == ids::EVT_SCAN_PROGRESS)
+        .map(|(i, m)| (i, m.event()))
+        .collect();
+    assert_eq!(progress.len(), 6);
+    assert!(
+        progress
+            .iter()
+            .all(|(i, p)| *i < event && p.req_tid == scan && p.scan == 0)
+    );
+    assert_eq!(
+        progress
+            .iter()
+            .map(|(_, p)| (p.channel, p.channels_done, p.channels_total))
+            .collect::<Vec<_>>(),
+        [
+            (15, 1, 6),
+            (20, 2, 6),
+            (25, 3, 6),
+            (15, 4, 6),
+            (20, 5, 6),
+            (25, 6, 6)
+        ]
+    );
+    while host.event(ids::EVT_SCAN_PROGRESS).is_some() {}
     assert_eq!(host.response(scan).status(), 0);
     assert_eq!(host.response(again).status(), Status::InProgress.to_u8());
     assert_eq!(
@@ -1893,6 +1923,36 @@ fn active_scan_answers_with_every_beacon_and_keeps_the_network() {
         Status::InvalidParameter.to_u8()
     );
     assert_eq!(host.response(busy).status(), Status::InProgress.to_u8());
+    let answered = host
+        .inbox
+        .iter()
+        .position(|m| m.kind == Kind::Response && m.tid == scan)
+        .unwrap();
+    let progress: Vec<(usize, EvtScanProgress)> = host
+        .inbox
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.kind == Kind::Event && m.msg_id == ids::EVT_SCAN_PROGRESS)
+        .map(|(i, m)| (i, m.event()))
+        .collect();
+    assert!(
+        progress
+            .iter()
+            .all(|(i, p)| *i < answered && p.scan == 1 && p.req_tid == scan)
+    );
+    assert_eq!(
+        progress
+            .iter()
+            .map(|(_, p)| (
+                p.channel,
+                p.channels_done,
+                p.channels_total,
+                p.networks_found
+            ))
+            .collect::<Vec<_>>(),
+        [(15, 1, 3, 0), (20, 2, 3, 0), (25, 3, 3, 2)]
+    );
+    while host.event(ids::EVT_SCAN_PROGRESS).is_some() {}
     let response = host.response(scan);
     let beacons: NwkActiveScanRsp = response.body();
     let found: Vec<_> = beacons

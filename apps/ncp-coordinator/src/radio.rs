@@ -32,6 +32,9 @@ pub struct EnergyScan {
     passes_left: u8,
     /// Channels measured at least once.
     measured: u32,
+    /// Measurements done (across passes) and planned.
+    done: u8,
+    total: u8,
     /// Highest energy per channel (index `channel - 11`).
     energy: [u8; 16],
     status: Status,
@@ -60,6 +63,8 @@ impl EnergyScan {
             duration_exp: request.duration_exp,
             passes_left: request.count,
             measured: 0,
+            done: 0,
+            total: (mask.count_ones() * u32::from(request.count)).min(255) as u8,
             energy: [0; 16],
             status: Status::Success,
             yielded: false,
@@ -79,6 +84,7 @@ impl EnergyScan {
     /// scan with its status; channels already measured are reported.
     pub fn record(&mut self, channel: u8, result: Result<u8, OpError>) {
         self.remaining &= !(1 << channel);
+        self.done = self.done.saturating_add(1);
         match result {
             Ok(energy) => {
                 self.measured |= 1 << channel;
@@ -101,6 +107,11 @@ impl EnergyScan {
                 self.remaining = self.mask;
             }
         }
+    }
+
+    /// `EVT_SCAN_PROGRESS` counts: measurements done and planned.
+    pub fn progress(&self) -> (u8, u8) {
+        (self.done, self.total)
     }
 
     /// `EVT_ENERGY_SCAN_RESULT` fields once complete: status and the
@@ -138,6 +149,8 @@ pub struct ActiveScan {
     pub tid: u16,
     remaining: u32,
     duration_exp: u8,
+    done: u8,
+    total: u8,
     results: Vec<ScanResult, MAX_ACTIVE_SCAN_RESULTS>,
     status: Status,
     /// The last pass scanned a channel: let the stack run before the next.
@@ -157,6 +170,8 @@ impl ActiveScan {
             tid,
             remaining: mask,
             duration_exp: request.duration_exp,
+            done: 0,
+            total: mask.count_ones() as u8,
             results: Vec::new(),
             status: Status::Success,
             yielded: false,
@@ -191,6 +206,7 @@ impl ActiveScan {
     /// the beacons heard so far are reported.
     pub fn finish_channel(&mut self, channel: u8, result: Result<(), OpError>) {
         self.remaining &= !(1 << channel);
+        self.done = self.done.saturating_add(1);
         if let Err(error) = result {
             self.status = match error {
                 OpError::Unsupported => Status::UnsupportedCommand,
@@ -199,6 +215,11 @@ impl ActiveScan {
             };
             self.remaining = 0;
         }
+    }
+
+    /// `EVT_SCAN_PROGRESS` counts: channels done, planned, beacons kept.
+    pub fn progress(&self) -> (u8, u8, u8) {
+        (self.done, self.total, self.results.len() as u8)
     }
 
     /// The response: status and the beacons in the order heard.
