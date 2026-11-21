@@ -58,11 +58,6 @@ router = [
     "zigbee-zdo/router",
 ]
 trust-center = ["router", "zigbee-aps/trust-center", "zigbee-bdb/trust-center"]
-# Trust Center Verify-Key hash through the MAC's AES provider instead of
-# software AES (images whose platform AES is a hardware engine and that link
-# no software AES, e.g. the CC2652P7 NCP). Off by default: images without it
-# are unchanged.
-tc-platform-aes = ["trust-center", "zigbee-bdb/platform-aes"]
 # One durably reserved outgoing APS frame counter for every APS-secured frame
 # the coordinator sends (ZRHP decision 2). Kept in the Trust Center journal
 # (record version 5); a version-4 journal migrates on the first start with
