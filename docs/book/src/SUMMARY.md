@@ -57,6 +57,7 @@
 - [Power Management](./advanced/power.md)
 - [NV Storage](./advanced/nv-storage.md)
 - [Security](./advanced/security.md)
+- [Hardware Crypto](./advanced/hardware-crypto.md)
 - [OTA Updates](./advanced/ota.md)
 - [Bootloader Core](./advanced/bootloader.md)
 - [Firmware Size](./advanced/firmware-size.md)

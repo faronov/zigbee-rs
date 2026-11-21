@@ -85,11 +85,11 @@ let out = ccm_star_encrypt_with(&mut cipher /* impl Aes128Forward */, &nonce, &a
 ```
 
 The MAC driver chooses the block cipher through
-`ForwardAesProvider::forward_cipher()`. The default is `SoftwareAesProvider`;
-backends with an AES peripheral (nRF ECB via `hardware-aes-nrf`, ESP32, and the opt-in
-`hardware-aes`/`hardware-aes-bl702`/`hardware-aes-efr32mg1` features) return a
-hardware `Aes128Forward`. AES-MMO (`aes_mmo_hash`) and install-code key
-derivation use the same hook.
+`ForwardAesProvider::forward_cipher()`. Every production backend returns a
+hardware `Aes128Forward`; the software default (`SoftwareAesProvider`) is for
+host tests and the mock simulators. AES-MMO, install-code derivation and the
+Trust Center Verify-Key hash use the same hook. See
+[Hardware Crypto](./hardware-crypto.md) for the per-platform engines.
 
 The CCM\* nonce is built from the security auxiliary header:
 
