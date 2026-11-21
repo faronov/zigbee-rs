@@ -123,6 +123,14 @@ pub(crate) trait SeBus {
     fn bus_address(&self, ptr: *const u8) -> u32;
     /// Open the mailbox bus clock (xG24 `CMU_CLKEN1.SEMAILBOXHOST`).
     fn enable_clock(&mut self) {}
+    /// Take the mailbox from other SE clients of this image (xG24: the SE
+    /// TRNG); [`AesError::MailboxBusy`] if one holds it or it is poisoned.
+    fn lock(&mut self) -> Result<(), AesError> {
+        Ok(())
+    }
+    fn unlock(&mut self) {}
+    /// Mark the mailbox unusable for every client (a command timed out).
+    fn poison_mailbox(&mut self) {}
 }
 
 /// Mailbox protocol, independent of the register transport.
@@ -184,11 +192,34 @@ impl<B: SeBus> SeAes<B> {
         if self.poisoned {
             return Err(AesError::Poisoned);
         }
+        self.bus.lock()?;
+        let result = self.run_locked(key, input, output);
+        if self.poisoned {
+            // Other mailbox clients must not trust it either.
+            self.bus.poison_mailbox();
+        }
+        self.bus.unlock();
+        result
+    }
+
+    fn run_locked(
+        &mut self,
+        key: &[u8; 16],
+        input: &[u8; 16],
+        output: &mut [u8; 16],
+    ) -> Result<(), AesError> {
         let timeout = self.timeout;
         self.bus.enable_clock();
         let bus = &mut self.bus;
         // Nothing is submitted yet: a busy mailbox is a plain timeout.
         poll(timeout, || bus.read(reg::TX_STATUS) & TX_STATUS_TXINT != 0)?;
+        // A response nobody read (left by an earlier client) would be taken
+        // for ours: drain it. A foreign command still in flight cannot
+        // exist: clients are serialized by the mailbox lock, and a command
+        // that timed out poisons the mailbox.
+        if self.bus.read(reg::RX_STATUS) & RX_STATUS_RXINT != 0 {
+            let _ = self.bus.read(reg::RX_HEADER);
+        }
 
         let (auth, data_out) = self.fill(key, input);
         dma_fence();
@@ -378,6 +409,8 @@ mod tests {
         tx_error: bool,
         corrupt: bool,
         clock_enables: u32,
+        locked: bool,
+        mailbox_poisoned: bool,
     }
 
     impl Model {
@@ -396,6 +429,8 @@ mod tests {
                 tx_error: false,
                 corrupt: false,
                 clock_enables: 0,
+                locked: false,
+                mailbox_poisoned: false,
             }
         }
 
@@ -500,6 +535,19 @@ mod tests {
         fn enable_clock(&mut self) {
             self.clock_enables += 1;
         }
+        fn lock(&mut self) -> Result<(), AesError> {
+            if self.locked || self.mailbox_poisoned {
+                return Err(AesError::MailboxBusy);
+            }
+            self.locked = true;
+            Ok(())
+        }
+        fn unlock(&mut self) {
+            self.locked = false;
+        }
+        fn poison_mailbox(&mut self) {
+            self.mailbox_poisoned = true;
+        }
     }
 
     fn engine(timeout: u32) -> SeAes<Model> {
@@ -593,6 +641,41 @@ mod tests {
         // Two KAT commands precede the request after a fault.
         assert_eq!(e.bus.commands, before + 3);
         assert_eq!(out, reference_encrypt(&[1; 16], &[2; 16]));
+    }
+
+    #[test]
+    fn stale_response_is_drained_before_submitting() {
+        let mut e = engine(4);
+        // An unread response with an error code from an earlier client.
+        e.bus_mut().rx_ready = true;
+        e.bus_mut().rx_header = 7 << 16;
+        let mut out = [0; 16];
+        e.encrypt(&[1; 16], &[2; 16], &mut out).unwrap();
+        assert_eq!(out, reference_encrypt(&[1; 16], &[2; 16]));
+    }
+
+    #[test]
+    fn busy_or_poisoned_mailbox_is_refused_and_poison_is_shared() {
+        let mut e = engine(4);
+        e.bus_mut().locked = true;
+        let mut out = [0x66; 16];
+        assert_eq!(
+            e.encrypt(&[1; 16], &[2; 16], &mut out),
+            Err(AesError::MailboxBusy)
+        );
+        assert_eq!(e.bus.commands, 0);
+        e.bus_mut().locked = false;
+        e.bus_mut().never_answer = true;
+        assert_eq!(
+            e.encrypt(&[1; 16], &[2; 16], &mut out),
+            Err(AesError::Timeout)
+        );
+        assert!(
+            e.bus.mailbox_poisoned,
+            "a timeout poisons the shared mailbox"
+        );
+        assert!(!e.bus.locked, "the lock is released after the failure");
+        assert_eq!(out, [0x66; 16]);
     }
 
     #[test]
