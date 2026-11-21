@@ -354,6 +354,8 @@ pub fn active_scan<S: ByteStream>(
             b.channel, b.pan, b.epid, b.src, b.lqi, b.rssi, b.permit, b.stack_profile, b.update_id
         );
     }
+    Ok(())
+}
 
 /// `SYS_SET_CONFIG{coex_tx_priority_mask, coex_enable}` (spec 7.1, 11.5).
 pub fn coex<S: ByteStream>(host: &mut Host<S>, enable: bool, mask: u8) -> Result<(), String> {
