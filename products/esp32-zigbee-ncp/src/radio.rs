@@ -33,6 +33,14 @@ pub const fn energy_to_dbm(energy: u8) -> i8 {
     ((energy as i16 * 105 + 127) / 255 - 100) as i8
 }
 
+/// The RSSI an LQI stands for: zigbee-mac's ESP PHY derives a frame's LQI
+/// from its RSSI linearly over -100..=-20 dBm (`zigbee-mac/src/lqi.rs`
+/// `from_rssi_dbm`); this is its inverse, rounded to the nearest dB. A
+/// signal above -20 dBm reads -20.
+pub const fn lqi_to_dbm(lqi: u8) -> i8 {
+    ((lqi as i16 * 80 + 127) / 255 - 100) as i8
+}
+
 /// MAC counters (`DIAG_GET_COUNTERS` group bit 1, ids `0x0201..`), in id
 /// order: transmissions started (every CSMA-CA attempt), of those with an
 /// ACK request, of those without ACK, failed starts (radio busy or no
@@ -58,6 +66,21 @@ mod tests {
         }
         assert_eq!(energy_to_dbm(0), -100);
         assert_eq!(energy_to_dbm(255), 5);
+    }
+
+    /// zigbee-mac's `lqi::from_rssi_dbm`.
+    fn lqi(dbm: i8) -> u8 {
+        let clamped = i16::from(dbm).clamp(-100, -20);
+        ((clamped + 100) as u16 * 255 / 80) as u8
+    }
+
+    #[test]
+    fn lqi_round_trips_through_the_esp_scale() {
+        for dbm in -100..=-20i8 {
+            assert_eq!(lqi_to_dbm(lqi(dbm)), dbm, "{dbm} dBm");
+        }
+        assert_eq!(lqi_to_dbm(255), -20);
+        assert_eq!(lqi_to_dbm(0), -100);
     }
 
     #[test]

@@ -43,8 +43,9 @@ use zigbee_zrhp::msg::firmware::{
     FwActivate, FwBegin as FwBeginReq, FwBeginRsp, FwFinishRsp, FwGetSlotsRsp, FwWrite, FwWriteRsp,
 };
 use zigbee_zrhp::msg::network::{
-    EvtChannelChanged, EvtEnergyScanResult, NwkChangeChannel, NwkEnergyScan, NwkForm,
-    NwkGetInfoRsp, NwkGroupMembership, NwkLeaveReset, NwkSetTxPower, NwkSetTxPowerRsp,
+    EvtChannelChanged, EvtEnergyScanResult, EvtScanProgress, NwkActiveScan, NwkActiveScanRsp,
+    NwkChangeChannel, NwkEnergyScan, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkLeaveReset,
+    NwkSetTxPower, NwkSetTxPowerRsp,
 };
 use zigbee_zrhp::msg::security::{
     SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecGetFrameCountersRsp,
@@ -363,6 +364,9 @@ impl NcpPlatform for FakePlatform {
     fn energy_to_dbm(&self, energy: u8) -> i8 {
         energy as i8 - 100
     }
+    fn lqi_to_dbm(&self, lqi: u8) -> i8 {
+        (lqi / 4) as i8 - 100
+    }
     fn visit_counters(&self, group_mask: u8, sink: &mut dyn FnMut(u16, u32)) {
         if group_mask & 0x02 != 0 {
             // As the ESP32 product: eight MAC counters.
@@ -510,6 +514,7 @@ macro_rules! setup {
             caps::GROUP_MEMBERSHIP,
             caps::ENERGY_SCAN,
             caps::TX_POWER,
+            caps::ACTIVE_SCAN,
         ] {
             assert_ne!(negotiated.ncp_caps & bit, 0, "capability {bit:#x}");
         }
@@ -1734,6 +1739,36 @@ fn energy_scan_tx_power_and_stack_counters() {
         .position(|m| m.kind == Kind::Event && m.msg_id == ids::EVT_ENERGY_SCAN_RESULT)
         .expect("EVT_ENERGY_SCAN_RESULT");
     assert!(response < event, "the result follows the response");
+    // One EVT_SCAN_PROGRESS per measurement (3 channels × 2 passes), all
+    // before the result.
+    let progress: Vec<(usize, EvtScanProgress)> = host
+        .inbox
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.kind == Kind::Event && m.msg_id == ids::EVT_SCAN_PROGRESS)
+        .map(|(i, m)| (i, m.event()))
+        .collect();
+    assert_eq!(progress.len(), 6);
+    assert!(
+        progress
+            .iter()
+            .all(|(i, p)| *i < event && p.req_tid == scan && p.scan == 0)
+    );
+    assert_eq!(
+        progress
+            .iter()
+            .map(|(_, p)| (p.channel, p.channels_done, p.channels_total))
+            .collect::<Vec<_>>(),
+        [
+            (15, 1, 6),
+            (20, 2, 6),
+            (25, 3, 6),
+            (15, 4, 6),
+            (20, 5, 6),
+            (25, 6, 6)
+        ]
+    );
+    while host.event(ids::EVT_SCAN_PROGRESS).is_some() {}
     assert_eq!(host.response(scan).status(), 0);
     assert_eq!(host.response(again).status(), Status::InProgress.to_u8());
     assert_eq!(
@@ -1826,4 +1861,142 @@ fn energy_scan_tx_power_and_stack_counters() {
     let mut ids: Vec<u16> = all.iter().map(|(id, _)| *id).collect();
     ids.dedup();
     assert_eq!(ids.len(), all.len());
+}
+
+fn neighbour_beacon(channel: u8, src: u16) -> zigbee_mac::primitives::PanDescriptor {
+    use zigbee_mac::primitives::{PanDescriptor, SuperframeSpec, ZigbeeBeaconPayload};
+    PanDescriptor {
+        channel,
+        coord_address: zigbee_types::MacAddress::Short(
+            zigbee_types::PanId(0x4D2A),
+            zigbee_types::ShortAddress(src),
+        ),
+        superframe_spec: SuperframeSpec {
+            association_permit: true,
+            ..Default::default()
+        },
+        lqi: 160,
+        security_use: false,
+        zigbee_beacon: ZigbeeBeaconPayload {
+            protocol_id: 0,
+            stack_profile: 2,
+            protocol_version: 2,
+            router_capacity: true,
+            device_depth: 1,
+            end_device_capacity: true,
+            extended_pan_id: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            tx_offset: [0xFF; 3],
+            update_id: 7,
+        },
+    }
+}
+
+#[test]
+fn active_scan_answers_with_every_beacon_and_keeps_the_network() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    {
+        let mac = TcApp::device_mut(port.app_mut())
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut();
+        mac.add_beacon(neighbour_beacon(25, 0x0000));
+        mac.add_beacon(neighbour_beacon(25, 0x1234));
+    }
+    let channels = (1 << 15) | (1 << 20) | (1 << 25);
+    let bad = host.request(&NwkActiveScan {
+        channel_mask: channels,
+        duration_exp: 7,
+    });
+    let scan = host.request(&NwkActiveScan {
+        channel_mask: channels,
+        duration_exp: 3,
+    });
+    let busy = host.request(&NwkEnergyScan {
+        channel_mask: channels,
+        duration_exp: 2,
+        count: 1,
+    });
+    exchange!();
+    exchange!();
+    assert_eq!(
+        host.response(bad).status(),
+        Status::InvalidParameter.to_u8()
+    );
+    assert_eq!(host.response(busy).status(), Status::InProgress.to_u8());
+    let answered = host
+        .inbox
+        .iter()
+        .position(|m| m.kind == Kind::Response && m.tid == scan)
+        .unwrap();
+    let progress: Vec<(usize, EvtScanProgress)> = host
+        .inbox
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.kind == Kind::Event && m.msg_id == ids::EVT_SCAN_PROGRESS)
+        .map(|(i, m)| (i, m.event()))
+        .collect();
+    assert!(
+        progress
+            .iter()
+            .all(|(i, p)| *i < answered && p.scan == 1 && p.req_tid == scan)
+    );
+    assert_eq!(
+        progress
+            .iter()
+            .map(|(_, p)| (
+                p.channel,
+                p.channels_done,
+                p.channels_total,
+                p.networks_found
+            ))
+            .collect::<Vec<_>>(),
+        [(15, 1, 3, 0), (20, 2, 3, 0), (25, 3, 3, 2)]
+    );
+    while host.event(ids::EVT_SCAN_PROGRESS).is_some() {}
+    let response = host.response(scan);
+    let beacons: NwkActiveScanRsp = response.body();
+    let found: Vec<_> = beacons
+        .results
+        .iter()
+        .map(|b| {
+            (
+                b.channel,
+                b.pan,
+                b.epid,
+                b.src,
+                b.lqi,
+                b.rssi,
+                b.permit,
+                b.stack_profile,
+                b.update_id,
+            )
+        })
+        .collect();
+    let epid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    assert_eq!(
+        found,
+        [
+            (25, 0x4D2A, epid, 0x0000, 160, -60, 1, 2, 7),
+            (25, 0x4D2A, epid, 0x1234, 160, -60, 1, 2, 7),
+        ]
+    );
+
+    // With the network up: the radio is back on the operating channel.
+    let form = host.request(&form_request(0x2B35, 1 << 20));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let scan = host.request(&NwkActiveScan {
+        channel_mask: channels,
+        duration_exp: 3,
+    });
+    exchange!();
+    exchange!();
+    let response = host.response(scan);
+    let beacons: NwkActiveScanRsp = response.body();
+    assert_eq!(beacons.results.len(), 2);
+    assert_eq!(port.info().channel, 20);
+    assert_eq!(
+        port.info().state,
+        ncp_coordinator_app::port::NetworkState::Up
+    );
 }

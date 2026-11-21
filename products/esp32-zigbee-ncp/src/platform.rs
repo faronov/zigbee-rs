@@ -300,6 +300,10 @@ impl<F: OtaFlash, S: SettingsStore> NcpPlatform for Platform<F, S> {
         crate::radio::energy_to_dbm(energy)
     }
 
+    fn lqi_to_dbm(&self, lqi: u8) -> i8 {
+        crate::radio::lqi_to_dbm(lqi)
+    }
+
     fn visit_counters(&self, group_mask: u8, sink: &mut dyn FnMut(u16, u32)) {
         if let (true, Some((read, base))) = (group_mask & 0x02 != 0, self.mac_counters) {
             for ((id, now), base) in (0x0201..).zip(read()).zip(base) {

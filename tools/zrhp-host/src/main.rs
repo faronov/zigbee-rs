@@ -1538,6 +1538,17 @@ fn main() {
                 .map_err(|_| "COUNT")?;
             checks::energy_scan(&mut host, mask, exp, count)?;
         }
+        if let Some(spec) = value("--active-scan") {
+            // 0xMASK[,EXP]
+            let parts: Vec<&str> = spec.split(',').collect();
+            let mask = u32::from_str_radix(parts[0].trim_start_matches("0x"), 16)
+                .map_err(|_| "--active-scan 0xMASK[,EXP]")?;
+            let exp = parts
+                .get(1)
+                .map_or(Ok(3), |v| v.parse())
+                .map_err(|_| "EXP")?;
+            checks::active_scan(&mut host, mask, exp)?;
+        }
         if let Some(dbm) = value("--tx-power") {
             let dbm = dbm.parse().map_err(|_| "--tx-power DBM")?;
             checks::tx_power(&mut host, dbm)?;

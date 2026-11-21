@@ -10,8 +10,8 @@ use zigbee_zrhp::msg::diag::{
 use zigbee_zrhp::msg::diag::{DiagGetCounters, DiagGetCountersRsp};
 use zigbee_zrhp::msg::ids;
 use zigbee_zrhp::msg::network::{
-    EvtChannelChanged, EvtEnergyScanResult, NwkChangeChannel, NwkEnergyScan, NwkGetInfoRsp,
-    NwkGroupMembership, NwkSetTxPower, NwkSetTxPowerRsp,
+    EvtChannelChanged, EvtEnergyScanResult, NwkActiveScan, NwkActiveScanRsp, NwkChangeChannel,
+    NwkEnergyScan, NwkGetInfoRsp, NwkGroupMembership, NwkSetTxPower, NwkSetTxPowerRsp,
 };
 use zigbee_zrhp::msg::security::{SecAddInstallCode, SecAddInstallCodeRsp};
 use zigbee_zrhp::msg::system::{EvtNcpReady, SysEcho, SysReset};
@@ -326,6 +326,33 @@ pub fn counters<S: ByteStream>(host: &mut Host<S>, group_mask: u8) -> Result<(),
     println!("DIAG_GET_COUNTERS 0x{group_mask:02X}:");
     for c in counters.counters.iter() {
         println!("  0x{:04X} = {}", c.id, c.value);
+    }
+    Ok(())
+}
+
+/// `NWK_ACTIVE_SCAN` of `channel_mask` (synchronous response).
+pub fn active_scan<S: ByteStream>(
+    host: &mut Host<S>,
+    channel_mask: u32,
+    duration_exp: u8,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let tid = host.request(&NwkActiveScan {
+        channel_mask,
+        duration_exp,
+    });
+    let rsp = host.response(tid)?;
+    println!(
+        "NWK_ACTIVE_SCAN 0x{channel_mask:08X} exp {duration_exp}: {:?} after {:?}",
+        rsp.status(),
+        started.elapsed()
+    );
+    let beacons: NwkActiveScanRsp = body(&rsp)?;
+    for b in beacons.results.iter() {
+        println!(
+            "  channel {:2} pan 0x{:04X} epid {:02X?} src 0x{:04X} lqi {:3} rssi {:4} permit {} profile {} update {}",
+            b.channel, b.pan, b.epid, b.src, b.lqi, b.rssi, b.permit, b.stack_profile, b.update_id
+        );
     }
     Ok(())
 }
