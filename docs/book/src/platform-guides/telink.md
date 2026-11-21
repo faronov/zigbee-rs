@@ -630,6 +630,39 @@ Cost against the base, with every stack and layout gate passing:
 On the routers the larger `.ram_code` moves `.data` up by one 256 B
 step.
 
+The fixed router was then checked with the Nucleo-WB55 itself. The
+Nucleo's journals were erased before each attempt and permit-join was
+opened on 0x045B only. There were 10 fresh joins (7 with the WB55's
+hardware AES image, 3 with software AES), 14 associations in total,
+counting re-associations. All 14 went through 0x045B. The router ACKed
+the WB55's polls 178-187 us after the frame (median 183 us), always with
+FP=1, and the WB55 never moved to another parent. One of 15 polls got no
+ACK; the WB55's retry 1.8 ms later was ACKed. Every join delivered the
+network key, and every join ended with Confirm-Key SUCCESS.
+
+Four of the 14 associations still waited 15 s for the unique TCLK,
+then left and associated again. All four had the same pattern:
+
+- 0x045B gave the WB55 the short address it had held before the
+  journal erase. A parent reuses the address of an IEEE address still
+  in its neighbor table (`handle_child_association`).
+- The WB55 sent its Request-Key straight to another vendor's router
+  (0x43FD or 0xD586). That router MAC-ACKed it and never relayed it.
+
+Every other association reached the Trust Center. With a reused
+address and Request-Key routed through 0x045B or 0x7D2D, it got through
+3 of 3 times. With a new address it got through 6 of 6 times, once only
+on the second try, after 0xF020 did not relay the first. Erasing the journals resets
+the WB55's outgoing NWK frame counter. Those routers evidently keep the
+incoming counter of a neighbor under its short address, so they treat
+frames from the old address as replays. 0x045B relays them, because a
+new association resets its replay state for the child. This is not
+caused by the ACK path. A real device that loses its NV after a factory
+reset can hit it too. The WB55 recovers on its own by leaving and
+associating again, and then gets a new address. Allocating a fresh
+address on every MAC association would avoid the problem, but it would
+give up the reuse of a known child's address, so it was not adopted.
+
 ### Trust Center rejoin
 
 The `lab-rejoin-trigger` feature (off in production) exposes
