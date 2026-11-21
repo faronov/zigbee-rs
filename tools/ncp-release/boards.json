@@ -1,0 +1,32 @@
+[
+  {
+    "name": "h2-usj",
+    "id": "esp32h2-devkit-ncp",
+    "title": "ESP32-H2 DevKit: ZRHP NCP",
+    "chip": "esp32h2",
+    "chip_family": "ESP32-H2",
+    "features": "esp32h2,transport-usj",
+    "transport": "USB-Serial-JTAG (the DevKit's \"USB\" port), any baud rate",
+    "connect": "Connect the DevKit's \"USB\" port (native USB-Serial-JTAG), not the \"UART\" port."
+  },
+  {
+    "name": "c6-usj",
+    "id": "esp32c6-devkit-ncp",
+    "title": "ESP32-C6 DevKit: ZRHP NCP",
+    "chip": "esp32c6",
+    "chip_family": "ESP32-C6",
+    "features": "esp32c6,transport-usj",
+    "transport": "USB-Serial-JTAG (the DevKit's \"USB\" port), any baud rate",
+    "connect": "Connect the DevKit's \"USB\" port (native USB-Serial-JTAG), not the \"UART\" port."
+  },
+  {
+    "name": "h2-br",
+    "id": "thread-br-h2-ncp",
+    "title": "Espressif Thread Border Router board, H2: ZRHP NCP",
+    "chip": "esp32h2",
+    "chip_family": "ESP32-H2",
+    "features": "esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines",
+    "transport": "UART0 to the S3, 921600 8N1 with RTS/CTS on the reserved R19/R20 lines",
+    "connect": "Flash through the H2's own USB port (USB1, USB-Serial-JTAG). The NCP then talks to the S3 over UART; the hub (or tbr-bridge) on the S3 is its host."
+  }
+]

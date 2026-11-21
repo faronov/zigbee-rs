@@ -25,11 +25,19 @@ class PagesTests(unittest.TestCase):
         self.firmware.mkdir()
         for name in ("esp32c6-sensor.bin", "esp32h2-sensor.bin"):
             (self.firmware / name).write_bytes(b"artifact")
-        self.template = ROOT / "docs/flasher/index.html"
+        self.template = ROOT / "docs/flasher"
+        self.releases = self.root / "releases"
+        (self.releases / "releases" / "ncp-v0.1.0").mkdir(parents=True)
+        (self.releases / "releases" / "ncp-v0.1.0" / "app.bin").write_bytes(b"release")
+        (self.releases / "releases.json").write_text('{"schema": 1, "products": []}')
+        self.esp_web_tools = self.root / "ewt"
+        self.esp_web_tools.mkdir()
+        (self.esp_web_tools / "install-button.js").write_text("// bundle")
 
     def prepare(self, output, results):
         PAGES.prepare(
             self.book, self.template, self.firmware, output, REVISION, 123, results,
+            self.releases, self.esp_web_tools,
         )
 
     def test_all_result_combinations_fail_closed(self):
@@ -38,12 +46,17 @@ class PagesTests(unittest.TestCase):
             with self.subTest(results=results):
                 output = self.root / f"site-{index}"
                 self.prepare(output, results)
-                flasher = output / "flasher"
+                site = output / "flasher"
+                flasher = site / "sensor"
                 available = all(value == "success" for value in values)
                 manifest = json.loads((flasher / "manifest.json").read_text())
                 metadata = json.loads((flasher / "status.json").read_text())
                 html = (flasher / "index.html").read_text()
                 self.assertEqual((output / "index.html").read_text(), "documentation")
+                self.assertIn(REVISION, (site / "index.html").read_text())
+                self.assertEqual((site / "releases/ncp-v0.1.0/app.bin").read_bytes(), b"release")
+                self.assertTrue((site / "vendor/esp-web-tools/install-button.js").is_file())
+                self.assertTrue((site / "releases.json").is_file())
                 self.assertEqual(metadata["firmware_available"], available)
                 self.assertEqual(metadata["firmware_jobs"], results)
                 self.assertEqual(manifest["version"], REVISION)

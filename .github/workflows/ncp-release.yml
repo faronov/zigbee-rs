@@ -1,0 +1,199 @@
+name: NCP release
+
+# Tagged ZRHP NCP release: `git tag ncp-v0.1.0 && git push origin ncp-v0.1.0`.
+#
+# The tag must match `examples/esp32-ncp/Cargo.toml` (the version the
+# firmware reports in its app descriptor, SYS_GET_INFO.fw_version and FW_*);
+# a tag with a suffix (`ncp-v0.2.0-rc.1`) needs the same Cargo version and
+# makes a pre-release. Per board (tools/ncp-release/boards.json) the release
+# carries the full 4 MB flash image, bootloader, partition table, blank
+# otadata, app, the FW_* update file, release-manifest.json (the web
+# flasher's input) and SHA256SUMS. Builds are reproducible from the tag:
+# pinned toolchain and espflash, --locked, no build cache, SOURCE_DATE_EPOCH
+# and ZRHP_BUILD_ID from the commit.
+#
+# FW_* update files are signed only when the repository secret
+# NCP_FW_SIGNING_KEY (PEM, ECDSA P-256, the key behind
+# bootloaders/keys/own-ec-p256.xy.hex) exists. Without it the update file is
+# the plain app image, which shipped NCP firmware refuses over FW_* (only
+# `dev-unsigned-fw` builds accept it); serial flashing is unaffected.
+#
+# After publishing, the Pages site (web flasher) is rebuilt through
+# site-refresh.yml on master.
+
+on:
+    push:
+        tags: ['ncp-v*']
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ncp-release-${{ github.ref }}
+    cancel-in-progress: false
+
+env:
+    CARGO_TERM_COLOR: always
+    ESP_PHY_RUST_TOOLCHAIN: nightly-2026-08-01
+    ESPFLASH_VERSION: 4.5.0
+    IMGTOOL_VERSION: 2.4.0
+
+jobs:
+    meta:
+        name: Tag and version
+        runs-on: ubuntu-latest
+        outputs:
+            version: ${{ steps.meta.outputs.version }}
+            prerelease: ${{ steps.meta.outputs.prerelease }}
+            matrix: ${{ steps.meta.outputs.matrix }}
+            epoch: ${{ steps.meta.outputs.epoch }}
+        steps:
+            - uses: actions/checkout@v4
+            - id: meta
+              run: |
+                  set -euo pipefail
+                  tag="${GITHUB_REF_NAME}"
+                  version="${tag#ncp-v}"
+                  if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+                    echo "::error::tag $tag is not ncp-vMAJOR.MINOR.PATCH[-PRE]"; exit 1
+                  fi
+                  cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' examples/esp32-ncp/Cargo.toml | head -1)
+                  if [ "$cargo_version" != "$version" ]; then
+                    echo "::error::tag $tag but examples/esp32-ncp/Cargo.toml has version $cargo_version"; exit 1
+                  fi
+                  grep -q "^name = \"esp32-ncp\"" examples/esp32-ncp/Cargo.lock
+                  awk '/^name = "esp32-ncp"$/{getline; print}' examples/esp32-ncp/Cargo.lock | grep -qx "version = \"$version\"" \
+                    || { echo "::error::examples/esp32-ncp/Cargo.lock is not at $version (cargo update -p esp32-ncp)"; exit 1; }
+                  echo "version=$version" >>"$GITHUB_OUTPUT"
+                  echo "prerelease=$([[ "$version" == *-* ]] && echo true || echo false)" >>"$GITHUB_OUTPUT"
+                  echo "matrix=$(python3 tools/ncp-release/esp_release.py boards)" >>"$GITHUB_OUTPUT"
+                  echo "epoch=$(git log -1 --format=%ct)" >>"$GITHUB_OUTPUT"
+
+    build:
+        name: ${{ matrix.name }}
+        needs: meta
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: true
+            matrix:
+                include: ${{ fromJSON(needs.meta.outputs.matrix) }}
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@master
+              with:
+                  toolchain: ${{ env.ESP_PHY_RUST_TOOLCHAIN }}
+                  targets: riscv32imac-unknown-none-elf
+                  components: rust-src
+            - uses: taiki-e/install-action@v2
+              with:
+                  tool: espflash@${{ env.ESPFLASH_VERSION }}
+            - name: Build
+              working-directory: examples/esp32-ncp
+              env:
+                  ZRHP_BUILD_ID: ${{ github.sha }}
+                  # esp-bootloader-esp-idf 0.4 reads SOURCE_DATE_EPOCH as
+                  # microseconds (app descriptor time and date).
+                  EPOCH: ${{ needs.meta.outputs.epoch }}
+              run: |
+                  export ZRHP_BUILD_ID="${ZRHP_BUILD_ID:0:16}"
+                  export SOURCE_DATE_EPOCH=$((EPOCH * 1000000))
+                  cargo build --release --locked --bin esp32-ncp -Z build-std=core,alloc \
+                    --no-default-features --features "${{ matrix.features }}"
+            - name: Assemble images
+              run: |
+                  python3 tools/ncp-release/esp_release.py assemble --board "${{ matrix.name }}" \
+                    --elf examples/esp32-ncp/target/riscv32imac-unknown-none-elf/release/esp32-ncp \
+                    --stem "zrhp-ncp-${{ matrix.name }}-${{ needs.meta.outputs.version }}" \
+                    --out "out/${{ matrix.name }}" --expect-version "${{ needs.meta.outputs.version }}"
+            - name: Sign the FW_* update file
+              env:
+                  NCP_FW_SIGNING_KEY: ${{ secrets.NCP_FW_SIGNING_KEY }}
+              run: |
+                  set -euo pipefail
+                  if [ -z "$NCP_FW_SIGNING_KEY" ]; then
+                    echo "::warning::NCP_FW_SIGNING_KEY is not set: the FW_* update file is the unsigned app image"
+                    exit 0
+                  fi
+                  python3 -m venv "$RUNNER_TEMP/imgtool"
+                  "$RUNNER_TEMP/imgtool/bin/pip" install --quiet "imgtool==${IMGTOOL_VERSION}"
+                  export PATH="$RUNNER_TEMP/imgtool/bin:$PATH"
+                  key="$RUNNER_TEMP/ncp-fw.pem"
+                  (umask 077 && printf '%s\n' "$NCP_FW_SIGNING_KEY" >"$key")
+                  trap 'rm -f "$key"' EXIT
+                  python3 tools/ncp-release/esp_release.py sign --dir "out/${{ matrix.name }}" \
+                    --key "$key" --version "${{ needs.meta.outputs.version }}"
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: ncp-${{ matrix.name }}
+                  path: out/${{ matrix.name }}/
+                  if-no-files-found: error
+
+    release:
+        name: GitHub release
+        needs: [meta, build]
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+            actions: write
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+            - uses: actions/download-artifact@v4
+              with:
+                  pattern: ncp-*
+                  path: boards
+            - name: Release manifest and checksums
+              env:
+                  VERSION: ${{ needs.meta.outputs.version }}
+              run: |
+                  set -euo pipefail
+                  toolchain=$(jq -cn --arg rust "$ESP_PHY_RUST_TOOLCHAIN" --arg espflash "$ESPFLASH_VERSION" \
+                    '{rust: $rust, espflash: $espflash}')
+                  python3 tools/ncp-release/esp_release.py manifest --dirs boards/ncp-* --out dist \
+                    --tag "$GITHUB_REF_NAME" --version "$VERSION" --commit "$GITHUB_SHA" \
+                    --date "$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)" \
+                    --toolchain "$toolchain"
+                  ls -l dist
+            - name: Release notes
+              env:
+                  VERSION: ${{ needs.meta.outputs.version }}
+              run: |
+                  set -euo pipefail
+                  python3 - <<'EOF' >notes.md
+                  import json, os
+                  m = json.load(open("dist/release-manifest.json"))
+                  print(f"ZRHP NCP {m['version']} (ZRHP {m['zrhp']['protocol']}), commit `{m['commit'][:12]}`, build_id `{m['build_id']}`.\n")
+                  print("**Web flasher:** https://faronov.github.io/zigbee-rs/flasher/ (Chrome or Edge; updates keep the Zigbee network unless you choose to erase).\n")
+                  print("| Board | Chip | Full flash image (offset 0x0, erases the network) | App (update, offset 0x10000) | FW_* update |")
+                  print("|---|---|---|---|---|")
+                  for b in m["boards"]:
+                      fw = b["fw_update"]
+                      print(f"| {b['title']} | {b['chip_family']} | `{b['files']['merged']['name']}` | `{b['files']['app']['name']}` | "
+                            f"`{fw['file']['name']}` ({'signed' if fw['signed'] else 'unsigned: dev firmware only'}) |")
+                  print("\nWith esptool (v5: `write-flash`; v4: `write_flash`). Factory-new NCP, wipes the stored network:")
+                  print("```\nesptool --chip <esp32h2|esp32c6> --port <PORT> write-flash 0x0 <...-merged.bin>\n```")
+                  print("Update keeping the network (also resets `otadata` so the new app in ota_0 boots):")
+                  print("```\nesptool --chip <chip> --port <PORT> write-flash 0x0 <...-bootloader.bin> 0x8000 <...-partition-table.bin> 0x9000 <...-otadata-blank.bin> 0x10000 <...-app.bin>\n```")
+                  print("Verify downloads with `SHA256SUMS`. `release-manifest.json` describes every image (offsets, layout, versions).\n")
+                  EOF
+                  prev=$(git tag --list 'ncp-v*' --sort=-v:refname | grep -vx "$GITHUB_REF_NAME" | head -1 || true)
+                  echo "previous tag: ${prev:-none}"
+                  echo "prev=$prev" >>"$GITHUB_ENV"
+                  cat notes.md
+            - name: Publish
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+              run: |
+                  set -euo pipefail
+                  args=(--verify-tag --title "ZRHP NCP ${{ needs.meta.outputs.version }}" --notes-file notes.md --generate-notes)
+                  [ -n "$prev" ] && args+=(--notes-start-tag "$prev")
+                  [ "$PRERELEASE" = true ] && args+=(--prerelease)
+                  gh release create "$GITHUB_REF_NAME" "${args[@]}" dist/*
+            - name: Rebuild the web flasher
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  gh workflow run site-refresh.yml --ref master -f reason="$GITHUB_REF_NAME" \
+                    || echo "::warning::could not start site-refresh.yml on master; run it by hand"

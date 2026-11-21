@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Assemble documentation, publishing firmware only when every required job passes."""
+"""Assemble the Pages site: the book, the release web flasher and the CI
+sensor flasher, publishing sensor firmware only when every required job passes.
+
+Layout of the site:
+  /                     the mdBook
+  /flasher/             release flasher (docs/flasher/index.html), images of
+                        tagged releases (tools/flasher_site.py fetch) and a
+                        vendored ESP Web Tools
+  /flasher/sensor/      CI sensor flasher (docs/flasher/sensor.html)
+"""
 
 from __future__ import annotations
 
@@ -32,6 +41,8 @@ def prepare(
     revision: str,
     run_id: int,
     results: dict[str, str],
+    releases: Path,
+    esp_web_tools: Path,
 ) -> None:
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None or run_id <= 0:
         raise ValueError("expected a full commit SHA and positive workflow run ID")
@@ -43,6 +54,10 @@ def prepare(
         raise ValueError("refusing to reuse a site directory with potentially stale firmware")
     if not (book / "index.html").is_file() or (book / "flasher").exists():
         raise ValueError("expected a built book without the reserved flasher directory")
+    if not (releases / "releases.json").is_file():
+        raise ValueError("expected fetched releases (tools/flasher_site.py fetch)")
+    if not (esp_web_tools / "install-button.js").is_file():
+        raise ValueError("expected the ESP Web Tools web bundle (dist/web)")
 
     available = all(result == "success" for result in results.values())
     files = [f"{chip.lower().replace('-', '')}-sensor.bin" for chip in CHIPS]
@@ -69,7 +84,7 @@ def prepare(
         if available else
         '<button disabled>Prebuilt firmware unavailable</button>'
     )
-    template = replace_slot(flasher.read_text(), "PREBUILT_INSTALL", button)
+    template = replace_slot((flasher / "sensor.html").read_text(), "PREBUILT_INSTALL", button)
     template = replace_slot(template, "PREBUILT_STATUS", status)
     manifest = {
         "name": "Zigbee-RS Sensor Firmware",
@@ -86,7 +101,15 @@ def prepare(
         "firmware_jobs": results,
     }
     shutil.copytree(book, output)
-    destination = output / "flasher"
+    site = output / "flasher"
+    site.mkdir()
+    page = (flasher / "index.html").read_text()
+    page = page.replace("@REVISION@", revision).replace("@RUN_URL@", run_url)
+    (site / "index.html").write_text(page)
+    shutil.copyfile(releases / "releases.json", site / "releases.json")
+    shutil.copytree(releases / "releases", site / "releases")
+    shutil.copytree(esp_web_tools, site / "vendor" / "esp-web-tools")
+    destination = site / "sensor"
     destination.mkdir()
     (destination / "index.html").write_text(template)
     (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -100,7 +123,7 @@ def prepare(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("book", "flasher", "firmware", "output"):
+    for name in ("book", "flasher", "firmware", "output", "releases", "esp-web-tools"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--run-id", type=int, required=True)
@@ -112,6 +135,7 @@ def main() -> None:
             args.book, args.flasher, args.firmware, args.output,
             args.revision, args.run_id,
             {chip: getattr(args, f"{chip}_result") for chip in ("esp32c6", "esp32h2", "bl702")},
+            args.releases, args.esp_web_tools,
         )
     except (OSError, ValueError) as error:
         parser.exit(1, f"Cannot assemble Pages site: {error}\n")

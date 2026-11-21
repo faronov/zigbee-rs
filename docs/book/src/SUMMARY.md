@@ -7,6 +7,7 @@
 # Getting Started
 
 - [Quick Start](./getting-started/quickstart.md)
+- [Web Flasher](./getting-started/web-flasher.md)
 - [Your First Device](./getting-started/first-device.md)
 - [Architecture Overview](./getting-started/architecture.md)
 

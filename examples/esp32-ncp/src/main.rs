@@ -221,7 +221,7 @@ fn main() -> ! {
     );
     let identity = NcpIdentity {
         fw_version: env!("CARGO_PKG_VERSION"),
-        build_id: [0; 8],
+        build_id: BUILD_ID,
         chip: product::CHIP,
         chip_rev: 0,
         flash_size: verdict.reported_size(),
@@ -681,4 +681,31 @@ fn radio_watch(now_us: u64) {
             state
         );
     }
+}
+
+/// `SYS_GET_INFO.build_id`: the first 8 bytes of the source commit, which
+/// the release workflow passes as `ZRHP_BUILD_ID` (16 hex digits); zero in
+/// other builds.
+const BUILD_ID: [u8; 8] = match option_env!("ZRHP_BUILD_ID") {
+    Some(hex) => parse_build_id(hex.as_bytes()),
+    None => [0; 8],
+};
+
+const fn parse_build_id(hex: &[u8]) -> [u8; 8] {
+    const fn nibble(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => panic!("ZRHP_BUILD_ID: not a hex digit"),
+        }
+    }
+    assert!(hex.len() == 16, "ZRHP_BUILD_ID: expected 16 hex digits");
+    let mut id = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        id[i] = nibble(hex[2 * i]) << 4 | nibble(hex[2 * i + 1]);
+        i += 1;
+    }
+    id
 }

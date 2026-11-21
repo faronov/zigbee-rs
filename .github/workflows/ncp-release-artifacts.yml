@@ -1,14 +1,18 @@
 name: NCP release artifacts
 
-# Flashable ZRHP NCP images for testers (not a release): ESP32-H2 and ESP32-C6 DevKits over their native
-# USB-Serial-JTAG port, plus the Espressif Thread Border Router board (H2 side, UART 921 600 RTS/CTS).
+# Flashable ZRHP NCP images of any ref as a CI artifact (not a release; tagged
+# releases come from ncp-release.yml and are what the web flasher serves):
+# the boards of tools/ncp-release/boards.json (ESP32-H2 and ESP32-C6 DevKits
+# over their native USB-Serial-JTAG port, the Espressif Thread Border Router
+# board's H2 on UART 921 600 RTS/CTS).
 #
 # Each image directory holds:
 #   *-merged.bin           full 4 MB flash image: `esptool --chip <chip> write-flash 0x0 <file>` (wipes the Zigbee state)
 #   *-bootloader.bin       second-stage bootloader            @ 0x0
 #   *-partition-table.bin  partition table (esp32h2-ncp-4mb)  @ 0x8000
+#   *-otadata-blank.bin    blank otadata (boot ota_0)         @ 0x9000
 #   *-app.bin              NCP application (ota_0)            @ 0x10000
-#   FLASHING.txt, SHA256SUMS
+#   board.json, FLASHING.txt, SHA256SUMS
 # The bootloader is espflash's bundled ESP-IDF bootloader (no A/B rollback; FW_* rollback needs
 # products/esp32-zigbee-ncp/bootloader, built with ESP-IDF v5.5.1).
 
@@ -30,25 +34,25 @@ env:
     ESPFLASH_VERSION: 4.5.0
 
 jobs:
+    matrix:
+        runs-on: ubuntu-latest
+        outputs:
+            boards: ${{ steps.boards.outputs.boards }}
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: ${{ inputs.ref || github.ref }}
+            - id: boards
+              run: echo "boards=$(python3 tools/ncp-release/esp_release.py boards)" >>"$GITHUB_OUTPUT"
+
     build:
         name: ${{ matrix.name }}
+        needs: matrix
         runs-on: ubuntu-latest
         strategy:
             fail-fast: false
             matrix:
-                include:
-                    - name: h2-usj
-                      chip: esp32h2
-                      features: esp32h2,transport-usj
-                      board: 'ESP32-H2 DevKit, native USB-Serial-JTAG port ("USB")'
-                    - name: c6-usj
-                      chip: esp32c6
-                      features: esp32c6,transport-usj
-                      board: 'ESP32-C6 DevKit, native USB-Serial-JTAG port ("USB")'
-                    - name: h2-br
-                      chip: esp32h2
-                      features: esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines
-                      board: 'Espressif Thread Border Router board, H2 side, UART0 921600 8N1 RTS/CTS (R19/R20)'
+                include: ${{ fromJSON(needs.matrix.outputs.boards) }}
         steps:
             - uses: actions/checkout@v4
               with:
@@ -69,54 +73,23 @@ jobs:
               working-directory: examples/esp32-ncp
               run: cargo build --release --locked --bin esp32-ncp -Z build-std=core,alloc --no-default-features --features "${{ matrix.features }}"
             - name: Assemble images
-              working-directory: examples/esp32-ncp
               run: |
                   set -euo pipefail
-                  ELF=target/riscv32imac-unknown-none-elf/release/esp32-ncp
-                  CSV=../../products/esp32-zigbee-ncp/partitions/esp32h2-ncp-4mb.csv
                   NAME="zrhp-ncp-${{ matrix.name }}"
                   OUT="$GITHUB_WORKSPACE/out/$NAME"
-                  mkdir -p "$OUT"
-                  espflash save-image --skip-update-check --chip ${{ matrix.chip }} --flash-size 4mb \
-                    --partition-table "$CSV" --target-app-partition ota_0 "$ELF" "$OUT/$NAME-app.bin"
-                  espflash save-image --skip-update-check --chip ${{ matrix.chip }} --flash-size 4mb --merge \
-                    --partition-table "$CSV" --target-app-partition ota_0 "$ELF" "$OUT/$NAME-merged.bin"
-                  espflash partition-table --to-binary --output "$OUT/$NAME-partition-table.bin" "$CSV"
-                  python3 - "$OUT/$NAME-merged.bin" "$OUT/$NAME-bootloader.bin" "$OUT/$NAME-app.bin" <<'EOF'
-                  import sys
-                  merged = open(sys.argv[1], "rb").read()
-                  def image_len(buf, off):
-                      # ESP image: 24-byte header, segments, checksum padded to 16, optional SHA-256
-                      assert buf[off] == 0xE9, "not an ESP image"
-                      n = buf[off + 1]
-                      p = off + 24
-                      for _ in range(n):
-                          p += 8 + int.from_bytes(buf[p + 4:p + 8], "little")
-                      p += 1
-                      p = (p - off + 15) // 16 * 16 + off
-                      if buf[off + 23] == 1:
-                          p += 32
-                      return p - off
-                  n = image_len(merged, 0)
-                  open(sys.argv[2], "wb").write(merged[:n])
-                  app = open(sys.argv[3], "rb").read()
-                  assert merged[0x10000:0x10000 + len(app)] == app, "app at 0x10000 differs from the merged image"
-                  print(f"bootloader {n} bytes, app {len(app)} bytes, merged {len(merged)} bytes")
-                  EOF
-                  cmp <(head -c 3072 "$OUT/$NAME-partition-table.bin") <(tail -c +$((0x8000 + 1)) "$OUT/$NAME-merged.bin" | head -c 3072)
+                  python3 tools/ncp-release/esp_release.py assemble --board "${{ matrix.name }}" \
+                    --elf examples/esp32-ncp/target/riscv32imac-unknown-none-elf/release/esp32-ncp \
+                    --stem "$NAME" --out "$OUT"
                   cat >"$OUT/FLASHING.txt" <<EOF
-                  $NAME: ${{ matrix.board }}
+                  $NAME: ${{ matrix.title }}
                   zigbee-rs $(git rev-parse --short HEAD) ($(git log -1 --format=%cs)), features: ${{ matrix.features }}
+                  Not a release: tagged releases and the web flasher are at https://faronov.github.io/zigbee-rs/flasher/
 
                   Full flash (factory-new NCP; erases any Zigbee network stored on the chip):
                     esptool --chip ${{ matrix.chip }} --port <PORT> write-flash 0x0 $NAME-merged.bin
 
-                  Or the parts (erase first, so that no old otadata or Zigbee state remains):
-                    esptool --chip ${{ matrix.chip }} --port <PORT> erase-flash
-                    esptool --chip ${{ matrix.chip }} --port <PORT> write-flash 0x0 $NAME-bootloader.bin 0x8000 $NAME-partition-table.bin 0x10000 $NAME-app.bin
-
-                  Firmware update keeping the network (same partition table):
-                    esptool --chip ${{ matrix.chip }} --port <PORT> write-flash 0x10000 $NAME-app.bin
+                  Update keeping the network (same partition table; the blank otadata makes the new ota_0 app boot):
+                    esptool --chip ${{ matrix.chip }} --port <PORT> write-flash 0x0 $NAME-bootloader.bin 0x8000 $NAME-partition-table.bin 0x9000 $NAME-otadata-blank.bin 0x10000 $NAME-app.bin
 
                   (esptool v4: write_flash instead of write-flash.) See docs/zrhp-z2m-testing.md in faronov/zigbee-herdsman (branch zrhp).
                   EOF
