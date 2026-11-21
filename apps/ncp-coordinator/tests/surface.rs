@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 
 use ncp_coordinator_app::platform::{
-    FwBegin, FwImage, FwSlot, NcpPlatform, PlatformError, slot_state,
+    Counter, Counters, FwBegin, FwImage, FwSlot, NcpPlatform, PlatformError, slot_state,
 };
 use ncp_coordinator_app::port::CoordinatorPort;
 use ncp_coordinator_app::tc::{TcApp, TcPort};
@@ -36,14 +36,15 @@ use zigbee_zrhp::msg::backup::{
     BkpRestoreBegin, BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, BkpRestorePutRsp,
 };
 use zigbee_zrhp::msg::diag::{
-    DiagGetChildren, DiagGetChildrenRsp, DiagGetNeighbors, DiagGetNeighborsRsp, DiagGetRoutes,
-    DiagGetRoutesRsp,
+    DiagGetChildren, DiagGetChildrenRsp, DiagGetCounters, DiagGetCountersRsp, DiagGetNeighbors,
+    DiagGetNeighborsRsp, DiagGetRoutes, DiagGetRoutesRsp, DiagResetCounters,
 };
 use zigbee_zrhp::msg::firmware::{
     FwActivate, FwBegin as FwBeginReq, FwBeginRsp, FwFinishRsp, FwGetSlotsRsp, FwWrite, FwWriteRsp,
 };
 use zigbee_zrhp::msg::network::{
-    EvtChannelChanged, NwkChangeChannel, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkLeaveReset,
+    EvtChannelChanged, EvtEnergyScanResult, NwkChangeChannel, NwkEnergyScan, NwkForm,
+    NwkGetInfoRsp, NwkGroupMembership, NwkLeaveReset, NwkSetTxPower, NwkSetTxPowerRsp,
 };
 use zigbee_zrhp::msg::security::{
     SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecGetFrameCountersRsp,
@@ -264,6 +265,7 @@ struct FakePlatform {
     confirmed: bool,
     ieee_override: Option<[u8; 8]>,
     pta: Option<(bool, u8)>,
+    mac_tx: u32,
 }
 
 impl NcpPlatform for FakePlatform {
@@ -353,6 +355,26 @@ impl NcpPlatform for FakePlatform {
     fn set_pta(&mut self, enable: bool, priority_mask: u8) -> Result<(), PlatformError> {
         self.pta = Some((enable, priority_mask));
         Ok(())
+    }
+    /// A radio with 2 dB steps from -20 to +10 dBm.
+    fn tx_power_step(&self, dbm: i8) -> Option<i8> {
+        Some(dbm.clamp(-20, 10) & !1)
+    }
+    fn energy_to_dbm(&self, energy: u8) -> i8 {
+        energy as i8 - 100
+    }
+    fn append_counters(&self, group_mask: u8, out: &mut Counters) {
+        if group_mask & 0x02 != 0 {
+            let _ = out.push(Counter {
+                id: 0x0201,
+                value: self.mac_tx,
+            });
+        }
+    }
+    fn reset_counters(&mut self, group_mask: u8) {
+        if group_mask & 0x02 != 0 {
+            self.mac_tx = 0;
+        }
     }
 }
 
@@ -485,6 +507,8 @@ macro_rules! setup {
             caps::IEEE_REWRITABLE,
             caps::PTA_COEX,
             caps::GROUP_MEMBERSHIP,
+            caps::ENERGY_SCAN,
+            caps::TX_POWER,
         ] {
             assert_ne!(negotiated.ncp_caps & bit, 0, "capability {bit:#x}");
         }
@@ -1668,4 +1692,135 @@ fn channel_change_announces_commits_then_switches() {
     assert_eq!(host.response(same).status(), 0);
     let changed: EvtChannelChanged = host.event(ids::EVT_CHANNEL_CHANGED).unwrap().event();
     assert_eq!((changed.channel, changed.req_tid), (25, same));
+}
+
+fn counter_values(received: Received) -> Vec<(u16, u32)> {
+    let diag: DiagGetCountersRsp = received.body();
+    diag.counters.iter().map(|c| (c.id, c.value)).collect()
+}
+
+#[test]
+fn energy_scan_tx_power_and_stack_counters() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let channels = (1 << 15) | (1 << 20) | (1 << 25);
+
+    // Before a network exists; a second scan while one runs is refused.
+    let scan = host.request(&NwkEnergyScan {
+        channel_mask: channels,
+        duration_exp: 2,
+        count: 2,
+    });
+    let again = host.request(&NwkEnergyScan {
+        channel_mask: channels,
+        duration_exp: 2,
+        count: 1,
+    });
+    let bad = host.request(&NwkEnergyScan {
+        channel_mask: 1 << 10,
+        duration_exp: 2,
+        count: 1,
+    });
+    exchange!();
+    exchange!();
+    let response = host
+        .inbox
+        .iter()
+        .position(|m| m.kind == Kind::Response && m.tid == scan)
+        .unwrap();
+    let event = host
+        .inbox
+        .iter()
+        .position(|m| m.kind == Kind::Event && m.msg_id == ids::EVT_ENERGY_SCAN_RESULT)
+        .expect("EVT_ENERGY_SCAN_RESULT");
+    assert!(response < event, "the result follows the response");
+    assert_eq!(host.response(scan).status(), 0);
+    assert_eq!(host.response(again).status(), Status::InProgress.to_u8());
+    assert_eq!(
+        host.response(bad).status(),
+        Status::InvalidParameter.to_u8()
+    );
+    let result = host.event(ids::EVT_ENERGY_SCAN_RESULT).unwrap();
+    let result: EvtEnergyScanResult = result.event();
+    assert_eq!((result.req_tid, result.status), (scan, 0));
+    let results: Vec<_> = result
+        .results
+        .iter()
+        .map(|r| (r.channel, r.energy, r.max_rssi_dbm))
+        .collect();
+    // MockMac energies of `device()`.
+    assert_eq!(results, [(15, 60, -40), (20, 5, -95), (25, 90, -10)]);
+
+    // With the network up, on the operating channel afterwards.
+    let form = host.request(&form_request(0x2B33, 1 << 20));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let scan = host.request(&NwkEnergyScan {
+        channel_mask: channels,
+        duration_exp: 4,
+        count: 1,
+    });
+    exchange!();
+    exchange!();
+    assert_eq!(host.response(scan).status(), 0);
+    let result = host.event(ids::EVT_ENERGY_SCAN_RESULT).unwrap();
+    let result: EvtEnergyScanResult = result.event();
+    assert_eq!((result.status, result.results.len()), (0, 3));
+    assert_eq!(port.info().channel, 20);
+    assert_eq!(
+        port.info().state,
+        ncp_coordinator_app::port::NetworkState::Up
+    );
+
+    // Transmit power: stepped and clamped by the platform, reported by
+    // NWK_GET_INFO, kept across a formation with tx_power 0.
+    let set = host.request(&NwkSetTxPower { dbm: 7 });
+    let high = host.request(&NwkSetTxPower { dbm: 20 });
+    exchange!();
+    let applied: NwkSetTxPowerRsp = host.response(set).body();
+    assert_eq!(applied.applied_dbm, 6);
+    let applied: NwkSetTxPowerRsp = host.response(high).body();
+    assert_eq!(applied.applied_dbm, 10);
+    let info = host.request_raw(ids::NWK_GET_INFO, &[]);
+    exchange!();
+    let info: NwkGetInfoRsp = host.response(info).body();
+    assert_eq!(info.tx_power, 10);
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+    let form = host.request(&form_request(0x2B34, 1 << 20));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let info = host.request_raw(ids::NWK_GET_INFO, &[]);
+    exchange!();
+    let info: NwkGetInfoRsp = host.response(info).body();
+    assert_eq!(info.tx_power, 10, "NWK_FORM tx_power 0 keeps the power");
+
+    // Counter groups: MAC from the platform, NWK from the stack, APS and
+    // security from the NCP; each reset by its own group bit.
+    platform.mac_tx = 9;
+    let counters = host.request(&DiagGetCounters { group_mask: 0x1E });
+    exchange!();
+    let values = counter_values(host.response(counters));
+    let ids: Vec<u16> = values.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        ids,
+        [
+            0x0201, 0x0301, 0x0302, 0x0303, 0x0304, 0x0305, 0x0306, 0x0401, 0x0402, 0x0403, 0x0501,
+            0x0502, 0x0503, 0x0504, 0x0505
+        ]
+    );
+    assert_eq!(values[0], (0x0201, 9));
+    let reset = host.request(&DiagResetCounters { group_mask: 0x02 });
+    exchange!();
+    assert_eq!(host.response(reset).status(), 0);
+    assert_eq!(platform.mac_tx, 0);
+    // Every counter of every group fits one response.
+    let counters = host.request(&DiagGetCounters { group_mask: 0xFF });
+    exchange!();
+    let all = counter_values(host.response(counters));
+    assert!(
+        all.len() < ncp_coordinator_app::ncp::MAX_COUNTERS,
+        "{}",
+        all.len()
+    );
 }

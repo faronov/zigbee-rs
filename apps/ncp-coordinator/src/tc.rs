@@ -1223,6 +1223,86 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         true
     }
 
+    fn energy_scan_supported(&self) -> bool {
+        true
+    }
+
+    async fn energy_detect(&mut self, channel: u8, duration_exp: u8) -> Result<u8, OpError> {
+        // MLME-SCAN (ED) of the one channel; the MAC returns to the
+        // operating channel and address filter afterwards.
+        let scan = self
+            .app
+            .device_mut()
+            .aps_mut()
+            .nwk_mut()
+            .nlme_ed_scan(zigbee_types::ChannelMask(1 << channel), duration_exp)
+            .await
+            .map_err(|status| OpError::Zigbee(status as u8))?;
+        scan.energy_list
+            .iter()
+            .find(|ed| ed.channel == channel)
+            .map(|ed| ed.energy)
+            .ok_or(OpError::Zigbee(0x01))
+    }
+
+    async fn set_tx_power(&mut self, dbm: i8) -> Result<(), OpError> {
+        self.app
+            .device_mut()
+            .aps_mut()
+            .nwk_mut()
+            .mac_mut()
+            .mlme_set(
+                zigbee_mac::PibAttribute::PhyTransmitPower,
+                zigbee_mac::PibValue::I8(dbm),
+            )
+            .await
+            .map_err(|_| OpError::InvalidParameter)
+    }
+
+    async fn tx_power(&mut self) -> Option<i8> {
+        match self
+            .app
+            .device()
+            .aps()
+            .nwk()
+            .mac()
+            .mlme_get(zigbee_mac::PibAttribute::PhyTransmitPower)
+            .await
+        {
+            Ok(zigbee_mac::PibValue::I8(dbm)) => Some(dbm),
+            _ => None,
+        }
+    }
+
+    /// NWK group (`0x0301..`): the NWK layer's receive-security counters.
+    fn append_counters(&self, group_mask: u8, out: &mut crate::platform::Counters) {
+        if group_mask & 0x04 == 0 {
+            return;
+        }
+        let stats = self.app.device().aps().nwk().rx_security_stats();
+        for (id, value) in [
+            (0x0301, stats.secured_frames),
+            (0x0302, stats.decrypt_failures),
+            (0x0303, stats.missing_keys),
+            (0x0304, stats.replay_rejections),
+            (0x0305, stats.replay_table_full),
+            (0x0306, stats.security_header_parse_failures),
+        ] {
+            let _ = out.push(zigbee_zrhp::msg::diag::Counter { id, value });
+        }
+    }
+
+    fn reset_counters(&mut self, group_mask: u8) {
+        if group_mask & 0x04 != 0 {
+            *self
+                .app
+                .device_mut()
+                .aps_mut()
+                .nwk_mut()
+                .rx_security_stats_mut() = Default::default();
+        }
+    }
+
     fn commit_channel(&mut self, channel: u8, update_id: u8) -> Result<(), OpError> {
         if !self.running {
             return Err(OpError::InvalidState);

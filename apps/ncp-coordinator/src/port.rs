@@ -218,6 +218,11 @@ pub enum Op {
     RestoreCommit {
         tid: u16,
     },
+    /// `NWK_SET_TX_POWER` with the platform's supported step `dbm`.
+    SetTxPower {
+        tid: u16,
+        dbm: i8,
+    },
 }
 
 /// Why an operation failed.
@@ -401,6 +406,39 @@ pub trait CoordinatorPort {
     /// wiped or replaced; 0 without a network.
     fn table_epoch(&mut self) -> u32 {
         0
+    }
+    /// `ENERGY_SCAN` capability: [`Self::energy_detect`] works, with or
+    /// without a running network.
+    fn energy_scan_supported(&self) -> bool {
+        false
+    }
+    /// One energy measurement of `channel` for `(2^duration_exp + 1)`
+    /// superframe periods (IEEE 802.15.4 ED scale 0..=255). The radio
+    /// returns to the operating channel afterwards; traffic is not
+    /// received meanwhile.
+    async fn energy_detect(&mut self, channel: u8, duration_exp: u8) -> Result<u8, OpError> {
+        let _ = (channel, duration_exp);
+        Err(OpError::Unsupported)
+    }
+    /// Program the radio's transmit power (`PhyTransmitPower`, a value the
+    /// platform's radio supports). Volatile.
+    async fn set_tx_power(&mut self, dbm: i8) -> Result<(), OpError> {
+        let _ = dbm;
+        Err(OpError::Unsupported)
+    }
+    /// The radio's programmed transmit power (`PhyTransmitPower`), `None`
+    /// when unknown.
+    async fn tx_power(&mut self) -> Option<i8> {
+        None
+    }
+    /// Stack counters of the `DIAG_GET_COUNTERS` groups in `group_mask`
+    /// (spec 7.8: bit2 NWK `0x03xx`, bit4 security `0x05xx`).
+    fn append_counters(&self, group_mask: u8, out: &mut crate::platform::Counters) {
+        let _ = (group_mask, out);
+    }
+    /// `DIAG_RESET_COUNTERS` for the groups in `group_mask`.
+    fn reset_counters(&mut self, group_mask: u8) {
+        let _ = group_mask;
     }
 }
 
