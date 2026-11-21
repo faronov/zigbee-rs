@@ -11,14 +11,20 @@
 //! - [`flash`]: dual-core-safe internal flash windows below the CPU2 secure
 //!   area, presented through [`word_flash::WordPerDoubleWord`] so the
 //!   zigbee-runtime journals work on 64-bit-programmed flash;
-//! - [`hsem`]: the hardware semaphores shared with CPU2.
+//! - [`hsem`]: the hardware semaphores shared with CPU2;
+//! - [`aes`]: the CPU1 AES1 engine behind Zigbee CCM* and AES-MMO (the
+//!   MAC transport owns it; no software AES is linked).
 //!
-//! Only [`word_flash`] is hardware independent; the rest requires one chip
+//! Only [`word_flash`] and the AES1 register protocol (host-tested against
+//! a model) are hardware independent; the rest requires one chip
 //! feature (`stm32wb55vg`, `stm32wb55rg`, `stm32wb55cg`).
 
 #![no_std]
 
 pub mod word_flash;
+
+#[cfg(any(feature = "_chip", test))]
+pub mod aes;
 
 #[cfg(feature = "_chip")]
 pub mod flash;

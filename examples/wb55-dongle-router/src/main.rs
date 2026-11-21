@@ -107,7 +107,7 @@ async fn main(spawner: Spawner) {
 
     let transport = stm32wb_router_app::mac_started(
         spawner,
-        stm32wb_hal::mac::start(p.IPCC, Irqs, p.RNG).await,
+        stm32wb_hal::mac::start(p.IPCC, Irqs, p.RNG, stm32wb_router_app::aes_engine()).await,
     );
     let (app, _settings) = router::compose(
         &CELLS,

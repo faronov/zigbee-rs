@@ -3209,6 +3209,16 @@ jobs:
           "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
           ./tools/firmware-size-report.sh stm32wb5mm-dk-router ${ELF}.bin ${ELF}.size.json
           NM="$NM" ./tools/check-role-symbols.sh parent "$ELF"
+          # Zigbee CCM*/AES-MMO run on CPU1's AES1 (stm32wb-hal/src/aes.rs).
+          SYMS="$("$NM" --demangle "$ELF")"
+          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
+            echo "STM32WB5MM-DK router image still links software AES" >&2
+            exit 1
+          fi
+          if ! grep -Eq 'stm32wb_hal::aes' <<<"$SYMS"; then
+            echo "STM32WB5MM-DK router image is missing the AES1 backend" >&2
+            exit 1
+          fi
       - name: Upload STM32WB5MM-DK router firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -3290,6 +3300,16 @@ jobs:
             "$OBJCOPY" -O ihex   "$ELF" "${ELF}.hex"
             ./tools/firmware-size-report.sh $image ${ELF}.bin ${ELF}.size.json
             NM="$NM" ./tools/check-role-symbols.sh parent "$ELF"
+            # Zigbee CCM*/AES-MMO run on CPU1's AES1 (stm32wb-hal/src/aes.rs).
+            SYMS="$("$NM" --demangle "$ELF")"
+            if grep -Eq 'aes::soft|SoftwareAes128' <<<"$SYMS"; then
+              echo "$image still links software AES" >&2
+              exit 1
+            fi
+            if ! grep -Eq 'stm32wb_hal::aes' <<<"$SYMS"; then
+              echo "$image is missing the AES1 backend" >&2
+              exit 1
+            fi
           done
           SHIM=tools/stm32wb-fus-shim/target/thumbv7em-none-eabihf/release/stm32wb-fus-shim
           "$OBJCOPY" -O binary "$SHIM" "${SHIM}.bin"

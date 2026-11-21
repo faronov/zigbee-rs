@@ -91,7 +91,13 @@ async fn main(spawner: Spawner) {
     spawner.spawn(sound::run(started.mic).unwrap_or_else(|_| wb_platform::halt()));
     let transport = stm32wb_router_app::mac_started(
         spawner,
-        stm32wb_hal::mac::start(started.ipcc, platform::Irqs, started.rng).await,
+        stm32wb_hal::mac::start(
+            started.ipcc,
+            platform::Irqs,
+            started.rng,
+            stm32wb_router_app::aes_engine(),
+        )
+        .await,
     );
 
     let (app, settings) = router::compose(

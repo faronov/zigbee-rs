@@ -28,6 +28,7 @@ pub mod router;
 pub mod usb_log;
 
 use embassy_executor::Spawner;
+use stm32wb_hal::aes::AesEngine;
 use stm32wb_hal::embassy_stm32_wpan::sub::mm::MemoryManager;
 use stm32wb_hal::mac::WbTransport;
 
@@ -35,6 +36,16 @@ use stm32wb_hal::mac::WbTransport;
 #[embassy_executor::task]
 async fn run_memory_manager(mut memory_manager: MemoryManager<'static>) {
     memory_manager.run_queue().await
+}
+
+/// CPU1's AES1 engine for the MAC transport (Zigbee CCM*/AES-MMO); halts
+/// when it cannot be claimed. [`stm32wb_hal::mac::start`] runs its
+/// known-answer test before CPU2 boots.
+pub fn aes_engine() -> AesEngine {
+    AesEngine::take().unwrap_or_else(|error| {
+        ::log::error!("[WB] AES1 unavailable: {error:?}");
+        platform::halt()
+    })
 }
 
 /// Hand back CPU2's started MAC transport after spawning its memory
@@ -52,6 +63,6 @@ pub fn mac_started(
         }
     };
     spawner.spawn(run_memory_manager(memory_manager).unwrap_or_else(|_| platform::halt()));
-    ::log::info!("[WB] coprocessor MAC running");
+    ::log::info!("[WB] AES1 known-answer test passed; coprocessor MAC running");
     transport
 }

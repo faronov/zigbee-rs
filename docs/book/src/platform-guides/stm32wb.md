@@ -306,6 +306,68 @@ deviations. Three of them matter most:
   it is delivered over the air.
 - LQI is not reported for MAC commands.
 
+## Hardware crypto
+
+Zigbee NWK/APS CCM\*, AES-MMO (install codes, Trust Center key
+derivation) and every other forward AES-128 block run on CPU1's **AES1**
+engine (`stm32wb-hal/src/aes.rs`). No STM32WB image links software AES; CI
+fails a router image that contains `SoftwareAes128`/`aes::soft` or lacks
+`stm32wb_hal::aes`.
+
+Engine and ownership:
+
+- **AES1** (`0x5006_0000`, AHB2, `RCC_AHB2ENR.AES1EN`) is the CPU1
+  application engine (RM0434 memory map and AES chapter). CPU2 only writes
+  it on an explicit CPU1 request through the FUS customer key storage
+  commands (`SHCI_C2_FUS_LoadUsrKey`/`UnloadUsrKey`), which zigbee-rs never
+  issues. ST's semaphore table (`hw_conf.h`: RNG, PKA, FLASH, RCC, stop
+  mode, CLK48, flash blocking, NVM SRAM) has no AES entry, so no HSEM is
+  taken.
+- **AES2** (`0x5800_1800`, AHB3) belongs to CPU2's wireless firmware and is
+  never touched by CPU1.
+- MAC-level security on CPU2 is unused: every MLME/MCPS request carries
+  `SecurityLevel::Unsecure`.
+- `embassy-stm32` has no AES1 singleton on STM32WB (its metadata has no
+  register block) and its generic AES driver polls without a bound, so the
+  HAL owns a small register driver and an `Aes1` token. `mac::start` takes
+  the `AesEngine`; the MAC transport owns it from then on and its
+  `forward_cipher` returns `HardwareAes128` with no software fall-back.
+
+Register sequence (ECB encrypt): `CR = ERRC|CCFC` (EN = 0), configuration
+(`MODE = 00`, `CHMOD = 000`, `KEYSIZE = 0`, `DATATYPE = 10` byte swap),
+`KEYR3..KEYR0` as big-endian key words (`KEYR3` = key bytes 0..3, as in
+ST's HAL), `EN = 1`, four `DINR` writes of the little-endian word view,
+a bounded poll of `SR.CCF` that fails on `RDERR`/`WRERR`, four `DOUTR`
+reads, `CCFC`, `EN = 0`. Output is published only after a clean
+completion. The byte swap is what makes the Cortex-M little-endian word
+view reach the core in standard AES byte order; the host model shows that
+the other `DATATYPE` values do not.
+
+Start-up: `mac::start` runs a two-key FIPS-197 self-test before CPU2 is
+booted and returns `StartError::AesSelfTest` on failure, so the router
+halts before any frame is secured. A customer key left loaded in AES1 by
+the FUS (secure mode) makes CPU1 key writes ineffective and fails this
+test. If the AES1 clock is ever found gated, the engine is re-enabled and
+re-validated before the next block. The routers run the thread executor
+(WFI sleep, no Stop mode), so no wake-up restore path exists.
+
+Lab check: `cargo build --release --features lab-aes-kat` in
+`examples/nucleo-wb55-router` runs the full `zigbee_crypto::kat` suite
+(FIPS-197/SP 800-38A blocks, IEEE 802.15.4 Annex C CCM\*, Zigbee CCM\*,
+install-code AES-MMO) on AES1 instead of the self-test. Never ship it.
+
+Validation level:
+
+- host-tested: the register sequence against an RM0434-faithful model
+  that passes `kat::run_all`, plus timeout, zero budget, `RDERR`/`WRERR`,
+  clock loss, dead engine, ignored key writes and no-partial-output
+  cases;
+- lab-tested on hardware (Nucleo-WB55, MAC 1.24.0): the full KAT suite
+  passes on AES1;
+- production path proven on hardware (Nucleo-WB55): see the validation
+  status below. The STM32WB5MM-DK and USB dongle images build with the
+  same backend but were not run on hardware with it.
+
 ## Coprocessor ABI: vendored embassy-stm32-wpan
 
 `embassy-stm32-wpan` at Embassy rev `7419ec0` mis-describes two MAC
@@ -382,7 +444,27 @@ Host tests cover:
 CI builds and clippy-checks the HAL, the board, the peripheral lab, and
 the example in its default, plain and single-peripheral configurations.
 The CI job also checks that the image contains the router symbols
-(`tools/check-role-symbols.sh parent`).
+(`tools/check-role-symbols.sh parent`) and the AES1 backend, and that it
+links no software AES.
+
+AES1 hardware crypto on the Nucleo-WB55 (FUS 1.2.0, MAC 1.24.0, ZHA
+network on channel 15):
+
+- the `lab-aes-kat` image passed the full `zigbee_crypto::kat` suite on
+  AES1 at start-up and resumed the existing network;
+- the production image (no software AES linked) passed the start-up
+  self-test, resumed from the journals and answered ZHA attribute reads;
+- after a ZHA remove (Mgmt_Leave) it rejoined after the 300 s
+  recommission delay: NWK key, Request-Key, TC link key, Verify-Key and
+  Confirm-Key SUCCESS, and ZHA interviewed it again (Basic, Identify on
+  EP1). The first attempt's Request-Key went unanswered for 15 s while the
+  Trust Center was interviewing the node; the stack reported
+  `TrustCenterLinkKeyExchangeFailure` and the automatic retry succeeded;
+- after a system reset it resumed at the same address without a rescan
+  and kept answering ZCL reads.
+
+The STM32WB5MM-DK and USB dongle images build with the same AES1 backend
+but have not been run on hardware with it.
 
 Peripheral image (all features), on the same DK:
 
