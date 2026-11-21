@@ -129,12 +129,120 @@ impl AckPendingTable {
         )
     }
 
+    /// Whether `psdu` (without FCS) is an unsecured Data Request whose exact
+    /// source address has indirect data pending.
+    ///
+    /// This runs inside the RX->TX turnaround of every Data Request, so it is
+    /// inlined into the `.ram_code` ACK path and makes no out-of-line calls:
+    /// a call into flash-resident code stalls on XIP fetches. The previous
+    /// flash-resident parse and binary search delayed the ACK of Data Requests
+    /// to 216-274 us after the frame (others: 142-147 us), and an
+    /// STM32WB55 joining through the router discarded those ACKs, retried its
+    /// association poll and gave up on the router.
+    ///
+    /// Entries are validated on insertion, so an exact match needs no further
+    /// address checks; a linear scan of at most
+    /// [`MAX_ACK_PENDING_ADDRESSES`] entries is cheaper in code than the
+    /// ordered search.
+    #[cfg(test)]
+    fn data_request_pending(&self, psdu: &[u8]) -> bool {
+        // SAFETY: every read below is bounds-checked against `psdu.len()`.
+        unsafe { self.data_request_pending_raw(psdu.as_ptr(), psdu.len()) }
+    }
+
+    /// [`Self::data_request_pending`] over a raw PSDU.
+    ///
+    /// # Safety
+    ///
+    /// `psdu` must be valid for reads of `len` bytes.
+    #[cfg(test)]
+    unsafe fn data_request_pending_raw(&self, psdu: *const u8, len: usize) -> bool {
+        if len < 8 {
+            return false;
+        }
+        let frame_control = unsafe { *psdu as u16 | (*psdu.add(1) as u16) << 8 };
+        let destination_pan = unsafe { *psdu.add(3) as u16 | (*psdu.add(4) as u16) << 8 };
+        unsafe { self.data_request_pending_parsed(psdu, len, frame_control, destination_pan) }
+    }
+
+    /// The Data Request match once the frame control and destination PAN
+    /// are known, which the ACK path has already read. No slice bounds
+    /// checks (and their out-of-line panic calls) end up in `.ram_code`.
+    ///
+    /// # Safety
+    ///
+    /// `psdu` must be valid for reads of `len` bytes.
+    #[inline(always)]
+    unsafe fn data_request_pending_parsed(
+        &self,
+        psdu: *const u8,
+        len: usize,
+        frame_control: u16,
+        destination_pan: u16,
+    ) -> bool {
+        let byte = |index: usize| unsafe { *psdu.add(index) };
+        let word = |index: usize| byte(index) as u16 | (byte(index + 1) as u16) << 8;
+        // An unsecured, intra-PAN (PAN ID compression) MAC command with ACK
+        // request, a short or extended destination (bit 11) and a short or
+        // extended source (bit 15), in one compare. With PAN ID compression
+        // the destination PAN is the source PAN to match; entries never hold
+        // PAN 0xFFFF.
+        if frame_control & 0x886F != 0x8863 {
+            return false;
+        }
+        let offset = if frame_control & 0x0400 == 0 { 7 } else { 13 };
+        let source_pan = destination_pan;
+        let extended = frame_control & 0x4000 != 0;
+        let address_len = if extended { 8 } else { 2 };
+        if len != offset + address_len + 1
+            || byte(offset + address_len) != frame::CMD_ID_DATA_REQUEST
+        {
+            return false;
+        }
+        let entries = self.entries.as_ptr();
+        // `set` keeps `len <= MAX_ACK_PENDING_ADDRESSES`.
+        let count = self.len as usize;
+        let mut index = 0;
+        while index < count {
+            // SAFETY: `index < len <= MAX_ACK_PENDING_ADDRESSES`.
+            let hit = match unsafe { &(*entries.add(index)).address } {
+                AckPendingAddress::Short { pan_id, address } => {
+                    !extended && *pan_id == source_pan && *address == word(offset)
+                }
+                AckPendingAddress::Extended { pan_id, address } => {
+                    let mut equal = extended && *pan_id == source_pan;
+                    let mut at = 0;
+                    while equal && at < 8 {
+                        equal = address[at] == byte(offset + at);
+                        at += 1;
+                    }
+                    equal
+                }
+            };
+            if hit {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
     #[cfg(test)]
     fn frame_pending(&self, psdu: &[u8]) -> bool {
-        let Some(source) = data_request_source(psdu) else {
-            return false;
-        };
-        self.frame_pending_for(source)
+        let pending =
+            data_request_source(psdu).is_some_and(|source| self.frame_pending_for(source));
+        // The ACK-path lookup only accepts intra-PAN (PAN ID compression)
+        // Data Requests; elsewhere it must agree with the reference parser.
+        if psdu.first().is_some_and(|control| control & 0x40 != 0) {
+            assert_eq!(
+                self.data_request_pending(psdu),
+                pending,
+                "the ACK-path lookup must agree with the parsed lookup"
+            );
+        } else {
+            assert!(!self.data_request_pending(psdu));
+        }
+        pending
     }
 
     #[cfg(test)]
@@ -168,7 +276,8 @@ const fn ack_frame_control(frame_pending: bool) -> u8 {
 }
 
 /// Return the exact child identity from a valid, unsecured Data Request.
-#[cfg(any(target_arch = "tc32", test))]
+/// Reference parser for the tests of the ACK-path lookup.
+#[cfg(test)]
 fn data_request_source(psdu: &[u8]) -> Option<AckPendingAddress> {
     if psdu.len() < 8 {
         return None;
@@ -1015,6 +1124,80 @@ mod tests {
     }
 
     #[test]
+    fn ack_path_lookup_matches_a_polling_association_candidate() {
+        // An extended-source association poll, as an STM32WB55 sends it while
+        // its Association Response is pending at this router.
+        let mut table = AckPendingTable::new();
+        let candidate = [0x9A, 0x78, 0x1B, 0x00, 0x26, 0xE1, 0x80, 0x00];
+        table
+            .set(
+                AckPendingAddress::Short {
+                    pan_id: 0xDFE9,
+                    address: 0x1234,
+                },
+                true,
+            )
+            .unwrap();
+        table
+            .set(
+                AckPendingAddress::Extended {
+                    pan_id: 0xDFE9,
+                    address: candidate,
+                },
+                true,
+            )
+            .unwrap();
+        let mut poll = [0u8; 16];
+        poll[..7].copy_from_slice(&[0x63, 0xC8, 0x2C, 0xE9, 0xDF, 0x5B, 0x04]);
+        poll[7..15].copy_from_slice(&candidate);
+        poll[15] = frame::CMD_ID_DATA_REQUEST;
+        assert!(table.data_request_pending(&poll));
+        assert!(table.frame_pending(&poll));
+
+        // One differing address byte, another PAN, a secured frame and a
+        // trailing byte all miss.
+        let mut other = poll;
+        other[14] ^= 1;
+        assert!(!table.frame_pending(&other));
+        let mut other_pan = poll;
+        other_pan[3] = 0x00;
+        assert!(!table.frame_pending(&other_pan));
+        let mut secured = poll;
+        secured[0] |= 1 << 3;
+        assert!(!table.frame_pending(&secured));
+        let mut longer = [0u8; 17];
+        longer[..16].copy_from_slice(&poll);
+        assert!(!table.frame_pending(&longer));
+        // A short-source poll never matches an extended entry, nor the
+        // reverse.
+        let short_poll = frame::data_request_associated_short(5, 0xDFE9, 0x045B, 0x1234);
+        assert!(table.frame_pending(&short_poll));
+        let short_miss = frame::data_request_associated_short(6, 0xDFE9, 0x045B, 0x9A78);
+        assert!(!table.frame_pending(&short_miss));
+    }
+
+    #[test]
+    fn ack_path_lookup_requires_pan_id_compression() {
+        let mut table = AckPendingTable::new();
+        table
+            .set(
+                AckPendingAddress::Short {
+                    pan_id: 0x1234,
+                    address: 0x3344,
+                },
+                true,
+            )
+            .unwrap();
+        // Data Request with an explicit, equal source PAN: accepted by the
+        // reference parser, deliberately not by the `.ram_code` lookup.
+        let explicit = [
+            0x23, 0x88, 0x01, 0x34, 0x12, 0x01, 0x00, 0x34, 0x12, 0x44, 0x33, 0x04,
+        ];
+        assert!(data_request_source(&explicit).is_some());
+        assert!(!table.data_request_pending(&explicit));
+    }
+
+    #[test]
     fn association_request_never_performs_a_frame_pending_match() {
         // Frame 3084 from the clean BL702 -> TLSR8258 parent capture. Unlike
         // an extended Data Request, an Association Request has source PAN
@@ -1768,6 +1951,16 @@ mod hw {
         crate::irq::IrqSource::Dma.mask() | crate::irq::IrqSource::ZbRt.mask();
 
     const CCA_THRESHOLD_DBM: i8 = -70;
+    /// RX-completion anchor to software-ACK `tx_pkt`.
+    ///
+    /// IEEE 802.15.4 starts an Imm-Ack aTurnaroundTime (12 symbols, 192 us)
+    /// after the last symbol of the acknowledged frame. With the previous
+    /// 120 us (the TLSR8258's minimum RX->TX settle) the SHR started about
+    /// 143 us after the frame on air, against 190-199 us for the other
+    /// routers on the same network. 160 us puts it about 185 us after the
+    /// frame: still early enough for an STM32WB55 (CPU2 MAC), which kept
+    /// ACKs at up to 199 us and discarded every one from 216 us on.
+    const ACK_TURNAROUND_TICKS: u32 = timer::us(160);
     /// Longest 802.15.4 PPDU on air (6 B SHR/PHR + 127 B PSDU at 32 us/B),
     /// rounded up.
     const RX_MAX_PPDU_TICKS: u32 = timer::us(4_300);
@@ -3237,13 +3430,26 @@ mod hw {
             let psdu = unsafe {
                 core::slice::from_raw_parts(rx_ptr.add(5), payload_len.saturating_sub(2))
             };
-            // Association Requests also ask for an ACK, but can never carry
-            // Frame Pending. Determine whether this is a Data Request before
-            // touching the 16-entry pending table. The old code copied the
-            // entire table with read_volatile() for every ACK-requested
-            // frame; on TC32 that consumed most of the 192 us turnaround
-            // budget before the mandatory 120 us RX->TX settle even began.
-            super::data_request_source(psdu).is_some_and(ack_pending_for_source)
+            // Only a Data Request can carry Frame Pending. The match runs
+            // inlined here in `.ram_code`: see `data_request_pending`.
+            let active = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(ACK_PENDING_ACTIVE)) as usize
+            } & 1;
+            // The main loop only rewrites the inactive snapshot and then
+            // publishes it, so the active one is stable while it is read.
+            let table = unsafe {
+                &*core::ptr::addr_of!(ACK_PENDING_TABLES)
+                    .cast::<AckPendingTable>()
+                    .add(active)
+            };
+            unsafe {
+                table.data_request_pending_parsed(
+                    psdu.as_ptr(),
+                    psdu.len(),
+                    frame_control,
+                    destination_pan,
+                )
+            }
         } else {
             false
         };
@@ -3277,54 +3483,31 @@ mod hw {
         true
     }
 
-    #[inline(always)]
-    fn ack_pending_for_source(source: AckPendingAddress) -> bool {
-        // One volatile publication read selects a coherent sorted snapshot.
-        // Binary search needs at most five entry reads for 16 children,
-        // instead of copying or scanning the complete table.
-        let active =
-            unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ACK_PENDING_ACTIVE)) as usize }
-                & 1;
-        let tables = core::ptr::addr_of!(ACK_PENDING_TABLES).cast::<AckPendingTable>();
-        let table = unsafe { tables.add(active) };
-        let len = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*table).len)) } as usize;
-        let entries =
-            unsafe { core::ptr::addr_of!((*table).entries).cast::<super::AckPendingEntry>() };
-        let mut low = 0usize;
-        let mut high = len;
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let entry = unsafe { core::ptr::read_volatile(entries.add(mid)) };
-            if entry.address < source {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        low < len && unsafe { core::ptr::read_volatile(entries.add(low)) }.address == source
-    }
-
     #[inline(never)]
     #[unsafe(link_section = ".ram_code")]
     fn send_ack_fast(sequence: u8, frame_pending: bool, rx_complete_ticks: u32) -> bool {
         // RX completion runs either in the RF IRQ or with that IRQ masked by
         // a synchronous operation. Only this path owns RF_ACK_TX_BUF.
         let tx_ptr = core::ptr::addr_of_mut!(RF_ACK_TX_BUF) as *mut u8;
+        // DMA length 4, then PHR 5, frame control, sequence: two aligned
+        // word stores (`DmaBuf` is word aligned) keep `.ram_code` small.
         unsafe {
-            core::ptr::write_volatile(tx_ptr, 4);
-            core::ptr::write_volatile(tx_ptr.add(1), 0);
-            core::ptr::write_volatile(tx_ptr.add(2), 0);
-            core::ptr::write_volatile(tx_ptr.add(3), 0);
-            core::ptr::write_volatile(tx_ptr.add(4), 5);
-            core::ptr::write_volatile(tx_ptr.add(5), super::ack_frame_control(frame_pending));
-            core::ptr::write_volatile(tx_ptr.add(6), 0);
-            core::ptr::write_volatile(tx_ptr.add(7), sequence);
+            core::ptr::write_volatile(tx_ptr.cast::<u32>(), 4);
+            core::ptr::write_volatile(
+                tx_ptr.add(4).cast::<u32>(),
+                u32::from_le_bytes([5, super::ack_frame_control(frame_pending), 0, sequence]),
+            );
         }
         compiler_fence(Ordering::Release);
-        // The TLSR8258 requires 120 us from the RX->TX transition, not 120 us
-        // after arbitrary address parsing and pending-table lookup.
-        let remaining =
-            super::remaining_settle_ticks(rx_complete_ticks, timer::now_ticks(), timer::us(120));
+        // Timed from the RX-completion anchor, so parsing and the pending
+        // lookup run inside it. It covers the TLSR8258's 120 us RX->TX
+        // settle and places the ACK at aTurnaroundTime (see
+        // `ACK_TURNAROUND_TICKS`).
+        let remaining = super::remaining_settle_ticks(
+            rx_complete_ticks,
+            timer::now_ticks(),
+            ACK_TURNAROUND_TICKS,
+        );
         if remaining != 0 {
             timer::sleep_ticks(remaining);
         }

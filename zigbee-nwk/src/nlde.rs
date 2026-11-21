@@ -9903,6 +9903,9 @@ mod tests {
         let child = nwk
             .handle_child_association(child_ieee, 0x80)
             .expect("the child associates");
+        // A provisional child announced elsewhere is dropped instead (see
+        // `an_unauthenticated_child_announced_elsewhere_is_dropped_at_once`).
+        assert!(nwk.authorize_child(child));
 
         nwk.note_announced_address(FAR, child_ieee);
 
@@ -13323,6 +13326,48 @@ mod tests {
             parent.mac.indirect_pending_history().last(),
             Some(&(MacAddress::Short(PAN, child), false))
         );
+    }
+
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_unauthenticated_child_announced_elsewhere_is_dropped_at_once() {
+        // STM32WB55 field case: the joiner missed our late imm-ACKs, joined
+        // through another parent and announced itself there, while its MAC
+        // had still acknowledged our Association Response. The provisional
+        // child under our address must not linger for the timeout.
+        for rx_on_when_idle in [true, false] {
+            let capability = CapabilityInfo {
+                device_type_ffd: rx_on_when_idle,
+                mains_powered: rx_on_when_idle,
+                rx_on_when_idle,
+                security_capable: true,
+                allocate_address: true,
+            };
+            let mut parent = node(DeviceType::Router, OUR_ADDR);
+            parent.nib.permit_joining = true;
+            let stale = parent
+                .handle_child_association(ORIGIN_IEEE, capability.to_byte())
+                .unwrap();
+            parent.routing.update_route(stale, stale, 1).unwrap();
+            parent.routing.update_route(FAR, stale, 2).unwrap();
+            if !rx_on_when_idle {
+                parent.enqueue_indirect_for_child(stale, &[0xAA]).unwrap();
+            }
+            let elsewhere = ShortAddress(if stale.0 == 0x4321 { 0x4322 } else { 0x4321 });
+
+            parent.note_announced_address(elsewhere, ORIGIN_IEEE);
+
+            assert_eq!(parent.known_child_by_ieee(&ORIGIN_IEEE), None);
+            assert!(parent.neighbors.find_by_short(stale).is_none());
+            assert!(!parent.indirect_queue().has_pending(stale));
+            assert!(parent.routing.get_entry(stale).is_none());
+            assert_eq!(parent.routing.next_hop(FAR), None);
+            assert_eq!(parent.find_short_by_ieee(&ORIGIN_IEEE), Some(elsewhere));
+            assert_eq!(
+                parent.mac.indirect_pending_history().last(),
+                Some(&(MacAddress::Short(PAN, stale), false))
+            );
+        }
     }
 
     #[test]
