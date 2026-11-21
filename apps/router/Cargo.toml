@@ -44,6 +44,10 @@ green-power-translation-table = [
     "green-power-sink",
     "zigbee-runtime/green-power-translation-table",
 ]
+# GPD key provisioning on the combo's sink (shared key attributes, keys for
+# GPDs that ask for one, out-of-band keys). Product images must opt in
+# explicitly.
+green-power-key-provisioning = ["green-power-sink", "zigbee-runtime/green-power-key-provisioning"]
 
 [dependencies]
 zigbee-aps = { path = "../../zigbee-aps" }

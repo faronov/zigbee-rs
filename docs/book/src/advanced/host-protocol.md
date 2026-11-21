@@ -1800,8 +1800,13 @@ itself has no GP fields.
   `gpsCommissioningWindow` (non-zero `window_s`) and the "on first pairing"
   exit bit from its flags; it needs a running network and `NCP_SINK`
   (`INVALID_STATE`).
-- `GP_SET_SHARED_KEY` is `UNSUPPORTED_COMMAND`: the sink provisions no
-  shared GPD key (`zigbee_gp::sink`).
+- `GP_SET_SHARED_KEY` sets gpSharedSecurityKeyType and
+  gpSharedSecurityKey (`green-power-key-provisioning`): a protected GPD that
+  asks for a key at commissioning gets the shared or derived key, TC-LK
+  protected when it uses key encryption (always for the network key).
+  Key types 0–4 and 7; reserved types are `INVALID_PARAMETER`. A GPD whose
+  key is known out of band is imported with `GP_SINK_TABLE_PUT`
+  (green-power.md 3.11).
 - `EVT_GP_FRAME.result` follows the sink outcome: 0–4 as listed. Result 5
   is not emitted by this build. A bidirectional commissioning reports the
   Commissioning frame with result 3 and the completing frame (Success)

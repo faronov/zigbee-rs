@@ -21181,3 +21181,18 @@ mod gp_translation_tests;
 #[cfg(feature = "green-power-translation-table")]
 #[path = "green_power/local_config.rs"]
 mod gp_local_config;
+
+/// The sink's view of this node (addresses, network key).
+#[cfg(feature = "green-power-sink")]
+#[path = "green_power/sink_keys.rs"]
+mod gp_sink_keys;
+
+/// GPD key provisioning on a combo, end to end.
+#[cfg(all(
+    test,
+    feature = "router",
+    feature = "green-power-key-provisioning",
+    feature = "green-power-bidirectional"
+))]
+#[path = "green_power/key_provisioning_tests.rs"]
+mod gp_key_provisioning_tests;

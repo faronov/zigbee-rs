@@ -148,6 +148,10 @@ green-power-sink = ["green-power", "zigbee-gp/sink"]
 # endpoints are persisted in the GP journal's sink record. Off by default:
 # images built without it are unchanged.
 green-power-translation-table = ["green-power-sink", "zigbee-gp/translation-table"]
+# GPD key provisioning on the sink: gpSharedSecurityKeyType/Key and
+# gpLinkKey, keys handed to GPDs that ask for one at commissioning,
+# out-of-band GPD keys (zigbee-gp `key-provisioning`).
+green-power-key-provisioning = ["green-power-sink", "zigbee-gp/key-provisioning"]
 # ZRHP network co-processor integration of the GP combo (spec 7.11,
 # `green_power::ncp`): one sink authority switchable at runtime between the
 # runtime's sink (NCP_SINK) and the host's (HOST_SINK: GP server frames and
