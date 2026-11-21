@@ -58,7 +58,7 @@ opt-level = "s"
 lto = true
 
 [features]
-default = ["sed"]
+default = ["sed", "identify-led"]
 # Sleepy environmental sensor (the original image).
 sed = ["dep:sensor-sed-app", "esp32-zigbee-devkit-product/sed"]
 # Always-on End Device: router-app AlwaysOnEndDeviceApp, end-device MAC.
@@ -81,6 +81,11 @@ router-core = [
 # router, opt-in for the ED (`--features ed,status-led`). Sleepy images
 # reject it.
 status-led = ["esp32-zigbee-devkit-product/status-led"]
+# Default for the sensor: Identify (ZCL Identify time / Trigger Effect)
+# blinks the board's WS2812 (GPIO8); dark otherwise. Links the RMT
+# driver. Not with `light-sleep`: that image is built with
+# `--no-default-features --features sed,light-sleep` (pads isolated, no RMT).
+identify-led = ["sed", "esp32-zigbee-devkit-product/identify-led"]
 # Lab only, never in shipped images: red, green, blue for 3 s each when the
 # LED starts, to check the colour byte order of the board.
 status-led-selftest = ["status-led", "esp32-zigbee-devkit-product/status-led-selftest"]

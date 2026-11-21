@@ -1161,6 +1161,10 @@ fn report_event(message: &Received) -> Option<(u16, [u8; 8])> {
                 event.asdu.0
             );
         }
+        ids::EVT_PERMIT_JOIN_STATE => {
+            let event: zigbee_zrhp::msg::network::EvtPermitJoinState = raw.decode().ok()?;
+            println!("EVT_PERMIT_JOIN_STATE: remaining {} s", event.remaining_s);
+        }
         ids::EVT_LOG_RECORD => {
             if let Ok(log) = raw.decode::<zigbee_zrhp::msg::log::EvtLogRecord>() {
                 println!(
@@ -1522,6 +1526,18 @@ fn main() {
         if let Some(channel) = value("--change-channel") {
             let channel = channel.parse().map_err(|_| "--change-channel CH")?;
             checks::change_channel(&mut host, channel)?;
+        }
+        if let Some(secs) = value("--permit") {
+            let secs = secs.parse().map_err(|_| "--permit SECS")?;
+            checks::permit(&mut host, secs)?;
+        }
+        if let Some(spec) = value("--identify") {
+            // SECS, or `effect:N` for a Trigger Effect.
+            let nwk = hex16("--device").ok_or("--device 0xNWK required")?;
+            let ep = value("--ep")
+                .map_or(Ok(1), |v| v.parse())
+                .map_err(|_| "--ep N")?;
+            checks::identify(&mut host, nwk, ep, &spec)?;
         }
         if args.iter().any(|a| a == "--reset-under-load") {
             let nwk = hex16("--device").ok_or("--device 0xNWK required")?;

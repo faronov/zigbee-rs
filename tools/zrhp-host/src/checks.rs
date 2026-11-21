@@ -186,3 +186,69 @@ pub fn invalidate<S: ByteStream>(host: &mut Host<S>, ieee: [u8; 8]) -> Result<()
     println!("TBL_INVALIDATE {ieee:02X?}: {:?}", rsp.status());
     Ok(())
 }
+
+/// Print the events of `secs` seconds (permit-join state, indications).
+fn watch<S: ByteStream>(host: &mut Host<S>, secs: u64) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        host.round(Duration::from_millis(100))?;
+        let events: Vec<_> = host
+            .inbox
+            .drain(..)
+            .filter(|m| m.kind == zigbee_zrhp::msg::Kind::Event)
+            .collect();
+        for message in &events {
+            super::report_event(message);
+        }
+    }
+    Ok(())
+}
+
+/// `NWK_PERMIT_JOIN{secs, NCP only}`, then watch the window to its expiry.
+pub fn permit<S: ByteStream>(host: &mut Host<S>, secs: u8) -> Result<(), String> {
+    use zigbee_zrhp::msg::network::NwkPermitJoin;
+    let started = Instant::now();
+    let tid = host.request(&NwkPermitJoin {
+        duration_s: secs,
+        target: 0x0000,
+        flags: 0,
+    });
+    let rsp = host.response(tid)?;
+    println!(
+        "NWK_PERMIT_JOIN {secs} s: {:?} after {:?}",
+        rsp.status(),
+        started.elapsed()
+    );
+    watch(host, u64::from(secs) + 4)
+}
+
+/// ZCL Identify to `nwk`/`ep`: `spec` is IdentifyTime seconds (then an
+/// Identify Query while it runs), or `effect:N` for Trigger Effect N.
+pub fn identify<S: ByteStream>(
+    host: &mut Host<S>,
+    nwk: u16,
+    ep: u8,
+    spec: &str,
+) -> Result<(), String> {
+    // Cluster-specific, client to server, default response enabled.
+    let (command, payload, secs): (u8, Vec<u8>, u64) = match spec.strip_prefix("effect:") {
+        Some(effect) => {
+            let effect: u8 = effect.parse().map_err(|_| "--identify effect:N")?;
+            (0x40, vec![effect, 0x00], 20)
+        }
+        None => {
+            let secs: u16 = spec.parse().map_err(|_| "--identify SECS")?;
+            (0x00, secs.to_le_bytes().to_vec(), u64::from(secs) + 10)
+        }
+    };
+    let mut zcl = vec![0x01, 0x31, command];
+    zcl.extend_from_slice(&payload);
+    data_request(host, nwk, ep, 1, 0x0104, 0x0003, &zcl);
+    println!("-> Identify cmd 0x{command:02X} {payload:02X?} to 0x{nwk:04X} ep {ep}");
+    watch(host, 15)?;
+    if command == 0x00 {
+        data_request(host, nwk, ep, 1, 0x0104, 0x0003, &[0x01, 0x32, 0x01]);
+        println!("-> Identify Query");
+    }
+    watch(host, secs.saturating_sub(15))
+}

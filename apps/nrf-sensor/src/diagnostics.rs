@@ -172,6 +172,10 @@ impl Diagnostics for NrfDiagnostics {
                 cluster_id,
                 command_id
             ),
+            DiagnosticEvent::Identify {
+                command_id,
+                argument,
+            } => defmt::info!("Identify cmd=0x{:02X} arg={}", command_id, argument),
             DiagnosticEvent::CommissioningComplete { success: true } => {
                 defmt::info!("Commissioning: ok")
             }

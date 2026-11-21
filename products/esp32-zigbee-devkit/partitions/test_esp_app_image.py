@@ -336,7 +336,11 @@ class OtaBuildTests(unittest.TestCase):
                         "cargo", "+nightly-2026-08-01", "build", "--release",
                         "--locked", "-Z", "build-std=core,alloc",
                     ]
-                    if features:
+                    if features and chip == "esp32c6":
+                        # The C6 light-sleep image leaves out the default
+                        # Identify LED.
+                        command += ["--no-default-features", "--features", f"sed,{features}"]
+                    elif features:
                         command += ["--features", features]
                     self.assertEqual(run.call_args.args[0], command)
                     self.assertEqual(run.call_args.kwargs["cwd"], example)

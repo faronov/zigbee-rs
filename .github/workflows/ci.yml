@@ -1474,9 +1474,11 @@ jobs:
           for elf in "$DIR/esp32c6-sensor" "$DIR/esp32c6-ed" "$DIR/esp32c6-router" \
             "$LED_DIR/esp32c6-ed"; do
             SYMS="$("$NM" --demangle "$elf")"
-            if [[ "$elf" == "$LED_DIR"/* || "$elf" == */esp32c6-router ]]; then
+            # The sensor drives the WS2812 for Identify (`identify-led`,
+            # default); the ED links it only with `status-led`.
+            if [[ "$elf" == "$LED_DIR"/* || "$elf" == */esp32c6-router || "$elf" == */esp32c6-sensor ]]; then
               grep -q 'esp_hal::rmt::' <<<"$SYMS" ||
-                { echo "$elf is missing the RMT status LED driver" >&2; exit 1; }
+                { echo "$elf is missing the RMT LED driver" >&2; exit 1; }
             elif grep -q 'esp_hal::rmt::' <<<"$SYMS"; then
               echo "$elf links the RMT status LED driver without status-led" >&2
               exit 1
@@ -1873,9 +1875,10 @@ jobs:
               echo "$elf does not use the hardware AES backend alone" >&2
               exit 1
             fi
-            if [[ "$elf" == */esp32c5-router ]]; then
+            # The sensor drives the WS2812 for Identify (`identify-led`).
+            if [[ "$elf" == */esp32c5-router || "$elf" == */esp32c5-sensor ]]; then
               grep -q 'esp_hal::rmt::' <<<"$SYMS" ||
-                { echo "$elf is missing the RMT status LED driver" >&2; exit 1; }
+                { echo "$elf is missing the RMT LED driver" >&2; exit 1; }
             elif grep -q 'esp_hal::rmt::' <<<"$SYMS"; then
               echo "$elf links the RMT status LED driver without status-led" >&2
               exit 1
@@ -1935,7 +1938,18 @@ jobs:
           tool: espflash@${{ env.ESPFLASH_VERSION }}
       - name: Link retained-sleep firmware
         working-directory: examples/${{ matrix.chip }}-sensor
-        run: cargo build --release --locked --features light-sleep -Z build-std=core,alloc
+        run: |
+          # Without the defaults: the C6's default Identify LED (RMT) is not
+          # combined with retained light sleep; for both chips this is the
+          # former `--features light-sleep` image (default was `sed`).
+          cargo build --release --locked --no-default-features --features sed,light-sleep \
+            -Z build-std=core,alloc
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          ELF=target/riscv32imac-unknown-none-elf/release/${{ matrix.chip }}-sensor
+          if "$NM" --demangle "$ELF" | grep -q 'esp_hal::rmt::'; then
+            echo "$ELF links the RMT driver with light-sleep" >&2
+            exit 1
+          fi
       - name: Validate actual application and OTA corpus and report size
         env:
           CHIP: ${{ matrix.chip }}

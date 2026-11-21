@@ -28,9 +28,9 @@ use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataConfirm, EvtApsDa
 use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagGetCountersRsp, DiagResetCounters};
 use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord, LogConfig};
 use zigbee_zrhp::msg::network::{
-    EvtChannelChanged, EvtDeviceJoined, EvtDeviceLeft, EvtNetworkState, NwkAddEndpoint,
-    NwkChangeChannel, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkInit, NwkInitRsp,
-    NwkLeaveReset, NwkPermitJoin,
+    EvtChannelChanged, EvtDeviceJoined, EvtDeviceLeft, EvtNetworkState, EvtPermitJoinState,
+    NwkAddEndpoint, NwkChangeChannel, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkInit,
+    NwkInitRsp, NwkLeaveReset, NwkPermitJoin,
 };
 use zigbee_zrhp::msg::security::{
     EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey,
@@ -236,6 +236,12 @@ pub struct Ncp<const LOG_N: usize> {
     held_credits: [u8; Endpoint::COUNT],
     deferred: Deque<Deferred, DEFERRED>,
     pending_channel: Option<PendingChannel>,
+    /// Permit-join seconds last seen by `EVT_PERMIT_JOIN_STATE` tracking
+    /// (`None`: a new session, nothing reported yet).
+    permit_join_seen: Option<u8>,
+    /// Report the permit-join state on the next pass (`NWK_PERMIT_JOIN`
+    /// completed).
+    permit_join_report: bool,
 }
 
 impl<const LOG_N: usize> Ncp<LOG_N> {
@@ -278,6 +284,8 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             held_credits: [0; Endpoint::COUNT],
             deferred: Deque::new(),
             pending_channel: None,
+            permit_join_seen: None,
+            permit_join_report: false,
         }
     }
 
@@ -459,6 +467,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             Op::PermitJoin { duration_s, target } => {
                 let status = op_status(port.permit_join(duration_s, target).await);
                 self.respond_status(ids::NWK_PERMIT_JOIN, accepted_tid(accepted_us), status);
+                self.permit_join_report = status == Status::Success;
             }
             Op::LeaveReset { flags } => {
                 let result = port.leave_reset().await;
@@ -570,6 +579,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             match event {
                 LinkEvent::Established(_) => {
                     self.negotiated = false;
+                    self.permit_join_seen = None;
                     self.event_seq = [0; Endpoint::COUNT];
                     self.queues.clear();
                     // A new session starts with fresh credit edges; owed
@@ -1676,6 +1686,33 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         self.event(Endpoint::Zigbee, &event);
     }
 
+    /// `EVT_PERMIT_JOIN_STATE` (7.2): when joining opens or closes on the
+    /// NCP (host request, expiry, a `Mgmt_Permit_Joining_req` from the
+    /// network), when it is re-armed (the remaining time grows), after every
+    /// successful `NWK_PERMIT_JOIN`, and once per session while it is open.
+    /// The per-second countdown is not reported.
+    #[inline(never)]
+    fn emit_permit_join_state<C: CoordinatorPort>(&mut self, port: &C) {
+        let remaining = port.permit_join_remaining_s();
+        let changed = match self.permit_join_seen {
+            None => remaining != 0,
+            Some(seen) => (seen == 0) != (remaining == 0) || remaining > seen,
+        };
+        if (changed || self.permit_join_report)
+            && !self.event(
+                Endpoint::Zigbee,
+                &EvtPermitJoinState {
+                    remaining_s: remaining,
+                },
+            )
+        {
+            // Queue full: reported on a later pass.
+            return;
+        }
+        self.permit_join_report = false;
+        self.permit_join_seen = Some(remaining);
+    }
+
     fn respond_status(&mut self, id: u16, tid: u16, status: Status) {
         Self::owe_status(&mut self.queues, &mut self.deferred, id, tid, status);
     }
@@ -1775,6 +1812,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     }
 
     fn emit_stack_events<C: CoordinatorPort>(&mut self, now_us: u64, port: &mut C) {
+        self.emit_permit_join_state(port);
         // Frame-counter checkpoints after every durable reservation.
         let counters = port.frame_counters();
         let key_seq = port.info().key_seq;
@@ -2237,6 +2275,8 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 held_credits: _,
                 deferred: _,
                 pending_channel: _,
+                permit_join_seen: _,
+                permit_join_report: _,
             } = ncp;
         };
         let reason = match identity.reset_reason {
@@ -2280,6 +2320,8 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             addr_of_mut!((*slot).held_credits).write([0; Endpoint::COUNT]);
             addr_of_mut!((*slot).deferred).write(Deque::new());
             addr_of_mut!((*slot).pending_channel).write(None);
+            addr_of_mut!((*slot).permit_join_seen).write(None);
+            addr_of_mut!((*slot).permit_join_report).write(false);
             let ncp = &mut *slot;
             ncp.link.open(now_us, reason);
             ncp

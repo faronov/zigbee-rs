@@ -143,6 +143,8 @@ where
     was_fast_polling: bool,
     was_identifying: bool,
     identify_phase_on: bool,
+    /// A running Identify Trigger Effect: start and length (ms).
+    identify_effect: Option<(R::Mark, u32)>,
     interview_done: bool,
     consecutive_rejoin_failures: u8,
     /// The secure-rejoin failure limit was reached: the durable reset and
@@ -247,6 +249,7 @@ where
             was_fast_polling: false,
             was_identifying: false,
             identify_phase_on: false,
+            identify_effect: None,
             interview_done: false,
             consecutive_rejoin_failures: 0,
             fallback_rejoin_due: false,
@@ -369,6 +372,11 @@ where
     ) {
         let (device, profile) = self.node.device_and_profile_mut();
         (device, profile.poll_control_mut())
+    }
+
+    /// Identifying (IdentifyTime running) or showing a Trigger Effect.
+    fn identifying_or_effect(&self) -> bool {
+        self.identify_effect.is_some() || self.node.device().is_identifying(self.endpoint)
     }
 
     fn mark(&self) -> W::Mark {
@@ -711,6 +719,7 @@ where
         self.interview_done = false;
         self.was_identifying = false;
         self.identify_phase_on = false;
+        self.identify_effect = None;
         // A fresh join/rejoin means the coordinator re-runs its interview.
         self.node.reset_remote_reporting();
         self.was_fast_polling = true;
@@ -784,7 +793,7 @@ where
             step => step.allows(),
         };
 
-        let identifying = self.node.device().is_identifying(self.endpoint);
+        let identifying = self.identifying_or_effect();
         let identifying =
             match self
                 .identify_bound
@@ -1154,6 +1163,7 @@ where
         self.was_fast_polling = joined;
         self.was_identifying = false;
         self.identify_phase_on = false;
+        self.identify_effect = None;
         if joined {
             let duration_ms = if resumed_at_boot {
                 self.policy.restored_fast_ms
@@ -1336,8 +1346,24 @@ where
                 src_addr,
                 cluster_id,
                 command_id,
+                payload,
                 ..
             } => {
+                if *cluster_id == 0x0003 {
+                    // Identify is served by the stack's Identify cluster
+                    // (IdentifyTime countdown, Query response, Trigger
+                    // Effect); the status indicator follows it.
+                    self.resources
+                        .diagnostics
+                        .record(DiagnosticEvent::Identify {
+                            command_id: *command_id,
+                            argument: match payload.as_slice() {
+                                [low, high, ..] => u16::from_le_bytes([*low, *high]),
+                                _ => 0,
+                            },
+                        });
+                    return false;
+                }
                 if *command_id == 0x06 {
                     // A Configure Reporting the stack did not fully accept
                     // (malformed, unsupported/unreportable attribute, invalid
@@ -1564,7 +1590,20 @@ where
         // naturally reads false and a stale `send_device_annce` is already
         // tolerated (`let _ = ...`) below.
         if St::PRESENT {
-            let identifying = self.node.device().is_identifying(self.endpoint);
+            // Trigger Effect (ZCL 3.5.2.3.3): shown with the Identify blink
+            // for the effect's length; Finish and Stop end it.
+            if let Some((effect, _variant)) =
+                self.node.device_mut().take_identify_effect(self.endpoint)
+            {
+                let now = self.mark();
+                self.identify_effect = identify_effect_ms(effect).map(|ms| (now, ms));
+            }
+            if let Some((started, ms)) = self.identify_effect
+                && self.elapsed_ms(started) >= ms
+            {
+                self.identify_effect = None;
+            }
+            let identifying = self.identifying_or_effect();
             if identifying {
                 self.identify_phase_on = !self.identify_phase_on;
                 self.resources.status.set(SensorStatus::Identifying {
@@ -2070,5 +2109,18 @@ where
         loop {
             self.step_initialized().await;
         }
+    }
+}
+
+/// Length of an Identify Trigger Effect (ZCL r8 Table 3-8): blink one
+/// on/off cycle, breathe 15 cycles, okay two flashes, channel change 8 s;
+/// Finish (0xFE), Stop (0xFF) and unknown effects end the running one.
+const fn identify_effect_ms(effect: u8) -> Option<u32> {
+    match effect {
+        0x00 => Some(1_000),
+        0x01 => Some(15_000),
+        0x02 => Some(2_000),
+        0x0B => Some(8_000),
+        _ => None,
     }
 }

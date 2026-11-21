@@ -1212,7 +1212,7 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | `0x0185` | `EVT_ROUTE_RECORD` | `u16 src_nwk, [8] src_ieee (0 if unknown), u8 n, n×u16 relays` (Route Record order: entry 0 is nearest the originator) | event | P (route-record receive exists) |
 | `0x0186` | `EVT_NWK_STATUS` | `u16 dst, u8 nwk_status, u16 reporter` | event | P |
 | `0x0187` | `EVT_PAN_ID_CONFLICT` | `u16 conflicting_pan, u8 count` | event | P (`conflict.rs`) |
-| `0x0188` | `EVT_PERMIT_JOIN_STATE` | `u8 remaining_s` | event | N |
+| `0x0188` | `EVT_PERMIT_JOIN_STATE` | `u8 remaining_s` | event: the NCP's own permit-join window (0 closed, 255 no time limit). Sent when it opens or closes (host request, expiry, a `Mgmt_Permit_Joining_req` from the network), when it is re-armed (the remaining time grows), after every successful `NWK_PERMIT_JOIN`, and once per session while it is open. The per-second countdown is not sent. | E |
 | `0x0189` | `EVT_CHANNEL_CHANGED` | `u8 channel, u8 nwk_update_id, u16 req_tid` | event (`channel` is the one the radio is on; a failed tune reports the old channel, NV already holds the new one) | E |
 | `0x018A` | `EVT_ENERGY_SCAN_RESULT` | `u16 req_tid, u8 status, u8 n, n×{u8 channel, i8 max_rssi_dbm, u8 energy}` | event | N |
 

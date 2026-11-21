@@ -78,6 +78,8 @@ pub mod flash_timing;
     )
 ))]
 mod flash_window;
+#[cfg(all(target_os = "none", feature = "identify-led"))]
+pub mod identify_led;
 pub mod migration;
 #[cfg(feature = "esp32h2")]
 pub mod pad_isolation;
