@@ -71,6 +71,7 @@ async fn main(_spawner: Spawner) {
         rtcc,
         flash,
         supply: _,
+        crypto,
     } = BoardResources::take().unwrap_or_else(|| platform::halt());
 
     let clocks = efr32mg22_devkit::init_clocks(clocks);
@@ -105,19 +106,27 @@ async fn main(_spawner: Spawner) {
     // Composition runs in its own (non-inlined) frame: the large
     // temporaries of building the MAC, device and app are released before
     // the run loop, whose call chain needs every byte of the 32 KiB SRAM.
-    compose(radio, flash, button, led).run().await
+    compose(radio, crypto, flash, button, led).run().await
 }
 
 #[inline(never)]
 fn compose(
     radio: efr32s2_hal::radio::RadioToken,
+    crypto: efr32s2_hal::crypto::Crypto,
     flash: efr32s2_hal::flash::Efr32s2Flash,
     button: efr32mg22_devkit::Button0,
     led: efr32mg22_devkit::Led0,
 ) -> &'static mut SharedSensorApp {
     let mac = Efr32s2RadioPhy::new(radio)
         .map_err(|error| log::error!("[MG22] radio init failed: {error:?}"))
-        .and_then(|phy| {
+        .and_then(|mut phy| {
+            // CRYPTOACC AES with its on-silicon KAT; no software AES exists.
+            phy.install_aes_engine(crypto)
+                .map_err(|error| log::error!("[MG22] AES engine failed: {error:?}"))?;
+            #[cfg(feature = "zrs-boot")]
+            vcom_log::marker(format_args!("MG22 AES_KAT_PASS CRYPTOACC"));
+            #[cfg(not(feature = "zrs-boot"))]
+            log::info!("[MG22] AES_KAT_PASS CRYPTOACC");
             phy.into_soft_mac()
                 .map_err(|error| log::error!("[MG22] MAC init failed: {error:?}"))
         })

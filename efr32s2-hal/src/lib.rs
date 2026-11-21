@@ -16,6 +16,7 @@ compile_error!("efr32s2-hal: enable one chip feature (`efr32mg21` or `efr32mg22`
 
 pub mod chip;
 pub mod clock;
+pub mod crypto;
 pub mod delay;
 pub mod devinfo;
 pub mod flash;

@@ -25,7 +25,7 @@ use product::end_device::EndDeviceProfile;
 use roles::{CommissioningTrigger, LedStatus, LogDiagnostics, ResetSupervisor, halt};
 use router_app::{AlwaysOnEndDeviceApp, NodeArchetype};
 use static_cell::StaticCell;
-use zigbee_mac::efr32s2::{Efr32s2RadioPhy, Efr32s2SoftMac};
+use zigbee_mac::efr32s2::Efr32s2SoftMac;
 use zigbee_nwk::DeviceType;
 use zigbee_runtime::{
     ZigbeeDevice, node::ZigbeeNode, power::PowerMode, profile::ApplicationProfile,
@@ -53,7 +53,7 @@ const ARCHETYPE: NodeArchetype = NodeArchetype::AlwaysOnEndDevice;
 async fn main(_spawner: Spawner) {
     let started = roles::start(product::END_DEVICE_MODEL);
     let mut trigger = CommissioningTrigger::new(started.button);
-    let app = compose(started.radio, started.flash, started.led);
+    let app = compose(started.radio, started.crypto, started.flash, started.led);
     if let Err(error) = app.initialize().await {
         roles::fatal(app.parts_mut(), ARCHETYPE, error);
     }
@@ -73,16 +73,16 @@ async fn main(_spawner: Spawner) {
 #[inline(never)]
 fn compose(
     radio: efr32s2_hal::radio::RadioToken,
+    crypto: efr32s2_hal::crypto::Crypto,
     flash: efr32s2_hal::flash::Efr32s2Flash,
     led: efr32mg22_devkit::Led0,
 ) -> &'static mut App {
-    let mac: Mac = Efr32s2RadioPhy::new(radio)
-        .map_err(|error| log::error!("[MG22] radio init failed: {error:?}"))
-        .and_then(|phy| {
-            phy.into_soft_mac()
-                .map_err(|error| log::error!("[MG22] MAC init failed: {error:?}"))
-        })
-        .unwrap_or_else(|()| halt());
+    let mac: Mac = roles::radio_with_aes(radio, crypto)
+        .into_soft_mac()
+        .unwrap_or_else(|error| {
+            log::error!("[MG22] MAC init failed: {error:?}");
+            halt()
+        });
     let ieee = mac.pib().extended_address();
     roles::check_ieee(ieee);
 
