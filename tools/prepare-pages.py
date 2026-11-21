@@ -6,7 +6,7 @@ Layout of the site:
   /                     the mdBook
   /flasher/             release flasher (docs/flasher/index.html), images of
                         tagged releases (tools/flasher_site.py fetch) and a
-                        vendored ESP Web Tools
+                        vendored ESP Web Tools and esptool-js
   /flasher/sensor/      CI sensor flasher (docs/flasher/sensor.html)
 """
 
@@ -42,7 +42,7 @@ def prepare(
     run_id: int,
     results: dict[str, str],
     releases: Path,
-    esp_web_tools: Path,
+    vendor: Path,
 ) -> None:
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None or run_id <= 0:
         raise ValueError("expected a full commit SHA and positive workflow run ID")
@@ -56,8 +56,9 @@ def prepare(
         raise ValueError("expected a built book without the reserved flasher directory")
     if not (releases / "releases.json").is_file():
         raise ValueError("expected fetched releases (tools/flasher_site.py fetch)")
-    if not (esp_web_tools / "install-button.js").is_file():
-        raise ValueError("expected the ESP Web Tools web bundle (dist/web)")
+    if not (vendor / "esp-web-tools" / "install-button.js").is_file() or \
+            not (vendor / "esptool-js" / "bundle.js").is_file():
+        raise ValueError("expected vendor/esp-web-tools (dist/web) and vendor/esptool-js (bundle.js)")
 
     available = all(result == "success" for result in results.values())
     files = [f"{chip.lower().replace('-', '')}-sensor.bin" for chip in CHIPS]
@@ -108,7 +109,7 @@ def prepare(
     (site / "index.html").write_text(page)
     shutil.copyfile(releases / "releases.json", site / "releases.json")
     shutil.copytree(releases / "releases", site / "releases")
-    shutil.copytree(esp_web_tools, site / "vendor" / "esp-web-tools")
+    shutil.copytree(vendor, site / "vendor")
     destination = site / "sensor"
     destination.mkdir()
     (destination / "index.html").write_text(template)
@@ -123,7 +124,7 @@ def prepare(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("book", "flasher", "firmware", "output", "releases", "esp-web-tools"):
+    for name in ("book", "flasher", "firmware", "output", "releases", "vendor"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--run-id", type=int, required=True)
@@ -135,7 +136,7 @@ def main() -> None:
             args.book, args.flasher, args.firmware, args.output,
             args.revision, args.run_id,
             {chip: getattr(args, f"{chip}_result") for chip in ("esp32c6", "esp32h2", "bl702")},
-            args.releases, args.esp_web_tools,
+            args.releases, args.vendor,
         )
     except (OSError, ValueError) as error:
         parser.exit(1, f"Cannot assemble Pages site: {error}\n")
