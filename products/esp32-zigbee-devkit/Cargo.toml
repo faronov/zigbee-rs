@@ -62,6 +62,10 @@ roles = ["dep:router-app"]
 # palette over `router_app::StatusIndicator`, shown through the board's RMT
 # driver. Never enabled by sleepy images.
 status-led = ["roles", "esp32-zigbee-devkit/status-led"]
+# Sleepy sensor (opt-in): the board's WS2812 shows only Identify (ZCL
+# Identify time and Trigger Effect) and stays dark otherwise
+# (`identify_led`). Links the RMT driver; not with `light-sleep`.
+identify-led = ["sed", "esp32-zigbee-devkit/status-led"]
 # Build for the Waveshare ESP32-H2-Zero instead of the ESP32-H2-DevKitM-1
 # (status LED byte order; see `esp32_zigbee_devkit::BOARD`).
 waveshare-h2-zero = ["esp32-zigbee-devkit/waveshare-h2-zero"]

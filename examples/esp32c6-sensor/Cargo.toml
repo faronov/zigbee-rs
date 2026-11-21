@@ -81,6 +81,9 @@ router-core = [
 # router, opt-in for the ED (`--features ed,status-led`). Sleepy images
 # reject it.
 status-led = ["esp32-zigbee-devkit-product/status-led"]
+# Sleepy sensor, opt-in: Identify (ZCL Identify time / Trigger Effect)
+# blinks the board's WS2812 (GPIO8); dark otherwise. Links the RMT driver.
+identify-led = ["sed", "esp32-zigbee-devkit-product/identify-led"]
 # Lab only, never in shipped images: red, green, blue for 3 s each when the
 # LED starts, to check the colour byte order of the board.
 status-led-selftest = ["status-led", "esp32-zigbee-devkit-product/status-led-selftest"]

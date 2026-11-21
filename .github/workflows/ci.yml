@@ -1482,6 +1482,24 @@ jobs:
               exit 1
             fi
           done
+          # Opt-in Identify LED on the sleepy sensor (`identify-led`).
+          ID_DIR=target/identify-led/riscv32imac-unknown-none-elf/release
+          cargo build --release --locked -Z build-std=core,alloc --target-dir target/identify-led \
+            --features identify-led
+          cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/identify-led \
+            --features identify-led -- -D warnings
+          espflash save-image --skip-update-check --chip esp32c6 \
+            --partition-table "$CSV" --target-app-partition ota_0 \
+            "$ID_DIR/esp32c6-sensor" "$ID_DIR/esp32c6-sensor.app.bin"
+          espflash save-image --skip-update-check --chip esp32c6 \
+            --merge --skip-padding --flash-size 4mb \
+            --partition-table "$CSV" --target-app-partition ota_0 \
+            "$ID_DIR/esp32c6-sensor" "$ID_DIR/esp32c6-sensor.bin"
+          python3 ../../products/esp32-zigbee-devkit/partitions/check-app-image-size.py \
+            --chip esp32c6 --slot ota_0 --merged "$ID_DIR/esp32c6-sensor.bin" \
+            "$ID_DIR/esp32c6-sensor.app.bin"
+          "$NM" --demangle "$ID_DIR/esp32c6-sensor" | grep -q 'esp_hal::rmt::' ||
+            { echo "identify-led image is missing the RMT driver" >&2; exit 1; }
       - name: Check ESP32-C6 hardware AES and role split
         run: |
           ELF=examples/esp32c6-sensor/target/riscv32imac-unknown-none-elf/release/esp32c6-sensor
@@ -1850,6 +1868,8 @@ jobs:
             --no-default-features --features ed,status-led -- -D warnings
           cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/variants \
             --no-default-features --features router,green-power-bidirectional -- -D warnings
+          cargo clippy --release --locked -Z build-std=core,alloc --target-dir target/variants \
+            --features identify-led -- -D warnings
           DIR=target/riscv32imac-unknown-none-elf/release
           CSV=../../products/esp32-zigbee-devkit/partitions/esp32-4mb-ota.csv
           for image in esp32c5-sensor esp32c5-ed esp32c5-router; do

@@ -48,7 +48,7 @@ use esp_hal::tsens::{Config as TsensConfig, TemperatureSensor};
 use platform::{C6Environment, EspDiagnostics, EspSupervisor};
 
 use esp32_zigbee_devkit_product::executor::block_on;
-use sensor_sed_app::{FixedBattery, NoStatus, SensorApp, SensorSedParts, ToggleJoinAction};
+use sensor_sed_app::{FixedBattery, SensorApp, SensorSedParts, ToggleJoinAction};
 use static_cell::StaticCell;
 
 use esp32_zigbee_devkit_product as product;
@@ -58,9 +58,15 @@ use zigbee_runtime::profile::{ApplicationProfile, BatteryMeasurement};
 use zigbee_runtime::ZigbeeDevice;
 use zigbee_zcl::clusters::basic::PowerSource;
 
+/// The status sink: none, or the WS2812 for Identify (`identify-led`).
+#[cfg(feature = "identify-led")]
+type C6Status = product::identify_led::IdentifyLed;
+#[cfg(not(feature = "identify-led"))]
+type C6Status = sensor_sed_app::NoStatus;
+
 type C6Parts = SensorSedParts<
     SensorWake<'static>,
-    NoStatus,
+    C6Status,
     C6Environment<'static>,
     FixedBattery,
     product::ota_transport::OtaTransport,
@@ -297,7 +303,10 @@ fn main() -> ! {
     let node = ZigbeeNode::new(device, security, profile);
     let parts = SensorSedParts {
         wake: SensorWake::new(button, sleep),
-        status: NoStatus,
+        #[cfg(feature = "identify-led")]
+        status: product::identify_led::IdentifyLed::new(peripherals.RMT, peripherals.GPIO8),
+        #[cfg(not(feature = "identify-led"))]
+        status: sensor_sed_app::NoStatus,
         environment: C6Environment::new(temp_sensor),
         battery: FixedBattery::new(
             3_300,

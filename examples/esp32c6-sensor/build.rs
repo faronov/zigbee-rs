@@ -18,6 +18,13 @@ fn main() {
         "`status-led` is for the mains roles: the router enables it; the ED takes --no-default-features --features ed,status-led"
     );
 
+    // The Identify LED links RMT on GPIO8; retained light sleep isolates and
+    // holds the unused pads, and the pair is not measured.
+    assert!(
+        !(feature("IDENTIFY_LED") && feature("LIGHT_SLEEP")),
+        "`identify-led` is not combined with `light-sleep`"
+    );
+
     let raw = env::var("ESP32_OTA_VERSION").unwrap_or_else(|_| "1".to_owned());
     let version = if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
         u32::from_str_radix(hex, 16)

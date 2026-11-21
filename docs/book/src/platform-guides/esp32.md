@@ -190,6 +190,17 @@ sensor's active-low GPIO8 output cannot light the board's WS2812. It is
 kept unchanged so the validated image stays byte-identical; the
 `status-led` driver above is for the mains roles only.
 
+**Identify on the sleepy C6/C5 (`identify-led`, opt-in).** The stack's
+Identify cluster always runs (IdentifyTime countdown, Identify Query
+response, Trigger Effect); the lifecycle keeps the radio on the fast poll
+while it identifies and records each Identify command as
+`DiagnosticEvent::Identify`. With `--features identify-led` the board's
+WS2812 (GPIO8 on the C6, GPIO27 on the C5) blinks magenta while the device
+identifies or shows a Trigger Effect (blink 1 s, breathe 15 s, okay 2 s,
+channel change 8 s; Finish/Stop end it) and stays dark otherwise. It links
+the RMT driver, so it is not part of the default image and is refused
+together with `light-sleep` (pad isolation and RMT not measured together).
+
 `Active`/`Active` describes the radio/SoC policy, not a continuously spinning
 CPU. The executor uses `WFI` while its root future is pending. SYSTIMER alarm 0
 wakes expired Embassy timers and is rearmed for the next deadline; the
