@@ -3,8 +3,8 @@
 
 Checks (all hard failures):
 * the loadable flash bytes lie in the application window [0, app_end) of
-  `products/cc26x2-dongle/link/memory-<chip>.x` -- never in the router
-  journals, the security journal or the CCFG sector padding;
+  `products/cc26x2-dongle/link/memory-<chip>.x` -- never in the GP Proxy
+  Table, router or security journals or the CCFG sector padding;
 * exactly one 88-byte CCFG sits at FLASH_SIZE - 88 and keeps the serial ROM
   bootloader and its backdoor enabled (the only recovery path of a dongle
   without a debug header), the image valid at 0 and no sector protected;
@@ -23,7 +23,7 @@ import sys
 
 CHIPS = {
     # flash size, application end, RAM end
-    "cc2652p": (352 * 1024, 0x4A000, 0x20014000),
+    "cc2652p": (352 * 1024, 0x46000, 0x20014000),
     "cc2652p7": (704 * 1024, 0x9E000, 0x20024000),
 }
 # Application end of the ZRHP NCP product (160 KiB of NV journals).

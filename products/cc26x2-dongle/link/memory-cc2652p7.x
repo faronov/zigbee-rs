@@ -2,7 +2,7 @@
  * Flash 704 KiB (88 x 8 KiB sectors); SRAM 144 KiB.
  *
  *   0x00000..0x9E000  application
- *   0x9E000..0xA2000  router: Green Power Proxy Table journal (reserved)
+ *   0x9E000..0xA2000  router: Green Power Proxy Table journal
  *   0xA2000..0xAA000  router: child-table and APS journals
  *   0xAA000..0xAE000  security journal (two 8 KiB sectors)
  *   0xAE000..0xB0000  CCFG sector (CCFG at 0xAFFA8, rest erased)

@@ -18,7 +18,7 @@ header once the bootloader is gone):
 * every written range is verified with the ROM's CRC32.
 
     cc26xx-rom-bsl.py identify -p /dev/cu.usbserial-0001
-    cc26xx-rom-bsl.py flash -p PORT --app-end 0x4A000 image.elf
+    cc26xx-rom-bsl.py flash -p PORT --app-end 0x46000 image.elf   # CC2652P
     cc26xx-rom-bsl.py read -p PORT --out dump.bin [--addr 0 --len 0x58000]
 """
 import argparse

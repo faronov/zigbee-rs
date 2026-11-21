@@ -7,7 +7,7 @@ autobins = false
 
 # CC2652P / CC2652P7 USB dongle images. One board variant per build:
 #   cargo build --release                                   # ZBDongle-P (default)
-#   cargo build --release --no-default-features --features cc2652p7-dongle
+#   cargo build --release --no-default-features --features cc2652p7-dongle,info-log
 # Bins: `cc26x2-router` (Zigbee Router) and `cc26x2-lab` (peripheral and
 # radio bring-up gates, never part of the product image).
 [[bin]]
@@ -19,9 +19,19 @@ name = "cc26x2-lab"
 path = "src/lab.rs"
 
 [features]
-default = ["zbdongle-p"]
+default = ["zbdongle-p", "info-log"]
 zbdongle-p = ["cc26x2-dongle-product/zbdongle-p", "cc26x2-dongle/zbdongle-p"]
 cc2652p7-dongle = ["cc26x2-dongle-product/cc2652p7-dongle", "cc26x2-dongle/cc2652p7-dongle"]
+# Green Power Proxy Basic (tunnels GPDFs to the sink; Proxy Table journal).
+# The CC2652P GP image fits its 280 KiB window only with `quiet-log` and the
+# `release-compact` profile (see .cargo/config.toml):
+#   cargo build --profile release-compact --no-default-features \
+#     --features zbdongle-p,green-power,quiet-log
+green-power = ["router-app/green-power", "cc26x2-dongle-product/green-power", "zigbee-mac/green-power"]
+# Release log level, exactly one: `info-log` (default) keeps info sites,
+# `quiet-log` compiles them out (warnings and errors stay).
+info-log = ["log/release_max_level_info"]
+quiet-log = ["log/release_max_level_warn"]
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
@@ -42,7 +52,7 @@ zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
 embassy-time = "0.5"
 embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
-log = { version = "0.4", features = ["max_level_info", "release_max_level_info"] }
+log = { version = "0.4", features = ["max_level_info"] }
 static_cell = "2"
 
 [profile.dev]
@@ -51,7 +61,7 @@ debug = true
 
 # `z` and (in .cargo/config.toml) `-Zlocation-detail=none`, with debug and
 # trace log sites compiled out (`log` features above): the CC2652P router
-# must fit the 296 KiB application window of its 352 KiB flash.
+# must fit the 280 KiB application window of its 352 KiB flash.
 [profile.release]
 opt-level = "z"
 codegen-units = 1

@@ -2,7 +2,8 @@
  * Flash 352 KiB (FLASH:FLASH_SIZE = 44 x 8 KiB sectors, read over the ROM
  * bootloader on the lab unit); SRAM 80 KiB (PRCM:RAMHWOPT = 3).
  *
- *   0x00000..0x4A000  application (vector table at 0, booted by the ROM)
+ *   0x00000..0x46000  application (vector table at 0, booted by the ROM)
+ *   0x46000..0x4A000  router: Green Power Proxy Table journal
  *   0x4A000..0x52000  router: child-table and APS journals
  *   0x52000..0x56000  security journal (two 8 KiB sectors)
  *   0x56000..0x58000  CCFG sector; the 88-byte CCFG sits at 0x57FA8 and the
@@ -10,15 +11,18 @@
  *                     time (cc26x2-hal refuses it); only the ROM bootloader
  *                     tooling writes it, after the application.
  *
- * Unlike the CC2652P7 map there is no Green Power Proxy Table window: a
- * GP proxy build does not fit this flash, and its 16 KiB are needed by the
- * router image. Every role image links this map, so a reflash never moves
- * persistence.
+ * The GP window (16 KiB, two sectors) was carved from the top of the former
+ * 296 KiB application window; the child/APS/security journals did not move,
+ * so a device joined with an earlier image keeps its network state. The
+ * GP window may still hold the tail of an older, larger image: the GP
+ * journal finds no record there and erases a sector before its first write.
+ * Every role image links this map, so a reflash never moves persistence.
  * Keep in sync with src/journal.rs and tools/verify-layout.py.
  */
 MEMORY
 {
-    FLASH          : ORIGIN = 0x00000000, LENGTH = 296K
+    FLASH          : ORIGIN = 0x00000000, LENGTH = 280K
+    GP_PROXY_TABLE : ORIGIN = 0x00046000, LENGTH = 16K
     ROUTER_TABLES  : ORIGIN = 0x0004A000, LENGTH = 32K
     PERSISTENCE    : ORIGIN = 0x00052000, LENGTH = 16K
     CCFG_PAD       : ORIGIN = 0x00056000, LENGTH = 0x1FA8
@@ -35,8 +39,10 @@ INSERT AFTER .rodata;
 _security_partition_start = ORIGIN(PERSISTENCE);
 _security_partition_end   = ORIGIN(PERSISTENCE) + LENGTH(PERSISTENCE);
 
-ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) == ORIGIN(ROUTER_TABLES),
-  "CC2652P: application must end at the router tables");
+ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) == ORIGIN(GP_PROXY_TABLE),
+  "CC2652P: application must end at the GP Proxy Table journal");
+ASSERT(ORIGIN(GP_PROXY_TABLE) + LENGTH(GP_PROXY_TABLE) == ORIGIN(ROUTER_TABLES),
+  "CC2652P: GP Proxy Table journal must end at the router tables");
 ASSERT(ORIGIN(ROUTER_TABLES) + LENGTH(ROUTER_TABLES) == ORIGIN(PERSISTENCE),
   "CC2652P: router tables must end at the security journal");
 ASSERT(ORIGIN(PERSISTENCE) + LENGTH(PERSISTENCE) == ORIGIN(CCFG_PAD),

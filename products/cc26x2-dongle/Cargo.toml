@@ -13,6 +13,8 @@ default = ["zbdongle-p"]
 # Board variant (memory map, CCFG); exactly one.
 zbdongle-p = ["cc26x2-dongle/zbdongle-p"]
 cc2652p7-dongle = ["cc26x2-dongle/cc2652p7-dongle"]
+# Green Power Proxy Basic: the Proxy Table journal in its own window.
+green-power = ["router-app/green-power", "zigbee-runtime/green-power"]
 
 [dependencies]
 cc26x2-dongle = { path = "../../boards/cc26x2-dongle", default-features = false }

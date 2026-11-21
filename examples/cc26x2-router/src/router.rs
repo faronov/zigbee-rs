@@ -213,6 +213,8 @@ fn compose(started: platform::Started) -> &'static mut App {
         .build_router_into(DEVICE.uninit());
 
     let (flash, child_store, aps_store) = product::router::router_stores(flash);
+    #[cfg(feature = "green-power")]
+    let (flash, gp_store) = product::router::gp_proxy_table_store(flash);
     let (security_store, migration) =
         product::storage::security_store(flash).unwrap_or_else(|error| {
             log::error!("[CC26X2] security journal open failed: {error:?}");
@@ -250,6 +252,13 @@ fn compose(started: platform::Started) -> &'static mut App {
         log::error!("[CC26X2] invalid composition: {error:?}");
         halt()
     });
+    #[cfg(feature = "green-power")]
+    let app = {
+        static GP_STORE: StaticCell<product::router::GpProxyTableStore> = StaticCell::new();
+        let mut app = app;
+        app.set_green_power_store(GP_STORE.init(gp_store));
+        app
+    };
     APP.init(app)
 }
 

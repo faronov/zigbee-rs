@@ -70,6 +70,30 @@ pub fn router_stores(
     )
 }
 
+/// Green Power Proxy Table journal window (two 8 KiB sectors).
+#[cfg(feature = "green-power")]
+pub type GpProxyTableFlash = FlashPartition<
+    { crate::journal::GP_PROXY_TABLE_PARTITION_START },
+    { crate::journal::GP_PROXY_TABLE_PARTITION_SIZE },
+>;
+/// Green Power Proxy Table journal on two 8 KiB sectors.
+#[cfg(feature = "green-power")]
+pub type GpProxyTableStore =
+    zigbee_runtime::gp_store::GpProxyJournal<GpProxyTableFlash, FLASH_PAGE_SIZE>;
+
+/// Mint the GP Proxy Table journal; the flash handle is passed through as
+/// by [`router_stores`].
+#[cfg(feature = "green-power")]
+pub fn gp_proxy_table_store(
+    flash: cc26x2_hal::flash::Flash,
+) -> (cc26x2_hal::flash::Flash, GpProxyTableStore) {
+    // SAFETY: the GP window is disjoint from the child, APS and security
+    // windows and from the application (journal.rs and the linker script
+    // assert it); the single flash handle is consumed by the caller after.
+    let gp = unsafe { GpProxyTableFlash::new_unchecked() };
+    (flash, GpProxyTableStore::new(gp, 0, FLASH_PAGE_SIZE as u32))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
