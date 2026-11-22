@@ -161,6 +161,24 @@ class FlasherSiteTests(unittest.TestCase):
         SITE.mark_size_groups(same, "ncp")
         self.assertNotIn("size_group", same[0])
 
+    def test_flash_and_psram_variants_form_one_group(self):
+        def board(bid, size, psram, match):
+            return {"id": bid, "title": f"Thread BR board, S3 ({size}): hub", "product": "zigbee-rs-hub",
+                    "firmware": "tbr-hub", "chip_family": "ESP32-S3", "flash_size": size,
+                    "psram": psram, "match": {"embedded_psram_mb": match}}
+        boards = [board("thread-br-s3-hub-8mb", "8MB", "quad", [0, 2, 4]),
+                  board("thread-br-s3-hub-8mb-opi", "8MB", "octal", [8, 16]),
+                  board("thread-br-s3-hub-4mb-dev", "4MB", "quad", [0, 2, 4]),
+                  board("thread-br-s3-hub-4mb-dev-opi", "4MB", "octal", [8, 16])]
+        SITE.mark_size_groups(boards, "zigbee-rs hub")
+        self.assertEqual({b["size_group"] for b in boards}, {"thread-br-s3-hub"})
+        self.assertEqual(boards[0]["size_group_title"],
+                         "Thread BR board, S3 (4 MB / 8 MB, octal/quad PSRAM, detected): zigbee-rs hub")
+        # The same flash size and PSRAM twice is no choice.
+        twins = [board("a", "8MB", "quad", [0, 2]), board("b", "8MB", "quad", [0, 2])]
+        SITE.mark_size_groups(twins, "hub")
+        self.assertNotIn("size_group", twins[0])
+
     def test_fingerprint_ignores_order_and_tracks_content(self):
         a = [("o/r", "ncp-v0.1.0", "1" * 64), ("o/h", "hub-v0.1.0", "2" * 64)]
         self.assertEqual(SITE.fingerprint(a), SITE.fingerprint(list(reversed(a))))

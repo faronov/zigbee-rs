@@ -157,12 +157,20 @@ def flash_bytes(size: str) -> int:
     return int(m.group(1)) << (10 if m.group(2) == "K" else 20)
 
 
+def psram_match(board: dict) -> list[int] | None:
+    match = (board.get("match") or {}).get("embedded_psram_mb")
+    if match is not None and (not isinstance(match, list) or not all(isinstance(n, int) for n in match)):
+        raise SiteError(f"{board.get('id')}: match.embedded_psram_mb must be a list of MB")
+    return match
+
+
 def mark_size_groups(boards: list[dict], product_name: str) -> None:
-    """Boards of one release that differ only in flash size (same product,
-    firmware, chip and host link) form a size group: the page reads the
-    chip's flash ID and offers only images that fit, the largest first.
-    A release manifest may name the group itself (`size_group`,
-    `size_group_title`)."""
+    """Boards of one release that differ only in flash size and/or PSRAM
+    (same product, firmware, chip and host link) form a size group: the page
+    reads the chip's flash ID and embedded PSRAM and offers only images that
+    fit, the largest flash first. A board's `match.embedded_psram_mb` lists
+    the PSRAM sizes it is for (absent: any). A release manifest may name the
+    group itself (`size_group`, `size_group_title`)."""
     keyed: dict[str, list[dict]] = {}
     for board in boards:
         key = board.get("size_group") or "|".join(
@@ -170,11 +178,15 @@ def mark_size_groups(boards: list[dict], product_name: str) -> None:
         keyed.setdefault(key, []).append(board)
     for members in keyed.values():
         sizes = {flash_bytes(b["flash_size"]) for b in members}
-        if len(members) < 2 or len(sizes) != len(members):
+        variants = {(flash_bytes(b["flash_size"]), tuple(sorted(psram_match(b) or ()))) for b in members}
+        if len(members) < 2 or len(variants) != len(members):
             continue
         ids = os.path.commonprefix([b["id"] for b in members]).rstrip("-")
         titles = os.path.commonprefix([b["title"] for b in members]).rstrip(" (:,")
         label = " / ".join(f"{n >> 20} MB" for n in sorted(sizes))
+        psram = sorted({b["psram"] for b in members if b.get("psram")})
+        if psram:
+            label += ", " + "/".join(psram) + " PSRAM"
         group = members[0].get("size_group") or ids or members[0]["id"]
         title = members[0].get("size_group_title") or f"{titles} ({label}, detected): {product_name}"
         for board in members:
