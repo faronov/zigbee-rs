@@ -150,6 +150,35 @@ pub enum EntropyError {
     ReseedRequired,
 }
 
+impl EntropyError {
+    /// Compact diagnostic code, so logs need no `Debug` formatting of the
+    /// nested error enums:
+    ///
+    /// | code | error |
+    /// |------|-------|
+    /// | `0x01` .. `0x06` | `Unseeded`, `AesUnavailable`, `RadioBusy`, `Cipher`, `KnownAnswerMismatch`, `ReseedRequired` |
+    /// | `0x10 + n` | `Noise(e)`, `n` = position of `e` in [`NoiseError`] (`Unavailable` = 0 .. `StopTimeout` = 10) |
+    /// | `0x20` | `Health(Format)` |
+    /// | `0x22`/`0x23` | `Health(RepetitionCount(I/Q))` |
+    /// | `0x24`/`0x25` | `Health(AdaptiveProportion(I/Q))` |
+    /// | `0x26`/`0x27` | `Health(Bimodal(I/Q))` |
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Unseeded => 0x01,
+            Self::AesUnavailable => 0x02,
+            Self::RadioBusy => 0x03,
+            Self::Cipher => 0x04,
+            Self::KnownAnswerMismatch => 0x05,
+            Self::ReseedRequired => 0x06,
+            Self::Noise(error) => 0x10 | error as u8,
+            Self::Health(HealthFailure::Format) => 0x20,
+            Self::Health(HealthFailure::RepetitionCount(stream)) => 0x22 | stream as u8,
+            Self::Health(HealthFailure::AdaptiveProportion(stream)) => 0x24 | stream as u8,
+            Self::Health(HealthFailure::Bimodal(stream)) => 0x26 | stream as u8,
+        }
+    }
+}
+
 /// Run-time state of the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntropyDisposition {
@@ -271,10 +300,13 @@ impl CbcMac {
     }
 
     fn absorb<C: Aes128Forward>(&mut self, cipher: &mut C, word: u32) -> Result<(), C::Error> {
-        for (offset, byte) in word.to_le_bytes().into_iter().enumerate() {
-            self.state[self.filled + offset] ^= byte;
+        // `filled` is 0, 4, 8 or 12; the mask lets the compiler drop the
+        // bounds checks.
+        let base = self.filled & 0xC;
+        for (state, byte) in self.state[base..].iter_mut().zip(word.to_le_bytes()) {
+            *state ^= byte;
         }
-        self.filled += 4;
+        self.filled = base + 4;
         if self.filled == 16 {
             self.filled = 0;
             cipher.encrypt_block(&mut self.state)?;
@@ -953,6 +985,45 @@ mod tests {
     impl ForwardAesProvider for Wrong {
         fn forward_cipher(&mut self, _key: &AesKey) -> impl Aes128Forward + '_ {
             WrongCipher
+        }
+    }
+
+    #[test]
+    fn error_codes_are_stable_and_unique() {
+        use HealthFailure::*;
+        let cases = [
+            (EntropyError::Unseeded, 0x01),
+            (EntropyError::AesUnavailable, 0x02),
+            (EntropyError::RadioBusy, 0x03),
+            (EntropyError::Cipher, 0x04),
+            (EntropyError::KnownAnswerMismatch, 0x05),
+            (EntropyError::ReseedRequired, 0x06),
+            (EntropyError::Noise(NoiseError::Unavailable), 0x10),
+            (EntropyError::Noise(NoiseError::InvalidLength), 0x11),
+            (EntropyError::Noise(NoiseError::RadioBusy), 0x12),
+            (EntropyError::Noise(NoiseError::ClockTimeout), 0x13),
+            (EntropyError::Noise(NoiseError::ImageTooLarge), 0x14),
+            (EntropyError::Noise(NoiseError::TrimUnavailable), 0x15),
+            (EntropyError::Noise(NoiseError::RfeBootTimeout), 0x16),
+            (EntropyError::Noise(NoiseError::PllCalibrationTimeout), 0x17),
+            (EntropyError::Noise(NoiseError::RxStartTimeout), 0x18),
+            (EntropyError::Noise(NoiseError::CaptureTimeout), 0x19),
+            (EntropyError::Noise(NoiseError::StopTimeout), 0x1A),
+            (EntropyError::Health(Format), 0x20),
+            (EntropyError::Health(RepetitionCount(Stream::I)), 0x22),
+            (EntropyError::Health(RepetitionCount(Stream::Q)), 0x23),
+            (EntropyError::Health(AdaptiveProportion(Stream::I)), 0x24),
+            (EntropyError::Health(AdaptiveProportion(Stream::Q)), 0x25),
+            (EntropyError::Health(Bimodal(Stream::I)), 0x26),
+            (EntropyError::Health(Bimodal(Stream::Q)), 0x27),
+        ];
+        for (index, &(error, code)) in cases.iter().enumerate() {
+            assert_eq!(error.code(), code, "{error:?}");
+            assert!(
+                cases[..index]
+                    .iter()
+                    .all(|&(other, _)| other.code() != code)
+            );
         }
     }
 

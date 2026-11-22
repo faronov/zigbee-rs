@@ -234,10 +234,7 @@ impl Cc2340Driver {
             let tx_power =
                 config::tx_power(self.config.tx_power_dbm).ok_or(RadioError::InvalidTxPower)?;
 
-            hardware::setup_device_trim();
-            hardware::start_hfxt()?;
-            hardware::enable_hfxt_clock_buffer();
-            hardware::enable_radio_clocks()?;
+            hardware::start_lrfd_clocks()?;
             if !self.images_resident {
                 if let Err(error) = hardware::load_firmware(images.pbe, images.mce, images.rfe) {
                     hardware::disable_radio_clocks();

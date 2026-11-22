@@ -94,10 +94,6 @@ pub const fn available() -> bool {
     NOISE_CONFIG_AVAILABLE
 }
 
-pub(crate) fn source() -> &'static str {
-    NOISE_CONFIG_SOURCE
-}
-
 pub(crate) const fn validate_words(words: usize) -> Result<usize, NoiseError> {
     if words == 0 || words > MAX_WORDS {
         Err(NoiseError::InvalidLength)
@@ -108,6 +104,7 @@ pub(crate) const fn validate_words(words: usize) -> Result<usize, NoiseError> {
 
 // The generated tables are only referenced by the target capture (and an
 // unavailable table never names `RegisterWidth`).
+const _: &str = NOISE_CONFIG_SOURCE;
 const _: usize = NOISE_RFE_LEN;
 const _: u32 = NOISE_RFE_CHECKSUM;
 const _: &[(u16, u16)] = NOISE_RFE_RUNS;
@@ -268,10 +265,7 @@ mod lrf {
             return Err(NoiseError::Unavailable);
         }
 
-        hardware::setup_device_trim();
-        hardware::start_hfxt()?;
-        hardware::enable_hfxt_clock_buffer();
-        hardware::enable_radio_clocks()?;
+        hardware::start_lrfd_clocks()?;
         // From here on the guard restores clocks/HFXT on every exit.
         let capture = Capture { words };
         wipe_samples(MAX_WORDS);
@@ -316,11 +310,10 @@ mod lrf {
         write32(DBELL_ICLR0, DBELL_RFEDONE);
         write32(RFE_INIT, RFE_TOPSM);
         write32(RFE_ENABLE, RFE_TOPSM);
-        if !wait_until(RFE_BOOT_TICKS, || read32(RFE_MSGBOX) == RFE_BOOT_DONE) {
+        if !wait_field(RFE_BOOT_TICKS, RFE_MSGBOX, u32::MAX, RFE_BOOT_DONE, true) {
             return Err(NoiseError::RfeBootTimeout);
         }
-        write32(RFE_MSGBOX, 0);
-        write32(PBE_RFEAPI, RFE_CMD_CALIBRATE_PLL);
+        rfe_command(RFE_CMD_CALIBRATE_PLL);
 
         // RCL_Handler_Adc_Noise_configureS2R()
         write32(DBELL_CLKCTL, read32(DBELL_CLKCTL) | DBELL_CLKCTL_S2R);
@@ -330,17 +323,24 @@ mod lrf {
         write32(S2R_STOP, S2R_PBE_RAM_START + words as u32 - 1);
 
         // lrfEvents.rfedone: the PLL is calibrated.
-        if !wait_until(PLL_CALIBRATION_TICKS, || {
-            read32(DBELL_RIS0) & DBELL_RFEDONE != 0
-        }) {
+        if !wait_field(
+            PLL_CALIBRATION_TICKS,
+            DBELL_RIS0,
+            DBELL_RFEDONE,
+            DBELL_RFEDONE,
+            true,
+        ) {
             return Err(NoiseError::PllCalibrationTimeout);
         }
         write32(DBELL_ICLR0, DBELL_RFEDONE);
-        write32(RFE_MSGBOX, 0);
-        write32(PBE_RFEAPI, RFE_CMD_START_RX);
-        if !wait_until(RX_START_TICKS, || {
-            read32(MDM_RFECMDIN) & MDM_RFECMDIN_RX_RUNNING != 0
-        }) {
+        rfe_command(RFE_CMD_START_RX);
+        if !wait_field(
+            RX_START_TICKS,
+            MDM_RFECMDIN,
+            MDM_RFECMDIN_RX_RUNNING,
+            MDM_RFECMDIN_RX_RUNNING,
+            true,
+        ) {
             return Err(NoiseError::RxStartTimeout);
         }
         write32(RFE_LNA, read32(RFE_LNA) & !RFE_LNA_EN);
@@ -351,7 +351,7 @@ mod lrf {
 
         // The capture needs ~words * 87 ns; then poll for the last part.
         wait_ticks(words as u32 / 3)?;
-        if !wait_until(CAPTURE_TICKS, || read32(S2R_STAT) & S2R_RUNNING == 0) {
+        if !wait_field(CAPTURE_TICKS, S2R_STAT, S2R_RUNNING, 0, true) {
             return Err(NoiseError::CaptureTimeout);
         }
         power_down()
@@ -359,12 +359,8 @@ mod lrf {
 
     /// `RCL_Handler_Adc_Noise_powerDown()`.
     fn power_down() -> Result<(), NoiseError> {
-        write32(RFE_MSGBOX, 0);
-        write32(PBE_RFEAPI, RFE_CMD_STOP_RX);
-        let rx_stopped = wait_until(RFE_STOP_TICKS, || read32(PBE_RFEMSGBOX) != 0);
-        write32(RFE_MSGBOX, 0);
-        write32(PBE_RFEAPI, RFE_CMD_STOP_PLL);
-        let pll_stopped = wait_until(RFE_STOP_TICKS, || read32(PBE_RFEMSGBOX) != 0);
+        let rx_stopped = rfe_command_acknowledged(RFE_CMD_STOP_RX);
+        let pll_stopped = rfe_command_acknowledged(RFE_CMD_STOP_PLL);
         hard_stop();
         if rx_stopped && pll_stopped {
             Ok(())
@@ -373,7 +369,30 @@ mod lrf {
         }
     }
 
+    /// Post an RFE API command (`LRFDRFE.MSGBOX` cleared first, as
+    /// `adc_noise.c` does).
+    #[inline(never)]
+    fn rfe_command(command: u32) {
+        write32(RFE_MSGBOX, 0);
+        write32(PBE_RFEAPI, command);
+    }
+
+    /// [`rfe_command`], then wait for the RFE's reply in `LRFDPBE.RFEMSGBOX`.
+    fn rfe_command_acknowledged(command: u32) -> bool {
+        rfe_command(command);
+        wait_field(RFE_STOP_TICKS, PBE_RFEMSGBOX, u32::MAX, 0, false)
+    }
+
+    /// Bounded wait until `(read32(address) & mask == value) == equal`. One
+    /// out-of-line loop for every wait of the capture.
+    #[inline(never)]
+    fn wait_field(timeout_ticks: u32, address: u32, mask: u32, value: u32, equal: bool) -> bool {
+        wait_until(timeout_ticks, || (read32(address) & mask == value) == equal)
+    }
+
     /// The unconditional tail of `powerDown()`: S2R, ADCDIG and RFE off.
+    /// Shared by the normal and the error path.
+    #[inline(never)]
     fn hard_stop() {
         write32(S2R_CFG, 0);
         write32(MDM_INIT, 0xFFFF);
@@ -422,12 +441,30 @@ mod tests {
             );
             assert!(!ADC_NOISE_PHY_WRITES.is_empty());
             assert!(ADC_NOISE_PHY_WRITES.iter().all(|write| {
-                (0x4008_3000..0x4008_4000).contains(&write.address)
-                    || (0x4009_6000..0x4009_7000).contains(&write.address)
+                (0x4008_3000..0x4008_4000).contains(&write.address())
+                    || (0x4009_6000..0x4009_7000).contains(&write.address())
             }));
+            // adc_noise_bt5_cc23xx.json: 142 fields in 60 register writes.
+            assert_eq!(ADC_NOISE_PHY_WRITES.len(), 60);
         } else {
             assert!(NOISE_RFE_RUNS.is_empty() && ADC_NOISE_PHY_WRITES.is_empty());
         }
+    }
+
+    /// The packed table decodes to exactly the writes `build.rs` resolved
+    /// from TI's `adc_noise_bt5_cc23xx.json` (same order).
+    #[test]
+    fn packed_noise_phy_table_matches_resolved_writes() {
+        assert_eq!(
+            ADC_NOISE_PHY_WRITES.len(),
+            ADC_NOISE_PHY_WRITES_RESOLVED.len()
+        );
+        assert!(
+            ADC_NOISE_PHY_WRITES
+                .iter()
+                .map(|write| (write.address(), write.value(), write.width()))
+                .eq(ADC_NOISE_PHY_WRITES_RESOLVED.iter().copied())
+        );
     }
 
     /// The IEEE RFE image plus the patch must be TI's BLE5 RFE image

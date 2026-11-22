@@ -337,8 +337,13 @@ impl Cc2340RadioPhy {
             .seed(&mut aes, noise, &entropy::CUTOFFS, &personalization);
         self.driver.invalidate_lrfd();
         match result {
-            Ok(()) => log::info!("[CC2340] entropy seeded from {}", noise::source()),
-            Err(error) => log::error!("[CC2340] entropy source failed closed: {error:?}"),
+            Ok(()) => {
+                log::info!("[CC2340] entropy seeded: CTR_DRBG KAT and noise health tests passed")
+            }
+            Err(error) => log::error!(
+                "[CC2340] entropy failed closed (code {:#04x}); fill_random disabled",
+                error.code()
+            ),
         }
         result
     }

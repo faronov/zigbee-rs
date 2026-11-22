@@ -98,12 +98,14 @@ pub fn radio(ieee: zigbee_types::IeeeAddress, aes: board::aes::Aes) -> Cc2340Rad
         halt()
     }
     rtt_target::rprintln!("[CC2340] LAES AES-128 self-test passed");
+    // `EntropyError::code` instead of `Debug`: these roles log over RTT only.
     match phy.seed_entropy() {
-        Ok(()) => rtt_target::rprintln!("[CC2340] entropy={:?}", phy.entropy_disposition()),
+        Ok(()) => rtt_target::rprintln!(
+            "[CC2340] entropy seeded: CTR_DRBG KAT and noise health tests passed"
+        ),
         Err(error) => rtt_target::rprintln!(
-            "[CC2340] entropy={:?} ({:?}); fill_random fails closed",
-            phy.entropy_disposition(),
-            error
+            "[CC2340] entropy failed closed (code {:#04x}); fill_random disabled",
+            error.code()
         ),
     }
     if let Err(error) = phy.initialize_radio() {

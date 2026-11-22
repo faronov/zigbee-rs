@@ -73,13 +73,10 @@ impl CtrDrbg {
             reseed_counter: 1,
             reseed_interval,
         };
-        let mut seed_material = *entropy_input;
-        if let Some(personalization) = personalization {
-            xor_into(&mut seed_material, personalization);
-        }
-        let result = drbg.update(aes, Some(&seed_material));
-        zeroize(&mut seed_material);
-        result.map(|()| drbg)
+        // From `Key = 0, V = 0` the instantiate steps are exactly the reseed
+        // steps, with the personalization string as `additional_input`.
+        drbg.reseed(aes, entropy_input, personalization)?;
+        Ok(drbg)
     }
 
     /// `CTR_DRBG_Reseed_algorithm` (10.2.1.4.1):
@@ -147,6 +144,41 @@ impl CtrDrbg {
             self.update(aes, additional_input)?;
         }
 
+        self.ctr_blocks(aes, output)?;
+
+        // Step 6: Update(additional_input), with a zero string when absent.
+        self.update(aes, additional_input)?;
+        self.reseed_counter += 1;
+        Ok(())
+    }
+
+    /// `CTR_DRBG_Update` (10.2.1.2). `None` means `provided_data = 0^seedlen`.
+    fn update<P: ForwardAesProvider>(
+        &mut self,
+        aes: &mut P,
+        provided_data: Option<&[u8; SEED_LEN]>,
+    ) -> Result<(), DrbgError> {
+        let mut temp = [0u8; SEED_LEN];
+        self.ctr_blocks(aes, &mut temp)?;
+        if let Some(provided_data) = provided_data {
+            xor_into(&mut temp, provided_data);
+        }
+        self.key.copy_from_slice(&temp[..16]);
+        self.v.copy_from_slice(&temp[16..]);
+        zeroize(&mut temp);
+        Ok(())
+    }
+
+    /// The counter-mode loop shared by `Update` (10.2.1.2 step 2) and
+    /// `Generate` (10.2.1.5.1 step 4): `V = (V + 1) mod 2^128`, then the next
+    /// output block is `Encrypt(Key, V)`, until `output` is full (the last
+    /// block truncated). A cipher error zeroises `output`, wipes the state
+    /// and returns [`DrbgError::Cipher`].
+    fn ctr_blocks<P: ForwardAesProvider>(
+        &mut self,
+        aes: &mut P,
+        output: &mut [u8],
+    ) -> Result<(), DrbgError> {
         let mut block = [0u8; BLOCK_LEN];
         let mut failed = false;
         {
@@ -163,48 +195,10 @@ impl CtrDrbg {
         }
         zeroize(&mut block);
         if failed {
+            zeroize(output);
             self.wipe();
             return Err(DrbgError::Cipher);
         }
-
-        // Step 6: Update(additional_input), with a zero string when absent.
-        self.update(aes, Some(additional_input.unwrap_or(&[0; SEED_LEN])))?;
-        self.reseed_counter += 1;
-        Ok(())
-    }
-
-    /// `CTR_DRBG_Update` (10.2.1.2). `None` means `provided_data = 0^seedlen`.
-    fn update<P: ForwardAesProvider>(
-        &mut self,
-        aes: &mut P,
-        provided_data: Option<&[u8; SEED_LEN]>,
-    ) -> Result<(), DrbgError> {
-        let mut temp = [0u8; SEED_LEN];
-        let mut ok = true;
-        {
-            let mut cipher = aes.forward_cipher(&self.key);
-            for chunk in temp.chunks_exact_mut(BLOCK_LEN) {
-                increment(&mut self.v);
-                let mut block = self.v;
-                ok = cipher.encrypt_block(&mut block).is_ok();
-                chunk.copy_from_slice(&block);
-                zeroize(&mut block);
-                if !ok {
-                    break;
-                }
-            }
-        }
-        if !ok {
-            zeroize(&mut temp);
-            self.wipe();
-            return Err(DrbgError::Cipher);
-        }
-        if let Some(provided_data) = provided_data {
-            xor_into(&mut temp, provided_data);
-        }
-        self.key.copy_from_slice(&temp[..16]);
-        self.v.copy_from_slice(&temp[16..]);
-        zeroize(&mut temp);
         Ok(())
     }
 

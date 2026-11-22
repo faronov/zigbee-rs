@@ -274,6 +274,8 @@ pub(crate) const NOISE_RFE_CHECKSUM: u32 = 0;
 pub(crate) static NOISE_RFE_RUNS: &[(u16, u16)] = &[];
 pub(crate) static NOISE_RFE_WORDS: &[u32] = &[];
 pub(crate) static ADC_NOISE_PHY_WRITES: &[RegisterWrite] = &[];
+#[cfg(test)]
+pub(crate) static ADC_NOISE_PHY_WRITES_RESOLVED: &[(u32, u32, RegisterWidth)] = &[];
 ",
     )
     .expect("write unavailable CC2340 ADC-noise marker");
@@ -407,6 +409,8 @@ fn write_unavailable_phy_config(output: &Path) {
 pub(crate) const PHY_CONFIG_AVAILABLE: bool = false;
 pub(crate) const PHY_CONFIG_SOURCE: &str = \"set CC2340_SDK_DIR to a current TI SimpleLink Low Power F3 SDK\";
 pub(crate) static IEEE_802154_PHY_WRITES: &[RegisterWrite] = &[];
+#[cfg(test)]
+pub(crate) static IEEE_802154_PHY_WRITES_RESOLVED: &[(u32, u32, RegisterWidth)] = &[];
 pub(crate) static TX_POWER_TABLE: &[TxPowerEntry] = &[];
 ",
     )
@@ -732,8 +736,58 @@ fn parse_unsigned_number(value: &str) -> Result<u32, String> {
     }
 }
 
+/// Mirror of `RegisterWrite` in `src/cc2340/config.rs`: a write is packed
+/// into `(code, value)` halfwords with `address = BASE + 2 * code`; codes at
+/// or above `U16_CODES` (the TOPsm RAM blocks from `0x4009_0000`) are 16-bit
+/// writes, the others 32-bit register writes.
+const PACKED_WRITE_BASE: u32 = 0x4008_0000;
+const PACKED_WRITE_U16_CODES: u32 = 0x8000;
+
+fn pack_register_write(write: &RegisterWrite) -> (u16, u16) {
+    let offset = write
+        .address
+        .checked_sub(PACKED_WRITE_BASE)
+        .filter(|offset| offset % 2 == 0 && offset / 2 <= u32::from(u16::MAX))
+        .unwrap_or_else(|| panic!("CC2340 register 0x{:08X} cannot be packed", write.address));
+    let code = offset / 2;
+    let width = if code >= PACKED_WRITE_U16_CODES {
+        RegisterWidth::U16
+    } else {
+        RegisterWidth::U32
+    };
+    if width != write.width {
+        panic!(
+            "CC2340 register 0x{:08X}: its width does not follow the packed address rule",
+            write.address
+        );
+    }
+    let value = u16::try_from(write.value).unwrap_or_else(|_| {
+        panic!(
+            "CC2340 register 0x{:08X} value 0x{:X} does not fit 16 bits",
+            write.address, write.value
+        )
+    });
+    (code as u16, value)
+}
+
 fn write_register_writes(generated: &mut String, name: &str, writes: &[RegisterWrite]) {
     writeln!(generated, "pub(crate) static {name}: &[RegisterWrite] = &[").unwrap();
+    for write in writes {
+        let (code, value) = pack_register_write(write);
+        writeln!(
+            generated,
+            "    RegisterWrite::packed(0x{code:04X}, 0x{value:04X}),"
+        )
+        .unwrap();
+    }
+    generated.push_str("];\n");
+    // The resolved (unpacked) table, so a host test proves the target
+    // decoder reproduces every address, width and value.
+    writeln!(
+        generated,
+        "#[cfg(test)]\npub(crate) static {name}_RESOLVED: &[(u32, u32, RegisterWidth)] = &["
+    )
+    .unwrap();
     for write in writes {
         let width = match write.width {
             RegisterWidth::U16 => "RegisterWidth::U16",
@@ -741,7 +795,7 @@ fn write_register_writes(generated: &mut String, name: &str, writes: &[RegisterW
         };
         writeln!(
             generated,
-            "    RegisterWrite {{ address: 0x{:08X}, value: 0x{:08X}, width: {width} }},",
+            "    (0x{:08X}, 0x{:08X}, {width}),",
             write.address, write.value
         )
         .unwrap();

@@ -278,6 +278,17 @@ pub(crate) fn disable_radio_clocks() {
     write32(CLKCTL_CLKENCLR0, CLKCTL_LRFD);
 }
 
+/// The clock prologue of RCL `LRF_setupRadio()`, shared (out of line) by the
+/// IEEE bring-up and the ADC-noise capture: device trims, HFXT, its
+/// high-performance buffer, then the LRFD clocks.
+#[inline(never)]
+pub(crate) fn start_lrfd_clocks() -> Result<(), HardwareError> {
+    setup_device_trim();
+    start_hfxt()?;
+    enable_hfxt_clock_buffer();
+    enable_radio_clocks()
+}
+
 pub(crate) fn route_scheduler_interrupt() {
     write32(EVTSVT_CPUIRQ4SEL, 0x0E);
 }
@@ -296,11 +307,13 @@ pub(crate) fn load_rfe_image(rfe: &[u32]) -> Result<(), HardwareError> {
     load_image(RFE_RAM_BASE, rfe)
 }
 
+/// Out of line: the IEEE bring-up and the ADC-noise capture share it.
+#[inline(never)]
 pub(crate) fn apply_phy_configuration(writes: &[RegisterWrite]) {
-    for write in writes {
-        match write.width {
-            RegisterWidth::U16 => write16(write.address, write.value as u16),
-            RegisterWidth::U32 => write32(write.address, write.value),
+    for &write in writes {
+        match write.width() {
+            RegisterWidth::U16 => write16(write.address(), write.value() as u16),
+            RegisterWidth::U32 => write32(write.address(), write.value()),
         }
     }
 }

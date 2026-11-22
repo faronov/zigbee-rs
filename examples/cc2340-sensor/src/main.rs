@@ -159,17 +159,9 @@ fn build_device(
     }
     log::info!("[CC2340] LAES AES-128 self-test passed");
     // Radio noise is captured before the IEEE radio is brought up. A failure
-    // is not fatal: `fill_random` then fails closed for the whole boot.
-    match phy.seed_entropy() {
-        Ok(()) => log::info!(
-            "[CC2340] entropy={:?}: CTR_DRBG KAT and noise health tests passed",
-            phy.entropy_disposition()
-        ),
-        Err(error) => log::error!(
-            "[CC2340] entropy={:?} ({error:?}); fill_random fails closed",
-            phy.entropy_disposition()
-        ),
-    }
+    // is not fatal: `fill_random` then fails closed for the whole boot. The
+    // PHY logs the outcome (and the error code).
+    let _ = phy.seed_entropy();
     log::info!("[CC2340] radio-sleep={:?}", phy.radio_sleep_disposition());
 
     if let Err(error) = phy.initialize_radio() {
