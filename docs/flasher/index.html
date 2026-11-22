@@ -80,7 +80,7 @@
       <h2>1. Board</h2>
       <select id="board"></select>
       <div id="layout-box" class="hidden" style="margin-top:.8rem">
-        <label for="layout" class="muted" style="font-size:.9rem">Image (chosen from the detected flash size, step 4)</label>
+        <label for="layout" class="muted" style="font-size:.9rem">Image (chosen from the detected flash and PSRAM, step 4)</label>
         <select id="layout" disabled></select>
         <p id="layout-note" class="muted" style="font-size:.85rem;margin:.4rem 0 0"></p>
       </div>
@@ -127,10 +127,11 @@
         ports.
       </div>
       <div id="detect-box" class="hidden note">
-        <p style="margin-top:0">This board comes with different flash sizes, and an image for a larger flash does not
-          boot at all. The flasher first reads the chip's flash ID and partition table, then offers only images that
-          fit (the largest by default). Install then uses the same port.</p>
-        <button class="button secondary" id="detect">Connect and read the flash size</button>
+        <p style="margin-top:0">This board comes with different flash sizes and PSRAM types: an image for a larger flash
+          does not boot at all, and a build for the other PSRAM type runs without PSRAM. The flasher first reads the
+          chip's flash ID, embedded PSRAM (eFuse) and partition table, then offers only images that fit (the largest
+          flash by default). Install then uses the same port.</p>
+        <button class="button secondary" id="detect">Connect and read flash and PSRAM</button>
         <div id="detect-result" class="muted" style="font-size:.9rem;margin-top:.5rem"></div>
       </div>
       <div class="install" style="margin-top:1rem">
@@ -236,7 +237,7 @@
           let r = entry.releases.find((x) => x.release === release);
           if (!r) entry.releases.push(r = {release, boards: []});
           r.boards.push(board);
-          r.boards.sort((a, b) => b.flash_bytes - a.flash_bytes);
+          r.boards.sort((a, b) => b.flash_bytes - a.flash_bytes || (a.psram || '').localeCompare(b.psram || ''));
         }
       }
     }
@@ -291,6 +292,10 @@
   const sameBytes = (chip, image) => image && chip && image.length <= chip.length && image.every((v, i) => v === chip[i]);
 
   // The image for this release: the only board, or for a size group the chosen fitting variant (null = refuse).
+  // Images list the embedded PSRAM sizes they are for (`match.embedded_psram_mb`; absent: any).
+  const psramFits = (b) => !b.match?.embedded_psram_mb || (detection.psramMb !== null && b.match.embedded_psram_mb.includes(detection.psramMb));
+  const psramText = (n) => n === null ? 'unknown PSRAM' : n ? `${n} MB embedded PSRAM` : 'no embedded PSRAM';
+
   function choose(entry, r) {
     if (!entry.group) return {board: r.boards[0]};
     const select = $('layout');
@@ -298,25 +303,28 @@
     for (const b of r.boards) {
       const opt = document.createElement('option');
       opt.value = b.id;
-      const fits = detection && b.flash_bytes <= detection.flashBytes;
-      opt.textContent = `${b.flash_size}: ${b.layout}` + (detection && !fits ? `  (needs ${mb(b.flash_bytes)}, the chip has ${mb(detection.flashBytes)})` : '');
-      opt.disabled = !!detection && !fits;
+      const why = !detection ? '' :
+        b.flash_bytes > detection.flashBytes ? `needs ${mb(b.flash_bytes)} flash, the chip has ${mb(detection.flashBytes)}` :
+        !psramFits(b) ? `for ${b.match.embedded_psram_mb.join('/')} MB PSRAM, the chip has ${psramText(detection.psramMb)}` : '';
+      opt.textContent = `${b.flash_size}: ${b.layout}${b.psram ? `, ${b.psram} PSRAM` : ''}` + (why ? `  (${why})` : '');
+      opt.disabled = !!why;
       select.appendChild(opt);
     }
     select.disabled = !detection;
     if (!detection) {
-      $('layout-note').textContent = 'Read the flash size first (step 4); until then nothing can be installed.';
-      return {board: r.boards[0], blocked: 'Read the flash size first'};
+      $('layout-note').textContent = 'Read flash and PSRAM first (step 4); until then nothing can be installed.';
+      return {board: r.boards[0], blocked: 'Read flash and PSRAM first'};
     }
-    const fitting = r.boards.filter((b) => b.flash_bytes <= detection.flashBytes);
+    const found = `Detected ${mb(detection.flashBytes)} flash, ${psramText(detection.psramMb)}`;
+    const fitting = r.boards.filter((b) => b.flash_bytes <= detection.flashBytes && psramFits(b));
     if (!fitting.length) {
-      $('layout-note').textContent = `The chip has ${mb(detection.flashBytes)} of flash; no image of this release fits.`;
-      return {board: r.boards[r.boards.length - 1], blocked: 'No image fits this flash'};
+      $('layout-note').textContent = `${found}: no image of this release fits this chip.`;
+      return {board: r.boards[r.boards.length - 1], blocked: 'No image fits this chip'};
     }
     const board = fitting.find((b) => b.id === preferredLayout) || fitting[0];
     select.value = board.id;
-    $('layout-note').textContent = `Detected ${mb(detection.flashBytes)} of flash: ` +
-      (board === fitting[0] ? 'the largest image that fits is selected.' : 'a smaller image, chosen by hand.');
+    $('layout-note').textContent = `${found}: ` + (board === fitting[0]
+      ? `selected the largest fitting image${board.psram ? ` (${board.psram} PSRAM build)` : ''}.` : 'a smaller image, chosen by hand.');
     return {board};
   }
 
@@ -353,7 +361,7 @@
     const repo = `https://github.com/${product.repository}`;
     $('board-info').innerHTML = `
       <dt>Chip</dt><dd>${esc(board.chip_family)}, ${esc(board.flash_size)} flash${entry.group ? ' (selected image)' : ''}</dd>
-      <dt>Layout</dt><dd><code>${esc(board.layout)}</code>${board.note ? ` · ${esc(board.note)}` : ''}</dd>
+      <dt>Layout</dt><dd><code>${esc(board.layout)}</code>${board.psram ? `, ${esc(board.psram)} PSRAM build` : ''}${board.note ? ` · ${esc(board.note)}` : ''}</dd>
       ${board.transport ? `<dt>Host link</dt><dd>${esc(board.transport)}</dd>` : ''}
       <dt>Firmware</dt><dd>${esc(product.name)}</dd>`;
     const fw = board.fw_update;
@@ -431,10 +439,16 @@
         out.innerHTML = `<span style="color:var(--red)">Cannot read the flash size (flash ID ${hex(flashId)}): not installing.</span>`;
         return;
       }
+      // eFuse PSRAM_CAP as esptool words it: "Embedded PSRAM 8MB (AP_1v8)"; none listed = no embedded PSRAM.
+      const features = await loader.chip.getChipFeatures(loader);
+      const psramFeature = features.find((f) => /PSRAM/i.test(f));
+      const psramMatch = psramFeature && psramFeature.match(/Embedded PSRAM (\d+)MB/);
+      const psramMb = !psramFeature ? 0 : psramMatch ? Number(psramMatch[1]) : null;
       const table = await loader.readFlash(0x8000, 0xc00);
       await loadTables(release, r.boards);
-      detection = {port, chipFamily, flashId, flashBytes: 2 ** capacity, table};
-      out.innerHTML = `Connected: ${esc(chipFamily)}, flash ID <code>${hex(flashId)}</code>, <strong>${mb(detection.flashBytes)}</strong> of flash.`;
+      detection = {port, chipFamily, flashId, flashBytes: 2 ** capacity, psramMb, table};
+      out.innerHTML = `Connected: ${esc(chipFamily)}, flash ID <code>${hex(flashId)}</code>, <strong>${mb(detection.flashBytes)}</strong> flash,
+        <strong>${psramText(psramMb)}</strong>${psramFeature ? ` (<code>${esc(psramFeature)}</code>)` : ''}.`;
     } catch (e) {
       out.innerHTML = `<span style="color:var(--red)">Detection failed: ${esc(e.message || e)}</span>. Hold BOOT, press and release RESET, release BOOT, then try again.`;
     } finally {
@@ -521,8 +535,9 @@
       const holder = r.boards.find((b) => b.flash_size === params.get('table'));
       const table = holder ? tableCache.get(partitionTableUrl(release, holder)).slice() :
         new Uint8Array(0xc00).fill(params.get('table') === 'erased' ? 0xff : 0x42);
-      detection = {port: null, chipFamily: r.boards[0].chip_family, flashId: 0, flashBytes: Number(params.get('selftest')) << 20, table, selftest: true};
-      $('detect-result').textContent = `Self-test: simulated ${params.get('selftest')} MB flash, table ${params.get('table')}.`;
+      const psramMb = params.has('psram') ? Number(params.get('psram')) : 0;
+      detection = {port: null, chipFamily: r.boards[0].chip_family, flashId: 0, flashBytes: Number(params.get('selftest')) << 20, psramMb, table, selftest: true};
+      $('detect-result').textContent = `Self-test: simulated ${params.get('selftest')} MB flash, ${psramMb} MB PSRAM, table ${params.get('table')}.`;
     }
     render();
   }

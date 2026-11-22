@@ -23,16 +23,22 @@ only).
 
 An image for a larger flash than the chip has does not boot at all (the
 Thread Border Router board's S3 ships with 4 MB on early samples and 8 MB on
-retail boards). Boards of one release that differ only in flash size (same
-product, firmware, chip and host link) therefore appear as **one entry**,
+retail boards), and other S3 modules differ in PSRAM. Boards of one release
+that differ only in flash size and/or PSRAM (same product, firmware, chip
+and host link) therefore appear as **one entry**,
 and installing takes one more step:
 
 1. *Connect and read the flash size*: the page opens the port with
    esptool-js (vendored, pinned), checks the chip family, reads the SPI flash
    ID (`RDID`; size = 2^((ID >> 16) & 0xFF): `0x16` = 4 MB, `0x17` = 8 MB,
    `0x18` = 16 MB) and the partition table at `0x8000`.
-2. It selects the largest image whose flash size fits. Images for a larger
-   flash are disabled; a smaller one can be chosen by hand. An unreadable ID
+2. It reads the embedded PSRAM from eFuse (`getChipFeatures()`:
+   "Embedded PSRAM 2MB" / "8MB"; none listed = 0) and keeps only images whose
+   `match.embedded_psram_mb` contains it (hub: quad build for 0/2/4 MB, octal
+   `-opi` build for 8/16 MB; ESP-IDF fixes the PSRAM mode at build time and a
+   wrong build runs without PSRAM). Of those it selects the largest whose
+   flash size fits. Other images are disabled; a smaller fitting one can be
+   chosen by hand. An unreadable ID
    (all 0 or all 1, implausible size) or a flash smaller than every image
    blocks the install.
 3. If the chip's partition table differs from the chosen image's (another
@@ -46,7 +52,8 @@ and installing takes one more step:
 `tools/flasher_site.py` marks these groups (`size_group`,
 `size_group_title`; a release manifest may set them itself). For checking
 the selection without hardware, `?board=<group>&selftest=<MB>&table=<4MB|8MB|erased|other>`
-simulates a detection (installing stays blocked).
+simulates a detection, `&psram=<MB>` the embedded PSRAM (installing stays
+blocked).
 
 ## Serial console and Wi-Fi setup
 
