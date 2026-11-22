@@ -48,6 +48,33 @@ and installing takes one more step:
 the selection without hardware, `?board=<group>&selftest=<MB>&table=<4MB|8MB|erased|other>`
 simulates a detection (installing stays blocked).
 
+## Serial console and Wi-Fi setup
+
+**<https://faronov.github.io/zigbee-rs/flasher/console/>** is a Web Serial
+terminal (Chrome or Edge, no other dependencies) for the hub's USB console:
+
+- **Port.** After tbr-hub starts, the S3's USB port shows two serial ports
+  ("Thread BR H2 bridge"); the console is the **second** one (macOS
+  `cu.usbmodem…3`, Linux the higher `ttyACM`, Windows usually the higher
+  `COM`). The page sends an empty line and expects the prompt `> `, so the
+  first port (H2 bridge or JSON API) is reported as the wrong one. It always
+  opens at 115 200 baud: 1 200 baud on the console port is the touch that
+  hands the USB port to USB-Serial-JTAG. The NCP DevKits speak binary ZRHP
+  and have no text console.
+- **Terminal:** input line with history (↑/↓, session only), quick buttons
+  (`help`, `mode`, `hub status`, `wifi`, *Read token* = `token`, *Reboot S3*
+  = `s3 reset`), clear, download of the log.
+- **Set up Wi-Fi:** sends `wifi set <ssid> <password>`; if the hub boots as
+  the bridge, `mode hub` (the S3 reboots and the page reopens the console by
+  itself); polls `wifi` until `up, ws://<ip>/api`; reads `token`; shows
+  `http://<ip>/#token=<token>`, which the hub's web UI takes over. The
+  console takes printable ASCII only and splits on spaces, so SSIDs with
+  spaces and passwords with leading, trailing or double spaces are refused.
+- **The password** stays in the form field until it is sent, then the field
+  is cleared. It is never stored (no localStorage, no history) and is masked
+  in the terminal and the downloaded log, including the console's echo of a
+  hand-typed `wifi set`.
+
 ## Keep or erase
 
 **Default: keep.** The flasher writes the bootloader, the partition table, a

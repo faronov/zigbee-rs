@@ -121,6 +121,11 @@
         <button class="button secondary" id="s3-usj">Switch the S3 to USB-Serial-JTAG (1200 bps touch)</button>
         <span id="s3-usj-result" class="muted"></span>
       </div>
+      <div id="console-box" class="hidden note">
+        After the install: <a href="./console/"><strong>serial console and Wi-Fi setup</strong></a> in the browser
+        (hub mode, Wi-Fi credentials, API token and the hub's address), on the second of the hub's two USB serial
+        ports.
+      </div>
       <div id="detect-box" class="hidden note">
         <p style="margin-top:0">This board comes with different flash sizes, and an image for a larger flash does not
           boot at all. The flasher first reads the chip's flash ID and partition table, then offers only images that
@@ -145,6 +150,7 @@
 
   <footer>
     <a href="https://faronov.github.io/zigbee-rs/getting-started/web-flasher.html">How the web flasher works</a> ·
+    <a href="./console/">Serial console and Wi-Fi setup</a> ·
     <a href="./sensor/">CI sensor builds (not releases)</a> ·
     <a href="https://github.com/faronov/zigbee-rs/releases">zigbee-rs releases</a> ·
     <a href="https://github.com/faronov/zigbee-rs-hub/releases">hub releases</a><br>
@@ -377,6 +383,7 @@
     $('connect-steps').innerHTML = [board.connect, ...(board.connect_steps || [])].filter(Boolean).map((s) => `<li>${esc(s)}</li>`).join('') +
       '<li>If no port appears or the connection fails: hold BOOT, press and release RESET, release BOOT, then try again.</li>';
     $('s3-prepare').classList.toggle('hidden', board.chip_family !== 'ESP32-S3');
+    $('console-box').classList.toggle('hidden', product.product !== 'zigbee-rs-hub');
 
     const button = $('install');
     button.setAttribute('manifest', board.manifests[erase ? 'erase' : 'update']);
