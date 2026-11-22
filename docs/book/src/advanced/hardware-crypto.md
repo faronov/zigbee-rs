@@ -68,7 +68,7 @@ runs recorded in their platform guides.
 | EFR32MG22 | CRYPTOACC (BA411E) with descriptor DMA | clocks shared with the CRYPTOACC TRNG through a holder count | ZHA |
 | EFR32MG24 | Secure Engine (HSE) mailbox | mailbox and disable flag shared with the SE TRNG | branch `aes-hw-efr32mg24` (host, build) |
 | STM32WB55 | AES1 (CPU1) | AES2 belongs to CPU2; AES1 has no HSEM and CPU2 never uses it (MAC requests are unsecured) | ZHA (Nucleo-WB55); DK and dongle build |
-| CC2340R5 | LAES | radio (LRF) does not use it; registers reloaded per block | **software AES on master**; engine on branch `aes-hw-cc2340` (host, build), waiting for a hardware run |
+| CC2340R5 | LAES | radio (LRF) does not use it; registers reloaded per block | ZHA (LP-EM-CC2340R5): KAT, secured join, reports, reset/resume |
 | CC26x2 / CC13x2 | CRYPTO | see the CC26x2 guide | see guide |
 | PHY6222 / PHY6252 | LL AES block, single (ECB) mode | BLE LL not used; clock gated per block; completion is a fixed cycle wait until the status bit is measured | **software AES on master**; engine on branch `aes-hw-phy62x2` (host, build), waiting for a hardware run |
 | Mock simulators | software | host only | — |

@@ -14,6 +14,12 @@ publish = false
 embedded-hal = "1.0"
 embedded-storage = "0.3"
 
+[dev-dependencies]
+# Host-only: AES oracle and the shared Zigbee known-answer vectors for the
+# `aes` register-model tests. Never linked into firmware.
+aes = { version = "0.8", default-features = false }
+zigbee-crypto = { path = "../zigbee-crypto", features = ["kat"] }
+
 [features]
 default = ["runtime"]
 # Application runtime: Embassy time driver, interrupt dispatch, standby and

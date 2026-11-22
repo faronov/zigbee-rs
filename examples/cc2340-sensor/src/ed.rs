@@ -57,7 +57,13 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
 async fn main(_spawner: Spawner) {
     let started = roles::start(product::END_DEVICE_MODEL);
     let mut trigger = CommissioningTrigger::new(started.button);
-    let app = compose(started.ieee, started.flash, started.led, started.reset);
+    let app = compose(
+        started.ieee,
+        started.aes,
+        started.flash,
+        started.led,
+        started.reset,
+    );
     if let Err(error) = app.initialize().await {
         roles::fatal(app.parts_mut(), ARCHETYPE, error);
     }
@@ -77,11 +83,12 @@ async fn main(_spawner: Spawner) {
 #[inline(never)]
 fn compose(
     ieee: zigbee_types::IeeeAddress,
+    aes: lp_em_cc2340r5::aes::Aes,
     flash: lp_em_cc2340r5::flash::InternalFlash,
     led: lp_em_cc2340r5::pins::Led1,
     reset: lp_em_cc2340r5::reset::SystemReset,
 ) -> &'static mut App {
-    let mac: Mac = roles::mac(roles::radio(ieee).into_soft_mac());
+    let mac: Mac = roles::mac(roles::radio(ieee, aes).into_soft_mac());
 
     static SECURITY: StaticCell<SecurityStore> = StaticCell::new();
     static PROFILE: StaticCell<EndDeviceProfile> = StaticCell::new();

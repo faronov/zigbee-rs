@@ -20,6 +20,8 @@ pub const CLKCTL_CLKENCLR0: u32 = CLKCTL_BASE + 0x20;
 pub enum PeripheralClock {
     I2c0 = 0x0000_0040,
     Adc0 = 0x0000_4000,
+    /// `LAES`, the AES-128 core ([`crate::aes`]).
+    Laes = 0x0001_0000,
     Lgpt1 = 0x1000_0000,
 }
 
@@ -64,6 +66,7 @@ mod tests {
         assert_eq!(CLKCTL_CLKENCLR0, 0x4002_0020);
         assert_eq!(PeripheralClock::I2c0.mask(), 1 << 6);
         assert_eq!(PeripheralClock::Adc0.mask(), 1 << 14);
+        assert_eq!(PeripheralClock::Laes.mask(), 1 << 16);
         assert_eq!(PeripheralClock::Lgpt1.mask(), 1 << 28);
     }
 }
