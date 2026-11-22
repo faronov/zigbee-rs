@@ -16,6 +16,18 @@
 //! --gp-tables              Sink Table Request (by GPD) and Translation
 //!                          Table Request
 //! --gp-watch SECS          print every event for SECS afterwards
+//! --gp-group 0xGROUP       with --gp-pair: pre-commissioned groupcast to
+//!                          GROUP instead of derived groupcast
+//! --gp-config-dst 0xNWK    send the Pairing Configuration there (e.g.
+//!                          0xFFFD broadcast; no Default Response is awaited)
+//! --gp-proxy-table         Proxy Table Request (by GPD) to --gp-sink
+//! --gp-send-pairing MODE   GP Pairing to --gp-sink (a proxy, or 0xFFFD):
+//!                          `remove` (RemoveGPD) or `add:KEY:FC` (AddSink,
+//!                          derived groupcast, level 3)
+//! --gp-ncp-put KEY:FC      import the GPD into the NCP's own Sink Table
+//!                          (GP_SINK_TABLE_PUT, derived groupcast, level 3)
+//! --gp-ncp-remove          remove the GPD from the NCP's own Sink Table
+//!                          quietly (GP_SINK_REMOVE, no GP Pairing)
 //! ```
 //!
 //! Every step waits for the request's response and the matching
@@ -26,12 +38,14 @@ use std::time::{Duration, Instant};
 
 use zigbee_zrhp::codec::List;
 use zigbee_zrhp::msg::gp::{
-    EvtGpRemoteSinkTable, EvtGpRemoteStatus, EvtGpRemoteTranslationTable, GpPairingConfiguration,
-    GpRemoteRsp, GpRemoteSinkTableRequest, GpTranslationRequest, GpTranslationUpdate,
-    paired_endpoints, pairing_config_flags,
+    EvtGpRemoteProxyTable, EvtGpRemoteSinkTable, EvtGpRemoteStatus, EvtGpRemoteTranslationTable,
+    GpGroup, GpPairingConfiguration, GpRemoteProxyTableRequest, GpRemoteRsp,
+    GpRemoteSinkTableRequest, GpSendPairing, GpSinkRemove, GpSinkTablePut, GpSinkTablePutRsp,
+    GpTranslationRequest, GpTranslationUpdate, paired_endpoints, pairing_config_flags,
+    send_pairing_flags,
 };
 use zigbee_zrhp::msg::{Kind, ids};
-use zigbee_zrhp::records::{GpTranslation, GpdId};
+use zigbee_zrhp::records::{GpSinkRecord, GpTranslation, GpdId, Record, gp_sink_flags};
 
 use crate::{ByteStream, Host, Received, body, report_event};
 
@@ -65,6 +79,20 @@ pub struct GpArgs {
     pub remove: bool,
     pub tables: bool,
     pub watch_s: u64,
+    pub group: Option<u16>,
+    pub config_dst: Option<u16>,
+    pub proxy_table: bool,
+    pub send_pairing: Option<Option<([u8; 16], u32)>>,
+    pub ncp_put: Option<([u8; 16], u32)>,
+    pub ncp_remove: bool,
+}
+
+fn key_fc(flag: &str, spec: &str) -> Result<([u8; 16], u32), String> {
+    let (key_hex, fc) = spec.split_once(':').ok_or(format!("{flag} KEY:FC"))?;
+    let key: [u8; 16] = crate::unhex(key_hex)
+        .try_into()
+        .map_err(|_| format!("{flag}: a 16-byte key (32 hex digits)"))?;
+    Ok((key, fc.parse().map_err(|_| format!("{flag}: decimal FC"))?))
 }
 
 impl GpArgs {
@@ -105,6 +133,26 @@ impl GpArgs {
             tables: args.iter().any(|a| a == "--gp-tables"),
             watch_s: value("--gp-watch")
                 .map_or(Ok(0), |v| v.parse().map_err(|_| "--gp-watch SECS"))?,
+            group: value("--gp-group")
+                .map(|v| hex_u32(&v).map(|g| g as u16))
+                .transpose()?,
+            config_dst: value("--gp-config-dst")
+                .map(|v| hex_u32(&v).map(|d| d as u16))
+                .transpose()?,
+            proxy_table: args.iter().any(|a| a == "--gp-proxy-table"),
+            send_pairing: match value("--gp-send-pairing").as_deref() {
+                None => None,
+                Some("remove") => Some(None),
+                Some(spec) => Some(Some(key_fc(
+                    "--gp-send-pairing add:",
+                    spec.strip_prefix("add:")
+                        .ok_or("--gp-send-pairing remove|add:KEY:FC")?,
+                )?)),
+            },
+            ncp_put: value("--gp-ncp-put")
+                .map(|v| key_fc("--gp-ncp-put", &v))
+                .transpose()?,
+            ncp_remove: args.iter().any(|a| a == "--gp-ncp-remove"),
         }))
     }
 }
@@ -122,11 +170,20 @@ fn remote<S: ByteStream>(
     let tsn = body::<GpRemoteRsp>(&rsp)
         .map_err(|e| format!("{what}: {e}"))?
         .zcl_tsn;
-    let event = host.wait_for(&format!("{what} answer (tsn {tsn})"), REMOTE_TIMEOUT, |m| {
+    let event = match host.wait_for(&format!("{what} answer (tsn {tsn})"), REMOTE_TIMEOUT, |m| {
         m.kind == Kind::Event
             && (m.msg_id == event_id || m.msg_id == ids::EVT_GP_REMOTE_STATUS)
             && m.payload.get(2) == Some(&tsn)
-    })?;
+    }) {
+        Ok(event) => event,
+        Err(error) => {
+            // Show what became of the frame (EVT_APS_DATA_CONFIRM, logs).
+            for message in host.inbox.drain(..) {
+                report_event(&message);
+            }
+            return Err(error);
+        }
+    };
     println!("{what}: tsn {tsn}, answered after {:?}", started.elapsed());
     Ok(event)
 }
@@ -190,12 +247,18 @@ fn pairing_configuration<S: ByteStream>(
     } else {
         "GP_PAIRING_CONFIGURATION extend"
     };
+    let groups = args.group.map(|group| GpGroup {
+        group,
+        alias: 0xFFFF,
+    });
+    let groups = groups.as_slice();
+    let dst = args.config_dst.unwrap_or(args.sink);
     let tid = host.request(&GpPairingConfiguration {
-        dst: args.sink,
+        dst,
         actions,
         gpd_id: GpdId::SrcId(args.src),
         device_id: 0x02,
-        communication_mode: 1,
+        communication_mode: if args.group.is_some() { 2 } else { 1 },
         flags: if security.is_some() {
             pairing_config_flags::SECURITY
                 | pairing_config_flags::MAC_SEQ_CAPABLE
@@ -209,7 +272,7 @@ fn pairing_configuration<S: ByteStream>(
         key_type: 4,
         key,
         frame_counter,
-        groups: List::new(&[]),
+        groups: List::new(groups),
         paired: paired_endpoints::SINK_DERIVES,
         endpoints: List::new(&[]),
         app_info: 0,
@@ -220,13 +283,145 @@ fn pairing_configuration<S: ByteStream>(
         client_clusters: List::new(&[]),
     });
     println!(
-        "-> {what} to 0x{:04X}: 0x{:08X} derived groupcast, security {}, frame counter {frame_counter}",
-        args.sink,
+        "-> {what} to 0x{dst:04X}: 0x{:08X} {}, security {}, frame counter {frame_counter}",
         args.src,
+        match args.group {
+            Some(g) => format!("pre-commissioned groupcast 0x{g:04X}"),
+            None => "derived groupcast".into(),
+        },
         security.is_some()
     );
+    if dst >= 0xFFF8 {
+        // A broadcast has no Default Response: only the acceptance.
+        let rsp = host.response_within(tid, REMOTE_TIMEOUT)?;
+        let tsn = body::<GpRemoteRsp>(&rsp)
+            .map_err(|e| format!("{what}: {e}"))?
+            .zcl_tsn;
+        println!("{what}: broadcast accepted, tsn {tsn}");
+        return Ok(());
+    }
     let event = remote(host, what, tid, ids::EVT_GP_REMOTE_STATUS)?;
     expect_success(what, &event)
+}
+
+fn proxy_table<S: ByteStream>(host: &mut Host<S>, args: &GpArgs) -> Result<(), String> {
+    let what = "GP_REMOTE_PROXY_TABLE_REQUEST";
+    let tid = host.request(&GpRemoteProxyTableRequest {
+        dst: args.sink,
+        index: 0xFF,
+        gpd_id: GpdId::SrcId(args.src),
+    });
+    let event = remote(host, what, tid, ids::EVT_GP_REMOTE_PROXY_TABLE)?;
+    if event.msg_id == ids::EVT_GP_REMOTE_STATUS {
+        let status: EvtGpRemoteStatus = event.raw().decode().map_err(|e| format!("{e:?}"))?;
+        println!(
+            "  EVT_GP_REMOTE_STATUS from 0x{:04X}: command 0x{:02X} status 0x{:02X}",
+            status.src_nwk, status.command_id, status.zcl_status
+        );
+        return Ok(());
+    }
+    let table: EvtGpRemoteProxyTable = event.raw().decode().map_err(|e| format!("{e:?}"))?;
+    println!(
+        "  EVT_GP_REMOTE_PROXY_TABLE from 0x{:04X}: status 0x{:02X} total {} start 0x{:02X} flags 0x{:02X}",
+        table.src_nwk, table.status, table.total, table.start_index, table.flags
+    );
+    for record in table.records.iter() {
+        match record {
+            Record::GpProxy(proxy) => {
+                // Opaque entries that may hold a key: only their size and
+                // the leading options and GPD ID.
+                let head = &proxy.entries[..proxy.entries.len().min(6)];
+                println!(
+                    "    R_GP_PROXY v{} {} B, head {head:02X?}",
+                    proxy.format_version,
+                    proxy.entries.len()
+                );
+            }
+            other => println!("    {other:?}"),
+        }
+    }
+    Ok(())
+}
+
+fn send_pairing<S: ByteStream>(
+    host: &mut Host<S>,
+    args: &GpArgs,
+    add: Option<([u8; 16], u32)>,
+) -> Result<(), String> {
+    let (key, frame_counter) = add.unwrap_or(([0; 16], 0));
+    let flags = match add {
+        Some(_) => {
+            send_pairing_flags::ADD_SINK
+                | send_pairing_flags::GPD_FIXED
+                | send_pairing_flags::MAC_SEQ_CAPABLE
+                | send_pairing_flags::KEY
+                | send_pairing_flags::FRAME_COUNTER
+        }
+        None => send_pairing_flags::REMOVE_GPD,
+    };
+    let tid = host.request(&GpSendPairing {
+        dst: args.sink,
+        flags,
+        gpd_id: GpdId::SrcId(args.src),
+        communication_mode: 1,
+        security_level: if add.is_some() { 3 } else { 0 },
+        key_type: if add.is_some() { 4 } else { 0 },
+        sink_ieee: zigbee_zrhp::Ieee([0; 8]),
+        sink_nwk: 0,
+        sink_group: 0,
+        device_id: 0x02,
+        frame_counter,
+        key,
+        assigned_alias: 0,
+        groupcast_radius: 0,
+    });
+    let rsp = host.response_within(tid, REMOTE_TIMEOUT)?;
+    let tsn = body::<GpRemoteRsp>(&rsp)
+        .map_err(|e| format!("GP_SEND_PAIRING: {e}"))?
+        .zcl_tsn;
+    println!(
+        "-> GP_SEND_PAIRING to 0x{:04X}: 0x{:08X} {} accepted, tsn {tsn}",
+        args.sink,
+        args.src,
+        if add.is_some() {
+            "AddSink"
+        } else {
+            "RemoveGPD"
+        }
+    );
+    Ok(())
+}
+
+fn ncp_put<S: ByteStream>(
+    host: &mut Host<S>,
+    args: &GpArgs,
+    (key, fc): ([u8; 16], u32),
+) -> Result<(), String> {
+    let record = Record::GpSink(GpSinkRecord {
+        gpd_id: GpdId::SrcId(args.src),
+        device_id: 0x02,
+        communication_mode: 1,
+        group: 0xFFFF,
+        assigned_alias: 0xFFFF,
+        flags: gp_sink_flags::MAC_SEQ_CAPABLE | gp_sink_flags::FIXED_LOCATION,
+        security_level: 3,
+        key_type: 4,
+        key: Some(key),
+        frame_counter: fc,
+        groupcast_radius: 0,
+    });
+    let records = [record];
+    let tid = host.request(&GpSinkTablePut {
+        flags: 0,
+        records: List::new(&records),
+    });
+    let rsp = host.response_within(tid, REMOTE_TIMEOUT)?;
+    let put = body::<GpSinkTablePutRsp>(&rsp).map_err(|e| format!("GP_SINK_TABLE_PUT: {e}"))?;
+    println!(
+        "-> GP_SINK_TABLE_PUT 0x{:08X} into the NCP sink: {put:?}",
+        args.src
+    );
+    Ok(())
 }
 
 fn tables<S: ByteStream>(host: &mut Host<S>, args: &GpArgs) -> Result<(), String> {
@@ -284,9 +479,16 @@ fn tables<S: ByteStream>(host: &mut Host<S>, args: &GpArgs) -> Result<(), String
     Ok(())
 }
 
-/// Run the selected GP steps in a fixed order: pair, translate, untranslate,
-/// tables, remove, watch.
+/// Run the selected GP steps in a fixed order: NCP import, send pairing,
+/// pair, translate, untranslate, tables, proxy table, remove, NCP removal,
+/// watch.
 pub fn run<S: ByteStream>(host: &mut Host<S>, args: &GpArgs) -> Result<(), String> {
+    if let Some(put) = args.ncp_put {
+        ncp_put(host, args, put)?;
+    }
+    if let Some(add) = args.send_pairing {
+        send_pairing(host, args, add)?;
+    }
     if let Some((key, fc)) = args.pair {
         pairing_configuration(host, args, 1, Some((key, fc)))?;
     }
@@ -299,8 +501,23 @@ pub fn run<S: ByteStream>(host: &mut Host<S>, args: &GpArgs) -> Result<(), Strin
     if args.tables {
         tables(host, args)?;
     }
+    if args.proxy_table {
+        proxy_table(host, args)?;
+    }
     if args.remove {
         pairing_configuration(host, args, 4, None)?;
+    }
+    if args.ncp_remove {
+        let tid = host.request(&GpSinkRemove {
+            gpd_id: GpdId::SrcId(args.src),
+            flags: 0,
+        });
+        let rsp = host.response_within(tid, REMOTE_TIMEOUT)?;
+        println!(
+            "-> GP_SINK_REMOVE 0x{:08X} from the NCP sink: status 0x{:02X}",
+            args.src,
+            rsp.payload.first().copied().unwrap_or(0xFF)
+        );
     }
     let deadline = Instant::now() + Duration::from_secs(args.watch_s);
     while Instant::now() < deadline {
