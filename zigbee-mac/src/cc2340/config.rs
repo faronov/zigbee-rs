@@ -7,11 +7,45 @@ pub(crate) enum RegisterWidth {
     U32,
 }
 
+/// One register write of an imported RCL PHY, packed into two halfwords.
+///
+/// Every imported field setting lands in the LRFD register blocks
+/// (`0x4008_1000..0x4008_4000`, 32-bit writes) or the PBE/RFE TOPsm RAM
+/// blocks (`0x4009_2000`, `0x4009_6000`, 16-bit writes), and every value
+/// fits 16 bits, so `address = BASE + 2 * code` and the width follows from
+/// the address. `build.rs` refuses to generate a table that breaks either
+/// rule, and a host test compares the decoded table with the resolved one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RegisterWrite {
-    pub address: u32,
-    pub value: u32,
-    pub width: RegisterWidth,
+    code: u16,
+    value: u16,
+}
+
+impl RegisterWrite {
+    const BASE: u32 = 0x4008_0000;
+    /// First code of the 16-bit TOPsm RAM blocks (`0x4009_0000`).
+    const U16_CODES: u16 = 0x8000;
+
+    #[allow(dead_code)] // Only the SDK-generated tables construct writes.
+    pub(crate) const fn packed(code: u16, value: u16) -> Self {
+        Self { code, value }
+    }
+
+    pub(crate) const fn address(self) -> u32 {
+        Self::BASE + 2 * self.code as u32
+    }
+
+    pub(crate) const fn value(self) -> u32 {
+        self.value as u32
+    }
+
+    pub(crate) const fn width(self) -> RegisterWidth {
+        if self.code >= Self::U16_CODES {
+            RegisterWidth::U16
+        } else {
+            RegisterWidth::U32
+        }
+    }
 }
 
 /// One row of the SysConfig board PA table.
@@ -97,6 +131,50 @@ pub(crate) fn tx_power(requested_dbm: i8) -> Option<TxPowerEntry> {
 mod tests {
     use super::*;
 
+    fn decoded(writes: &[RegisterWrite]) -> impl Iterator<Item = (u32, u32, RegisterWidth)> + '_ {
+        writes
+            .iter()
+            .map(|write| (write.address(), write.value(), write.width()))
+    }
+
+    /// The packed IEEE table decodes to exactly the writes `build.rs`
+    /// resolved from TI's RCL metadata (same order).
+    #[test]
+    fn packed_ieee_phy_table_matches_resolved_writes() {
+        assert_eq!(
+            IEEE_802154_PHY_WRITES.len(),
+            IEEE_802154_PHY_WRITES_RESOLVED.len()
+        );
+        assert!(
+            decoded(IEEE_802154_PHY_WRITES).eq(IEEE_802154_PHY_WRITES_RESOLVED.iter().copied())
+        );
+        if PHY_CONFIG_AVAILABLE {
+            // TI ieee_802_15_4_oqpsk_250k_cc23xx.json: 256 fields, 110 writes.
+            assert_eq!(IEEE_802154_PHY_WRITES.len(), 110);
+        }
+    }
+
+    #[test]
+    fn packed_write_covers_both_register_spaces() {
+        let rfe = RegisterWrite::packed(0x1858, 0xDF7F);
+        assert_eq!(
+            (rfe.address(), rfe.value(), rfe.width()),
+            (0x4008_30B0, 0xDF7F, RegisterWidth::U32)
+        );
+        let pbe_ram = RegisterWrite::packed(0x9004, 0x0012);
+        assert_eq!(pbe_ram.address(), 0x4009_2008);
+        assert_eq!(pbe_ram.width(), RegisterWidth::U16);
+        let rfe_ram = RegisterWrite::packed(0xB403, 0x0300);
+        assert_eq!(rfe_ram.address(), 0x4009_6806);
+        assert_eq!(rfe_ram.width(), RegisterWidth::U16);
+        // The last 32-bit code and the first 16-bit code.
+        assert_eq!(RegisterWrite::packed(0x7FFF, 0).address(), 0x4008_FFFE);
+        assert_eq!(RegisterWrite::packed(0x7FFF, 0).width(), RegisterWidth::U32);
+        assert_eq!(RegisterWrite::packed(0x8000, 0).address(), 0x4009_0000);
+        assert_eq!(RegisterWrite::packed(0x8000, 0).width(), RegisterWidth::U16);
+        assert_eq!(RegisterWrite::packed(0xFFFF, 0xFFFF).address(), 0x4009_FFFE);
+        assert_eq!(RegisterWrite::packed(0xFFFF, 0xFFFF).value(), 0xFFFF);
+    }
     #[test]
     fn selects_exact_or_next_lower_tx_power() {
         if !PHY_CONFIG_AVAILABLE {

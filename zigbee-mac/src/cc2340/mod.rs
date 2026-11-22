@@ -27,6 +27,16 @@
 //! and AES-MMO block then runs on the `LAES` core ([`aes`]); no software
 //! AES is linked and nothing falls back to it.
 //!
+//! # Entropy
+//!
+//! The CC23x0 has no general-purpose TRNG. Like TI's `RNGLPF3RF` driver,
+//! [`Cc2340RadioPhy::seed_entropy`] captures IF-ADC noise with the radio
+//! otherwise unused ([`noise`]), health-tests and CBC-MAC-conditions it, and
+//! seeds an AES-128 CTR_DRBG ([`entropy`]) that serves
+//! [`PlatformServices::fill_random`]. Conditioning and the DRBG use the same
+//! installed `LAES` engine as CCM*; the PHY is its only owner. Without a
+//! successful seed every request fails closed.
+//!
 //! # Hardware filtering and acknowledgement
 //!
 //! The PBE does the time-critical parts of IEEE 802.15.4 itself, configured
@@ -65,9 +75,11 @@
 pub mod aes;
 mod config;
 pub mod driver;
+pub mod entropy;
 mod fifo;
 mod firmware;
 mod hardware;
+pub mod noise;
 
 use embassy_time::{Duration, Instant, Timer};
 use zigbee_types::{IeeeAddress, MacAddress};
@@ -80,7 +92,9 @@ use crate::{
 };
 use driver::Cc2340Driver;
 pub use driver::{DriverStats, RadioConfig, RadioError, RxInfo};
+pub use entropy::{EntropyDisposition, EntropyError, HealthFailure};
 pub use fifo::PbeCounters;
+pub use noise::NoiseError;
 
 /// Retained-RX depth of the CC2340 end-device MAC; the depth of the former
 /// bespoke `Cc2340Mac` queue. Each slot is one [`PhyRxFrame`].
@@ -137,13 +151,9 @@ pub enum IdentityError {
     UnprogrammedExtendedAddress,
 }
 
-/// The CC2340 backend has no independently verified entropy peripheral.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntropyDisposition {
-    /// `PlatformServices::fill_random` returns `MacError::Unsupported` and
-    /// never substitutes deterministic bytes for cryptographic entropy.
-    UnavailableFailClosed,
-}
+/// SP 800-90A personalization string prefix; the EUI-64 follows, so every
+/// device instantiates a distinct DRBG even from identical noise.
+const DRBG_PERSONALIZATION_LABEL: &[u8; 24] = b"zigbee-rs CC2340R5 DRBG ";
 
 /// Radio power states exposed by the current direct-register backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +195,8 @@ pub struct Cc2340RadioPhy {
     /// Validated `LAES` engine; `None` until the composition root installs
     /// it, in which case every cipher operation fails closed.
     aes_engine: Option<aes::AesEngine>,
+    /// Radio-noise seeded CTR_DRBG; uses `aes_engine` for every block.
+    entropy: entropy::EntropyState,
 }
 
 impl Cc2340RadioPhy {
@@ -212,6 +224,7 @@ impl Cc2340RadioPhy {
                 fifo_evictions: 0,
             },
             aes_engine: None,
+            entropy: entropy::EntropyState::new(),
         })
     }
 
@@ -232,11 +245,14 @@ impl Cc2340RadioPhy {
 
     /// Build the end-device [`Cc2340SoftMac`] on top of this PHY.
     ///
-    /// Call [`Self::initialize_radio`] first. `macDSN`/`macBSN` start at 0
-    /// (there is no verified entropy source); `MLME-RESET` re-seeds them.
+    /// Call [`Self::initialize_radio`] first. `macDSN`/`macBSN` start at
+    /// random values (IEEE 802.15.4-2006 7.4.2) from the seeded entropy
+    /// source, or at 0 when it is unavailable (they are sequence numbers,
+    /// not key material); `MLME-RESET` re-seeds them.
     #[inline(never)]
-    pub fn into_soft_mac(self) -> Result<Cc2340SoftMac, MacError> {
-        let mut pib = MacPib::new(self.extended_address(), 0, 0);
+    pub fn into_soft_mac(mut self) -> Result<Cc2340SoftMac, MacError> {
+        let [dsn, bsn] = self.initial_sequence_numbers();
+        let mut pib = MacPib::new(self.extended_address(), dsn, bsn);
         pib.set(
             PibAttribute::PhyTransmitPower,
             PibValue::I8(TX_POWER_DEFAULT_DBM),
@@ -250,15 +266,24 @@ impl Cc2340RadioPhy {
     /// Same PIB as [`Self::into_soft_mac`]; kept out of line like it.
     #[inline(never)]
     pub fn into_parent_mac<R: MacRole, const RX: usize>(
-        self,
+        mut self,
     ) -> Result<SoftMacCore<Self, R, RX>, MacError> {
-        let mut pib = MacPib::new(self.extended_address(), 0, 0);
+        let [dsn, bsn] = self.initial_sequence_numbers();
+        let mut pib = MacPib::new(self.extended_address(), dsn, bsn);
         pib.set(
             PibAttribute::PhyTransmitPower,
             PibValue::I8(TX_POWER_DEFAULT_DBM),
         )
         .map_err(|_| MacError::InvalidParameter)?;
         SoftMacCore::new_custom(self, pib)
+    }
+
+    fn initial_sequence_numbers(&mut self) -> [u8; 2] {
+        let mut numbers = [0u8; 2];
+        if self.fill_entropy(&mut numbers).is_err() {
+            numbers = [0; 2];
+        }
+        numbers
     }
 
     /// Return the EUI-64 selected before PHY construction.
@@ -280,8 +305,79 @@ impl Cc2340RadioPhy {
         self.driver.init()
     }
 
-    pub const fn entropy_disposition(&self) -> EntropyDisposition {
-        EntropyDisposition::UnavailableFailClosed
+    /// Whether `fill_random` currently serves entropy, and if not, why.
+    pub fn entropy_disposition(&self) -> EntropyDisposition {
+        self.entropy.disposition()
+    }
+
+    /// Seed (or reseed) the CTR_DRBG from fresh radio ADC noise.
+    ///
+    /// Runs the CTR_DRBG known-answer test on the `LAES` engine, captures
+    /// [`entropy::NOISE_WORDS`] noise words, runs the health tests on every
+    /// code, conditions the capture and (re)seeds the DRBG. Call it after
+    /// [`Self::install_aes_engine`] and before [`Self::initialize_radio`]
+    /// (TI's `RNG_init()` rule); later it is only allowed while the radio is
+    /// asleep and holds no undelivered frame, and the next wake then reloads
+    /// the radio firmware. Any failure other than [`EntropyError::RadioBusy`]
+    /// and [`EntropyError::AesUnavailable`] wipes the DRBG, and
+    /// `fill_random` fails closed until a later seed succeeds.
+    pub fn seed_entropy(&mut self) -> Result<(), EntropyError> {
+        self.seed_entropy_from(&mut entropy::LrfNoise)
+    }
+
+    fn seed_entropy_from<N: entropy::NoiseSource>(
+        &mut self,
+        noise: &mut N,
+    ) -> Result<(), EntropyError> {
+        self.claim_lrfd_for_noise()?;
+        let personalization = self.drbg_personalization();
+        let mut aes = aes::LaesProvider::new(self.aes_engine.as_mut());
+        let result = self
+            .entropy
+            .seed(&mut aes, noise, &entropy::CUTOFFS, &personalization);
+        self.driver.invalidate_lrfd();
+        match result {
+            Ok(()) => {
+                log::info!("[CC2340] entropy seeded: CTR_DRBG KAT and noise health tests passed")
+            }
+            Err(error) => log::error!(
+                "[CC2340] entropy failed closed (code {:#04x}); fill_random disabled",
+                error.code()
+            ),
+        }
+        result
+    }
+
+    /// The ADC-noise capture owns the whole LRFD: only allowed with an
+    /// installed `LAES` engine and while the IEEE radio is not running.
+    fn claim_lrfd_for_noise(&self) -> Result<(), EntropyError> {
+        if self.aes_engine.is_none() {
+            return Err(EntropyError::AesUnavailable);
+        }
+        if !self.driver.lrfd_free_for_noise() || self.holds_frame {
+            return Err(EntropyError::RadioBusy);
+        }
+        Ok(())
+    }
+
+    fn drbg_personalization(&self) -> [u8; zigbee_crypto::ctr_drbg::SEED_LEN] {
+        let mut personalization = [0u8; zigbee_crypto::ctr_drbg::SEED_LEN];
+        personalization[..24].copy_from_slice(DRBG_PERSONALIZATION_LABEL);
+        personalization[24..].copy_from_slice(&self.extended_address());
+        personalization
+    }
+
+    /// Lab only: copy one raw ADC-noise capture (no health tests, no
+    /// conditioning) for offline characterisation. Raw samples are the
+    /// DRBG's entropy input; product images must not enable this.
+    #[cfg(feature = "cc2340-entropy-lab")]
+    pub fn lab_capture_raw_noise(&mut self, output: &mut [u32]) -> Result<(), EntropyError> {
+        if !self.driver.lrfd_free_for_noise() || self.holds_frame {
+            return Err(EntropyError::RadioBusy);
+        }
+        let result = entropy::raw_capture(&mut entropy::LrfNoise, output);
+        self.driver.invalidate_lrfd();
+        result
     }
 
     pub const fn radio_sleep_disposition(&self) -> RadioSleepDisposition {
@@ -552,8 +648,37 @@ impl PlatformServices for Cc2340RadioPhy {
         Timer::after_micros(u64::from(duration_us)).await;
     }
 
-    fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
-        Err(MacError::Unsupported)
+    /// CTR_DRBG output seeded from radio noise (see [`entropy`]).
+    ///
+    /// Unseeded or failed: `MacError::Unsupported` and `output` untouched.
+    /// An `LAES` error during the request: `MacError::SecurityError`,
+    /// `output` zeroised and the source failed closed. When the DRBG is due
+    /// for a reseed it captures fresh noise first if the radio is idle, and
+    /// fails closed while it cannot.
+    fn fill_random(&mut self, output: &mut [u8]) -> Result<(), MacError> {
+        self.fill_entropy(output)
+    }
+}
+
+impl Cc2340RadioPhy {
+    /// [`PlatformServices::fill_random`], kept out of line: the MAC
+    /// constructors use it too.
+    #[inline(never)]
+    fn fill_entropy(&mut self, output: &mut [u8]) -> Result<(), MacError> {
+        if self.entropy.reseed_due() && self.claim_lrfd_for_noise().is_ok() {
+            // A failure is logged by `seed_entropy_from` and leaves the
+            // source failed closed.
+            let _ = self.seed_entropy();
+        }
+        let mut aes = aes::LaesProvider::new(self.aes_engine.as_mut());
+        self.entropy
+            .fill(&mut aes, output)
+            .map_err(|error| match error {
+                EntropyError::Cipher
+                | EntropyError::KnownAnswerMismatch
+                | EntropyError::AesUnavailable => MacError::SecurityError,
+                _ => MacError::Unsupported,
+            })
     }
 }
 
@@ -720,15 +845,27 @@ mod tests {
     }
 
     #[test]
-    fn entropy_is_explicitly_fail_closed() {
+    fn entropy_is_fail_closed_until_seeded() {
         let mut phy = Cc2340RadioPhy::new(VALID_IEEE).unwrap();
         let mut output = [0xA5; 8];
-        assert_eq!(
-            phy.entropy_disposition(),
-            EntropyDisposition::UnavailableFailClosed
-        );
+        assert_eq!(phy.entropy_disposition(), EntropyDisposition::Unseeded);
         assert_eq!(phy.fill_random(&mut output), Err(MacError::Unsupported));
         assert_eq!(output, [0xA5; 8]);
+
+        // Host builds have no LAES engine (and no radio noise): seeding is
+        // refused before any capture and the source stays fail-closed.
+        assert_eq!(phy.seed_entropy(), Err(EntropyError::AesUnavailable));
+        assert_eq!(phy.entropy_disposition(), EntropyDisposition::Unseeded);
+        assert_eq!(phy.fill_random(&mut output), Err(MacError::Unsupported));
+        assert_eq!(output, [0xA5; 8]);
+    }
+
+    #[test]
+    fn drbg_personalization_binds_the_eui64() {
+        let phy = Cc2340RadioPhy::new(VALID_IEEE).unwrap();
+        let personalization = phy.drbg_personalization();
+        assert_eq!(&personalization[..24], DRBG_PERSONALIZATION_LABEL);
+        assert_eq!(personalization[24..], VALID_IEEE);
     }
 
     #[test]

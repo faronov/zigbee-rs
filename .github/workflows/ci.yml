@@ -2245,9 +2245,12 @@ jobs:
             exit 1
           fi
           grep -q 'Ed25519 is not supported on CC2340R5' "$RUNNER_TEMP/cc2340-ed25519.log"
-      - name: Host-test CC2340 LAES AES backend
+      - name: Host-test CC2340 LAES AES and entropy backends
         # The HAL register-model KATs run in the standalone-host matrix; this
-        # covers the MAC provider's fail-closed (not installed) path.
+        # covers the MAC provider's fail-closed (not installed) path and the
+        # entropy health tests, conditioning and fail-closed state machine
+        # (the CTR_DRBG CAVP vectors run with `zigbee-crypto` in the
+        # workspace tests).
         run: cargo test --locked -p zigbee-mac --features cc2340 --lib cc2340
       - name: Build CC2340 explicit fallback mode
         working-directory: examples/cc2340-sensor
@@ -2263,8 +2266,15 @@ jobs:
             exit 1
           fi
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
-          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$("$NM" --demangle "$ELF")"; then
+          FALLBACK_SYMS="$("$NM" --demangle "$ELF")"
+          if grep -Eq 'aes::soft|SoftwareAes128' <<<"$FALLBACK_SYMS"; then
             echo "CC2340 fallback image still links software AES" >&2
+            exit 1
+          fi
+          # No SDK, no ADC-noise configuration: the seed path is dropped and
+          # fill_random fails closed.
+          if grep -Eq 'ctr_drbg::CtrDrbg|cc2340::noise::lrf' <<<"$FALLBACK_SYMS"; then
+            echo "CC2340 fallback image links the radio-noise entropy path" >&2
             exit 1
           fi
       - name: Check out pinned TI radio sources
@@ -2305,7 +2315,7 @@ jobs:
             cat router.log >&2
             exit 1
           }
-      - name: Check CC2340 SDK, layout, AES, and role gates
+      - name: Check CC2340 SDK, layout, AES, entropy, and role gates
         run: |
           ELF=examples/cc2340-sensor/target/sdk/thumbv6m-none-eabi/release/cc2340-sensor
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
@@ -2332,6 +2342,17 @@ jobs:
               echo "$(basename "$IMAGE") is missing the CC2340 LAES AES backend" >&2
               exit 1
             fi
+            # fill_random: radio ADC noise -> CTR_DRBG on the LAES engine.
+            if ! grep -q 'ctr_drbg::CtrDrbg>::generate::<zigbee_mac::cc2340::aes::LaesProvider>' <<<"$IMAGE_SYMS" ||
+               ! grep -q 'cc2340::noise::lrf::Capture' <<<"$IMAGE_SYMS"; then
+              echo "$(basename "$IMAGE") is missing the CC2340 radio-noise entropy source" >&2
+              exit 1
+            fi
+            # Raw noise is the DRBG input: only the lab image may read it.
+            if grep -q 'lab_capture_raw_noise' <<<"$IMAGE_SYMS"; then
+              echo "$(basename "$IMAGE") links the lab-only raw-noise accessor" >&2
+              exit 1
+            fi
           done
           PARENT_SYMS='parent_beacon_response|handle_parent_command|handle_child_rejoin_request|queue_pending_child_update|process_pending_routing|send_link_status'
           if grep -Eq "($PARENT_SYMS)" <<<"$SYMS"; then
@@ -2339,6 +2360,18 @@ jobs:
             grep -E "($PARENT_SYMS)" <<<"$SYMS" >&2
             exit 1
           fi
+      - name: Build CC2340 entropy lab image
+        # Lab-only characterisation binary (raw radio noise); kept building
+        # so the hardware gate can be re-run. Separate target dir: the
+        # product images above must not see the lab feature.
+        working-directory: examples/cc2340-sensor
+        env:
+          CC2340_SDK_DIR: ${{ github.workspace }}/.ci/simplelink-lowpower-f3-sdk
+        run: |
+          cargo build --release --locked --target-dir target/lab \
+            --features entropy-lab --bin cc2340-entropy-lab
+          cargo clippy --release --locked --target-dir target/lab --target thumbv6m-none-eabi \
+            --features entropy-lab --bin cc2340-entropy-lab -- -D warnings
       - name: Create CC2340 firmware artifacts
         run: |
           ELF=examples/cc2340-sensor/target/sdk/thumbv6m-none-eabi/release/cc2340-sensor

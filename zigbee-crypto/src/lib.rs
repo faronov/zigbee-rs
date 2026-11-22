@@ -6,6 +6,7 @@ use aes::Aes128;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockEncrypt, KeyInit};
 
+pub mod ctr_drbg;
 #[cfg(any(test, feature = "kat"))]
 pub mod kat;
 

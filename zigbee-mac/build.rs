@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 const FIRMWARE_OUTPUT_FILE: &str = "cc2340_firmware.rs";
 const PHY_CONFIG_OUTPUT_FILE: &str = "cc2340_phy_config.rs";
+const NOISE_CONFIG_OUTPUT_FILE: &str = "cc2340_noise_config.rs";
 const IEEE_PHY_SETTING_COUNT: usize = 256;
+/// Field settings of TI's `adc_noise_bt5_cc23xx.json` (`LRF_configAdcNoise`).
+const ADC_NOISE_SETTING_COUNT: usize = 142;
 const TX_POWER_ENTRY_COUNT: usize = 14;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,21 +82,203 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let firmware_output = out_dir.join(FIRMWARE_OUTPUT_FILE);
     let phy_config_output = out_dir.join(PHY_CONFIG_OUTPUT_FILE);
+    let noise_config_output = out_dir.join(NOISE_CONFIG_OUTPUT_FILE);
 
     if env::var_os("CARGO_FEATURE_CC2340").is_none() {
         write_unavailable_firmware(&firmware_output);
         write_unavailable_phy_config(&phy_config_output);
+        write_unavailable_noise_config(&noise_config_output);
         return;
     }
 
     let Some(sdk_dir) = env::var_os("CC2340_SDK_DIR").map(PathBuf::from) else {
         write_unavailable_firmware(&firmware_output);
         write_unavailable_phy_config(&phy_config_output);
+        write_unavailable_noise_config(&noise_config_output);
         return;
     };
 
     import_firmware(&sdk_dir, &firmware_output);
     import_phy_config(&sdk_dir, &phy_config_output);
+    import_noise_config(&sdk_dir, &noise_config_output);
+}
+
+/// Import what TI's `RCL_AdcNoise_get_samples_blocking()` loads through
+/// `LRF_configAdcNoise`: the BLE5 RFE image (no PBE/MCE image) and the
+/// register field settings of `adc_noise_bt5_cc23xx.json`.
+fn import_noise_config(sdk_dir: &Path, output: &Path) {
+    let device_dir = sdk_dir.join("source/ti/devices/cc23x0r5");
+    let image_path = device_dir.join("rf_patches/lrf_rfe_binary_ble5_cc23x0r5.c");
+    let ieee_rfe_path = device_dir.join("rf_patches/lrf_rfe_binary_ieee_cc23x0r5.c");
+    let phy_path = sdk_dir.join(
+        "source/ti/devices/radioconfig/.meta/config/rcl/\
+         adc_noise_bt5_cc23xx.json",
+    );
+    let include_dir = device_dir.join("inc");
+    println!("cargo:rerun-if-changed={}", image_path.display());
+    println!("cargo:rerun-if-changed={}", phy_path.display());
+
+    if !image_path.is_file()
+        || !ieee_rfe_path.is_file()
+        || !phy_path.is_file()
+        || !REGISTER_BLOCKS
+            .iter()
+            .all(|block| include_dir.join(block.header).is_file())
+    {
+        println!(
+            "cargo:warning=CC2340 ADC-noise configuration is unavailable; \
+             the radio entropy source will fail closed"
+        );
+        write_unavailable_noise_config(output);
+        return;
+    }
+
+    let image = parse_image(&image_path, "LRF_RFE_binary_ble5").unwrap_or_else(|error| {
+        panic!(
+            "failed to import CC2340 ADC-noise RFE image {}: {error}",
+            image_path.display()
+        )
+    });
+    let ieee_rfe = parse_image(&ieee_rfe_path, "LRF_RFE_binary_ieee").unwrap_or_else(|error| {
+        panic!(
+            "failed to import CC2340 IEEE RFE image {}: {error}",
+            ieee_rfe_path.display()
+        )
+    });
+    let patch = rfe_patch(&ieee_rfe, &image);
+    let settings = parse_phy_settings(&phy_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to parse CC2340 ADC-noise settings {}: {error}",
+            phy_path.display()
+        )
+    });
+    if settings.len() != ADC_NOISE_SETTING_COUNT {
+        panic!(
+            "CC2340 ADC-noise metadata contains {} field settings, expected \
+             {ADC_NOISE_SETTING_COUNT}",
+            settings.len()
+        );
+    }
+    let writes = resolve_phy_settings(&include_dir, &settings)
+        .unwrap_or_else(|error| panic!("failed to resolve CC2340 ADC-noise settings: {error}"));
+
+    let mut generated = String::new();
+    generated
+        .push_str("// Generated from TI's CC23xx ADC-noise RCL metadata (LRF_configAdcNoise).\n");
+    generated.push_str("pub(crate) const NOISE_CONFIG_AVAILABLE: bool = true;\n");
+    generated.push_str(
+        "pub(crate) const NOISE_CONFIG_SOURCE: &str = \
+         \"TI adc_noise_bt5_cc23xx.json + lrf_rfe_binary_ble5\";\n",
+    );
+    write_rfe_patch(&mut generated, &image, &patch);
+    write_register_writes(&mut generated, "ADC_NOISE_PHY_WRITES", &writes);
+    fs::write(output, generated).expect("write generated CC2340 ADC-noise config");
+}
+
+/// One run of words where the BLE5 RFE image differs from the IEEE one.
+struct PatchRun {
+    start: usize,
+    words: Vec<u32>,
+}
+
+/// Express the BLE5 RFE image as the (already embedded) IEEE RFE image plus
+/// patch runs, and prove the reconstruction is exact. Equal stretches of up
+/// to two words are kept inside a run (a run header costs one word). Words
+/// past the IEEE image are always written.
+fn rfe_patch(ieee: &[u32], ble5: &[u32]) -> Vec<PatchRun> {
+    const MERGE_GAP: usize = 2;
+    let differs = |index: usize| ieee.get(index) != Some(&ble5[index]);
+    let mut runs: Vec<PatchRun> = Vec::new();
+    let mut index = 0;
+    while index < ble5.len() {
+        if !differs(index) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut end = index + 1;
+        loop {
+            while end < ble5.len() && differs(end) {
+                end += 1;
+            }
+            let next = (end..ble5.len().min(end + MERGE_GAP + 1)).find(|&i| differs(i));
+            match next {
+                Some(next) => end = next,
+                None => break,
+            }
+        }
+        runs.push(PatchRun {
+            start,
+            words: ble5[start..end].to_vec(),
+        });
+        index = end;
+    }
+
+    let mut rebuilt = ieee.to_vec();
+    rebuilt.resize(rebuilt.len().max(ble5.len()), 0);
+    for run in &runs {
+        rebuilt[run.start..run.start + run.words.len()].copy_from_slice(&run.words);
+    }
+    assert_eq!(
+        &rebuilt[..ble5.len()],
+        ble5,
+        "CC2340 BLE5 RFE patch does not reproduce the SDK image"
+    );
+    runs
+}
+
+/// FNV-1a over the image words (little-endian bytes); checked by the host
+/// test that rebuilds the image from the IEEE image and the patch.
+fn image_checksum(words: &[u32]) -> u32 {
+    let mut hash = 0x811C_9DC5u32;
+    for byte in words.iter().flat_map(|word| word.to_le_bytes()) {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+fn write_rfe_patch(generated: &mut String, image: &[u32], runs: &[PatchRun]) {
+    writeln!(
+        generated,
+        "pub(crate) const NOISE_RFE_LEN: usize = {};",
+        image.len()
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub(crate) const NOISE_RFE_CHECKSUM: u32 = 0x{:08X};",
+        image_checksum(image)
+    )
+    .unwrap();
+    generated.push_str("pub(crate) static NOISE_RFE_RUNS: &[(u16, u16)] = &[\n");
+    for run in runs {
+        writeln!(generated, "    ({}, {}),", run.start, run.words.len()).unwrap();
+    }
+    generated.push_str("];\n");
+    let words: Vec<u32> = runs
+        .iter()
+        .flat_map(|run| run.words.iter().copied())
+        .collect();
+    write_image(generated, "NOISE_RFE_WORDS", &words);
+}
+
+fn write_unavailable_noise_config(output: &Path) {
+    fs::write(
+        output,
+        "// CC2340 ADC-noise configuration unavailable: the entropy source fails closed.
+pub(crate) const NOISE_CONFIG_AVAILABLE: bool = false;
+pub(crate) const NOISE_CONFIG_SOURCE: &str = \"set CC2340_SDK_DIR to a current TI SimpleLink Low Power F3 SDK\";
+pub(crate) const NOISE_RFE_LEN: usize = 0;
+pub(crate) const NOISE_RFE_CHECKSUM: u32 = 0;
+pub(crate) static NOISE_RFE_RUNS: &[(u16, u16)] = &[];
+pub(crate) static NOISE_RFE_WORDS: &[u32] = &[];
+pub(crate) static ADC_NOISE_PHY_WRITES: &[RegisterWrite] = &[];
+#[cfg(test)]
+pub(crate) static ADC_NOISE_PHY_WRITES_RESOLVED: &[(u32, u32, RegisterWidth)] = &[];
+",
+    )
+    .expect("write unavailable CC2340 ADC-noise marker");
 }
 
 fn import_firmware(sdk_dir: &Path, output: &Path) {
@@ -224,6 +409,8 @@ fn write_unavailable_phy_config(output: &Path) {
 pub(crate) const PHY_CONFIG_AVAILABLE: bool = false;
 pub(crate) const PHY_CONFIG_SOURCE: &str = \"set CC2340_SDK_DIR to a current TI SimpleLink Low Power F3 SDK\";
 pub(crate) static IEEE_802154_PHY_WRITES: &[RegisterWrite] = &[];
+#[cfg(test)]
+pub(crate) static IEEE_802154_PHY_WRITES_RESOLVED: &[(u32, u32, RegisterWidth)] = &[];
 pub(crate) static TX_POWER_TABLE: &[TxPowerEntry] = &[];
 ",
     )
@@ -549,6 +736,73 @@ fn parse_unsigned_number(value: &str) -> Result<u32, String> {
     }
 }
 
+/// Mirror of `RegisterWrite` in `src/cc2340/config.rs`: a write is packed
+/// into `(code, value)` halfwords with `address = BASE + 2 * code`; codes at
+/// or above `U16_CODES` (the TOPsm RAM blocks from `0x4009_0000`) are 16-bit
+/// writes, the others 32-bit register writes.
+const PACKED_WRITE_BASE: u32 = 0x4008_0000;
+const PACKED_WRITE_U16_CODES: u32 = 0x8000;
+
+fn pack_register_write(write: &RegisterWrite) -> (u16, u16) {
+    let offset = write
+        .address
+        .checked_sub(PACKED_WRITE_BASE)
+        .filter(|offset| offset % 2 == 0 && offset / 2 <= u32::from(u16::MAX))
+        .unwrap_or_else(|| panic!("CC2340 register 0x{:08X} cannot be packed", write.address));
+    let code = offset / 2;
+    let width = if code >= PACKED_WRITE_U16_CODES {
+        RegisterWidth::U16
+    } else {
+        RegisterWidth::U32
+    };
+    if width != write.width {
+        panic!(
+            "CC2340 register 0x{:08X}: its width does not follow the packed address rule",
+            write.address
+        );
+    }
+    let value = u16::try_from(write.value).unwrap_or_else(|_| {
+        panic!(
+            "CC2340 register 0x{:08X} value 0x{:X} does not fit 16 bits",
+            write.address, write.value
+        )
+    });
+    (code as u16, value)
+}
+
+fn write_register_writes(generated: &mut String, name: &str, writes: &[RegisterWrite]) {
+    writeln!(generated, "pub(crate) static {name}: &[RegisterWrite] = &[").unwrap();
+    for write in writes {
+        let (code, value) = pack_register_write(write);
+        writeln!(
+            generated,
+            "    RegisterWrite::packed(0x{code:04X}, 0x{value:04X}),"
+        )
+        .unwrap();
+    }
+    generated.push_str("];\n");
+    // The resolved (unpacked) table, so a host test proves the target
+    // decoder reproduces every address, width and value.
+    writeln!(
+        generated,
+        "#[cfg(test)]\npub(crate) static {name}_RESOLVED: &[(u32, u32, RegisterWidth)] = &["
+    )
+    .unwrap();
+    for write in writes {
+        let width = match write.width {
+            RegisterWidth::U16 => "RegisterWidth::U16",
+            RegisterWidth::U32 => "RegisterWidth::U32",
+        };
+        writeln!(
+            generated,
+            "    (0x{:08X}, 0x{:08X}, {width}),",
+            write.address, write.value
+        )
+        .unwrap();
+    }
+    generated.push_str("];\n");
+}
+
 fn write_phy_config(output: &Path, writes: &[RegisterWrite], tx_power: &[TxPowerEntry]) {
     let mut generated = String::new();
     generated.push_str("// Generated from TI's CC23xx IEEE 802.15.4 RCL PHY metadata.\n");
@@ -557,25 +811,7 @@ fn write_phy_config(output: &Path, writes: &[RegisterWrite], tx_power: &[TxPower
         "pub(crate) const PHY_CONFIG_SOURCE: &str = \
          \"TI ieee_802_15_4_oqpsk_250k_cc23xx.json\";\n",
     );
-    writeln!(
-        generated,
-        "pub(crate) static IEEE_802154_PHY_WRITES: &[RegisterWrite] = &["
-    )
-    .unwrap();
-
-    for write in writes {
-        let width = match write.width {
-            RegisterWidth::U16 => "RegisterWidth::U16",
-            RegisterWidth::U32 => "RegisterWidth::U32",
-        };
-        writeln!(
-            generated,
-            "    RegisterWrite {{ address: 0x{:08X}, value: 0x{:08X}, width: {width} }},",
-            write.address, write.value
-        )
-        .unwrap();
-    }
-    generated.push_str("];\n");
+    write_register_writes(&mut generated, "IEEE_802154_PHY_WRITES", writes);
     generated.push_str("pub(crate) static TX_POWER_TABLE: &[TxPowerEntry] = &[\n");
     for entry in tx_power {
         writeln!(

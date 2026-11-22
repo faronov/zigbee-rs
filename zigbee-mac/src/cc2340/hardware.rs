@@ -278,6 +278,17 @@ pub(crate) fn disable_radio_clocks() {
     write32(CLKCTL_CLKENCLR0, CLKCTL_LRFD);
 }
 
+/// The clock prologue of RCL `LRF_setupRadio()`, shared (out of line) by the
+/// IEEE bring-up and the ADC-noise capture: device trims, HFXT, its
+/// high-performance buffer, then the LRFD clocks.
+#[inline(never)]
+pub(crate) fn start_lrfd_clocks() -> Result<(), HardwareError> {
+    setup_device_trim();
+    start_hfxt()?;
+    enable_hfxt_clock_buffer();
+    enable_radio_clocks()
+}
+
 pub(crate) fn route_scheduler_interrupt() {
     write32(EVTSVT_CPUIRQ4SEL, 0x0E);
 }
@@ -289,21 +300,44 @@ pub(crate) fn load_firmware(pbe: &[u32], mce: &[u32], rfe: &[u32]) -> Result<(),
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+/// Load an RFE TOPsm image only (TI's `LRF_setupRadio()` with
+/// `pbeImage = mceImage = NULL`, as `LRF_configAdcNoise` does).
+pub(crate) fn load_rfe_image(rfe: &[u32]) -> Result<(), HardwareError> {
+    load_image(RFE_RAM_BASE, rfe)
+}
+
+/// Out of line: the IEEE bring-up and the ADC-noise capture share it.
+#[inline(never)]
 pub(crate) fn apply_phy_configuration(writes: &[RegisterWrite]) {
-    for write in writes {
-        match write.width {
-            RegisterWidth::U16 => write16(write.address, write.value as u16),
-            RegisterWidth::U32 => write32(write.address, write.value),
+    for &write in writes {
+        match write.width() {
+            RegisterWidth::U16 => write16(write.address(), write.value() as u16),
+            RegisterWidth::U32 => write32(write.address(), write.value()),
         }
     }
 }
+
+/// IF-ADC trim variant selection of an RCL PHY (`LRF_SwConfig.bwIndex` and
+/// `bwIndexDither`, used by `LRF_setTrimCommon()` from trim revision 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrimVariant {
+    pub bw_index: u32,
+    pub bw_index_dither: u32,
+}
+
+/// `ieee_802_15_4_oqpsk_250k_cc23xx.json`: `bwIndex = 0`, `bwIndexDither = 1`.
+pub(crate) const IEEE_TRIM_VARIANT: TrimVariant = TrimVariant {
+    bw_index: 0,
+    bw_index_dither: 1,
+};
 
 /// Apply the per-die radio trims stored in FCFG.
 ///
 /// This is the nominal-temperature path from TI's `LRF_applyTrim()`. Dynamic
 /// temperature compensation can update the same fields later without changing
 /// the initial radio bring-up sequence.
-pub(crate) fn apply_factory_radio_trim() -> Result<(), HardwareError> {
+pub(crate) fn apply_factory_radio_trim(variant: TrimVariant) -> Result<(), HardwareError> {
     const TRIM_REVISION: u32 = 0;
     const TRIM_PA0: u32 = 4;
     const TRIM_ATSTREFH: u32 = 6;
@@ -315,12 +349,14 @@ pub(crate) fn apply_factory_radio_trim() -> Result<(), HardwareError> {
     const TRIM_IFADCALDO: u32 = 18;
     const TRIM_IFADCDLDO: u32 = 20;
     const TRIM_DCO: u32 = 22;
-    const TRIM_VARIANT_NORMAL: u32 = 24;
-    const TRIM_VARIANT_DITHER: u32 = 32;
+    /// `trimVariant[0..2]`, four `u16` each.
+    const TRIM_VARIANTS: u32 = 24;
+    const TRIM_VARIANT_SIZE: u32 = 8;
     const TRIM_EXT0: u32 = 44;
     const TRIM_RSSI_OFFSET: u32 = 48;
     const TRIM_DEMIQMC0: u32 = 50;
-    const TRIM_IFAMPRFLDO_NORMAL: u32 = 54;
+    /// `trim4.ifamprfldo[0..2]`.
+    const TRIM_IFAMPRFLDO_BW: u32 = 54;
 
     const RFE_RSSIOFFSET: u32 = LRFDRFE_BASE + 0x088;
     const RFE_SPARE0: u32 = LRFDRFE_BASE + 0x098;
@@ -370,19 +406,24 @@ pub(crate) fn apply_factory_radio_trim() -> Result<(), HardwareError> {
     or32(RFE_IFADCALDO, trim16(TRIM_IFADCALDO) as u32);
     or32(RFE_IFADCDLDO, trim16(TRIM_IFADCDLDO) as u32);
 
-    let normal_ifadc_quant = trim16(TRIM_VARIANT_NORMAL);
-    let normal_ifadc0 = trim16(TRIM_VARIANT_NORMAL + 2);
-    let normal_ifadc1 = trim16(TRIM_VARIANT_NORMAL + 4);
-    let normal_ifadclf = trim16(TRIM_VARIANT_NORMAL + 6);
-    or32(RFE_IFADCQUANT, normal_ifadc_quant as u32);
-    or32(RFE_IFADC0, normal_ifadc0 as u32);
-    or32(RFE_IFADC1, normal_ifadc1 as u32);
-    or32(RFE_IFADCLF, normal_ifadclf as u32);
+    // `LRF_setTrimCommon()`: revisions before 4 only carry variant 0.
+    let (bw_index, bw_index_dither) = if revision >= 4 {
+        (variant.bw_index.min(1), variant.bw_index_dither.min(1))
+    } else {
+        (0, 0)
+    };
+    let selected = TRIM_VARIANTS + TRIM_VARIANT_SIZE * bw_index;
+    or32(RFE_IFADCQUANT, trim16(selected) as u32);
+    or32(RFE_IFADC0, trim16(selected + 2) as u32);
+    or32(RFE_IFADC1, trim16(selected + 4) as u32);
+    or32(RFE_IFADCLF, trim16(selected + 6) as u32);
 
     if revision >= 4 {
-        let dither = trim16(TRIM_VARIANT_DITHER + 2) as u32;
-        update32(RFE_IFADC0, IFADC0_DITHER_MASK, dither);
-        or32(RFE_IFAMPRFLDO, trim8(TRIM_IFAMPRFLDO_NORMAL) as u32);
+        if bw_index_dither != bw_index {
+            let dither = trim16(TRIM_VARIANTS + TRIM_VARIANT_SIZE * bw_index_dither + 2) as u32;
+            update32(RFE_IFADC0, IFADC0_DITHER_MASK, dither);
+        }
+        or32(RFE_IFAMPRFLDO, trim8(TRIM_IFAMPRFLDO_BW + bw_index) as u32);
     }
 
     write32(MDM_DEMIQMC0, trim16(TRIM_DEMIQMC0) as u32);
@@ -463,7 +504,7 @@ pub(crate) fn finish_radio_setup() -> Result<(), HardwareError> {
     write32(LRFDRFE_RSSI, INVALID_RSSI);
     write16(PBE_FIFOCMDADD, PBE_FCMD_ADDRESS);
     write16(RFE_RAM_GRANTPIN, 0x000F);
-    apply_factory_radio_trim()
+    apply_factory_radio_trim(IEEE_TRIM_VARIANT)
 }
 
 #[inline(always)]
@@ -808,7 +849,7 @@ fn scale_frequency_with_hfxt(frequency: u32) -> u32 {
         + ((ratio_high * frequency_high) << 10)
 }
 
-fn wait_ticks(ticks: u32) -> Result<(), HardwareError> {
+pub(super) fn wait_ticks(ticks: u32) -> Result<(), HardwareError> {
     let start = read32(SYSTIM_TIME250N);
     for _ in 0..CLOCK_READY_SPINS {
         if read32(SYSTIM_TIME250N).wrapping_sub(start) >= ticks {
@@ -819,7 +860,7 @@ fn wait_ticks(ticks: u32) -> Result<(), HardwareError> {
     Err(HardwareError::ClockTimeout)
 }
 
-fn wait_until<F>(timeout_ticks: u32, mut ready: F) -> bool
+pub(super) fn wait_until<F>(timeout_ticks: u32, mut ready: F) -> bool
 where
     F: FnMut() -> bool,
 {

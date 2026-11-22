@@ -167,6 +167,10 @@ cc2340 = [
 # HAL engine installed by the composition root, so no software AES is
 # linked. Marker pulled in by `cc2340`; not an independent switch.
 hardware-aes-cc2340 = ["dep:cc2340r5-hal"]
+# Lab-only raw ADC-noise access (`Cc2340RadioPhy::lab_capture_raw_noise`)
+# for the entropy characterisation binary. Raw samples are the DRBG's
+# entropy input: no product image may enable this.
+cc2340-entropy-lab = ["cc2340"]
 
 tlsr8258 = [
     "dep:tlsr8258-hal",
