@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "cc26x2-ncp"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "cc26x2-dongle",
  "cc26x2-hal",
