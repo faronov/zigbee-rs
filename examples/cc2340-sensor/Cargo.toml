@@ -23,6 +23,12 @@ name = "cc2340-router"
 path = "src/router.rs"
 required-features = ["router"]
 
+# Entropy-source lab image (raw radio noise, DRBG output); not a product.
+[[bin]]
+name = "cc2340-entropy-lab"
+path = "src/entropy_lab.rs"
+required-features = ["entropy-lab"]
+
 [features]
 default = ["sed"]
 # Sleepy BATMON sensor (the original image).
@@ -31,6 +37,8 @@ sed = []
 ed = ["dep:router-app", "dep:static_cell", "dep:zigbee-nwk", "cc2340-sensor-product/roles"]
 # Router size probe: parent MAC, ParentRouterApp, durable child and APS
 # tables. Does NOT fit the 36 KiB SRAM; the link is rejected (src/router.rs).
+# Lab only: raw radio ADC-noise access for the entropy characterisation bin.
+entropy-lab = ["zigbee-mac/cc2340-entropy-lab"]
 router = ["dep:router-app", "dep:static_cell", "dep:zigbee-nwk", "cc2340-sensor-product/roles", "router-app/router", "zigbee-runtime/router"]
 
 [dependencies]

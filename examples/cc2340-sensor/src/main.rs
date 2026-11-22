@@ -9,9 +9,10 @@
 //!
 //! This remains hardware bring-up firmware. The fallback and partial-SDK
 //! images stop with distinct `FirmwareUnavailable` and
-//! `RadioConfigUnavailable` diagnostics. Even a fully configured image must
-//! not be treated as commissionable until radio HIL passes and a verified
-//! entropy source replaces the fail-closed backend.
+//! `RadioConfigUnavailable` diagnostics. Entropy comes from radio ADC noise
+//! seeded into a CTR_DRBG before the radio starts; if that fails the image
+//! keeps running with `fill_random` failing closed. Commissioning is not
+//! claimed as qualified until MAC/power HIL passes.
 
 #![no_std]
 #![no_main]
@@ -110,9 +111,7 @@ async fn main(_spawner: Spawner) {
         product::environment::source_disposition(),
         product::battery::source_disposition()
     );
-    log::warn!(
-        "[CC2340] commissioning is not claimed: entropy is unavailable and MAC/power HIL is open"
-    );
+    log::warn!("[CC2340] commissioning is not claimed as qualified: MAC/power HIL is open");
 
     let node = ZigbeeNode::new(device, &mut security_store, &mut profile);
     let mut app = SensorApp::new(
@@ -159,11 +158,19 @@ fn build_device(
         fatal(status);
     }
     log::info!("[CC2340] LAES AES-128 self-test passed");
-    log::warn!(
-        "[CC2340] entropy={:?} (fail closed); radio-sleep={:?}",
-        phy.entropy_disposition(),
-        phy.radio_sleep_disposition()
-    );
+    // Radio noise is captured before the IEEE radio is brought up. A failure
+    // is not fatal: `fill_random` then fails closed for the whole boot.
+    match phy.seed_entropy() {
+        Ok(()) => log::info!(
+            "[CC2340] entropy={:?}: CTR_DRBG KAT and noise health tests passed",
+            phy.entropy_disposition()
+        ),
+        Err(error) => log::error!(
+            "[CC2340] entropy={:?} ({error:?}); fill_random fails closed",
+            phy.entropy_disposition()
+        ),
+    }
+    log::info!("[CC2340] radio-sleep={:?}", phy.radio_sleep_disposition());
 
     if let Err(error) = phy.initialize_radio() {
         match error {

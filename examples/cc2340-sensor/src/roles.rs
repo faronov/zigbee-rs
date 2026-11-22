@@ -84,9 +84,10 @@ pub fn start(model: &str) -> Started {
 }
 
 /// Install the `LAES` AES engine (halt if its self-test fails: Zigbee
-/// security has no software fall-back), then bring the radio up; the
-/// fallback (no TI SDK) build stops there with a distinct diagnostic, like
-/// the sensor.
+/// security has no software fall-back), seed the entropy source from radio
+/// noise (a failure leaves `fill_random` failing closed), then bring the
+/// radio up; the fallback (no TI SDK) build stops there with a distinct
+/// diagnostic, like the sensor.
 pub fn radio(ieee: zigbee_types::IeeeAddress, aes: board::aes::Aes) -> Cc2340RadioPhy {
     let mut phy = Cc2340RadioPhy::new(ieee).unwrap_or_else(|error| {
         rtt_target::rprintln!("[CC2340] rejected factory identity: {:?}", error);
@@ -97,6 +98,14 @@ pub fn radio(ieee: zigbee_types::IeeeAddress, aes: board::aes::Aes) -> Cc2340Rad
         halt()
     }
     rtt_target::rprintln!("[CC2340] LAES AES-128 self-test passed");
+    match phy.seed_entropy() {
+        Ok(()) => rtt_target::rprintln!("[CC2340] entropy={:?}", phy.entropy_disposition()),
+        Err(error) => rtt_target::rprintln!(
+            "[CC2340] entropy={:?} ({:?}); fill_random fails closed",
+            phy.entropy_disposition(),
+            error
+        ),
+    }
     if let Err(error) = phy.initialize_radio() {
         match error {
             RadioError::FirmwareUnavailable => {

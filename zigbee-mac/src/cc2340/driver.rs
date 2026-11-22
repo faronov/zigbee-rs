@@ -782,6 +782,23 @@ impl Cc2340Driver {
         self.asleep
     }
 
+    /// Whether another LRFD owner (the ADC-noise capture) may run: the radio
+    /// is not initialised, or it is asleep (no operation, clocks gated).
+    pub(crate) const fn lrfd_free_for_noise(&self) -> bool {
+        !self.configured || self.asleep
+    }
+
+    /// Record that another owner overwrote the LRFD (TOPsm images, PHY
+    /// registers, trims): the next bring-up reloads the images. While asleep
+    /// this is the standby path, so the next [`Self::wake`] re-runs
+    /// [`Self::init`]; before the first init nothing else changes.
+    pub(crate) fn invalidate_lrfd(&mut self) {
+        self.images_resident = false;
+        if self.asleep {
+            self.lrfd_lost = true;
+        }
+    }
+
     /// Record that the device was in standby while the radio was asleep.
     ///
     /// The LRFD power domain is off in standby, so its registers (PHY

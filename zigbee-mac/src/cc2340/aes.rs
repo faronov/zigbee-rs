@@ -12,12 +12,14 @@
 //!
 //! Ownership: the radio (LRFD/PBE, driven by this crate's `driver`) never
 //! uses `LAES`; nothing else in the image can reach it because the HAL token
-//! is consumed here.
+//! is consumed here. The entropy source (noise conditioning, CTR_DRBG and its
+//! known-answer test) borrows the same engine from the PHY through
+//! [`LaesProvider`] for the duration of one request; it never holds it.
 
 #[cfg(target_os = "none")]
 pub use cc2340r5_hal::aes::AesEngine;
 pub use cc2340r5_hal::aes::{Aes as AesPeripheral, AesError};
-use zigbee_crypto::{Aes128Forward, AesKey};
+use zigbee_crypto::{Aes128Forward, AesKey, ForwardAesProvider};
 
 /// Host builds have no `LAES` core, so no engine can exist there.
 #[cfg(not(target_os = "none"))]
@@ -66,6 +68,24 @@ impl Aes128Forward for Cc2340HardwareAes128<'_> {
             Some(engine) => engine.encrypt_block(&self.key, block).map_err(Into::into),
             None => Err(Cc2340AesError::NotInstalled),
         }
+    }
+}
+
+/// [`ForwardAesProvider`] over a borrowed engine, so the PHY's entropy
+/// state can use `LAES` while the PHY keeps sole ownership of it.
+pub(super) struct LaesProvider<'engine> {
+    engine: Option<&'engine mut AesEngine>,
+}
+
+impl<'engine> LaesProvider<'engine> {
+    pub(super) fn new(engine: Option<&'engine mut AesEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+impl ForwardAesProvider for LaesProvider<'_> {
+    fn forward_cipher(&mut self, key: &AesKey) -> impl Aes128Forward + '_ {
+        Cc2340HardwareAes128::new(self.engine.as_deref_mut(), key)
     }
 }
 
