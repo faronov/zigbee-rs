@@ -1277,6 +1277,13 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             Err(_) => return Err(OpError::Zigbee(0xEA)),
         };
         for pd in confirm.pan_descriptors.iter() {
+            // Zigbee networks only: a beacon of another protocol (Thread's
+            // protocol ID 3, a plain IEEE 802.15.4 coordinator) parses into
+            // zeros, and a Zigbee router always announces its network's
+            // EPID.
+            if pd.zigbee_beacon.protocol_id != 0 || pd.zigbee_beacon.extended_pan_id == [0; 8] {
+                continue;
+            }
             let (pan, src) = match pd.coord_address {
                 MacAddress::Short(pan, short) => (pan.0, short.0),
                 MacAddress::Extended(pan, _) => (pan.0, 0xFFFF),

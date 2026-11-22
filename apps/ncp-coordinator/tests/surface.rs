@@ -1901,6 +1901,14 @@ fn active_scan_answers_with_every_beacon_and_keeps_the_network() {
             .mac_mut();
         mac.add_beacon(neighbour_beacon(25, 0x0000));
         mac.add_beacon(neighbour_beacon(25, 0x1234));
+        // Not reported: a Thread beacon and one without a Zigbee payload.
+        let mut thread = neighbour_beacon(20, 0x0042);
+        thread.zigbee_beacon.protocol_id = 3;
+        mac.add_beacon(thread);
+        let mut bare = neighbour_beacon(20, 0x0043);
+        bare.zigbee_beacon.extended_pan_id = [0; 8];
+        bare.zigbee_beacon.stack_profile = 0;
+        mac.add_beacon(bare);
     }
     let channels = (1 << 15) | (1 << 20) | (1 << 25);
     let bad = host.request(&NwkActiveScan {
