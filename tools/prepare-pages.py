@@ -7,6 +7,7 @@ Layout of the site:
   /flasher/             release flasher (docs/flasher/index.html), images of
                         tagged releases (tools/flasher_site.py fetch) and a
                         vendored ESP Web Tools and esptool-js
+  /flasher/console/     Web Serial console with Wi-Fi setup (docs/flasher/console.html)
   /flasher/sensor/      CI sensor flasher (docs/flasher/sensor.html)
 """
 
@@ -107,6 +108,8 @@ def prepare(
     page = (flasher / "index.html").read_text()
     page = page.replace("@REVISION@", revision).replace("@RUN_URL@", run_url)
     (site / "index.html").write_text(page)
+    (site / "console").mkdir()
+    shutil.copyfile(flasher / "console.html", site / "console" / "index.html")
     shutil.copyfile(releases / "releases.json", site / "releases.json")
     shutil.copytree(releases / "releases", site / "releases")
     shutil.copytree(vendor, site / "vendor")

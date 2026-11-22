@@ -56,6 +56,7 @@ class PagesTests(unittest.TestCase):
                 html = (flasher / "index.html").read_text()
                 self.assertEqual((output / "index.html").read_text(), "documentation")
                 self.assertIn(REVISION, (site / "index.html").read_text())
+                self.assertIn("Set up Wi-Fi", (site / "console/index.html").read_text())
                 self.assertEqual((site / "releases/ncp-v0.1.0/app.bin").read_bytes(), b"release")
                 self.assertTrue((site / "vendor/esp-web-tools/install-button.js").is_file())
                 self.assertTrue((site / "vendor/esptool-js/bundle.js").is_file())

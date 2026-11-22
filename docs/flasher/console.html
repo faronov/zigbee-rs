@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zigbee-rs serial console</title>
+  <style>
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #e6edf3;
+      --muted: #8b949e; --accent: #58a6ff; --green: #3fb950; --red: #f85149; --orange: #d29922;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background: var(--bg); color: var(--text); margin: 0; padding: 2rem 1rem;
+      display: flex; flex-direction: column; align-items: center; line-height: 1.45;
+    }
+    main { max-width: 860px; width: 100%; }
+    h1 { font-size: 1.6rem; margin: 0 0 .3rem; }
+    h2 { font-size: 1.05rem; margin: 0 0 .7rem; }
+    .subtitle, .muted { color: var(--muted); }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.2rem 1.4rem; margin-bottom: 1rem; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, pre, input.mono { font-family: 'SF Mono', 'Fira Code', Consolas, monospace; font-size: .85rem; }
+    button { background: var(--border); color: var(--text); border: none; border-radius: 6px; padding: .5rem .9rem;
+      font-size: .9rem; font-weight: 600; cursor: pointer; }
+    button.primary { background: var(--green); color: var(--bg); }
+    button.danger { background: var(--red); color: var(--bg); }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    input { padding: .5rem .6rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: .95rem; }
+    .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+    .row + .row { margin-top: .6rem; }
+    #term { background: #010409; border: 1px solid var(--border); border-radius: 6px; padding: .7rem; height: 360px;
+      overflow-y: auto; white-space: pre-wrap; word-break: break-all; margin: .7rem 0; }
+    #line { flex: 1; min-width: 200px; }
+    .note, .warn, .danger-box, .ok { border-radius: 6px; padding: .7rem .9rem; font-size: .9rem; margin-top: .7rem; }
+    .note { border: 1px solid var(--border); background: var(--bg); }
+    .warn { border: 1px solid var(--orange); background: rgba(210,153,34,.1); }
+    .danger-box { border: 1px solid var(--red); background: rgba(248,81,73,.1); }
+    .ok { border: 1px solid var(--green); background: rgba(63,185,80,.1); }
+    .status { font-size: .9rem; }
+    .hidden { display: none; }
+    label.field { display: flex; flex-direction: column; gap: .2rem; font-size: .85rem; color: var(--muted); }
+    footer { color: var(--muted); font-size: .8rem; margin-top: 1.5rem; text-align: center; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>zigbee-rs serial console</h1>
+  <p class="subtitle">A terminal for the hub's USB console in the browser, with Wi-Fi setup. Needs Chrome or Edge on a
+    desktop (Web Serial); Firefox and Safari cannot open serial ports. <a href="../">Back to the web flasher</a>.</p>
+
+  <div id="unsupported" class="card danger-box hidden">
+    <strong>This browser has no Web Serial.</strong> Use Chrome or Edge (version 89 or later) on Windows, macOS or Linux.
+  </div>
+
+  <section class="card">
+    <h2>Which port</h2>
+    <p style="margin:0">After tbr-hub (or tbr-bridge) starts, the Thread Border Router board's S3 USB port (USB2) shows
+      <strong>two serial ports</strong> of the device "Thread BR H2 bridge" (manufacturer zigbee-rs-hub):</p>
+    <ul style="margin:.4rem 0">
+      <li><strong>the second port is the console</strong>: macOS <code>cu.usbmodem…3</code>, Linux the higher
+        <code>/dev/ttyACM…</code>, Windows usually the higher <code>COM</code> number;</li>
+      <li>the first port is the bridge to the H2 (bridge mode) or the JSON API (hub mode): not a console.</li>
+    </ul>
+    <p class="muted" style="margin:0;font-size:.85rem">The page sends an empty line and waits for the console prompt
+      <code>&gt;</code>, so a wrong port is reported. It always opens at 115 200 baud: 1 200 baud on the console port
+      would hand the USB port back to USB-Serial-JTAG (the flasher uses that on purpose). Close other programs on the
+      port first. The ZRHP NCP DevKits speak the binary ZRHP protocol on their port: there is no text console there.</p>
+  </section>
+
+  <section class="card">
+    <h2>Console</h2>
+    <div class="row">
+      <button class="primary" id="connect">Connect</button>
+      <button id="disconnect" disabled>Disconnect</button>
+      <span class="status" id="status">Not connected.</span>
+    </div>
+    <pre id="term"></pre>
+    <div class="row">
+      <input id="line" class="mono" placeholder="command, e.g. help (Enter sends; ↑/↓ history)" autocomplete="off" disabled>
+      <button id="send" disabled>Send</button>
+    </div>
+    <div class="row">
+      <button data-cmd="help" disabled>help</button>
+      <button data-cmd="mode" disabled>mode</button>
+      <button data-cmd="hub status" disabled>hub status</button>
+      <button data-cmd="wifi" disabled>wifi</button>
+      <button id="token" disabled>Read token</button>
+      <button id="reboot" class="danger" disabled>Reboot S3</button>
+      <span style="flex:1"></span>
+      <button id="clear">Clear</button>
+      <button id="download">Download log</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Set up Wi-Fi</h2>
+    <p style="margin:0">Stores the credentials on the hub (<code>wifi set</code>), switches it to hub mode if it boots as
+      the bridge (<code>mode hub</code>, the S3 reboots and the page reconnects), waits for an address and reads the API
+      token. The password is only sent to the device: it is not stored by this page, not kept in the history and masked
+      in the terminal and the log.</p>
+    <div class="row" style="margin-top:.7rem">
+      <label class="field">SSID<input id="ssid" autocomplete="off" spellcheck="false" disabled></label>
+      <label class="field">Password<input id="password" type="password" autocomplete="off" disabled></label>
+      <button class="primary" id="wifi-setup" disabled style="align-self:flex-end">Set up Wi-Fi</button>
+    </div>
+    <p class="muted" style="font-size:.85rem;margin:.5rem 0 0">The console takes printable ASCII only and splits on
+      spaces: the SSID must not contain spaces, the password not start or end with one or contain two in a row
+      (set such networks later in the hub's web UI). 2.4 GHz networks only (ESP32-S3).</p>
+    <div id="wifi-result"></div>
+  </section>
+
+  <footer>
+    <a href="../">Web flasher</a> ·
+    <a href="https://faronov.github.io/zigbee-rs/getting-started/web-flasher.html">Docs</a> ·
+    <a href="https://github.com/faronov/zigbee-rs-hub">zigbee-rs-hub</a>
+  </footer>
+</main>
+
+<script type="module">
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const BAUD = 115200;
+  const MAX_LINE = 119;  // the console keeps at most 119 characters per line
+
+  if (!('serial' in navigator)) {
+    $('unsupported').classList.remove('hidden');
+    $('connect').disabled = true;
+  }
+
+  let port = null, reader = null, writer = null, reading = null;
+  let isConsole = false, mode = null;
+  let log = '';                // terminal text, already masked
+  let hold = null;             // {secret, text}: incoming text held back until the secret can be masked
+  let waiters = [];            // command() callbacks fed with every received chunk
+  let expectReboot = false;
+  const history = [];
+  let historyPos = 0;
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  function setStatus(text, cls = '') {
+    $('status').className = 'status ' + cls;
+    $('status').textContent = text;
+  }
+
+  function enable() {
+    const on = !!port;
+    $('connect').disabled = on || !('serial' in navigator);
+    $('disconnect').disabled = !on;
+    for (const el of [$('line'), $('send'), ...document.querySelectorAll('[data-cmd]')]) el.disabled = !on;
+    for (const el of [$('token'), $('reboot'), $('ssid'), $('password'), $('wifi-setup')]) el.disabled = !(on && isConsole);
+  }
+
+  // Terminal text: CR LF / lone CR as line breaks, the console's "\b \b" erases, no other control bytes.
+  function show(text) {
+    text = text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    for (const part of text.split(/(\x08 \x08)/)) {
+      if (part === '\x08 \x08') log = log.slice(0, -1);
+      else log += part.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+    }
+    if (log.length > 400000) log = log.slice(-300000);
+    const term = $('term');
+    const atEnd = term.scrollTop + term.clientHeight >= term.scrollHeight - 20;
+    term.textContent = log;
+    if (atEnd) term.scrollTop = term.scrollHeight;
+  }
+
+  const mask = (text, secret) => secret ? text.split(secret).join('•'.repeat(8)) : text;
+
+  function received(text) {
+    for (const w of waiters) w(text);
+    if (hold) hold.text += text;
+    else show(text);
+  }
+
+  async function readLoop() {
+    try {
+      while (port && port.readable) {
+        reader = port.readable.getReader();
+        try {
+          for (;;) {
+            const {value, done} = await reader.read();
+            if (done) break;
+            received(decoder.decode(value, {stream: true}));
+          }
+        } finally {
+          reader.releaseLock();
+          reader = null;
+        }
+      }
+    } catch (e) {
+      // The device went away (reboot, unplug, USB hand-over).
+    }
+    await closePort(true);
+  }
+
+  async function openPort(p) {
+    await p.open({baudRate: BAUD});
+    port = p;
+    writer = port.writable.getWriter();
+    reading = readLoop();
+    enable();
+  }
+
+  async function closePort(lost = false) {
+    const p = port;
+    if (!p) return;
+    port = null;
+    isConsole = false;
+    try { if (reader) await reader.cancel(); } catch { /* closed */ }
+    try { if (writer) { writer.releaseLock(); writer = null; } } catch { /* closed */ }
+    try { await p.close(); } catch { /* closed */ }
+    enable();
+    if (lost) {
+      show('\n[port closed]\n');
+      setStatus(expectReboot ? 'The S3 is rebooting: waiting for its console…' : 'Disconnected (the device went away).', expectReboot ? '' : 'warn');
+    }
+  }
+
+  async function write(text) {
+    if (!writer) throw new Error('not connected');
+    await writer.write(encoder.encode(text));
+  }
+
+  // Send one console line and collect the output up to the next prompt.
+  // `secret` is masked in everything shown or logged, including the device's echo.
+  async function command(cmd, {secret = null, timeout = 4000} = {}) {
+    if (cmd.length > MAX_LINE) throw new Error(`the console takes at most ${MAX_LINE} characters per line`);
+    let got = '';
+    let done;
+    const finished = new Promise((r) => { done = r; });
+    const waiter = (text) => { got += text; if (/\n?> $/.test(got) && got.includes('\r\n')) done(true); };
+    waiters.push(waiter);
+    if (secret) hold = {secret, text: ''};
+    try {
+      await write(cmd + '\r');
+      const ok = await Promise.race([finished, sleep(timeout).then(() => false)]);
+      // The echo line, then the reply, then the prompt.
+      const reply = got.replace(/^[^\n]*\r\n/, '').replace(/> $/, '').replace(/\r\n/g, '\n').trim();
+      return {ok, reply: mask(reply, secret)};
+    } finally {
+      waiters = waiters.filter((w) => w !== waiter);
+      if (hold && secret) {
+        const text = mask(hold.text, secret);
+        hold = null;
+        show(text);
+      }
+    }
+  }
+
+  // The console answers an empty line with its prompt; the bridge/API port does not.
+  async function probe() {
+    let got = '';
+    const waiter = (text) => { got += text; };
+    waiters.push(waiter);
+    try {
+      await write('\r');
+      for (let i = 0; i < 15 && !got.includes('> '); i++) await sleep(100);
+    } finally {
+      waiters = waiters.filter((w) => w !== waiter);
+    }
+    return got.includes('> ');
+  }
+
+  async function identify() {
+    isConsole = await probe();
+    if (!isConsole) {
+      setStatus('No console prompt on this port: it is probably the first port (bridge or JSON API). Disconnect and pick the other one.', 'warn');
+      enable();
+      return false;
+    }
+    const m = (await command('mode')).reply.match(/mode (Hub|Bridge)/);
+    mode = m ? m[1] : null;
+    setStatus(`Connected to the hub console${mode ? ` (${mode.toLowerCase()} mode)` : ''}.`);
+    enable();
+    return true;
+  }
+
+  async function connect() {
+    let p;
+    try {
+      p = await navigator.serial.requestPort();
+    } catch (e) {
+      setStatus(`No port selected: ${e.message}`);
+      return;
+    }
+    try {
+      await openPort(p);
+    } catch (e) {
+      setStatus(`Cannot open the port: ${e.message} (is another program using it?)`, 'warn');
+      return;
+    }
+    setStatus('Connected; looking for the console prompt…');
+    await identify();
+  }
+
+  // After a reboot the USB device comes back with new port objects. Ports this site may use again are reopened
+  // without a prompt; the one answering with the console prompt wins.
+  async function reconnect(info, timeoutMs = 45000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await sleep(1500);
+      const candidates = (await navigator.serial.getPorts()).filter((p) => {
+        const i = p.getInfo();
+        return i.usbVendorId === info.usbVendorId && i.usbProductId === info.usbProductId && !p.readable;
+      });
+      for (const p of candidates) {
+        try {
+          await openPort(p);
+          if (await probe()) {
+            await identify();
+            return true;
+          }
+          await closePort();
+        } catch {
+          await closePort();
+        }
+      }
+    }
+    return false;
+  }
+
+  function addHistory(cmd) {
+    if (/^\s*wifi\s+set\b/i.test(cmd)) return;
+    if (history[history.length - 1] !== cmd) history.push(cmd);
+    if (history.length > 100) history.shift();
+    historyPos = history.length;
+  }
+
+  async function sendLine() {
+    const cmd = $('line').value;
+    $('line').value = '';
+    if (!cmd.trim()) { await write('\r'); return; }
+    // A password typed by hand is masked too.
+    const m = cmd.match(/^\s*wifi\s+set\s+\S+\s+(.+)$/i);
+    addHistory(cmd);
+    try {
+      await command(cmd, {secret: m ? m[1].trim() : null});
+    } catch (e) {
+      setStatus(e.message, 'warn');
+    }
+  }
+
+  function validate(ssid, password) {
+    const printable = /^[\x20-\x7e]*$/;
+    if (!ssid) return 'Enter the SSID.';
+    if (/\s/.test(ssid)) return 'The console cannot set an SSID with spaces.';
+    if (!printable.test(ssid) || !printable.test(password)) return 'Only printable ASCII characters can be typed into the console.';
+    if (ssid.length > 32) return 'An SSID has at most 32 characters.';
+    if (password && (password.length < 8 || password.length > 63)) return 'A WPA2 password has 8 to 63 characters (or leave it empty for an open network).';
+    if (/^ | $|  /.test(password)) return 'The console would change a password with leading, trailing or double spaces.';
+    return null;
+  }
+
+  function result(html, cls = 'note') {
+    $('wifi-result').innerHTML = `<div class="${cls}">${html}</div>`;
+  }
+
+  async function readToken() {
+    const {reply} = await command('token');
+    const m = reply.match(/API token: (\S+)/);
+    return m ? m[1] : null;
+  }
+
+  async function setupWifi() {
+    const ssid = $('ssid').value.trim();
+    let password = $('password').value;
+    const problem = validate(ssid, password);
+    if (problem) { result(esc(problem), 'warn'); return; }
+    $('wifi-setup').disabled = true;
+    try {
+      result('Storing the Wi-Fi credentials…');
+      const set = await command(`wifi set ${ssid}${password ? ' ' + password : ''}`, {secret: password || null});
+      $('password').value = '';
+      password = null;
+      if (!/stored/.test(set.reply)) { result(`The hub did not store them: <code>${esc(set.reply || 'no reply')}</code>`, 'danger-box'); return; }
+
+      if (mode !== 'Hub') {
+        result('Switching to hub mode: the S3 reboots and this page reconnects (keep the cable in)…');
+        const info = port.getInfo();
+        expectReboot = true;
+        await command('mode hub', {timeout: 3000}).catch(() => {});
+        await Promise.race([reading || Promise.resolve(), sleep(10000)]);
+        const back = port ? await identify() : await reconnect(info);
+        expectReboot = false;
+        if (!back) {
+          result('The S3 rebooted, but the page could not reopen its console by itself. Click Connect, pick the second port and press <em>wifi</em>.', 'warn');
+          return;
+        }
+      }
+
+      result('Waiting for the Wi-Fi connection…');
+      let ip = null, last = '';
+      for (let i = 0; i < 30 && !ip; i++) {
+        await sleep(i ? 2000 : 500);
+        if (!isConsole) break;
+        last = (await command('wifi')).reply;
+        const m = last.match(/up, ws:\/\/([0-9.]+)\/api/);
+        if (m) ip = m[1];
+      }
+      if (!ip) {
+        result(`No Wi-Fi address yet: <code>${esc(last || 'no reply')}</code>. Check the SSID and password
+          (2.4 GHz), then press <em>wifi</em> again; to change them run the setup again.`, 'warn');
+        return;
+      }
+      const token = await readToken();
+      const url = `http://${ip}/` + (token ? `#token=${encodeURIComponent(token)}` : '');
+      result(`Hub online at <strong>${esc(ip)}</strong>.<br>Open the hub: <a href="${esc(url)}" target="_blank" rel="noopener">${esc(url)}</a>
+        ${token ? '' : '<br>No API token yet (it is created at the first hub boot): press <em>Read token</em> later.'}
+        <br><span class="muted">The link carries the API token; the hub page keeps it in that browser. Home Assistant's
+        zigbee-rs-hub integration needs the same address and token.</span>`, 'ok');
+    } catch (e) {
+      result(`Wi-Fi setup failed: ${esc(e.message)}`, 'danger-box');
+    } finally {
+      $('password').value = '';
+      expectReboot = false;
+      enable();
+    }
+  }
+
+  $('connect').addEventListener('click', connect);
+  $('disconnect').addEventListener('click', () => closePort());
+  $('send').addEventListener('click', sendLine);
+  $('line').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); sendLine(); }
+    else if (ev.key === 'ArrowUp' && history.length) { historyPos = Math.max(0, historyPos - 1); $('line').value = history[historyPos]; ev.preventDefault(); }
+    else if (ev.key === 'ArrowDown' && history.length) { historyPos = Math.min(history.length, historyPos + 1); $('line').value = history[historyPos] ?? ''; ev.preventDefault(); }
+  });
+  for (const b of document.querySelectorAll('[data-cmd]')) {
+    b.addEventListener('click', () => { addHistory(b.dataset.cmd); command(b.dataset.cmd).catch((e) => setStatus(e.message, 'warn')); });
+  }
+  $('token').addEventListener('click', async () => {
+    const token = await readToken().catch(() => null);
+    setStatus(token ? `API token: ${token}` : 'No API token yet (generated at the first hub boot).');
+  });
+  $('reboot').addEventListener('click', async () => {
+    if (!confirm('Reboot the S3? The console disconnects and comes back after the boot.')) return;
+    const info = port.getInfo();
+    expectReboot = true;
+    await command('s3 reset', {timeout: 2000}).catch(() => {});
+    await Promise.race([reading || Promise.resolve(), sleep(10000)]);
+    const back = port ? await identify() : await reconnect(info);
+    expectReboot = false;
+    if (!back) setStatus('The S3 rebooted; click Connect and pick the console port again.', 'warn');
+  });
+  $('clear').addEventListener('click', () => { log = ''; $('term').textContent = ''; });
+  $('download').addEventListener('click', () => {
+    const blob = new Blob([log], {type: 'text/plain'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `zigbee-rs-console-${new Date().toISOString().replace(/[:.]/g, '-')}.log`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+  $('wifi-setup').addEventListener('click', setupWifi);
+  navigator.serial?.addEventListener('disconnect', (ev) => { if (ev.target === port) closePort(true); });
+  enable();
+</script>
+</body>
+</html>
