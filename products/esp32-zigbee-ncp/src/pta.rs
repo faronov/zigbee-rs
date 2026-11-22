@@ -53,16 +53,22 @@
 //! {tx,rx}_stage` calls and configurable scene PTIs) is the esp-radio local
 //! patch `ieee802154-extcoex` (`vendor/esp-radio/LOCAL-PATCHES.md`).
 //!
-//! # Hardware status (Thread BR board, `pta_lab`, 2026-11-21)
+//! # Hardware status (Thread BR board, `pta_lab`, 2026-11-21/22)
 //!
 //! - Without the adapter registration and `coex_pre_init` the arbiter
 //!   stayed off: no line moved.
 //! - With them the outputs work: `priority` (GPIO2, signal 81) is high for
 //!   every transmission, `request` (GPIO0, signal 82) only for `High`
 //!   PTIs (mask bit 3), and the S3 sees both.
-//! - Grant does **not** gate transmissions yet: with grant pulled low (also
-//!   with request high, and after the blob's `coex_init`/`coex_enable`)
-//!   every frame went out, `TX_BREAK_COEX_CNT` stayed 0. Gate H9 is open.
+//! - A transmission is refused only while `tx_line` (the leader's Wi-Fi
+//!   TX) is high **and** `grant` is low: 40/40 refused (`TxCoexBreak`,
+//!   failed at once and counted), every other combination of grant, tx_line
+//!   and priority sent 40/40. An ESP-IDF v5.5.1 reference app with
+//!   `ot_rcp`'s follower setup behaves identically (same coexistence-block
+//!   registers, `ESP_IEEE802154_TX_ERR_COEXIST` in the same phase), so the
+//!   primitive matches ESP-IDF. `TX_BREAK_COEX_CNT` stays 0 in both.
+//! - Still open (gate H9): PER and latency under Wi-Fi load with the S3 as
+//!   the leader.
 //!
 //! # Priority mask (`coex_tx_priority_mask`)
 //!

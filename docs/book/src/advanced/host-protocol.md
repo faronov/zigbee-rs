@@ -3055,14 +3055,20 @@ are kept, and the size is detected at runtime:
   `EXTERNAL_COEX_FOLLOWER_ROLE`, 4 wires:
   - *request* (H2 out) is raised by the hardware for every radio operation;
     *priority* (H2 out) reflects the PTI of the current radio scene;
-  - *grant* (H2 in) gates the radio. A transmission without grant ends in
+  - *grant* (H2 in) gates the radio while the leader transmits: a
+    transmission is refused only when *tx_line* is high and *grant* low
+    (measured on the board with `pta_lab` and with an ESP-IDF v5.5.1
+    `ot_rcp`-style reference: same registers, same result). The refusal is
     the hardware abort `TxCoexBreak`: the NCP fails it at once as a busy
     channel (CSMA-CA backs off and retries) and counts `coex_denied`
     (`0x0220`); ACK receptions and automatic ACKs the arbiter breaks off
-    count `0x0221`/`0x0222` (7.8);
+    count `0x0221`/`0x0222` (7.8). The follower needs ESP-IDF's start-up
+    `esp_coex_adapter_register` + `coex_pre_init`, without which the arbiter
+    stays off;
   - *tx_line* is an **input** on the follower: the S3 leader's Wi-Fi TX
     indication (ESP-IDF `SOC_EXTERNAL_COEX_LEADER_TX_LINE`). The H2 does
-    not drive it.
+    not drive it. *priority* is high for every 802.15.4 transmission,
+    *request* only for `High` scenes.
 - **Priority classes** (`coex_tx_priority_mask`, config `0x000A`). The radio
   has one PTI per scene (idle, RX, TX, timed TX, automatic ACK), not per
   frame: bit0 raises the automatic-ACK PTI, bit1 the timed-TX PTI (the GP
