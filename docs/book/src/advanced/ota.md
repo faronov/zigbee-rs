@@ -192,6 +192,50 @@ device following the reset.
 | CC2340R5 | `bootloaders/cc2340r5-boot` shell of the [bootloader core](./bootloader.md); no product loader binary or writer | `NoOta`; loader build/host-tested only |
 | PHY6222/PB-03F/EFR32MG21/TLSR8258 | no product writer | `NoOta` |
 
+## Manufacturer code and image types
+
+zigbee-rs products advertise manufacturer code **`0x6D6B`** in Query Next
+Image Request and carry it in their OTA headers (decision D8 of the
+zigbee-rs hub; not a CSA assignment, also the Manufacturer ID of the
+zigbee-rs Green Power devices). Servers (ZHA, Zigbee2MQTT, the zigbee-rs
+hub) match images on manufacturer code + image type, then on file version
+and the hardware-version range.
+
+| product | image type |
+|---|---|
+| ESP32-C6 devkit sensor | `0x0001` |
+| ESP32-H2 devkit sensor | `0x0002` |
+| ESP32-C5 devkit sensor | `0x0003` |
+| ESP32-H2 thermometer (`thermometer.toml`) | `0x0012` |
+| EFR32MG22 sensor (`zrs-boot`) | `0x0022` |
+| BL702 XT-ZB1 sensor | `0x0702` |
+| HA Connect ZBT-1 router (`zrs-boot`) | `0x2101` |
+| CC2340 flower (outside this repository; reserved) | `0x2340`..`0x2342` |
+| EFR32MG1 TRADFRI (IKEA code `0x1049`, not `0x6D6B`) | `0x0002` |
+
+Conventions for new products: one image type per firmware that must never
+be installed on another board (chip, board and role); a number that hints
+at the chip or board (`0x0702` BL702, `0x2101` ZBT-1, `0x0022` MG22) and
+is not in the table yet; never `0xFFC0`..`0xFFFF` (ZCL: security
+credential, configuration, log, wildcard). File versions are `0x25MMmmpp`
+(prefix `0x25`, then major, minor, patch of the product's Cargo version),
+so a newer release always has a larger file version.
+
+**Transition from `0x1234`.** Firmware before this change advertised the
+placeholder code `0x1234`, and the client takes only offers and headers
+with its own code. A device still running such firmware therefore needs
+one update whose OTA header carries `0x1234` while the image inside is the
+new (`0x6D6B`) firmware; after that update it queries with `0x6D6B`.
+The tools build that file on request:
+
+```bash
+tools/create-esp32-ota.py 0x25000300 --chip esp32h2 --legacy-manufacturer
+tools/bl702_ota.py release --legacy-manufacturer ...
+tools/zrs_boot_ota.py release --header-manufacturer 0x1234 ...
+```
+
+The file name carries `-mfr1234`; `check` / `index` accept both codes.
+
 ## ESP32 layout
 
 ```text

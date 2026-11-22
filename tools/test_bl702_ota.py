@@ -84,10 +84,20 @@ class OtaFileTest(unittest.TestCase):
         header, element = ota.parse_ota_file(data)
         self.assertEqual(len(data), ota.OTA_HEADER_LEN + 6 + len(image))
         self.assertEqual(header.total_size, len(data))
-        self.assertEqual((header.manufacturer, header.image_type), (0x1234, 0x0702))
+        self.assertEqual((header.manufacturer, header.image_type), (0x6D6B, 0x0702))
         self.assertEqual(header.header_string, b"bl702-xt-zb1 0.1.1")
         self.assertEqual(element, image)
         self.assertIn("file version 0x25000101", ota.check(data))
+
+    def test_legacy_manufacturer_transition_file(self):
+        # Devices on firmware from before 0x6D6B accept only 0x1234 headers.
+        data = ota.ota_file(signed_image(), ota.file_version(0, 1, 1), manufacturer=0x1234)
+        header, _ = ota.parse_ota_file(data)
+        self.assertEqual(header.manufacturer, 0x1234)
+        self.assertIn("file version 0x25000101", ota.check(data))
+        other = ota.ota_file(signed_image(), ota.file_version(0, 1, 1), manufacturer=0x1049)
+        with self.assertRaisesRegex(ota.ToolError, "identity"):
+            ota.check(other)
 
     def test_version_mismatch_is_rejected(self):
         data = ota.ota_file(signed_image(version=(0, 1, 0)), ota.file_version(0, 1, 1))
@@ -220,15 +230,15 @@ class IndexTest(unittest.TestCase):
             root = Path(tmp)
             (root / "images").mkdir()
             data = ota.ota_file(signed_image(), ota.file_version(0, 1, 1))
-            path = root / "images" / "1234-0702-25000101.zigbee"
+            path = root / "images" / "6D6B-0702-25000101.zigbee"
             path.write_bytes(data)
             ota.write_index(root / "index.json", [path])
             index = json.loads((root / "index.json").read_text())
         entry, = index["firmwares"]
-        self.assertEqual(entry["path"], "images/1234-0702-25000101.zigbee")
+        self.assertEqual(entry["path"], "images/6D6B-0702-25000101.zigbee")
         self.assertEqual(entry["file_version"], 0x25000101)
         self.assertEqual(entry["file_size"], len(data))
-        self.assertEqual((entry["manufacturer_id"], entry["image_type"]), (0x1234, 0x0702))
+        self.assertEqual((entry["manufacturer_id"], entry["image_type"]), (0x6D6B, 0x0702))
         self.assertEqual(entry["checksum"], "sha3-256:" + hashlib.sha3_256(data).hexdigest())
 
 

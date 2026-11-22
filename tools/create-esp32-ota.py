@@ -60,7 +60,10 @@ SUB_ELEMENT_HEADER_LEN = 6
 ZIGBEE_PRO_STACK_VERSION = 0x0002
 
 # Must match products/esp32-zigbee-devkit/src/lib.rs and the product profile.
-MANUFACTURER_CODE = 0x1234
+MANUFACTURER_CODE = 0x6D6B
+# The placeholder code of firmware before 0x6D6B: devices still running it
+# accept only OTA files whose header carries it (`--legacy-manufacturer`).
+LEGACY_MANUFACTURER_CODE = 0x1234
 HARDWARE_VERSION = 1
 MANUFACTURER_NAME = "Zigbee-RS"
 
@@ -295,7 +298,8 @@ def sign_image(image_path: pathlib.Path, version: int, key: pathlib.Path,
     return envelope
 
 
-def build_container(image: bytes, version: int, config: ChipConfig) -> bytes:
+def build_container(image: bytes, version: int, config: ChipConfig,
+                    manufacturer: int = MANUFACTURER_CODE) -> bytes:
     header_length = OTA_HEADER_BASE_LEN + 4  # + min/max hardware version
     total = header_length + SUB_ELEMENT_HEADER_LEN + len(image)
     header_string = config.header_string.encode("utf-8")[:32].ljust(32, b"\x00")
@@ -306,7 +310,7 @@ def build_container(image: bytes, version: int, config: ChipConfig) -> bytes:
         OTA_HEADER_VERSION,
         header_length,
         FIELD_CONTROL_HARDWARE_VERSIONS,
-        MANUFACTURER_CODE,
+        manufacturer,
         config.image_type,
         version,
         ZIGBEE_PRO_STACK_VERSION,
@@ -385,14 +389,15 @@ def parse_container(blob: bytes) -> dict:
 
 
 def verify_container(
-    blob: bytes, image: bytes, version: int, config: ChipConfig
+    blob: bytes, image: bytes, version: int, config: ChipConfig,
+    manufacturer: int = MANUFACTURER_CODE,
 ) -> None:
     parsed = parse_container(blob)
     if parsed["payload"] != image:
         raise SystemExit("UpgradeImage payload differs from the application image")
     if parsed["file_version"] != version:
         raise SystemExit("container file version does not match the requested version")
-    if parsed["manufacturer_code"] != MANUFACTURER_CODE:
+    if parsed["manufacturer_code"] != manufacturer:
         raise SystemExit("container manufacturer code mismatch")
     if parsed["image_type"] != config.image_type:
         raise SystemExit("container image type mismatch")
@@ -414,7 +419,7 @@ def write_index(output_dir: pathlib.Path) -> pathlib.Path:
     for path in sorted(output_dir.glob("*.ota")):
         blob = path.read_bytes()
         parsed = parse_container(blob)
-        if parsed["manufacturer_code"] != MANUFACTURER_CODE:
+        if parsed["manufacturer_code"] not in (MANUFACTURER_CODE, LEGACY_MANUFACTURER_CODE):
             raise SystemExit(
                 f"{path} uses unknown manufacturer 0x"
                 f"{parsed['manufacturer_code']:04X}"
@@ -469,6 +474,12 @@ def main() -> int:
     parser.add_argument(
         "--toolchain", default="nightly", help="cargo toolchain (default: nightly)"
     )
+    parser.add_argument(
+        "--legacy-manufacturer", action="store_true",
+        help=f"stamp 0x{LEGACY_MANUFACTURER_CODE:04X} into the OTA header: the transition "
+             "image for devices still running firmware from before "
+             f"0x{MANUFACTURER_CODE:04X}",
+    )
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
         "--elf", help="use an existing ELF instead of building one (skips cargo)"
@@ -497,7 +508,10 @@ def main() -> int:
         else build_elf(version, example_dir, args.toolchain, features, config.bin_name)
     )
 
+    manufacturer = LEGACY_MANUFACTURER_CODE if args.legacy_manufacturer else MANUFACTURER_CODE
     signed = "-signed" if args.sign_key else ""
+    if args.legacy_manufacturer:
+        signed += f"-mfr{manufacturer:04x}"
     base = output_dir / f"{config.binary}-v{version}{signed}"
     app_bin = base.with_suffix(".app.bin")
     ota_file = base.with_suffix(".ota")
@@ -515,9 +529,9 @@ def main() -> int:
         except ToolError as error:
             raise SystemExit(str(error)) from error
 
-    container = build_container(payload, version, config)
+    container = build_container(payload, version, config, manufacturer)
     ota_file.write_bytes(container)
-    verify_container(ota_file.read_bytes(), payload, version, config)
+    verify_container(ota_file.read_bytes(), payload, version, config, manufacturer)
 
     index = write_index(output_dir)
 
@@ -527,7 +541,7 @@ def main() -> int:
         print(f"signed envelope   : {base.with_suffix('.signed.bin')} "
               f"({len(payload)} bytes, version {envelope_version(version)})")
     print(f"OTA container     : {ota_file} ({len(container)} bytes)")
-    print(f"  manufacturer    : 0x{MANUFACTURER_CODE:04X}")
+    print(f"  manufacturer    : 0x{manufacturer:04X}")
     print(f"  image type      : 0x{config.image_type:04X}")
     print(f"  file version    : {version} (0x{version:08X})")
     print(f"  hardware        : {HARDWARE_VERSION}..{HARDWARE_VERSION}")

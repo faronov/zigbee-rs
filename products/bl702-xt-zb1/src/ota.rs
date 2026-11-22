@@ -51,9 +51,12 @@ use crate::profile::{SensorProfile, sensor_profile};
 use crate::storage::OtaFlash;
 use crate::{ENDPOINT, VERSION};
 
-/// zigbee-rs development manufacturer code (also used by the ESP32 devkit
-/// and flower products). Not a Zigbee Alliance assignment.
-pub const MANUFACTURER_CODE: u16 = 0x1234;
+/// zigbee-rs manufacturer code (D8 of the zigbee-rs hub; not a CSA
+/// assignment). Firmware before it used the placeholder `0x1234`: those
+/// devices take only OTA files whose header carries `0x1234`, so the first
+/// update to this firmware is packaged with `0x1234` (see the OTA tools'
+/// legacy-manufacturer option).
+pub const MANUFACTURER_CODE: u16 = 0x6D6B;
 /// XT-ZB1 sensor image type. Distinct from the other zigbee-rs products
 /// (EFR32 TRADFRI `0x0002`, ESP32 `0x0001`/`0x0002`, flower
 /// `0x2340`..`0x2342`).
@@ -519,7 +522,7 @@ mod tests {
     #[test]
     fn identity_and_config() {
         let config = ota_config();
-        assert_eq!(config.manufacturer_code, 0x1234);
+        assert_eq!(config.manufacturer_code, 0x6D6B);
         assert_eq!(config.image_type, 0x0702);
         assert_eq!(config.current_version, FILE_VERSION);
         assert_eq!(config.endpoint, ENDPOINT);

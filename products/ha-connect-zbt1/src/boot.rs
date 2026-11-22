@@ -75,9 +75,12 @@ const fn reserves(start: u32, end: u32) -> bool {
     false
 }
 
-/// zigbee-rs development manufacturer code (as the other zigbee-rs
-/// products). Not a Zigbee Alliance assignment.
-pub const MANUFACTURER_CODE: u16 = 0x1234;
+/// zigbee-rs manufacturer code (D8 of the zigbee-rs hub; not a CSA
+/// assignment). Firmware before it used the placeholder `0x1234`: those
+/// devices take only OTA files whose header carries `0x1234`, so the first
+/// update to this firmware is packaged with `0x1234` (see the OTA tools'
+/// legacy-manufacturer option).
+pub const MANUFACTURER_CODE: u16 = 0x6D6B;
 /// ZBT-1 router image type. Distinct from the other zigbee-rs products
 /// (EFR32 TRADFRI `0x0002`, ESP32 `0x0001`/`0x0002`, BL702 `0x0702`,
 /// flower `0x2340`..`0x2342`, EFR32MG22 `0x0022`).
@@ -335,7 +338,7 @@ mod tests {
     #[test]
     fn file_version_and_identity() {
         assert_eq!(file_version(0, 2, 1), 0x2500_0201);
-        assert_eq!(OTA_IDENTITY[0], 0x2101_1234);
+        assert_eq!(OTA_IDENTITY[0], 0x2101_6D6B);
         assert_eq!(OTA_IDENTITY[1] >> 24, 0x25);
         assert_eq!(OTA_IDENTITY[1], FILE_VERSION);
     }

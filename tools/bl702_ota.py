@@ -70,7 +70,10 @@ MAX_IMAGE_LEN = SLOT_SIZE - SECTOR_SIZE  # the last sector holds the trailer
 APP_XIP_START = XIP_BASE + PRIMARY_SLOT + IMAGE_HEADER_SIZE - LOADER_START
 
 # products/bl702-xt-zb1/src/ota.rs
-MANUFACTURER = 0x1234
+MANUFACTURER = 0x6D6B
+# The placeholder code of firmware before 0x6D6B: devices still running it
+# accept only OTA files whose header carries it (`release --legacy-manufacturer`).
+LEGACY_MANUFACTURER = 0x1234
 IMAGE_TYPE = 0x0702
 FILE_VERSION_PREFIX = 0x25
 VERSION_SYMBOL = "BL702_OTA_FILE_VERSION"
@@ -315,10 +318,11 @@ class OtaHeader:
                    control)
 
 
-def ota_file(image: bytes, version: int, header_string: bytes = b"") -> bytes:
+def ota_file(image: bytes, version: int, header_string: bytes = b"",
+             manufacturer: int = MANUFACTURER) -> bytes:
     """A file with a single Upgrade Image (tag 0) element holding `image`."""
     element = struct.pack("<HI", OTA_TAG_UPGRADE_IMAGE, len(image)) + image
-    header = OtaHeader(MANUFACTURER, IMAGE_TYPE, version, OTA_HEADER_LEN + len(element),
+    header = OtaHeader(manufacturer, IMAGE_TYPE, version, OTA_HEADER_LEN + len(element),
                        header_string)
     return header.encode() + element
 
@@ -419,7 +423,8 @@ def check(data: bytes) -> str:
     """Validate a .zigbee file; returns a one-line summary."""
     header, image = parse_ota_file(data)
     mcuboot = check_signed(image)
-    if (header.manufacturer, header.image_type) != (MANUFACTURER, IMAGE_TYPE):
+    if (header.manufacturer not in (MANUFACTURER, LEGACY_MANUFACTURER)
+            or header.image_type != IMAGE_TYPE):
         raise ToolError(
             f"identity 0x{header.manufacturer:04X}/0x{header.image_type:04X} is not "
             f"the XT-ZB1's 0x{MANUFACTURER:04X}/0x{IMAGE_TYPE:04X}"
@@ -591,8 +596,9 @@ def cmd_release(args: argparse.Namespace) -> None:
             raise ToolError("application binary does not fit the slot")
         signed = imgtool_sign(imgtool, key, version, payload, out / f"{stem}-signed.bin")
 
-    ota_name = f"{MANUFACTURER:04X}-{IMAGE_TYPE:04X}-{fversion:08X}-{stem}.zigbee"
-    data = ota_file(signed, fversion, f"{PRODUCT} {version}".encode())
+    manufacturer = LEGACY_MANUFACTURER if args.legacy_manufacturer else MANUFACTURER
+    ota_name = f"{manufacturer:04X}-{IMAGE_TYPE:04X}-{fversion:08X}-{stem}.zigbee"
+    data = ota_file(signed, fversion, f"{PRODUCT} {version}".encode(), manufacturer)
     (out / ota_name).write_bytes(data)
     print(f"{ota_name}: {check(data)}")
 
@@ -644,6 +650,10 @@ def main(argv: list[str] | None = None) -> None:
     release.add_argument("--imgtool")
     release.add_argument("--objcopy")
     release.add_argument("--out", default="dist")
+    release.add_argument("--legacy-manufacturer", action="store_true",
+                         help=f"stamp 0x{LEGACY_MANUFACTURER:04X} into the OTA header: the "
+                         "transition file for devices still running firmware from before "
+                         f"0x{MANUFACTURER:04X}")
     release.set_defaults(func=cmd_release)
 
     checker = sub.add_parser("check", help="validate .zigbee files")

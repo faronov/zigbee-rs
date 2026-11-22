@@ -39,9 +39,12 @@ use crate::boot_layout::{
 use crate::profile::{SensorProfile, sensor_profile};
 use crate::{ENDPOINT, VERSION};
 
-/// zigbee-rs development manufacturer code (also used by the ESP32, BL702
-/// and flower products). Not a Zigbee Alliance assignment.
-pub const MANUFACTURER_CODE: u16 = 0x1234;
+/// zigbee-rs manufacturer code (D8 of the zigbee-rs hub; not a CSA
+/// assignment). Firmware before it used the placeholder `0x1234`: those
+/// devices take only OTA files whose header carries `0x1234`, so the first
+/// update to this firmware is packaged with `0x1234` (see the OTA tools'
+/// legacy-manufacturer option).
+pub const MANUFACTURER_CODE: u16 = 0x6D6B;
 /// BRD4183A EFR32MG22 sensor image type. Distinct from the other zigbee-rs
 /// products (EFR32 TRADFRI `0x0002`, ESP32 `0x0001`/`0x0002`, BL702
 /// `0x0702`, flower `0x2340`..`0x2342`).
@@ -361,12 +364,12 @@ mod tests {
     #[test]
     fn identity_config_and_client_policy() {
         let config = ota_config();
-        assert_eq!(config.manufacturer_code, 0x1234);
+        assert_eq!(config.manufacturer_code, 0x6D6B);
         assert_eq!(config.image_type, 0x0022);
         assert_eq!(config.current_version, FILE_VERSION);
         assert_eq!(config.endpoint, ENDPOINT);
         assert!(!config.auto_accept);
-        assert_eq!(OTA_IDENTITY, [0x0022_1234, FILE_VERSION]);
+        assert_eq!(OTA_IDENTITY, [0x0022_6D6B, FILE_VERSION]);
         assert_eq!(CLIENT_POLICY.server, (0x0000, 1));
         assert_eq!(CLIENT_POLICY.endpoint, ENDPOINT);
         fn reset() -> ! {

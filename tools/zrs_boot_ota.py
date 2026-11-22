@@ -265,23 +265,31 @@ def check_image(image: bytes, layout: Layout, identity: Identity | None = None) 
            f"(slot margin {layout.max_image_len - mcuboot.end} B)"
 
 
-def ota_file(image: bytes, identity: Identity, header_string: bytes = b"") -> bytes:
-    """A file with a single Upgrade Image (tag 0) element holding `image`."""
+def ota_file(image: bytes, identity: Identity, header_string: bytes = b"",
+             header_manufacturer: int | None = None) -> bytes:
+    """A file with a single Upgrade Image (tag 0) element holding `image`.
+    `header_manufacturer` replaces the application's manufacturer code in
+    the OTA header (see `release --header-manufacturer`)."""
     element = OTA_TAG_UPGRADE_IMAGE.to_bytes(2, "little") + len(image).to_bytes(4, "little")
     element += image
-    header = OtaHeader(identity.manufacturer, identity.image_type, identity.file_version,
+    manufacturer = identity.manufacturer if header_manufacturer is None else header_manufacturer
+    header = OtaHeader(manufacturer, identity.image_type, identity.file_version,
                        OTA_HEADER_LEN + len(element), header_string)
     return header.encode() + element
 
 
-def check(data: bytes, layout: Layout, identity: Identity | None = None) -> str:
-    """Validate a .zigbee file; returns a one-line summary."""
+def check(data: bytes, layout: Layout, identity: Identity | None = None,
+          header_manufacturer: int | None = None) -> str:
+    """Validate a .zigbee file; returns a one-line summary.
+    `header_manufacturer`: the code the header must carry instead of the
+    application's (a transition file)."""
     header, image = parse_ota_file(data)
-    if identity is not None and (header.manufacturer, header.image_type) != (
-            identity.manufacturer, identity.image_type):
-        raise ToolError(
-            f"identity 0x{header.manufacturer:04X}/0x{header.image_type:04X} is not the "
-            f"application's 0x{identity.manufacturer:04X}/0x{identity.image_type:04X}")
+    if identity is not None:
+        expected = identity.manufacturer if header_manufacturer is None else header_manufacturer
+        if (header.manufacturer, header.image_type) != (expected, identity.image_type):
+            raise ToolError(
+                f"identity 0x{header.manufacturer:04X}/0x{header.image_type:04X} is not the "
+                f"application's 0x{expected:04X}/0x{identity.image_type:04X}")
     if identity is not None and header.file_version != identity.file_version:
         raise ToolError(f"file version 0x{header.file_version:08X} != the application's "
                         f"0x{identity.file_version:08X}")
@@ -365,17 +373,20 @@ def cmd_release(args: argparse.Namespace) -> None:
         signed = imgtool_sign(imgtool, key, layout, f"{version}+0", payload, signed_path)
     imgtool_verify(imgtool, key, signed_path)
     check_image(signed, layout, identity)
-    zigbee = ota_file(signed, identity, header_string)
+    mfr = args.header_manufacturer
+    zigbee = ota_file(signed, identity, header_string, mfr)
+    if mfr is not None:
+        stem += f"-mfr{mfr:04x}"
     zigbee_path = out / f"{stem}.zigbee"
     zigbee_path.write_bytes(zigbee)
-    print(f"{signed_path}\n{zigbee_path}: {check(zigbee, layout, identity)}")
+    print(f"{signed_path}\n{zigbee_path}: {check(zigbee, layout, identity, mfr)}")
 
 
 def cmd_check(args: argparse.Namespace) -> None:
     layout = Layout.load(Path(args.layout))
     identity = elf_identity(Elf(Path(args.elf).read_bytes())) if args.elf else None
     for path in args.files:
-        print(f"{path}: {check(Path(path).read_bytes(), layout, identity)}")
+        print(f"{path}: {check(Path(path).read_bytes(), layout, identity, args.header_manufacturer)}")
 
 
 def cmd_index(args: argparse.Namespace) -> None:
@@ -400,11 +411,18 @@ def main(argv: list[str] | None = None) -> None:
     release.add_argument("--label", help="extra file name tag, e.g. test")
     release.add_argument("--imgtool")
     release.add_argument("--objcopy")
+    release.add_argument("--header-manufacturer", type=lambda v: int(v, 0), metavar="CODE",
+                         help="manufacturer code for the OTA header instead of the "
+                              "application's: the transition file for devices whose "
+                              "installed firmware advertises another code (0x1234 before "
+                              "0x6D6B)")
     release.set_defaults(func=cmd_release)
 
     check_cmd = sub.add_parser("check", help="validate OTA files")
     check_cmd.add_argument("--layout", required=True)
     check_cmd.add_argument("--elf", help="compare with this application's identity")
+    check_cmd.add_argument("--header-manufacturer", type=lambda v: int(v, 0), metavar="CODE",
+                           help="the header carries this code (a transition file)")
     check_cmd.add_argument("files", nargs="+")
     check_cmd.set_defaults(func=cmd_check)
 
