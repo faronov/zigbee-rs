@@ -112,9 +112,12 @@ pub const PROFILE_ZLL: u16 = 0xC05E;
 /// Wildcard profile — matches any profile
 pub const PROFILE_WILDCARD: u16 = 0xFFFF;
 
-// ── APS Status Codes (Zigbee spec Table 2-27) ──────────────────
+// ── APS Status Codes (Zigbee spec R22 Table 2-27) ──────────────
 
-/// APS layer status codes.
+/// APS layer status codes: the values of Zigbee R22 Table 2-27, plus the
+/// NLDE-DATA.confirm route statuses that an APSDE-DATA.confirm passes
+/// through (R22 2.2.4.1.2: "any status value returned from the
+/// NLDE-DATA.confirm primitive").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ApsStatus {
@@ -123,9 +126,10 @@ pub enum ApsStatus {
     /// A transmit request failed since the ASDU is too large and fragmentation
     /// is not supported
     AsduTooLong = 0xA0,
-    /// A received fragmented frame could not be defragmented
+    /// A received fragmented frame could not be defragmented at the current
+    /// time
     DefragDeferred = 0xA1,
-    /// A received fragmented frame could not be defragmented because the device
+    /// A received fragmented frame could not be defragmented since the device
     /// does not support fragmentation
     DefragUnsupported = 0xA2,
     /// A parameter value was out of range
@@ -133,34 +137,45 @@ pub enum ApsStatus {
     /// An APSME-UNBIND.request failed because the requested binding table
     /// entry was not found
     InvalidBinding = 0xA4,
-    /// An APSME-GET/SET request was issued with an unknown attribute identifier
-    InvalidParameter = 0xA5,
+    /// An APSME-REMOVE-GROUP.request was issued with a group identifier that
+    /// does not appear in the group table
+    InvalidGroup = 0xA5,
+    /// A parameter value was invalid or out of range
+    InvalidParameter = 0xA6,
     /// An APSDE-DATA.request requesting acknowledged transmission failed due
     /// to no acknowledgement being received
-    NoAck = 0xA6,
+    NoAck = 0xA7,
     /// An APSDE-DATA.request with a destination addressing mode set to 0x00
     /// failed due to there being no devices bound to this device
-    NoBoundDevice = 0xA7,
+    NoBoundDevice = 0xA8,
     /// An APSDE-DATA.request with a destination addressing mode set to 0x03
-    /// failed because no matching group table entry could be found
-    NoShortAddress = 0xA8,
-    /// An APSME-BIND.request or APSME-ADD-GROUP.request issued when the
-    /// binding/group table is full
-    TableFull = 0xA9,
-    /// An ASDU was received that was secured using a link key but a link key
-    /// was not found in the key table
-    UnsecuredKey = 0xAA,
-    /// An APSME-GET.request or APSME-SET.request has been issued with an
-    /// unsupported attribute identifier
-    UnsupportedAttribute = 0xAB,
-    /// An unsecured frame was received
+    /// failed due to no corresponding short (16-bit) address found in the
+    /// address map table
+    NoShortAddress = 0xA9,
+    /// An APSDE-DATA.request with a destination addressing mode set to 0x00
+    /// failed due to a binding table not being supported on the device
+    NotSupported = 0xAA,
+    /// An ASDU was received that was secured using a link key
+    SecuredLinkKey = 0xAB,
+    /// An ASDU was received that was secured using a network key
+    SecuredNwkKey = 0xAC,
+    /// An APSDE-DATA.request requesting security has resulted in an error
+    /// during the corresponding security processing
     SecurityFail = 0xAD,
-    /// Decryption or authentication of the APS frame failed
-    DecryptionError = 0xAE,
-    /// Not enough buffers for the requested operation
-    InsufficientSpace = 0xAF,
-    /// No matching entry in binding table
-    NotFound = 0xB0,
+    /// An APSME-BIND.request or APSME-ADD-GROUP.request issued when the
+    /// binding or group tables, respectively, were full
+    TableFull = 0xAE,
+    /// An ASDU was received without any security
+    Unsecured = 0xAF,
+    /// An APSME-GET.request or APSME-SET.request has been issued with an
+    /// unknown attribute identifier
+    UnsupportedAttribute = 0xB0,
+    /// NLDE-DATA.confirm pass-through: route discovery for the destination
+    /// failed (NWK `ROUTE_DISCOVERY_FAILED`)
+    RouteDiscoveryFailed = 0xD0,
+    /// NLDE-DATA.confirm pass-through: the frame could not be routed (NWK
+    /// `ROUTE_ERROR`)
+    RouteError = 0xD1,
 }
 
 // ── APS address modes ───────────────────────────────────────────

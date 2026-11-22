@@ -300,10 +300,9 @@ where
 /// The APS layer tracks fewer (8 on a router build) and evicts the oldest,
 /// which then resolves as `NO_ACK`.
 pub const MAX_PENDING_ACKS: usize = 16;
-/// R22 Table 2-27 `NO_ACK` and `TABLE_FULL` (`zigbee_aps::ApsStatus` does
-/// not use the R22 numbering for these).
-const APS_NO_ACK: u8 = 0xA7;
-const APS_TABLE_FULL: u8 = 0xAE;
+/// R22 Table 2-27 `NO_ACK` and `TABLE_FULL`.
+const APS_NO_ACK: u8 = ApsStatus::NoAck as u8;
+const APS_TABLE_FULL: u8 = ApsStatus::TableFull as u8;
 
 /// One acknowledged send awaiting its APS ACK (12 bytes; the NCP keeps
 /// [`MAX_PENDING_ACKS`] in RAM).

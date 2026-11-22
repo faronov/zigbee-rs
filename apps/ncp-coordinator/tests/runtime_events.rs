@@ -9,8 +9,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use ncp_coordinator_app::port::{
-    CoordinatorPort, DataConfirm, DataRequest, Destination, DeviceEvent, FormParams, joined,
-    key_source, left,
+    CoordinatorPort, DataConfirm, DataRequest, Destination, DeviceEvent, FormParams, OpError,
+    joined, key_source, left,
 };
 use ncp_coordinator_app::tc::{TcApp, TcPort};
 use ncp_coordinator_app::transport::{HostTransport, TransportInfo};
@@ -537,6 +537,40 @@ fn ack_request_confirms_wait_for_the_aps_ack_outcome() {
     pollster::block_on(port.leave_reset()).unwrap();
     let done = port.take_data_confirm().expect("reset outcome");
     assert_eq!((done.req_tid, done.confirm.zb_status), (4, 0xA7));
+}
+
+/// `zb_status` uses the R22 values: APS Table 2-27 for APS outcomes, and the
+/// NLDE-DATA.confirm status for a route failure (R22 2.2.4.1.2).
+#[test]
+fn data_confirm_statuses_follow_r22() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    formed_port!(port);
+    let request = |req_tid, dst| DataRequest {
+        req_tid,
+        dst,
+        dst_ep: 1,
+        src_ep: 1,
+        profile: PROFILE_HOME_AUTOMATION,
+        cluster: 0x0006,
+        tx_options: 0,
+        radius: 0,
+        asdu: heapless::Vec::from_slice(&[0x01, 0x07, 0x02]).unwrap(),
+    };
+    let zb_status = |result| match result {
+        Ok(confirm) => confirm,
+        Err(OpError::Zigbee(status)) => status,
+        Err(other) => panic!("not a Zigbee outcome: {other:?}"),
+    };
+
+    // An IEEE destination missing from the address map: NO_SHORT_ADDRESS.
+    let unknown_ieee = pollster::block_on(port.send(&request(1, Destination::Ieee([0xC3; 8]))))
+        .map(|confirm| confirm.zb_status);
+    assert_eq!(zb_status(unknown_ieee), 0xA9);
+
+    // A unicast nobody routes: NWK ROUTE_DISCOVERY_FAILED, passed through.
+    let unroutable = pollster::block_on(port.send(&request(2, Destination::Nwk(0x7777))))
+        .map(|confirm| confirm.zb_status);
+    assert_eq!(zb_status(unroutable), 0xD0);
 }
 
 /// Spec 7.3 `tx_options` bit5 / sleepy children: a read sent right after a

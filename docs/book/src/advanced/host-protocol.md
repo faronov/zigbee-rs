@@ -1032,7 +1032,11 @@ within an endpoint.
 
 Zigbee MAC/NWK/APS/ZDO outcomes are carried separately as `zb_status`
 (`u8`), using the raw Zigbee status values (for example `0x00` SUCCESS,
-`0xA7` APS NO_ACK, `0xE9` MAC NO_ACK, `0xD0` NWK ROUTE_ERROR).
+`0xA7` APS NO_ACK, `0xE9` MAC NO_ACK, `0xD0` NWK ROUTE_DISCOVERY_FAILED,
+`0xD1` NWK ROUTE_ERROR). APS values are those of R22 Table 2-27 (`0xA5`
+INVALID_GROUP, `0xA6` INVALID_PARAMETER, `0xA7` NO_ACK, `0xA8`
+NO_BOUND_DEVICE, `0xA9` NO_SHORT_ADDRESS, `0xAD` SECURITY_FAIL, `0xAE`
+TABLE_FULL); 7.3 lists what an APS data confirm reports.
 
 ### 6.5 Retry and idempotency
 
@@ -1265,7 +1269,25 @@ an APS queue with a bounded in-flight count and confirm events is N).
 `EVT_APS_DATA_CONFIRM` (`0x0281`): `u16 req_tid, u8 status, u8 zb_status,
 u8 aps_counter, u16 dst_nwk, u8 flags (bit0 APS ACK received, bit1 via source
 route, bit2 route discovery done), u16 elapsed_ms`. `status` is `SUCCESS` or
-`FAILURE`. `zb_status` carries the Zigbee reason.
+`FAILURE`. `zb_status` carries the Zigbee reason, as the APSDE-DATA.confirm
+status (R22 2.2.4.1.2):
+
+| `zb_status` | Meaning |
+|---|---|
+| `0x00` SUCCESS | Transmitted (and, with `tx_options` bit0, acknowledged) |
+| `0xA0` ASDU_TOO_LONG | Payload too long for the destination mode or fragmentation |
+| `0xA7` NO_ACK | No APS ACK after the retries, the ACK tracking was evicted or the network was reset; also a transmission failure without a more specific status |
+| `0xA8` NO_BOUND_DEVICE | Indirect (binding) addressing without a matching binding |
+| `0xA9` NO_SHORT_ADDRESS | IEEE destination missing from the address map |
+| `0xAD` SECURITY_FAIL | APS security requested without a usable link key |
+| `0xAE` TABLE_FULL | No free slot (pending ACKs, the fragmented-transmission slot) |
+| `0xD0` ROUTE_DISCOVERY_FAILED | NWK pass-through: no route to the destination was found |
+| `0xD1` ROUTE_ERROR | NWK pass-through: the next hop did not take the frame |
+
+Firmware before the R22 alignment (zigbee-rs master before the
+`aps-status-codes` merge) reported `0xA6` for NO_ACK on some paths and `0xA8`
+for a route failure; hosts should treat any non-zero `zb_status` as not
+delivered.
 
 For a unicast with `tx_options` bit0 the confirm waits for the APS ACK: it
 follows once the ACK arrives (`SUCCESS`, flags bit0) or once the APS retries

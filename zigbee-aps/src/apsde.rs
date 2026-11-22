@@ -3864,12 +3864,15 @@ impl<M: MacDriver> ApsLayer<M> {
     }
 }
 
-/// Convert NWK status to APS status.
+/// Convert an NLDE-DATA.confirm failure to the APSDE-DATA.confirm status.
+/// Route failures pass through with their NWK value (R22 2.2.4.1.2); the
+/// remaining transmission failures report APS `NO_ACK`.
 pub(crate) fn nwk_status_to_aps(nwk_err: NwkStatus) -> ApsStatus {
     match nwk_err {
         NwkStatus::FrameTooLong => ApsStatus::AsduTooLong,
         NwkStatus::InvalidRequest => ApsStatus::IllegalRequest,
-        NwkStatus::RouteError | NwkStatus::RouteDiscoveryFailed => ApsStatus::NoShortAddress,
+        NwkStatus::RouteDiscoveryFailed => ApsStatus::RouteDiscoveryFailed,
+        NwkStatus::RouteError => ApsStatus::RouteError,
         _ => ApsStatus::NoAck,
     }
 }
@@ -3879,6 +3882,55 @@ mod tests {
     use super::*;
     #[cfg(feature = "router")]
     use crate::frames::{FRAG_FIRST, FRAG_SUBSEQUENT};
+
+    /// The status values of Zigbee R22 Table 2-27, and the NWK route
+    /// statuses an APSDE-DATA.confirm passes through (R22 2.2.4.1.2).
+    #[test]
+    fn aps_status_values_follow_r22_table_2_27() {
+        let table = [
+            (ApsStatus::Success, 0x00),
+            (ApsStatus::AsduTooLong, 0xA0),
+            (ApsStatus::DefragDeferred, 0xA1),
+            (ApsStatus::DefragUnsupported, 0xA2),
+            (ApsStatus::IllegalRequest, 0xA3),
+            (ApsStatus::InvalidBinding, 0xA4),
+            (ApsStatus::InvalidGroup, 0xA5),
+            (ApsStatus::InvalidParameter, 0xA6),
+            (ApsStatus::NoAck, 0xA7),
+            (ApsStatus::NoBoundDevice, 0xA8),
+            (ApsStatus::NoShortAddress, 0xA9),
+            (ApsStatus::NotSupported, 0xAA),
+            (ApsStatus::SecuredLinkKey, 0xAB),
+            (ApsStatus::SecuredNwkKey, 0xAC),
+            (ApsStatus::SecurityFail, 0xAD),
+            (ApsStatus::TableFull, 0xAE),
+            (ApsStatus::Unsecured, 0xAF),
+            (ApsStatus::UnsupportedAttribute, 0xB0),
+            (
+                ApsStatus::RouteDiscoveryFailed,
+                NwkStatus::RouteDiscoveryFailed as u8,
+            ),
+            (ApsStatus::RouteError, NwkStatus::RouteError as u8),
+        ];
+        for (status, value) in table {
+            assert_eq!(status as u8, value, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn nlde_failures_map_to_aps_confirm_statuses() {
+        let cases = [
+            (NwkStatus::RouteDiscoveryFailed, 0xD0),
+            (NwkStatus::RouteError, 0xD1),
+            (NwkStatus::FrameTooLong, ApsStatus::AsduTooLong as u8),
+            (NwkStatus::InvalidRequest, ApsStatus::IllegalRequest as u8),
+            (NwkStatus::FrameNotBuffered, ApsStatus::NoAck as u8),
+        ];
+        for (nwk, aps) in cases {
+            assert_eq!(nwk_status_to_aps(nwk) as u8, aps, "{nwk:?}");
+        }
+    }
+
     #[cfg(feature = "router")]
     use core::future::Future;
     #[cfg(feature = "router")]

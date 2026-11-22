@@ -200,7 +200,8 @@ impl<M: MacDriver> ApsLayer<M> {
             return Err(ApsStatus::AsduTooLong);
         }
         if self.fragment_tx.is_some() {
-            return Err(ApsStatus::InsufficientSpace);
+            // The single fragmented-transmission slot is taken.
+            return Err(ApsStatus::TableFull);
         }
         let security = if req.tx_options.security_enabled {
             let dst_ieee = self.nwk.find_ieee_by_short(nwk_dst);
@@ -795,7 +796,7 @@ mod tests {
         block_on(aps.apsde_data_request(&req)).unwrap();
         assert_eq!(
             block_on(aps.apsde_data_request(&req)).err(),
-            Some(ApsStatus::InsufficientSpace)
+            Some(ApsStatus::TableFull)
         );
     }
 
