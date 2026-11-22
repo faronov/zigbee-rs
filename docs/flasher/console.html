@@ -57,17 +57,29 @@
 
   <section class="card">
     <h2>Which port</h2>
-    <p style="margin:0">After tbr-hub (or tbr-bridge) starts, the Thread Border Router board's S3 USB port (USB2) shows
-      <strong>two serial ports</strong> of the device "Thread BR H2 bridge" (manufacturer zigbee-rs-hub):</p>
+    <p style="margin:0">While tbr-hub (or tbr-bridge) runs, the Thread Border Router board's S3 USB port (USB2) shows
+      <strong>two serial ports</strong> of the device "Thread BR H2 bridge" (manufacturer zigbee-rs-hub, USB ID
+      303A:4002). <strong>The second one is the console.</strong> The port picker shows only Espressif devices
+      (tick <em>all ports</em> below to see others):</p>
     <ul style="margin:.4rem 0">
-      <li><strong>the second port is the console</strong>: macOS <code>cu.usbmodem…3</code>, Linux the higher
-        <code>/dev/ttyACM…</code>, Windows usually the higher <code>COM</code> number;</li>
-      <li>the first port is the bridge to the H2 (bridge mode) or the JSON API (hub mode): not a console.</li>
+      <li><strong>Windows:</strong> two entries "Thread BR H2 bridge (COMx)" or "USB Serial Device (COMx)"
+        ("Устройство с последовательным интерфейсом USB"); the console is usually the <em>higher</em> COM number.
+        "Communications Port (COM1)" / "Последовательный порт (COM1)" is the PC's own port: not the board.</li>
+      <li><strong>macOS:</strong> <code>cu.usbmodem…3</code> (console) and <code>cu.usbmodem…1</code>;
+        <strong>Linux:</strong> the higher <code>/dev/ttyACM…</code>.</li>
+      <li>The first port is the bridge to the H2 (bridge mode) or the JSON API (hub mode): not a console.</li>
+      <li><strong>"USB JTAG/serial debug unit"</strong> (303A:1001) is the S3's own USB-Serial-JTAG: the chip is in its
+        ROM loader or still booting (the ROM prints <code>ESP-ROM:esp32s3-…</code>), or the hub handed the USB port
+        over (<code>s3 usj</code>, a 1 200 bps touch, the flasher). A booting hub replaces it within seconds by its
+        two ports; then connect again and pick the second one.</li>
     </ul>
     <p class="muted" style="margin:0;font-size:.85rem">The page sends an empty line and waits for the console prompt
-      <code>&gt;</code>, so a wrong port is reported. It always opens at 115 200 baud: 1 200 baud on the console port
-      would hand the USB port back to USB-Serial-JTAG (the flasher uses that on purpose). Close other programs on the
-      port first. The ZRHP NCP DevKits speak the binary ZRHP protocol on their port: there is no text console there.</p>
+      <code>&gt;</code> (several tries over about ten seconds, so a booting board has time), and says which port it
+      got if there is none. It always opens at 115 200 baud: 1 200 baud on the console port would hand the USB port
+      back to USB-Serial-JTAG. It does not toggle DTR/RTS on the hub's ports; on a USB-Serial-JTAG port it releases
+      RTS first and then DTR, because RTS without DTR resets the chip there (opening such a port can still reset it on
+      some systems). Close other programs on the port first. The ZRHP NCP DevKits speak the binary ZRHP protocol on
+      their port: there is no text console there.</p>
   </section>
 
   <section class="card">
@@ -75,6 +87,7 @@
     <div class="row">
       <button class="primary" id="connect">Connect</button>
       <button id="disconnect" disabled>Disconnect</button>
+      <label class="muted" style="font-size:.85rem"><input type="checkbox" id="all-ports"> all ports</label>
       <span class="status" id="status">Not connected.</span>
     </div>
     <pre id="term"></pre>
@@ -88,6 +101,7 @@
       <button data-cmd="hub status" disabled>hub status</button>
       <button data-cmd="wifi" disabled>wifi</button>
       <button id="token" disabled>Read token</button>
+      <button id="hub-mode" disabled class="hidden">Switch to hub mode</button>
       <button id="reboot" class="danger" disabled>Reboot S3</button>
       <span style="flex:1"></span>
       <button id="clear">Clear</button>
@@ -124,6 +138,12 @@
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const BAUD = 115200;
+  const ESPRESSIF = 0x303a, USJ_PID = 0x1001, HUB_PID = 0x4002;
+  const kindOf = (p) => {
+    const i = p.getInfo();
+    if (i.usbVendorId !== ESPRESSIF) return 'other';
+    return i.usbProductId === USJ_PID ? 'usj' : i.usbProductId === HUB_PID ? 'hub' : 'espressif';
+  };
   const MAX_LINE = 119;  // the console keeps at most 119 characters per line
 
   if (!('serial' in navigator)) {
@@ -152,7 +172,7 @@
     $('connect').disabled = on || !('serial' in navigator);
     $('disconnect').disabled = !on;
     for (const el of [$('line'), $('send'), ...document.querySelectorAll('[data-cmd]')]) el.disabled = !on;
-    for (const el of [$('token'), $('reboot'), $('ssid'), $('password'), $('wifi-setup')]) el.disabled = !(on && isConsole);
+    for (const el of [$('token'), $('reboot'), $('hub-mode'), $('ssid'), $('password'), $('wifi-setup')]) el.disabled = !(on && isConsole);
   }
 
   // Terminal text: CR LF / lone CR as line breaks, the console's "\b \b" erases, no other control bytes.
@@ -200,6 +220,11 @@
 
   async function openPort(p) {
     await p.open({baudRate: BAUD});
+    // USB-Serial-JTAG resets the chip on RTS without DTR: release RTS first, then DTR. The hub's TinyUSB ports keep
+    // their lines untouched (the first port maps DTR/RTS to the H2's EN/BOOT in bridge mode).
+    if (kindOf(p) === 'usj') {
+      try { await p.setSignals({requestToSend: false}); await p.setSignals({dataTerminalReady: false}); } catch { /* unsupported */ }
+    }
     port = p;
     writer = port.writable.getWriter();
     reading = readLoop();
@@ -217,7 +242,9 @@
     enable();
     if (lost) {
       show('\n[port closed]\n');
-      setStatus(expectReboot ? 'The S3 is rebooting: waiting for its console…' : 'Disconnected (the device went away).', expectReboot ? '' : 'warn');
+      setStatus(expectReboot ? 'The S3 is rebooting: waiting for its console…' :
+        kindOf(p) === 'usj' ? 'The USB-Serial-JTAG port went away: the S3 has probably finished booting and started the hub\'s two "Thread BR H2 bridge" ports. Click Connect and pick the second one.' :
+        'Disconnected (the device went away).', expectReboot ? '' : 'warn');
     }
   }
 
@@ -252,30 +279,56 @@
     }
   }
 
-  // The console answers an empty line with its prompt; the bridge/API port does not.
-  async function probe() {
+  // The console answers an empty line with its prompt; the bridge/API port does not. A booting board gets several
+  // tries; `seen` collects what came back (e.g. the ROM's boot banner).
+  async function probe(tries = 1, onTry = () => {}) {
     let got = '';
     const waiter = (text) => { got += text; };
     waiters.push(waiter);
     try {
-      await write('\r');
-      for (let i = 0; i < 15 && !got.includes('> '); i++) await sleep(100);
+      for (let t = 0; t < tries && port && !got.includes('> '); t++) {
+        onTry(t, got);
+        await write('\r');
+        for (let i = 0; i < 15 && !got.includes('> '); i++) await sleep(100);
+      }
+    } catch {
+      // port gone
     } finally {
       waiters = waiters.filter((w) => w !== waiter);
     }
-    return got.includes('> ');
+    return {ok: got.includes('> '), seen: got};
   }
 
-  async function identify() {
-    isConsole = await probe();
+  async function readMode() {
+    const m = (await command('mode')).reply.match(/mode (Hub|Bridge)(?: \(once\))?, persisted (None|Some\((Hub|Bridge)\))/);
+    mode = m ? m[1] : null;
+    const persisted = m ? (m[3] || 'none (bridge by default)') : null;
+    // Offered whenever hub mode is not the persisted one (bridge, or `mode hub once`).
+    $('hub-mode').classList.toggle('hidden', !m || m[3] === 'Hub');
+    return {mode, persisted};
+  }
+
+  async function identify(tries = 7) {
+    const kind = port ? kindOf(port) : 'other';
+    const r = await probe(tries, (t, seen) => {
+      if (t) setStatus(/ESP-ROM|rst:0x|boot:0x/.test(seen) ? `The S3 is booting (ROM banner seen); waiting for the console… (${t + 1}/${tries})`
+        : `Waiting for the console prompt… (${t + 1}/${tries})`);
+    });
+    isConsole = r.ok;
+    if (!port) return false;
     if (!isConsole) {
-      setStatus('No console prompt on this port: it is probably the first port (bridge or JSON API). Disconnect and pick the other one.', 'warn');
+      const booting = /ESP-ROM|rst:0x|boot:0x/.test(r.seen);
+      setStatus(
+        kind === 'usj' ? (booting
+          ? 'This is the S3\'s USB-Serial-JTAG ("USB JTAG/serial debug unit") and the chip is booting or sits in its ROM loader. A booting hub switches to its two "Thread BR H2 bridge" ports within seconds: click Connect again and pick the second one. If nothing else appears, the chip is in the ROM loader: press RESET (without BOOT).'
+          : 'This is the S3\'s USB-Serial-JTAG ("USB JTAG/serial debug unit"), not the hub console: the hub handed the USB port over (s3 usj, a 1200 bps touch, the flasher) or the chip waits in its ROM loader. Press RESET (without BOOT), then connect to the second "Thread BR H2 bridge" port.')
+        : kind === 'hub' ? 'No console prompt: this is the hub\'s first port (H2 bridge or JSON API). Disconnect and pick the other "Thread BR H2 bridge" port (Windows: the other COM number, usually the higher one).'
+        : 'No console prompt on this port. On the Thread BR board pick the second "Thread BR H2 bridge" port; if the board was just booting, click Connect again.', 'warn');
       enable();
       return false;
     }
-    const m = (await command('mode')).reply.match(/mode (Hub|Bridge)/);
-    mode = m ? m[1] : null;
-    setStatus(`Connected to the hub console${mode ? ` (${mode.toLowerCase()} mode)` : ''}.`);
+    const {persisted} = await readMode();
+    setStatus(`Connected to the hub console${mode ? ` (${mode.toLowerCase()} mode, persisted: ${persisted})` : ''}.`);
     enable();
     return true;
   }
@@ -283,7 +336,7 @@
   async function connect() {
     let p;
     try {
-      p = await navigator.serial.requestPort();
+      p = await navigator.serial.requestPort($('all-ports').checked ? {} : {filters: [{usbVendorId: ESPRESSIF}]});
     } catch (e) {
       setStatus(`No port selected: ${e.message}`);
       return;
@@ -311,8 +364,8 @@
       for (const p of candidates) {
         try {
           await openPort(p);
-          if (await probe()) {
-            await identify();
+          if ((await probe(3)).ok) {
+            await identify(1);
             return true;
           }
           await closePort();
@@ -360,6 +413,19 @@
     $('wifi-result').innerHTML = `<div class="${cls}">${html}</div>`;
   }
 
+  // `mode hub` persists the mode and reboots the S3; its USB ports disappear and come back after the boot.
+  async function switchToHub() {
+    const info = port.getInfo();
+    expectReboot = true;
+    try {
+      await command('mode hub', {timeout: 3000}).catch(() => {});
+      await Promise.race([reading || Promise.resolve(), sleep(10000)]);
+      return port ? await identify(3) : await reconnect(info);
+    } finally {
+      expectReboot = false;
+    }
+  }
+
   async function readToken() {
     const {reply} = await command('token');
     const m = reply.match(/API token: (\S+)/);
@@ -379,16 +445,19 @@
       password = null;
       if (!/stored/.test(set.reply)) { result(`The hub did not store them: <code>${esc(set.reply || 'no reply')}</code>`, 'danger-box'); return; }
 
+      const {persisted} = await readMode();
       if (mode !== 'Hub') {
-        result('Switching to hub mode: the S3 reboots and this page reconnects (keep the cable in)…');
-        const info = port.getInfo();
-        expectReboot = true;
-        await command('mode hub', {timeout: 3000}).catch(() => {});
-        await Promise.race([reading || Promise.resolve(), sleep(10000)]);
-        const back = port ? await identify() : await reconnect(info);
-        expectReboot = false;
-        if (!back) {
-          result('The S3 rebooted, but the page could not reopen its console by itself. Click Connect, pick the second port and press <em>wifi</em>.', 'warn');
+        result(`The hub runs as the USB bridge (persisted mode: ${esc(persisted || 'unknown')}), which has no Wi-Fi.
+          Switching to hub mode with <code>mode hub</code>: the setting is kept, the S3 reboots, its USB ports disappear
+          for a few seconds and this page reopens the console (keep the cable in)…`);
+        if (!(await switchToHub())) {
+          result(`The credentials are stored and the S3 rebooted into hub mode, but the page could not reopen its console
+            by itself (the browser may ask again for the port after a reboot). Click <em>Connect</em>, pick the second
+            "Thread BR H2 bridge" port and press <em>wifi</em>: it shows the address once connected.`, 'warn');
+          return;
+        }
+        if (mode !== 'Hub') {
+          result('The S3 came back, but not in hub mode: run <code>mode</code> and <code>mode hub</code> in the terminal.', 'warn');
           return;
         }
       }
@@ -436,6 +505,10 @@
   $('token').addEventListener('click', async () => {
     const token = await readToken().catch(() => null);
     setStatus(token ? `API token: ${token}` : 'No API token yet (generated at the first hub boot).');
+  });
+  $('hub-mode').addEventListener('click', async () => {
+    if (!confirm('Switch to hub mode? The S3 stores the mode and reboots; the console comes back after the boot. (Wi-Fi needs credentials: use the form below.)')) return;
+    if (!(await switchToHub())) setStatus('The S3 rebooted; click Connect and pick the console port again.', 'warn');
   });
   $('reboot').addEventListener('click', async () => {
     if (!confirm('Reboot the S3? The console disconnects and comes back after the boot.')) return;

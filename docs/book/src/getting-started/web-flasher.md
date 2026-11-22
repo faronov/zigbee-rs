@@ -54,19 +54,34 @@ simulates a detection (installing stays blocked).
 terminal (Chrome or Edge, no other dependencies) for the hub's USB console:
 
 - **Port.** After tbr-hub starts, the S3's USB port shows two serial ports
-  ("Thread BR H2 bridge"); the console is the **second** one (macOS
-  `cu.usbmodem…3`, Linux the higher `ttyACM`, Windows usually the higher
-  `COM`). The page sends an empty line and expects the prompt `> `, so the
-  first port (H2 bridge or JSON API) is reported as the wrong one. It always
+  ("Thread BR H2 bridge", 303A:4002); the console is the **second** one
+  (Windows: "Thread BR H2 bridge" or "USB Serial Device" / "Устройство с
+  последовательным интерфейсом USB", usually the higher `COM`; macOS
+  `cu.usbmodem…3`; Linux the higher `ttyACM`). The picker lists only
+  Espressif devices unless *all ports* is ticked, which hides the PC's own
+  "Communications Port (COM1)". "USB JTAG/serial debug unit" (303A:1001) is
+  the S3's USB-Serial-JTAG: the chip is booting (ROM banner
+  `ESP-ROM:esp32s3-…`), waits in its ROM loader, or the hub handed the port
+  over; the page says so and asks to reconnect to the hub's second port once
+  it appears.
+- **Probe.** The page sends empty lines for about ten seconds and expects the
+  prompt `> `, so a booting board has time; without a prompt it names the
+  kind of port it got (hub's first port, USB-Serial-JTAG, other). It always
   opens at 115 200 baud: 1 200 baud on the console port is the touch that
-  hands the USB port to USB-Serial-JTAG. The NCP DevKits speak binary ZRHP
-  and have no text console.
+  hands the USB port to USB-Serial-JTAG. It never toggles DTR/RTS on the
+  hub's ports (the first one maps them to the H2's EN/BOOT in bridge mode);
+  on USB-Serial-JTAG it releases RTS first and then DTR, since RTS without
+  DTR resets the chip there (opening such a port may still reset it,
+  depending on the OS driver). The NCP DevKits speak binary ZRHP and have no
+  text console.
 - **Terminal:** input line with history (↑/↓, session only), quick buttons
   (`help`, `mode`, `hub status`, `wifi`, *Read token* = `token`, *Reboot S3*
   = `s3 reset`), clear, download of the log.
-- **Set up Wi-Fi:** sends `wifi set <ssid> <password>`; if the hub boots as
-  the bridge, `mode hub` (the S3 reboots and the page reopens the console by
-  itself); polls `wifi` until `up, ws://<ip>/api`; reads `token`; shows
+- **Set up Wi-Fi:** sends `wifi set <ssid> <password>`; reads `mode`
+  (e.g. `mode Bridge, persisted Some(Bridge)`) and, unless the hub runs in
+  hub mode, explains and sends `mode hub` (persisted; the S3 reboots and the
+  page reopens the console by itself, or asks to reconnect if the browser
+  needs the port picked again); *Switch to hub mode* does the same alone; polls `wifi` until `up, ws://<ip>/api`; reads `token`; shows
   `http://<ip>/#token=<token>`, which the hub's web UI takes over. The
   console takes printable ASCII only and splits on spaces, so SSIDs with
   spaces and passwords with leading, trailing or double spaces are refused.
