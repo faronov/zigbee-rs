@@ -3,7 +3,8 @@
 at 0x0800_6000 above the 24 KiB Gecko bootloader, nothing in the bootloader
 or the NV journals (0x0815_8000..0x0818_0000), the 76-IRQ xG24 vector table
 with the expected handlers, one 80-byte Gecko ApplicationProperties_t, and
-at least 32 KiB of linked stack in the 256 KiB SRAM; with --ncp also the
+at least 32 KiB of linked stack in the 256 KiB SRAM, nothing in the first
+SRAM word (the Gecko reset-cause record, src/fatal.rs); with --ncp also the
 48-byte ZRHP build record that tools/efr32-gbl fills.
 
 Adapted from examples/ha-connect-zbt1/tools/verify-layout.py."""
@@ -18,7 +19,9 @@ FLASH_END = 0x08158000
 # 0x08158000..0x08180000: identity, APS, GP, child, Trust Center and
 # security journals (products/efr32mg24/src/layout.rs).
 PERSISTENCE_END = 0x08180000
-RAM_START = 0x20000000
+SRAM_BASE = 0x20000000
+# 0x20000000..0x20000004: Gecko BootloaderResetCause_t, never image RAM.
+RAM_START = SRAM_BASE + 4
 RAM_END = 0x20040000
 MIN_STACK_BYTES = 32 * 1024
 # xG24: 76 external IRQs (EXT_IRQ_COUNT in GSDK efr32mg24*.h).
@@ -222,6 +225,11 @@ def main() -> None:
         if app_start <= start < app_end:
             if end > app_end:
                 fail(f"{section['name']} ends at 0x{end:08X}, above 0x{app_end:08X}")
+        elif SRAM_BASE <= start < RAM_START:
+            fail(
+                f"{section['name']} at 0x{start:08X} overlaps the Gecko "
+                f"reset-cause word 0x{SRAM_BASE:08X}..0x{RAM_START:08X}"
+            )
         elif RAM_START <= start < RAM_END:
             if end > RAM_END:
                 fail(f"{section['name']} exceeds RAM at 0x{end:08X}")
@@ -315,7 +323,8 @@ def main() -> None:
         "(identity 16K, APS 16K, GP 16K, child 16K, TC 64K, security 32K)"
     )
     print(
-        f"  BSS={bss_bytes} bytes RAM-static-end=0x{ram_static_end:08X} "
+        f"  reset-cause=0x{SRAM_BASE:08X}..0x{RAM_START:08X} "
+        f"BSS={bss_bytes} bytes RAM-static-end=0x{ram_static_end:08X} "
         f"stack={stack_bytes} bytes"
     )
     print(

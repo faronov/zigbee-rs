@@ -10,9 +10,13 @@
 //! the host has started it (`NWK_INIT`/`NWK_FORM`).
 //!
 //! The UART carries only ZRHP: logs go to the ZRHP LOG endpoint. A panic
-//! or a fault resets the chip. Firmware updates go through the resident
-//! Gecko bootloader: `SYS_RESET` mode 1 reboots into it (GBL over XMODEM
-//! at 115 200); `FW_*` is not built in.
+//! or a fault resets the chip. A poisoned Secure Engine (the TRNG, the
+//! NCP's only entropy source) is a product fatal fault: it is logged, the
+//! host gets a bounded window to read it, and the reset records it so the
+//! next `EVT_NCP_READY` reports `reset_reason` 6 (`product::fatal`).
+//! Firmware updates go through the resident Gecko bootloader: `SYS_RESET`
+//! mode 1 reboots into it (GBL over XMODEM at 115 200); `FW_*` is not
+//! built in.
 //!
 //! Status: builds and links. The xG24 radio tables are not captured yet,
 //! so the radio init fails and the image halts before the NCP starts (see
@@ -25,7 +29,7 @@
 #![recursion_limit = "256"]
 
 use efr32mg24_product as product;
-use efr32s2_hal::reset::{ResetCause, take_reset_cause};
+use efr32s2_hal::reset::take_reset_cause;
 use embassy_executor::Spawner;
 use embassy_time::{Instant, Timer};
 use ncp_coordinator_app::log_ring::level_code;
@@ -33,6 +37,7 @@ use ncp_coordinator_app::platform::NoPlatform;
 use ncp_coordinator_app::tc::TcPort;
 use ncp_coordinator_app::{LogRing, Ncp, NcpIdentity, PlatformRequest};
 use product::board::resources::BoardResources;
+use product::fatal::Fatal;
 use product::stores::{self, Opened};
 use product::transport::Host;
 use router_app::{
@@ -82,6 +87,8 @@ static BUILD_INFO: product::gecko::BuildInfo =
 
 const LOG_RECORDS: usize = 16;
 static LOG: LogRing<LOG_RECORDS> = LogRing::new();
+/// How long a fatal fault is served to the host before the reset.
+const FATAL_REPORT_MS: u64 = 100;
 
 struct RingLogger;
 
@@ -122,21 +129,6 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
     efr32s2_hal::reset::system_reset()
-}
-
-/// `EVT_NCP_READY.reset_reason` (spec 7.1). The RESET pin is driven by the
-/// host (Dongle-M ESP32 GPIO15, dev-board ESP32-S3 or J-Link): a host
-/// request.
-fn reset_reason(cause: ResetCause) -> u8 {
-    match cause {
-        ResetCause::PowerOn => 1,
-        ResetCause::Software => 2,
-        ResetCause::Watchdog => 3,
-        ResetCause::BrownOut => 4,
-        ResetCause::Lockup => 5,
-        ResetCause::Em4Wakeup | ResetCause::Unknown => 6,
-        ResetCause::Pin => 7,
-    }
 }
 
 /// Resources after clocks and time are running.
@@ -185,14 +177,19 @@ async fn main(_spawner: Spawner) {
     let _ =
         unsafe { core::ptr::read_volatile(&product::gecko::APPLICATION_PROPERTIES.struct_version) };
     let (cause, _raw) = take_reset_cause();
+    let previous = product::fatal::take_previous(cause);
     let Started { host, radio, flash } = start();
     static HOST: StaticCell<Host> = StaticCell::new();
     let host = HOST.init(host);
+    if let Some(fatal) = previous {
+        log::error!("previous reset: fatal {:?}", fatal);
+    }
 
     let ieee_factory = efr32s2_hal::devinfo::eui64();
-    // Session cookie: no TRNG driver yet (SE mailbox), so it mixes the
-    // EUI-64 with the HFXO/LFRCO start-up timing. It only has to differ
-    // between boots of this NCP (spec 5.3), not be secret.
+    // Session cookie: not from the SE TRNG (unproven on hardware, and a
+    // boot-time failure would leave the NCP without a session), so it
+    // mixes the EUI-64 with the HFXO/LFRCO start-up timing. It only has to
+    // differ between boots of this NCP (spec 5.3), not be secret.
     let cookie = {
         let low = u32::from_le_bytes([
             ieee_factory[0],
@@ -217,7 +214,7 @@ async fn main(_spawner: Spawner) {
         flash_size: product::layout::FLASH_SIZE,
         board: product::BOARD_NAME,
         product: product::PRODUCT_NAME,
-        reset_reason: reset_reason(cause),
+        reset_reason: product::fatal::zrhp_reset_reason(cause, previous),
         key_export: true,
         max_children: zigbee_runtime::child_store::MAX_PERSISTED_CHILDREN as u32,
         max_tc_devices: zigbee_bdb::trust_center::MAX_TRUST_CENTER_DEVICES as u32,
@@ -345,6 +342,12 @@ fn new_ncp(
 async fn run(ncp: &mut Ncp<LOG_RECORDS>, host: &mut Host, port: &mut Port) -> ! {
     let mut platform = NoPlatform;
     loop {
+        // After every stack step: a poisoned Secure Engine never recovers
+        // without a reset, and the NCP cannot form or key a network
+        // without it.
+        if let Err(fatal) = product::fatal::check_platform() {
+            fatal_reset(ncp, host, port, fatal)
+        }
         if let Some(PlatformRequest::Reset { mode }) =
             ncp.service_with(now_us(), host, port, &mut platform, &LOG)
         {
@@ -378,4 +381,20 @@ async fn run(ncp: &mut Ncp<LOG_RECORDS>, host: &mut Host, port: &mut Port) -> ! 
             Timer::after_micros(until.clamp(100, 1_000)).await;
         }
     }
+}
+
+/// Report `fatal` on the LOG endpoint, serve the host link for a bounded
+/// window so a connected host can read it, then record it and reset.
+/// Requests that arrive in the window die with the reset.
+#[inline(never)]
+fn fatal_reset(ncp: &mut Ncp<LOG_RECORDS>, host: &mut Host, port: &mut Port, fatal: Fatal) -> ! {
+    log::error!("fatal: {:?}; controlled reset", fatal);
+    let mut platform = NoPlatform;
+    let started = Instant::now();
+    while started.elapsed().as_millis() < FATAL_REPORT_MS {
+        let _ = ncp.service_with(now_us(), host, port, &mut platform, &LOG);
+    }
+    let drained = Instant::now();
+    while !host.tx_idle() && drained.elapsed().as_millis() < 50 {}
+    product::fatal::reset(fatal)
 }

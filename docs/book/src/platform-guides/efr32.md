@@ -638,6 +638,7 @@ are unchanged.
 | IRQs | 61 / 64 | 76 (15 and 64 reserved); FRC 33, RAC_RSM 36, USART0_RX/TX 9/10 |
 | WDOG0, I2C0 | `0x4A01_8000`, `0x4A01_0000` | `0x4B00_4000`, `0x4B00_0000` |
 | TRNG | xG22 CRYPTOACC; xG21 none | Secure Engine mailbox `TRNG_GET_RANDOM` (`se`), wired to `PlatformServices::fill_random` on xG24 only |
+| AES (NWK/APS CCM*, MMO) | xG22 CRYPTOACC hardware; xG21 software | software (`zigbee-crypto`), like xG21, until a Secure Engine AES backend (branch `aes-hw-efr32mg24`) is proven on hardware |
 | reset cause | — | `reset::take_reset_cause` (`EMU_RSTCAUSE`, same bits on all three dies) |
 
 The SE writes the TRNG output descriptor and buffer by DMA, possibly after
@@ -655,6 +656,25 @@ completion; host builds have no SE and fail with `SeError::Unavailable`.
 as a failed TRNG on CC26x2); a non-OK SE result is `SecurityError`; a mailbox
 held by another caller is `Other`. Every stack caller fails closed on any of
 them (formation, PAN ID, Trust Center keys).
+
+**Poisoned Secure Engine is fatal** (product policy, `fatal` module of
+`products/efr32mg24`). A poisoned mailbox only recovers with a reset; on
+xG24 the TRNG is the NCP's only entropy source, so the NCP could never form
+a network or generate a key again while it kept answering the host. Both
+compositions check `se::is_poisoned()` after every main-loop step. On a
+fault the NCP logs it to the ZRHP LOG ring and serves the host link for
+100 ms; the Router logs it on its UART and flushes it. Both then reset with
+the cause recorded in the Gecko `BootloaderResetCause_t` word at
+`SRAM_BASE` (reason `0x0980`, the EmberZNet `RESET_FATAL` group with a
+zigbee-rs extension code; not a bootload reason, so the resident bootloader
+starts the application). The next boot takes and clears the record: the
+NCP reports `EVT_NCP_READY.reset_reason` 6 (fatal) and both images log the
+cause. The product linker script starts RAM at `0x2000_0004` so start-up
+never overwrites that word (asserted in `link/memory.x` and by
+`verify-layout.py`). The Router links no SE client today, so the compiler
+removes its check; it becomes live if one is added. The policy, the reason
+encoding and the ZRHP reset-reason mapping are host-tested; no MG24 has run
+the path.
 
 Not changed and not yet checked on xG24 silicon: EM2 entry (`power`), DC-DC
 (left in bypass), the LFXO (the RF-BM module has one; the time base still uses
@@ -702,6 +722,9 @@ A programmed `MFG_CTUNE` token always wins over the board default.
 0x0800_6000..0x0815_8000  application = GBL payload                 1352 KiB
 0x0815_8000..0x0818_0000  journals: identity, APS, GP, children,
                           Trust Center (NCP), security                160 KiB
+
+0x2000_0000..0x2000_0004  Gecko BootloaderResetCause_t (outside the image)
+0x2000_0004..0x2004_0000  image RAM, stack at the top             256 KiB - 4
 ```
 
 The journals are those of the ESP32-H2 and CC2652P7 NCPs (spec 8.9). The
@@ -710,9 +733,11 @@ between the NCP (role tag `0x5203`) and the router (`0x5201`) keeps the
 frame-counter reservations and erases the other role's tables. A GBL only
 erases the pages it programs, so the journals survive a firmware update.
 The stock EmberZNet NVM3 sits inside the journal window; the first boot
-treats it as foreign and erases it. Before going back to EmberZNet, clear the
-window (an "app clear" GBL or SWD erase), because NVM3 does not expect our
-journals there.
+treats it as foreign and erases it, together with the stock network key,
+frame counters and tables. **On a Dongle-M in service, the hub must take an
+EZSP network backup before flashing**: nothing can be recovered from the
+erased NVM3. Before going back to EmberZNet, clear the window (an "app
+clear" GBL or SWD erase), because NVM3 does not expect our journals there.
 
 ### Firmware update path: Gecko bootloader kept
 
@@ -744,7 +769,7 @@ The NCP keeps the resident Gecko bootloader and does not build in `FW_*`:
 
 **A/B on the radio chip (decision N6).** Flash would allow it: a 16 KiB
 zrs-boot loader chained above Gecko (as on the ZBT-1) plus two 664 KiB slots
-fits the 1352 KiB application window, and the NCP image is 426 KiB today.
+fits the 1352 KiB application window, and the NCP image is 441 KiB today.
 It is not the default because the Dongle-M already has a host-driven,
 unbrickable recovery path (ESP32 GPIO12 + RESET into Gecko), Gecko is the
 path SONOFF's flasher and the community tools use, and a chained loader would
@@ -756,12 +781,18 @@ would not move it.
 
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
-| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 435,996 B | 166,480 B | 91,568 B |
-| NCP, Dongle-M | 436,008 B | 166,480 B | 91,568 B |
-| Router, RF-BM-MG24B1 (GP Proxy Basic) | 340,988 B | 37,140 B | 224,492 B |
+| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 451,524 B | 168,536 B | 89,512 B |
+| NCP, Dongle-M | 451,460 B | 168,536 B | 89,512 B |
+| Router, RF-BM-MG24B1 (GP Proxy Basic) | 341,760 B | 37,140 B | 224,492 B |
+| Router, Dongle-M | 341,908 B | 37,140 B | 224,492 B |
 
-The NCP uses 32 % of the application window and 65 % of SRAM for static
-data. The compact capacity tier is not needed.
+The NCP uses 33 % of the application window and 66 % of SRAM for static
+data. The compact capacity tier is not needed. The poisoned-engine reset
+costs 520 B of flash in the NCP and about 240 B in the Router (the boot-time
+record and its log line; the Router's loop check compiles away) and no
+static RAM or stack: `.data` now starts at `0x2000_0008` (8-byte aligned),
+and the end of static RAM and the linked stack are unchanged because
+alignment padding absorbs the shift.
 
 ### Hardware gates (open)
 
@@ -777,7 +808,10 @@ data. The compact capacity tier is not needed.
    A410 at 39 MHz, halted over SWD in idle, RX and TX; static registers
    reduced against the register-map reset values and cross-checked with the
    GSDK PHY table), then raw TX/RX, ACK turnaround and CCA, as on xG22.
-4. SE mailbox TRNG.
+4. SE mailbox TRNG, and the poisoned-mailbox fatal reset: the record must
+   survive the resident Gecko bootloader and come back as `reset_reason` 6
+   (needs an SE that stops answering, e.g. a debugger-held SE request, or a
+   lab build that poisons the lock on purpose).
 5. NCP: ZRHP session over the S3, network formation, joins, reset/resume.
 6. Gecko path: install a Gecko UART bootloader on the module, then GBL upload
    and journal retention across an update.

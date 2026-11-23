@@ -6,7 +6,9 @@
 //! Imm-Ack, HAL-owned Frame Pending); the lifecycle is
 //! [`router_app::ParentRouterApp`] with durable child, APS and GP Proxy
 //! tables in the product's shared journal windows. Logs go out on the host
-//! USART at 115 200 (TX only).
+//! USART at 115 200 (TX only). A product fatal fault (a poisoned Secure
+//! Engine, `product::fatal`) is logged and ends in a reset that records
+//! it; the next boot logs the recorded cause.
 //!
 //! Status: builds and links. The xG24 radio tables are not captured yet,
 //! so the radio init fails, the image logs that and halts; no MG24 has run
@@ -25,6 +27,7 @@ use efr32s2_hal::usart::UartTx;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant};
 use product::board::resources::BoardResources;
+use product::fatal::Fatal;
 use product::router::{RECOMMISSION_AFTER_LEAVE_MS, ROUTER_POLICY, RouterProfile};
 use product::stores::{self, Opened};
 use router_app::{
@@ -107,6 +110,7 @@ async fn main(_spawner: Spawner) {
     let _ =
         unsafe { core::ptr::read_volatile(&product::gecko::APPLICATION_PROPERTIES.struct_version) };
     let (cause, raw) = efr32s2_hal::reset::take_reset_cause();
+    let previous = product::fatal::take_previous(cause);
     let BoardResources {
         clocks,
         host_uart,
@@ -139,6 +143,9 @@ async fn main(_spawner: Spawner) {
         product::board::hfxo_ctune(),
         product::TX_POWER_DBM
     );
+    if let Some(fatal) = previous {
+        log::warn!("[MG24] previous reset: fatal {fatal:?}");
+    }
     let capacity = efr32s2_hal::flash::device_flash_capacity();
     if capacity != product::layout::FLASH_SIZE as usize {
         log::error!("[MG24] DEVINFO flash size {capacity} B, product needs 1536 KiB");
@@ -164,6 +171,9 @@ async fn main(_spawner: Spawner) {
         }
         if let Err(error) = app.step().await {
             fatal(app.parts_mut(), error);
+        }
+        if let Err(fault) = product::fatal::check_platform() {
+            platform_fatal(app.parts_mut(), fault);
         }
         if Instant::now() >= next_summary {
             next_summary += SUMMARY_PERIOD;
@@ -335,6 +345,21 @@ fn fatal(parts: &mut Parts, error: RouterAppError) -> ! {
         archetype: ARCHETYPE,
     });
     parts.supervisor.reset()
+}
+
+/// A product fatal fault: log it, let the UART finish the line, then reset
+/// with the cause recorded for the next boot.
+fn platform_fatal(parts: &mut Parts, fault: Fatal) -> ! {
+    log::error!("[MG24] fatal: {fault:?}; controlled reset");
+    parts.status.set(RouterStatus::Fault {
+        archetype: ARCHETYPE,
+    });
+    cortex_m::interrupt::free(|cs| {
+        if let Some(uart) = LOG_UART.borrow(cs).borrow_mut().as_mut() {
+            uart.flush();
+        }
+    });
+    product::fatal::reset(fault)
 }
 
 const _: () = assert!(EFR32S2_ROUTER_PENDING_RX >= 4);

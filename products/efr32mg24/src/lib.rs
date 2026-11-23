@@ -18,7 +18,9 @@
 //!   roles so a role change keeps the frame-counter reservations;
 //! * the NCP host transport and its UART policy (`transport`);
 //! * the router policy and profile (`router`);
-//! * the Gecko `ApplicationProperties` record ([`gecko`]).
+//! * the Gecko `ApplicationProperties` record ([`gecko`]);
+//! * the fatal-fault policy ([`fatal`]): a poisoned Secure Engine is
+//!   reported and ends in a controlled reset that records its cause.
 //!
 //! `FW_*` (A/B slots) is not built in; see the platform guide for why the
 //! Gecko path is the default and what an A/B layout would cost.
@@ -39,6 +41,7 @@ compile_error!(
     "efr32mg24-ncp-product: enable a board variant (`rf-bm-mg24b1` or `sonoff-dongle-m`)"
 );
 
+pub mod fatal;
 pub mod gecko;
 pub mod layout;
 #[cfg(feature = "router")]

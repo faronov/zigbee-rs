@@ -3077,10 +3077,11 @@ jobs:
           cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
             --no-default-features --features rfbm --bin s2-mg24-hello \
             --target-dir target/rfbm -- -D warnings
-      - name: Layout gate, GBL packaging, size report
+      - name: Layout gate, AES and SE policy symbols, GBL packaging, size report
         run: |
           OUT=target/efr32mg24
           mkdir -p "$OUT"
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           for example in ncp router; do
             for board in rf-bm-mg24b1 sonoff-dongle-m; do
               if [ "$board" = rf-bm-mg24b1 ]; then
@@ -3092,6 +3093,20 @@ jobs:
               FLAGS=()
               if [ "$example" = ncp ]; then FLAGS=(--ncp); fi
               python3 examples/efr32mg24-ncp/tools/verify-layout.py "${FLAGS[@]}" "$ELF"
+              SYMS="$("$NM" --demangle "$ELF")"
+              # xG24 runs NWK/APS AES in software until a Secure Engine
+              # AES backend is proven on hardware (as xG21).
+              if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
+                echo "$ELF is missing its software AES backend" >&2
+                exit 1
+              fi
+              # An image with an SE mailbox client must carry the product's
+              # poisoned-engine reset (products/efr32mg24/src/fatal.rs).
+              if grep -q 'efr32s2_hal::se::MAILBOX' <<<"$SYMS" \
+                && ! grep -q 'efr32mg24_product::fatal::reset' <<<"$SYMS"; then
+                echo "$ELF uses the Secure Engine without the fatal reset path" >&2
+                exit 1
+              fi
               NAME="efr32mg24-$example-$board"
               cargo run --quiet --locked -p efr32-gbl -- app --elf "$ELF" --out "$OUT/$NAME"
               cargo run --quiet --locked -p efr32-gbl -- parse "$OUT/$NAME.gbl"
