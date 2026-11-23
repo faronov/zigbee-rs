@@ -324,7 +324,7 @@ fn triggered_fire() {
                 #[cfg(not(feature = "ieee802154-extcoex"))] ieee802154_set_txrx_pti(Ieee802154TxRxScene::Tx); #[cfg(feature = "ieee802154-extcoex")] ieee802154_set_txrx_pti(Ieee802154TxRxScene::TxAt);
                 set_cmd(Command::TxStart);
                 state.state = Ieee802154State::Transmit;
-                t.outcome = Some(TriggeredOutcome::Sent { fired_after_us });
+                #[cfg(not(feature = "ieee802154-extcoex"))] { t.outcome = Some(TriggeredOutcome::Sent { fired_after_us }); } #[cfg(feature = "ieee802154-extcoex")] coex_break::triggered_on_air(fired_after_us);
                 t.on_air = true;
                 t.phase = TriggeredPhase::Idle;
             }
@@ -338,7 +338,7 @@ fn triggered_fire() {
 /// TX_DONE of the triggered frame (consumed: the thread is not notified).
 #[cfg(feature = "ieee802154-triggered-tx")]
 fn triggered_tx_done() -> bool {
-    TRIGGERED.with(|t| core::mem::replace(&mut t.on_air, false))
+    TRIGGERED.with(|t| { #[cfg(feature = "ieee802154-extcoex")] coex_break::triggered_ended(t, true); core::mem::replace(&mut t.on_air, false) })
 }
 
 pub(crate) fn esp_ieee802154_enable<'d>(
@@ -706,7 +706,7 @@ pub(crate) fn cancel_transmit() {
     });
     // A cancelled frame produces no TX_DONE.
     #[cfg(feature = "ieee802154-triggered-tx")]
-    TRIGGERED.with(|t| t.on_air = false);
+    TRIGGERED.with(|t| { #[cfg(feature = "ieee802154-extcoex")] coex_break::triggered_ended(t, false); t.on_air = false });
 }
 
 pub(crate) fn shutdown() {
@@ -869,7 +869,7 @@ fn tx_ack_aborted() {
     if reason == RxAbortReason::TxAckTimeout as u8
         || reason == RxAbortReason::TxAckStop as u8
         || reason == RxAbortReason::TxAckCoexBreak as u8
-    {
+    { #[cfg(feature = "ieee802154-extcoex")] coex_break::ack_tx_aborted(reason);
         let previous = STATE.with(|state| {
             if state.state == Ieee802154State::TxAck {
                 next_operation_inner(state)
@@ -991,8 +991,8 @@ fn zb_mac_handler() {
     }
 
     if events & Event::TxAbort != 0 {
-        trace!("TxAbort");
-        abort_tx();
+        trace!("TxAbort"); #[cfg(feature = "ieee802154-extcoex")] let reason = IEEE802154::regs().tx_status().read().tx_abort_status().bits();
+        abort_tx(); #[cfg(feature = "ieee802154-extcoex")] coex_break::tx_aborted(reason);
     } #[cfg(feature = "ieee802154-energy-detect")] energy_detect::on_interrupt(events);
 }
 
@@ -1306,4 +1306,145 @@ mod tx_ack_watchdog {
 #[cfg(feature = "ieee802154-tx-ack-watchdog")]
 pub(crate) fn tx_ack_recoveries() -> u32 {
     tx_ack_watchdog::recovered()
+}
+
+/// Local patch `ieee802154-extcoex` (declared last): arbiter refusals
+/// (coexistence-break aborts) are counted and end the operation they broke
+/// off, as in ESP-IDF v5.5.1.
+#[cfg(feature = "ieee802154-extcoex")]
+pub(crate) mod coex_break {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// Radio operations the external arbiter broke off, since boot or the
+    /// last [`reset_coex_breaks`]. Counted in the ZB_MAC interrupt.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct CoexBreaks {
+        /// Transmissions aborted without grant (`TxCoexBreak`); each is
+        /// reported to its caller as failed (thread transmission) or as
+        /// [`super::TriggeredOutcome::Busy`] (triggered reply).
+        pub tx: u32,
+        /// ACK receptions after a transmission aborted (`RxAckCoexBreak`).
+        pub ack_rx: u32,
+        /// Automatic ACKs aborted (`TxAckCoexBreak`).
+        pub ack_tx: u32,
+    }
+
+    static TX_BREAKS: AtomicU32 = AtomicU32::new(0);
+    static ACK_RX_BREAKS: AtomicU32 = AtomicU32::new(0);
+    static ACK_TX_BREAKS: AtomicU32 = AtomicU32::new(0);
+    /// The thread's transmission ended in `TxCoexBreak` (read once by
+    /// [`take_tx_denied`] after its TX-done notification).
+    static TX_DENIED: AtomicBool = AtomicBool::new(false);
+    /// `fired_after_us` of the triggered frame on air.
+    #[cfg(feature = "ieee802154-triggered-tx")]
+    static TRIGGERED_FIRED_AFTER_US: AtomicU32 = AtomicU32::new(0);
+
+    /// The counters.
+    pub fn coex_breaks() -> CoexBreaks {
+        CoexBreaks {
+            tx: TX_BREAKS.load(Ordering::Relaxed),
+            ack_rx: ACK_RX_BREAKS.load(Ordering::Relaxed),
+            ack_tx: ACK_TX_BREAKS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Zero the counters.
+    pub fn reset_coex_breaks() {
+        TX_BREAKS.store(0, Ordering::Relaxed);
+        ACK_RX_BREAKS.store(0, Ordering::Relaxed);
+        ACK_TX_BREAKS.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether the transmission that just reported TX-done was refused by
+    /// the arbiter instead of sent; clears the flag.
+    pub(crate) fn take_tx_denied() -> bool {
+        TX_DENIED.swap(false, Ordering::AcqRel)
+    }
+
+    /// Clear the flag before a new transmission.
+    pub(crate) fn clear_tx_denied() {
+        TX_DENIED.store(false, Ordering::Release);
+    }
+
+    /// TX_ABORT with the hardware `tx_abort_status` `reason` (read before
+    /// `abort_tx` cleared it). ESP-IDF v5.5.1 `isr_handle_tx_abort`: a
+    /// `TxCoexBreak` fails the transmission (`ESP_IEEE802154_TX_ERR_COEXIST`)
+    /// and starts the next operation; upstream esp-radio left the state in
+    /// `Transmit` until the caller's TX-done timeout cancelled it (and a
+    /// triggered reply never left it).
+    pub(crate) fn tx_aborted(reason: u8) {
+        if reason == super::TxAbortReason::RxAckCoexBreak as u8 {
+            ACK_RX_BREAKS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if reason != super::TxAbortReason::TxCoexBreak as u8 {
+            return;
+        }
+        TX_BREAKS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "ieee802154-triggered-tx")]
+        if triggered_denied() {
+            return;
+        }
+        let previous = super::STATE.with(|state| {
+            if state.state != super::Ieee802154State::Transmit {
+                return super::Ieee802154State::Idle;
+            }
+            // As `cancel_transmit`: stop whatever is left of the TX
+            // command before the receiver restarts.
+            super::set_cmd(super::Command::Stop);
+            TX_DENIED.store(true, Ordering::Release);
+            super::next_operation_inner(state)
+        });
+        super::notify_state(previous);
+    }
+
+    /// An automatic ACK ended in the RX abort `reason`.
+    pub(crate) fn ack_tx_aborted(reason: u8) {
+        if reason == super::RxAbortReason::TxAckCoexBreak as u8 {
+            ACK_TX_BREAKS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The triggered frame went on air `fired_after_us` after its trigger;
+    /// its outcome is published when the transmission ends, so a reply the
+    /// arbiter breaks off is never reported `Sent`.
+    #[cfg(feature = "ieee802154-triggered-tx")]
+    pub(super) fn triggered_on_air(fired_after_us: u32) {
+        TRIGGERED_FIRED_AFTER_US.store(fired_after_us, Ordering::Relaxed);
+    }
+
+    /// The triggered frame on air ended: sent (`TX_DONE`) or cancelled.
+    #[cfg(feature = "ieee802154-triggered-tx")]
+    pub(super) fn triggered_ended(t: &mut super::Triggered, sent: bool) {
+        if !t.on_air {
+            return;
+        }
+        let fired_after_us = TRIGGERED_FIRED_AFTER_US.load(Ordering::Relaxed);
+        t.outcome = Some(if sent {
+            super::TriggeredOutcome::Sent { fired_after_us }
+        } else {
+            super::TriggeredOutcome::Busy { fired_after_us }
+        });
+    }
+
+    /// `TxCoexBreak` of the triggered frame: report it `Busy` (nothing was
+    /// sent) and restart the receiver without notifying the thread, as
+    /// its TX_DONE would not have.
+    #[cfg(feature = "ieee802154-triggered-tx")]
+    fn triggered_denied() -> bool {
+        super::TRIGGERED.with(|t| {
+            if !t.on_air {
+                return false;
+            }
+            triggered_ended(t, false);
+            t.on_air = false;
+            super::STATE.with(|state| {
+                if state.state == super::Ieee802154State::Transmit {
+                    super::set_cmd(super::Command::Stop);
+                    super::next_operation_inner(state);
+                }
+            });
+            true
+        })
+    }
 }

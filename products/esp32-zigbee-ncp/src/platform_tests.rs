@@ -236,6 +236,15 @@ impl CoexControl for FakeCoex {
         self.0.borrow_mut().push((enable, priority_mask));
         Ok(())
     }
+    fn counters(&self) -> CoexCounters {
+        CoexCounters {
+            tx_denied: self.0.borrow().len() as u32,
+            ..CoexCounters::default()
+        }
+    }
+    fn reset_counters(&mut self) {
+        self.0.borrow_mut().clear();
+    }
 }
 
 #[test]
@@ -243,6 +252,7 @@ fn factory_ieee_and_attached_pta_are_platform_services() {
     let (mut platform, _) = boot(&MockFlash::new(), &Settings::default(), 0);
     assert_eq!(platform.factory_ieee(), None);
     assert_eq!(platform.set_pta(true, 1), Err(PlatformError::Unsupported));
+    assert_eq!(mac_group(&platform), []);
     platform.set_factory_ieee([7; 8]);
     assert_eq!(platform.factory_ieee(), Some([7; 8]));
     let log = Rc::new(RefCell::new(Vec::new()));
@@ -254,4 +264,18 @@ fn factory_ieee_and_attached_pta_are_platform_services() {
         Err(PlatformError::InvalidParameter)
     );
     assert_eq!(*log.borrow(), [(true, 0x05)]);
+    assert_eq!(
+        mac_group(&platform),
+        [(0x0220, 1), (0x0221, 0), (0x0222, 0)]
+    );
+    platform.reset_counters(0x40);
+    assert_eq!(mac_group(&platform)[0], (0x0220, 1));
+    platform.reset_counters(0x02);
+    assert_eq!(mac_group(&platform)[0], (0x0220, 0));
+}
+
+fn mac_group<F: OtaFlash, S: SettingsStore>(platform: &Platform<F, S>) -> Vec<(u16, u32)> {
+    let mut out = Vec::new();
+    platform.visit_counters(0x02, &mut |id, value| out.push((id, value)));
+    out
 }

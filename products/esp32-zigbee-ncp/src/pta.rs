@@ -53,6 +53,23 @@
 //! {tx,rx}_stage` calls and configurable scene PTIs) is the esp-radio local
 //! patch `ieee802154-extcoex` (`vendor/esp-radio/LOCAL-PATCHES.md`).
 //!
+//! # Hardware status (Thread BR board, `pta_lab`, 2026-11-21/22)
+//!
+//! - Without the adapter registration and `coex_pre_init` the arbiter
+//!   stayed off: no line moved.
+//! - With them the outputs work: `priority` (GPIO2, signal 81) is high for
+//!   every transmission, `request` (GPIO0, signal 82) only for `High`
+//!   PTIs (mask bit 3), and the S3 sees both.
+//! - A transmission is refused only while `tx_line` (the leader's Wi-Fi
+//!   TX) is high **and** `grant` is low: 40/40 refused (`TxCoexBreak`,
+//!   failed at once and counted), every other combination of grant, tx_line
+//!   and priority sent 40/40. An ESP-IDF v5.5.1 reference app with
+//!   `ot_rcp`'s follower setup behaves identically (same coexistence-block
+//!   registers, `ESP_IEEE802154_TX_ERR_COEXIST` in the same phase), so the
+//!   primitive matches ESP-IDF. `TX_BREAK_COEX_CNT` stays 0 in both.
+//! - Still open (gate H9): PER and latency under Wi-Fi load with the S3 as
+//!   the leader.
+//!
 //! # Priority mask (`coex_tx_priority_mask`)
 //!
 //! The only priority control the blob offers is the PTI of each radio
@@ -175,7 +192,7 @@ const fn raise(raised: bool, default: Priority) -> Priority {
 }
 
 #[cfg(target_os = "none")]
-pub use self::hw::Pta;
+pub use self::hw::{Pta, adapter_stats, lab_coex_init_enable};
 
 #[cfg(target_os = "none")]
 mod hw {
@@ -183,6 +200,7 @@ mod hw {
         GPIO, GPIO0, GPIO1, GPIO2, GPIO3, IO_MUX, MODEM_LPCON, MODEM_SYSCON,
     };
     use esp_radio::ieee802154::{CoexPriority, CoexPti, set_coex_pti};
+    pub(super) use esp_radio::ieee802154::{coex_breaks, reset_coex_breaks};
     use esp_thread_br_h2::THREAD_BR_H2_PTA as WIRING;
 
     use super::{Priority, PtaError, ScenePriorities, priorities};
@@ -228,6 +246,14 @@ mod hw {
         ) -> i32;
         fn esp_coex_external_set(level1: u32, level2: u32, level3: u32) -> i32;
         fn esp_coex_external_stop();
+        // libcoexist.a, coexist.o: the OS adapter and the pre-init ESP-IDF
+        // runs at start-up (`esp_system/startup_funcs.c` `init_coexist`:
+        // `esp_coex_adapter_register(&g_coex_adapter_funcs);
+        // coex_pre_init();`) whenever external coexistence is configured.
+        fn esp_coex_adapter_register(funcs: *mut adapter::CoexAdapterFuncs) -> i32;
+        fn coex_pre_init() -> i32;
+        fn coex_init() -> i32;
+        fn coex_enable() -> i32;
         // ESP32-H2 ROM (esp-rom-sys `esp32h2.rom.api.ld`: gpio_matrix_out /
         // gpio_matrix_in at 0x400006a8 / 0x400006a4).
         fn esp_rom_gpio_connect_out_signal(gpio: u32, signal: u32, out_inv: bool, oen_inv: bool);
@@ -346,9 +372,52 @@ mod hw {
                 .bit_is_set()
     }
 
+    /// ESP-IDF's start-up `init_coexist`, once: register the OS adapter and
+    /// run `coex_pre_init`, which sets up the blob's state (`coex_env`) that
+    /// `esp_coex_external_set` needs to actually enable the arbiter. Without
+    /// it the arbiter stays off (Thread BR board, 2026-11-21: grant held low
+    /// did not stop transmissions, request never rose).
+    fn pre_init() -> Result<(), PtaError> {
+        use core::sync::atomic::{AtomicI32, Ordering};
+        /// 1 not yet run, 0 done, other: the error it returned.
+        static STATE: AtomicI32 = AtomicI32::new(1);
+        match STATE.load(Ordering::Relaxed) {
+            0 => return Ok(()),
+            1 => {}
+            error => return Err(PtaError::Arbiter(error)),
+        }
+        let ret = unsafe {
+            let ret = esp_coex_adapter_register(core::ptr::addr_of_mut!(adapter::FUNCS));
+            if ret != 0 { ret } else { coex_pre_init() }
+        };
+        STATE.store(ret, Ordering::Relaxed);
+        if ret != 0 {
+            return Err(PtaError::Arbiter(ret));
+        }
+        Ok(())
+    }
+
+    /// Lab experiment: the blob's `coex_init` and `coex_enable` (ESP-IDF
+    /// runs them only with Wi-Fi or Bluetooth), after the pre-init.
+    pub fn lab_coex_init_enable() -> (i32, i32, i32) {
+        let pre = match pre_init() {
+            Ok(()) => 0,
+            Err(PtaError::Arbiter(e)) => e,
+            Err(_) => -1,
+        };
+        unsafe { (pre, coex_init(), coex_enable()) }
+    }
+
+    /// Diagnostics of the OS adapter (lab): semaphores created, timer
+    /// calls, allocation bytes, failed allocations.
+    pub fn adapter_stats() -> (u32, u32, u32, u32) {
+        adapter::stats()
+    }
+
     /// `esp_enable_extern_coex_gpio_pin(EXTERN_COEX_WIRE_4, ...)` in the
     /// follower role (ESP-IDF v5.5.1 `coexist.c` 168, 215-257, 265-268).
     unsafe fn start() -> Result<(), PtaError> {
+        pre_init()?;
         unsafe {
             esp_coex_external_set_wire_type(EXTERN_COEX_WIRE_4);
             // tx_line: leader Wi-Fi TX → EXTERN_PRIORITY_I.
@@ -444,6 +513,222 @@ mod hw {
             w.sync2_bypass().bits(2)
         });
     }
+
+    /// The OS adapter `libcoexist.a` calls (`coex_adapter_funcs_t`, ESP-IDF
+    /// v5.5.1 `esp_coex/esp32h2/esp_coex_adapter.c`, adapter version 2).
+    /// Bare metal, one core, no scheduler: semaphores are counters taken
+    /// and given under a critical section (nothing ever waits: with one
+    /// context a held semaphore could not be released, so a blocking take
+    /// fails instead of hanging), memory comes from a small arena that is
+    /// never freed (the blob allocates its state once in `coex_pre_init`),
+    /// and the software timers are not provided (the external-coexistence
+    /// path does not schedule; calls are counted for the lab).
+    pub(super) mod adapter {
+        use core::ffi::c_void;
+        use core::sync::atomic::{AtomicU32, Ordering};
+
+        #[repr(C)]
+        pub struct CoexAdapterFuncs {
+            version: i32,
+            task_yield_from_isr: unsafe extern "C" fn(),
+            semphr_create: unsafe extern "C" fn(u32, u32) -> *mut c_void,
+            semphr_delete: unsafe extern "C" fn(*mut c_void),
+            semphr_take_from_isr: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32,
+            semphr_give_from_isr: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32,
+            semphr_take: unsafe extern "C" fn(*mut c_void, u32) -> i32,
+            semphr_give: unsafe extern "C" fn(*mut c_void) -> i32,
+            is_in_isr: unsafe extern "C" fn() -> i32,
+            malloc_internal: unsafe extern "C" fn(usize) -> *mut c_void,
+            free: unsafe extern "C" fn(*mut c_void),
+            esp_timer_get_time: unsafe extern "C" fn() -> i64,
+            env_is_chip: unsafe extern "C" fn() -> bool,
+            timer_disarm: unsafe extern "C" fn(*mut c_void),
+            timer_done: unsafe extern "C" fn(*mut c_void),
+            timer_setfn: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
+            timer_arm_us: unsafe extern "C" fn(*mut c_void, u32, bool),
+            debug_matrix_init: unsafe extern "C" fn(i32, i32, bool) -> i32,
+            xtal_freq_get: unsafe extern "C" fn() -> i32,
+            magic: i32,
+        }
+
+        /// `COEX_ADAPTER_VERSION`, `COEX_ADAPTER_MAGIC`.
+        const VERSION: i32 = 2;
+        const MAGIC: i32 = 0xDEAD_BEAFu32 as i32;
+        /// `ESP_ERR_NOT_SUPPORTED`.
+        const NOT_SUPPORTED: i32 = 0x106;
+
+        pub static mut FUNCS: CoexAdapterFuncs = CoexAdapterFuncs {
+            version: VERSION,
+            task_yield_from_isr,
+            semphr_create,
+            semphr_delete,
+            semphr_take_from_isr,
+            semphr_give_from_isr,
+            semphr_take,
+            semphr_give,
+            is_in_isr,
+            malloc_internal,
+            free,
+            esp_timer_get_time,
+            env_is_chip,
+            timer_disarm,
+            timer_done,
+            timer_setfn,
+            timer_arm_us,
+            debug_matrix_init,
+            xtal_freq_get,
+            magic: MAGIC,
+        };
+
+        struct Semaphore {
+            count: AtomicU32,
+            max: AtomicU32,
+        }
+        const SEMAPHORES: usize = 8;
+        static POOL: [Semaphore; SEMAPHORES] = [const {
+            Semaphore {
+                count: AtomicU32::new(0),
+                max: AtomicU32::new(0),
+            }
+        }; SEMAPHORES];
+        static CREATED: AtomicU32 = AtomicU32::new(0);
+        static TIMER_CALLS: AtomicU32 = AtomicU32::new(0);
+        static ALLOC_FAILED: AtomicU32 = AtomicU32::new(0);
+
+        const ARENA_BYTES: usize = 2048;
+        #[repr(align(8))]
+        struct Arena([u8; ARENA_BYTES]);
+        static mut ARENA: Arena = Arena([0; ARENA_BYTES]);
+        static USED: AtomicU32 = AtomicU32::new(0);
+
+        pub fn stats() -> (u32, u32, u32, u32) {
+            (
+                CREATED.load(Ordering::Relaxed),
+                TIMER_CALLS.load(Ordering::Relaxed),
+                USED.load(Ordering::Relaxed),
+                ALLOC_FAILED.load(Ordering::Relaxed),
+            )
+        }
+
+        unsafe extern "C" fn task_yield_from_isr() {}
+
+        unsafe extern "C" fn semphr_create(max: u32, init: u32) -> *mut c_void {
+            let index = CREATED.fetch_add(1, Ordering::Relaxed) as usize;
+            let Some(slot) = POOL.get(index) else {
+                return core::ptr::null_mut();
+            };
+            slot.max.store(max, Ordering::Relaxed);
+            slot.count.store(init.min(max), Ordering::Relaxed);
+            core::ptr::from_ref(slot).cast_mut().cast()
+        }
+
+        unsafe extern "C" fn semphr_delete(_semphr: *mut c_void) {}
+
+        fn take(semphr: *mut c_void) -> i32 {
+            let Some(slot) = (unsafe { semphr.cast::<Semaphore>().as_ref() }) else {
+                return 0;
+            };
+            critical_section::with(|_| {
+                let count = slot.count.load(Ordering::Relaxed);
+                if count == 0 {
+                    0
+                } else {
+                    slot.count.store(count - 1, Ordering::Relaxed);
+                    1
+                }
+            })
+        }
+
+        fn give(semphr: *mut c_void) -> i32 {
+            let Some(slot) = (unsafe { semphr.cast::<Semaphore>().as_ref() }) else {
+                return 0;
+            };
+            critical_section::with(|_| {
+                let count = slot.count.load(Ordering::Relaxed);
+                if count >= slot.max.load(Ordering::Relaxed) {
+                    0
+                } else {
+                    slot.count.store(count + 1, Ordering::Relaxed);
+                    1
+                }
+            })
+        }
+
+        unsafe extern "C" fn semphr_take_from_isr(semphr: *mut c_void, _hptw: *mut c_void) -> i32 {
+            take(semphr)
+        }
+
+        unsafe extern "C" fn semphr_give_from_isr(semphr: *mut c_void, _hptw: *mut c_void) -> i32 {
+            give(semphr)
+        }
+
+        unsafe extern "C" fn semphr_take(semphr: *mut c_void, _block_time_tick: u32) -> i32 {
+            take(semphr)
+        }
+
+        unsafe extern "C" fn semphr_give(semphr: *mut c_void) -> i32 {
+            give(semphr)
+        }
+
+        unsafe extern "C" fn is_in_isr() -> i32 {
+            // Only selects the `_from_isr` variants, which are the same here.
+            0
+        }
+
+        unsafe extern "C" fn malloc_internal(size: usize) -> *mut c_void {
+            let size = (size + 7) & !7;
+            let offset = USED.fetch_add(size as u32, Ordering::Relaxed) as usize;
+            if offset + size > ARENA_BYTES {
+                USED.fetch_sub(size as u32, Ordering::Relaxed);
+                ALLOC_FAILED.fetch_add(1, Ordering::Relaxed);
+                return core::ptr::null_mut();
+            }
+            // SAFETY: each range of the arena is handed out once.
+            unsafe {
+                core::ptr::addr_of_mut!(ARENA.0)
+                    .cast::<u8>()
+                    .add(offset)
+                    .cast()
+            }
+        }
+
+        unsafe extern "C" fn free(_p: *mut c_void) {}
+
+        unsafe extern "C" fn esp_timer_get_time() -> i64 {
+            esp_hal::time::Instant::now()
+                .duration_since_epoch()
+                .as_micros() as i64
+        }
+
+        unsafe extern "C" fn env_is_chip() -> bool {
+            true
+        }
+
+        unsafe extern "C" fn timer_disarm(_timer: *mut c_void) {
+            TIMER_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        unsafe extern "C" fn timer_done(_timer: *mut c_void) {
+            TIMER_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        unsafe extern "C" fn timer_setfn(_timer: *mut c_void, _f: *mut c_void, _arg: *mut c_void) {
+            TIMER_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        unsafe extern "C" fn timer_arm_us(_timer: *mut c_void, _us: u32, _repeat: bool) {
+            TIMER_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        unsafe extern "C" fn debug_matrix_init(_event: i32, _signal: i32, _rev: bool) -> i32 {
+            NOT_SUPPORTED
+        }
+
+        unsafe extern "C" fn xtal_freq_get() -> i32 {
+            // ESP32-H2: 32 MHz crystal.
+            32
+        }
+    }
 }
 
 #[cfg(test)]
@@ -520,5 +805,18 @@ impl crate::platform::CoexControl for Pta<'static> {
                 PtaError::Arbiter(_) => PlatformError::Hardware,
             }
         })
+    }
+
+    fn counters(&self) -> crate::platform::CoexCounters {
+        let breaks = hw::coex_breaks();
+        crate::platform::CoexCounters {
+            tx_denied: breaks.tx,
+            ack_rx_denied: breaks.ack_rx,
+            ack_tx_denied: breaks.ack_tx,
+        }
+    }
+
+    fn reset_counters(&mut self) {
+        hw::reset_coex_breaks();
     }
 }
