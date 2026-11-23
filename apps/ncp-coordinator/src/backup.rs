@@ -3,12 +3,13 @@
 //! **Export** streams a record set built from the running network:
 //! `NODE`, `NETWORK`, `NETWORK_KEY`, `TC_LINK_KEY` (keys only with export
 //! flag bit0 and an unlocked key export), one `DEVICE` per Trust Center
-//! record or child (flag bit1), `RS_PARAMS`, then `END` with the count and
-//! CRC-32C. Counters are exported as durable limits; every link-key
-//! `tx_counter` is the global durable APS limit (8.4). The records are
-//! generated on demand per `BKP_EXPORT_READ` (no RAM copy): a device that
-//! joins or leaves while a transfer runs can appear or vanish between reads.
-//! GP tables (flag bit2) are not part of the stream: hosts read them with
+//! record or child (flag bit1), one `APS_GROUP` per group of the APS group
+//! table (flag bit3), `RS_PARAMS`, then `END` with the count and CRC-32C.
+//! Counters are exported as durable limits; every link-key `tx_counter` is
+//! the global durable APS limit (8.4). The records are generated on demand
+//! per `BKP_EXPORT_READ` (no RAM copy): a device or group that joins or
+//! leaves while a transfer runs can appear or vanish between reads. GP
+//! tables (flag bit2) are not part of the stream: hosts read them with
 //! `GP_*_TABLE_READ`.
 //!
 //! **Restore** stages the network records and up to [`MAX_STAGED_KEYS`]
@@ -18,43 +19,55 @@
 //! network (the previous one is wiped only at commit), then the link keys.
 //! Children of the NCP (`DEVICE` with a child block, up to
 //! [`MAX_STAGED_CHILDREN`]) are written to the durable child table before
-//! the resume, so they keep their parent and short address. Deviations,
-//! reported as notes: link keys beyond the staging capacity
-//! (`HOST_BACKED`), children beyond it (`CHILD_DEMOTED`: they rejoin), GP
-//! records, the EZSP hashed TCLK and unknown records (`IGNORED`). The
-//! network is started at commit (flags bit1 is implied); a later `NWK_INIT`
-//! only applies floors. A restore may begin with the network up: it keeps
-//! running while records are staged, and `COMMIT` (once `END` checked)
-//! wipes it like `NWK_LEAVE_RESET`, outgoing counters retained, before
-//! installing the restored one.
+//! the resume, so they keep their parent and short address. `APS_GROUP`
+//! records (merged per group) replace the APS group table once the network
+//! runs, through the port's `NWK_GROUP_MEMBERSHIP` add, and are persisted
+//! with the APS tables like it. Deviations, reported as notes: link keys
+//! beyond the staging capacity (`HOST_BACKED`), children beyond it
+//! (`CHILD_DEMOTED`: they rejoin), GP records, the EZSP hashed TCLK,
+//! unknown records and `APS_GROUP` records the group table cannot hold
+//! (more groups than its capacity, more than [`MAX_GROUP_ENDPOINTS`]
+//! endpoints in a group, or no group table: `IGNORED`, the record is not
+//! applied). With a group table, an `APS_GROUP` with a group above
+//! `0xFFF7`, no endpoint or an endpoint `NWK_GROUP_MEMBERSHIP` refuses
+//! violates rule 2. The network is started at commit (flags bit1 is
+//! implied); a later `NWK_INIT` only applies floors. A restore may begin
+//! with the network up: it keeps running while records are staged, and
+//! `COMMIT` (once `END` checked) wipes it like `NWK_LEAVE_RESET`, outgoing
+//! counters retained, before installing the restored one.
 
 use heapless::Vec;
 use zigbee_zrhp::codec::List;
 use zigbee_zrhp::codec::{Reader, Writer};
 use zigbee_zrhp::msg::backup::{
     BkpExportBegin, BkpExportBeginRsp, BkpExportEnd, BkpExportRead, BkpRestoreAbort,
-    BkpRestoreBegin, BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, RestoreNote, note,
+    BkpRestoreBegin, BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, RestoreNote,
+    export_flags, note,
 };
 use zigbee_zrhp::msg::{Kind, RawMessage, ids};
 use zigbee_zrhp::queue::EndpointQueues;
 use zigbee_zrhp::records::{
-    EndRecord, NetworkKeyRecord, NetworkRecord, NodeRecord, RawRecords, Record, RestoreCounters,
-    RsParamsRecord, StreamCrc, TcLinkKeyRecord, record_type,
+    ApsGroupRecord, EndRecord, NetworkKeyRecord, NetworkRecord, NodeRecord, RawRecords, Record,
+    RestoreCounters, RsParamsRecord, StreamCrc, TcLinkKeyRecord, record_type,
 };
 use zigbee_zrhp::types::{Endpoint, Ieee, Status};
 
 use crate::ncp::{FC_STRIDE, QUEUE_BYTES};
 use crate::platform::NcpPlatform;
 use crate::port::{
-    CoordinatorPort, NetworkImage, NetworkState, OpError, RestoredChild, RestoredKey,
+    CoordinatorPort, GroupView, MAX_GROUP_ENDPOINTS, MAX_GROUPS, NetworkImage, NetworkState,
+    OpError, RestoredChild, RestoredKey, group_member_valid,
 };
-use crate::tables::device_record;
+use crate::tables::{device_record, group_record};
 
 /// NCP children staged by a restore; more are `CHILD_DEMOTED` (they
 /// rejoin).
 pub const MAX_STAGED_CHILDREN: usize = 64;
 /// Device link keys staged by a restore; more are `HOST_BACKED`.
 pub const MAX_STAGED_KEYS: usize = 64;
+/// APS groups staged by a restore (also bounded by the port's
+/// `group_capacity`); more are `IGNORED`.
+pub const MAX_STAGED_GROUPS: usize = MAX_GROUPS;
 /// `max_records_per_put` advertised by `BKP_RESTORE_BEGIN`.
 pub const MAX_RECORDS_PER_PUT: u16 = 12;
 /// Largest export chunk (record bytes per `BKP_EXPORT_READ`).
@@ -79,7 +92,9 @@ pub(crate) const fn is_backup_request(id: u16) -> bool {
 pub struct Export {
     txn: u16,
     keys: bool,
-    devices: bool,
+    /// `DEVICE` and `APS_GROUP` positions (0 without flag bit1 / bit3).
+    devices: usize,
+    groups: usize,
     /// Next record position (see [`Export::record`]).
     next: usize,
     total: usize,
@@ -103,6 +118,7 @@ pub struct Restore {
     keys: Vec<RestoredKey, MAX_STAGED_KEYS>,
     host_backed: u16,
     children: Vec<RestoredChild, MAX_STAGED_CHILDREN>,
+    groups: Vec<GroupView, MAX_STAGED_GROUPS>,
     end: Option<EndRecord>,
     put_index: u16,
 }
@@ -143,8 +159,14 @@ impl BackupState {
 
 impl Export {
     /// Position layout: 0 NODE, 1 NETWORK, 2 NETWORK_KEY, 3 TC_LINK_KEY,
-    /// 4.. devices, then RS_PARAMS, then END.
-    fn record<C: CoordinatorPort>(&self, port: &C, position: usize) -> Option<Record<'static>> {
+    /// 4.. devices, then groups, then RS_PARAMS, then END. A group record
+    /// borrows `group`, which holds its table entry.
+    fn record<'g, C: CoordinatorPort>(
+        &self,
+        port: &C,
+        position: usize,
+        group: &'g mut Option<GroupView>,
+    ) -> Option<Record<'g>> {
         let info = port.info();
         let counters = port.frame_counters();
         match position {
@@ -182,13 +204,15 @@ impl Export {
             }),
             2 | 3 => None,
             _ => {
-                let devices = if self.devices { self.total - 6 } else { 0 };
                 let index = position - 4;
-                if index < devices {
+                if index < self.devices {
                     port.device(index).map(|view| {
                         Record::Device(device_record(&view, self.keys, counters.aps_limit))
                     })
-                } else if index == devices {
+                } else if index < self.devices + self.groups {
+                    *group = port.group(index - self.devices);
+                    group.as_ref().map(group_record)
+                } else if index == self.devices + self.groups {
                     Some(Record::RsParams(RsParamsRecord {
                         fc_stride: FC_STRIDE,
                         table_epoch: self.table_epoch,
@@ -242,20 +266,26 @@ pub(crate) fn dispatch_backup<C: CoordinatorPort>(
                 status(queues, Status::InvalidState);
                 return false;
             }
-            let keys = request.flags & 0x01 != 0 && keys_exportable;
-            let devices = request.flags & 0x02 != 0;
-            let device_count = if devices {
+            let keys = request.flags & export_flags::KEYS != 0 && keys_exportable;
+            let devices = if request.flags & export_flags::DEVICES != 0 {
                 crate::tables::device_count(port)
             } else {
                 0
             };
-            // NODE, NETWORK, [NWK key, TCLK], devices, RS_PARAMS, END.
-            let total = 6 + device_count;
+            let groups = if request.flags & export_flags::APS_GROUPS != 0 {
+                crate::tables::group_count(port)
+            } else {
+                0
+            };
+            // NODE, NETWORK, [NWK key, TCLK], devices, groups, RS_PARAMS,
+            // END.
+            let total = 6 + devices + groups;
             let txn = state.txn();
             state.export = Some(Export {
                 txn,
                 keys,
                 devices,
+                groups,
                 next: 0,
                 total,
                 crc: StreamCrc::new(),
@@ -286,7 +316,8 @@ pub(crate) fn dispatch_backup<C: CoordinatorPort>(
                 let result = if export.next == end_position {
                     crc_end(&crc, &mut w)
                 } else {
-                    match export.record(port, export.next) {
+                    let mut group = None;
+                    match export.record(port, export.next, &mut group) {
                         Some(record) => crc.write_record(&record, &mut w),
                         None => Ok(()),
                     }
@@ -344,6 +375,7 @@ pub(crate) fn dispatch_backup<C: CoordinatorPort>(
                 keys: Vec::new(),
                 host_backed: 0,
                 children: Vec::new(),
+                groups: Vec::new(),
                 end: None,
                 put_index: 0,
             });
@@ -384,7 +416,7 @@ pub(crate) fn dispatch_backup<C: CoordinatorPort>(
                 if rtype != record_type::END {
                     restore.crc.add(tlv);
                 }
-                match stage(restore, &record, port.ieee()) {
+                match stage(restore, &record, port.ieee(), port.group_capacity()) {
                     Ok(Some(n)) => {
                         let _ = notes.push(RestoreNote { index, note: n });
                     }
@@ -470,8 +502,13 @@ fn crc_end(crc: &StreamCrc, w: &mut Writer<'_>) -> Result<(), zigbee_zrhp::codec
 }
 
 /// Validate and stage one record; `Ok(Some(note))` reports a deviation,
-/// `Err` violates 9.4 rule 2.
-fn stage(restore: &mut Restore, record: &Record<'_>, own_ieee: [u8; 8]) -> Result<Option<u8>, ()> {
+/// `Err` violates 9.4 rule 2. `group_capacity` bounds the staged groups.
+fn stage(
+    restore: &mut Restore,
+    record: &Record<'_>,
+    own_ieee: [u8; 8],
+    group_capacity: usize,
+) -> Result<Option<u8>, ()> {
     restore.counters.add(record);
     match record {
         Record::Node(node) => {
@@ -547,6 +584,7 @@ fn stage(restore: &mut Restore, record: &Record<'_>, own_ieee: [u8; 8]) -> Resul
             }
             Ok(result)
         }
+        Record::ApsGroup(group) => stage_group(&mut restore.groups, group, group_capacity),
         Record::RsParams(_) => Ok(None),
         Record::End(end) => {
             restore.end = Some(end.clone());
@@ -554,6 +592,52 @@ fn stage(restore: &mut Restore, record: &Record<'_>, own_ieee: [u8; 8]) -> Resul
         }
         _ => Ok(Some(note::IGNORED)),
     }
+}
+
+/// Stage one `APS_GROUP`, merged with an earlier record of the same group.
+/// Without a group table (`capacity` 0) every record is `IGNORED`, as by an
+/// NCP that predates the record. Malformed (a group above `0xFFF7`, no
+/// endpoint, an endpoint `NWK_GROUP_MEMBERSHIP` refuses): `Err` (rule 2).
+/// Beyond the table (more than `capacity` groups or
+/// [`MAX_GROUP_ENDPOINTS`] distinct endpoints): `IGNORED`, and nothing of
+/// the record is staged.
+fn stage_group(
+    staged: &mut Vec<GroupView, MAX_STAGED_GROUPS>,
+    record: &ApsGroupRecord<'_>,
+    capacity: usize,
+) -> Result<Option<u8>, ()> {
+    if capacity == 0 {
+        return Ok(Some(note::IGNORED));
+    }
+    if record.endpoints.is_empty()
+        || !record
+            .endpoints
+            .iter()
+            .all(|&endpoint| group_member_valid(record.group, endpoint))
+    {
+        return Err(());
+    }
+    let existing = staged.iter().position(|view| view.group == record.group);
+    let mut endpoints: Vec<u8, MAX_GROUP_ENDPOINTS> =
+        existing.map_or_else(Vec::new, |at| staged[at].endpoints.clone());
+    for &endpoint in record.endpoints {
+        if !endpoints.contains(&endpoint) && endpoints.push(endpoint).is_err() {
+            return Ok(Some(note::IGNORED));
+        }
+    }
+    match existing {
+        Some(at) => staged[at].endpoints = endpoints,
+        None => {
+            let view = GroupView {
+                group: record.group,
+                endpoints,
+            };
+            if staged.len() >= capacity || staged.push(view).is_err() {
+                return Ok(Some(note::IGNORED));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// "ZigBeeAlliance09".
@@ -623,6 +707,7 @@ async fn commit<C: CoordinatorPort, P: NcpPlatform>(
         .await
         .map_err(op_status)?;
     let (on_ncp, host_backed) = restore_keys(port, &restore.keys, restore.host_backed);
+    restore_groups(port, &restore.groups);
     let counters = port.frame_counters();
     Ok(BkpRestoreCommitRsp {
         nwk_fc_start: counters.nwk_current.max(nwk_fc_start),
@@ -654,6 +739,24 @@ fn restore_keys<C: CoordinatorPort>(
     (on_ncp, host_backed)
 }
 
+/// Install the staged APS groups on the running network's (empty) group
+/// table through `NWK_GROUP_MEMBERSHIP`'s add, which also persists them.
+/// Staging bounded and validated them for the port, so a refusal here is a
+/// port fault: logged, the group stays out (visible to `TBL_READ`).
+#[inline(never)]
+fn restore_groups<C: CoordinatorPort>(port: &mut C, groups: &[GroupView]) {
+    for view in groups {
+        for &endpoint in &view.endpoints {
+            if let Err(error) = port.group_membership(1, view.group, endpoint) {
+                log::warn!(
+                    "restore: group 0x{:04X} endpoint {endpoint}: {error:?}",
+                    view.group
+                );
+            }
+        }
+    }
+}
+
 fn op_status(error: OpError) -> Status {
     match error {
         OpError::InvalidState => Status::InvalidState,
@@ -662,5 +765,74 @@ fn op_status(error: OpError) -> Status {
         OpError::Unsupported => Status::UnsupportedCommand,
         OpError::InvalidParameter => Status::InvalidParameter,
         OpError::Zigbee(_) => Status::Failure,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(group: u16, endpoints: &[u8]) -> ApsGroupRecord<'_> {
+        ApsGroupRecord { group, endpoints }
+    }
+
+    #[test]
+    fn without_a_group_table_every_group_is_ignored() {
+        let mut staged = Vec::new();
+        for record in [group(0x1234, &[1]), group(0xFFF8, &[]), group(1, &[0])] {
+            assert_eq!(
+                stage_group(&mut staged, &record, 0),
+                Ok(Some(note::IGNORED))
+            );
+        }
+        assert!(staged.is_empty());
+    }
+
+    #[test]
+    fn groups_stay_within_the_port_capacity_and_the_endpoint_bound() {
+        let mut staged = Vec::new();
+        assert_eq!(stage_group(&mut staged, &group(1, &[1, 1, 2]), 2), Ok(None));
+        assert_eq!(stage_group(&mut staged, &group(2, &[242]), 2), Ok(None));
+        // A third group exceeds a 2-group table; an existing one merges.
+        assert_eq!(
+            stage_group(&mut staged, &group(3, &[1]), 2),
+            Ok(Some(note::IGNORED))
+        );
+        assert_eq!(stage_group(&mut staged, &group(1, &[3]), 2), Ok(None));
+        // Nine distinct endpoints (here after a merge, and the codec's 255)
+        // never fit: the record is dropped whole.
+        assert_eq!(
+            stage_group(&mut staged, &group(1, &[4, 5, 6, 7, 8, 9]), 2),
+            Ok(Some(note::IGNORED))
+        );
+        let many: std::vec::Vec<u8> = (1..=240).chain(1..=15).collect();
+        assert_eq!(
+            stage_group(&mut staged, &group(2, &many), 2),
+            Ok(Some(note::IGNORED))
+        );
+        let staged: std::vec::Vec<(u16, &[u8])> = staged
+            .iter()
+            .map(|view| (view.group, &view.endpoints[..]))
+            .collect();
+        assert_eq!(staged, [(1, &[1u8, 2, 3][..]), (2, &[242][..])]);
+    }
+
+    #[test]
+    fn malformed_groups_violate_rule_2() {
+        let mut staged = Vec::new();
+        for record in [
+            group(0xFFF8, &[1]),
+            group(1, &[]),
+            group(1, &[0]),
+            group(1, &[241]),
+            group(1, &[1, 243]),
+        ] {
+            assert_eq!(stage_group(&mut staged, &record, 16), Err(()));
+        }
+        assert!(staged.is_empty());
+        assert_eq!(
+            stage_group(&mut staged, &group(0xFFF7, &[240]), 16),
+            Ok(None)
+        );
     }
 }

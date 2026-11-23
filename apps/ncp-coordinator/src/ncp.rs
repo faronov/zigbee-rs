@@ -920,6 +920,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 if port.groups_supported() {
                     ncp_caps |= caps::GROUP_MEMBERSHIP;
                 }
+                if port.group_capacity() != 0 {
+                    ncp_caps |= caps::APS_GROUP_TABLE;
+                }
                 if platform.fw_supported() {
                     ncp_caps |= caps::NCP_FW_UPDATE;
                 }
@@ -988,6 +991,11 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     Capacity {
                         id: capacity::NEIGHBOR_TABLE,
                         value: zigbee_nwk::neighbor::MAX_NEIGHBORS as u32,
+                    },
+                    // 0 without a readable group table.
+                    Capacity {
+                        id: capacity::GROUP_TABLE,
+                        value: port.group_capacity() as u32,
                     },
                     Capacity {
                         id: capacity::GP_SINK_TABLE,

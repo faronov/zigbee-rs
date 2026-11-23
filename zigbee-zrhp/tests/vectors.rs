@@ -500,6 +500,17 @@ fn message_vectors() {
                     (14024, 3, 2, 3)
                 );
             }
+            "tbl_read_aps_group" => {
+                let r: TblRead = rt(&m, &whole);
+                assert_eq!(
+                    r,
+                    TblRead {
+                        table: records::record_type::APS_GROUP,
+                        cursor: 0,
+                        max: 8
+                    }
+                );
+            }
             "tbl_read_aps_group_rsp" => {
                 let r = rt_rsp::<TblReadRsp>(&m, &whole);
                 let b = r.body.unwrap();

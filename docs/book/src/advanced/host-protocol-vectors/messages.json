@@ -264,6 +264,17 @@
     "message_hex": "00020502002f000503390000000526000c0b0afeff142e84214f0aa0a1a2a3a4a5a6a7a8a9aaabacadaeaf000203c836000003000000"
   },
   {
+    "name": "tbl_read_aps_group",
+    "endpoint": 3,
+    "kind": 0,
+    "msg_id": "0x0506",
+    "tid": 3,
+    "note": "host reads the APS group table (0x0D) from cursor 0, at most 8 entries",
+    "fields": {},
+    "payload_hex": "0d000008",
+    "message_hex": "000605030004000d000008"
+  },
+  {
     "name": "tbl_read_aps_group_rsp",
     "endpoint": 3,
     "kind": 1,

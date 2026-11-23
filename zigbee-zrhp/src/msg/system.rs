@@ -54,6 +54,10 @@ pub mod caps {
     pub const UART_FLOW_CONTROL: u64 = 1 << 22;
     /// `NWK_ACTIVE_SCAN`.
     pub const ACTIVE_SCAN: u64 = 1 << 23;
+    /// The APS group table is readable (`TBL_READ` / `TBL_STATS` of table
+    /// `APS_GROUP` `0x0D`) and backed up (`BKP_EXPORT_BEGIN` flags bit3,
+    /// `APS_GROUP` records restored).
+    pub const APS_GROUP_TABLE: u64 = 1 << 24;
 }
 
 /// Host capability bits (`host_caps`, 8.8).

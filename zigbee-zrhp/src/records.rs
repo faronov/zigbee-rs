@@ -475,6 +475,9 @@ wire_struct! {
 
 /// `APS_GROUP` (`0x0D`): one group of the coordinator's APS group table and
 /// its member endpoints (`u16 group, u8 n, n × u8 endpoint`).
+///
+/// The codec carries up to 255 endpoints; an NCP holds fewer (zigbee-rs: 8
+/// per group, `group_table` groups) and bounds a restore itself (spec 9.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApsGroupRecord<'a> {
     /// Group address.

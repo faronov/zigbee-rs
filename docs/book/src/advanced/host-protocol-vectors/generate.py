@@ -682,6 +682,9 @@ def build_messages():
         struct.pack("<BBI", R_DEVICE, 3, 57) + dev, "NCP evicts a dirty entry; host must fsync first")
     groups = [record(R_APS_GROUP, struct.pack("<HB", 0x0B84, 1) + bytes([242])),
               record(R_APS_GROUP, struct.pack("<HB", 0x1234, 2) + bytes([1, 3]))]
+    add("tbl_read_aps_group", EP_TABLES, K_REQUEST, TBL_READ, 0x0003,
+        struct.pack("<BHB", R_APS_GROUP, 0, 8),
+        "host reads the APS group table (0x0D) from cursor 0, at most 8 entries")
     add("tbl_read_aps_group_rsp", EP_TABLES, K_RESPONSE, TBL_READ, 0x0003,
         b"\x00" + struct.pack("<HB", 0xFFFF, len(groups))
         + b"".join(struct.pack("<IB", 0, 0) + g for g in groups),

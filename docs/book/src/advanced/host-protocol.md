@@ -1081,7 +1081,7 @@ Capability bits (`u64`, NCP → host):
 | 9 | `ENERGY_SCAN` | 19 | `INTERPAN` (reserved) |
 | 20 | `GREEN_POWER_SINK` (combo sink, 7.11) | 21 | `PTA_COEX` (external 802.15.4/Wi-Fi coexistence wired and supported, 11.5) |
 | 22 | `UART_FLOW_CONTROL` (RTS/CTS active on this link) | 23 | `ACTIVE_SCAN` (`NWK_ACTIVE_SCAN`) |
-| 24–63 | reserved | | |
+| 24 | `APS_GROUP_TABLE` (`TBL_READ`/`TBL_STATS` of table `0x0D`, `BKP_EXPORT_BEGIN` flags bit3, `APS_GROUP` restore; 8.5, 9.3–9.5) | 25–63 | reserved |
 
 Capacities (`{u8 id, u32 value}` list):
 
@@ -1207,7 +1207,7 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | `0x010A` | `NWK_ACTIVE_SCAN` | `u32 channel_mask, u8 duration_exp` | `u8 n, n×{u8 channel, u16 pan, [8] epid, u16 src, u8 lqi, i8 rssi, u8 permit, u8 stack_profile, u8 update_id}`, sent when the scan is complete (synchronous: no event; host timeout 2 × scan time + 15 s, scan time = channels × (2^`duration_exp` + 1) × 15.36 ms). Works with or without a network: one MLME-SCAN (active: beacon request, then the beacons) per channel, the NCP serving the link and the stack between channels and returning to the operating channel after each; frames sent to the NCP during a channel's window are lost (MAC retries, SED polls). `channel_mask` non-empty within 11–26 and `duration_exp` ≤ 6, else `INVALID_PARAMETER`; `IN_PROGRESS` while an active or energy scan runs. One record per Zigbee beacon heard in the order heard (the host deduplicates), at most 25; beacons of other protocols (Thread, plain IEEE 802.15.4) and beacons without a Zigbee payload or with an all-zero EPID are skipped; `epid` in air byte order; `src` `0xFFFF` for a beacon with an extended source; `permit` the superframe's association-permit bit; `rssi` the antenna power from the frame's LQI by the radio's mapping (ESP32: −100…−20 dBm, a stronger signal reads −20), `-128` when the platform does not know it. A failed channel ends the scan: `FAILURE` with the beacons heard so far | E (capability bit 23; ESP32 and CC26x2 NCPs) |
 | `0x010B` | `NWK_ADD_ENDPOINT` | `u8 ep, u16 profile, u16 device_id, u8 version, u8 n_in, n_in×u16, u8 n_out, n_out×u16` | — (`NO_SPACE` beyond `max_host_endpoints`; `INVALID_PARAMETER` for `ep` outside 1..=240 or more than 16 clusters in a list) | E (`ZigbeeDevice::register_host_endpoint`: the ZDO registry the server answers from; `max_host_endpoints` = 8; registering an endpoint again replaces it, including the product profile's endpoint with that number; registrations are RAM only and cleared by `NWK_LEAVE_RESET` without flags bit1) |
 | `0x010C` | `NWK_SET_MANUFACTURER_CODE` | `u16 code` | — | P (node descriptor field) |
-| `0x010D` | `NWK_GROUP_MEMBERSHIP` | `u8 op (1 add, 2 remove, 3 clear), u16 group, u8 ep` | — Needs the network up. `ep` 1..=240 or the GP endpoint 242, `group` ≤ `0xFFF7`. Remove is idempotent; clear removes `ep` from every group (`group` ignored). `NO_SPACE` when the table is full. Persisted with the APS tables. | E (APS group table, 16 groups × 8 endpoints; capability bit 17) |
+| `0x010D` | `NWK_GROUP_MEMBERSHIP` | `u8 op (1 add, 2 remove, 3 clear), u16 group, u8 ep` | — Needs the network up. `ep` 1..=240 or the GP endpoint 242, `group` ≤ `0xFFF7`. Remove is idempotent; clear removes `ep` from every group (`group` ignored). `NO_SPACE` when the table is full. Persisted with the APS tables. Hosts read the table with `TBL_READ` of table `0x0D` (`APS_GROUP` records, 8.5) and back it up with `BKP_EXPORT_BEGIN` flags bit3 (9.5). | E (APS group table, 16 groups × 8 endpoints, capacity 9 `group_table`; capability bit 17, reads and backup bit 24) |
 | `0x010E` | `NWK_REMOVE_DEVICE` | `u16 nwk, [8] ieee, u8 flags (bit0 rejoin, bit1 remove children, bit2 TC remove via parent)` | — | E (TC Remove-Device/leave journal) + P |
 | `0x0180` | `EVT_NETWORK_STATE` | `u8 state (0 down, 1 forming, 2 up, 3 leaving), u8 reason, u8 zb_status, u16 req_tid` | event | N |
 | `0x0181` | `EVT_DEVICE_JOINED` | `u16 nwk, [8] ieee, u16 parent_nwk, u8 join_type (0 association, 1 secured rejoin, 2 unsecured/TC rejoin, 3 direct), u8 capability, u8 decision (0 admitted, 1 denied)` | event | E (`TrustCenterHostEvent::Joined`: one event per Trust Center Update-Device join decision, through any parent including the NCP itself; `capability` is reconstructed from the neighbour entry for a child of the NCP and 0 for a device that joined through another parent; `parent_nwk` `0xFFFF` when unknown. `Device_annce` is forwarded as an indication, not as this event) |
@@ -1923,7 +1923,7 @@ paths of 8.6.
 | Children of the coordinator | Child table + `ChildTableJournal` (authoritative, 64) | Mirror (backup) | Not paged; capacity `max_children` |
 | Source routes | Cache of the latest route records (128) | Relays per device (zigpy `device.relays`) | Host sends relays in `APS_DATA_REQUEST`, or `TBL_PUSH` |
 | Neighbor / routing / discovery tables | Authoritative, RAM | — (read via DIAG) | None; rebuilt by Link Status and MTORR |
-| Bindings / groups with the coordinator as source | APS tables (32 bindings, 16 groups × 8 endpoints) | Mirror | `NWK_GROUP_MEMBERSHIP`; resynced at start |
+| Bindings / groups with the coordinator as source | APS tables (32 bindings, 16 groups × 8 endpoints) | Mirror | `NWK_GROUP_MEMBERSHIP`; resynced at start; groups read with `TBL_READ` of table `0x0D` and backed up as `APS_GROUP` (9.3) |
 | Network key, NIB, TCLK, hashed-TCLK seed, TC policy | Authoritative | Backup copy | None |
 | Outgoing NWK counter and global APS counter | Authoritative, reserved | Checkpoint log (floors) | `EVT_FC_CHECKPOINT`, floors in `NWK_INIT` |
 | GP Proxy Table / GP Sink Table | Authoritative (GP journal) | Mirror via `EVT_GP_*` and backup | `GP_*_TABLE_READ`, `GP_SINK_TABLE_PUT` (7.11) |
@@ -2023,7 +2023,9 @@ to restore while another adapter for the same network is connected. Section
 ### 8.5 TABLES commands (`0x05xx`, endpoint 3)
 
 Table IDs equal record types (9.3): `0x05` DEVICE, `0x08` SOURCE_ROUTE,
-`0x09` GP_PROXY, `0x0B` GP_SINK (read-only here; written with `GP_*`).
+`0x09` GP_PROXY, `0x0B` GP_SINK (read-only here; written with `GP_*`),
+`0x0D` APS_GROUP (read-only; written with `NWK_GROUP_MEMBERSHIP`;
+capability bit 24).
 
 | ID | Name | Direction | Request payload | Response after `status` |
 |---|---|---|---|---|
@@ -2036,6 +2038,29 @@ Table IDs equal record types (9.3): `0x05` DEVICE, `0x08` SOURCE_ROUTE,
 | `0x0507` | `TBL_STATS` | host → NCP | `u8 table` | `u16 capacity, u16 used, u16 dirty, u16 pinned, u32 hits, u32 misses, u32 evictions, u32 lookup_timeouts` |
 | `0x0580` | `EVT_TBL_EPOCH_CHANGED` | NCP → host | `u32 new_epoch, u8 reason (1 factory reset, 2 restore, 3 NV re-initialized)` | event |
 | `0x0581` | `EVT_TBL_PAGING` | NCP → host | `u8 active, u16 cached, u16 capacity` | event (paging started or stopped) |
+
+**`TBL_READ` paging.** `cursor` is an entry index and `next_cursor` the
+first entry not sent (`FFFF` at the end); `max` is clamped to 1..8. A
+standalone NCP (8.1) reports `rev` 0 and no dirty bit; DEVICE entries of
+children are pinned, APS_GROUP entries never are. A page needs the network
+up (`INVALID_STATE` otherwise), like the export. Entries added or removed
+between pages can shift the others by one, so a host that needs a
+consistent view (for example after its own `NWK_GROUP_MEMBERSHIP` calls)
+reads again from cursor 0. `TBL_STATS` of table `0x0D` reports `capacity`
+(= capacity 9 `group_table`) and `used`; `TBL_PUSH` and `TBL_INVALIDATE`
+of a read-only table answer `UNSUPPORTED_COMMAND`, as does any table the
+NCP does not serve. The group table belongs to the network: it is wiped
+with it (`NWK_LEAVE_RESET`) and replaced by a restore, both announced by
+`EVT_TBL_EPOCH_CHANGED`; membership changes leave `table_epoch` as is.
+
+```text
+req: 00 0605 0300 0400 | 0d 0000 08
+rsp: 40 0605 0300 1d00 | 00 ffff 02 | 00000000 00 0d 0400 840b 01 f2
+     | 00000000 00 0d 0500 3412 02 01 03
+```
+
+(`messages.json` `tbl_read_aps_group`/`_rsp`: group `0x0B84` with the GP
+endpoint 242, group `0x1234` with endpoints 1 and 3.)
 
 **`TBL_SYNC` handling.**
 
@@ -2321,6 +2346,7 @@ Real files deviate from the specification in ways an importer must tolerate:
 | `stack_specific.ezsp.hashed_tclk` | `EZSP_HASHED_TCLK` | NCP | Stored value | Stored; devices without an explicit key get derived keys (7.5, decision 8) | N |
 | `stack_specific.zstack.*`, `.zboss.*`, other unknown keys | — | Host (pass-through) | Re-emitted unchanged | Not sent to the NCP | — |
 | `stack_specific.zigbee_rs.*` | `RS_PARAMS`, `GP_PROXY`, `GP_SINK` | NCP | See below | Limits become floors; GP Proxy and Sink entries restored (no GP Pairing sent) | N |
+| `stack_specific.zigbee_rs.aps_group_table` | `APS_GROUP` | NCP APS group table | Export flags bit3 (capability bit 24) | Restored on the new network (9.4); a source without it restores no coordinator groups and the host replays them with `NWK_GROUP_MEMBERSHIP` | E |
 | `metadata.*` (except the above) | — | Host | Host | Host | — |
 
 The `stack_specific.zigbee_rs` object, written by ZRHP hosts:
@@ -2334,7 +2360,8 @@ The `stack_specific.zigbee_rs` object, written by ZRHP hosts:
   "aps_frame_counter_limit": 14024,
   "host_backed_tables": true,
   "gp_proxy_table": ["<hex R_GP_PROXY value>", "..."],
-  "gp_sink_table": ["<hex R_GP_SINK value>", "..."]
+  "gp_sink_table": ["<hex R_GP_SINK value>", "..."],
+  "aps_group_table": ["<hex R_APS_GROUP value>", "..."]
 }
 ```
 
@@ -2359,6 +2386,7 @@ Each record is a TLV: `u8 type, u16 len, value[len]`.
 | `0x0A` | `RS_PARAMS` | `u32 fc_stride, u32 table_epoch, u32 nwk_fc_limit, u32 aps_fc_limit, u8 flags (bit0 host-backed tables)` | 17 |
 | `0x0B` | `GP_SINK` | `gpd_id` (`u8 app_id`; then `u32 src_id`, or `[8] ieee, u8 endpoint`), `u8 device_id, u8 communication_mode, u16 group (FFFF none), u16 assigned_alias (FFFF derived), u8 flags (bit0 MAC seq capable, bit1 rx-on capable, bit2 fixed location, bit3 key present), u8 security_level, u8 key_type, [16] key (if bit3), u32 frame_counter, u8 groupcast_radius` | 19..40 |
 | `0x0C` | `GP_TRANSLATION` | `gpd_id`, then a translation (7.11): `u8 gpd_command, u8 endpoint, u16 profile, u16 cluster, u8 zcl_command, u8 payload_len, payload[]` | 14.. |
+| `0x0D` | `APS_GROUP` | `u16 group, u8 n, n×u8 endpoint`: one group of the coordinator's APS group table and its member endpoints (table `0x0D`, 8.5; export flags bit3) | 3+n |
 | `0xFF` | `END` | `u32 record_count, u32 crc32c` over the concatenated TLV bytes of all preceding records in the stream | 8 |
 
 `DEVICE.flags`:
@@ -2390,6 +2418,10 @@ imported/host, 4 EZSP-hashed derived), u32 tx_counter, u32 rx_floor`.
 
 The field keeps OCB's per-device `tx_counter` round-trippable.
 
+`APS_GROUP` carries up to 255 endpoints; an NCP table holds fewer
+(zigbee-rs: `group_table` = 16 groups of at most 8 endpoints). A record
+lists `group` once; a restore merges records of the same group.
+
 Unknown record types are skipped on import, reported as an `IGNORED` note,
 and preserved by hosts. Within a major version, records may grow by
 appending fields.
@@ -2404,7 +2436,8 @@ appending fields.
 | `0x0614` | `BKP_RESTORE_ABORT` | `u16 txn` | — |
 
 Notes: 1 `HOST_BACKED` (key not cached on the NCP; the host must hold it),
-2 `CHILD_DEMOTED` (child table full; kept as a non-child), 3 `IGNORED`,
+2 `CHILD_DEMOTED` (child table full; kept as a non-child), 3 `IGNORED`
+(unknown record, or a record this NCP cannot hold, rule 8),
 4 `FLOOR_RAISED`.
 
 Rules:
@@ -2459,6 +2492,18 @@ Rules:
    without a writable identity item reports `SECURITY_ERROR` unless bit0 is
    clear and the IEEEs match. Hosts then follow zigpy's
    `can_write_network_settings` rules (`DestructiveWriteNetworkSettings`).
+8. **Coordinator groups.** `APS_GROUP` records are validated like
+   `NWK_GROUP_MEMBERSHIP`: a `group` above `0xFFF7`, `n` = 0 or an
+   endpoint other than 1..=240 or 242 violates rule 2. Records of one group
+   merge (duplicate endpoints count once). A record the table cannot hold,
+   because it would add a group beyond `group_table` or leave a group with
+   more endpoints than the NCP holds per group (8), is not applied at all
+   and gets `IGNORED`; so does every `APS_GROUP` on an NCP without
+   capability bit 24. `COMMIT` installs the staged groups once the restored
+   network runs, replacing the coordinator's group table (the previous one
+   went with the previous network), and they are persisted with the APS
+   tables like `NWK_GROUP_MEMBERSHIP`. `BKP_RESTORE_COMMIT` has no group
+   count: a host checks the result with `TBL_READ` of table `0x0D`.
 
 `EVT_NCP_READY`, `NWK_GET_INFO` and the export always report the IEEE the
 radio actually uses.
@@ -2467,7 +2512,7 @@ radio actually uses.
 
 | ID | Name | Request payload | Response after `status` |
 |---|---|---|---|
-| `0x0601` | `BKP_EXPORT_BEGIN` | `u8 flags (bit0 keys, bit1 devices, bit2 GP tables)` | `u16 txn, u32 record_count` |
+| `0x0601` | `BKP_EXPORT_BEGIN` | `u8 flags (bit0 keys, bit1 devices, bit2 GP tables, bit3 APS group table)` | `u16 txn, u32 record_count` |
 | `0x0602` | `BKP_EXPORT_READ` | `u16 txn, u16 max_bytes` | `u8 more, records…` (the stream ends with `END`) |
 | `0x0603` | `BKP_EXPORT_END` | `u16 txn` | — |
 
@@ -2492,6 +2537,10 @@ radio actually uses.
   with a link block replaces the host's key for that device; a record
   without one keeps the host's key (keys not exported, or held only by the
   host). Every link-key `tx_counter` is then set to the exported APS limit.
+- Bit3 adds one `APS_GROUP` per group of the coordinator's APS group
+  table, after the `DEVICE` records (capability bit 24; an NCP without it
+  ignores the bit). It is a flag so that hosts which do not store the
+  records yet keep their record counts.
 - Without bit0 (or when export is locked), keys are omitted and the host
   produces an **incomplete** backup. zigpy's `is_complete()` then rejects
   it. The UI must say so instead of storing an unusable backup.
@@ -3421,6 +3470,17 @@ After `ncp-host-gaps` (host-tested): H5, `NWK_GROUP_MEMBERSHIP{add, 0x0B84,
 implemented on the ESP32 NCPs (`ncp-hub-gaps`, host-tested).
 `NWK_PERMIT_JOIN` with a router target is still `UNSUPPORTED_COMMAND`.
 H10: use capacity 19, as in Z1.
+
+After `ncp-groups-h11` (host-tested; no hardware run yet): H11 takes the
+second proposal. The NCP serves table `0x0D` (`APS_GROUP` records,
+read-only) with `TBL_READ` and `TBL_STATS` (8.5), exports the group table
+with `BKP_EXPORT_BEGIN` flags bit3, and restores it at `COMMIT` with the
+9.4 rule 8 bounds; capability bit 24 and capacity 9 `group_table`
+advertise it. There is no `op 4 list`: the adapter can answer genGroups
+`view`/`getMembership` for an endpoint by filtering one `TBL_READ` pass
+(at most 16 groups, two pages), keep the records under
+`stack_specific.zigbee_rs.aps_group_table` (9.2), and reconcile its replay
+list against them at start. Adapter side still open.
 
 ### 12.4 Embedded hub (`faronov/zigbee-rs-hub`, ESP32-S3)
 
