@@ -1167,7 +1167,7 @@ Config IDs (v1):
 | `0x0006` | `indirect_timeout_ms` |
 | `0x0007` | reserved (key-export locking is the command `SEC_LOCK_KEY_EXPORT`, 7.5) |
 | `0x0008` | `log_level` |
-| `0x0009` | `coex_enable` (0/1; volatile, default 0; only when `PTA_COEX`; the embedded hub drives it from its Wi-Fi state, 11.5) |
+| `0x0009` | `coex_enable` (0/1; volatile, default 0; only when `PTA_COEX`; the embedded hub drives it from its Wi-Fi state, 11.5; reads 0 once the NCP has turned PTA off after an OS-adapter fault, and setting 1 then fails with `FAILURE` until the next boot) |
 | `0x000A` | `coex_tx_priority_mask` (bit0 MAC ACK frames, bit1 GP timed TX, bit2 TC/key transport, bit3 all) |
 
 `reset_reason` values: 0 unknown, 1 power-on, 2 software, 3 watchdog, 4
@@ -1490,6 +1490,7 @@ other kinds above stay reserved until a cheap source exists.
 | `0x0220` | `coex_denied` | Transmissions the PTA arbiter refused (no grant); failed as a busy channel (11.5) | ESP32-H2 with PTA |
 | `0x0221` | `coex_ack_rx_denied` | ACK receptions the arbiter broke off | ESP32-H2 with PTA |
 | `0x0222` | `coex_ack_tx_denied` | Automatic ACKs the arbiter broke off | ESP32-H2 with PTA |
+| `0x0223` | `coex_adapter_faults` | Requests of the vendor coexistence library the NCP's OS adapter could not honour (a wait, a timer, the semaphore or memory pool exhausted, an unknown handle). The first one turns PTA off until the next boot (11.5); resetting the counter does not re-enable it | ESP32-H2 with PTA |
 | `0x0301` | `nwk_secured_rx` | Secured NWK frames received | all |
 | `0x0302` | `nwk_decrypt_failures` | Of those, MIC/decrypt failures | all |
 | `0x0303` | `nwk_missing_key` | Of those, no key for the key sequence | all |
@@ -3090,6 +3091,22 @@ are kept, and the size is detected at runtime:
     replay (12.4).
   - Capability 21 is set only when the board crate declares the PTA
     wiring.
+- **Fail closed.** The vendor library (`libcoexist.a`) calls an OS adapter
+  for semaphores, memory and timers, and ignores some of its results (the
+  enable path turns the hardware on even when its locks failed). The bare-
+  metal NCP has no scheduler and no timer service, so its adapter never
+  waits: a take that would have to wait, a timer arm, a ninth semaphore, an
+  allocation beyond its 2 KiB arena or an unknown handle is refused and
+  counted as `coex_adapter_faults` (`0x0223`, 7.8). With a fault latched,
+  `coex_enable = 1` fails with `FAILURE`; a fault while PTA is on stops the
+  arbiter within one main-loop pass (the hardware stop does not depend on
+  the library's bookkeeping), `SYS_GET_STATUS.flags` bit 2 and
+  `coex_enable` read 0, and a LOG record names the fault. PTA stays off
+  until the next NCP boot. Static analysis of the H2 library (`coex_pre_init`
+  creates two semaphores and sets a timer function; the locks take with
+  `portMAX_DELAY`; the phase timer is armed only when a coexistence scheme
+  allows the phase loop; no allocation) suggests the follower path records
+  no fault; gate PTA1 checks it on the board.
 - **Validation.** Gate PTA1 (14.6) measures PER and latency with Wi-Fi load,
   with coexistence on and off.
 
@@ -3710,7 +3727,7 @@ This is simulation-level evidence, not hardware evidence.
 | H6 | NCP firmware update with trial boot, confirm, rollback and retained network state. |
 | H7 | 24 h soak with noise injection on the UART variant (921 600, RTS/CTS). |
 | H8 | **Thread BR board UART:** 921 600 (default) and 2 000 000 with RTS/CTS on R19/R20, and the 460 800 fallback without flow control, with both chips writing flash (`rx_overflow = 0`) under the real NCP and hub (R18–R20 fitting and an RX-stall test through the phase-0 bridge passed on 2026-11-19, 11.5; the real NCP with the H2 writing flash through the phase-0 bridge passed on 2026-11-20, 11.5; the real hub with the S3 writing flash is still open). Identify the H2 module's flash size (2 MB or 4 MB) via JEDEC ID, and check the NCP's layout-mismatch refusal. ROM-path recovery via S3 GPIO7/8 with `zbnv` preserved. |
-| PTA1 | **PTA coexistence** (formerly H9; renamed because 12.3.1 uses H9 for a herdsman note): Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on. The hub's automatic enable/disable follows Wi-Fi up/down, including Ethernet-only. GP TempMaster reply behaviour with grant denied. |
+| PTA1 | **PTA coexistence** (formerly H9; renamed because 12.3.1 uses H9 for a herdsman note): Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on. The hub's automatic enable/disable follows Wi-Fi up/down, including Ethernet-only. GP TempMaster reply behaviour with grant denied. The fail-closed OS adapter (11.5) records no fault on the production path: `coex_adapter_faults` (`0x0223`) stays 0 with coexistence on. |
 | H10 | **GP combo on the NCP:** direct and proxy-tunnelled commissioning into the NCP sink with zigpy as shadow, including an unsecured (level-0) FlowerX GP / BGT1 GP; a bidirectional GPD with the NCP as its own TempMaster; Sink Table across an NCP reboot (seamless resume) and across backup/restore. |
 | H11 | **Z2M end to end:** zigbee-herdsman adapter with 10+ real devices; Z2M backup → restore on a fresh NCP. |
 | H12 | **Embedded hub:** S3 hub with a synthetic 2 000-device store (PSRAM budget of 3.4), paging forced by a reduced NCP cache, power cuts during writebacks, store journal recovery. Candidate NCP image that fails its trial (no `FW_CONFIRM`) → the H2 bootloader returns to the previous slot, network state retained; an image larger than the H2 slot refused with `TOO_LARGE` before any erase. Hub app within its slot (3 MiB on 8 MB, 2 944 KiB on the 4 MB development layout). |

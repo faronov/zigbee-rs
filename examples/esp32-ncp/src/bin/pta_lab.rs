@@ -38,6 +38,12 @@
 //!
 //! Lab-only pad changes: input buffers are enabled on GPIO0/GPIO2 so the
 //! outputs can be read back, and phases B-D set pulls on GPIO1.
+//!
+//! The OS adapter fails closed (`product::pta::os_adapter`): `dump` prints
+//! its statistics and latched fault bits, and each phase ends with
+//! `Pta::poll`. A fault (for instance a timer the blob arms after the
+//! second cycle's `coex_init`/`coex_enable`) makes every later enable fail
+//! with `PtaError::Adapter` until the next boot.
 
 #![no_std]
 #![no_main]
@@ -243,6 +249,11 @@ fn phase(
         stats.priority_high,
         stats.tx_line_high
     );
+    // Fail closed as the NCP main loop does: an OS-adapter fault during
+    // the phase stops the arbiter.
+    if let Some(faults) = pta.poll() {
+        println!("PTA stopped: OS adapter fault {faults:#04x} (off until reboot)");
+    }
 }
 
 fn refusals(pta: &mut Pta<'_>) {
@@ -304,8 +315,9 @@ fn dump(pta: &Pta<'_>) {
     let coex =
         |offset: usize| unsafe { core::ptr::read_volatile((0x600A_D000 + offset) as *const u32) };
     println!(
-        "enabled={} mask={:#04x} adapter(sem, timer calls, arena, alloc fails)={:?} | coex 49C={:08x} 4A0={:08x} 4A4={:08x} 4D0={:08x} 4D8={:08x}",
+        "enabled={} active={} mask={:#04x} {:?} | coex 49C={:08x} 4A0={:08x} 4A4={:08x} 4D0={:08x} 4D8={:08x}",
         pta.enabled(),
+        pta.active(),
         pta.priority_mask(),
         esp32_zigbee_ncp_product::pta::adapter_stats(),
         coex(0x49C),

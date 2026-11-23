@@ -268,6 +268,12 @@ jobs:
             manifest: products/esp32-zigbee-ncp/Cargo.toml
             workspace: products/esp32-zigbee-ncp
             features: esp32h2,transport-uart,thread-br-h2
+          # PTA follower: the fail-closed OS adapter and state machine
+          # (`pta::os_adapter`, `pta::Follower`) are host-tested here.
+          - name: ESP32-H2 NCP product (Thread BR, PTA)
+            manifest: products/esp32-zigbee-ncp/Cargo.toml
+            workspace: products/esp32-zigbee-ncp
+            features: esp32h2,transport-uart,thread-br-h2,rtscts-reserved-lines,pta
           - name: ESP32-C6 NCP product (USB-Serial-JTAG)
             manifest: products/esp32-zigbee-ncp/Cargo.toml
             workspace: products/esp32-zigbee-ncp
