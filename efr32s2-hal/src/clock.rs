@@ -1,19 +1,29 @@
 //! EFR32 Series 2 HFXO, system-clock and bus-clock setup.
 //!
 //! This implements the subset needed by the supported boards: crystal mode
-//! at 38.4 MHz, divide-by-one HCLK/PCLK, and the GSDK `CMU_HFXOINIT_DEFAULT`
-//! values. The HFXO register layout and the init defaults are identical for
-//! Series 2 config 1 (xG21) and config 2 (xG22); xG22 additionally gates the
-//! HFXO bus clock in `CMU_CLKEN0`, which must be opened first.
+//! at 38.4 MHz (39 MHz on xG24 boards with `hfxo-39mhz`), divide-by-one
+//! HCLK/PCLK, and the GSDK `CMU_HFXOINIT_DEFAULT` values. The HFXO register
+//! layout and the init defaults are identical for Series 2 config 1 (xG21)
+//! and config 2 (xG22); xG22 additionally gates the HFXO bus clock in
+//! `CMU_CLKEN0`, which must be opened first.
+//!
+//! xG24 (config 4) differs (GSDK 4.5.0 `efr32mg24_hfxo.h`, `em_cmu.c`
+//! `CMU_HFXOInit`, `sl_device_init_hfxo_s2.c`): the block moved to
+//! `0x4A00_4000`, `CTRL.FORCEEN`/`DISONDEMAND` are bits 16/24, there is no
+//! `FSMLOCK`/`MANUALOVERRIDE` but a `STATUS.SYNCBUSY` to wait for, the XO
+//! tuning capacitance is the XI value plus 40 (internal load imbalance),
+//! and 20 dBm-PA parts use the fixed capacitor on XO only ([PM-5131]).
+//! The xG24 sequence is built from those sources and is not yet
+//! hardware-proven.
 
 use crate::chip::BusClock;
 
 const CMU_BASE: u32 = 0x4000_8000;
 const CMU_LOCK: u32 = CMU_BASE + 0x010;
 const CMU_SYSCLKCTRL: u32 = CMU_BASE + 0x070;
-#[cfg(feature = "efr32mg22")]
+#[cfg(any(feature = "efr32mg22", feature = "efr32mg24"))]
 const CMU_CLKEN0: u32 = CMU_BASE + 0x064;
-#[cfg(feature = "efr32mg22")]
+#[cfg(any(feature = "efr32mg22", feature = "efr32mg24"))]
 const CMU_CLKEN1: u32 = CMU_BASE + 0x068;
 /// xG22 `CMU_CRYPTOACCCLKCTRL` (PKEN bit 0, AESEN bit 1).
 #[cfg(feature = "efr32mg22")]
@@ -26,10 +36,10 @@ const CMU_IADCCLKCTRL_CLKSEL_FSRCO: u32 = 0x2;
 const CMU_CRYPTOACCCLKCTRL: u32 = CMU_BASE + 0x260;
 #[cfg(feature = "efr32mg22")]
 const CMU_CRYPTOACCCLKCTRL_PKEN_AESEN: u32 = 0x3;
-/// Present on both xG21 and xG22 at the same offset.
+/// Present on xG21, xG22 and xG24 at the same offset.
 const CMU_RADIOCLKCTRL: u32 = CMU_BASE + 0x280;
 
-const HFXO_BASE: u32 = 0x4000_C000;
+const HFXO_BASE: u32 = crate::chip::base::HFXO0;
 const HFXO_XTALCFG: u32 = HFXO_BASE + 0x010;
 const HFXO_XTALCTRL: u32 = HFXO_BASE + 0x018;
 const HFXO_CFG: u32 = HFXO_BASE + 0x020;
@@ -62,19 +72,41 @@ const CMU_SYSCLKCTRL_PCLKPRESC_MASK: u32 = 1 << 10;
 const CMU_SYSCLKCTRL_HCLKPRESC_MASK: u32 = 0x3 << 12;
 
 const HFXO_LOCK_UNLOCK: u32 = 0x580E;
+#[cfg(not(feature = "efr32mg24"))]
 const HFXO_CTRL_FORCEEN: u32 = 1 << 0;
+#[cfg(not(feature = "efr32mg24"))]
 const HFXO_CTRL_DISONDEMAND: u32 = 1 << 1;
+#[cfg(feature = "efr32mg24")]
+const HFXO_CTRL_FORCEEN: u32 = 1 << 16;
+#[cfg(feature = "efr32mg24")]
+const HFXO_CTRL_DISONDEMAND: u32 = 1 << 24;
+/// xG24 `CTRL.DISONDEMANDBUFOUT` (set with `DISONDEMAND` while stopping)
+/// and `CTRL.EM23ONDEMAND` (cleared when locking, GSDK default false).
+#[cfg(feature = "efr32mg24")]
+const HFXO_CTRL_DISONDEMANDBUFOUT: u32 = 1 << 26;
+#[cfg(feature = "efr32mg24")]
+const HFXO_CTRL_EM23ONDEMAND: u32 = 1 << 3;
 const HFXO_CTRL_FORCEXI2GNDANA: u32 = 1 << 4;
 const HFXO_CTRL_FORCEXO2GNDANA: u32 = 1 << 5;
 const HFXO_STATUS_RDY: u32 = 1 << 0;
 const HFXO_STATUS_COREBIASOPTRDY: u32 = 1 << 1;
 const HFXO_STATUS_ENS: u32 = 1 << 16;
+#[cfg(not(feature = "efr32mg24"))]
 const HFXO_STATUS_FSMLOCK: u32 = 1 << 30;
+/// xG24: register writes still crossing into the HFXO clock domain.
+#[cfg(feature = "efr32mg24")]
+const HFXO_STATUS_SYNCBUSY: u32 = 1 << 30;
 
 const HFXO_XTALCFG_TIMEOUTSTEADY_MASK: u32 = 0xF << 20;
 const HFXO_XTALCTRL_CONFIG_MASK: u32 = 0x0FFF_FFFF;
 const HFXO_XTALCTRL_SKIPCOREBIASOPT: u32 = 1 << 31;
 const HFXO_CFG_CONFIG_MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3);
+
+/// Crystal frequency this build supports (`hfxo-39mhz` selects 39 MHz).
+#[cfg(not(feature = "hfxo-39mhz"))]
+pub const HFXO_HZ: u32 = 38_400_000;
+#[cfg(feature = "hfxo-39mhz")]
+pub const HFXO_HZ: u32 = 39_000_000;
 
 const STARTUP_TIMEOUT_ITERATIONS: u32 = 2_000_000;
 
@@ -118,9 +150,9 @@ impl ClockControl {
         Self { _private: () }
     }
 
-    /// Configure and select the 38.4 MHz crystal as HCLK and PCLK.
+    /// Configure and select the crystal ([`HFXO_HZ`]) as HCLK and PCLK.
     pub fn configure_hfxo(&mut self, config: HfxoConfig) -> Result<SystemClocks, ClockError> {
-        if config.frequency_hz != 38_400_000 {
+        if config.frequency_hz != HFXO_HZ {
             return Err(ClockError::UnsupportedFrequency);
         }
         if config.ctune > u8::MAX as u16 {
@@ -143,9 +175,17 @@ impl ClockControl {
             .ok_or(ClockError::FsrcoSelectTimeout)?;
 
             write(HFXO_LOCK, HFXO_LOCK_UNLOCK);
+            #[cfg(not(feature = "efr32mg24"))]
             write(HFXO_CTRL + SET_ALIAS_OFFSET, HFXO_CTRL_DISONDEMAND);
+            #[cfg(feature = "efr32mg24")]
+            write(
+                HFXO_CTRL + SET_ALIAS_OFFSET,
+                HFXO_CTRL_DISONDEMAND | HFXO_CTRL_DISONDEMANDBUFOUT,
+            );
             write(HFXO_CTRL + CLEAR_ALIAS_OFFSET, HFXO_CTRL_FORCEEN);
             wait_clear(HFXO_STATUS, HFXO_STATUS_ENS).ok_or(ClockError::HfxoStopTimeout)?;
+            #[cfg(feature = "efr32mg24")]
+            wait_clear(HFXO_STATUS, HFXO_STATUS_SYNCBUSY).ok_or(ClockError::HfxoStopTimeout)?;
             #[cfg(feature = "efr32mg21")]
             hfxo_rev_a_errata();
 
@@ -159,6 +199,7 @@ impl ClockControl {
                 steady_xtalctrl(config.ctune as u8),
             );
             modify(HFXO_CFG, HFXO_CFG_CONFIG_MASK, 0); // crystal mode
+            #[cfg(not(feature = "efr32mg24"))]
             modify(
                 HFXO_CTRL,
                 HFXO_CTRL_FORCEEN
@@ -167,11 +208,24 @@ impl ClockControl {
                     | HFXO_CTRL_FORCEXO2GNDANA,
                 HFXO_CTRL_FORCEEN,
             );
+            #[cfg(feature = "efr32mg24")]
+            modify(
+                HFXO_CTRL,
+                HFXO_CTRL_FORCEEN
+                    | HFXO_CTRL_DISONDEMAND
+                    | HFXO_CTRL_EM23ONDEMAND
+                    | HFXO_CTRL_FORCEXI2GNDANA
+                    | HFXO_CTRL_FORCEXO2GNDANA,
+                HFXO_CTRL_FORCEEN,
+            );
 
+            #[cfg(not(feature = "efr32mg24"))]
             let ready = HFXO_STATUS_RDY
                 | HFXO_STATUS_COREBIASOPTRDY
                 | HFXO_STATUS_ENS
                 | HFXO_STATUS_FSMLOCK;
+            #[cfg(feature = "efr32mg24")]
+            let ready = HFXO_STATUS_RDY | HFXO_STATUS_COREBIASOPTRDY | HFXO_STATUS_ENS;
             wait_value(HFXO_STATUS, ready, ready).ok_or(ClockError::HfxoStartTimeout)?;
 
             // Finish the first-lock optimization, then use the shorter 83 us
@@ -179,6 +233,7 @@ impl ClockControl {
             write(HFXO_CTRL + SET_ALIAS_OFFSET, HFXO_CTRL_DISONDEMAND);
             #[cfg(feature = "efr32mg22")]
             write(HFXO_CMD, HFXO_CMD_MANUALOVERRIDE);
+            #[cfg(not(feature = "efr32mg24"))]
             wait_clear(HFXO_STATUS, HFXO_STATUS_FSMLOCK).ok_or(ClockError::HfxoUnlockTimeout)?;
             modify(HFXO_XTALCFG, HFXO_XTALCFG_TIMEOUTSTEADY_MASK, 2 << 20);
             write(
@@ -188,7 +243,9 @@ impl ClockControl {
             write(HFXO_CTRL + CLEAR_ALIAS_OFFSET, HFXO_CTRL_DISONDEMAND);
 
             // 38.4 MHz is below the config-1 40 MHz zero-wait-state limit for
-            // flash and below the 50 MHz zero-wait-state SRAM limit.
+            // flash and below the 50 MHz zero-wait-state SRAM limit. The MSC
+            // read wait states are left at their reset value on every die
+            // (xG24 resets to `READCTRL.MODE` = WS1, valid up to 80 MHz).
             select_system_clock(CMU_SYSCLKCTRL_CLKSEL_HFXO);
             wait_value(
                 CMU_SYSCLKCTRL,
@@ -214,10 +271,14 @@ impl ClockControl {
     }
 }
 
-/// Open one peripheral bus clock (xG22 `CMU_CLKEN0/1`; no-op on xG21).
+/// Open one peripheral bus clock (xG22/xG24 `CMU_CLKEN0/1`; no-op on xG21).
 #[inline]
 pub fn enable_bus_clock(clock: BusClock) {
-    #[cfg(all(feature = "efr32mg22", target_arch = "arm", target_os = "none"))]
+    #[cfg(all(
+        any(feature = "efr32mg22", feature = "efr32mg24"),
+        target_arch = "arm",
+        target_os = "none"
+    ))]
     unsafe {
         let register = if clock.register == 0 {
             CMU_CLKEN0
@@ -227,7 +288,11 @@ pub fn enable_bus_clock(clock: BusClock) {
         write(CMU_LOCK, CMU_LOCK_UNLOCK);
         write(register + SET_ALIAS_OFFSET, 1 << clock.bit);
     }
-    #[cfg(not(all(feature = "efr32mg22", target_arch = "arm", target_os = "none")))]
+    #[cfg(not(all(
+        any(feature = "efr32mg22", feature = "efr32mg24"),
+        target_arch = "arm",
+        target_os = "none"
+    )))]
     let _ = clock;
 }
 
@@ -333,7 +398,7 @@ pub fn enable_radio_clocks() {
     #[cfg(all(target_arch = "arm", target_os = "none"))]
     unsafe {
         write(CMU_LOCK, CMU_LOCK_UNLOCK);
-        #[cfg(feature = "efr32mg22")]
+        #[cfg(any(feature = "efr32mg22", feature = "efr32mg24"))]
         write(
             CMU_CLKEN1 + SET_ALIAS_OFFSET,
             crate::chip::CLKEN1_RADIO_MASK,
@@ -348,11 +413,31 @@ const fn initial_xtalcfg() -> u32 {
     (11 << 24) | (11 << 20) | (32 << 6) | 32
 }
 
+#[cfg(not(feature = "efr32mg24"))]
 const fn steady_xtalctrl(ctune: u8) -> u32 {
     // COREDGENANA=none, CTUNEFIXANA=both, CTUNEXOANA/CTUNEXIANA=ctune,
     // COREBIASANA=60. Series 2 config 1 and 2 have no XI/XO CTUNE delta
     // (GSDK `CMU_HFXOInit` only adds one for configs 3+).
     (3 << 24) | ((ctune as u32) << 16) | ((ctune as u32) << 8) | 60
+}
+
+/// xG24 `CMU_HFXOCTuneDeltaGet()`: XO = XI + 40, clamped to 255.
+#[cfg(feature = "efr32mg24")]
+const CTUNE_XO_DELTA: u32 = 40;
+/// xG24 `CMU_HFXOINIT_CTUNEFIXANA_DEFAULT`: fixed capacitor on XO only for
+/// 20 dBm-PA parts ([PM-5131]), on both pins otherwise.
+#[cfg(feature = "efr32mg24-pa20")]
+const CTUNEFIXANA: u32 = 2;
+#[cfg(all(feature = "efr32mg24", not(feature = "efr32mg24-pa20")))]
+const CTUNEFIXANA: u32 = 3;
+
+#[cfg(feature = "efr32mg24")]
+const fn steady_xtalctrl(ctune: u8) -> u32 {
+    // COREDGENANA=none, CTUNEFIXANA per PA, CTUNEXIANA=ctune,
+    // CTUNEXOANA=ctune+40 (sl_device_init_hfxo_s2.c), COREBIASANA=60.
+    let xo = ctune as u32 + CTUNE_XO_DELTA;
+    let xo = if xo > 0xFF { 0xFF } else { xo };
+    (CTUNEFIXANA << 24) | (xo << 16) | ((ctune as u32) << 8) | 60
 }
 
 unsafe fn select_system_clock(source: u32) {
@@ -422,9 +507,29 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(feature = "efr32mg24"))]
     fn gsdk_config_one_defaults_are_encoded_exactly() {
         assert_eq!(initial_xtalcfg(), 0x0BB0_0820);
         assert_eq!(steady_xtalctrl(133), 0x0385_853C);
+    }
+
+    #[test]
+    #[cfg(feature = "efr32mg24")]
+    fn gsdk_config_four_defaults_are_encoded_exactly() {
+        // XTALCFG reset value of efr32mg24_hfxo.h equals the init value.
+        assert_eq!(initial_xtalcfg(), 0x0BB0_0820);
+        // RF-BM-MG24B1 datasheet CTUNE 92: XI 92 (0x5C), XO 132 (0x84).
+        #[cfg(feature = "efr32mg24-pa10")]
+        assert_eq!(steady_xtalctrl(92), 0x0384_5C3C);
+        #[cfg(feature = "efr32mg24-pa20")]
+        assert_eq!(steady_xtalctrl(92), 0x0284_5C3C);
+        // XO saturates at 255.
+        assert_eq!((steady_xtalctrl(250) >> 16) & 0xFF, 0xFF);
+        assert_eq!(HFXO_BASE, 0x4A00_4000);
+        assert_eq!(
+            (HFXO_CTRL_FORCEEN, HFXO_CTRL_DISONDEMAND),
+            (0x1_0000, 0x100_0000)
+        );
     }
 
     #[test]
@@ -439,7 +544,7 @@ mod tests {
         );
         assert_eq!(
             clocks.configure_hfxo(HfxoConfig {
-                frequency_hz: 38_400_000,
+                frequency_hz: HFXO_HZ,
                 ctune: 256,
             }),
             Err(ClockError::CtuneOutOfRange)

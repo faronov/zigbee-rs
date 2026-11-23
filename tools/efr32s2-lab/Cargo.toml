@@ -45,6 +45,11 @@ path = "src/bin/aes.rs"
 # `aes-hw-efr32mg21` until it is proven on hardware.
 required-features = ["wstk"]
 
+[[bin]]
+name = "s2-mg24-hello"
+path = "src/bin/mg24_hello.rs"
+required-features = ["rfbm"]
+
 [features]
 default = ["wstk"]
 # BRD4001A + BRD4183A (EFR32MG22): VCOM log, LED0, image at 0x0.
@@ -52,6 +57,10 @@ wstk = ["efr32s2-hal/efr32mg22"]
 # Home Assistant Connect ZBT-1 (EFR32MG21): image at 0x4000 above the
 # resident Gecko Bootloader, log through SEGGER RTT over SWD.
 zbt1 = ["efr32s2-hal/efr32mg21"]
+# RF-BM-MG24B1 dev board (EFR32MG24A410, 39 MHz): image at 0x0800_0000 on a
+# module without a bootloader, log on the USART0 host link (PA05/PA06).
+# Only `s2-mg24-hello` builds for it so far (no xG24 radio tables yet).
+rfbm = ["dep:rf-bm-mg24b1"]
 
 [dependencies]
 efr32s2-hal = { path = "../../efr32s2-hal", features = ["rt", "time-driver"] }
@@ -59,6 +68,7 @@ embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7", features = ["device"] }
 embedded-hal = "1.0"
+rf-bm-mg24b1 = { path = "../../boards/rf-bm-mg24b1", optional = true, features = ["host-uart"] }
 
 [profile.dev]
 opt-level = "s"

@@ -160,7 +160,7 @@ const RAC_IF_STATECHANGE: u32 = 1 << 0;
 #[cfg(any(feature = "rt", feature = "isr-ack"))]
 const NVIC_ISER1: u32 = 0xE000_E104;
 #[cfg(feature = "rt")]
-const RAC_RSM_IRQ_BIT: u32 = 1 << (37 - 32);
+const RAC_RSM_IRQ_BIT: u32 = 1 << (chip::RAC_RSM_IRQN - 32);
 
 const SYNTH_STATUS: u32 = 0x08;
 const SYNTH_CMD: u32 = 0x0C;
@@ -1453,13 +1453,13 @@ fn close_loop(target: u32, tuning: u32, diag: &mut SynthDiag, timeout_us: u32) -
     }
 }
 
-/// `SYNTH.FREQ` for an O-QPSK channel: `f / 38.4 MHz * 2^19`.
+/// `SYNTH.FREQ` for an O-QPSK channel: `f / f_HFXO * 2^19` (38.4 MHz).
 pub const fn synth_freq(channel: u8) -> Option<u32> {
     if channel < 11 || channel > 26 {
         return None;
     }
     let hz = 2_405_000_000u64 + 5_000_000u64 * (channel as u64 - 11);
-    Some(((hz << 19) / 38_400_000) as u32)
+    Some(((hz << 19) / crate::clock::HFXO_HZ as u64) as u32)
 }
 
 fn tx_power_entry(ddbm: i16) -> (i16, u8, u16) {
@@ -1564,6 +1564,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(feature = "hfxo-39mhz"))]
     fn channel_frequency_words() {
         assert_eq!(synth_freq(15), Some(0x01F9_3555));
         assert_eq!(synth_freq(10), None);
@@ -1577,6 +1578,18 @@ mod tests {
         assert_eq!(TX_POWER_RANGE_DBM, (-25, 6));
         #[cfg(feature = "efr32mg21")]
         assert_eq!(TX_POWER_RANGE_DBM, (-30, 20));
+        #[cfg(feature = "efr32mg24")]
+        assert_eq!(TX_POWER_RANGE_DBM, (0, 0));
+    }
+
+    #[test]
+    #[cfg(feature = "efr32mg24")]
+    fn xg24_radio_is_explicitly_unsupported() {
+        // No captured tables: init must fail before any radio access.
+        const { assert!(!chip::SUPPORTED) };
+        assert!(chip::INIT.is_empty());
+        let token = RadioToken::new();
+        assert!(matches!(token.init(), Err(RadioError::Unsupported)));
     }
 
     #[test]
@@ -1632,6 +1645,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "hfxo-39mhz"))]
     fn locnt_target_matches_rail_reference() {
         // xG22 channel 15 snapshots: RX LOCNTTARGET 0xFCB, TX (CW) 0xFC9.
         let freq = synth_freq(15).unwrap();
@@ -1671,3 +1685,9 @@ mod tests {
         assert_eq!(chip::LAYOUT.bufc, 0x5400_4000);
     }
 }
+
+// xG24 tables (appended so the line numbers above, which end up in panic
+// locations of the MG21/MG22 images, stay unchanged).
+#[cfg(feature = "efr32mg24")]
+#[path = "xg24.rs"]
+mod chip;

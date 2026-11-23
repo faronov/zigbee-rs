@@ -1,0 +1,47 @@
+[package]
+name = "efr32mg24-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "zigbee-rs EFR32MG24 products: ZRHP network co-processor and Router (RF-BM-MG24B1 dev board, SONOFF Dongle-M)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[features]
+default = ["rf-bm-mg24b1", "ncp"]
+# Board variant (identity, crystal, PA); exactly one. The memory map is the
+# same on both: Gecko bootloader kept at 0x0800_0000..0x0800_6000.
+rf-bm-mg24b1 = ["dep:rf-bm-mg24b1"]
+sonoff-dongle-m = ["dep:sonoff-dongle-m"]
+# Role; exactly one. Both roles share the memory map and the security
+# journal window, so a role change keeps the frame-counter reservations
+# (`select_role_tag`).
+# ZRHP coordinator NCP (Trust Center, GP combo, host transport).
+ncp = [
+    "dep:ncp-coordinator-app",
+    "rf-bm-mg24b1?/host-uart",
+    "sonoff-dongle-m?/host-uart",
+    "router-app/centralized-tclk",
+    "router-app/global-aps-counter",
+    "router-app/ncp-capacity",
+    "router-app/green-power-sink",
+    "zigbee-runtime/centralized-tclk",
+    "zigbee-runtime/trust-center",
+    "zigbee-runtime/global-aps-counter",
+    "zigbee-runtime/host-passthrough",
+    "zigbee-runtime/ncp-capacity",
+    "zigbee-runtime/green-power-ncp",
+]
+# Routing node (HA Range Extender) with the Green Power Proxy Basic.
+router = ["router-app/router", "router-app/green-power", "zigbee-runtime/router"]
+
+[dependencies]
+efr32s2-hal = { path = "../../efr32s2-hal" }
+rf-bm-mg24b1 = { path = "../../boards/rf-bm-mg24b1", optional = true }
+sonoff-dongle-m = { path = "../../boards/sonoff-dongle-m", optional = true }
+embedded-storage = "0.3"
+ncp-coordinator-app = { path = "../../apps/ncp-coordinator", optional = true }
+router-app = { path = "../../apps/router", default-features = false }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }

@@ -327,3 +327,9 @@ pub(super) fn seq_arm(_warm: Warm) {}
 pub(super) fn seq_release(warm: Warm) {
     unsafe { write(L.rac + RAC_SEQIF + CLR, seqif(warm)) };
 }
+
+/// `FRC_IRQn` and `RAC_RSM_IRQn` (GSDK 4.5.0 `IRQn_Type`).
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+pub(super) const FRC_IRQN: u32 = 34;
+#[cfg_attr(not(feature = "rt"), allow(dead_code))]
+pub(super) const RAC_RSM_IRQN: u32 = 37;

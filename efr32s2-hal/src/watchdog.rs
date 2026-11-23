@@ -31,7 +31,7 @@
 
 use crate::chip::{BusClock, base};
 
-const WDOG0: u32 = 0x4A01_8000;
+const WDOG0: u32 = base::WDOG0;
 const WDOG_EN: u32 = WDOG0 + 0x04;
 const WDOG_CFG: u32 = WDOG0 + 0x08;
 const WDOG_CMD: u32 = WDOG0 + 0x0C;

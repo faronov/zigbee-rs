@@ -25,6 +25,8 @@ pub struct Peripherals {
     pub gpio: Gpio,
     pub flash: Efr32s2Flash,
     pub usart0: Usart,
+    /// xG24 has a single USART.
+    #[cfg(not(feature = "efr32mg24"))]
     pub usart1: Usart,
     pub i2c0: I2c0Token,
     pub radio: RadioToken,
@@ -41,8 +43,8 @@ pub struct Peripherals {
 impl Peripherals {
     /// Acquire the singleton peripheral set once.
     ///
-    /// On xG22 this also opens the GPIO, HFXO, SYSCFG and MSC bus clocks
-    /// (all gated at reset) so the returned tokens are usable.
+    /// On xG22 and xG24 this also opens the GPIO, HFXO, SYSCFG and MSC bus
+    /// clocks (all gated at reset) so the returned tokens are usable.
     pub fn take() -> Option<Self> {
         TAKEN
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -57,6 +59,7 @@ impl Peripherals {
                 gpio: Gpio::new(),
                 flash: Efr32s2Flash::new(),
                 usart0: Usart::new(Instance::Usart0),
+                #[cfg(not(feature = "efr32mg24"))]
                 usart1: Usart::new(Instance::Usart1),
                 i2c0: I2c0Token::new(),
                 radio: RadioToken::new(),

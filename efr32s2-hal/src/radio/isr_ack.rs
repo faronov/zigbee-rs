@@ -59,8 +59,8 @@ const BUFC_CATCH_UP_US: u32 = 40;
 /// 5-byte ACK airtime (352 us) with warm-down margin.
 const ACK_TX_TIMEOUT_US: u32 = 1_000;
 
-/// `FRC` is IRQ 34 on xG21 and xG22 (`FRC_PRI` is 33).
-const FRC_IRQ_BIT: u32 = 1 << (34 - 32);
+/// `FRC` IRQ number per die (`chip::FRC_IRQN`: 34 on xG21/xG22, 33 on xG24).
+const FRC_IRQ_BIT: u32 = 1 << (super::chip::FRC_IRQN - 32);
 const NVIC_ICER1: u32 = 0xE000_E184;
 const NVIC_ISPR1: u32 = 0xE000_E204;
 
