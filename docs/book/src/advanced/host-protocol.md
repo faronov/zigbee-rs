@@ -10,7 +10,7 @@
 > on an ESP32-C6 DevKit (lab variant, USB-Serial-JTAG) it completed the
 > session, formed a network (soft MAC `pan-coordinator` + `energy-detect`)
 > and resumed it after a reset. No device has joined it yet and none of the
-> hardware gates H1–H12 has passed. The zigpy library
+> hardware gates of 14.6 (H1–H8, H10–H12, PTA1) has passed. The zigpy library
 > ([`faronov/zigpy-zrhp`](https://github.com/faronov/zigpy-zrhp)) is tested
 > against the vectors, a Python NCP simulator and the Rust NCP on the host
 > (12.1.1) and on the Thread BR H2 NCP (2026-11-20: start on the existing
@@ -3090,7 +3090,7 @@ are kept, and the size is detected at runtime:
     replay (12.4).
   - Capability 21 is set only when the board crate declares the PTA
     wiring.
-- **Validation.** Gate H9 (14.6) measures PER and latency with Wi-Fi load,
+- **Validation.** Gate PTA1 (14.6) measures PER and latency with Wi-Fi load,
   with coexistence on and off.
 
 ---
@@ -3710,7 +3710,7 @@ This is simulation-level evidence, not hardware evidence.
 | H6 | NCP firmware update with trial boot, confirm, rollback and retained network state. |
 | H7 | 24 h soak with noise injection on the UART variant (921 600, RTS/CTS). |
 | H8 | **Thread BR board UART:** 921 600 (default) and 2 000 000 with RTS/CTS on R19/R20, and the 460 800 fallback without flow control, with both chips writing flash (`rx_overflow = 0`) under the real NCP and hub (R18–R20 fitting and an RX-stall test through the phase-0 bridge passed on 2026-11-19, 11.5; the real NCP with the H2 writing flash through the phase-0 bridge passed on 2026-11-20, 11.5; the real hub with the S3 writing flash is still open). Identify the H2 module's flash size (2 MB or 4 MB) via JEDEC ID, and check the NCP's layout-mismatch refusal. ROM-path recovery via S3 GPIO7/8 with `zbnv` preserved. |
-| H9 | **PTA coexistence:** Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on. The hub's automatic enable/disable follows Wi-Fi up/down, including Ethernet-only. GP TempMaster reply behaviour with grant denied. |
+| PTA1 | **PTA coexistence** (formerly H9; renamed because 12.3.1 uses H9 for a herdsman note): Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on. The hub's automatic enable/disable follows Wi-Fi up/down, including Ethernet-only. GP TempMaster reply behaviour with grant denied. |
 | H10 | **GP combo on the NCP:** direct and proxy-tunnelled commissioning into the NCP sink with zigpy as shadow, including an unsecured (level-0) FlowerX GP / BGT1 GP; a bidirectional GPD with the NCP as its own TempMaster; Sink Table across an NCP reboot (seamless resume) and across backup/restore. |
 | H11 | **Z2M end to end:** zigbee-herdsman adapter with 10+ real devices; Z2M backup → restore on a fresh NCP. |
 | H12 | **Embedded hub:** S3 hub with a synthetic 2 000-device store (PSRAM budget of 3.4), paging forced by a reduced NCP cache, power cuts during writebacks, store journal recovery. Candidate NCP image that fails its trial (no `FW_CONFIRM`) → the H2 bootloader returns to the previous slot, network state retained; an image larger than the H2 slot refused with `TOO_LARGE` before any erase. Hub app within its slot (3 MiB on 8 MB, 2 944 KiB on the 4 MB development layout). |
@@ -3727,12 +3727,12 @@ This is simulation-level evidence, not hardware evidence.
 | 4 | Runtime/persistence: FC checkpoint hook and floors; IEEE override; atomic restore transaction; snapshot export; TC-device cache with writeback/eviction, `host_acked_rev`, streamed TC-journal snapshots (256 entries); child journal with 1 024-byte slots (64 children); key-export lock | 2 | Host-tested with journal fault injection |
 | 5 | Runtime: EZSP hashed-TCLK derivation (HMAC-MMO), cached with origin 4 | 4 | Host-tested against the candidate vectors; normative after H5 |
 | 6 | GP: NCP-sink mode surface (`EVT_GP_*`, `GP_*` commands, `R_GP_SINK` codec), sink table size as a product parameter (16), host-sink mode local-proxy hand-off | GP sink on master | Host-tested with zigpy golden vectors |
-| 7 | MAC/HAL: H2/C6 UART transport with UHCI RX DMA and optional RTS/CTS; USJ non-blocking pump; PTA follower in the ESP MAC | — | Host/unit tests, builds; hardware gates H1, H2, H8, H9 |
+| 7 | MAC/HAL: H2/C6 UART transport with UHCI RX DMA and optional RTS/CTS; USJ non-blocking pump; PTA follower in the ESP MAC | — | Host/unit tests, builds; hardware gates H1, H2, H8, PTA1 |
 | 8 | `apps/ncp-coordinator` over `TrustCenterCoordinatorApp` + GP combo | 1–6 | Host-tested against the Rust reference host over an in-memory pipe |
 | 9 | `products/esp32-zigbee-ncp`: 2 MB and 4 MB layouts (8.9), NV journals, identity, transport features (`transport-usj`, `transport-uart`), boards (H2 devkit, Thread BR H2 side), signed update, size report | 7, 8 | Builds, post-link layout checks, size budget |
 | 10 | Hosts: `zigpy-zrhp` (Python, under `faronov`) plus the sink-on-radio hook in the `faronov/zigpy` fork (no upstream PR; upstreaming later, with user approval), Go `adapter/zrhp` (+ margin 10 000), zigbee-herdsman fork with `zrhp` (TypeScript, plus the backup pass-through), embedded `faronov/zigbee-rs-hub` (Rust, S3) | 1 vectors | Host-tested vs vectors and the simulated NCP |
 | 11 | Noise bench (14.4), mcuemu scenario (14.5) | 1, 8 | Simulation |
-| 12 | Hardware gates H1–H12 | 9, 10 | Lab, then production-path evidence |
+| 12 | Hardware gates H1–H8, H10–H12 and PTA1 (14.6) | 9, 10 | Lab, then production-path evidence |
 
 Nothing beyond step 1 should claim more than "host-tested" until gates H1–H4
 pass. The coordinator remains documented as host-tested in
@@ -3761,7 +3761,7 @@ two requirements. Each decision is applied in the sections listed.
 | 12 | LOG endpoint carries **UTF-8 text**. | 7.10 |
 | 13 | Go hub `FrameCounterRestoreMargin` **2 500 → 10 000**. This is a required change in the Go repository; this document does not edit it. | 9.4, 12.2 |
 | 14 | **zigbee-herdsman / Z2M adapter in scope.** | 9.1, 9.6, 12.3, 14.3, gate H11 |
-| R1 | **Embedded host** from the start: Rust hub `faronov/zigbee-rs-hub` on the ESP32-S3 of the Espressif Thread BR / Zigbee GW board, using the shared crate `zigbee-zrhp`. Covers host profiles, minimum host buffers, BR-board UART, ROM-path NCP update and PTA. | 1 (G9), 3.2–3.4, 4.1, 4.4, 11.5, 12.4, gates H8, H9, H12 |
+| R1 | **Embedded host** from the start: Rust hub `faronov/zigbee-rs-hub` on the ESP32-S3 of the Espressif Thread BR / Zigbee GW board, using the shared crate `zigbee-zrhp`. Covers host profiles, minimum host buffers, BR-board UART, ROM-path NCP update and PTA. | 1 (G9), 3.2–3.4, 4.1, 4.4, 11.5, 12.4, gates H8, PTA1, H12 |
 | R2 | **No network transport in ZRHP** (USJ and UART only). The S3 hub's WebSocket JSON API is hub-level and out of scope. | Header, 1, 3.2, 4, 13 |
 
 **Answers to the follow-up questions** (same day):
@@ -3774,7 +3774,7 @@ two requirements. Each decision is applied in the sections listed.
 | N4 | BR board UART: **460 800 without flow control** by default (UART part superseded by N10, 2026-11-19), DMA/IRAM RX mandatory; RTS/CTS via R19/R20 documented as an optional board mod. H2 module flash size unknown: both 2 MB/4 MB partition tables kept, size detected at runtime (checked when the board is on hwlab). | 11.5, 8.9, H8 |
 | N5 | zigbee-herdsman: **maintained fork**, no upstream PR plan for v1. | 3, 12.3, 15 |
 | N6 | ~~The S3 stores known-good + candidate NCP images, with rollback through the H2 ROM bootloader.~~ **Amended 2026-11-18:** rollback lives on the **H2**: A/B application slots on the H2 flash, `FW_*` writes the inactive slot, trial boot, host `FW_CONFIRM`, H2 bootloader rollback of an unconfirmed image. The S3 stores **no** NCP images. The H2 ROM-bootloader path is a manual/development recovery path with an operator-supplied image. | 7.9, 8.9, 11.5, 12.4, H12 |
-| N7 | PTA **disabled by default**; the hub enables it automatically while Wi-Fi is active (off with Ethernet-only). | 7.1, 11.5, 12.4, H9 |
+| N7 | PTA **disabled by default**; the hub enables it automatically while Wi-Fi is active (off with Ethernet-only). | 7.1, 11.5, 12.4, PTA1 |
 | N8 | USB identity: **keep Espressif's VID/PID**. | 4.3, 11.3, H1 |
 | N9 | (2026-11-18, amended 2026-11-20) S3 flash: **detect 4 MB / 8 MB at boot, one partition table per size.** 8 MB is the product: hub app ×2 at 3 MiB (A/B OTA) + `hubdata` 1 920 KiB. 4 MB samples: development layout, one 2 944 KiB app slot without OTA + 1 MiB `hubdata` (host store, configuration, declarative converter database); no 1.5 MiB app target (superseded). No NCP image partition. | 3.4, 12.4, H12 |
 | N10 | (2026-11-19, proposal) BR board UART: **921 600 with RTS/CTS** on the reserved links R19/R20 by default (verified fitted; RX stalls lose nothing with flow control and lose data without it at every rate), 2 000 000 allowed, 460 800 without flow control as the fallback. Supersedes the UART part of N4. | 4.1, 4.4, 11.5, H8 |
@@ -3786,7 +3786,7 @@ unknowns are hardware facts tracked as gates:
 - the H2 UART maximum rate (H2);
 - the EZSP hashed-TCLK byte order (H5);
 - the BR board's UART under real flash-write load (H8; the flash variant and the R18–R20 fitting are known since 2026-11-18/19);
-- PTA behaviour under Wi-Fi load (H9).
+- PTA behaviour under Wi-Fi load (PTA1).
 
 ## 17. References
 
