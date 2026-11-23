@@ -294,6 +294,8 @@
   // The image for this release: the only board, or for a size group the chosen fitting variant (null = refuse).
   // Images list the embedded PSRAM sizes they are for (`match.embedded_psram_mb`; absent: any).
   const psramFits = (b) => !b.match?.embedded_psram_mb || (detection.psramMb !== null && b.match.embedded_psram_mb.includes(detection.psramMb));
+  // Hub images list optional parts (`features`: ["mqtt"] on 8 MB); the NCP's string is its build features.
+  const featureText = (b) => Array.isArray(b.features) ? (b.features.length ? `, with ${b.features.map((f) => f.toUpperCase()).join(', ')}` : ', no MQTT') : '';
   const psramText = (n) => n === null ? 'unknown PSRAM' : n ? `${n} MB embedded PSRAM` : 'no embedded PSRAM';
 
   function choose(entry, r) {
@@ -306,7 +308,7 @@
       const why = !detection ? '' :
         b.flash_bytes > detection.flashBytes ? `needs ${mb(b.flash_bytes)} flash, the chip has ${mb(detection.flashBytes)}` :
         !psramFits(b) ? `for ${b.match.embedded_psram_mb.join('/')} MB PSRAM, the chip has ${psramText(detection.psramMb)}` : '';
-      opt.textContent = `${b.flash_size}: ${b.layout}${b.psram ? `, ${b.psram} PSRAM` : ''}` + (why ? `  (${why})` : '');
+      opt.textContent = `${b.flash_size}: ${b.layout}${b.psram ? `, ${b.psram} PSRAM` : ''}${featureText(b)}` + (why ? `  (${why})` : '');
       opt.disabled = !!why;
       select.appendChild(opt);
     }
@@ -361,7 +363,7 @@
     const repo = `https://github.com/${product.repository}`;
     $('board-info').innerHTML = `
       <dt>Chip</dt><dd>${esc(board.chip_family)}, ${esc(board.flash_size)} flash${entry.group ? ' (selected image)' : ''}</dd>
-      <dt>Layout</dt><dd><code>${esc(board.layout)}</code>${board.psram ? `, ${esc(board.psram)} PSRAM build` : ''}${board.note ? ` · ${esc(board.note)}` : ''}</dd>
+      <dt>Layout</dt><dd><code>${esc(board.layout)}</code>${board.psram ? `, ${esc(board.psram)} PSRAM build` : ''}${esc(featureText(board))}${board.note ? ` · ${esc(board.note)}` : ''}</dd>
       ${board.transport ? `<dt>Host link</dt><dd>${esc(board.transport)}</dd>` : ''}
       <dt>Firmware</dt><dd>${esc(product.name)}</dd>`;
     const fw = board.fw_update;

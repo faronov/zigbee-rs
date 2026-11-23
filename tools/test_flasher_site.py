@@ -170,6 +170,9 @@ class FlasherSiteTests(unittest.TestCase):
                   board("thread-br-s3-hub-8mb-opi", "8MB", "octal", [8, 16]),
                   board("thread-br-s3-hub-4mb-dev", "4MB", "quad", [0, 2, 4]),
                   board("thread-br-s3-hub-4mb-dev-opi", "4MB", "octal", [8, 16])]
+        # Feature lists (MQTT only in the 8 MB images) do not split the group.
+        for b in boards:
+            b["features"] = ["mqtt"] if b["flash_size"] == "8MB" else []
         SITE.mark_size_groups(boards, "zigbee-rs hub")
         self.assertEqual({b["size_group"] for b in boards}, {"thread-br-s3-hub"})
         self.assertEqual(boards[0]["size_group_title"],
