@@ -266,6 +266,8 @@ struct FakePlatform {
     confirmed: bool,
     ieee_override: Option<[u8; 8]>,
     pta: Option<(bool, u8)>,
+    /// PTA turned off by the platform itself (fail closed after a fault).
+    pta_failed: bool,
     mac_tx: u32,
 }
 
@@ -354,8 +356,14 @@ impl NcpPlatform for FakePlatform {
         true
     }
     fn set_pta(&mut self, enable: bool, priority_mask: u8) -> Result<(), PlatformError> {
+        if enable && self.pta_failed {
+            return Err(PlatformError::Hardware);
+        }
         self.pta = Some((enable, priority_mask));
         Ok(())
+    }
+    fn pta_active(&self) -> Option<bool> {
+        Some(self.pta.is_some_and(|(enable, _)| enable) && !self.pta_failed)
     }
     /// A radio with 2 dB steps from -20 to +10 dBm.
     fn tx_power_step(&self, dbm: i8) -> Option<i8> {
@@ -1076,6 +1084,38 @@ fn firmware_ieee_pta_and_retry_cache() {
     assert_eq!(platform.pta, Some((true, 0x05)));
     let status = host.response(status);
     assert_eq!(status.body::<SysGetStatusRsp>().flags & 0x04, 0x04);
+
+    // The platform turns PTA off on its own (fail closed after a fault):
+    // reported off, re-enabling fails, a new mask is passed on as disabled.
+    platform.pta_failed = true;
+    let status = host.request_raw(ids::SYS_GET_STATUS, &[]);
+    let get = host.request(&SysGetConfig {
+        ids: List::new(&[config::COEX_ENABLE]),
+    });
+    let set = host.request(&SysSetConfig {
+        values: List::new(&[
+            ConfigValue {
+                id: config::COEX_TX_PRIORITY_MASK,
+                value: Bytes8(&[0x02]),
+            },
+            ConfigValue {
+                id: config::COEX_ENABLE,
+                value: Bytes8(&[1]),
+            },
+        ]),
+    });
+    exchange!();
+    let status = host.response(status);
+    assert_eq!(status.body::<SysGetStatusRsp>().flags & 0x04, 0);
+    let get = host.response(get);
+    let get: SysGetConfigRsp = get.body();
+    let values: Vec<_> = get.items.iter().map(|i| i.value.0.to_vec()).collect();
+    assert_eq!(values, [vec![0]]);
+    let set = host.response(set);
+    let set: SysSetConfigRsp = set.body();
+    let results: Vec<_> = set.results.iter().map(|r| r.status).collect();
+    assert_eq!(results, [Status::Success, Status::Failure]);
+    assert_eq!(platform.pta, Some((false, 0x02)));
 
     // Retry cache: a repeated NWK_FORM is answered from the cache and the
     // network is formed once.
