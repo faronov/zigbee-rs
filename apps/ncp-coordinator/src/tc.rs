@@ -1416,6 +1416,17 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         }
     }
 
+    fn group(&self, index: usize) -> Option<crate::port::GroupView> {
+        const _: () = assert!(
+            crate::port::MAX_GROUP_ENDPOINTS == zigbee_aps::group::MAX_ENDPOINTS_PER_GROUP
+        );
+        let entry = self.app.device().aps().group_table().groups().get(index)?;
+        Some(crate::port::GroupView {
+            group: entry.group_address,
+            endpoints: entry.endpoint_list.clone(),
+        })
+    }
+
     fn gp(&mut self) -> Option<&mut dyn crate::gp::GpPort> {
         Some(self)
     }

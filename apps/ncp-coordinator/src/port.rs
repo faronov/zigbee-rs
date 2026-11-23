@@ -242,6 +242,16 @@ pub enum OpError {
     Zigbee(u8),
 }
 
+/// Most endpoints of one APS group (`zigbee_aps` `MAX_ENDPOINTS_PER_GROUP`).
+pub const MAX_GROUP_ENDPOINTS: usize = 8;
+
+/// One group of the coordinator's APS group table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupView {
+    pub group: u16,
+    pub endpoints: Vec<u8, MAX_GROUP_ENDPOINTS>,
+}
+
 /// The coordinator stack behind the NCP.
 #[allow(async_fn_in_trait)]
 pub trait CoordinatorPort {
@@ -319,6 +329,12 @@ pub trait CoordinatorPort {
     fn group_membership(&mut self, op: u8, group: u16, endpoint: u8) -> Result<(), EndpointError> {
         let _ = (op, group, endpoint);
         Err(EndpointError::Unsupported)
+    }
+    /// Group `index` of the APS group table (`APS_GROUP` records of
+    /// `TBL_READ` and the backup); `None` past the end.
+    fn group(&self, index: usize) -> Option<GroupView> {
+        let _ = index;
+        None
     }
 
     // ── Network images, Trust Center devices (formation parameters,
