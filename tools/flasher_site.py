@@ -173,8 +173,11 @@ def mark_size_groups(boards: list[dict], product_name: str) -> None:
     group itself (`size_group`, `size_group_title`)."""
     keyed: dict[str, list[dict]] = {}
     for board in boards:
+        # A feature *string* is a different build (the NCP's Cargo features per transport); a feature
+        # *list* (hub: ["mqtt"] on 8 MB only) describes what an image of the group includes.
+        features = board.get("features") if isinstance(board.get("features"), str) else ""
         key = board.get("size_group") or "|".join(
-            str(board.get(k) or "") for k in ("product", "firmware", "chip_family", "transport", "features"))
+            [str(board.get(k) or "") for k in ("product", "firmware", "chip_family", "transport")] + [features])
         keyed.setdefault(key, []).append(board)
     for members in keyed.values():
         sizes = {flash_bytes(b["flash_size"]) for b in members}
