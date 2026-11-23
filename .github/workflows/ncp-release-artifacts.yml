@@ -1,4 +1,5 @@
 name: NCP release artifacts
+run-name: NCP images from ${{ inputs.ref || github.ref_name }}
 
 # Flashable ZRHP NCP images of any ref as a CI artifact (not a release; tagged
 # releases come from ncp-release.yml and are what the web flasher serves):
@@ -15,6 +16,9 @@ name: NCP release artifacts
 #   board.json, FLASHING.txt, SHA256SUMS
 # The bootloader is espflash's bundled ESP-IDF bootloader (no A/B rollback; FW_* rollback needs
 # products/esp32-zigbee-ncp/bootloader, built with ESP-IDF v5.5.1).
+#
+# Build the current stack, or select another commit with the ref input:
+#   gh workflow run ncp-release-artifacts.yml --ref master -f ref=master
 
 on:
     push:
