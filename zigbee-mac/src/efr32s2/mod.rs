@@ -497,5 +497,47 @@ fn fill_random(_output: &mut [u8]) -> Result<(), MacError> {
 /// hardware); a mailbox error is reported, never replaced.
 #[cfg(feature = "efr32mg24")]
 fn fill_random(output: &mut [u8]) -> Result<(), MacError> {
-    efr32s2_hal::se::fill_random(output).map_err(|_| MacError::Unsupported)
+    efr32s2_hal::se::fill_random(output).map_err(map_se_error)
+}
+
+/// Secure Engine TRNG failures as MAC errors. `Unsupported` stays reserved
+/// for a build without an SE (the platform contract for "no entropy
+/// source"). An SE that does not answer, refuses the mailbox or has a
+/// poisoned mailbox is a hardware fault (`RadioError`, as a failed TRNG on
+/// the CC26x2 backend); a non-OK SE result (refused command, failed health
+/// test) is a failed security service; a mailbox held by another caller
+/// is transient (`Other`). Whether a poisoned mailbox ends in a reset is
+/// the product's policy (`efr32s2_hal::se::is_poisoned`).
+#[cfg(feature = "efr32mg24")]
+fn map_se_error(error: efr32s2_hal::se::SeError) -> MacError {
+    use efr32s2_hal::se::SeError;
+    match error {
+        SeError::Busy => MacError::Other,
+        SeError::Timeout | SeError::Poisoned | SeError::MailboxError => MacError::RadioError,
+        SeError::Response(_) => MacError::SecurityError,
+        SeError::Unavailable => MacError::Unsupported,
+    }
+}
+
+#[cfg(all(test, feature = "efr32mg24"))]
+mod se_tests {
+    use super::*;
+    use efr32s2_hal::se::SeError;
+
+    #[test]
+    fn se_errors_map_to_specific_mac_errors() {
+        assert_eq!(map_se_error(SeError::Busy), MacError::Other);
+        assert_eq!(map_se_error(SeError::Timeout), MacError::RadioError);
+        assert_eq!(map_se_error(SeError::Poisoned), MacError::RadioError);
+        assert_eq!(map_se_error(SeError::MailboxError), MacError::RadioError);
+        assert_eq!(map_se_error(SeError::Response(5)), MacError::SecurityError);
+        assert_eq!(map_se_error(SeError::Unavailable), MacError::Unsupported);
+    }
+
+    #[test]
+    fn host_build_reports_no_entropy_source_and_publishes_nothing() {
+        let mut out = [0xAAu8; 18];
+        assert_eq!(fill_random(&mut out), Err(MacError::Unsupported));
+        assert_eq!(out, [0; 18]);
+    }
 }

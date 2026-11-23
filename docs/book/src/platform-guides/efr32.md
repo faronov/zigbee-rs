@@ -649,6 +649,13 @@ its response is never taken for a later command's. A failed request zeroes
 the caller's buffer. Host-model tests in `efr32s2_hal::se` cover the late
 completion; host builds have no SE and fail with `SeError::Unavailable`.
 
+`fill_random` reports SE failures as specific MAC errors: no SE
+(`Unavailable`) is `Unsupported`, the platform's "no entropy source";
+`Timeout`, `MailboxError` and `Poisoned` are `RadioError` (a hardware fault,
+as a failed TRNG on CC26x2); a non-OK SE result is `SecurityError`; a mailbox
+held by another caller is `Other`. Every stack caller fails closed on any of
+them (formation, PAN ID, Trust Center keys).
+
 Not changed and not yet checked on xG24 silicon: EM2 entry (`power`), DC-DC
 (left in bypass), the LFXO (the RF-BM module has one; the time base still uses
 the LFRCO), I2C and IADC (not used by these products).

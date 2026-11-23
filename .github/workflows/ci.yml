@@ -101,6 +101,9 @@ jobs:
       - run: cargo test -p zigbee-tests --all-features --locked
       - run: cargo test -p zigbee-zdo --features router --locked
       - run: cargo test -p zigbee-mac --features stm32wb --lib stm32wb --locked
+      # EFR32 Series 2 PHY adapter on xG24: ACK filter, error mapping and the
+      # Secure Engine TRNG error mapping (the PA variant is the board's).
+      - run: cargo test -p zigbee-mac --features efr32mg24,efr32s2-hal/efr32mg24-pa10 --lib efr32s2 --locked
       - run: cargo test -p zigbee-runtime --no-default-features --locked
       - run: cargo test -p zigbee-gp --all-features --locked
       - run: cargo test -p zigbee-gp --no-default-features --locked
@@ -596,6 +599,7 @@ jobs:
       - run: cargo clippy -p zigbee-runtime --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zdo --features router --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --features stm32wb --all-targets --locked -- -D warnings
+      - run: cargo clippy -p zigbee-mac --features efr32mg24,efr32s2-hal/efr32mg24-pa10 --all-targets --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --features nrf-fem --all-targets --locked -- -D warnings
       - run: cargo clippy -p zigbee-runtime --no-default-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --no-default-features --locked -- -D warnings

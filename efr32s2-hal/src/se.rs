@@ -27,6 +27,11 @@
 //! completion only writes memory nobody uses, and its response cannot be
 //! taken for the answer to a later command. Nothing is published from a
 //! failed request: the caller's buffer is zeroed.
+//!
+//! Recovery is the product's decision, not this driver's: a poisoned
+//! mailbox ([`is_poisoned`]) only comes back with a reset, and the
+//! EFR32MG24 product turns it into a reported, controlled reset
+//! (`products/efr32mg24/src/fatal.rs`).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -119,8 +124,7 @@ impl MailboxLock {
         self.poisoned.store(true, Ordering::Release);
     }
 
-    #[cfg(test)]
-    fn is_poisoned(&self) -> bool {
+    pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
     }
 }
@@ -242,6 +246,20 @@ pub fn fill_random(output: &mut [u8]) -> Result<(), SeError> {
 pub fn fill_random(output: &mut [u8]) -> Result<(), SeError> {
     output.fill(0);
     Err(SeError::Unavailable)
+}
+
+/// Whether an unanswered (or refused) command has poisoned the SE
+/// mailbox: every later request fails with [`SeError::Poisoned`] until
+/// the chip resets. A cheap flag read, meant for the product's main loop.
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+pub fn is_poisoned() -> bool {
+    MAILBOX.is_poisoned()
+}
+
+/// Host build: there is no mailbox to poison.
+#[cfg(not(all(target_arch = "arm", target_os = "none")))]
+pub fn is_poisoned() -> bool {
+    false
 }
 
 /// # Safety
@@ -727,5 +745,24 @@ mod tests {
         let mut out = [0xAAu8; 8];
         assert_eq!(fill_random(&mut out), Err(SeError::Unavailable));
         assert_eq!(out, [0; 8]);
+        assert!(!is_poisoned());
+    }
+
+    #[test]
+    fn only_an_unanswered_or_refused_command_poisons() {
+        for (answer, poisons) in [
+            (Answer::Never, true),
+            (Answer::TxError, true),
+            (Answer::Response(5), false),
+            (Answer::RxError, false),
+            (Answer::Now, false),
+        ] {
+            let dma = leaked_dma();
+            let lock = MailboxLock::new();
+            let mut model = Model::new(dma);
+            model.answer = answer;
+            let _ = fill(&mut model, &lock, dma, &mut [0u8; 4]);
+            assert_eq!(lock.is_poisoned(), poisons);
+        }
     }
 }
