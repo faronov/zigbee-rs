@@ -101,6 +101,9 @@ jobs:
       - run: cargo test -p zigbee-tests --all-features --locked
       - run: cargo test -p zigbee-zdo --features router --locked
       - run: cargo test -p zigbee-mac --features stm32wb --lib stm32wb --locked
+      # EFR32 Series 2 PHY adapter on xG24: ACK filter, error mapping and the
+      # Secure Engine TRNG error mapping (the PA variant is the board's).
+      - run: cargo test -p zigbee-mac --features efr32mg24,efr32s2-hal/efr32mg24-pa10 --lib efr32s2 --locked
       - run: cargo test -p zigbee-runtime --no-default-features --locked
       - run: cargo test -p zigbee-gp --all-features --locked
       - run: cargo test -p zigbee-gp --no-default-features --locked
@@ -425,6 +428,37 @@ jobs:
             manifest: efr32s2-hal/Cargo.toml
             workspace: efr32s2-hal
             features: "efr32mg22,isr-ack"
+          # EFR32MG24: SYSRTC time base, xG24 HFXO/CMU/GPIO/USART maps, the
+          # USART0 host rings, the SE mailbox TRNG framing and the explicit
+          # `Unsupported` radio (no captured xG24 tables yet).
+          - name: EFR32 Series 2 HAL (MG24 10 dBm, 39 MHz, host UART)
+            manifest: efr32s2-hal/Cargo.toml
+            workspace: efr32s2-hal
+            features: "efr32mg24-pa10,hfxo-39mhz,usart0-host"
+          - name: EFR32 Series 2 HAL (MG24 20 dBm, ISR Imm-Ack)
+            manifest: efr32s2-hal/Cargo.toml
+            workspace: efr32s2-hal
+            features: "efr32mg24-pa20,isr-ack"
+          - name: RF-BM-MG24B1 board
+            manifest: boards/rf-bm-mg24b1/Cargo.toml
+            workspace: boards/rf-bm-mg24b1
+            features: "host-uart"
+          - name: SONOFF Dongle-M board
+            manifest: boards/sonoff-dongle-m/Cargo.toml
+            workspace: boards/sonoff-dongle-m
+            features: "host-uart"
+          - name: EFR32MG24 product (RF-BM-MG24B1, NCP)
+            manifest: products/efr32mg24/Cargo.toml
+            workspace: products/efr32mg24
+            features: "rf-bm-mg24b1,ncp"
+          - name: EFR32MG24 product (Dongle-M, NCP)
+            manifest: products/efr32mg24/Cargo.toml
+            workspace: products/efr32mg24
+            features: "sonoff-dongle-m,ncp"
+          - name: EFR32MG24 product (RF-BM-MG24B1, Router)
+            manifest: products/efr32mg24/Cargo.toml
+            workspace: products/efr32mg24
+            features: "rf-bm-mg24b1,router"
           # CC26x2/CC13x2: CCFG builder, identity decode, RF core command
           # layouts, PA tables and override lists, flash/UART/RTC logic.
           - name: CC26x2 HAL (CC2652P)
@@ -571,6 +605,7 @@ jobs:
       - run: cargo clippy -p zigbee-runtime --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zdo --features router --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --features stm32wb --all-targets --locked -- -D warnings
+      - run: cargo clippy -p zigbee-mac --features efr32mg24,efr32s2-hal/efr32mg24-pa10 --all-targets --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --features nrf-fem --all-targets --locked -- -D warnings
       - run: cargo clippy -p zigbee-runtime --no-default-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --no-default-features --locked -- -D warnings
@@ -579,6 +614,7 @@ jobs:
       - run: cargo clippy -p zigbee-zcl --all-targets --features green-power --locked -- -D warnings
       - run: cargo clippy -p zigbee-nwk --all-targets --features router,green-power --locked -- -D warnings
       - run: cargo clippy -p zigbee-zrhp --all-targets --all-features --locked -- -D warnings
+      - run: cargo clippy -p efr32-gbl --all-targets --locked -- -D warnings
 
   fmt:
     name: Format
@@ -621,6 +657,9 @@ jobs:
           cargo fmt --manifest-path products/efr32mg22-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path products/efr32mg22-gpd/Cargo.toml -- --check
           cargo fmt --manifest-path products/ha-connect-zbt1/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/rf-bm-mg24b1/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/sonoff-dongle-m/Cargo.toml -- --check
+          cargo fmt --manifest-path products/efr32mg24/Cargo.toml -- --check
           cargo fmt --manifest-path products/phy62x2-evk/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52840-router/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52833-sensor/Cargo.toml -- --check
@@ -635,6 +674,8 @@ jobs:
           cargo fmt --manifest-path examples/efr32mg22-sensor/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg22-gpd/Cargo.toml -- --check
           cargo fmt --manifest-path examples/ha-connect-zbt1/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/efr32mg24-ncp/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/efr32mg24-router/Cargo.toml -- --check
           cargo fmt --manifest-path efr32mg1-hal/Cargo.toml -- --check
           cargo fmt --manifest-path efr32s2-hal/Cargo.toml -- --check
           cargo fmt --manifest-path cc26x2-hal/Cargo.toml -- --check
@@ -2990,6 +3031,103 @@ jobs:
           path: |
             examples/cc26x2-ncp/target/cc26x2-ncp-*.hex
             examples/cc26x2-ncp/target/cc26x2-ncp-*.size.json
+          if-no-files-found: error
+
+  # EFR32MG24 (RF-BM-MG24B1 dev board, SONOFF Dongle-M): ZRHP NCP and
+  # Router, linked above the 24 KiB Gecko bootloader and packaged as raw
+  # image + Intel HEX + plain GBL (tools/efr32-gbl). Build-only: the xG24
+  # radio tables are not captured, so both images halt at radio init on
+  # hardware until they are.
+  build-efr32mg24:
+    name: Build EFR32MG24 ZRHP NCP and Router (RF-BM-MG24B1, Dongle-M)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv8m.main-none-eabihf
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            examples/efr32mg24-ncp
+            examples/efr32mg24-router
+          key: thumbv8m-efr32mg24-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('examples/efr32mg24-*/Cargo.lock', 'products/efr32mg24/link/**', 'efr32s2-hal/link/**') }}
+      - name: Build EFR32MG24 NCP and Router (release, both boards)
+        run: |
+          for example in ncp router; do
+            (
+              cd "examples/efr32mg24-$example"
+              cargo build --release --locked
+              cargo build --release --locked --no-default-features \
+                --features sonoff-dongle-m --target-dir target/dongle-m
+            )
+          done
+      - name: Clippy EFR32MG24 compositions
+        run: |
+          for example in ncp router; do
+            (
+              cd "examples/efr32mg24-$example"
+              cargo clippy --release --locked --target thumbv8m.main-none-eabihf -- -D warnings
+              cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+                --no-default-features --features sonoff-dongle-m \
+                --target-dir target/dongle-m -- -D warnings
+            )
+          done
+      - name: Build and lint the RF-BM-MG24B1 lab gate (clocks, SYSRTC, UART, TRNG)
+        working-directory: tools/efr32s2-lab
+        run: |
+          cargo build --release --locked --no-default-features --features rfbm \
+            --bin s2-mg24-hello --target-dir target/rfbm
+          cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+            --no-default-features --features rfbm --bin s2-mg24-hello \
+            --target-dir target/rfbm -- -D warnings
+      - name: Layout gate, AES and SE policy symbols, GBL packaging, size report
+        run: |
+          OUT=target/efr32mg24
+          mkdir -p "$OUT"
+          NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
+          for example in ncp router; do
+            for board in rf-bm-mg24b1 sonoff-dongle-m; do
+              if [ "$board" = rf-bm-mg24b1 ]; then
+                DIR="examples/efr32mg24-$example/target/thumbv8m.main-none-eabihf/release"
+              else
+                DIR="examples/efr32mg24-$example/target/dongle-m/thumbv8m.main-none-eabihf/release"
+              fi
+              ELF="$DIR/efr32mg24-$example"
+              FLAGS=()
+              if [ "$example" = ncp ]; then FLAGS=(--ncp); fi
+              python3 examples/efr32mg24-ncp/tools/verify-layout.py "${FLAGS[@]}" "$ELF"
+              SYMS="$("$NM" --demangle "$ELF")"
+              # xG24 runs NWK/APS AES in software until a Secure Engine
+              # AES backend is proven on hardware (as xG21).
+              if ! grep -Eq 'SoftwareAes128|aes::soft' <<<"$SYMS"; then
+                echo "$ELF is missing its software AES backend" >&2
+                exit 1
+              fi
+              # An image with an SE mailbox client must carry the product's
+              # poisoned-engine reset (products/efr32mg24/src/fatal.rs).
+              if grep -q 'efr32s2_hal::se::MAILBOX' <<<"$SYMS" \
+                && ! grep -q 'efr32mg24_product::fatal::reset' <<<"$SYMS"; then
+                echo "$ELF uses the Secure Engine without the fatal reset path" >&2
+                exit 1
+              fi
+              NAME="efr32mg24-$example-$board"
+              cargo run --quiet --locked -p efr32-gbl -- app --elf "$ELF" --out "$OUT/$NAME"
+              cargo run --quiet --locked -p efr32-gbl -- parse "$OUT/$NAME.gbl"
+              ./tools/firmware-size-report.sh "$NAME" "$OUT/$NAME.bin" "$OUT/$NAME.size.json"
+            done
+          done
+      - name: Upload EFR32MG24 firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: efr32mg24-firmware
+          path: |
+            target/efr32mg24/*.bin
+            target/efr32mg24/*.hex
+            target/efr32mg24/*.gbl
+            target/efr32mg24/*.size.json
           if-no-files-found: error
 
   build-efr32mg22:

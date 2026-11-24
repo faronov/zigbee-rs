@@ -12,6 +12,8 @@
 *.bin
 # imgtool-produced MCUboot test vectors are source fixtures.
 !/mcuboot-image/tests/vectors/*.bin
+# Synthetic Gecko application images behind the Commander GBL goldens.
+!/tools/efr32-gbl/tests/fixtures/*.bin
 
 # Local toolchain extractions (e.g. tc32 from modern-tc32/rust release)
 /.toolchains/

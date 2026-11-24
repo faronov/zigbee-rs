@@ -1,0 +1,71 @@
+[package]
+name = "efr32mg24-ncp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+autobins = false
+
+# zigbee-rs ZRHP v1 network co-processor (coordinator + Trust Center + GP
+# combo) for EFR32MG24 boards; the host link is USART0 without flow control.
+#   cargo build --release                                    # RF-BM-MG24B1
+#   cargo build --release --no-default-features --features sonoff-dongle-m \
+#     --target-dir target/dongle-m
+# The image is linked above the resident Gecko bootloader (0x0800_6000);
+# `tools/efr32-gbl` turns the ELF into the raw image and a GBL.
+[[bin]]
+name = "efr32mg24-ncp"
+path = "src/main.rs"
+
+[features]
+default = ["rf-bm-mg24b1"]
+rf-bm-mg24b1 = ["efr32mg24-product/rf-bm-mg24b1", "dep:rf-bm-mg24b1"]
+sonoff-dongle-m = ["efr32mg24-product/sonoff-dongle-m", "dep:sonoff-dongle-m"]
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+# The chip and PA variant come from the board crate.
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["rt", "time-driver", "isr-ack", "usart0-host"] }
+rf-bm-mg24b1 = { path = "../../boards/rf-bm-mg24b1", optional = true, features = ["host-uart"] }
+sonoff-dongle-m = { path = "../../boards/sonoff-dongle-m", optional = true, features = ["host-uart"] }
+efr32mg24-product = { path = "../../products/efr32mg24", default-features = false, features = ["ncp"] }
+# Full NCP capacity (256 Trust Center devices, 16-frame link window): the
+# 256 KiB SRAM holds it (see the size report in the platform guide).
+ncp-coordinator-app = { path = "../../apps/ncp-coordinator" }
+# GP combo without the TempMaster: `green-power-bidirectional` needs a MAC
+# with timed transmission (`zigbee-mac/timed-tx`), which the EFR32 Series 2
+# backend does not implement.
+router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity", "green-power-sink"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = [
+    "centralized-tclk",
+    "trust-center",
+    "global-aps-counter",
+    "host-passthrough",
+    "ncp-capacity",
+    "green-power-ncp",
+] }
+# `pan-coordinator`: MLME-START with short address 0x0000. The HAL's
+# Frame Pending source table stays 8 short + 8 extended.
+zigbee-mac = { path = "../../zigbee-mac", features = ["efr32mg24", "pan-coordinator", "ncp-capacity"] }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-bdb = { path = "../../zigbee-bdb", default-features = false }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
+embassy-time = "0.5"
+embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
+log = { version = "0.4", features = ["max_level_info", "release_max_level_info"] }
+static_cell = "2"
+
+[profile.dev]
+opt-level = "s"
+debug = true
+
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+debug = true
+panic = "abort"

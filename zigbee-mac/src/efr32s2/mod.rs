@@ -1,4 +1,4 @@
-//! EFR32 Series 2 (EFR32MG21 / EFR32MG22) [`RadioPhy`] for [`SoftMacCore`].
+//! EFR32 Series 2 (EFR32MG21 / MG22 / MG24) [`RadioPhy`] for [`SoftMacCore`].
 //!
 //! The radio itself is `efr32s2_hal::radio`: a pure-Rust driver that programs
 //! RAC/FRC/MODEM/AGC/SYNTH/BUFC directly from GSDK-verified register values
@@ -28,8 +28,8 @@
 //! - **AES** — xG22: hardware only (`aes`, CRYPTOACC). The composition
 //!   root installs the engine with `install_aes_engine` (on-silicon KAT);
 //!   without it every CCM*/MMO request fails. No software AES is linked.
-//!   xG21: software AES (`zigbee-crypto`) until the Secure Engine backend
-//!   (branch `aes-hw-efr32mg21`) is proven on hardware.
+//!   xG21/xG24: software AES (`zigbee-crypto`) until the Secure Engine
+//!   backends (branches `aes-hw-efr32mg21`/`-mg24`) are hardware-proven.
 //!
 //! Validation: on EFR32MG22 (WSTK + BRD4183A) the sleepy sensor joins ZHA,
 //! is interviewed and reports through this PHY. On EFR32MG21 (Home Assistant
@@ -379,8 +379,8 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
     }
 }
 
-/// xG21: software AES until the Secure Engine backend is proven on hardware.
-#[cfg(feature = "efr32mg21")]
+/// xG21/xG24: software AES until a Secure Engine backend is hardware-proven.
+#[cfg(any(feature = "efr32mg21", feature = "efr32mg24"))]
 impl<const D: i8> zigbee_crypto::ForwardAesProvider for Efr32s2RadioPhy<D> {}
 
 impl<const D: i8> PlatformServices for Efr32s2RadioPhy<D> {
@@ -392,9 +392,9 @@ impl<const D: i8> PlatformServices for Efr32s2RadioPhy<D> {
         Timer::after_micros(u64::from(duration_us)).await;
     }
 
-    /// No TRNG driver yet; the HAL's xorshift is not cryptographic.
-    fn fill_random(&mut self, _output: &mut [u8]) -> Result<(), MacError> {
-        Err(MacError::Unsupported)
+    /// xG24: Secure Engine TRNG; xG21/xG22: none (never the xorshift).
+    fn fill_random(&mut self, output: &mut [u8]) -> Result<(), MacError> {
+        fill_random(output)
     }
 }
 
@@ -479,5 +479,65 @@ mod tests {
             PhyError::Unsupported
         );
         assert_eq!(map_radio_error(RadioError::SynthLock), PhyError::Hardware);
+    }
+}
+
+// Entropy source per die (appended so the lines above, which end up in log
+// and panic locations of the MG21/MG22 images, keep their numbers).
+
+/// The HAL's xorshift is not cryptographic, and xG21/xG22 have no TRNG
+/// driver yet: entropy is unavailable and callers fail explicitly.
+#[cfg(not(feature = "efr32mg24"))]
+#[inline(always)]
+fn fill_random(_output: &mut [u8]) -> Result<(), MacError> {
+    Err(MacError::Unsupported)
+}
+
+/// xG24: the Secure Engine TRNG over the SE mailbox (not yet run on
+/// hardware); a mailbox error is reported, never replaced.
+#[cfg(feature = "efr32mg24")]
+fn fill_random(output: &mut [u8]) -> Result<(), MacError> {
+    efr32s2_hal::se::fill_random(output).map_err(map_se_error)
+}
+
+/// Secure Engine TRNG failures as MAC errors. `Unsupported` stays reserved
+/// for a build without an SE (the platform contract for "no entropy
+/// source"). An SE that does not answer, refuses the mailbox or has a
+/// poisoned mailbox is a hardware fault (`RadioError`, as a failed TRNG on
+/// the CC26x2 backend); a non-OK SE result (refused command, failed health
+/// test) is a failed security service; a mailbox held by another caller
+/// is transient (`Other`). Whether a poisoned mailbox ends in a reset is
+/// the product's policy (`efr32s2_hal::se::is_poisoned`).
+#[cfg(feature = "efr32mg24")]
+fn map_se_error(error: efr32s2_hal::se::SeError) -> MacError {
+    use efr32s2_hal::se::SeError;
+    match error {
+        SeError::Busy => MacError::Other,
+        SeError::Timeout | SeError::Poisoned | SeError::MailboxError => MacError::RadioError,
+        SeError::Response(_) => MacError::SecurityError,
+        SeError::Unavailable => MacError::Unsupported,
+    }
+}
+
+#[cfg(all(test, feature = "efr32mg24"))]
+mod se_tests {
+    use super::*;
+    use efr32s2_hal::se::SeError;
+
+    #[test]
+    fn se_errors_map_to_specific_mac_errors() {
+        assert_eq!(map_se_error(SeError::Busy), MacError::Other);
+        assert_eq!(map_se_error(SeError::Timeout), MacError::RadioError);
+        assert_eq!(map_se_error(SeError::Poisoned), MacError::RadioError);
+        assert_eq!(map_se_error(SeError::MailboxError), MacError::RadioError);
+        assert_eq!(map_se_error(SeError::Response(5)), MacError::SecurityError);
+        assert_eq!(map_se_error(SeError::Unavailable), MacError::Unsupported);
+    }
+
+    #[test]
+    fn host_build_reports_no_entropy_source_and_publishes_nothing() {
+        let mut out = [0xAAu8; 18];
+        assert_eq!(fill_random(&mut out), Err(MacError::Unsupported));
+        assert_eq!(out, [0; 18]);
     }
 }

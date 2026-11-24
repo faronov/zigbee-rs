@@ -85,7 +85,7 @@ pub mod phy6222;
 #[cfg(feature = "efr32")]
 pub mod efr32;
 
-#[cfg(any(feature = "efr32mg21", feature = "efr32mg22"))]
+#[cfg(any(feature = "efr32mg21", feature = "efr32mg22", feature = "efr32mg24"))]
 pub mod efr32s2;
 
 #[cfg(feature = "cc26x2")]

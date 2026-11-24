@@ -1189,7 +1189,8 @@ Enabling `flow = 1` is refused with `UNSUPPORTED_COMMAND` unless the board
 has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 
 `chip` values: 1 ESP32-H2, 2 ESP32-C6, 3 nRF52840, 4 EFR32MG21, 5 EFR32MG22,
-6 TLSR8258, 7 BL702, 8 STM32WB55, 9 CC2340R5, 10 CC2652P, 11 CC2652P7.
+6 TLSR8258, 7 BL702, 8 STM32WB55, 9 CC2340R5, 10 CC2652P, 11 CC2652P7,
+12 EFR32MG24.
 
 ### 7.2 NETWORK (`0x01xx`, endpoint 2)
 
@@ -1546,6 +1547,50 @@ Rules:
   cannot establish a ZRHP session or for first provisioning. It is a
   manual/development path with an operator-supplied image (11.5); firmware
   rollback itself is the NCP's A/B slots (8.9).
+
+#### Gecko bootloader path (EFR32MG24 NCPs)
+
+EFR32MG24 NCPs (`chip` 12: the RF-BM-MG24B1 dev board and the SONOFF
+Dongle-M) keep the resident Silicon Labs Gecko bootloader and do **not**
+implement `FW_*` (`UNSUPPORTED_COMMAND`, `FW_UPDATE` capability clear). The
+host updates them through the bootloader with a GBL file:
+
+1. **Enter the bootloader.** `SYS_RESET{mode 1}`: the NCP answers, then
+   stores the Gecko BOOTLOAD reset cause and resets. A host that drives the
+   reset and boot lines may enter it without a session (Dongle-M: ESP32
+   GPIO12 high while GPIO15 pulses RESET low). The bootloader menu and
+   XMODEM-CRC upload run at **115 200 8N1** without flow control, whatever
+   rate the NCP used.
+2. **Accept only application GBLs.** A plain GBL3 (`0x03A617EB` header,
+   type 0) whose program records cover only the application window
+   (`0x0800_6000..0x0815_8000`) and that carries this ZRHP metadata record
+   (tag `0xF60808F6`), written by `tools/efr32-gbl`:
+
+   | field | size | value |
+   |---|---|---|
+   | magic | 4 | `"ZRHP"` |
+   | version | 1 | 1 |
+   | build_id | 8 | the image's build ID: first 8 bytes of the SHA-256 of the raw image with the build-ID field zeroed |
+   | n | 1 | length of the firmware version |
+   | fw | n | firmware version string (`SYS_NEGOTIATE.fw`) |
+
+   The host **refuses** a GBL with a bootloader record (`0xF50909F5`) or an
+   SE-upgrade record (`0x5EA617EB`): the NCP update path never replaces the
+   Gecko bootloader or the Secure Engine firmware. It also refuses a GBL
+   without the ZRHP record or with an unexpected record version.
+3. **Upload and boot.** After the XMODEM upload the host selects "run" (or
+   resets). The bootloader erases and programs only the pages the GBL
+   covers, so the NV journals (`0x0815_8000..0x0818_0000`, 8.9) survive.
+4. **Verify.** In the next session at the product rate (460 800 8N1, no
+   RTS/CTS; 115 200 as a host fallback), `SYS_NEGOTIATE.build_id` and `fw`
+   must equal the GBL's ZRHP record. A mismatch means the update did not
+   take. An upload that fails partway leaves a partly written application:
+   enter the bootloader again and repeat the upload.
+
+There is no trial boot or automatic rollback on this path; recovery is the
+same bootloader entry with a known-good GBL. An image flashed from the ELF
+instead of the packaged `.bin`/`.hex`/`.gbl` reports an all-zero
+`build_id`.
 
 ### 7.10 LOG (`0x09xx`, endpoint 5)
 

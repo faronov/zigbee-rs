@@ -1,4 +1,5 @@
-//! Typed EFR32 Series 2 GPIO primitives (identical on xG21 and xG22).
+//! Typed EFR32 Series 2 GPIO primitives (identical on xG21 and xG22; on xG24
+//! the port registers start 0x30 later, everything else is unchanged).
 //!
 //! The register layout is the Series-2 layout at `0x4003_C000`; it is not
 //! compatible with the Series-1 GPIO block at `0x4000_A000`.
@@ -6,6 +7,11 @@
 use core::marker::PhantomData;
 
 const GPIO_BASE: u32 = 0x4003_C000;
+/// Offset of `P[0]` (`efr32mg2x_gpio.h`): `PORTA_CTRL` sits at 0x30 on xG24.
+#[cfg(not(feature = "efr32mg24"))]
+const PORT_OFFSET: u32 = 0;
+#[cfg(feature = "efr32mg24")]
+const PORT_OFFSET: u32 = 0x30;
 const PORT_STRIDE: u32 = 0x30;
 const MODEL_OFFSET: u32 = 0x04;
 const MODEH_OFFSET: u32 = 0x0C;
@@ -110,7 +116,7 @@ impl<MODE> Pin<MODE> {
     }
 
     const fn port_base(&self) -> u32 {
-        GPIO_BASE + (self.port as u32) * PORT_STRIDE
+        GPIO_BASE + PORT_OFFSET + (self.port as u32) * PORT_STRIDE
     }
 
     const fn mode_register(&self) -> (u32, u32) {
@@ -374,6 +380,26 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "efr32mg24")]
+    fn xg24_port_registers_start_at_0x30() {
+        // efr32mg24_gpio.h: P[0].MODEL 0x34, P[1].MODEL 0x64, P[0].DOUT 0x40.
+        let usart_tx = Pin::<Disabled> {
+            port: Port::A,
+            number: 5,
+            _mode: PhantomData,
+        };
+        assert_eq!(usart_tx.mode_register(), (0x4003_C034, 20));
+        assert_eq!(usart_tx.port_base() + DOUT_OFFSET, 0x4003_C040);
+        let pb0 = Pin::<Disabled> {
+            port: Port::B,
+            number: 0,
+            _mode: PhantomData,
+        };
+        assert_eq!(pb0.mode_register(), (0x4003_C064, 0));
+    }
+
+    #[test]
+    #[cfg(not(feature = "efr32mg24"))]
     fn series_two_pin_registers_match_brd4181a_pins() {
         let led = Pin::<Disabled> {
             port: Port::B,

@@ -81,12 +81,13 @@ pub fn init(rtcc: Rtcc) {
     // module-level register functions from interrupt context.
     let _started = rtcc;
     rtcc::enable_overflow_interrupt();
-    cortex_m::peripheral::NVIC::unpend(Interrupt::RTCC);
-    unsafe { cortex_m::peripheral::NVIC::unmask(Interrupt::RTCC) };
+    cortex_m::peripheral::NVIC::unpend(TIME_IRQ);
+    unsafe { cortex_m::peripheral::NVIC::unmask(TIME_IRQ) };
 }
 
 /// RTCC interrupt: overflow epoch, Embassy CC0 alarm, CC1 sleep wake.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "efr32mg24"), unsafe(no_mangle))]
+#[cfg_attr(feature = "efr32mg24", allow(non_snake_case))]
 extern "C" fn RTCC() {
     let flags = rtcc::take_flags();
     if flags.overflow {
@@ -95,4 +96,21 @@ extern "C" fn RTCC() {
     if flags.cc0 || flags.overflow {
         DRIVER.rearm();
     }
+}
+
+// ---- Per-die interrupt line (appended: keeps the lines above stable) ----
+
+/// The time base's interrupt line: RTCC, or SYSRTC_APP on xG24, where
+/// [`crate::rtcc`] runs on SYSRTC0.
+#[cfg(not(feature = "efr32mg24"))]
+const TIME_IRQ: Interrupt = Interrupt::RTCC;
+#[cfg(feature = "efr32mg24")]
+const TIME_IRQ: Interrupt = Interrupt::SYSRTC_APP;
+
+/// SYSRTC0 application interrupt (xG24): the RTCC handler's duties. The
+/// `RTCC` function above is then an ordinary (unexported) function.
+#[cfg(feature = "efr32mg24")]
+#[unsafe(no_mangle)]
+extern "C" fn SYSRTC_APP() {
+    RTCC();
 }

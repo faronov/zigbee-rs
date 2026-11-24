@@ -5,11 +5,14 @@ The repository supports these products:
 - EFR32MG1P TRÅDFRI environmental sleepy end device (Series 1);
 - EFR32MG22 BRD4183A development sensor (Series 2, hardware-proven);
 - EFR32MG21 BRD4181A development sensor (Series 2, builds; no hardware run);
-- Home Assistant Connect ZBT-1 always-on End Device (EFR32MG21, lab-tested).
+- Home Assistant Connect ZBT-1 always-on End Device (EFR32MG21, lab-tested);
+- EFR32MG24 ZRHP NCP and Router for an RF-BM-MG24B1 dev board and the
+  SONOFF Dongle-M (Series 2, builds only; radio tables not captured).
 
 All use the shared `SensorApp`; their boards, products, clocks, storage, and
 power behavior are intentionally separate. Series 2 chips share one HAL
-(`efr32s2-hal`, chip chosen by the `efr32mg21` / `efr32mg22` feature) and
+(`efr32s2-hal`, chip chosen by the `efr32mg21` / `efr32mg22` /
+`efr32mg24-pa10` / `efr32mg24-pa20` feature) and
 one MAC backend (`zigbee_mac::efr32s2::Efr32s2RadioPhy` on `SoftMacCore`).
 
 ## EFR32MG1P TRÅDFRI
@@ -586,3 +589,246 @@ python3 tools/verify-layout.py \
 
 The ZBT-1 binary is named `ha-connect-zbt1-ed`, which keeps it apart from the
 board crate in the lockfile.
+
+## EFR32MG24 (xG24): RF-BM-MG24B1 dev board and SONOFF Dongle-M
+
+**Status: builds, links and is host-tested. No MG24 has run any of it.**
+The xG24 radio tables are not captured yet, so the radio refuses to start
+(`RadioError::Unsupported`) and both images halt at radio init. The
+primary hardware target is an RF-star RF-BM-MG24B1 module wired as a dev
+board; the SONOFF Dongle-M follows when a unit is available.
+
+### Crates
+
+```text
+examples/efr32mg24-ncp      ZRHP NCP composition root  (product feature `ncp`)
+examples/efr32mg24-router   Router composition root    (product feature `router`)
+        ↓
+products/efr32mg24          identity, memory map, journals, Gecko record,
+                            NCP transport policy, router policy
+        ↓
+boards/rf-bm-mg24b1 | boards/sonoff-dongle-m
+        ↓
+efr32s2-hal (`efr32mg24-pa10` / `efr32mg24-pa20`, `hfxo-39mhz`)
+        + zigbee-mac `efr32mg24` (Efr32s2RadioPhy on SoftMacCore)
+tools/efr32-gbl             ELF → raw image, Intel HEX and GBL3
+```
+
+No PAC is used. The only published xG24 PAC (`efr32mg24-pac` 0.1.0, one
+B220 part) has no radio blocks, and the HAL already uses MMIO addresses
+checked against the GSDK headers.
+
+### HAL: what changes on xG24
+
+Every value below was compared against GSDK 4.5.0
+(`platform/Device/SiliconLabs/EFR32MG24/Include`, A410F1536IM48 and
+A420F1536IM48) with `offsetof()` dumps from the headers. The MG21/MG22 paths
+are unchanged.
+
+| block | xG21 / xG22 | xG24 |
+|---|---|---|
+| flash | at `0x0`, 512 KiB / 1 MiB | at `0x0800_0000`, 1536 KiB, 8 KiB pages; `flash` offsets are relative to `chip::FLASH_BASE` |
+| SRAM | 64/96 KiB / 32 KiB | 256 KiB |
+| HFXO | `0x4000_C000`; `CTRL.FORCEEN`/`DISONDEMAND` bits 0/1; `FSMLOCK` (+ `MANUALOVERRIDE` on xG22) | `0x4A00_4000`; bits 16/24; no `FSMLOCK`, wait for `STATUS.SYNCBUSY`; XO CTUNE = XI + 40; fixed capacitor on XO only on 20 dBm parts ([PM-5131]) |
+| crystal | 38.4 MHz | 38.4 MHz (Dongle-M, per community manifests) or 39 MHz (RF-BM-MG24B1, feature `hfxo-39mhz`) |
+| bus clocks | xG22 `CLKEN0/1` | `CLKEN0/1` at other bit positions (GPIO 26, HFXO0 20, USART0 9, LFRCO 22, SYSRTC0 30, MSC 16 in CLKEN1, SE mailbox 10) |
+| GPIO | ports at `+0x00` | ports at `+0x30`; USART0 route at `0x720` |
+| time base | RTCC | **SYSRTC0** group 0 (compare 0/1, OVF/CMP0/CMP1 at bits 0/1/2), same `rtcc` API and time driver (`SYSRTC_APP` IRQ 67) |
+| UART | USART0/1 | USART0 only (+ EUSART0/1, not supported); new interrupt-driven host link `usart::host` (feature `usart0-host`): 8 KiB RX / 2 KiB TX rings, overrun and framing counters |
+| IRQs | 61 / 64 | 76 (15 and 64 reserved); FRC 33, RAC_RSM 36, USART0_RX/TX 9/10 |
+| WDOG0, I2C0 | `0x4A01_8000`, `0x4A01_0000` | `0x4B00_4000`, `0x4B00_0000` |
+| TRNG | xG22 CRYPTOACC; xG21 none | Secure Engine mailbox `TRNG_GET_RANDOM` (`se`), wired to `PlatformServices::fill_random` on xG24 only |
+| AES (NWK/APS CCM*, MMO) | xG22 CRYPTOACC hardware; xG21 software | software (`zigbee-crypto`), like xG21, until a Secure Engine AES backend (branch `aes-hw-efr32mg24`) is proven on hardware |
+| reset cause | — | `reset::take_reset_cause` (`EMU_RSTCAUSE`, same bits on all three dies) |
+
+The SE writes the TRNG output descriptor and buffer by DMA, possibly after
+the bounded wait gave up. Both live in a `static` area that only the holder
+of the mailbox lock (`se::MailboxLock`) touches; a submitted command that is
+not answered in time, or rejected with `TX_STATUS.TXERROR`, poisons the
+mailbox until reset, so a late completion only writes that unused area and
+its response is never taken for a later command's. A failed request zeroes
+the caller's buffer. Host-model tests in `efr32s2_hal::se` cover the late
+completion; host builds have no SE and fail with `SeError::Unavailable`.
+
+`fill_random` reports SE failures as specific MAC errors: no SE
+(`Unavailable`) is `Unsupported`, the platform's "no entropy source";
+`Timeout`, `MailboxError` and `Poisoned` are `RadioError` (a hardware fault,
+as a failed TRNG on CC26x2); a non-OK SE result is `SecurityError`; a mailbox
+held by another caller is `Other`. Every stack caller fails closed on any of
+them (formation, PAN ID, Trust Center keys).
+
+**Poisoned Secure Engine is fatal** (product policy, `fatal` module of
+`products/efr32mg24`). A poisoned mailbox only recovers with a reset; on
+xG24 the TRNG is the NCP's only entropy source, so the NCP could never form
+a network or generate a key again while it kept answering the host. Both
+compositions check `se::is_poisoned()` after every main-loop step. On a
+fault the NCP logs it to the ZRHP LOG ring and serves the host link for
+100 ms; the Router logs it on its UART and flushes it. Both then reset with
+the cause recorded in the Gecko `BootloaderResetCause_t` word at
+`SRAM_BASE` (reason `0x0980`, the EmberZNet `RESET_FATAL` group with a
+zigbee-rs extension code; not a bootload reason, so the resident bootloader
+starts the application). The next boot takes and clears the record: the
+NCP reports `EVT_NCP_READY.reset_reason` 6 (fatal) and both images log the
+cause. The product linker script starts RAM at `0x2000_0004` so start-up
+never overwrites that word (asserted in `link/memory.x` and by
+`verify-layout.py`). The Router links no SE client today, so the compiler
+removes its check; it becomes live if one is added.
+
+The other fatal resets use the same record, so the host can tell them from
+its own `SYS_RESET` (`reset_reason` 2):
+
+| cause | recorded reason | where |
+|---|---|---|
+| poisoned Secure Engine | `0x0980` | main loop of both images (logged first) |
+| panic | `0x0981` | `#[panic_handler]` of both images |
+| HardFault | `0x0982` | `HardFault` handler of both images (`verify-layout.py` rejects cortex-m-rt's spinning default) |
+| unrecoverable router-app error | `0x0983` | the Router's `Supervisor::reset`, after the app's `Fatal` diagnostic |
+
+The NCP reports each as `reset_reason` 6 and logs the cause to the ZRHP LOG
+ring at boot; the Router logs it. The policy, the reason encoding (every
+code decodes to itself and is outside the bootload set, const-asserted) and
+the ZRHP reset-reason mapping are host-tested; no MG24 has run any of these
+paths.
+
+Not changed and not yet checked on xG24 silicon: EM2 entry (`power`), DC-DC
+(left in bypass), the LFXO (the RF-BM module has one; the time base still uses
+the LFRCO), I2C and IADC (not used by these products).
+
+### Radio
+
+The xG24 register map (`efr32_multiphy_configurator/.../efr32xg24/revA1`) was
+compared field by field with xG22 rev A2:
+
+- FRC, AGC, MODEM, SYNTH, RAC and RFCRC sit at the xG22 addresses, and every
+  offset the shared driver uses is unchanged;
+- the RSM has the xG22 hand-shake (`RAC.CTRL.SEQCLKDIS`, `RAC.SEQIF` with the
+  same state bits), so the clock-gated sequencer approach carries over;
+- `MODEM.RAMPCTRL/RAMPLEV` moved to `0xD8/0xDC` and `IRCALCOEFWR0/1` to
+  `0x278/0x27C`;
+- the analog front end is new: the RAC analog registers moved, `RFPATHEN` and
+  `AGCOVERWRITE` are gone, and the PA has a 10 dBm (MP) and a 20 dBm (HP)
+  variant.
+
+The per-state analog values (idle/RX/TX), the BUFC base and stride, the PA
+programming of both variants, the RSSI offset and the DEVINFO IR-calibration
+word can only come from silicon, as on xG21 and xG22. `radio/xg24.rs`
+therefore sets `SUPPORTED = false`. The GSDK 802.15.4 PHY tables for xG24
+(`rail_util_built_in_phys/efr32xg24/sl_rail_ieee802154_config_{38M4,39,40}MHz.c`)
+are a cross-check for the static part of a capture.
+
+### Boards
+
+| | RF-BM-MG24B1 dev board | SONOFF Dongle-M |
+|---|---|---|
+| part | EFR32MG24A410F1536IM48-B (+10 dBm) | EFR32MG24A420F1536IM48 (+20 dBm), SONOFF spec page |
+| HFXO | 39 MHz on the module; CTUNE 92 (RF-star datasheet §4, **unmeasured**) | 38.4 MHz, CTUNE 100 (community manifests, **unverified**) |
+| host UART | USART0 TX PA05 (pin 12), RX PA06 (pin 13) → ESP32-S3 SuperMini; RTS PA07 / CTS PA08 claimed but unused | USART0 routed to TX PC01, RX PC02 → ESP32 GPIO13/GPIO17 (community builds use EUSART1 on the same pins, **unverified**) |
+| reset / boot | RESET_N (pin 36) open-drain from S3 GPIO6 (hub profile `S3_MG24_DEV`) and the J-Link; no boot-entry line (Gecko via `SYS_RESET` mode 1 once installed) | ESP32 GPIO15 → RESET (active low); GPIO12 high during reset → Gecko bootloader (the MG24 pin of that line is unknown) |
+| debug | SWDIO PA02, SWCLK PA01, SWO PA03 (never claimed) | SWD pads unknown |
+| other | 32.768 kHz LFXO, PCB antenna, no LED/button | no MG24 LED/button documented; RF path, stock TX power and LFXO unknown |
+
+A programmed `MFG_CTUNE` token always wins over the board default.
+
+### Memory map (both boards, both roles)
+
+```text
+0x0800_0000..0x0800_6000  Gecko bootloader (kept, never written)      24 KiB
+0x0800_6000..0x0815_8000  application = GBL payload                 1352 KiB
+0x0815_8000..0x0818_0000  journals: identity, APS, GP, children,
+                          Trust Center (NCP), security                160 KiB
+
+0x2000_0000..0x2000_0004  Gecko BootloaderResetCause_t (outside the image)
+0x2000_0004..0x2004_0000  image RAM, stack at the top             256 KiB - 4
+```
+
+The journals are those of the ESP32-H2 and CC2652P7 NCPs (spec 8.9). The
+router uses the same security, child, APS and GP windows, so a reflash
+between the NCP (role tag `0x5203`) and the router (`0x5201`) keeps the
+frame-counter reservations and erases the other role's tables. A GBL only
+erases the pages it programs, so the journals survive a firmware update.
+The stock EmberZNet NVM3 sits inside the journal window; the first boot
+treats it as foreign and erases it, together with the stock network key,
+frame counters and tables. **On a Dongle-M in service, the hub must take an
+EZSP network backup before flashing**: nothing can be recovered from the
+erased NVM3. Before going back to EmberZNet, clear the window (an "app
+clear" GBL or SWD erase), because NVM3 does not expect our journals there.
+
+### Firmware update path: Gecko bootloader kept
+
+The NCP keeps the resident Gecko bootloader and does not build in `FW_*`:
+
+- `SYS_RESET` mode 1 writes the BOOTLOAD reset cause and resets into Gecko
+  (`gecko_bootloader::reboot_to_bootloader`); on the Dongle-M the ESP32 can
+  also enter it through GPIO12 + RESET. Gecko speaks XMODEM at 115 200.
+- `tools/efr32-gbl app --elf <ELF> --out <prefix>` writes the raw image
+  (`.bin`, vector word 13 pointing at the `ApplicationProperties_t`, as GSDK
+  startup files do), an Intel HEX for J-Link, and a plain GBL3. Its output is
+  byte-identical to Simplicity Commander 1v22p1 `gbl create` (golden tests
+  with Commander output, and the real NCP image compared locally).
+- Signing: the stock Dongle-M GBLs (EmberZNet 7.4.5, OpenThread, multi-PAN)
+  and the community Dongle-M GBLs carry no signature or encryption tag, and
+  SONOFF's flasher accepts the community images, so the stock bootloader does
+  not enforce signed GBLs. Our image declares signature type NONE. A
+  bootloader with secure boot enabled would refuse it; we did not inspect a
+  Dongle-M bootloader's configuration.
+- NCP GBLs carry the ZRHP metadata record (`"ZRHP"`, version 1, 8-byte build
+  ID, firmware version; host-protocol 7.9, *Gecko bootloader path*). The
+  packager stores the build ID (SHA-256 of the image with the field zeroed)
+  in the image's `.zrhp_build_info` record, and the NCP reports it in
+  `SYS_NEGOTIATE`, so the hub can check which build runs after an update.
+  The hub refuses GBLs with bootloader or SE-upgrade records.
+  The record is not the JSON that Nabu Casa's Universal Silabs Flasher (used
+  by SONOFF's flasher) parses; whether those tools accept a non-JSON
+  metadata record is untested.
+
+**A/B on the radio chip (decision N6).** Flash would allow it: a 16 KiB
+zrs-boot loader chained above Gecko (as on the ZBT-1) plus two 664 KiB slots
+fits the 1352 KiB application window, and the NCP image is 441 KiB today.
+It is not the default because the Dongle-M already has a host-driven,
+unbrickable recovery path (ESP32 GPIO12 + RESET into Gecko), Gecko is the
+path SONOFF's flasher and the community tools use, and a chained loader would
+make every update depend on our loader's correctness on a device we cannot
+yet test. The journal window is placed so that a later A/B layout below it
+would not move it.
+
+### Size and RAM (release, `nightly-2026-03-23`)
+
+| image | file-backed flash | `.bss` | linked stack |
+|---|---:|---:|---:|
+| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 452,960 B | 168,536 B | 89,512 B |
+| NCP, Dongle-M | 452,900 B | 168,536 B | 89,512 B |
+| Router, RF-BM-MG24B1 (GP Proxy Basic) | 341,912 B | 37,140 B | 224,492 B |
+| Router, Dongle-M | 342,068 B | 37,140 B | 224,492 B |
+
+The NCP uses 33 % of the application window and 66 % of SRAM for static
+data. The compact capacity tier is not needed. The recorded fatal resets
+cost about 630 B of flash in the NCP and about 400 B in the Router (boot-time
+record and log line, the poisoned-engine report, the panic/HardFault/
+supervisor paths; the Router's SE check compiles away) and no static RAM or
+stack: `.data` now starts at `0x2000_0008` (8-byte aligned), and the end of
+static RAM and the linked stack are unchanged because alignment padding
+absorbs the shift.
+
+### Hardware gates (open)
+
+1. Identify the module over SWD (J-Link device `EFR32MG24AxxxF1536`, through
+   hwlab), read DEVINFO (part, flash size, EUI-64, `MODULEINFO`), dump and
+   back up the whole flash before writing anything.
+2. HFXO start at CTUNE 92, SYSRTC tick, USART0 at 115 200 / 460 800 / 921 600
+   on PA05/PA06: lab binary `s2-mg24-hello` (`tools/efr32s2-lab`, feature
+   `rfbm`, linked at `0x0800_0000` for a module without a bootloader) prints
+   reset cause, DEVINFO, CTUNE, the LFRCO-vs-HFXO ratio and SE TRNG bytes,
+   then echoes the UART.
+3. Capture the xG24 radio tables from RAIL (`rail_soc_railtest` built for the
+   A410 at 39 MHz, halted over SWD in idle, RX and TX; static registers
+   reduced against the register-map reset values and cross-checked with the
+   GSDK PHY table), then raw TX/RX, ACK turnaround and CCA, as on xG22.
+4. SE mailbox TRNG, and the recorded fatal resets: the record must survive
+   the resident Gecko bootloader and come back as `reset_reason` 6 (a lab
+   build that panics or faults on demand; for the poisoned mailbox an SE
+   that stops answering, e.g. a debugger-held SE request).
+5. NCP: ZRHP session over the S3, network formation, joins, reset/resume.
+6. Gecko path: install a Gecko UART bootloader on the module, then GBL upload
+   and journal retention across an update.
+7. Dongle-M: pins, crystal, CTUNE, bootloader-entry pin, RF path and TX power
+   limit on a real unit.

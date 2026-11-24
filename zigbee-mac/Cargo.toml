@@ -258,6 +258,14 @@ efr32mg22 = [
     "dep:efr32s2-hal", "efr32s2-hal/efr32mg22",
     "dep:embassy-time", "dep:embassy-futures",
 ]
+# EFR32MG24: the board crate also selects the PA variant
+# (`efr32s2-hal/efr32mg24-pa10` or `-pa20`). The xG24 radio tables are not
+# captured yet, so `Efr32s2RadioPhy::new` returns `PhyError::Hardware`
+# (HAL `RadioError::Unsupported`); the stack above it builds and links.
+efr32mg24 = [
+    "dep:efr32s2-hal", "efr32s2-hal/efr32mg24",
+    "dep:embassy-time", "dep:embassy-futures",
+]
 
 # TI CC26x2/CC13x2 `Cc26x2RadioPhy` on `SoftMacCore` (pure-Rust RF core
 # driver in `cc26x2-hal`). The image selects the chip feature of
