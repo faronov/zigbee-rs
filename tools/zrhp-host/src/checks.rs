@@ -1,5 +1,6 @@
 //! Hardware checks of the `ncp-host-gaps` commands: DIAG tables, group
-//! membership, channel change, install codes and `SYS_RESET` under load.
+//! membership and the APS group table, channel change, install codes and
+//! `SYS_RESET` under load.
 
 use std::time::{Duration, Instant};
 
@@ -86,6 +87,64 @@ pub fn group<S: ByteStream>(host: &mut Host<S>, op: u8, group: u16, ep: u8) -> R
     } else {
         Err("group membership refused".into())
     }
+}
+
+/// `TBL_STATS` and every `TBL_READ` page of the APS group table
+/// (`APS_GROUP`, `0x0D`; capability `APS_GROUP_TABLE`).
+pub fn group_table<S: ByteStream>(host: &mut Host<S>) -> Result<(), String> {
+    use zigbee_zrhp::msg::tables::{TblRead, TblReadRsp, TblStats, TblStatsRsp};
+    use zigbee_zrhp::records::{Record, record_type};
+    let tid = host.request(&TblStats {
+        table: record_type::APS_GROUP,
+    });
+    let rsp = host.response(tid)?;
+    let stats: TblStatsRsp =
+        body(&rsp).map_err(|e| format!("TBL_STATS APS_GROUP (capability bit 24?): {e}"))?;
+    println!(
+        "TBL_STATS APS_GROUP: capacity {} used {}",
+        stats.capacity, stats.used
+    );
+    let mut cursor = 0u16;
+    let mut groups = 0usize;
+    while cursor != 0xFFFF {
+        let tid = host.request(&TblRead {
+            table: record_type::APS_GROUP,
+            cursor,
+            max: 8,
+        });
+        let rsp = host.response(tid)?;
+        let read: TblReadRsp = body(&rsp)?;
+        let mut n = 0u16;
+        for entry in read.entries.iter() {
+            let Record::ApsGroup(group) = &entry.record else {
+                return Err(format!("not an APS_GROUP record: {:?}", entry.record));
+            };
+            println!(
+                "  APS_GROUP 0x{:04X}: endpoints {:?}",
+                group.group, group.endpoints
+            );
+            n += 1;
+        }
+        groups += usize::from(n);
+        if read.next_cursor != 0xFFFF && read.next_cursor != cursor.saturating_add(n) {
+            return Err(format!(
+                "next_cursor {} after cursor {cursor} + {n} entries",
+                read.next_cursor
+            ));
+        }
+        if n == 0 && read.next_cursor != 0xFFFF {
+            return Err("empty page before the end".into());
+        }
+        cursor = read.next_cursor;
+    }
+    println!("TBL_READ APS_GROUP: {groups} groups");
+    if groups != usize::from(stats.used) {
+        return Err(format!(
+            "TBL_READ found {groups} groups, TBL_STATS {}",
+            stats.used
+        ));
+    }
+    Ok(())
 }
 
 /// `NWK_CHANGE_CHANNEL`, then wait for `EVT_CHANNEL_CHANGED`.

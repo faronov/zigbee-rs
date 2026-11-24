@@ -34,6 +34,7 @@ use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent};
 use zigbee_zrhp::msg::backup::{
     BkpExportBegin, BkpExportBeginRsp, BkpExportEnd, BkpExportRead, BkpRestoreAbort,
     BkpRestoreBegin, BkpRestoreBeginRsp, BkpRestoreCommit, BkpRestoreCommitRsp, BkpRestorePutRsp,
+    export_flags, note,
 };
 use zigbee_zrhp::msg::diag::{
     DiagGetChildren, DiagGetChildrenRsp, DiagGetCounters, DiagGetCountersRsp, DiagGetNeighbors,
@@ -51,6 +52,7 @@ use zigbee_zrhp::msg::security::{
     SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecGetFrameCountersRsp,
     SecGetNetworkKey, SecGetNetworkKeyRsp,
 };
+use zigbee_zrhp::msg::system::capacity;
 use zigbee_zrhp::msg::system::{
     ConfigValue, SysGetConfig, SysGetConfigRsp, SysGetInfoRsp, SysGetStatusRsp, SysNegotiateReq,
     SysNegotiateRsp, SysReset, SysSetConfig, SysSetConfigRsp, SysSetIeee, caps, config,
@@ -61,7 +63,9 @@ use zigbee_zrhp::msg::tables::{
 };
 use zigbee_zrhp::msg::{Batch, Kind, MsgHeader, RawMessage, ids};
 use zigbee_zrhp::queue::EndpointQueues;
-use zigbee_zrhp::records::{DeviceRecord, LinkBlock, RawRecords, Record, StreamCrc, record_type};
+use zigbee_zrhp::records::{
+    ApsGroupRecord, DeviceRecord, LinkBlock, RawRecords, Record, StreamCrc, record_type,
+};
 use zigbee_zrhp::types::{Endpoint, Ieee, Status};
 
 const IEEE: [u8; 8] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
@@ -515,6 +519,7 @@ macro_rules! setup {
             caps::ENERGY_SCAN,
             caps::TX_POWER,
             caps::ACTIVE_SCAN,
+            caps::APS_GROUP_TABLE,
         ] {
             assert_ne!(negotiated.ncp_caps & bit, 0, "capability {bit:#x}");
         }
@@ -1582,6 +1587,473 @@ fn group_membership_edits_the_aps_group_table() {
         }
     }
     assert_eq!(status, Status::NoSpace.to_u8(), "a full table says so");
+}
+
+/// TLV bytes of an `APS_GROUP` record.
+fn group_tlv(group: u16, endpoints: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0u8; 3 + 3 + endpoints.len()];
+    let mut w = Writer::new(&mut buf);
+    Record::ApsGroup(ApsGroupRecord { group, endpoints })
+        .write(&mut w)
+        .unwrap();
+    buf
+}
+
+/// `stream` with `extra` TLVs before `RS_PARAMS` and `END` recomputed.
+fn with_records(stream: &[u8], extra: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in RawRecords::new(stream) {
+        let (kind, tlv) = item.unwrap();
+        if kind == record_type::RS_PARAMS {
+            for record in extra {
+                out.extend_from_slice(record);
+            }
+        }
+        out.extend_from_slice(tlv);
+    }
+    resign(&out)
+}
+
+/// `(group, endpoints)` of every `APS_GROUP` in a record stream.
+fn stream_groups(stream: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    RawRecords::new(stream)
+        .filter_map(|item| {
+            let (_, tlv) = item.unwrap();
+            match zigbee_zrhp::codec::Reader::new(tlv)
+                .read::<Record<'_>>()
+                .unwrap()
+            {
+                Record::ApsGroup(group) => Some((group.group, group.endpoints.to_vec())),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Sorted groups with sorted endpoints (the table reorders on removal).
+fn canonical(mut groups: Vec<(u16, Vec<u8>)>) -> Vec<(u16, Vec<u8>)> {
+    for (_, endpoints) in &mut groups {
+        endpoints.sort_unstable();
+    }
+    groups.sort_unstable();
+    groups
+}
+
+/// `TBL_READ` of the APS group table (`0x0D`): empty, one group, a full
+/// table over several pages, cursor and `max` bounds, read-only, and wiped
+/// with the network.
+#[test]
+fn group_table_reads_page_by_page() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    macro_rules! read {
+        ($cursor:expr, $max:expr) => {{
+            let request = host.request(&TblRead {
+                table: record_type::APS_GROUP,
+                cursor: $cursor,
+                max: $max,
+            });
+            exchange!();
+            host.response(request)
+        }};
+    }
+    macro_rules! page {
+        ($cursor:expr, $max:expr) => {{
+            let response = read!($cursor, $max);
+            let read: TblReadRsp = response.body();
+            let entries: Vec<(u32, u8, u16, Vec<u8>)> = read
+                .entries
+                .iter()
+                .map(|entry| match entry.record {
+                    Record::ApsGroup(group) => (
+                        entry.rev,
+                        entry.state,
+                        group.group,
+                        group.endpoints.to_vec(),
+                    ),
+                    other => panic!("not an APS_GROUP: {other:?}"),
+                })
+                .collect();
+            (read.next_cursor, entries)
+        }};
+    }
+    macro_rules! stats {
+        () => {{
+            let request = host.request(&TblStats {
+                table: record_type::APS_GROUP,
+            });
+            exchange!();
+            let response = host.response(request);
+            let stats: TblStatsRsp = response.body();
+            (stats.capacity, stats.used, stats.dirty, stats.pinned)
+        }};
+    }
+    macro_rules! member {
+        ($op:expr, $group:expr, $ep:expr) => {{
+            let request = host.request(&NwkGroupMembership {
+                op: $op,
+                group: $group,
+                ep: $ep,
+            });
+            exchange!();
+            assert_eq!(host.response(request).status(), 0);
+        }};
+    }
+
+    // Advertised: capability bit 24 and capacity `group_table`.
+    let negotiate = host.request(&SysNegotiateReq {
+        major_min: 1,
+        major_max: 1,
+        host_caps: 0,
+        name: Bytes8(b"surface"),
+    });
+    exchange!();
+    let negotiated = host.response(negotiate);
+    let negotiated: SysNegotiateRsp = negotiated.body();
+    assert_ne!(negotiated.ncp_caps & caps::APS_GROUP_TABLE, 0);
+    let group_table = negotiated
+        .capacities
+        .iter()
+        .find(|c| c.id == capacity::GROUP_TABLE)
+        .map(|c| c.value);
+    assert_eq!(group_table, Some(16));
+
+    // The table of the running network only, like DEVICE.
+    assert_eq!(read!(0, 8).status(), Status::InvalidState.to_u8());
+    assert_eq!(stats!(), (16, 0, 0, 0));
+    let form = host.request(&form_request(0x1A62, 1 << 20));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let epoch = port.table_epoch();
+    assert_eq!(page!(0, 8), (0xFFFF, vec![]), "empty");
+
+    member!(1, 0x0B84, 242);
+    assert_eq!(page!(0, 8), (0xFFFF, vec![(0, 0, 0x0B84, vec![242])]));
+    assert_eq!(stats!(), (16, 1, 0, 0));
+
+    // A full table: 0x0B84, 0x1234 with the most endpoints (8), 14 more.
+    for ep in 1..=8 {
+        member!(1, 0x1234, ep);
+    }
+    for group in 1..=14u16 {
+        member!(1, group, 1);
+    }
+    assert_eq!(stats!(), (16, 16, 0, 0));
+    let table: Vec<(u16, Vec<u8>)> = (0..16)
+        .map(|index| {
+            let view = port.group(index).unwrap();
+            (view.group, view.endpoints.to_vec())
+        })
+        .collect();
+    assert_eq!(table[1], (0x1234, (1..=8).collect::<Vec<u8>>()));
+    let (next, first) = page!(0, 8);
+    assert_eq!((next, first.len()), (8, 8));
+    let (next, second) = page!(8, 8);
+    assert_eq!((next, second.len()), (0xFFFF, 8));
+    let read: Vec<(u16, Vec<u8>)> = first
+        .into_iter()
+        .chain(second)
+        .map(|(rev, state, group, endpoints)| {
+            assert_eq!(
+                (rev, state),
+                (0, 0),
+                "standalone: rev 0, neither dirty nor pinned"
+            );
+            (group, endpoints)
+        })
+        .collect();
+    assert_eq!(read, table, "table order, every endpoint");
+    // Smaller pages walk the same table.
+    let mut cursor = 0u16;
+    let mut walked = Vec::new();
+    while cursor != 0xFFFF {
+        let (next, entries) = page!(cursor, 3);
+        assert!(entries.len() <= 3);
+        walked.extend(entries.into_iter().map(|(_, _, g, e)| (g, e)));
+        cursor = next;
+    }
+    assert_eq!(walked, table);
+    // `max` 0 reads one entry, more than 8 reads 8; past the end is empty.
+    assert_eq!(page!(0, 0).0, 1);
+    assert_eq!(page!(0, 0).1.len(), 1);
+    assert_eq!(page!(0, 255).1.len(), 8);
+    assert_eq!(
+        page!(15, 8),
+        (0xFFFF, vec![(0, 0, table[15].0, table[15].1.clone())])
+    );
+    assert_eq!(page!(16, 8), (0xFFFF, vec![]));
+    assert_eq!(page!(0xFFFF, 8), (0xFFFF, vec![]));
+
+    // Read-only: written with NWK_GROUP_MEMBERSHIP.
+    let push = host.request(&TblPush {
+        table: record_type::APS_GROUP,
+        flags: 0,
+        records: List::new(&[]),
+    });
+    let invalidate = host.request(&TblInvalidate {
+        table: record_type::APS_GROUP,
+        key: TableKey::Nwk(0x0B84),
+    });
+    exchange!();
+    assert_eq!(
+        host.response(push).status(),
+        Status::UnsupportedCommand.to_u8()
+    );
+    assert_eq!(
+        host.response(invalidate).status(),
+        Status::UnsupportedCommand.to_u8()
+    );
+    // Membership edits do not change the table epoch.
+    member!(3, 0, 1);
+    assert_eq!(stats!(), (16, 2, 0, 0));
+    assert_eq!(port.table_epoch(), epoch);
+
+    // A network leave wipes the groups with the other tables (new epoch).
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+    assert!(host.event(ids::EVT_TBL_EPOCH_CHANGED).is_some());
+    assert_eq!(read!(0, 8).status(), Status::InvalidState.to_u8());
+    let form = host.request(&form_request(0x1A63, 1 << 20));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    assert_eq!(page!(0, 8), (0xFFFF, vec![]), "a new network has no groups");
+}
+
+/// `BKP_EXPORT_BEGIN` flags bit3 exports the group table as `APS_GROUP`
+/// records; a restore puts it back on the restored network.
+#[test]
+fn backup_exports_and_restores_the_group_table() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let form = host.request(&form_request(0x7C01, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let groups = [
+        (0x0B84u16, vec![242u8]),
+        (0x1234, vec![1, 3]),
+        (0x0001, vec![2]),
+    ];
+    for (group, endpoints) in &groups {
+        for &ep in endpoints {
+            let request = host.request(&NwkGroupMembership {
+                op: 1,
+                group: *group,
+                ep,
+            });
+            exchange!();
+            assert_eq!(host.response(request).status(), 0);
+        }
+    }
+    macro_rules! export {
+        ($flags:expr) => {{
+            let begin = host.request(&BkpExportBegin { flags: $flags });
+            exchange!();
+            let begin = host.response(begin);
+            let begin: BkpExportBeginRsp = begin.body();
+            let mut stream = Vec::new();
+            loop {
+                let read = host.request(&BkpExportRead {
+                    txn: begin.txn,
+                    max_bytes: 64,
+                });
+                exchange!();
+                let read = host.response(read);
+                assert_eq!(read.status(), 0);
+                stream.extend_from_slice(&read.payload[2..]);
+                if read.payload[1] == 0 {
+                    break;
+                }
+            }
+            let end = host.request(&BkpExportEnd { txn: begin.txn });
+            exchange!();
+            assert_eq!(host.response(end).status(), 0);
+            assert_eq!(
+                zigbee_zrhp::records::verify_stream(&stream).unwrap(),
+                begin.record_count - 1,
+                "announced count"
+            );
+            stream
+        }};
+    }
+    let without = export!(export_flags::KEYS | export_flags::DEVICES);
+    assert!(stream_groups(&without).is_empty(), "groups only on request");
+    let stream = export!(export_flags::KEYS | export_flags::DEVICES | export_flags::APS_GROUPS);
+    assert_eq!(
+        RawRecords::new(&stream).count(),
+        RawRecords::new(&without).count() + 3
+    );
+    assert_eq!(
+        canonical(stream_groups(&stream)),
+        canonical(groups.to_vec())
+    );
+
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+    let begin = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 10_000,
+        aps_margin: 10_000,
+        expected_records: RawRecords::new(&stream).count() as u32,
+    });
+    exchange!();
+    let begin = host.response(begin);
+    let begin: BkpRestoreBeginRsp = begin.body();
+    let mut payload = begin.txn.to_le_bytes().to_vec();
+    payload.extend_from_slice(&stream);
+    let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+    let commit = host.request(&BkpRestoreCommit { txn: begin.txn });
+    exchange!();
+    let put = host.response(put);
+    let put: BkpRestorePutRsp = put.body();
+    assert_eq!(
+        put.notes.iter().count(),
+        0,
+        "a zigbee-rs backup restores as is"
+    );
+    let commit = host.response(commit);
+    let _: BkpRestoreCommitRsp = commit.body();
+    assert_eq!(port.state() as u8, 2);
+    let restored: Vec<(u16, Vec<u8>)> = (0..)
+        .map_while(|index| port.group(index))
+        .map(|view| (view.group, view.endpoints.to_vec()))
+        .collect();
+    assert_eq!(canonical(restored), canonical(groups.to_vec()));
+    let tables = TcApp::device(port.app()).aps().group_table();
+    assert!(tables.is_member(0x0B84, 242) && tables.is_member(0x1234, 3));
+    // The restored network exports them again.
+    let again = export!(export_flags::APS_GROUPS);
+    assert_eq!(canonical(stream_groups(&again)), canonical(groups.to_vec()));
+}
+
+/// A restore never overflows the group table: groups beyond its capacity
+/// and groups with more endpoints than it holds are `IGNORED` (nothing of
+/// the record applied), records of one group merge; malformed records
+/// abort the transaction (9.4 rule 2).
+#[test]
+fn restore_bounds_the_group_table() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let form = host.request(&form_request(0x7C02, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let begin = host.request(&BkpExportBegin {
+        flags: export_flags::KEYS,
+    });
+    exchange!();
+    let begin = host.response(begin);
+    let begin: BkpExportBeginRsp = begin.body();
+    let read = host.request(&BkpExportRead {
+        txn: begin.txn,
+        max_bytes: 480,
+    });
+    exchange!();
+    let read = host.response(read);
+    assert_eq!(read.payload[1], 0, "one chunk");
+    let stream = read.payload[2..].to_vec();
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+
+    /// Restore `stream` in PUTs of at most `max_records_per_put` records
+    /// and 512 bytes; the notes and the statuses of the last PUT and the
+    /// COMMIT.
+    macro_rules! restore {
+        ($stream:expr) => {{
+            let stream: Vec<u8> = $stream;
+            let records: Vec<&[u8]> = RawRecords::new(&stream).map(|r| r.unwrap().1).collect();
+            let begin = host.request(&BkpRestoreBegin {
+                flags: 0,
+                nwk_margin: 0,
+                aps_margin: 0,
+                expected_records: records.len() as u32,
+            });
+            exchange!();
+            let begin = host.response(begin);
+            let begin: BkpRestoreBeginRsp = begin.body();
+            let mut notes = Vec::new();
+            let mut put_status = 0;
+            let mut chunk: Vec<&[u8]> = Vec::new();
+            let mut chunks = Vec::new();
+            for record in records {
+                let bytes: usize = chunk.iter().map(|r| r.len()).sum();
+                if chunk.len() == usize::from(begin.max_records_per_put)
+                    || bytes + record.len() > 512
+                {
+                    chunks.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(record);
+            }
+            chunks.push(chunk);
+            for chunk in chunks {
+                let mut payload = begin.txn.to_le_bytes().to_vec();
+                for record in chunk {
+                    payload.extend_from_slice(record);
+                }
+                let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+                exchange!();
+                let put = host.response(put);
+                put_status = put.status();
+                if put_status != 0 {
+                    break;
+                }
+                let put: BkpRestorePutRsp = put.body();
+                notes.extend(put.notes.iter().map(|n| (n.index, n.note)));
+            }
+            let commit = host.request(&BkpRestoreCommit { txn: begin.txn });
+            exchange!();
+            (notes, put_status, host.response(commit).status())
+        }};
+    }
+
+    // Index of the first inserted record: NODE NETWORK NETWORK_KEY
+    // TC_LINK_KEY come first.
+    let first = 4u16;
+    let codec_max: Vec<u8> = (0..255).map(|i| (i % 240) as u8 + 1).collect();
+    let mut extra = vec![
+        group_tlv(0x2000, &[1, 2]),                      // 0: staged
+        group_tlv(0x2000, &[3]),                         // 1: merged into 0x2000
+        group_tlv(0x2001, &[1, 2, 3, 4, 5, 6, 7, 8, 9]), // 2: 9 endpoints
+        group_tlv(0x2000, &[4, 5, 6, 7, 8, 9]),          // 3: 0x2000 would hold 9
+        group_tlv(0x2002, &[5, 5, 5]),                   // 4: staged as [5]
+        group_tlv(0x2003, &codec_max),                   // 5: 255 endpoints (codec limit)
+    ];
+    for group in 0x3000..0x300E {
+        extra.push(group_tlv(group, &[1])); // 6..=19: 16 groups staged
+    }
+    extra.push(group_tlv(0x4000, &[1])); // 20: the table is full
+    extra.push(group_tlv(0x2002, &[6])); // 21: an existing group still merges
+    let (notes, put, commit) = restore!(with_records(&stream, &extra));
+    assert_eq!((put, commit), (0, 0));
+    assert_eq!(
+        notes,
+        [2u16, 3, 5, 20]
+            .iter()
+            .map(|i| (first + i, note::IGNORED))
+            .collect::<Vec<_>>()
+    );
+    let restored: Vec<(u16, Vec<u8>)> = (0..)
+        .map_while(|index| port.group(index))
+        .map(|view| (view.group, view.endpoints.to_vec()))
+        .collect();
+    let mut expected = vec![(0x2000u16, vec![1u8, 2, 3]), (0x2002, vec![5, 6])];
+    expected.extend((0x3000..0x300E).map(|group| (group, vec![1])));
+    assert_eq!(restored.len(), 16, "the table is exactly full");
+    assert_eq!(canonical(restored), canonical(expected));
+
+    // Malformed: the PUT fails and the transaction is gone.
+    for bad in [
+        group_tlv(0xFFF8, &[1]),
+        group_tlv(0x2000, &[]),
+        group_tlv(0x2000, &[0]),
+        group_tlv(0x2000, &[1, 241]),
+        group_tlv(0x2000, &[243]),
+    ] {
+        let (_, put, commit) = restore!(with_records(&stream, &[bad]));
+        assert_eq!(put, Status::InvalidParameter.to_u8());
+        assert_eq!(commit, Status::NotFound.to_u8());
+    }
+    // The last committed restore is untouched.
+    assert_eq!(port.group_capacity(), 16);
+    assert_eq!((0..).map_while(|index| port.group(index)).count(), 16);
 }
 
 /// `NWK_CHANGE_CHANNEL` (R22 2.4.3.3.9): the Mgmt_NWK_Update_req broadcast

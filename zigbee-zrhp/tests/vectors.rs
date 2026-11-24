@@ -500,6 +500,31 @@ fn message_vectors() {
                     (14024, 3, 2, 3)
                 );
             }
+            "tbl_read_aps_group" => {
+                let r: TblRead = rt(&m, &whole);
+                assert_eq!(
+                    r,
+                    TblRead {
+                        table: records::record_type::APS_GROUP,
+                        cursor: 0,
+                        max: 8
+                    }
+                );
+            }
+            "tbl_read_aps_group_rsp" => {
+                let r = rt_rsp::<TblReadRsp>(&m, &whole);
+                let b = r.body.unwrap();
+                assert_eq!(b.next_cursor, 0xFFFF);
+                let groups: Vec<(u16, Vec<u8>)> = b
+                    .entries
+                    .iter()
+                    .map(|entry| match entry.record {
+                        Record::ApsGroup(g) => (g.group, g.endpoints.to_vec()),
+                        other => panic!("not an APS_GROUP: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(groups, [(0x0B84, vec![242]), (0x1234, vec![1, 3])]);
+            }
             "tbl_writeback_evict" => {
                 let r: TblWriteback = rt(&m, &whole);
                 assert_eq!((r.table, r.reason, r.rev), (5, tables_reason_evict(), 0x39));

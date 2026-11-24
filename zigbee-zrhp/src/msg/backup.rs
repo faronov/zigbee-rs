@@ -14,16 +14,31 @@ pub mod note {
     pub const HOST_BACKED: u8 = 1;
     /// Child table full; kept as a non-child.
     pub const CHILD_DEMOTED: u8 = 2;
-    /// Unknown record ignored.
+    /// Record ignored: unknown, or not held by this NCP (for example an
+    /// `APS_GROUP` beyond its group table).
     pub const IGNORED: u8 = 3;
     /// A frame-counter floor was raised.
     pub const FLOOR_RAISED: u8 = 4;
 }
 
+/// `BKP_EXPORT_BEGIN` flags.
+pub mod export_flags {
+    /// Network and link keys (when key export is unlocked).
+    pub const KEYS: u8 = 0x01;
+    /// `DEVICE` records.
+    pub const DEVICES: u8 = 0x02;
+    /// GP tables.
+    pub const GP_TABLES: u8 = 0x04;
+    /// `APS_GROUP` records: the coordinator's APS group table
+    /// (`APS_GROUP_TABLE` capability).
+    pub const APS_GROUPS: u8 = 0x08;
+}
+
 wire_struct! {
     /// `BKP_EXPORT_BEGIN` request.
     pub struct BkpExportBegin {
-        /// Bit0 keys, bit1 devices, bit2 GP tables.
+        /// [`export_flags`]: bit0 keys, bit1 devices, bit2 GP tables, bit3
+        /// APS groups.
         pub flags: u8,
     }
 }
