@@ -48,16 +48,19 @@ composition; this crate has no board, product or vendor dependency.
 * SEC: `SEC_GET_NETWORK_KEY` (until `SEC_LOCK_KEY_EXPORT`),
   `SEC_GET_FRAME_COUNTERS`; one global outgoing APS counter.
 * TABLES (standalone mode, 8.1): `TBL_READ`/`TBL_STATS` of the DEVICE table
-  (Trust Center records and children), `TBL_PUSH` (unique TCLK provisioning),
-  `TBL_INVALIDATE` (device deletion), `TBL_SYNC`; `EVT_TBL_EPOCH_CHANGED`
-  after a wipe (reason 1) and a restore (reason 2).
-* BACKUP: export (`NODE`, `NETWORK`, keys, `DEVICE` records, `RS_PARAMS`,
-  `END` with CRC-32C, generated per read) and restore (records validated per
-  9.4 rule 2, staged in RAM with up to 64 link keys and 64 children, `END`
-  checked at commit, counter rules 4/6 including the 2²⁰ unknown-TCLK
-  margin, IEEE override with flags bit0; children are written to the
-  durable child table before the resume and keep their parent and short
-  address).
+  (Trust Center records and children) and of the APS group table (`0x0D`,
+  read-only, capability `APS_GROUP_TABLE`), `TBL_PUSH` (unique TCLK
+  provisioning), `TBL_INVALIDATE` (device deletion), `TBL_SYNC`;
+  `EVT_TBL_EPOCH_CHANGED` after a wipe (reason 1) and a restore (reason 2).
+* BACKUP: export (`NODE`, `NETWORK`, keys, `DEVICE` records, `APS_GROUP`
+  records with flags bit3, `RS_PARAMS`, `END` with CRC-32C, generated per
+  read) and restore (records validated per 9.4 rule 2, staged in RAM with up
+  to 64 link keys, 64 children and 16 APS groups, `END` checked at commit,
+  counter rules 4/6 including the 2²⁰ unknown-TCLK margin, IEEE override
+  with flags bit0; children are written to the durable child table before
+  the resume and keep their parent and short address; groups beyond the
+  table are `IGNORED`, the others are installed through the
+  `NWK_GROUP_MEMBERSHIP` path once the network runs, rule 8).
 * FW (product platform): `FW_BEGIN`/`WRITE`/`FINISH`/`ACTIVATE`/`CONFIRM`/
   `ABORT`/`GET_SLOTS`: inactive A/B slot, SHA-256 and signature policy,
   pending-verify trial with host confirmation, rollback by the IDF

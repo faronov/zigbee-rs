@@ -5,9 +5,18 @@
 //! **standalone** mode (8.1): no lookups, no evictions. Implemented:
 //!
 //! * `TBL_READ` / `TBL_STATS` of the DEVICE table (record type `0x05`);
+//! * `TBL_READ` / `TBL_STATS` of the APS group table (`APS_GROUP`, `0x0D`,
+//!   capability `APS_GROUP_TABLE`), read-only: it is written with
+//!   `NWK_GROUP_MEMBERSHIP`;
 //! * `TBL_PUSH` of DEVICE records with a link block (unique TCLK provisioned
 //!   before join), `TBL_INVALIDATE` (host deletion, I5);
 //! * `TBL_SYNC`: epoch and counts.
+//!
+//! `TBL_READ` pages by entry index: `next_cursor` is the first entry not
+//! sent. An entry added or removed between pages can shift the others by
+//! one (a host that needs a consistent view reads again from cursor 0 after
+//! its own changes); `table_epoch` changes when the network's tables are
+//! wiped or replaced, both tables included.
 //!
 //! Not implemented (answered explicitly): paging (`TBL_LOOKUP` misses,
 //! eviction writebacks), NCP-originated `TBL_WRITEBACK`, per-entry `rev`
@@ -17,20 +26,23 @@
 //! (8.1 "full without host tables").
 
 use heapless::Vec;
-use zigbee_zrhp::codec::{List, Writer};
+use zigbee_zrhp::codec::{CodecError, List, Writer};
 use zigbee_zrhp::msg::tables::{
     PushResult, TableKey, TblInvalidate, TblPush, TblPushRsp, TblRead, TblStats, TblStatsRsp,
     TblSync, TblSyncRsp,
 };
 use zigbee_zrhp::msg::{Kind, RawMessage, ids};
 use zigbee_zrhp::queue::EndpointQueues;
-use zigbee_zrhp::records::{ChildInfo, DeviceRecord, LinkBlock, Record, device_flags, record_type};
+use zigbee_zrhp::records::{
+    ApsGroupRecord, ChildInfo, DeviceRecord, LinkBlock, Record, device_flags, record_type,
+};
 use zigbee_zrhp::types::{Endpoint, Ieee, Status};
 
 use crate::ncp::QUEUE_BYTES;
-use crate::port::{CoordinatorPort, DeviceView, NetworkState, OpError};
+use crate::port::{CoordinatorPort, DeviceView, GroupView, NetworkState, OpError};
 
-/// Most DEVICE entries one `TBL_READ` response carries (≤ 46 B each).
+/// Most entries one `TBL_READ` response carries (DEVICE ≤ 46 B each,
+/// APS_GROUP ≤ 19 B).
 pub const MAX_READ_ENTRIES: usize = 8;
 
 /// Whether `id` belongs to the TABLES group.
@@ -116,7 +128,10 @@ pub(crate) fn dispatch_tables<C: CoordinatorPort>(
     match id {
         ids::TBL_READ => {
             let request = decode!(TblRead);
-            if request.table != record_type::DEVICE {
+            let table = request.table;
+            if table != record_type::DEVICE
+                && !(table == record_type::APS_GROUP && port.group_capacity() != 0)
+            {
                 status(queues, Status::UnsupportedCommand);
                 return;
             }
@@ -124,52 +139,60 @@ pub(crate) fn dispatch_tables<C: CoordinatorPort>(
                 status(queues, Status::InvalidState);
                 return;
             }
-            let aps_limit = port.frame_counters().aps_limit;
-            let max = usize::from(request.max).clamp(1, MAX_READ_ENTRIES);
-            // status, u16 next_cursor, u8 n, n × {u32 rev, u8 state, record}
-            let mut payload = [0u8; 4 + MAX_READ_ENTRIES * 48];
-            payload[0] = Status::Success.to_u8();
-            let mut w = Writer::new(&mut payload[4..]);
-            let mut index = usize::from(request.cursor);
-            let mut n = 0u8;
-            while usize::from(n) < max {
-                let Some(view) = port.device(index) else {
-                    break;
-                };
-                let record = Record::Device(device_record(&view, keys_exportable, aps_limit));
-                let state = u8::from(view.child.is_some()) << 1; // pinned
-                let mark = w.len();
-                if write_entry(&mut w, state, &record).is_err() {
-                    w.truncate(mark);
-                    break;
-                }
-                n += 1;
-                index += 1;
-            }
-            let written = w.len();
-            let next = if port.device(index).is_some() {
-                index as u16
+            if table == record_type::DEVICE {
+                let aps_limit = port.frame_counters().aps_limit;
+                read_page(
+                    queues,
+                    endpoint,
+                    tid,
+                    &request,
+                    port,
+                    |port, index| port.device(index).is_some(),
+                    |port, index, w| {
+                        let view = port.device(index)?;
+                        let record =
+                            Record::Device(device_record(&view, keys_exportable, aps_limit));
+                        // Children are pinned (bit1).
+                        Some(write_entry(w, u8::from(view.child.is_some()) << 1, &record))
+                    },
+                );
             } else {
-                0xFFFF
-            };
-            payload[1..3].copy_from_slice(&next.to_le_bytes());
-            payload[3] = n;
-            let _ = queues
-                .queue(endpoint)
-                .raw(Kind::Response, id, tid, &payload[..4 + written]);
+                read_page(
+                    queues,
+                    endpoint,
+                    tid,
+                    &request,
+                    port,
+                    |port, index| port.group(index).is_some(),
+                    |port, index, w| {
+                        let view = port.group(index)?;
+                        Some(write_entry(w, 0, &group_record(&view)))
+                    },
+                );
+            }
         }
         ids::TBL_STATS => {
             let request = decode!(TblStats);
-            if request.table != record_type::DEVICE {
-                status(queues, Status::UnsupportedCommand);
-                return;
-            }
-            let used = device_count(port);
-            let pinned = (0..used)
-                .filter(|&index| port.device(index).is_some_and(|view| view.child.is_some()))
-                .count();
+            let (capacity, used, pinned) = match request.table {
+                record_type::DEVICE => {
+                    let used = device_count(port);
+                    let pinned = (0..used)
+                        .filter(|&index| {
+                            port.device(index).is_some_and(|view| view.child.is_some())
+                        })
+                        .count();
+                    (port.device_capacity(), used, pinned)
+                }
+                record_type::APS_GROUP if port.group_capacity() != 0 => {
+                    (port.group_capacity(), group_count(port), 0)
+                }
+                _ => {
+                    status(queues, Status::UnsupportedCommand);
+                    return;
+                }
+            };
             let response = TblStatsRsp {
-                capacity: port.device_capacity().min(usize::from(u16::MAX)) as u16,
+                capacity: capacity.min(usize::from(u16::MAX)) as u16,
                 used: used as u16,
                 dirty: 0,
                 pinned: pinned as u16,
@@ -267,12 +290,74 @@ pub(crate) fn dispatch_tables<C: CoordinatorPort>(
     }
 }
 
+/// One `TBL_READ` page from `request.cursor` (the entry index): at most
+/// `request.max` (1..=[`MAX_READ_ENTRIES`]) entries written by `entry`
+/// (`None` past the end, `Err` when the entry does not fit the page), and
+/// `next_cursor` the first entry not sent (`FFFF` once `exists` says the
+/// table ends there). Every entry has `rev` 0 (standalone, 8.1).
+// Own frame per table: one page buffer on the stack at a time.
+#[inline(never)]
+fn read_page<C: CoordinatorPort>(
+    queues: &mut EndpointQueues<QUEUE_BYTES>,
+    endpoint: Endpoint,
+    tid: u16,
+    request: &TblRead,
+    port: &C,
+    exists: impl Fn(&C, usize) -> bool,
+    entry: impl Fn(&C, usize, &mut Writer<'_>) -> Option<Result<(), CodecError>>,
+) {
+    let max = usize::from(request.max).clamp(1, MAX_READ_ENTRIES);
+    // status, u16 next_cursor, u8 n, n × {u32 rev, u8 state, record}
+    let mut payload = [0u8; 4 + MAX_READ_ENTRIES * 48];
+    payload[0] = Status::Success.to_u8();
+    let mut w = Writer::new(&mut payload[4..]);
+    let mut index = usize::from(request.cursor);
+    let mut n = 0u8;
+    while usize::from(n) < max {
+        let mark = w.len();
+        match entry(port, index, &mut w) {
+            Some(Ok(())) => {}
+            Some(Err(_)) => {
+                w.truncate(mark);
+                break;
+            }
+            None => break,
+        }
+        n += 1;
+        index += 1;
+    }
+    let written = w.len();
+    let next = if exists(port, index) {
+        index as u16
+    } else {
+        0xFFFF
+    };
+    payload[1..3].copy_from_slice(&next.to_le_bytes());
+    payload[3] = n;
+    let _ = queues
+        .queue(endpoint)
+        .raw(Kind::Response, ids::TBL_READ, tid, &payload[..4 + written]);
+}
+
+/// An `APS_GROUP` record of `view` (table `0x0D` and the backup).
+pub(crate) fn group_record(view: &GroupView) -> Record<'_> {
+    Record::ApsGroup(ApsGroupRecord {
+        group: view.group,
+        endpoints: &view.endpoints,
+    })
+}
+
+/// Number of groups in the APS group table.
+pub(crate) fn group_count<C: CoordinatorPort>(port: &C) -> usize {
+    let mut count = 0;
+    while port.group(count).is_some() {
+        count += 1;
+    }
+    count
+}
+
 /// `u32 rev, u8 state, record` of one `TBL_READ` entry.
-fn write_entry(
-    w: &mut Writer<'_>,
-    state: u8,
-    record: &Record<'_>,
-) -> Result<(), zigbee_zrhp::codec::CodecError> {
+fn write_entry(w: &mut Writer<'_>, state: u8, record: &Record<'_>) -> Result<(), CodecError> {
     use zigbee_zrhp::codec::Wire;
     w.u32(0)?;
     w.u8(state)?;

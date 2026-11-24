@@ -566,3 +566,25 @@ pub fn debug_state() -> (u8, u16, u8, u8) {
 pub fn tx_ack_recoveries() -> u32 {
     raw::tx_ack_recoveries()
 }
+
+/// Transmissions the external arbiter refused (local patch
+/// `ieee802154-extcoex`, declared last).
+#[cfg(feature = "ieee802154-extcoex")]
+pub use self::raw::coex_break::{CoexBreaks, coex_breaks, reset_coex_breaks};
+
+/// Transmissions the external arbiter refused (local patch
+/// `ieee802154-extcoex`, declared last).
+#[cfg(feature = "ieee802154-extcoex")]
+impl Ieee802154<'_> {
+    /// Forget an earlier refusal; call before starting a transmission.
+    pub fn clear_tx_coex_denied(&mut self) {
+        raw::coex_break::clear_tx_denied()
+    }
+
+    /// Whether the transmission that just completed (its TX-done callback
+    /// ran) was refused for lack of grant (`TxCoexBreak`) rather than sent.
+    /// Reported once.
+    pub fn take_tx_coex_denied(&mut self) -> bool {
+        raw::coex_break::take_tx_denied()
+    }
+}

@@ -40,6 +40,9 @@ pub mod record_type {
     pub const GP_SINK: u8 = 0x0B;
     /// `GP_TRANSLATION`
     pub const GP_TRANSLATION: u8 = 0x0C;
+    /// `APS_GROUP` (also a table ID, read-only: written with
+    /// `NWK_GROUP_MEMBERSHIP`)
+    pub const APS_GROUP: u8 = 0x0D;
     /// `END`
     pub const END: u8 = 0xFF;
 }
@@ -470,6 +473,35 @@ wire_struct! {
     }
 }
 
+/// `APS_GROUP` (`0x0D`): one group of the coordinator's APS group table and
+/// its member endpoints (`u16 group, u8 n, n × u8 endpoint`).
+///
+/// The codec carries up to 255 endpoints; an NCP holds fewer (zigbee-rs: 8
+/// per group, `group_table` groups) and bounds a restore itself (spec 9.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApsGroupRecord<'a> {
+    /// Group address.
+    pub group: u16,
+    /// Member endpoints.
+    pub endpoints: &'a [u8],
+}
+
+impl<'a> Wire<'a> for ApsGroupRecord<'a> {
+    fn read(r: &mut Reader<'a>) -> Result<Self, CodecError> {
+        let group = r.u16()?;
+        let n = usize::from(r.u8()?);
+        Ok(Self {
+            group,
+            endpoints: r.bytes(n)?,
+        })
+    }
+    fn write(&self, w: &mut Writer<'_>) -> Result<(), CodecError> {
+        w.u16(self.group)?;
+        w.u8(u8::try_from(self.endpoints.len()).map_err(|_| CodecError::Invalid)?)?;
+        w.bytes(self.endpoints)
+    }
+}
+
 wire_struct! {
     /// `END` (`0xFF`).
     pub struct EndRecord {
@@ -505,6 +537,8 @@ pub enum Record<'a> {
     GpSink(GpSinkRecord),
     /// `0x0C`
     GpTranslation(GpTranslationRecord<'a>),
+    /// `0x0D`
+    ApsGroup(ApsGroupRecord<'a>),
     /// `0xFF`
     End(EndRecord),
     /// Any other type (skipped by the NCP, preserved by hosts).
@@ -532,6 +566,7 @@ impl Record<'_> {
             Self::RsParams(_) => RS_PARAMS,
             Self::GpSink(_) => GP_SINK,
             Self::GpTranslation(_) => GP_TRANSLATION,
+            Self::ApsGroup(_) => APS_GROUP,
             Self::End(_) => END,
             Self::Unknown { rtype, .. } => *rtype,
         }
@@ -557,6 +592,7 @@ impl<'a> Wire<'a> for Record<'a> {
             RS_PARAMS => Self::RsParams(v.read()?),
             GP_SINK => Self::GpSink(v.read()?),
             GP_TRANSLATION => Self::GpTranslation(v.read()?),
+            APS_GROUP => Self::ApsGroup(v.read()?),
             END => Self::End(v.read()?),
             _ => Self::Unknown { rtype, value },
         })
@@ -577,6 +613,7 @@ impl<'a> Wire<'a> for Record<'a> {
             Self::RsParams(v) => w.write(v)?,
             Self::GpSink(v) => w.write(v)?,
             Self::GpTranslation(v) => w.write(v)?,
+            Self::ApsGroup(v) => w.write(v)?,
             Self::End(v) => w.write(v)?,
             Self::Unknown { value, .. } => w.bytes(value)?,
         }

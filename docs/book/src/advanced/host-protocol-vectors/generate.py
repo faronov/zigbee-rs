@@ -154,7 +154,7 @@ EVT_GP_FRAME, EVT_GP_COMMISSIONED = 0x0A80, 0x0A82
 EVT_GP_REMOTE_STATUS, EVT_GP_REMOTE_TRANSLATION_TABLE = 0x0A85, 0x0A88
 EVT_GP_APP_DESCRIPTION = 0x0A89
 LOG_RECORD = 0x0980
-TBL_LOOKUP, TBL_WRITEBACK = 0x0501, 0x0502
+TBL_LOOKUP, TBL_WRITEBACK, TBL_READ = 0x0501, 0x0502, 0x0506
 BKP_RESTORE_BEGIN, BKP_RESTORE_PUT, BKP_RESTORE_COMMIT = 0x0611, 0x0612, 0x0613
 BKP_EXPORT_BEGIN, BKP_EXPORT_READ = 0x0601, 0x0602
 
@@ -269,7 +269,7 @@ def hmac_mmo(key: bytes, message: bytes) -> bytes | None:
 
 R_NODE, R_NETWORK, R_NETWORK_KEY, R_TC_LINK_KEY, R_DEVICE = 0x01, 0x02, 0x03, 0x04, 0x05
 R_EZSP_HASHED_TCLK, R_SOURCE_ROUTE, R_GP_PROXY, R_RS_PARAMS, R_END = 0x06, 0x08, 0x09, 0x0A, 0xFF
-R_GP_SINK, R_GP_TRANSLATION = 0x0B, 0x0C
+R_GP_SINK, R_GP_TRANSLATION, R_APS_GROUP = 0x0B, 0x0C, 0x0D
 APS_UNKNOWN_TCLK_MARGIN = 1 << 20  # host rule when a backup has no TCLK counter (9.4)
 DEV_IS_CHILD, DEV_HAS_LINK_KEY, DEV_HAS_CHILD_INFO, DEV_NWK_VALID = 0x01, 0x02, 0x04, 0x08
 KEY_ATTR_VERIFIED, KEY_ORIGIN_IMPORTED = 2, 3
@@ -680,6 +680,15 @@ def build_messages():
         b"\x00" + struct.pack("<I", 41) + dev, "host returns rev 41 device record with link key")
     add("tbl_writeback_evict", EP_TABLES, K_REQUEST, TBL_WRITEBACK, 0x0002,
         struct.pack("<BBI", R_DEVICE, 3, 57) + dev, "NCP evicts a dirty entry; host must fsync first")
+    groups = [record(R_APS_GROUP, struct.pack("<HB", 0x0B84, 1) + bytes([242])),
+              record(R_APS_GROUP, struct.pack("<HB", 0x1234, 2) + bytes([1, 3]))]
+    add("tbl_read_aps_group", EP_TABLES, K_REQUEST, TBL_READ, 0x0003,
+        struct.pack("<BHB", R_APS_GROUP, 0, 8),
+        "host reads the APS group table (0x0D) from cursor 0, at most 8 entries")
+    add("tbl_read_aps_group_rsp", EP_TABLES, K_RESPONSE, TBL_READ, 0x0003,
+        b"\x00" + struct.pack("<HB", 0xFFFF, len(groups))
+        + b"".join(struct.pack("<IB", 0, 0) + g for g in groups),
+        "APS group table (0x0D): GP sink group 0x0B84 with endpoint 242, 0x1234 with 1 and 3")
     add("sec_lock_key_export", EP_ZIGBEE, K_REQUEST, SEC_LOCK_KEY_EXPORT, 0x0106,
         struct.pack("<I", 0x4B434F4C), "confirm word 'LOCK'; key export refused until reboot")
     add("sec_lock_key_export_rsp", EP_ZIGBEE, K_RESPONSE, SEC_LOCK_KEY_EXPORT, 0x0106, b"\x00",

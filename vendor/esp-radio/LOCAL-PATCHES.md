@@ -359,10 +359,25 @@ at the end of `raw.rs`/`mod.rs`.
   ESP-IDF v5.5.1's (SHA-1 `d67b0a16d30eb2d876b6a717a84840ea14f18b82`). The
   stage functions write the PTI offset (`0x600AD4D8[3:0]` = 0 / 0xF); the
   PTI setters write IEEE802154 `COEX_PTI` through `coex_pti_tab`.
+- **Arbiter refusals** (`raw::coex_break`, appended after the other
+  patches; in-place edits only extend existing lines): TX_ABORT reads
+  `tx_abort_status` before `abort_tx` clears it. `TxCoexBreak` (grant
+  denied) is handled as ESP-IDF v5.5.1 `isr_handle_tx_abort` does: the
+  transmission fails (`ESP_IEEE802154_TX_ERR_COEXIST`) and the next
+  operation starts at once (`Stop`, receiver restarted, TX-done callback),
+  instead of leaving the state in `Transmit` until the caller's 10 ms
+  TX-done timeout cancelled it. The caller learns it from
+  `Ieee802154::take_tx_coex_denied` (zigbee-mac `esp-extcoex`: CSMA-CA
+  backs off as from a busy channel; a timed transmission reports
+  `Missed`). A triggered reply (`ieee802154-triggered-tx`) publishes its
+  outcome only when it ends: `Sent` at TX_DONE, `Busy` when the arbiter
+  broke it off or it was cancelled (upstream: `Sent` at the TX command, and
+  a broken-off reply left the radio in `Transmit` with nothing to cancel
+  it). Counted: `TxCoexBreak`, `RxAckCoexBreak` (TX_ABORT) and
+  `TxAckCoexBreak` (RX_ABORT of an automatic ACK) — `coex_breaks()` /
+  `reset_coex_breaks()`, reported as DIAG counters `0x0220..=0x0222`.
 - **Not included:** enabling the arbiter and routing the GPIO matrix
-  (application: `products/esp32-zigbee-ncp/src/pta.rs`); a TX aborted by
-  `TxCoexBreak` (grant denied) is still only cleared, not reported, so the
-  caller's TX-done timeout reports it.
+  (application: `products/esp32-zigbee-ncp/src/pta.rs`).
 - **Hardware:** not yet run on the Thread BR board
   (`examples/esp32-ncp` `pta_lab`).
 

@@ -242,6 +242,28 @@ pub enum OpError {
     Zigbee(u8),
 }
 
+/// Most endpoints of one APS group (`zigbee_aps` `MAX_ENDPOINTS_PER_GROUP`).
+pub const MAX_GROUP_ENDPOINTS: usize = 8;
+
+/// Most groups any port's APS group table holds (`zigbee_aps` `MAX_GROUPS`
+/// with `router`): the staging bound of a restore.
+pub const MAX_GROUPS: usize = 16;
+
+/// One group of the coordinator's APS group table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupView {
+    pub group: u16,
+    pub endpoints: Vec<u8, MAX_GROUP_ENDPOINTS>,
+}
+
+/// Whether `endpoint` may be a member of `group` (spec 7.2
+/// `NWK_GROUP_MEMBERSHIP`, `APS_GROUP` restore): host endpoints 1..=240 and
+/// the NCP-owned GP endpoint 242 (H5: GP Notifications groupcast to the
+/// sink group), groups up to `0xFFF7`.
+pub const fn group_member_valid(group: u16, endpoint: u8) -> bool {
+    group <= 0xFFF7 && (matches!(endpoint, 1..=240) || endpoint == 242)
+}
+
 /// The coordinator stack behind the NCP.
 #[allow(async_fn_in_trait)]
 pub trait CoordinatorPort {
@@ -319,6 +341,19 @@ pub trait CoordinatorPort {
     fn group_membership(&mut self, op: u8, group: u16, endpoint: u8) -> Result<(), EndpointError> {
         let _ = (op, group, endpoint);
         Err(EndpointError::Unsupported)
+    }
+    /// Group `index` of the APS group table (`APS_GROUP` records of
+    /// `TBL_READ` and the backup); `None` past the end.
+    fn group(&self, index: usize) -> Option<GroupView> {
+        let _ = index;
+        None
+    }
+    /// Groups the APS group table holds (at most [`MAX_GROUPS`]); 0 when
+    /// [`Self::group`] is not implemented: no `APS_GROUP_TABLE`
+    /// capability, table `0x0D` answers `UNSUPPORTED_COMMAND`, backups
+    /// carry no groups and a restore ignores them.
+    fn group_capacity(&self) -> usize {
+        0
     }
 
     // ── Network images, Trust Center devices (formation parameters,

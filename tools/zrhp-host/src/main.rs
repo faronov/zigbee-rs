@@ -20,10 +20,15 @@
 //! the smoke sequence:
 //!
 //! ```text
-//! --backup FILE    BKP_EXPORT (keys + devices) into FILE (OCB record stream)
+//! --backup FILE    BKP_EXPORT (keys + devices + APS groups) into FILE (OCB
+//!                  record stream)
 //! --restore FILE   BKP_RESTORE of FILE (network must not be running:
 //!                  after a reset, without --form); margins 10 000/10 000
 //! --tables         TBL_STATS / TBL_READ / TBL_SYNC of the DEVICE table
+//! --group OP,0xGROUP,EP
+//!                  NWK_GROUP_MEMBERSHIP (1 add, 2 remove, 3 clear)
+//! --group-table    TBL_STATS / every TBL_READ page of the APS group table
+//!                  (0x0D, capability bit 24; after --group)
 //! --fw-slots       FW_GET_SLOTS
 //! --fw-update FILE --fw-version 0xMMmmrrrr
 //!                  FW_BEGIN/WRITE/FINISH/ACTIVATE of FILE (format 1); the
@@ -811,14 +816,19 @@ fn record_name(kind: u8) -> &'static str {
         record_type::TC_LINK_KEY => "TC_LINK_KEY",
         record_type::DEVICE => "DEVICE",
         record_type::RS_PARAMS => "RS_PARAMS",
+        record_type::APS_GROUP => "APS_GROUP",
         record_type::END => "END",
         _ => "other",
     }
 }
 
-/// `BKP_EXPORT` with keys and devices into `path`.
+/// `BKP_EXPORT` with keys, devices and APS groups into `path` (an NCP
+/// without `APS_GROUP_TABLE` ignores the groups flag).
 fn backup_export<S: ByteStream>(host: &mut Host<S>, path: &str) -> Result<(), String> {
-    let tid = host.request(&BkpExportBegin { flags: 0x03 });
+    use zigbee_zrhp::msg::backup::export_flags;
+    let tid = host.request(&BkpExportBegin {
+        flags: export_flags::KEYS | export_flags::DEVICES | export_flags::APS_GROUPS,
+    });
     let rsp = host.response(tid)?;
     let begin: BkpExportBeginRsp = body(&rsp)?;
     let mut stream = Vec::new();
@@ -1503,6 +1513,9 @@ fn main() {
             let (op, group, ep) = parse().ok_or("--group OP,0xGROUP,EP")?;
             checks::group(&mut host, op, group, ep)?;
         }
+        if args.iter().any(|a| a == "--group-table") {
+            checks::group_table(&mut host)?;
+        }
         if let Some(hex) = value("--invalidate") {
             let mut ieee = [0u8; 8];
             for (index, byte) in ieee.iter_mut().enumerate() {
@@ -1522,6 +1535,18 @@ fn main() {
                     .ok_or("--install-code IEEE: 16 hex digits")?;
             }
             checks::install_code(&mut host, ieee)?;
+        }
+        if let Some(spec) = value("--coex") {
+            // on|off[,0xMASK]
+            let mut parts = spec.split(',');
+            let enable = parts.next() == Some("on");
+            let mask = parts
+                .next()
+                .map_or(Ok(0), |m| {
+                    u8::from_str_radix(m.trim_start_matches("0x"), 16)
+                })
+                .map_err(|_| "--coex on|off[,0xMASK]")?;
+            checks::coex(&mut host, enable, mask)?;
         }
         if let Some(spec) = value("--energy-scan") {
             // 0xMASK[,EXP[,COUNT]]

@@ -11,6 +11,11 @@
 //! espflash flash --monitor target/riscv32imac-unknown-none-elf/release/pta_lab   # H2 USB-C port
 //! ```
 //!
+//! Without a USB host on the H2 (esp-println `auto`) the output goes to
+//! UART0 at 115 200, which the S3 bridge forwards to CDC 0; the S3 console
+//! (`pta`, `pta grant high|low|in`, `pta sample <ms>`) drives grant and
+//! samples request/priority from the leader's side.
+//!
 //! Phases (repeated):
 //!
 //! | Phase | PTA | mask | GPIO1 (grant) pad |
@@ -19,6 +24,8 @@
 //! | B | on | 0x00 | pull-up (granted, if the S3 does not drive GPIO13) |
 //! | C | on | 0x00 | pull-down (denied, if the S3 does not drive GPIO13) |
 //! | D | on | 0x08 | pull-up (all TX `High`) |
+//! | F | on | 0x08 | pull-down (all TX `High`, denied) |
+//! | H, I, J | on | 0x00, 0x08, 0x00 | up, up, down; tx_line pulled up (leader Wi-Fi TX) |
 //! | E | on | 0x00 | no pull (the S3 leader drives grant) |
 //! | R | refusals: mask 0x04 and 0x10 must be refused, state unchanged |
 //!
@@ -31,6 +38,12 @@
 //!
 //! Lab-only pad changes: input buffers are enabled on GPIO0/GPIO2 so the
 //! outputs can be read back, and phases B-D set pulls on GPIO1.
+//!
+//! The OS adapter fails closed (`product::pta::os_adapter`): `dump` prints
+//! its statistics and latched fault bits, and each phase ends with
+//! `Pta::poll`. A fault (for instance a timer the blob arms after the
+//! second cycle's `coex_init`/`coex_enable`) makes every later enable fail
+//! with `PtaError::Adapter` until the next boot.
 
 #![no_std]
 #![no_main]
@@ -81,6 +94,7 @@ enum Pull {
 #[derive(Default)]
 struct Stats {
     sent: u32,
+    denied: u32,
     timed_out: u32,
     refused: u32,
     samples: u32,
@@ -122,7 +136,14 @@ fn main() -> ! {
     dump(&pta);
 
     let mut seq = 0u8;
+    let mut cycle = 0u32;
     loop {
+        // Second cycle on: also the blob's coex_init + coex_enable.
+        if cycle == 1 {
+            let r = esp32_zigbee_ncp_product::pta::lab_coex_init_enable();
+            println!("pta_lab: coex (pre_init, init, enable) -> {r:?}");
+        }
+        cycle += 1;
         let mut run = |name: &str, enable: bool, priority_mask: u8, pull: Pull| {
             phase(
                 name,
@@ -143,6 +164,29 @@ fn main() -> ! {
             mask::ALL,
             Pull::Up,
         );
+        run(
+            "F on mask 0x08 (all High), grant pull-down",
+            true,
+            mask::ALL,
+            Pull::Down,
+        );
+        // tx_line is the leader's Wi-Fi TX indication: pulled up, the
+        // "leader" transmits.
+        set_pull(TX_LINE, Pull::Up);
+        run("H on, grant pull-up, tx_line pull-up", true, 0, Pull::Up);
+        run(
+            "I on mask 0x08 (all High), grant pull-up, tx_line pull-up",
+            true,
+            mask::ALL,
+            Pull::Up,
+        );
+        run(
+            "J on, grant pull-down, tx_line pull-up",
+            true,
+            0,
+            Pull::Down,
+        );
+        set_pull(TX_LINE, Pull::None);
         run("E on, S3 drives grant", true, 0, Pull::None);
         refusals(&mut pta);
         let off = pta.set(false, 0);
@@ -185,9 +229,17 @@ fn phase(
         .read()
         .bits()
         .wrapping_sub(breaks_before);
+    let coex = esp_radio::ieee802154::coex_breaks();
     println!(
-        "tx: sent {} timed_out {} refused {} | TX_BREAK_COEX_CNT +{}",
-        stats.sent, stats.timed_out, stats.refused, breaks
+        "tx: sent {} denied {} timed_out {} refused {} | TX_BREAK_COEX_CNT +{} | coex_breaks tx {} ack_rx {} ack_tx {}",
+        stats.sent,
+        stats.denied,
+        stats.timed_out,
+        stats.refused,
+        breaks,
+        coex.tx,
+        coex.ack_rx,
+        coex.ack_tx
     );
     println!(
         "pad samples during TX: {} | request {} grant {} priority {} tx_line {}",
@@ -197,6 +249,11 @@ fn phase(
         stats.priority_high,
         stats.tx_line_high
     );
+    // Fail closed as the NCP main loop does: an OS-adapter fault during
+    // the phase stops the arbiter.
+    if let Some(faults) = pta.poll() {
+        println!("PTA stopped: OS adapter fault {faults:#04x} (off until reboot)");
+    }
 }
 
 fn refusals(pta: &mut Pta<'_>) {
@@ -236,7 +293,12 @@ fn transmit_one(radio: &mut Ieee802154<'_>, seq: &mut u8, stats: &mut Stats) {
         stats.priority_high += pads >> PRIORITY & 1;
         stats.tx_line_high += pads >> TX_LINE & 1;
         if TX_DONE.load(Ordering::Acquire) {
-            stats.sent += 1;
+            // esp-radio `ieee802154-extcoex`: a TxCoexBreak completes too.
+            if radio.take_tx_coex_denied() {
+                stats.denied += 1;
+            } else {
+                stats.sent += 1;
+            }
             return;
         }
         if Instant::now() > deadline {
@@ -253,9 +315,11 @@ fn dump(pta: &Pta<'_>) {
     let coex =
         |offset: usize| unsafe { core::ptr::read_volatile((0x600A_D000 + offset) as *const u32) };
     println!(
-        "enabled={} mask={:#04x} | coex 49C={:08x} 4A0={:08x} 4A4={:08x} 4D0={:08x} 4D8={:08x}",
+        "enabled={} active={} mask={:#04x} {:?} | coex 49C={:08x} 4A0={:08x} 4A4={:08x} 4D0={:08x} 4D8={:08x}",
         pta.enabled(),
+        pta.active(),
         pta.priority_mask(),
+        esp32_zigbee_ncp_product::pta::adapter_stats(),
         coex(0x49C),
         coex(0x4A0),
         coex(0x4A4),

@@ -60,7 +60,7 @@ use zigbee_zrhp::msg::tables::EvtTblEpochChanged;
 pub const WINDOW: usize = [16, 8][cfg!(feature = "compact") as usize];
 /// Counters one `DIAG_GET_COUNTERS` response carries: 6 B each, so that
 /// the response fits a frame (spec 7.8). Every group of this NCP fits (all
-/// groups with PTA: 71).
+/// groups with PTA: 72).
 pub const MAX_COUNTERS: usize = 100;
 /// Bytes of queued outgoing messages per endpoint.
 pub const QUEUE_BYTES: usize = [1536, 1024][cfg!(feature = "compact") as usize];
@@ -920,6 +920,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 if port.groups_supported() {
                     ncp_caps |= caps::GROUP_MEMBERSHIP;
                 }
+                if port.group_capacity() != 0 {
+                    ncp_caps |= caps::APS_GROUP_TABLE;
+                }
                 if platform.fw_supported() {
                     ncp_caps |= caps::NCP_FW_UPDATE;
                 }
@@ -988,6 +991,11 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     Capacity {
                         id: capacity::NEIGHBOR_TABLE,
                         value: zigbee_nwk::neighbor::MAX_NEIGHBORS as u32,
+                    },
+                    // 0 without a readable group table.
+                    Capacity {
+                        id: capacity::GROUP_TABLE,
+                        value: port.group_capacity() as u32,
                     },
                     Capacity {
                         id: capacity::GP_SINK_TABLE,
@@ -1060,7 +1068,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 if *state.key_export_locked {
                     flags |= 0x01;
                 }
-                if state.coex.0 {
+                if coex_on(state.coex.0, platform) {
                     flags |= 0x04;
                 }
                 if port.permit_join_remaining_s() != 0 {
@@ -1109,7 +1117,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                         {
                             // Validated by the platform even while disabled.
                             let mask = item.value.0[0];
-                            match platform.set_pta(state.coex.0, mask) {
+                            match platform.set_pta(coex_on(state.coex.0, platform), mask) {
                                 Ok(()) => {
                                     state.coex.1 = mask;
                                     Status::Success
@@ -1140,7 +1148,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             ids::SYS_GET_CONFIG => {
                 let request = decode!(SysGetConfig);
                 let level = [log.level()];
-                let coex_enable = [u8::from(state.coex.0)];
+                let coex_enable = [u8::from(coex_on(state.coex.0, platform))];
                 let coex_mask = [state.coex.1];
                 let pta = platform.pta_supported();
                 let mut items: Vec<ConfigReadItem<'_>, 16> = Vec::new();
@@ -2710,4 +2718,12 @@ fn visit_counters<C: CoordinatorPort, P: NcpPlatform>(
         }
     }
     crate::gp::visit_counters(group_mask, sink);
+}
+
+/// `coex_enable` as reported (`SYS_GET_STATUS.flags` bit 2, `SYS_GET_CONFIG`)
+/// and as passed on with a new priority mask: the platform's own state when
+/// it knows it (it may have turned PTA off after a fault), else the last
+/// accepted request. Declared last: the lines above keep their numbers.
+fn coex_on<P: NcpPlatform>(requested: bool, platform: &P) -> bool {
+    platform.pta_active().unwrap_or(requested)
 }

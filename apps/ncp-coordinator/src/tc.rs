@@ -1397,7 +1397,7 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
     fn group_membership(&mut self, op: u8, group: u16, endpoint: u8) -> Result<(), EndpointError> {
         // Host endpoints and the NCP-owned GP endpoint (H5: GP
         // Notifications groupcast to the sink group).
-        if !(1..=240).contains(&endpoint) && endpoint != 242 || group > 0xFFF7 {
+        if !crate::port::group_member_valid(group, endpoint) {
             return Err(EndpointError::InvalidParameter);
         }
         let groups = self.app.device_mut().aps_mut().group_table_mut();
@@ -1414,6 +1414,22 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             }
             _ => Err(EndpointError::InvalidParameter),
         }
+    }
+
+    fn group(&self, index: usize) -> Option<crate::port::GroupView> {
+        const _: () =
+            assert!(crate::port::MAX_GROUP_ENDPOINTS == zigbee_aps::group::MAX_ENDPOINTS_PER_GROUP);
+        let entry = self.app.device().aps().group_table().groups().get(index)?;
+        Some(crate::port::GroupView {
+            group: entry.group_address,
+            endpoints: entry.endpoint_list.clone(),
+        })
+    }
+
+    fn group_capacity(&self) -> usize {
+        // A restore can stage every group the table holds.
+        const _: () = assert!(zigbee_aps::group::MAX_GROUPS <= crate::port::MAX_GROUPS);
+        zigbee_aps::group::MAX_GROUPS
     }
 
     fn gp(&mut self) -> Option<&mut dyn crate::gp::GpPort> {

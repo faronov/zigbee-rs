@@ -10,7 +10,7 @@
 > on an ESP32-C6 DevKit (lab variant, USB-Serial-JTAG) it completed the
 > session, formed a network (soft MAC `pan-coordinator` + `energy-detect`)
 > and resumed it after a reset. No device has joined it yet and none of the
-> hardware gates H1–H12 has passed. The zigpy library
+> hardware gates of 14.6 (H1–H8, H10–H12, PTA1) has passed. The zigpy library
 > ([`faronov/zigpy-zrhp`](https://github.com/faronov/zigpy-zrhp)) is tested
 > against the vectors, a Python NCP simulator and the Rust NCP on the host
 > (12.1.1) and on the Thread BR H2 NCP (2026-11-20: start on the existing
@@ -1081,7 +1081,7 @@ Capability bits (`u64`, NCP → host):
 | 9 | `ENERGY_SCAN` | 19 | `INTERPAN` (reserved) |
 | 20 | `GREEN_POWER_SINK` (combo sink, 7.11) | 21 | `PTA_COEX` (external 802.15.4/Wi-Fi coexistence wired and supported, 11.5) |
 | 22 | `UART_FLOW_CONTROL` (RTS/CTS active on this link) | 23 | `ACTIVE_SCAN` (`NWK_ACTIVE_SCAN`) |
-| 24–63 | reserved | | |
+| 24 | `APS_GROUP_TABLE` (`TBL_READ`/`TBL_STATS` of table `0x0D`, `BKP_EXPORT_BEGIN` flags bit3, `APS_GROUP` restore; 8.5, 9.3–9.5) | 25–63 | reserved |
 
 Capacities (`{u8 id, u32 value}` list):
 
@@ -1167,7 +1167,7 @@ Config IDs (v1):
 | `0x0006` | `indirect_timeout_ms` |
 | `0x0007` | reserved (key-export locking is the command `SEC_LOCK_KEY_EXPORT`, 7.5) |
 | `0x0008` | `log_level` |
-| `0x0009` | `coex_enable` (0/1; volatile, default 0; only when `PTA_COEX`; the embedded hub drives it from its Wi-Fi state, 11.5) |
+| `0x0009` | `coex_enable` (0/1; volatile, default 0; only when `PTA_COEX`; the embedded hub drives it from its Wi-Fi state, 11.5; reads 0 once the NCP has turned PTA off after an OS-adapter fault, and setting 1 then fails with `FAILURE` until the next boot) |
 | `0x000A` | `coex_tx_priority_mask` (bit0 MAC ACK frames, bit1 GP timed TX, bit2 TC/key transport, bit3 all) |
 
 `reset_reason` values: 0 unknown, 1 power-on, 2 software, 3 watchdog, 4
@@ -1208,7 +1208,7 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | `0x010A` | `NWK_ACTIVE_SCAN` | `u32 channel_mask, u8 duration_exp` | `u8 n, n×{u8 channel, u16 pan, [8] epid, u16 src, u8 lqi, i8 rssi, u8 permit, u8 stack_profile, u8 update_id}`, sent when the scan is complete (synchronous: no event; host timeout 2 × scan time + 15 s, scan time = channels × (2^`duration_exp` + 1) × 15.36 ms). Works with or without a network: one MLME-SCAN (active: beacon request, then the beacons) per channel, the NCP serving the link and the stack between channels and returning to the operating channel after each; frames sent to the NCP during a channel's window are lost (MAC retries, SED polls). `channel_mask` non-empty within 11–26 and `duration_exp` ≤ 6, else `INVALID_PARAMETER`; `IN_PROGRESS` while an active or energy scan runs. One record per Zigbee beacon heard in the order heard (the host deduplicates), at most 25; beacons of other protocols (Thread, plain IEEE 802.15.4) and beacons without a Zigbee payload or with an all-zero EPID are skipped; `epid` in air byte order; `src` `0xFFFF` for a beacon with an extended source; `permit` the superframe's association-permit bit; `rssi` the antenna power from the frame's LQI by the radio's mapping (ESP32: −100…−20 dBm, a stronger signal reads −20), `-128` when the platform does not know it. A failed channel ends the scan: `FAILURE` with the beacons heard so far | E (capability bit 23; ESP32 and CC26x2 NCPs) |
 | `0x010B` | `NWK_ADD_ENDPOINT` | `u8 ep, u16 profile, u16 device_id, u8 version, u8 n_in, n_in×u16, u8 n_out, n_out×u16` | — (`NO_SPACE` beyond `max_host_endpoints`; `INVALID_PARAMETER` for `ep` outside 1..=240 or more than 16 clusters in a list) | E (`ZigbeeDevice::register_host_endpoint`: the ZDO registry the server answers from; `max_host_endpoints` = 8; registering an endpoint again replaces it, including the product profile's endpoint with that number; registrations are RAM only and cleared by `NWK_LEAVE_RESET` without flags bit1) |
 | `0x010C` | `NWK_SET_MANUFACTURER_CODE` | `u16 code` | — | P (node descriptor field) |
-| `0x010D` | `NWK_GROUP_MEMBERSHIP` | `u8 op (1 add, 2 remove, 3 clear), u16 group, u8 ep` | — Needs the network up. `ep` 1..=240 or the GP endpoint 242, `group` ≤ `0xFFF7`. Remove is idempotent; clear removes `ep` from every group (`group` ignored). `NO_SPACE` when the table is full. Persisted with the APS tables. | E (APS group table, 16 groups × 8 endpoints; capability bit 17) |
+| `0x010D` | `NWK_GROUP_MEMBERSHIP` | `u8 op (1 add, 2 remove, 3 clear), u16 group, u8 ep` | — Needs the network up. `ep` 1..=240 or the GP endpoint 242, `group` ≤ `0xFFF7`. Remove is idempotent; clear removes `ep` from every group (`group` ignored). `NO_SPACE` when the table is full. Persisted with the APS tables. Hosts read the table with `TBL_READ` of table `0x0D` (`APS_GROUP` records, 8.5) and back it up with `BKP_EXPORT_BEGIN` flags bit3 (9.5). | E (APS group table, 16 groups × 8 endpoints, capacity 9 `group_table`; capability bit 17, reads and backup bit 24) |
 | `0x010E` | `NWK_REMOVE_DEVICE` | `u16 nwk, [8] ieee, u8 flags (bit0 rejoin, bit1 remove children, bit2 TC remove via parent)` | — | E (TC Remove-Device/leave journal) + P |
 | `0x0180` | `EVT_NETWORK_STATE` | `u8 state (0 down, 1 forming, 2 up, 3 leaving), u8 reason, u8 zb_status, u16 req_tid` | event | N |
 | `0x0181` | `EVT_DEVICE_JOINED` | `u16 nwk, [8] ieee, u16 parent_nwk, u8 join_type (0 association, 1 secured rejoin, 2 unsecured/TC rejoin, 3 direct), u8 capability, u8 decision (0 admitted, 1 denied)` | event | E (`TrustCenterHostEvent::Joined`: one event per Trust Center Update-Device join decision, through any parent including the NCP itself; `capability` is reconstructed from the neighbour entry for a child of the NCP and 0 for a device that joined through another parent; `parent_nwk` `0xFFFF` when unknown. `Device_annce` is forwarded as an indication, not as this event) |
@@ -1488,6 +1488,10 @@ other kinds above stay reserved until a cheap source exists.
 | `0x0206` | `mac_data_requests` | Child Data Requests acknowledged by the radio | ESP32 |
 | `0x0207` | `frame_pending_acks` | Of those, ACKs with Frame Pending set | ESP32 |
 | `0x0208` | `mac_ack_stall_recoveries` | Stalled automatic ACKs the radio driver recovered | ESP32 |
+| `0x0220` | `coex_denied` | Transmissions the PTA arbiter refused (no grant); failed as a busy channel (11.5) | ESP32-H2 with PTA |
+| `0x0221` | `coex_ack_rx_denied` | ACK receptions the arbiter broke off | ESP32-H2 with PTA |
+| `0x0222` | `coex_ack_tx_denied` | Automatic ACKs the arbiter broke off | ESP32-H2 with PTA |
+| `0x0223` | `coex_adapter_faults` | Requests of the vendor coexistence library the NCP's OS adapter could not honour (a wait, a timer, the semaphore or memory pool exhausted, an unknown handle). The first one turns PTA off until the next boot (11.5); resetting the counter does not re-enable it | ESP32-H2 with PTA |
 | `0x0301` | `nwk_secured_rx` | Secured NWK frames received | all |
 | `0x0302` | `nwk_decrypt_failures` | Of those, MIC/decrypt failures | all |
 | `0x0303` | `nwk_missing_key` | Of those, no key for the key sequence | all |
@@ -1968,7 +1972,7 @@ paths of 8.6.
 | Children of the coordinator | Child table + `ChildTableJournal` (authoritative, 64) | Mirror (backup) | Not paged; capacity `max_children` |
 | Source routes | Cache of the latest route records (128) | Relays per device (zigpy `device.relays`) | Host sends relays in `APS_DATA_REQUEST`, or `TBL_PUSH` |
 | Neighbor / routing / discovery tables | Authoritative, RAM | — (read via DIAG) | None; rebuilt by Link Status and MTORR |
-| Bindings / groups with the coordinator as source | APS tables (32 bindings, 16 groups × 8 endpoints) | Mirror | `NWK_GROUP_MEMBERSHIP`; resynced at start |
+| Bindings / groups with the coordinator as source | APS tables (32 bindings, 16 groups × 8 endpoints) | Mirror | `NWK_GROUP_MEMBERSHIP`; resynced at start; groups read with `TBL_READ` of table `0x0D` and backed up as `APS_GROUP` (9.3) |
 | Network key, NIB, TCLK, hashed-TCLK seed, TC policy | Authoritative | Backup copy | None |
 | Outgoing NWK counter and global APS counter | Authoritative, reserved | Checkpoint log (floors) | `EVT_FC_CHECKPOINT`, floors in `NWK_INIT` |
 | GP Proxy Table / GP Sink Table | Authoritative (GP journal) | Mirror via `EVT_GP_*` and backup | `GP_*_TABLE_READ`, `GP_SINK_TABLE_PUT` (7.11) |
@@ -2068,7 +2072,9 @@ to restore while another adapter for the same network is connected. Section
 ### 8.5 TABLES commands (`0x05xx`, endpoint 3)
 
 Table IDs equal record types (9.3): `0x05` DEVICE, `0x08` SOURCE_ROUTE,
-`0x09` GP_PROXY, `0x0B` GP_SINK (read-only here; written with `GP_*`).
+`0x09` GP_PROXY, `0x0B` GP_SINK (read-only here; written with `GP_*`),
+`0x0D` APS_GROUP (read-only; written with `NWK_GROUP_MEMBERSHIP`;
+capability bit 24).
 
 | ID | Name | Direction | Request payload | Response after `status` |
 |---|---|---|---|---|
@@ -2081,6 +2087,29 @@ Table IDs equal record types (9.3): `0x05` DEVICE, `0x08` SOURCE_ROUTE,
 | `0x0507` | `TBL_STATS` | host → NCP | `u8 table` | `u16 capacity, u16 used, u16 dirty, u16 pinned, u32 hits, u32 misses, u32 evictions, u32 lookup_timeouts` |
 | `0x0580` | `EVT_TBL_EPOCH_CHANGED` | NCP → host | `u32 new_epoch, u8 reason (1 factory reset, 2 restore, 3 NV re-initialized)` | event |
 | `0x0581` | `EVT_TBL_PAGING` | NCP → host | `u8 active, u16 cached, u16 capacity` | event (paging started or stopped) |
+
+**`TBL_READ` paging.** `cursor` is an entry index and `next_cursor` the
+first entry not sent (`FFFF` at the end); `max` is clamped to 1..8. A
+standalone NCP (8.1) reports `rev` 0 and no dirty bit; DEVICE entries of
+children are pinned, APS_GROUP entries never are. A page needs the network
+up (`INVALID_STATE` otherwise), like the export. Entries added or removed
+between pages can shift the others by one, so a host that needs a
+consistent view (for example after its own `NWK_GROUP_MEMBERSHIP` calls)
+reads again from cursor 0. `TBL_STATS` of table `0x0D` reports `capacity`
+(= capacity 9 `group_table`) and `used`; `TBL_PUSH` and `TBL_INVALIDATE`
+of a read-only table answer `UNSUPPORTED_COMMAND`, as does any table the
+NCP does not serve. The group table belongs to the network: it is wiped
+with it (`NWK_LEAVE_RESET`) and replaced by a restore, both announced by
+`EVT_TBL_EPOCH_CHANGED`; membership changes leave `table_epoch` as is.
+
+```text
+req: 00 0605 0300 0400 | 0d 0000 08
+rsp: 40 0605 0300 1d00 | 00 ffff 02 | 00000000 00 0d 0400 840b 01 f2
+     | 00000000 00 0d 0500 3412 02 01 03
+```
+
+(`messages.json` `tbl_read_aps_group`/`_rsp`: group `0x0B84` with the GP
+endpoint 242, group `0x1234` with endpoints 1 and 3.)
 
 **`TBL_SYNC` handling.**
 
@@ -2366,6 +2395,7 @@ Real files deviate from the specification in ways an importer must tolerate:
 | `stack_specific.ezsp.hashed_tclk` | `EZSP_HASHED_TCLK` | NCP | Stored value | Stored; devices without an explicit key get derived keys (7.5, decision 8) | N |
 | `stack_specific.zstack.*`, `.zboss.*`, other unknown keys | — | Host (pass-through) | Re-emitted unchanged | Not sent to the NCP | — |
 | `stack_specific.zigbee_rs.*` | `RS_PARAMS`, `GP_PROXY`, `GP_SINK` | NCP | See below | Limits become floors; GP Proxy and Sink entries restored (no GP Pairing sent) | N |
+| `stack_specific.zigbee_rs.aps_group_table` | `APS_GROUP` | NCP APS group table | Export flags bit3 (capability bit 24) | Restored on the new network (9.4); a source without it restores no coordinator groups and the host replays them with `NWK_GROUP_MEMBERSHIP` | E |
 | `metadata.*` (except the above) | — | Host | Host | Host | — |
 
 The `stack_specific.zigbee_rs` object, written by ZRHP hosts:
@@ -2379,7 +2409,8 @@ The `stack_specific.zigbee_rs` object, written by ZRHP hosts:
   "aps_frame_counter_limit": 14024,
   "host_backed_tables": true,
   "gp_proxy_table": ["<hex R_GP_PROXY value>", "..."],
-  "gp_sink_table": ["<hex R_GP_SINK value>", "..."]
+  "gp_sink_table": ["<hex R_GP_SINK value>", "..."],
+  "aps_group_table": ["<hex R_APS_GROUP value>", "..."]
 }
 ```
 
@@ -2404,6 +2435,7 @@ Each record is a TLV: `u8 type, u16 len, value[len]`.
 | `0x0A` | `RS_PARAMS` | `u32 fc_stride, u32 table_epoch, u32 nwk_fc_limit, u32 aps_fc_limit, u8 flags (bit0 host-backed tables)` | 17 |
 | `0x0B` | `GP_SINK` | `gpd_id` (`u8 app_id`; then `u32 src_id`, or `[8] ieee, u8 endpoint`), `u8 device_id, u8 communication_mode, u16 group (FFFF none), u16 assigned_alias (FFFF derived), u8 flags (bit0 MAC seq capable, bit1 rx-on capable, bit2 fixed location, bit3 key present), u8 security_level, u8 key_type, [16] key (if bit3), u32 frame_counter, u8 groupcast_radius` | 19..40 |
 | `0x0C` | `GP_TRANSLATION` | `gpd_id`, then a translation (7.11): `u8 gpd_command, u8 endpoint, u16 profile, u16 cluster, u8 zcl_command, u8 payload_len, payload[]` | 14.. |
+| `0x0D` | `APS_GROUP` | `u16 group, u8 n, n×u8 endpoint`: one group of the coordinator's APS group table and its member endpoints (table `0x0D`, 8.5; export flags bit3) | 3+n |
 | `0xFF` | `END` | `u32 record_count, u32 crc32c` over the concatenated TLV bytes of all preceding records in the stream | 8 |
 
 `DEVICE.flags`:
@@ -2435,6 +2467,10 @@ imported/host, 4 EZSP-hashed derived), u32 tx_counter, u32 rx_floor`.
 
 The field keeps OCB's per-device `tx_counter` round-trippable.
 
+`APS_GROUP` carries up to 255 endpoints; an NCP table holds fewer
+(zigbee-rs: `group_table` = 16 groups of at most 8 endpoints). A record
+lists `group` once; a restore merges records of the same group.
+
 Unknown record types are skipped on import, reported as an `IGNORED` note,
 and preserved by hosts. Within a major version, records may grow by
 appending fields.
@@ -2449,7 +2485,8 @@ appending fields.
 | `0x0614` | `BKP_RESTORE_ABORT` | `u16 txn` | — |
 
 Notes: 1 `HOST_BACKED` (key not cached on the NCP; the host must hold it),
-2 `CHILD_DEMOTED` (child table full; kept as a non-child), 3 `IGNORED`,
+2 `CHILD_DEMOTED` (child table full; kept as a non-child), 3 `IGNORED`
+(unknown record, or a record this NCP cannot hold, rule 8),
 4 `FLOOR_RAISED`.
 
 Rules:
@@ -2504,6 +2541,18 @@ Rules:
    without a writable identity item reports `SECURITY_ERROR` unless bit0 is
    clear and the IEEEs match. Hosts then follow zigpy's
    `can_write_network_settings` rules (`DestructiveWriteNetworkSettings`).
+8. **Coordinator groups.** `APS_GROUP` records are validated like
+   `NWK_GROUP_MEMBERSHIP`: a `group` above `0xFFF7`, `n` = 0 or an
+   endpoint other than 1..=240 or 242 violates rule 2. Records of one group
+   merge (duplicate endpoints count once). A record the table cannot hold,
+   because it would add a group beyond `group_table` or leave a group with
+   more endpoints than the NCP holds per group (8), is not applied at all
+   and gets `IGNORED`; so does every `APS_GROUP` on an NCP without
+   capability bit 24. `COMMIT` installs the staged groups once the restored
+   network runs, replacing the coordinator's group table (the previous one
+   went with the previous network), and they are persisted with the APS
+   tables like `NWK_GROUP_MEMBERSHIP`. `BKP_RESTORE_COMMIT` has no group
+   count: a host checks the result with `TBL_READ` of table `0x0D`.
 
 `EVT_NCP_READY`, `NWK_GET_INFO` and the export always report the IEEE the
 radio actually uses.
@@ -2512,7 +2561,7 @@ radio actually uses.
 
 | ID | Name | Request payload | Response after `status` |
 |---|---|---|---|
-| `0x0601` | `BKP_EXPORT_BEGIN` | `u8 flags (bit0 keys, bit1 devices, bit2 GP tables)` | `u16 txn, u32 record_count` |
+| `0x0601` | `BKP_EXPORT_BEGIN` | `u8 flags (bit0 keys, bit1 devices, bit2 GP tables, bit3 APS group table)` | `u16 txn, u32 record_count` |
 | `0x0602` | `BKP_EXPORT_READ` | `u16 txn, u16 max_bytes` | `u8 more, records…` (the stream ends with `END`) |
 | `0x0603` | `BKP_EXPORT_END` | `u16 txn` | — |
 
@@ -2537,6 +2586,10 @@ radio actually uses.
   with a link block replaces the host's key for that device; a record
   without one keeps the host's key (keys not exported, or held only by the
   host). Every link-key `tx_counter` is then set to the exported APS limit.
+- Bit3 adds one `APS_GROUP` per group of the coordinator's APS group
+  table, after the `DEVICE` records (capability bit 24; an NCP without it
+  ignores the bit). It is a flag so that hosts which do not store the
+  records yet keep their record counts.
 - Without bit0 (or when export is locked), keys are omitted and the host
   produces an **incomplete** backup. zigpy's `is_complete()` then rejects
   it. The UI must say so instead of storing an unusable backup.
@@ -3091,20 +3144,38 @@ are kept, and the size is detected at runtime:
   configured on the S3 with ESP-IDF's external-coexistence GPIO API. The H2
   is the follower. Espressif disables it by default
   (`EXTERNAL_COEX_ENABLE`).
-- **NCP follower behaviour (new MAC work, N).** The zigbee-rs ESP MAC has no
-  external-coexistence support today. In v1 it implements:
-  - assert *request*, and *priority* when the frame class is in
-    `coex_tx_priority_mask`, before every CSMA-CA attempt;
-  - transmit only on *grant*, otherwise back off as a busy channel and count
-    `coex_denied`;
-  - drive *tx_line* for the duration of each TX.
+- **NCP follower behaviour** (ESP32-H2 `pta` image: `products/esp32-zigbee-ncp`
+  `pta.rs`, esp-radio local patch `ieee802154-extcoex`). The arbitration is
+  the radio's coexistence hardware, configured as ESP-IDF v5.5.1 does for
+  `EXTERNAL_COEX_FOLLOWER_ROLE`, 4 wires:
+  - *request* (H2 out) is raised by the hardware for every radio operation;
+    *priority* (H2 out) reflects the PTI of the current radio scene;
+  - *grant* (H2 in) gates the radio while the leader transmits: a
+    transmission is refused only when *tx_line* is high and *grant* low
+    (measured on the board with `pta_lab` and with an ESP-IDF v5.5.1
+    `ot_rcp`-style reference: same registers, same result). The refusal is
+    the hardware abort `TxCoexBreak`: the NCP fails it at once as a busy
+    channel (CSMA-CA backs off and retries) and counts `coex_denied`
+    (`0x0220`); ACK receptions and automatic ACKs the arbiter breaks off
+    count `0x0221`/`0x0222` (7.8). The follower needs ESP-IDF's start-up
+    `esp_coex_adapter_register` + `coex_pre_init`, without which the arbiter
+    stays off;
+  - *tx_line* is an **input** on the follower: the S3 leader's Wi-Fi TX
+    indication (ESP-IDF `SOC_EXTERNAL_COEX_LEADER_TX_LINE`). The H2 does
+    not drive it. *priority* is high for every 802.15.4 transmission,
+    *request* only for `High` scenes.
+- **Priority classes** (`coex_tx_priority_mask`, config `0x000A`). The radio
+  has one PTI per scene (idle, RX, TX, timed TX, automatic ACK), not per
+  frame: bit0 raises the automatic-ACK PTI, bit1 the timed-TX PTI (the GP
+  TempMaster reply), bit3 every TX. Bit 2 (TC/key transport) alone cannot be
+  honoured and is refused with `UNSUPPORTED_COMMAND`; together with bit 3 it
+  is covered. Bits 4–7 are `INVALID_PARAMETER`.
 - **Frames that cannot wait for grant.**
-  - MAC ACKs are sent by the radio's automatic ACK path; priority is
-    asserted around expected ACK windows.
-  - The GP TempMaster reply, a timed TX at +20 ms armed in the radio,
-    requests early with high priority. If grant is denied at the
-    transmission instant, the reply is reported `Missed` and counted. The
-    GPD retries commissioning.
+  - MAC ACKs are sent by the radio's automatic ACK path with the ACK PTI.
+  - The GP TempMaster reply, a timed TX at +20 ms armed in the radio, uses
+    the timed-TX PTI from the transmission instant; there is no early
+    request ahead of it. If the arbiter refuses it, the reply is reported
+    `Missed` (busy) and counted; the GPD retries commissioning.
 - **Enabling it** (decision N7).
   - PTA is **disabled by default**. `coex_enable` (config `0x0009`) is
     volatile and reads 0 after every NCP boot.
@@ -3114,7 +3185,23 @@ are kept, and the size is detected at runtime:
     replay (12.4).
   - Capability 21 is set only when the board crate declares the PTA
     wiring.
-- **Validation.** Gate H9 (14.6) measures PER and latency with Wi-Fi load,
+- **Fail closed.** The vendor library (`libcoexist.a`) calls an OS adapter
+  for semaphores, memory and timers, and ignores some of its results (the
+  enable path turns the hardware on even when its locks failed). The bare-
+  metal NCP has no scheduler and no timer service, so its adapter never
+  waits: a take that would have to wait, a timer arm, a ninth semaphore, an
+  allocation beyond its 2 KiB arena or an unknown handle is refused and
+  counted as `coex_adapter_faults` (`0x0223`, 7.8). With a fault latched,
+  `coex_enable = 1` fails with `FAILURE`; a fault while PTA is on stops the
+  arbiter within one main-loop pass (the hardware stop does not depend on
+  the library's bookkeeping), `SYS_GET_STATUS.flags` bit 2 and
+  `coex_enable` read 0, and a LOG record names the fault. PTA stays off
+  until the next NCP boot. Static analysis of the H2 library (`coex_pre_init`
+  creates two semaphores and sets a timer function; the locks take with
+  `portMAX_DELAY`; the phase timer is armed only when a coexistence scheme
+  allows the phase loop; no allocation) suggests the follower path records
+  no fault; gate PTA1 checks it on the board.
+- **Validation.** Gate PTA1 (14.6) measures PER and latency with Wi-Fi load,
   with coexistence on and off.
 
 ---
@@ -3467,6 +3554,17 @@ implemented on the ESP32 NCPs (`ncp-hub-gaps`, host-tested).
 `NWK_PERMIT_JOIN` with a router target is still `UNSUPPORTED_COMMAND`.
 H10: use capacity 19, as in Z1.
 
+After `ncp-groups-h11` (host-tested; no hardware run yet): H11 takes the
+second proposal. The NCP serves table `0x0D` (`APS_GROUP` records,
+read-only) with `TBL_READ` and `TBL_STATS` (8.5), exports the group table
+with `BKP_EXPORT_BEGIN` flags bit3, and restores it at `COMMIT` with the
+9.4 rule 8 bounds; capability bit 24 and capacity 9 `group_table`
+advertise it. There is no `op 4 list`: the adapter can answer genGroups
+`view`/`getMembership` for an endpoint by filtering one `TBL_READ` pass
+(at most 16 groups, two pages), keep the records under
+`stack_specific.zigbee_rs.aps_group_table` (9.2), and reconcile its replay
+list against them at start. Adapter side still open.
+
 ### 12.4 Embedded hub (`faronov/zigbee-rs-hub`, ESP32-S3)
 
 **Placement and stack.**
@@ -3734,7 +3832,7 @@ This is simulation-level evidence, not hardware evidence.
 | H6 | NCP firmware update with trial boot, confirm, rollback and retained network state. |
 | H7 | 24 h soak with noise injection on the UART variant (921 600, RTS/CTS). |
 | H8 | **Thread BR board UART:** 921 600 (default) and 2 000 000 with RTS/CTS on R19/R20, and the 460 800 fallback without flow control, with both chips writing flash (`rx_overflow = 0`) under the real NCP and hub (R18–R20 fitting and an RX-stall test through the phase-0 bridge passed on 2026-11-19, 11.5; the real NCP with the H2 writing flash through the phase-0 bridge passed on 2026-11-20, 11.5; the real hub with the S3 writing flash is still open). Identify the H2 module's flash size (2 MB or 4 MB) via JEDEC ID, and check the NCP's layout-mismatch refusal. ROM-path recovery via S3 GPIO7/8 with `zbnv` preserved. |
-| H9 | **PTA coexistence:** Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on. The hub's automatic enable/disable follows Wi-Fi up/down, including Ethernet-only. GP TempMaster reply behaviour with grant denied. |
+| PTA1 | **PTA coexistence** (formerly H9; renamed because 12.3.1 uses H9 for a herdsman note): Zigbee PER and latency with S3 Wi-Fi under load, coexistence off and on. The hub's automatic enable/disable follows Wi-Fi up/down, including Ethernet-only. GP TempMaster reply behaviour with grant denied. The fail-closed OS adapter (11.5) records no fault on the production path: `coex_adapter_faults` (`0x0223`) stays 0 with coexistence on. |
 | H10 | **GP combo on the NCP:** direct and proxy-tunnelled commissioning into the NCP sink with zigpy as shadow, including an unsecured (level-0) FlowerX GP / BGT1 GP; a bidirectional GPD with the NCP as its own TempMaster; Sink Table across an NCP reboot (seamless resume) and across backup/restore. |
 | H11 | **Z2M end to end:** zigbee-herdsman adapter with 10+ real devices; Z2M backup → restore on a fresh NCP. |
 | H12 | **Embedded hub:** S3 hub with a synthetic 2 000-device store (PSRAM budget of 3.4), paging forced by a reduced NCP cache, power cuts during writebacks, store journal recovery. Candidate NCP image that fails its trial (no `FW_CONFIRM`) → the H2 bootloader returns to the previous slot, network state retained; an image larger than the H2 slot refused with `TOO_LARGE` before any erase. Hub app within its slot (3 MiB on 8 MB, 2 944 KiB on the 4 MB development layout). |
@@ -3751,12 +3849,12 @@ This is simulation-level evidence, not hardware evidence.
 | 4 | Runtime/persistence: FC checkpoint hook and floors; IEEE override; atomic restore transaction; snapshot export; TC-device cache with writeback/eviction, `host_acked_rev`, streamed TC-journal snapshots (256 entries); child journal with 1 024-byte slots (64 children); key-export lock | 2 | Host-tested with journal fault injection |
 | 5 | Runtime: EZSP hashed-TCLK derivation (HMAC-MMO), cached with origin 4 | 4 | Host-tested against the candidate vectors; normative after H5 |
 | 6 | GP: NCP-sink mode surface (`EVT_GP_*`, `GP_*` commands, `R_GP_SINK` codec), sink table size as a product parameter (16), host-sink mode local-proxy hand-off | GP sink on master | Host-tested with zigpy golden vectors |
-| 7 | MAC/HAL: H2/C6 UART transport with UHCI RX DMA and optional RTS/CTS; USJ non-blocking pump; PTA follower in the ESP MAC | — | Host/unit tests, builds; hardware gates H1, H2, H8, H9 |
+| 7 | MAC/HAL: H2/C6 UART transport with UHCI RX DMA and optional RTS/CTS; USJ non-blocking pump; PTA follower in the ESP MAC | — | Host/unit tests, builds; hardware gates H1, H2, H8, PTA1 |
 | 8 | `apps/ncp-coordinator` over `TrustCenterCoordinatorApp` + GP combo | 1–6 | Host-tested against the Rust reference host over an in-memory pipe |
 | 9 | `products/esp32-zigbee-ncp`: 2 MB and 4 MB layouts (8.9), NV journals, identity, transport features (`transport-usj`, `transport-uart`), boards (H2 devkit, Thread BR H2 side), signed update, size report | 7, 8 | Builds, post-link layout checks, size budget |
 | 10 | Hosts: `zigpy-zrhp` (Python, under `faronov`) plus the sink-on-radio hook in the `faronov/zigpy` fork (no upstream PR; upstreaming later, with user approval), Go `adapter/zrhp` (+ margin 10 000), zigbee-herdsman fork with `zrhp` (TypeScript, plus the backup pass-through), embedded `faronov/zigbee-rs-hub` (Rust, S3) | 1 vectors | Host-tested vs vectors and the simulated NCP |
 | 11 | Noise bench (14.4), mcuemu scenario (14.5) | 1, 8 | Simulation |
-| 12 | Hardware gates H1–H12 | 9, 10 | Lab, then production-path evidence |
+| 12 | Hardware gates H1–H8, H10–H12 and PTA1 (14.6) | 9, 10 | Lab, then production-path evidence |
 
 Nothing beyond step 1 should claim more than "host-tested" until gates H1–H4
 pass. The coordinator remains documented as host-tested in
@@ -3785,7 +3883,7 @@ two requirements. Each decision is applied in the sections listed.
 | 12 | LOG endpoint carries **UTF-8 text**. | 7.10 |
 | 13 | Go hub `FrameCounterRestoreMargin` **2 500 → 10 000**. This is a required change in the Go repository; this document does not edit it. | 9.4, 12.2 |
 | 14 | **zigbee-herdsman / Z2M adapter in scope.** | 9.1, 9.6, 12.3, 14.3, gate H11 |
-| R1 | **Embedded host** from the start: Rust hub `faronov/zigbee-rs-hub` on the ESP32-S3 of the Espressif Thread BR / Zigbee GW board, using the shared crate `zigbee-zrhp`. Covers host profiles, minimum host buffers, BR-board UART, ROM-path NCP update and PTA. | 1 (G9), 3.2–3.4, 4.1, 4.4, 11.5, 12.4, gates H8, H9, H12 |
+| R1 | **Embedded host** from the start: Rust hub `faronov/zigbee-rs-hub` on the ESP32-S3 of the Espressif Thread BR / Zigbee GW board, using the shared crate `zigbee-zrhp`. Covers host profiles, minimum host buffers, BR-board UART, ROM-path NCP update and PTA. | 1 (G9), 3.2–3.4, 4.1, 4.4, 11.5, 12.4, gates H8, PTA1, H12 |
 | R2 | **No network transport in ZRHP** (USJ and UART only). The S3 hub's WebSocket JSON API is hub-level and out of scope. | Header, 1, 3.2, 4, 13 |
 
 **Answers to the follow-up questions** (same day):
@@ -3798,7 +3896,7 @@ two requirements. Each decision is applied in the sections listed.
 | N4 | BR board UART: **460 800 without flow control** by default (UART part superseded by N10, 2026-11-19), DMA/IRAM RX mandatory; RTS/CTS via R19/R20 documented as an optional board mod. H2 module flash size unknown: both 2 MB/4 MB partition tables kept, size detected at runtime (checked when the board is on hwlab). | 11.5, 8.9, H8 |
 | N5 | zigbee-herdsman: **maintained fork**, no upstream PR plan for v1. | 3, 12.3, 15 |
 | N6 | ~~The S3 stores known-good + candidate NCP images, with rollback through the H2 ROM bootloader.~~ **Amended 2026-11-18:** rollback lives on the **H2**: A/B application slots on the H2 flash, `FW_*` writes the inactive slot, trial boot, host `FW_CONFIRM`, H2 bootloader rollback of an unconfirmed image. The S3 stores **no** NCP images. The H2 ROM-bootloader path is a manual/development recovery path with an operator-supplied image. | 7.9, 8.9, 11.5, 12.4, H12 |
-| N7 | PTA **disabled by default**; the hub enables it automatically while Wi-Fi is active (off with Ethernet-only). | 7.1, 11.5, 12.4, H9 |
+| N7 | PTA **disabled by default**; the hub enables it automatically while Wi-Fi is active (off with Ethernet-only). | 7.1, 11.5, 12.4, PTA1 |
 | N8 | USB identity: **keep Espressif's VID/PID**. | 4.3, 11.3, H1 |
 | N9 | (2026-11-18, amended 2026-11-20) S3 flash: **detect 4 MB / 8 MB at boot, one partition table per size.** 8 MB is the product: hub app ×2 at 3 MiB (A/B OTA) + `hubdata` 1 920 KiB. 4 MB samples: development layout, one 2 944 KiB app slot without OTA + 1 MiB `hubdata` (host store, configuration, declarative converter database); no 1.5 MiB app target (superseded). No NCP image partition. | 3.4, 12.4, H12 |
 | N10 | (2026-11-19, proposal) BR board UART: **921 600 with RTS/CTS** on the reserved links R19/R20 by default (verified fitted; RX stalls lose nothing with flow control and lose data without it at every rate), 2 000 000 allowed, 460 800 without flow control as the fallback. Supersedes the UART part of N4. | 4.1, 4.4, 11.5, H8 |
@@ -3810,7 +3908,7 @@ unknowns are hardware facts tracked as gates:
 - the H2 UART maximum rate (H2);
 - the EZSP hashed-TCLK byte order (H5);
 - the BR board's UART under real flash-write load (H8; the flash variant and the R18–R20 fitting are known since 2026-11-18/19);
-- PTA behaviour under Wi-Fi load (H9).
+- PTA behaviour under Wi-Fi load (PTA1).
 
 ## 17. References
 
