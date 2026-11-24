@@ -226,15 +226,43 @@ fn the_product_policy_trusts_the_devkit_signed_ota_keys() {
 }
 
 #[derive(Default)]
-struct FakeCoex(Rc<RefCell<Vec<(bool, u8)>>>);
+struct FakeCoex {
+    log: Rc<RefCell<Vec<(bool, u8)>>>,
+    /// A fault the backend cannot honour (fail closed); `poll` acts on it.
+    fault: Rc<RefCell<u32>>,
+    enabled: bool,
+}
 
 impl CoexControl for FakeCoex {
     fn set(&mut self, enable: bool, priority_mask: u8) -> Result<(), PlatformError> {
         if priority_mask > 0x0F {
             return Err(PlatformError::InvalidParameter);
         }
-        self.0.borrow_mut().push((enable, priority_mask));
+        if enable && *self.fault.borrow() != 0 {
+            return Err(PlatformError::Hardware);
+        }
+        self.log.borrow_mut().push((enable, priority_mask));
+        self.enabled = enable;
         Ok(())
+    }
+    fn active(&self) -> bool {
+        self.enabled && *self.fault.borrow() == 0
+    }
+    fn poll(&mut self) {
+        if *self.fault.borrow() != 0 && self.enabled {
+            self.enabled = false;
+            self.log.borrow_mut().push((false, 0xFF));
+        }
+    }
+    fn counters(&self) -> CoexCounters {
+        CoexCounters {
+            tx_denied: self.log.borrow().len() as u32,
+            adapter_faults: *self.fault.borrow(),
+            ..CoexCounters::default()
+        }
+    }
+    fn reset_counters(&mut self) {
+        self.log.borrow_mut().clear();
     }
 }
 
@@ -243,15 +271,58 @@ fn factory_ieee_and_attached_pta_are_platform_services() {
     let (mut platform, _) = boot(&MockFlash::new(), &Settings::default(), 0);
     assert_eq!(platform.factory_ieee(), None);
     assert_eq!(platform.set_pta(true, 1), Err(PlatformError::Unsupported));
+    assert_eq!(mac_group(&platform), []);
     platform.set_factory_ieee([7; 8]);
     assert_eq!(platform.factory_ieee(), Some([7; 8]));
-    let log = Rc::new(RefCell::new(Vec::new()));
-    platform.attach_coex(Box::leak(Box::new(FakeCoex(log.clone()))));
+    let coex = FakeCoex::default();
+    let log = coex.log.clone();
+    platform.attach_coex(Box::leak(Box::new(coex)));
     assert!(platform.pta_supported());
+    assert_eq!(platform.pta_active(), Some(false));
     assert_eq!(platform.set_pta(true, 0x05), Ok(()));
+    assert_eq!(platform.pta_active(), Some(true));
     assert_eq!(
         platform.set_pta(false, 0x10),
         Err(PlatformError::InvalidParameter)
     );
     assert_eq!(*log.borrow(), [(true, 0x05)]);
+    assert_eq!(
+        mac_group(&platform),
+        [(0x0220, 1), (0x0221, 0), (0x0222, 0), (0x0223, 0)]
+    );
+    platform.reset_counters(0x40);
+    assert_eq!(mac_group(&platform)[0], (0x0220, 1));
+    platform.reset_counters(0x02);
+    assert_eq!(mac_group(&platform)[0], (0x0220, 0));
+}
+
+#[test]
+fn a_coex_fault_is_reported_and_polled_off() {
+    let (mut platform, _) = boot(&MockFlash::new(), &Settings::default(), 0);
+    // Nothing attached: no-op.
+    platform.poll_coex();
+    assert_eq!(platform.pta_active(), None);
+    let coex = FakeCoex::default();
+    let (log, fault) = (coex.log.clone(), coex.fault.clone());
+    platform.attach_coex(Box::leak(Box::new(coex)));
+    assert_eq!(platform.set_pta(true, 0x08), Ok(()));
+    platform.poll_coex();
+    assert_eq!(*log.borrow(), [(true, 0x08)]);
+
+    *fault.borrow_mut() = 3;
+    // Reported off at once, through DIAG too, and stopped by the poll.
+    assert_eq!(platform.pta_active(), Some(false));
+    assert_eq!(mac_group(&platform)[3], (0x0223, 3));
+    platform.poll_coex();
+    platform.poll_coex();
+    assert_eq!(*log.borrow(), [(true, 0x08), (false, 0xFF)]);
+    assert_eq!(platform.set_pta(true, 0x08), Err(PlatformError::Hardware));
+    assert_eq!(platform.set_pta(false, 0x08), Ok(()));
+    assert_eq!(platform.pta_active(), Some(false));
+}
+
+fn mac_group<F: OtaFlash, S: SettingsStore>(platform: &Platform<F, S>) -> Vec<(u16, u32)> {
+    let mut out = Vec::new();
+    platform.visit_counters(0x02, &mut |id, value| out.push((id, value)));
+    out
 }

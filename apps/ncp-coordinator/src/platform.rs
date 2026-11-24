@@ -144,6 +144,13 @@ pub trait NcpPlatform {
     fn set_pta(&mut self, _enable: bool, _priority_mask: u8) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
     }
+    /// Whether arbitration is really on, when the platform knows: a
+    /// platform that turns PTA off on its own (fail closed after a fault)
+    /// returns `Some(false)`, and `SYS_GET_STATUS` / `coex_enable` report it
+    /// off. `None`: the last accepted `coex_enable` is reported.
+    fn pta_active(&self) -> Option<bool> {
+        None
+    }
 
     // ── Radio (spec 7.2) ────────────────────────────────────────────
 

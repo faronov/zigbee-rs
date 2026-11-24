@@ -1536,6 +1536,18 @@ fn main() {
             }
             checks::install_code(&mut host, ieee)?;
         }
+        if let Some(spec) = value("--coex") {
+            // on|off[,0xMASK]
+            let mut parts = spec.split(',');
+            let enable = parts.next() == Some("on");
+            let mask = parts
+                .next()
+                .map_or(Ok(0), |m| {
+                    u8::from_str_radix(m.trim_start_matches("0x"), 16)
+                })
+                .map_err(|_| "--coex on|off[,0xMASK]")?;
+            checks::coex(&mut host, enable, mask)?;
+        }
         if let Some(spec) = value("--energy-scan") {
             // 0xMASK[,EXP[,COUNT]]
             let parts: Vec<&str> = spec.split(',').collect();

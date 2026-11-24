@@ -415,3 +415,29 @@ pub fn active_scan<S: ByteStream>(
     }
     Ok(())
 }
+
+/// `SYS_SET_CONFIG{coex_tx_priority_mask, coex_enable}` (spec 7.1, 11.5).
+pub fn coex<S: ByteStream>(host: &mut Host<S>, enable: bool, mask: u8) -> Result<(), String> {
+    use zigbee_zrhp::codec::List;
+    use zigbee_zrhp::msg::system::{ConfigValue, SysSetConfig, SysSetConfigRsp, config};
+    let mask_value = [mask];
+    let enable_value = [u8::from(enable)];
+    let values = [
+        ConfigValue {
+            id: config::COEX_TX_PRIORITY_MASK,
+            value: Bytes8(&mask_value),
+        },
+        ConfigValue {
+            id: config::COEX_ENABLE,
+            value: Bytes8(&enable_value),
+        },
+    ];
+    let tid = host.request(&SysSetConfig {
+        values: List::new(&values),
+    });
+    let rsp = host.response(tid)?;
+    let results: SysSetConfigRsp = body(&rsp)?;
+    let statuses: Vec<_> = results.results.iter().map(|r| r.status).collect();
+    println!("SYS_SET_CONFIG coex_enable {enable} mask 0x{mask:02X}: {statuses:?}");
+    Ok(())
+}

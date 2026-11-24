@@ -1,6 +1,7 @@
 //! The ESP32 NCP's [`NcpPlatform`]: firmware update (`FW_*`, spec 7.9),
 //! the persisted IEEE override (`SYS_SET_IEEE`, 9.4 rule 7) and the trial
-//! boot window. PTA coexistence is not implemented (no PTA lines driven).
+//! boot window, the PTA coexistence follower a board attaches
+//! ([`Platform::attach_coex`], spec 11.5) and the radio's MAC counters.
 //!
 //! # Boot sequence (composition root)
 //!
@@ -80,6 +81,35 @@ pub trait CoexControl {
     /// Enable/disable with `coex_tx_priority_mask`; validates the mask even
     /// when disabling.
     fn set(&mut self, enable: bool, priority_mask: u8) -> Result<(), PlatformError>;
+    /// Arbitration is really on: enabled, and not failed closed after a
+    /// fault (`SYS_GET_STATUS.flags` bit 2, `coex_enable`).
+    fn active(&self) -> bool;
+    /// Stop arbitration that a fault made untrustworthy (fail closed); the
+    /// composition root calls it from the main loop.
+    fn poll(&mut self);
+    /// Radio operations the arbiter broke off and OS-adapter faults, since
+    /// boot or the last reset.
+    fn counters(&self) -> CoexCounters;
+    /// Zero [`Self::counters`].
+    fn reset_counters(&mut self);
+}
+
+/// Radio operations the PTA arbiter broke off and the coexistence
+/// library's requests the OS adapter refused (`DIAG_GET_COUNTERS` MAC
+/// group, spec 7.8 `0x0220..=0x0223`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CoexCounters {
+    /// `coex_denied`: transmissions refused for lack of grant (each failed
+    /// as a busy channel and retried by CSMA-CA, or a timed reply missed).
+    pub tx_denied: u32,
+    /// `coex_ack_rx_denied`: ACK receptions broken off after a transmission.
+    pub ack_rx_denied: u32,
+    /// `coex_ack_tx_denied`: automatic ACKs broken off.
+    pub ack_tx_denied: u32,
+    /// `coex_adapter_faults`: requests the OS adapter could not honour (a
+    /// wait, a timer, the semaphore or memory pool exhausted, an unknown
+    /// handle). The first one keeps PTA off until the next boot.
+    pub adapter_faults: u32,
 }
 
 /// The product platform over an OTA flash `F` and the identity journal `S`.
@@ -167,6 +197,13 @@ impl<F: OtaFlash, S: SettingsStore> Platform<F, S> {
     /// The board's PTA lines (`PTA_COEX`).
     pub fn attach_coex(&mut self, coex: &'static mut dyn CoexControl) {
         self.coex = Some(coex);
+    }
+
+    /// [`CoexControl::poll`]; call from the main loop when PTA is attached.
+    pub fn poll_coex(&mut self) {
+        if let Some(coex) = self.coex.as_mut() {
+            coex.poll();
+        }
     }
 
     /// The radio backend's MAC counters (`DIAG_GET_COUNTERS` MAC group).
@@ -292,6 +329,10 @@ impl<F: OtaFlash, S: SettingsStore> NcpPlatform for Platform<F, S> {
         }
     }
 
+    fn pta_active(&self) -> Option<bool> {
+        self.coex.as_ref().map(|coex| coex.active())
+    }
+
     fn tx_power_step(&self, dbm: i8) -> Option<i8> {
         Some(crate::radio::tx_power_step(dbm))
     }
@@ -310,11 +351,28 @@ impl<F: OtaFlash, S: SettingsStore> NcpPlatform for Platform<F, S> {
                 sink(id, now.wrapping_sub(base));
             }
         }
+        if let (true, Some(coex)) = (group_mask & 0x02 != 0, self.coex.as_ref()) {
+            let coex = coex.counters();
+            for (id, value) in [
+                (0x0220, coex.tx_denied),
+                (0x0221, coex.ack_rx_denied),
+                (0x0222, coex.ack_tx_denied),
+                (0x0223, coex.adapter_faults),
+            ] {
+                sink(id, value);
+            }
+        }
     }
 
     fn reset_counters(&mut self, group_mask: u8) {
-        if let (true, Some((read, base))) = (group_mask & 0x02 != 0, self.mac_counters.as_mut()) {
+        if group_mask & 0x02 == 0 {
+            return;
+        }
+        if let Some((read, base)) = self.mac_counters.as_mut() {
             *base = read();
+        }
+        if let Some(coex) = self.coex.as_mut() {
+            coex.reset_counters();
         }
     }
 

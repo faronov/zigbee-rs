@@ -482,6 +482,10 @@ async fn run(
         if let TrialPoll::Expired { .. } = platform.poll_trial(now_ms()) {
             esp_hal::system::software_reset();
         }
+        // PTA fails closed: a coexistence-library request the OS adapter
+        // could not honour stops the arbiter until reboot (spec 11.5).
+        #[cfg(feature = "pta")]
+        platform.poll_coex();
         if let Some(PlatformRequest::Reset { .. }) =
             ncp.service_with(now_us(), host, port, platform, &LOG)
         {
