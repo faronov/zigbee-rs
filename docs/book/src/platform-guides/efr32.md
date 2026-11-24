@@ -672,9 +672,23 @@ NCP reports `EVT_NCP_READY.reset_reason` 6 (fatal) and both images log the
 cause. The product linker script starts RAM at `0x2000_0004` so start-up
 never overwrites that word (asserted in `link/memory.x` and by
 `verify-layout.py`). The Router links no SE client today, so the compiler
-removes its check; it becomes live if one is added. The policy, the reason
-encoding and the ZRHP reset-reason mapping are host-tested; no MG24 has run
-the path.
+removes its check; it becomes live if one is added.
+
+The other fatal resets use the same record, so the host can tell them from
+its own `SYS_RESET` (`reset_reason` 2):
+
+| cause | recorded reason | where |
+|---|---|---|
+| poisoned Secure Engine | `0x0980` | main loop of both images (logged first) |
+| panic | `0x0981` | `#[panic_handler]` of both images |
+| HardFault | `0x0982` | `HardFault` handler of both images (`verify-layout.py` rejects cortex-m-rt's spinning default) |
+| unrecoverable router-app error | `0x0983` | the Router's `Supervisor::reset`, after the app's `Fatal` diagnostic |
+
+The NCP reports each as `reset_reason` 6 and logs the cause to the ZRHP LOG
+ring at boot; the Router logs it. The policy, the reason encoding (every
+code decodes to itself and is outside the bootload set, const-asserted) and
+the ZRHP reset-reason mapping are host-tested; no MG24 has run any of these
+paths.
 
 Not changed and not yet checked on xG24 silicon: EM2 entry (`power`), DC-DC
 (left in bypass), the LFXO (the RF-BM module has one; the time base still uses
@@ -781,18 +795,19 @@ would not move it.
 
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
-| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 451,524 B | 168,536 B | 89,512 B |
-| NCP, Dongle-M | 451,460 B | 168,536 B | 89,512 B |
-| Router, RF-BM-MG24B1 (GP Proxy Basic) | 341,760 B | 37,140 B | 224,492 B |
-| Router, Dongle-M | 341,908 B | 37,140 B | 224,492 B |
+| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 452,960 B | 168,536 B | 89,512 B |
+| NCP, Dongle-M | 452,900 B | 168,536 B | 89,512 B |
+| Router, RF-BM-MG24B1 (GP Proxy Basic) | 341,912 B | 37,140 B | 224,492 B |
+| Router, Dongle-M | 342,068 B | 37,140 B | 224,492 B |
 
 The NCP uses 33 % of the application window and 66 % of SRAM for static
-data. The compact capacity tier is not needed. The poisoned-engine reset
-costs 520 B of flash in the NCP and about 240 B in the Router (the boot-time
-record and its log line; the Router's loop check compiles away) and no
-static RAM or stack: `.data` now starts at `0x2000_0008` (8-byte aligned),
-and the end of static RAM and the linked stack are unchanged because
-alignment padding absorbs the shift.
+data. The compact capacity tier is not needed. The recorded fatal resets
+cost about 630 B of flash in the NCP and about 400 B in the Router (boot-time
+record and log line, the poisoned-engine report, the panic/HardFault/
+supervisor paths; the Router's SE check compiles away) and no static RAM or
+stack: `.data` now starts at `0x2000_0008` (8-byte aligned), and the end of
+static RAM and the linked stack are unchanged because alignment padding
+absorbs the shift.
 
 ### Hardware gates (open)
 
@@ -808,10 +823,10 @@ alignment padding absorbs the shift.
    A410 at 39 MHz, halted over SWD in idle, RX and TX; static registers
    reduced against the register-map reset values and cross-checked with the
    GSDK PHY table), then raw TX/RX, ACK turnaround and CCA, as on xG22.
-4. SE mailbox TRNG, and the poisoned-mailbox fatal reset: the record must
-   survive the resident Gecko bootloader and come back as `reset_reason` 6
-   (needs an SE that stops answering, e.g. a debugger-held SE request, or a
-   lab build that poisons the lock on purpose).
+4. SE mailbox TRNG, and the recorded fatal resets: the record must survive
+   the resident Gecko bootloader and come back as `reset_reason` 6 (a lab
+   build that panics or faults on demand; for the poisoned mailbox an SE
+   that stops answering, e.g. a debugger-held SE request).
 5. NCP: ZRHP session over the S3, network formation, joins, reset/resume.
 6. Gecko path: install a Gecko UART bootloader on the module, then GBL upload
    and journal retention across an update.

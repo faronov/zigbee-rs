@@ -6,9 +6,9 @@
 //! Imm-Ack, HAL-owned Frame Pending); the lifecycle is
 //! [`router_app::ParentRouterApp`] with durable child, APS and GP Proxy
 //! tables in the product's shared journal windows. Logs go out on the host
-//! USART at 115 200 (TX only). A product fatal fault (a poisoned Secure
-//! Engine, `product::fatal`) is logged and ends in a reset that records
-//! it; the next boot logs the recorded cause.
+//! USART at 115 200 (TX only). A panic, a HardFault, an unrecoverable
+//! router-app error or a poisoned Secure Engine ends in a reset that
+//! records its cause (`product::fatal`); the next boot logs it.
 //!
 //! Status: builds and links. The xG24 radio tables are not captured yet,
 //! so the radio init fails, the image logs that and halts; no MG24 has run
@@ -94,7 +94,12 @@ static LOGGER: UartLogger = UartLogger;
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
-    efr32s2_hal::reset::system_reset()
+    product::fatal::reset(Fatal::Panic)
+}
+
+#[cortex_m_rt::exception]
+unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
+    product::fatal::reset(Fatal::HardFault)
 }
 
 fn halt() -> ! {
@@ -334,8 +339,9 @@ impl Supervisor for ResetSupervisor {
         None
     }
 
+    /// Only called after an unrecoverable router-app error.
     fn reset(&mut self) -> ! {
-        efr32s2_hal::reset::system_reset()
+        product::fatal::reset(Fatal::Application)
     }
 }
 

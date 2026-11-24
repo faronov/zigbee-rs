@@ -2,10 +2,12 @@
 """Verify an EFR32MG24 image (products/efr32mg24/link/memory.x): application
 at 0x0800_6000 above the 24 KiB Gecko bootloader, nothing in the bootloader
 or the NV journals (0x0815_8000..0x0818_0000), the 76-IRQ xG24 vector table
-with the expected handlers, one 80-byte Gecko ApplicationProperties_t, and
-at least 32 KiB of linked stack in the 256 KiB SRAM, nothing in the first
-SRAM word (the Gecko reset-cause record, src/fatal.rs); with --ncp also the
-48-byte ZRHP build record that tools/efr32-gbl fills.
+with the expected handlers (a product HardFault handler, not cortex-m-rt's
+spinning default), one 80-byte Gecko ApplicationProperties_t, and at least
+32 KiB of linked stack in the 256 KiB SRAM, nothing in the first SRAM word
+(the Gecko reset-cause record, src/fatal.rs); with --ncp also the USART0
+host-link handlers and the 48-byte ZRHP build record that tools/efr32-gbl
+fills.
 
 Adapted from examples/ha-connect-zbt1/tools/verify-layout.py."""
 
@@ -51,7 +53,7 @@ def main() -> None:
     parser.add_argument(
         "--ncp",
         action="store_true",
-        help="also require the NCP's HardFault and USART0 host-link handlers",
+        help="also require the NCP's USART0 host-link handlers and ZRHP build record",
     )
     args = parser.parse_args()
     data = args.elf.read_bytes()
@@ -185,8 +187,14 @@ def main() -> None:
         )
     if reset & 1 == 0 or not (app_start <= (reset & ~1) < app_end):
         fail(f"invalid Thumb reset vector 0x{reset:08X}")
-    if args.ncp:
-        require_handler(3, "HardFault")
+    require_handler(3, "HardFault")
+    # cortex-m-rt's default HardFault_ spins forever; both roles install the
+    # product handler, which records the fault and resets (src/fatal.rs).
+    default_hard_fault = symbols.get("HardFault_")
+    if default_hard_fault is not None and (default_hard_fault & ~1) == (
+        symbol("HardFault") & ~1
+    ):
+        fail("HardFault is cortex-m-rt's spinning default, not the product handler")
     # xG24 IRQ numbers: SYSRTC_APP 67 (time driver), RAC_RSM 36 (radio),
     # FRC 33 (interrupt Imm-Ack of the parent MAC).
     require_handler(16 + 67, "SYSRTC_APP")

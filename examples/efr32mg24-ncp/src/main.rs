@@ -9,11 +9,12 @@
 //! service the host link, run queued stack operations, step the stack once
 //! the host has started it (`NWK_INIT`/`NWK_FORM`).
 //!
-//! The UART carries only ZRHP: logs go to the ZRHP LOG endpoint. A panic
-//! or a fault resets the chip. A poisoned Secure Engine (the TRNG, the
-//! NCP's only entropy source) is a product fatal fault: it is logged, the
-//! host gets a bounded window to read it, and the reset records it so the
-//! next `EVT_NCP_READY` reports `reset_reason` 6 (`product::fatal`).
+//! The UART carries only ZRHP: logs go to the ZRHP LOG endpoint. A panic,
+//! a HardFault or a poisoned Secure Engine (the TRNG, the NCP's only
+//! entropy source) ends in a reset that records its cause, so the next
+//! `EVT_NCP_READY` reports `reset_reason` 6 (fatal) rather than 2, the
+//! answer to a host `SYS_RESET` (`product::fatal`). The poisoned engine is
+//! also logged, with a bounded window for the host to read it.
 //! Firmware updates go through the resident Gecko bootloader: `SYS_RESET`
 //! mode 1 reboots into it (GBL over XMODEM at 115 200); `FW_*` is not
 //! built in.
@@ -123,12 +124,12 @@ fn halt() -> ! {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
-    efr32s2_hal::reset::system_reset()
+    product::fatal::reset(Fatal::Panic)
 }
 
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
-    efr32s2_hal::reset::system_reset()
+    product::fatal::reset(Fatal::HardFault)
 }
 
 /// Resources after clocks and time are running.
