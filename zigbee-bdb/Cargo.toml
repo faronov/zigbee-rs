@@ -48,6 +48,9 @@ ncp-capacity = ["trust-center", "zigbee-aps/ncp-capacity"]
 # Compact coordinator NCP: 128 Trust Center devices and the compact APS/NWK
 # tables.
 ncp-capacity-compact = ["ncp-capacity", "zigbee-aps/ncp-capacity-compact"]
+# Tiny coordinator NCP (64 KiB parts): 48 Trust Center devices and the tiny
+# APS/NWK tables.
+ncp-capacity-tiny = ["ncp-capacity", "zigbee-aps/ncp-capacity-tiny"]
 trace = ["zigbee-aps/trace", "zigbee-nwk/trace"]
 touchlink = []
 

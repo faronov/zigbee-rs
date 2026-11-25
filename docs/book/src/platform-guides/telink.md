@@ -168,6 +168,17 @@ starts Network Steering again, retrying with the 5..60 s policy backoff. A
 product built on a module with a button should map its short press to
 `request_commissioning()`.
 
+## ZRHP network co-processor (not feasible on 64 KiB)
+
+A tiny-tier ZRHP NCP (`ncp-coordinator-app/tiny`) was composed for the
+TLSR8258 (ZT3L module, 1 MiB) in a measurement-only crate: 512,340 B image,
+72,932 B of `.data`/`.bss`/`.rf_dma` plus 5,632 B of RAM-code and I-cache
+reservations, and a 20,624 B steady-state SVC stack bound
+(`tools/tlsr8258-stack-report.py`), i.e. about 102 KiB of a 64 KiB SRAM
+(with the 4 KiB gap and the 1 KiB IRQ stack).
+There is no TLSR8258 NCP product; see [Tiny NCP tier](../advanced/tiny-ncp.md).
+NCP code must avoid atomic read-modify-write, which TC32 lacks.
+
 ## Always-on End Device application
 
 `examples/telink-tlsr8258-ed` is a mains-powered, RX-on-when-idle,

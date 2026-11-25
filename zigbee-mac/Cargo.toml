@@ -254,6 +254,11 @@ efr32mg21 = [
     "dep:efr32s2-hal", "efr32s2-hal/efr32mg21",
     "dep:embassy-time", "dep:embassy-futures",
 ]
+# xG21 entropy from the Secure Engine TRNG (`efr32s2-hal/se-trng`) for
+# images that generate keys (the coordinator NCP). Without it xG21 has no
+# entropy source and `fill_random` fails explicitly. Not yet run on xG21
+# silicon. Off by default: images without it are unchanged.
+efr32mg21-se-trng = ["efr32mg21", "efr32s2-hal/se-trng"]
 efr32mg22 = [
     "dep:efr32s2-hal", "efr32s2-hal/efr32mg22",
     "dep:embassy-time", "dep:embassy-futures",

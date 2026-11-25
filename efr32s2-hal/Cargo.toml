@@ -39,6 +39,15 @@ isr-ack = []
 # rings serviced by the `USART0_RX` / `USART0_TX` handlers, for network
 # co-processor images. Defines both handlers, so firmware builds need `rt`.
 usart0-host = []
+# Smaller host-link rings for 64 KiB parts: 4 KiB receive (a 4-frame ZRHP
+# window of 656-byte frames) and 1 KiB transmit, instead of 8 KiB / 2 KiB.
+# Off by default: images without it are unchanged.
+usart0-host-small = ["usart0-host"]
+# xG21: the Secure Engine mailbox TRNG (`se`), the same SEMAILBOX_HOST
+# interface and command as on xG24 (which always builds it). Opt-in for
+# images that need entropy (the coordinator NCP); not yet run on xG21
+# silicon. Off by default: images without it are unchanged.
+se-trng = []
 
 [dependencies]
 cortex-m = "0.7"

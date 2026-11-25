@@ -14,7 +14,7 @@
 use heapless::Deque;
 
 /// Entries kept (spec 6.5).
-pub const RETRY_CACHE_ENTRIES: usize = 64;
+pub const RETRY_CACHE_ENTRIES: usize = crate::capacity_tier(64, 64, 16);
 /// Most result bytes after `status` a cached response carries.
 pub const MAX_CACHED_RESULT: usize = 16;
 

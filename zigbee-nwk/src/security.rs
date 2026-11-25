@@ -16,7 +16,7 @@ use zigbee_types::IeeeAddress;
 /// Maximum number of network keys we can store (current + previous)
 pub const MAX_NETWORK_KEYS: usize = 2;
 #[cfg(feature = "router")]
-pub const MAX_FRAME_COUNTER_ENTRIES: usize = crate::ncp_capacity_tier(64, 128, 96);
+pub const MAX_FRAME_COUNTER_ENTRIES: usize = crate::ncp_capacity_tier(64, 128, 96, 64);
 #[cfg(not(feature = "router"))]
 pub const MAX_FRAME_COUNTER_ENTRIES: usize = 16;
 

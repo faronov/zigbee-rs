@@ -52,6 +52,13 @@ zigbee-gp = { path = "../../zigbee-gp", features = ["sink"] }
 # `ncp-capacity-compact`: 128 Trust Center devices). Off by default: images
 # without it are unchanged.
 compact = ["zigbee-runtime/ncp-capacity-compact", "router-app/ncp-capacity-compact"]
+# Tiny NCP for 64 KiB-RAM parts (EFR32MG21 F768/F512, TLSR8258): a 4-frame
+# link window each way (the spec minimum), 1 KiB endpoint queues, 8 APS
+# requests in flight, a 16-entry retry cache, restore staging for 48 keys
+# and 32 children, and the tiny stack tables (zigbee-runtime
+# `ncp-capacity-tiny`: 48 Trust Center devices, 16 children). Exclusive with
+# `compact`. Off by default: images without it are unchanged.
+tiny = ["zigbee-runtime/ncp-capacity-tiny", "router-app/ncp-capacity-tiny"]
 
 [dev-dependencies]
 critical-section = { version = "1.2", features = ["std"] }

@@ -46,6 +46,8 @@ ncp-capacity = ["trust-center", "zigbee-nwk/ncp-capacity"]
 adaptive-indirect = ["router", "zigbee-nwk/adaptive-indirect"]
 # Compact coordinator NCP: 128 link keys and the compact NWK tables.
 ncp-capacity-compact = ["ncp-capacity", "zigbee-nwk/ncp-capacity-compact"]
+# Tiny coordinator NCP (64 KiB parts): 48 link keys and the tiny NWK tables.
+ncp-capacity-tiny = ["ncp-capacity", "zigbee-nwk/ncp-capacity-tiny"]
 
 [dev-dependencies]
 zigbee-mac = { path = "../zigbee-mac", features = ["mock"] }

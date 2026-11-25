@@ -98,12 +98,19 @@ jobs:
       - run: cargo test -p zigbee-aps --features ncp-capacity --locked
       - run: cargo test -p zigbee-bdb --features ncp-capacity --locked
       - run: cargo test -p zigbee-runtime --features ncp-capacity,green-power-ncp,host-passthrough --locked
+      # Tiny NCP tier (64 KiB parts; feasibility study, no image fits).
+      - run: cargo test -p zigbee-nwk --features router,ncp-capacity-tiny --locked
+      - run: cargo test -p zigbee-aps --features ncp-capacity-tiny --locked
+      - run: cargo test -p zigbee-bdb --features ncp-capacity-tiny --locked
+      - run: cargo test -p zigbee-runtime --features ncp-capacity-tiny,green-power-ncp,host-passthrough --locked
       - run: cargo test -p zigbee-tests --all-features --locked
       - run: cargo test -p zigbee-zdo --features router --locked
       - run: cargo test -p zigbee-mac --features stm32wb --lib stm32wb --locked
       # EFR32 Series 2 PHY adapter on xG24: ACK filter, error mapping and the
       # Secure Engine TRNG error mapping (the PA variant is the board's).
       - run: cargo test -p zigbee-mac --features efr32mg24,efr32s2-hal/efr32mg24-pa10 --lib efr32s2 --locked
+      # xG21 with the opt-in Secure Engine TRNG (the tiny MG21 NCP).
+      - run: cargo test -p zigbee-mac --features efr32mg21-se-trng --lib efr32s2 --locked
       - run: cargo test -p zigbee-runtime --no-default-features --locked
       - run: cargo test -p zigbee-gp --all-features --locked
       - run: cargo test -p zigbee-gp --no-default-features --locked
@@ -137,6 +144,8 @@ jobs:
       - run: cargo test --manifest-path apps/ncp-coordinator/Cargo.toml --locked
       # Compact NCP (CC2652P7): 8-frame link window, compact stack tables.
       - run: cargo test --manifest-path apps/ncp-coordinator/Cargo.toml --features compact --locked
+      # Tiny NCP (64 KiB parts): 4-frame link window, tiny stack tables.
+      - run: cargo test --manifest-path apps/ncp-coordinator/Cargo.toml --features tiny --locked
       # nRF product crates are excluded from the root workspace (they pull in
       # `embassy-nrf`), but their battery-curve and profile logic is
       # host-testable because the hardware dependencies are
@@ -418,6 +427,27 @@ jobs:
             manifest: efr32s2-hal/Cargo.toml
             workspace: efr32s2-hal
             features: "efr32mg22"
+          # Tiny MG21 NCP: the xG21 Secure Engine TRNG and the small host rings.
+          - name: EFR32 Series 2 HAL (MG21, SE TRNG, small host UART)
+            manifest: efr32s2-hal/Cargo.toml
+            workspace: efr32s2-hal
+            features: "efr32mg21,se-trng,usart0-host-small"
+          - name: Tuya ZS3L board (gateway UART route)
+            manifest: boards/tuya-zs3l/Cargo.toml
+            workspace: boards/tuya-zs3l
+            features: "uart-gateway,host-uart"
+          - name: Tuya ZS3L board (PA05/PA06 pads)
+            manifest: boards/tuya-zs3l/Cargo.toml
+            workspace: boards/tuya-zs3l
+            features: "uart-pa05-pa06,host-uart"
+          - name: EFR32MG21 tiny NCP product (F768)
+            manifest: products/efr32mg21-ncp/Cargo.toml
+            workspace: products/efr32mg21-ncp
+            features: "flash-768k,uart-gateway"
+          - name: EFR32MG21 tiny NCP product (F512)
+            manifest: products/efr32mg21-ncp/Cargo.toml
+            workspace: products/efr32mg21-ncp
+            features: "flash-512k,uart-pa05-pa06"
           # Router images: interrupt-driven Imm-Ack with the HAL-owned
           # Frame Pending table (radio::isr_ack host tests).
           - name: EFR32 Series 2 HAL (MG21, ISR Imm-Ack)
@@ -592,6 +622,7 @@ jobs:
       - run: cargo clippy -p zigbee-mac --features pan-coordinator --all-targets --locked -- -D warnings
       - run: cargo clippy --manifest-path apps/ncp-coordinator/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo clippy --manifest-path apps/ncp-coordinator/Cargo.toml --all-targets --features compact --locked -- -D warnings
+      - run: cargo clippy --manifest-path apps/ncp-coordinator/Cargo.toml --all-targets --features tiny --locked -- -D warnings
       - run: cargo clippy -p router-app --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p router-app --no-default-features --locked -- -D warnings
       - run: cargo clippy -p sensor-sed-app --all-targets --features ota --locked -- -D warnings
@@ -660,6 +691,8 @@ jobs:
           cargo fmt --manifest-path boards/rf-bm-mg24b1/Cargo.toml -- --check
           cargo fmt --manifest-path boards/sonoff-dongle-m/Cargo.toml -- --check
           cargo fmt --manifest-path products/efr32mg24/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/tuya-zs3l/Cargo.toml -- --check
+          cargo fmt --manifest-path products/efr32mg21-ncp/Cargo.toml -- --check
           cargo fmt --manifest-path products/phy62x2-evk/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52840-router/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52833-sensor/Cargo.toml -- --check
@@ -675,6 +708,7 @@ jobs:
           cargo fmt --manifest-path examples/efr32mg22-gpd/Cargo.toml -- --check
           cargo fmt --manifest-path examples/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg24-ncp/Cargo.toml -- --check
+          cargo fmt --manifest-path examples/efr32mg21-ncp/Cargo.toml -- --check
           cargo fmt --manifest-path examples/efr32mg24-router/Cargo.toml -- --check
           cargo fmt --manifest-path efr32mg1-hal/Cargo.toml -- --check
           cargo fmt --manifest-path efr32s2-hal/Cargo.toml -- --check
@@ -3032,6 +3066,53 @@ jobs:
             examples/cc26x2-ncp/target/cc26x2-ncp-*.hex
             examples/cc26x2-ncp/target/cc26x2-ncp-*.size.json
           if-no-files-found: error
+
+  # Tiny ZRHP NCP for 64 KiB EFR32MG21 modules (Tuya ZS3L): a feasibility
+  # composition (docs/book/src/advanced/tiny-ncp.md). Its static RAM exceeds
+  # the SRAM, so the real link must fail; the measurement-only map links it
+  # for the size report and the layout checker must refuse that image.
+  build-efr32mg21-ncp:
+    name: Build EFR32MG21 tiny ZRHP NCP (feasibility, does not fit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv8m.main-none-eabihf
+          components: rust-src, llvm-tools, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: examples/efr32mg21-ncp
+          key: thumbv8m-efr32mg21-ncp-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('examples/efr32mg21-ncp/Cargo.lock', 'products/efr32mg21-ncp/link/**', 'efr32s2-hal/link/**') }}
+      - name: The 64 KiB link fails on RAM (F768 and F512)
+        working-directory: examples/efr32mg21-ncp
+        run: |
+          for variant in flash-768k,uart-gateway flash-512k,uart-pa05-pa06; do
+            if cargo build --release --locked --no-default-features --features "$variant" \
+                --target-dir "target/${variant%%,*}" 2> link.log; then
+              echo "the tiny MG21 NCP ($variant) linked; update docs/book/src/advanced/tiny-ncp.md" >&2
+              exit 1
+            fi
+            grep -F "section '.bss' will not fit in region 'RAM'" link.log || {
+              cat link.log >&2
+              exit 1
+            }
+          done
+      - name: Measurement-only build, clippy, size report
+        working-directory: examples/efr32mg21-ncp
+        env:
+          EFR32MG21_NCP_MEASURE: "1"
+        run: |
+          cargo build --release --locked --target-dir target/measure
+          cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+            --target-dir target/measure -- -D warnings
+          ELF=target/measure/thumbv8m.main-none-eabihf/release/efr32mg21-ncp
+          if python3 tools/verify-layout.py --ncp "$ELF"; then
+            echo "verify-layout accepted a measurement-only image" >&2
+            exit 1
+          fi
+          python3 ../../tools/mac-footprint.py report "mg21-tiny-ncp=$ELF"
 
   # EFR32MG24 (RF-BM-MG24B1 dev board, SONOFF Dongle-M): ZRHP NCP and
   # Router, linked above the 24 KiB Gecko bootloader and packaged as raw

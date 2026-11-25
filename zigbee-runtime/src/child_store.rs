@@ -59,7 +59,7 @@ use zigbee_types::IeeeAddress;
 /// Matches the router neighbour-table capacity so a full child table always
 /// fits (64 children in 1 024-byte slots with `ncp-capacity`, ZRHP spec 8.9);
 /// the encoded form still fits one journal slot (see the layout asserts below).
-pub const MAX_PERSISTED_CHILDREN: usize = crate::ncp_capacity(32, 64);
+pub const MAX_PERSISTED_CHILDREN: usize = crate::ncp_tier(32, 64, 32);
 
 /// Encoded size of one version-2/version-3 child record.
 const LEGACY_CHILD_ENTRY_LEN: usize = 12;
@@ -868,7 +868,7 @@ impl ChildTableStore for RamChildTableStore {
 /// Erase-unit size the journal assumes for each of its two sectors.
 pub const CHILD_JOURNAL_SECTOR_SIZE: usize = 4096;
 /// Size of one journal record slot.
-pub const CHILD_JOURNAL_SLOT_SIZE: usize = crate::ncp_capacity(512, 1024);
+pub const CHILD_JOURNAL_SLOT_SIZE: usize = crate::ncp_tier(512, 1024, 512);
 /// Slots that fit in one sector.
 pub const CHILD_JOURNAL_SLOTS_PER_SECTOR: usize =
     CHILD_JOURNAL_SECTOR_SIZE / CHILD_JOURNAL_SLOT_SIZE;
@@ -2046,7 +2046,10 @@ mod tests {
     }
 
     /// Coordinator NCP: 64 children in one 1 024-byte slot (ZRHP spec 8.9).
-    #[cfg(feature = "ncp-capacity")]
+    #[cfg(all(
+        feature = "ncp-capacity",
+        any(not(feature = "ncp-capacity-tiny"), feature = "ncp-capacity-compact")
+    ))]
     #[test]
     fn ncp_capacity_persists_64_children_in_1024_byte_slots() {
         assert_eq!(MAX_PERSISTED_CHILDREN, 64);

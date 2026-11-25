@@ -1,0 +1,78 @@
+[package]
+name = "efr32mg21-ncp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+autobins = false
+
+# zigbee-rs ZRHP v1 network co-processor (coordinator + Trust Center + GP
+# combo) at the tiny capacity tier for 64 KiB EFR32MG21 modules (Tuya
+# ZS3L); the host link is USART0 without flow control. Feasibility only:
+# neither layout links (static RAM > 64 KiB).
+#   cargo build --release                                     # F768 (ZS3L)
+#   cargo build --release --no-default-features --features flash-512k,uart-gateway \
+#     --target-dir target/f512
+#   EFR32MG21_NCP_MEASURE=1 cargo build --release --target-dir target/measure
+# The image is linked above the resident Gecko bootloader (0x4000);
+# `tools/efr32-gbl` turns the ELF into the raw image and a GBL.
+[[bin]]
+name = "efr32mg21-ncp"
+path = "src/main.rs"
+
+[features]
+default = ["flash-768k", "uart-gateway"]
+flash-768k = ["efr32mg21-ncp-product/flash-768k"]
+flash-512k = ["efr32mg21-ncp-product/flash-512k"]
+# Host-UART route: the ZS3L gateway wiring (PD00/PD01) or its TXD/RXD pads
+# (PA05/PA06).
+uart-gateway = ["efr32mg21-ncp-product/uart-gateway"]
+uart-pa05-pa06 = ["efr32mg21-ncp-product/uart-pa05-pa06"]
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7", features = ["device"] }
+# `se-trng`: the xG21 Secure Engine TRNG (the NCP's entropy source);
+# `usart0-host-small`: 4 KiB / 1 KiB host-link rings (4-frame window).
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21", "rt", "time-driver", "isr-ack", "usart0-host-small", "se-trng"] }
+tuya-zs3l = { path = "../../boards/tuya-zs3l", default-features = false, features = ["host-uart"] }
+efr32mg21-ncp-product = { path = "../../products/efr32mg21-ncp", default-features = false }
+# Tiny NCP capacity (48 Trust Center devices, 4-frame link window). Even
+# so the static RAM exceeds the 64 KiB SRAM and the link fails
+# (docs/book/src/advanced/tiny-ncp.md); EFR32MG21_NCP_MEASURE=1 links a
+# measurement-only image.
+ncp-coordinator-app = { path = "../../apps/ncp-coordinator", features = ["tiny"] }
+# GP combo without the TempMaster (no timed transmission on EFR32 S2).
+router-app = { path = "../../apps/router", default-features = false, features = ["centralized-tclk", "global-aps-counter", "ncp-capacity-tiny", "green-power-sink"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = [
+    "centralized-tclk",
+    "trust-center",
+    "global-aps-counter",
+    "host-passthrough",
+    "ncp-capacity-tiny",
+    "green-power-ncp",
+] }
+# `pan-coordinator`: MLME-START with short address 0x0000;
+# `efr32mg21-se-trng`: entropy from the Secure Engine.
+zigbee-mac = { path = "../../zigbee-mac", features = ["efr32mg21-se-trng", "pan-coordinator", "ncp-capacity"] }
+zigbee-aps = { path = "../../zigbee-aps" }
+zigbee-bdb = { path = "../../zigbee-bdb", default-features = false }
+zigbee-types = { path = "../../zigbee-types" }
+zigbee-zcl = { path = "../../zigbee-zcl", default-features = false }
+
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "nightly"] }
+embassy-time = "0.5"
+embassy-time-driver = { version = "0.2", features = ["tick-hz-32_768"] }
+log = { version = "0.4", features = ["max_level_info", "release_max_level_info"] }
+static_cell = "2"
+
+[profile.dev]
+opt-level = "s"
+debug = true
+
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+debug = true
+panic = "abort"

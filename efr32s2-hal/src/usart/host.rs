@@ -27,9 +27,9 @@ use crate::gpio::{Input, Pin, PushPull};
 use crate::vectors::Interrupt;
 
 /// Receive ring size (power of two).
-pub const RX_RING: usize = 8192;
+pub const RX_RING: usize = [8192, 4096][cfg!(feature = "usart0-host-small") as usize];
 /// Transmit ring size (power of two).
-pub const TX_RING: usize = 2048;
+pub const TX_RING: usize = [2048, 1024][cfg!(feature = "usart0-host-small") as usize];
 const _: () = assert!(RX_RING.is_power_of_two() && TX_RING.is_power_of_two());
 
 const RXDATAX: u32 = 0x20;

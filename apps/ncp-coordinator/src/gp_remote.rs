@@ -22,7 +22,7 @@
 //! mode a `GP_SEND_PAIRING` that removes one of its own GPDs, or that names
 //! the NCP itself as the unicast sink, is refused with `CONFLICT`.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::AtomicU8;
 
 use heapless::Vec;
 use zigbee_gp::cluster::{Pairing, PairingSink, ProxyTableRequest, client_cmd, server_cmd};
@@ -62,7 +62,7 @@ const MAX_LIST: usize = 16;
 static TSN: AtomicU8 = AtomicU8::new(0);
 
 fn next_tsn() -> u8 {
-    TSN.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    crate::increment_u8(&TSN)
 }
 
 /// Whether `id` is a remote GP request.

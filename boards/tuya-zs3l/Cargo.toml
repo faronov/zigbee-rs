@@ -1,0 +1,27 @@
+[package]
+name = "tuya-zs3l"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for the Tuya ZS3L Zigbee module (EFR32MG21A020F768IM32) wired to a host MCU"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Keep this board independently testable without changing the repository
+# workspace or its lockfile.
+[workspace]
+
+[features]
+# The module's two documented host-UART routes (exactly one):
+# `uart-gateway`: PD00 TX / PD01 RX (+ PA03 CTS / PA04 RTS), Tuya's wiring
+# for the module as a gateway coordinator; `uart-pa05-pa06`: the TXD/RXD
+# pads (module pins 16/15, PA05 TX / PA06 RX).
+default = ["uart-gateway"]
+uart-gateway = []
+uart-pa05-pa06 = []
+# Interrupt-driven USART0 host link (`efr32s2-hal` `usart0-host`): defines
+# the USART0 interrupt handlers, so only images that use it enable it.
+host-uart = ["efr32s2-hal/usart0-host"]
+
+[dependencies]
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21"] }

@@ -91,6 +91,13 @@ ncp-capacity = [
 # for parts with less RAM (CC2652P7). Off by default: images without it are
 # unchanged.
 ncp-capacity-compact = ["ncp-capacity", "zigbee-bdb/ncp-capacity-compact"]
+# Tiny coordinator NCP tables for 64 KiB-RAM parts (EFR32MG21 F768/F512,
+# TLSR8258): 48 Trust Center devices and link keys, 64 address-map entries,
+# 32 neighbors with 16 children, 32 source routes, 64 NWK replay floors,
+# 8 indirect frames, 32 persisted children in 512 B journal slots, an
+# 8-entry GP Sink Table and 8 TC removal intents. Exclusive with
+# `ncp-capacity-compact`. Off by default: images without it are unchanged.
+ncp-capacity-tiny = ["ncp-capacity", "zigbee-bdb/ncp-capacity-tiny"]
 # Network co-processor: APS data frames for application endpoints go to a
 # bounded host queue (`host_passthrough`) instead of the ZCL dispatcher, with
 # the last hop RSSI and the APS security/key source; neighbour departures,

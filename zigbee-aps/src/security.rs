@@ -1344,7 +1344,12 @@ mod global;
 pub use global::GlobalApsCounter;
 
 /// Coordinator NCP link-key table (`ncp-capacity`, ZRHP spec 8.9).
-#[cfg(all(test, feature = "ncp-capacity", not(feature = "ncp-capacity-compact")))]
+#[cfg(all(
+    test,
+    feature = "ncp-capacity",
+    not(feature = "ncp-capacity-compact"),
+    not(feature = "ncp-capacity-tiny")
+))]
 mod ncp_capacity_tests {
     use super::*;
 
@@ -1418,9 +1423,51 @@ mod ncp_capacity_compact_tests {
 const fn key_table_entries() -> usize {
     if cfg!(feature = "ncp-capacity-compact") {
         128
+    } else if cfg!(feature = "ncp-capacity-tiny") {
+        TINY_KEY_TABLE_ENTRIES
     } else if cfg!(feature = "ncp-capacity") {
         256
     } else {
         32
+    }
+}
+
+/// `ncp-capacity-tiny` link-key table (64 KiB parts): one key per Trust
+/// Center device (`zigbee-bdb` `MAX_TRUST_CENTER_DEVICES`). `compact` wins
+/// when both tiers are enabled (`--all-features` test builds).
+#[cfg(feature = "trust-center")]
+const TINY_KEY_TABLE_ENTRIES: usize = 48;
+
+/// Tiny coordinator NCP link-key table (`ncp-capacity-tiny`).
+#[cfg(all(
+    test,
+    feature = "ncp-capacity-tiny",
+    not(feature = "ncp-capacity-compact")
+))]
+mod ncp_capacity_tiny_tests {
+    use super::*;
+
+    fn entry(index: u16) -> ApsLinkKeyEntry {
+        let [lo, hi] = index.to_le_bytes();
+        ApsLinkKeyEntry {
+            partner_address: [lo, hi, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A],
+            key: [lo; 16],
+            key_type: ApsKeyType::TrustCenterLinkKey,
+            outgoing_frame_counter: 0,
+            outgoing_frame_counter_limit: 0x400,
+            incoming_frame_counter: 0,
+            incoming_frame_counter_valid: false,
+        }
+    }
+
+    #[test]
+    fn the_link_key_table_holds_48_unique_keys_and_then_refuses() {
+        assert_eq!(MAX_KEY_TABLE_ENTRIES, 48);
+        let mut security = ApsSecurity::new();
+        for index in 0..MAX_KEY_TABLE_ENTRIES as u16 {
+            assert!(security.add_key(entry(index)).is_ok(), "key {index}");
+        }
+        assert_eq!(security.key_count(), MAX_KEY_TABLE_ENTRIES);
+        assert!(security.add_key(entry(0x7FFF)).is_err());
     }
 }

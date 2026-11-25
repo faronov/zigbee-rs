@@ -39,7 +39,7 @@ pub const MAX_HOLD_SECS: u8 = 64;
 pub const WINDOW_US: u32 = 600_000_000;
 
 /// Children tracked at once (the NCP's `max_children`).
-pub const MAX_TRACKED: usize = crate::ncp_capacity(16, 64);
+pub const MAX_TRACKED: usize = crate::ncp_capacity_tier(16, 64, 64, 16);
 
 #[derive(Clone, Copy)]
 struct Estimate {

@@ -567,7 +567,12 @@ fn ncp_sink_commissions_reports_and_hands_over_to_a_host_sink() {
     let negotiated: SysNegotiateRsp = response.body();
     assert_ne!(negotiated.ncp_caps & caps::GREEN_POWER_PROXY, 0);
     assert_ne!(negotiated.ncp_caps & caps::GREEN_POWER_SINK, 0);
-    assert_eq!(negotiated.capacity(capacity::GP_SINK_TABLE), Some(16));
+    // 16 Sink Table entries (`ncp-capacity`); 8 on the tiny tier.
+    let sink_table = if cfg!(feature = "tiny") { 8 } else { 16 };
+    assert_eq!(
+        negotiated.capacity(capacity::GP_SINK_TABLE),
+        Some(sink_table)
+    );
     assert_eq!(negotiated.capacity(capacity::GP_PROXY_TABLE), Some(8));
 
     // Commissioning and table changes need a network (the table is

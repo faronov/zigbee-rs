@@ -487,7 +487,7 @@ mod tests {
 
 /// The HAL's xorshift is not cryptographic, and xG21/xG22 have no TRNG
 /// driver yet: entropy is unavailable and callers fail explicitly.
-#[cfg(not(feature = "efr32mg24"))]
+#[cfg(not(any(feature = "efr32mg24", feature = "efr32mg21-se-trng")))]
 #[inline(always)]
 fn fill_random(_output: &mut [u8]) -> Result<(), MacError> {
     Err(MacError::Unsupported)
@@ -495,7 +495,7 @@ fn fill_random(_output: &mut [u8]) -> Result<(), MacError> {
 
 /// xG24: the Secure Engine TRNG over the SE mailbox (not yet run on
 /// hardware); a mailbox error is reported, never replaced.
-#[cfg(feature = "efr32mg24")]
+#[cfg(any(feature = "efr32mg24", feature = "efr32mg21-se-trng"))]
 fn fill_random(output: &mut [u8]) -> Result<(), MacError> {
     efr32s2_hal::se::fill_random(output).map_err(map_se_error)
 }
@@ -508,7 +508,7 @@ fn fill_random(output: &mut [u8]) -> Result<(), MacError> {
 /// test) is a failed security service; a mailbox held by another caller
 /// is transient (`Other`). Whether a poisoned mailbox ends in a reset is
 /// the product's policy (`efr32s2_hal::se::is_poisoned`).
-#[cfg(feature = "efr32mg24")]
+#[cfg(any(feature = "efr32mg24", feature = "efr32mg21-se-trng"))]
 fn map_se_error(error: efr32s2_hal::se::SeError) -> MacError {
     use efr32s2_hal::se::SeError;
     match error {
@@ -519,7 +519,7 @@ fn map_se_error(error: efr32s2_hal::se::SeError) -> MacError {
     }
 }
 
-#[cfg(all(test, feature = "efr32mg24"))]
+#[cfg(all(test, any(feature = "efr32mg24", feature = "efr32mg21-se-trng")))]
 mod se_tests {
     use super::*;
     use efr32s2_hal::se::SeError;

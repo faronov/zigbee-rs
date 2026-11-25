@@ -57,15 +57,15 @@ use crate::transport::{HostTransport, UartChangeError};
 use zigbee_zrhp::msg::tables::EvtTblEpochChanged;
 
 /// Link slots (spec 8.9: 16 × 652 B each direction; 8 with `compact`).
-pub const WINDOW: usize = [16, 8][cfg!(feature = "compact") as usize];
+pub const WINDOW: usize = crate::capacity_tier(16, 8, 4);
 /// Counters one `DIAG_GET_COUNTERS` response carries: 6 B each, so that
 /// the response fits a frame (spec 7.8). Every group of this NCP fits (all
 /// groups with PTA: 72).
 pub const MAX_COUNTERS: usize = 100;
 /// Bytes of queued outgoing messages per endpoint.
-pub const QUEUE_BYTES: usize = [1536, 1024][cfg!(feature = "compact") as usize];
+pub const QUEUE_BYTES: usize = crate::capacity_tier(1536, 1024, 1024);
 /// `max_aps_inflight`: accepted, not yet confirmed `APS_DATA_REQUEST`s.
-pub const MAX_APS_INFLIGHT: usize = 16;
+pub const MAX_APS_INFLIGHT: usize = crate::capacity_tier(16, 16, 8);
 /// Outgoing-counter reservation stride (`FRAME_COUNTER_RESERVATION_SIZE`).
 pub const FC_STRIDE: u32 = 0x400;
 /// ZRHP major version spoken.

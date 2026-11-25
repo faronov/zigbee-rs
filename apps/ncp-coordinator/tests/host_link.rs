@@ -371,11 +371,15 @@ fn host_negotiates_forms_reads_counters_and_sends_data() {
     assert_ne!(negotiated.ncp_caps & caps::KEY_EXPORT, 0);
     assert_ne!(negotiated.ncp_caps & caps::BACKUP_RESTORE, 0);
     assert_eq!(negotiated.ncp_caps & caps::NCP_FW_UPDATE, 0, "NoPlatform");
-    assert_eq!(negotiated.capacity(1), Some(16), "max_aps_inflight");
+    let inflight = if cfg!(feature = "tiny") { 8 } else { 16 };
+    assert_eq!(negotiated.capacity(1), Some(inflight), "max_aps_inflight");
     assert_eq!(negotiated.capacity(7), Some(0x400), "fc_stride");
-    // `ncp-capacity` table sizes (spec 8.9), halved by `compact`.
+    // `ncp-capacity` table sizes (spec 8.9), halved by `compact`; the
+    // 64 KiB-part sizes with `tiny`.
     let (keys, address_map, source_routes, neighbors) = if cfg!(feature = "compact") {
         (128, 256, 64, 64)
+    } else if cfg!(feature = "tiny") {
+        (48, 64, 32, 32)
     } else {
         (256, 512, 128, 96)
     };

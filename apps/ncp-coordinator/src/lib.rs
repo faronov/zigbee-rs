@@ -50,3 +50,40 @@ pub use ncp::{Ncp, NcpIdentity, PlatformRequest};
 pub use platform::{NcpPlatform, NoPlatform};
 pub use port::CoordinatorPort;
 pub use transport::HostTransport;
+
+/// Capacity per NCP tier: `full` (`ncp-capacity`), `compact` (feature
+/// `compact`, CC2652P7) and `tiny` (feature `tiny`, 64 KiB parts). Only
+/// evaluated in constant contexts (declared last: keeps the line numbers
+/// above, which panic locations embed, unchanged).
+pub(crate) const fn capacity_tier(full: usize, compact: usize, tiny: usize) -> usize {
+    if cfg!(feature = "tiny") {
+        tiny
+    } else if cfg!(feature = "compact") {
+        compact
+    } else {
+        full
+    }
+}
+
+#[cfg(all(feature = "compact", feature = "tiny"))]
+compile_error!("ncp-coordinator-app: `compact` and `tiny` are exclusive capacity tiers");
+
+/// `cell.fetch_add(1) + 1` (wrapping). Targets without atomic
+/// read-modify-write (TC32, Cortex-M0+) do the same under a critical
+/// section (declared last, like the function above).
+#[cfg(target_has_atomic = "8")]
+#[inline(always)]
+pub(crate) fn increment_u8(cell: &core::sync::atomic::AtomicU8) -> u8 {
+    cell.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1)
+}
+
+#[cfg(not(target_has_atomic = "8"))]
+pub(crate) fn increment_u8(cell: &core::sync::atomic::AtomicU8) -> u8 {
+    use core::sync::atomic::Ordering;
+    critical_section::with(|_| {
+        let next = cell.load(Ordering::Relaxed).wrapping_add(1);
+        cell.store(next, Ordering::Relaxed);
+        next
+    })
+}
