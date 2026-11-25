@@ -15,9 +15,28 @@ Every image comes from a tagged GitHub release, never from a CI artifact:
 | ESP32-C6 DevKit | ZRHP NCP (USB-Serial-JTAG) | `ncp-v*` | the DevKit's "USB" port |
 | Espressif Thread Border Router board, H2 | ZRHP NCP (UART 921 600, RTS/CTS on R19/R20) | `ncp-v*` | flash through the H2's own port USB1 |
 | Espressif Thread Border Router board, S3 (4 MB or 8 MB, detected) | `tbr-hub`: A/B production layout on 8 MB, dev layout without OTA on 4 MB | `hub-v*` (zigbee-rs-hub) | one entry; the image follows the chip's flash size |
+| Espressif Thread Border Router board, S3 (8 MB, detected): **Developer edition** | `tbr-hub` with feature `dev` (the web UI's developer tools always on), 8 MB layout | `hub-v*` (once built) | its own entry, labelled; same layout as the 8 MB image, so switching keeps the data |
+| SONOFF Dongle Max (experimental) | `zrh-donglem`: the hub on SONOFF's EmberZNet NCP, in `ota_1` of SONOFF's partition table | `hub-v*` (since 0.3.0) | **listed only, no install button** (below) |
 
 There is no ESP32-C5 NCP image (the C5 port has router and sensor examples
 only).
+
+## Boards listed without an install button
+
+A board whose release manifest says `"web_install": false` is shown with its
+files, SHA-256, install steps and the esptool commands, but the page offers
+no ESP Web Tools install for it and the site has no ESP Web Tools manifest
+or copy of its images (the files link to the GitHub release). ESP Web Tools
+cannot write a few regions *without* the option to erase the chip: for a
+firmware that does not answer Improv Serial its install dialog either always
+erases (`new_install_prompt_erase: false`) or asks with an *Erase device*
+checkbox. On the **SONOFF Dongle Max** an erase removes SONOFF's bootloader,
+partition table, `nvs` and factory data, and the two hub parts alone do not
+boot. Its install is therefore SONOFF's own web console (*Upload & Flash
+Firmware* with `zrh-donglem-<version>-app.bin`) or esptool over USB:
+`zrh-donglem-<version>-app.bin` at 0x660000 (`ota_1`), then
+`zrh-donglem-<version>-otadata-ota1.bin` at 0x5D000 (`otadata` sector 1,
+selecting `ota_1`), each with its own `write-flash`, never an erase.
 
 ## Boards with several flash sizes
 
@@ -226,7 +245,14 @@ over ZRHP; flashing over USB is not affected.
 `flash` lists the parts the flasher writes, in order; their offsets must not
 overlap. Hub manifests add `components` (e.g. the bundled bridge version)
 and, once the hub speaks Improv Serial, `improv` (`firmware` name and wait
-time) for ESP Web Tools.
+time) for ESP Web Tools. A board with `"web_install": false` (default
+`true`) is never installed through ESP Web Tools; `flash` then lists the
+parts in their USB write order, `install_steps` the instructions the page
+shows, `experimental` and `hardware_status` its state, and
+`stock_partition_table` (offset, size, SHA-256) the table the parts are
+for. `edition: "devtools"` marks a developer edition: it names its own
+`size_group`, so it is a separate, labelled entry and never joins (or
+replaces) the standard images' group.
 
 ## How the site gets the images
 

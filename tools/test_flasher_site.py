@@ -66,6 +66,26 @@ def release(tag, version, *, published, prerelease=False, corrupt=None, manifest
     return tag, (m, assets, prerelease, published)
 
 
+def hub_release_with_dongle(tag, version, *, published):
+    """A hub release whose second board must not be installed through ESP Web Tools."""
+    tag, (m, assets, pre, published) = release(tag, version, published=published)
+    m["product"], m["name"] = "zigbee-rs-hub", "zigbee-rs hub"
+    dongle = {"app": (0x660000, b"\xe9dongle-app"), "otadata_ota1": (0x5D000, b"\x02\0\0\0" + b"\xff" * 28)}
+    files = {role: {"name": f"zrh-donglem-{version}-{role}.bin", "offset": off, "size": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest()} for role, (off, data) in dongle.items()}
+    m["boards"].append({
+        "id": "sonoff-dongle-max", "title": "SONOFF Dongle Max (experimental)", "product": "zigbee-rs-hub",
+        "firmware": "zrh-donglem", "chip_family": "ESP32", "flash_size": "16MB", "layout": "sonoff-dongle-m-stock",
+        "app_version": f"zrh-donglem-{version}", "experimental": True,
+        "hardware_status": "bring-up tested; full hub HIL pending", "web_install": False,
+        "install_steps": ["SONOFF's web console: Upload & Flash Firmware with the app file."],
+        "files": files, "flash": ["app", "otadata_ota1"], "fw_update": None,
+    })
+    assets.update({files[role]["name"]: data for role, (_, data) in dongle.items()})
+    assets["release-manifest.json"] = json.dumps(m).encode()
+    return tag, (m, assets, pre, published)
+
+
 class FlasherSiteTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -97,6 +117,38 @@ class FlasherSiteTests(unittest.TestCase):
         for part in parts:
             self.assertTrue((out / "releases/ncp-v0.1.0" / part["path"]).is_file())
         SITE.cmd_check(mock.Mock(dir=str(out)))
+
+    def test_board_without_web_install_gets_no_esp_web_tools_manifest(self):
+        out, index = self.fetch([hub_release_with_dongle("ncp-v0.3.0", "0.3.0", published="2026-11-25T10:00:00Z")])
+        installable, dongle = index["products"][0]["releases"][0]["boards"]
+        self.assertTrue(installable["web_install"])
+        self.assertEqual(set(installable["manifests"]), {"update", "erase"})
+        # Neither an erase nor an update manifest: ESP Web Tools' "Erase device" would wipe the stock firmware.
+        self.assertIs(dongle["web_install"], False)
+        self.assertEqual(dongle["manifests"], {})
+        self.assertEqual(list((out / "releases/ncp-v0.3.0").glob("sonoff-dongle-max.*")), [])
+        self.assertFalse((out / "releases/ncp-v0.3.0/zrh-donglem-0.3.0-app.bin").exists())
+        self.assertEqual([(f["role"], f["offset"], f["download"]) for f in dongle["files"]], [
+            ("app", 0x660000, "https://dl/ncp-v0.3.0/zrh-donglem-0.3.0-app.bin"),
+            ("otadata_ota1", 0x5D000, "https://dl/ncp-v0.3.0/zrh-donglem-0.3.0-otadata_ota1.bin"),
+        ])
+        self.assertEqual(dongle["install_steps"], ["SONOFF's web console: Upload & Flash Firmware with the app file."])
+        self.assertNotIn("size_group", dongle)
+        SITE.cmd_check(mock.Mock(dir=str(out)))
+        # A stray manifest for it fails the check.
+        (out / "releases/ncp-v0.3.0/sonoff-dongle-max.erase.json").write_text("{}")
+        with self.assertRaisesRegex(SITE.SiteError, "without web install"):
+            SITE.cmd_check(mock.Mock(dir=str(out)))
+
+    def test_board_without_web_install_needs_its_assets_and_a_boolean(self):
+        tag, (m, assets, pre, published) = hub_release_with_dongle("ncp-v0.3.0", "0.3.0", published="2026-11-25T10:00:00Z")
+        del assets["zrh-donglem-0.3.0-otadata_ota1.bin"]
+        with self.assertRaisesRegex(SITE.SiteError, "asset zrh-donglem-0.3.0-otadata_ota1.bin missing"):
+            self.fetch([(tag, (m, assets, pre, published))])
+        bad = json.loads(json.dumps(m))
+        bad["boards"][1]["web_install"] = "no"
+        with self.assertRaisesRegex(SITE.SiteError, "web_install must be true or false"):
+            SITE.validate_manifest(bad, tag)
 
     def test_keeps_the_newest_releases_and_skips_releases_without_manifest(self):
         out, index = self.fetch([
@@ -181,6 +233,26 @@ class FlasherSiteTests(unittest.TestCase):
         twins = [board("a", "8MB", "quad", [0, 2]), board("b", "8MB", "quad", [0, 2])]
         SITE.mark_size_groups(twins, "hub")
         self.assertNotIn("size_group", twins[0])
+
+    def test_developer_edition_is_its_own_group(self):
+        # The hub's 8 MB developer edition names its group itself: it must not join (and so break) the
+        # standard flash/PSRAM group, whose 8 MB variants it duplicates.
+        def board(bid, size, psram, match, **extra):
+            return {"id": bid, "title": f"Thread BR board, S3 ({size}): hub", "product": "zigbee-rs-hub",
+                    "firmware": "tbr-hub", "chip_family": "ESP32-S3", "flash_size": size, "psram": psram,
+                    "match": {"embedded_psram_mb": match}, **extra}
+        dev = {"edition": "devtools", "size_group": "thread-br-s3-hub-devtools",
+               "size_group_title": "Thread BR board, S3 (8 MB, detected): hub, Developer edition (devtools)"}
+        boards = [board("thread-br-s3-hub-8mb", "8MB", "quad", [0, 2, 4]),
+                  board("thread-br-s3-hub-8mb-opi", "8MB", "octal", [8, 16]),
+                  board("thread-br-s3-hub-4mb-dev", "4MB", "quad", [0, 2, 4]),
+                  board("thread-br-s3-hub-4mb-dev-opi", "4MB", "octal", [8, 16]),
+                  board("thread-br-s3-hub-8mb-devtools", "8MB", "quad", [0, 2, 4], **dev),
+                  board("thread-br-s3-hub-8mb-devtools-opi", "8MB", "octal", [8, 16], **dev)]
+        SITE.mark_size_groups(boards, "zigbee-rs hub")
+        self.assertEqual([b["size_group"] for b in boards], ["thread-br-s3-hub"] * 4 + ["thread-br-s3-hub-devtools"] * 2)
+        self.assertEqual(boards[4]["size_group_title"], dev["size_group_title"])
+        self.assertNotIn("Developer", boards[0]["size_group_title"])
 
     def test_fingerprint_ignores_order_and_tracks_content(self):
         a = [("o/r", "ncp-v0.1.0", "1" * 64), ("o/h", "hub-v0.1.0", "2" * 64)]

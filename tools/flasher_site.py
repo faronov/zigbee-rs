@@ -19,7 +19,11 @@ Defaults: faronov/zigbee-rs:ncp-v and faronov/zigbee-rs-hub:hub-v, the newest
 image against the release manifest (size and SHA-256), and writes
 `DIR/releases.json` plus `DIR/releases/<tag>/` with the images and one ESP
 Web Tools manifest per board and mode (`<board>.update.json` keeps the data
-partitions, `<board>.erase.json` erases the chip first). `resolve` decides
+partitions, `<board>.erase.json` erases the chip first). A board marked
+`"web_install": false` (the SONOFF Dongle Max of the hub releases: ESP Web
+Tools' erase would wipe its stock firmware) gets neither: the page lists it
+with its install steps and the release's download links, its images are
+not copied and no ESP Web Tools manifest exists for it. `resolve` decides
 whether the site must be rebuilt (the release set changed) and on which base
 (the revision and CI run of the live site); `live` prints the live base.
 """
@@ -129,6 +133,16 @@ def validate_manifest(manifest: dict, tag: str) -> None:
         fw = board.get("fw_update")
         if fw is not None:
             check_file(fw.get("file"), f"{tag}/{bid}/fw_update", offset=False)
+        if not isinstance(board.get("web_install", True), bool):
+            raise SiteError(f"{tag}/{bid}: web_install must be true or false")
+        steps = board.get("install_steps")
+        if steps is not None and (not isinstance(steps, list) or not all(isinstance(x, str) for x in steps)):
+            raise SiteError(f"{tag}/{bid}: install_steps must be a list of strings")
+
+
+def web_install(board: dict) -> bool:
+    """False: listed with its install steps, never installed through ESP Web Tools."""
+    return board.get("web_install", True) is not False
 
 
 def esp_web_tools_manifest(manifest: dict, board: dict, erase: bool) -> dict:
@@ -173,6 +187,8 @@ def mark_size_groups(boards: list[dict], product_name: str) -> None:
     group itself (`size_group`, `size_group_title`)."""
     keyed: dict[str, list[dict]] = {}
     for board in boards:
+        if not web_install(board):
+            continue
         # A feature *string* is a different build (the NCP's Cargo features per transport); a feature
         # *list* (hub: ["mqtt"] on 8 MB only) describes what an image of the group includes.
         features = board.get("features") if isinstance(board.get("features"), str) else ""
@@ -234,30 +250,37 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         directory = out / "releases" / tag
         directory.mkdir()
         boards = []
+        downloads = {a["name"]: a["browser_download_url"] for a in release["assets"]}
         for board in manifest["boards"]:
-            for role in board["flash"]:
-                item = board["files"][role]
-                target = directory / item["name"]
-                if not target.exists():
-                    source = asset(release, item["name"])
-                    if source is None:
-                        raise SiteError(f"{tag}: asset {item['name']} missing")
-                    data = http_get(source["browser_download_url"])
-                    if len(data) != item["size"] or hashlib.sha256(data).hexdigest() != item["sha256"]:
-                        raise SiteError(f"{tag}: {item['name']} does not match release-manifest.json")
-                    target.write_bytes(data)
             manifests = {}
-            for mode in ("update", "erase"):
-                name = f"{board['id']}.{mode}.json"
-                (directory / name).write_text(json.dumps(
-                    esp_web_tools_manifest(manifest, board, mode == "erase"), indent=2) + "\n")
-                manifests[mode] = f"releases/{tag}/{name}"
-            downloads = {a["name"]: a["browser_download_url"] for a in release["assets"]}
+            if not web_install(board):
+                # Only linked: the page offers no install, so nothing of it goes onto the site.
+                for item in board["files"].values():
+                    if item["name"] not in downloads:
+                        raise SiteError(f"{tag}: asset {item['name']} missing")
+            else:
+                for role in board["flash"]:
+                    item = board["files"][role]
+                    target = directory / item["name"]
+                    if not target.exists():
+                        source = asset(release, item["name"])
+                        if source is None:
+                            raise SiteError(f"{tag}: asset {item['name']} missing")
+                        data = http_get(source["browser_download_url"])
+                        if len(data) != item["size"] or hashlib.sha256(data).hexdigest() != item["sha256"]:
+                            raise SiteError(f"{tag}: {item['name']} does not match release-manifest.json")
+                        target.write_bytes(data)
+                for mode in ("update", "erase"):
+                    name = f"{board['id']}.{mode}.json"
+                    (directory / name).write_text(json.dumps(
+                        esp_web_tools_manifest(manifest, board, mode == "erase"), indent=2) + "\n")
+                    manifests[mode] = f"releases/{tag}/{name}"
             files = [{"role": role, **item, "download": downloads.get(item["name"])}
                      for role, item in board["files"].items()]
             fw = board.get("fw_update")
             boards.append({
                 **{k: v for k, v in board.items() if k not in ("files", "fw_update")},
+                "web_install": web_install(board),
                 "files": files,
                 "fw_update": fw and {**fw, "download": downloads.get(fw["file"]["name"])},
                 "manifests": manifests,
@@ -301,6 +324,12 @@ def cmd_check(args: argparse.Namespace) -> None:
         for release in product["releases"]:
             for board in release["boards"]:
                 sums = {f["name"]: f["sha256"] for f in board["files"]}
+                if board.get("web_install") is False:
+                    stray = [p.name for p in (root / "releases" / release["tag"]).glob(f"{board['id']}.*.json")]
+                    if board["manifests"] or stray:
+                        raise SiteError(f"{release['tag']}/{board['id']}: ESP Web Tools manifest for a board "
+                                        "without web install")
+                    continue
                 for mode, rel in board["manifests"].items():
                     path = root / rel
                     manifest = json.loads(path.read_text())
