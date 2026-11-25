@@ -53,6 +53,8 @@
     ol { padding-left: 1.2rem; margin: .4rem 0; }
     li { margin: .25rem 0; }
     .hidden { display: none; }
+    pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: .6rem .8rem;
+      overflow-x: auto; font-size: .78rem; margin: .5rem 0; }
     footer { color: var(--muted); font-size: .8rem; margin-top: 1.5rem; text-align: center; }
   </style>
 </head>
@@ -103,7 +105,7 @@
       </details>
     </section>
 
-    <section class="card">
+    <section class="card" id="mode-card">
       <h2>3. Keep or erase</h2>
       <label class="check"><input type="checkbox" id="erase"> Erase the whole chip first (factory reset)</label>
       <div id="layout-change"></div>
@@ -111,8 +113,9 @@
     </section>
 
     <section class="card">
-      <h2>4. Connect and install</h2>
+      <h2 id="install-title">4. Connect and install</h2>
       <ol id="connect-steps"></ol>
+      <div id="manual-box" class="hidden"></div>
       <div id="s3-prepare" class="hidden note">
         <p style="margin-top:0">If the S3 already runs tbr-hub or tbr-bridge, its USB port shows the bridge's two
           serial ports instead of the S3's own USB-Serial-JTAG. Switch it over first: pick the <em>second</em>
@@ -134,14 +137,14 @@
         <button class="button secondary" id="detect">Connect and read flash and PSRAM</button>
         <div id="detect-result" class="muted" style="font-size:.9rem;margin-top:.5rem"></div>
       </div>
-      <div class="install" style="margin-top:1rem">
+      <div class="install" id="install-box" style="margin-top:1rem">
         <esp-web-install-button id="install">
           <button slot="activate" id="install-label">Install</button>
           <span slot="unsupported">Web Serial is not available in this browser: use Chrome or Edge.</span>
           <span slot="not-allowed">Web Serial needs HTTPS: open https://faronov.github.io/zigbee-rs/flasher/.</span>
         </esp-web-install-button>
       </div>
-      <p class="muted" style="font-size:.85rem">ESP Web Tools then asks for the serial port (not for boards with a
+      <p class="muted" id="install-help" style="font-size:.85rem">ESP Web Tools then asks for the serial port (not for boards with a
         detected flash size: it uses the detected port), checks that the chip
         matches the board (a wrong chip is refused before anything is written), writes the images and resets the
         chip. Close any other program that holds the port (Zigbee2MQTT, Home Assistant, a serial monitor) first.
@@ -336,6 +339,23 @@
     return {entry, product: entry.product, release: r.release, r};
   }
 
+  // Install steps and esptool lines of a board without web install: the parts in their write order,
+  // each at its offset; never an erase, never a merged image.
+  function manualInstall(board) {
+    const chip = board.chip || board.chip_family.toLowerCase().replace('-', '');
+    const parts = board.flash.map((role) => board.files.find((f) => f.role === role));
+    const lines = [`esptool --chip ${chip} --port <PORT> read-flash 0 ALL backup.bin   # first: keep it private`,
+      ...parts.map((f) => `esptool --chip ${chip} --port <PORT> write-flash ${hex(f.offset)} ${f.name}`)];
+    const kept = (board.preserved || []).map((p) => `<code>${esc(p.name)}</code> at ${hex(p.offset)} (${esc(p.what)})`).join('; ');
+    return `<div class="danger"><strong>Not installed from this page.</strong> ESP Web Tools can erase the whole chip,
+        which destroys this board's stock firmware and factory data. Download the files (step 2) and install them as
+        below.</div>
+      <ol>${(board.install_steps || []).map((s) => `<li>${esc(s)}</li>`).join('')}</ol>
+      <p class="muted" style="font-size:.85rem;margin-bottom:0">Over USB, one command per part, in this order:</p>
+      <pre>${esc(lines.join('\n'))}</pre>
+      ${kept ? `<p class="muted" style="font-size:.85rem">Left untouched: ${kept}.</p>` : ''}`;
+  }
+
   function render() {
     const {entry, product, release, r} = current();
     $('layout-box').classList.toggle('hidden', !entry.group);
@@ -361,7 +381,11 @@
     const erase = $('erase').checked;
 
     const repo = `https://github.com/${product.repository}`;
+    // Boards the page lists but never installs (release manifest `web_install: false`, e.g. the SONOFF
+    // Dongle Max: ESP Web Tools' "Erase device" would wipe its stock bootloader, table and factory data).
+    const manual = board.web_install === false;
     $('board-info').innerHTML = `
+      ${board.experimental || board.hardware_status ? `<dt>Status</dt><dd>${board.experimental ? '<span class="badge pre" style="margin-left:0">experimental</span> ' : ''}${esc(board.hardware_status)}</dd>` : ''}
       <dt>Chip</dt><dd>${esc(board.chip_family)}, ${esc(board.flash_size)} flash${entry.group ? ' (selected image)' : ''}</dd>
       <dt>Layout</dt><dd><code>${esc(board.layout)}</code>${board.psram ? `, ${esc(board.psram)} PSRAM build` : ''}${esc(featureText(board))}${board.note ? ` · ${esc(board.note)}` : ''}</dd>
       ${board.transport ? `<dt>Host link</dt><dd>${esc(board.transport)}</dd>` : ''}
@@ -378,7 +402,7 @@
       <dt>Changes</dt><dd><a href="${esc(release.url)}">release notes and changelog</a></dd>
       ${fw ? `<dt>FW_* update</dt><dd><a href="${esc(fw.download)}">${esc(fw.file.name)}</a>
         ${fw.signed ? '(signed)' : '<span class="badge pre">unsigned</span> accepted only by development NCP builds; flash over USB instead'}</dd>` : ''}`;
-    const written = new Set(board.flash.map((role) => board.files.find((f) => f.role === role).name));
+    const written = new Set(manual ? [] : board.flash.map((role) => board.files.find((f) => f.role === role).name));
     $('files').innerHTML = board.files.map((f) => `<tr>
         <td>${written.has(f.name) ? '● ' : ''}<a href="${esc(f.download)}">${esc(f.name)}</a></td>
         <td class="mono">${f.offset === undefined ? '' : hex(f.offset)}</td>
@@ -391,11 +415,27 @@
     $('mode-text').innerHTML = (erase ? text.erase : text.keep) + (kept && !erase ? `<p class="muted" style="font-size:.85rem">Kept: ${kept}.</p>` : '');
 
     $('connect-steps').innerHTML = [board.connect, ...(board.connect_steps || [])].filter(Boolean).map((s) => `<li>${esc(s)}</li>`).join('') +
-      '<li>If no port appears or the connection fails: hold BOOT, press and release RESET, release BOOT, then try again.</li>';
-    $('s3-prepare').classList.toggle('hidden', board.chip_family !== 'ESP32-S3');
-    $('console-box').classList.toggle('hidden', product.product !== 'zigbee-rs-hub');
+      (manual ? '' : '<li>If no port appears or the connection fails: hold BOOT, press and release RESET, release BOOT, then try again.</li>');
+    $('s3-prepare').classList.toggle('hidden', manual || board.chip_family !== 'ESP32-S3');
+    $('console-box').classList.toggle('hidden', manual || product.product !== 'zigbee-rs-hub');
+    $('mode-card').classList.toggle('hidden', manual);
+    $('install-box').classList.toggle('hidden', manual);
+    $('install-help').classList.toggle('hidden', manual);
+    $('manual-box').classList.toggle('hidden', !manual);
+    $('install-title').textContent = manual ? '3. Install (not from this page)' : '4. Connect and install';
+    $('manual-box').innerHTML = manual ? manualInstall(board) : '';
 
     const button = $('install');
+    if (manual) {
+      button.removeAttribute('manifest');
+      button.dataset.blocked = 'Not installable from this page';
+      $('install-label').disabled = true;
+      const url = new URL(location.href);
+      url.searchParams.set('board', board.id);
+      url.searchParams.set('version', release.tag);
+      history.replaceState(null, '', url);
+      return;
+    }
     button.setAttribute('manifest', board.manifests[erase ? 'erase' : 'update']);
     button.classList.toggle('erase', erase);
     button.dataset.blocked = blocked || '';
@@ -461,6 +501,11 @@
 
   // Size groups: ESP Web Tools must flash the port that was measured, so its port request returns that port once.
   $('install-label').addEventListener('click', (ev) => {
+    if ($('install').dataset.blocked && !$('install').getAttribute('manifest')) {
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      return;
+    }
     if (!entries.get($('board').value).group) return;
     if ($('install').dataset.blocked || !detection || detection.selftest) {
       ev.preventDefault();
