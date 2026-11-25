@@ -15,6 +15,7 @@ Every image comes from a tagged GitHub release, never from a CI artifact:
 | ESP32-C6 DevKit | ZRHP NCP (USB-Serial-JTAG) | `ncp-v*` | the DevKit's "USB" port |
 | Espressif Thread Border Router board, H2 | ZRHP NCP (UART 921 600, RTS/CTS on R19/R20) | `ncp-v*` | flash through the H2's own port USB1 |
 | Espressif Thread Border Router board, S3 (4 MB or 8 MB, detected) | `tbr-hub`: A/B production layout on 8 MB, dev layout without OTA on 4 MB | `hub-v*` (zigbee-rs-hub) | one entry; the image follows the chip's flash size |
+| Espressif Thread Border Router board, S3 (8 MB, detected): **Developer edition** | `tbr-hub` with feature `dev` (the web UI's developer tools always on), 8 MB layout | `hub-v*` (once built) | its own entry, labelled; same layout as the 8 MB image, so switching keeps the data |
 | SONOFF Dongle Max (experimental) | `zrh-donglem`: the hub on SONOFF's EmberZNet NCP, in `ota_1` of SONOFF's partition table | `hub-v*` (since 0.3.0) | **listed only, no install button** (below) |
 
 There is no ESP32-C5 NCP image (the C5 port has router and sensor examples
@@ -249,7 +250,9 @@ time) for ESP Web Tools. A board with `"web_install": false` (default
 parts in their USB write order, `install_steps` the instructions the page
 shows, `experimental` and `hardware_status` its state, and
 `stock_partition_table` (offset, size, SHA-256) the table the parts are
-for.
+for. `edition: "devtools"` marks a developer edition: it names its own
+`size_group`, so it is a separate, labelled entry and never joins (or
+replaces) the standard images' group.
 
 ## How the site gets the images
 

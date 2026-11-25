@@ -385,6 +385,8 @@
     // Dongle Max: ESP Web Tools' "Erase device" would wipe its stock bootloader, table and factory data).
     const manual = board.web_install === false;
     $('board-info').innerHTML = `
+      ${board.edition === 'devtools' ? `<dt>Edition</dt><dd><span class="badge pre" style="margin-left:0">Developer edition</span>
+        developer tools always on, for developers; everyone else takes the standard entry</dd>` : ''}
       ${board.experimental || board.hardware_status ? `<dt>Status</dt><dd>${board.experimental ? '<span class="badge pre" style="margin-left:0">experimental</span> ' : ''}${esc(board.hardware_status)}</dd>` : ''}
       <dt>Chip</dt><dd>${esc(board.chip_family)}, ${esc(board.flash_size)} flash${entry.group ? ' (selected image)' : ''}</dd>
       <dt>Layout</dt><dd><code>${esc(board.layout)}</code>${board.psram ? `, ${esc(board.psram)} PSRAM build` : ''}${esc(featureText(board))}${board.note ? ` · ${esc(board.note)}` : ''}</dd>

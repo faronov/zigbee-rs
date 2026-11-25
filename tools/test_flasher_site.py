@@ -234,6 +234,26 @@ class FlasherSiteTests(unittest.TestCase):
         SITE.mark_size_groups(twins, "hub")
         self.assertNotIn("size_group", twins[0])
 
+    def test_developer_edition_is_its_own_group(self):
+        # The hub's 8 MB developer edition names its group itself: it must not join (and so break) the
+        # standard flash/PSRAM group, whose 8 MB variants it duplicates.
+        def board(bid, size, psram, match, **extra):
+            return {"id": bid, "title": f"Thread BR board, S3 ({size}): hub", "product": "zigbee-rs-hub",
+                    "firmware": "tbr-hub", "chip_family": "ESP32-S3", "flash_size": size, "psram": psram,
+                    "match": {"embedded_psram_mb": match}, **extra}
+        dev = {"edition": "devtools", "size_group": "thread-br-s3-hub-devtools",
+               "size_group_title": "Thread BR board, S3 (8 MB, detected): hub, Developer edition (devtools)"}
+        boards = [board("thread-br-s3-hub-8mb", "8MB", "quad", [0, 2, 4]),
+                  board("thread-br-s3-hub-8mb-opi", "8MB", "octal", [8, 16]),
+                  board("thread-br-s3-hub-4mb-dev", "4MB", "quad", [0, 2, 4]),
+                  board("thread-br-s3-hub-4mb-dev-opi", "4MB", "octal", [8, 16]),
+                  board("thread-br-s3-hub-8mb-devtools", "8MB", "quad", [0, 2, 4], **dev),
+                  board("thread-br-s3-hub-8mb-devtools-opi", "8MB", "octal", [8, 16], **dev)]
+        SITE.mark_size_groups(boards, "zigbee-rs hub")
+        self.assertEqual([b["size_group"] for b in boards], ["thread-br-s3-hub"] * 4 + ["thread-br-s3-hub-devtools"] * 2)
+        self.assertEqual(boards[4]["size_group_title"], dev["size_group_title"])
+        self.assertNotIn("Developer", boards[0]["size_group_title"])
+
     def test_fingerprint_ignores_order_and_tracks_content(self):
         a = [("o/r", "ncp-v0.1.0", "1" * 64), ("o/h", "hub-v0.1.0", "2" * 64)]
         self.assertEqual(SITE.fingerprint(a), SITE.fingerprint(list(reversed(a))))
