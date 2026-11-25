@@ -61,7 +61,7 @@ pub type GpProxy = Proxy<GP_PROXY_TABLE_ENTRIES, GP_TX_QUEUE_DEPTH>;
 
 /// Sink Table capacity of a combo (`green-power-sink`): 8, or 16 with `ncp-capacity`.
 #[cfg(feature = "green-power-sink")]
-pub const GP_SINK_TABLE_ENTRIES: usize = crate::ncp_capacity(8, 16);
+pub const GP_SINK_TABLE_ENTRIES: usize = crate::ncp_tier(8, 16, 8);
 /// Queued sink transmissions (GP Pairing, Proxy Commissioning Mode, GP
 /// Response, responses, alias `Device_annce`).
 #[cfg(feature = "green-power-sink")]

@@ -21211,3 +21211,17 @@ mod gp_sink_keys;
 ))]
 #[path = "green_power/key_provisioning_tests.rs"]
 mod gp_key_provisioning_tests;
+
+/// Table capacity per runtime tier: `default`, `ncp` with `ncp-capacity`
+/// (also `ncp-capacity-compact`, whose runtime tables are the NCP's) and
+/// `tiny` with `ncp-capacity-tiny` (64 KiB parts). `compact` wins when both
+/// tiers are enabled (`--all-features` test builds); products enable one.
+/// Only evaluated in constant contexts (declared last, like the modules
+/// above).
+pub(crate) const fn ncp_tier(default: usize, ncp: usize, tiny: usize) -> usize {
+    if cfg!(feature = "ncp-capacity-tiny") && !cfg!(feature = "ncp-capacity-compact") {
+        tiny
+    } else {
+        ncp_capacity(default, ncp)
+    }
+}

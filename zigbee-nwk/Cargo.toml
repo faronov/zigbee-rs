@@ -31,6 +31,11 @@ adaptive-indirect = ["router"]
 # children, 64 source routes, 64 replay floors) for parts with less RAM.
 # Off by default: images without it are unchanged.
 ncp-capacity-compact = ["ncp-capacity"]
+# Tiny coordinator NCP tables for 64 KiB-RAM parts (EFR32MG21 F768/F512,
+# TLSR8258): address map 64, 32 neighbors with 16 children, 32 source
+# routes, 64 replay floors, 8 indirect frames. Exclusive with
+# `ncp-capacity-compact`. Off by default: images without it are unchanged.
+ncp-capacity-tiny = ["ncp-capacity"]
 # Network co-processor: record neighbour Leave indications (with the rejoin
 # bit) and aged-out children for the host (`host_events`). Off by default:
 # images without it are unchanged.

@@ -21,7 +21,7 @@ pub const MAX_APPLICATION_KEY_REQUESTS: usize = 8;
 #[cfg(not(feature = "ncp-capacity"))]
 pub const MAX_PENDING_UNKNOWN_REMOVALS: usize = MAX_TRUST_CENTER_DEVICES;
 #[cfg(feature = "ncp-capacity")]
-pub const MAX_PENDING_UNKNOWN_REMOVALS: usize = 32;
+pub const MAX_PENDING_UNKNOWN_REMOVALS: usize = crate::ncp_tier(32, 32, 8);
 const _: () = assert!(MAX_PENDING_UNKNOWN_REMOVALS <= u8::MAX as usize);
 const _: () = assert!(MAX_APPLICATION_KEY_REQUESTS <= u8::MAX as usize);
 /// Trailer the current record version appends to the version-4 encoding:

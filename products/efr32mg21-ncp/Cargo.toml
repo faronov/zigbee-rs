@@ -1,0 +1,40 @@
+[package]
+name = "efr32mg21-ncp-product"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "zigbee-rs ZRHP network co-processor product for 64 KiB EFR32MG21 modules (Tuya ZS3L, F768; F512 layout)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+# Keep this product independently testable without changing the repository
+# workspace or its lockfile.
+[workspace]
+
+[features]
+default = ["flash-768k", "uart-gateway"]
+# Fitted flash; exactly one. The NV journals sit at the top of it, so the
+# two layouts differ only in the application window.
+flash-768k = []
+flash-512k = []
+# Host-UART route of the module (`tuya-zs3l`); exactly one.
+uart-gateway = ["tuya-zs3l/uart-gateway"]
+uart-pa05-pa06 = ["tuya-zs3l/uart-pa05-pa06"]
+
+[dependencies]
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg21", "se-trng", "usart0-host-small"] }
+embedded-storage = "0.3"
+ncp-coordinator-app = { path = "../../apps/ncp-coordinator", features = ["tiny"] }
+router-app = { path = "../../apps/router", default-features = false, features = [
+    "centralized-tclk",
+    "global-aps-counter",
+    "ncp-capacity-tiny",
+] }
+tuya-zs3l = { path = "../../boards/tuya-zs3l", default-features = false, features = ["host-uart"] }
+zigbee-runtime = { path = "../../zigbee-runtime", default-features = false, features = [
+    "centralized-tclk",
+    "trust-center",
+    "global-aps-counter",
+    "host-passthrough",
+    "ncp-capacity-tiny",
+] }

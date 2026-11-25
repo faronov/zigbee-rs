@@ -23,6 +23,8 @@ global-aps-counter = ["trust-center", "zigbee-runtime/global-aps-counter"]
 ncp-capacity = ["global-aps-counter", "zigbee-runtime/ncp-capacity"]
 # Compact NCP tables (zigbee-runtime `ncp-capacity-compact`).
 ncp-capacity-compact = ["ncp-capacity", "zigbee-runtime/ncp-capacity-compact"]
+# Tiny NCP tables for 64 KiB parts (zigbee-runtime `ncp-capacity-tiny`).
+ncp-capacity-tiny = ["ncp-capacity", "zigbee-runtime/ncp-capacity-tiny"]
 # Maintenance rejoin requests through `RouterObserver::take_rejoin_request`.
 # Off by default so products that never request one carry no request path.
 rejoin-request = []

@@ -9,7 +9,7 @@ use zigbee_types::ShortAddress;
 use crate::IndirectFrameKind;
 
 #[cfg(feature = "router")]
-pub const MAX_INDIRECT: usize = crate::ncp_capacity(8, 16);
+pub const MAX_INDIRECT: usize = crate::ncp_capacity_tier(8, 16, 16, 8);
 #[cfg(not(feature = "router"))]
 pub const MAX_INDIRECT: usize = 0;
 

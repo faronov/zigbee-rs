@@ -62,9 +62,9 @@ use crate::tables::{device_record, group_record};
 
 /// NCP children staged by a restore; more are `CHILD_DEMOTED` (they
 /// rejoin).
-pub const MAX_STAGED_CHILDREN: usize = 64;
+pub const MAX_STAGED_CHILDREN: usize = crate::capacity_tier(64, 64, 32);
 /// Device link keys staged by a restore; more are `HOST_BACKED`.
-pub const MAX_STAGED_KEYS: usize = 64;
+pub const MAX_STAGED_KEYS: usize = crate::capacity_tier(64, 64, 48);
 /// APS groups staged by a restore (also bounded by the port's
 /// `group_capacity`); more are `IGNORED`.
 pub const MAX_STAGED_GROUPS: usize = MAX_GROUPS;

@@ -2403,7 +2403,12 @@ impl<M: MacDriver> NwkLayer<M> {
 }
 
 /// Coordinator NCP table sizes (`ncp-capacity`, ZRHP spec 8.2/8.9).
-#[cfg(all(test, feature = "ncp-capacity", not(feature = "ncp-capacity-compact")))]
+#[cfg(all(
+    test,
+    feature = "ncp-capacity",
+    not(feature = "ncp-capacity-compact"),
+    not(feature = "ncp-capacity-tiny")
+))]
 mod ncp_capacity_tests {
     use super::*;
     use crate::neighbor::{NeighborEntry, NeighborTable, Relationship};
@@ -2482,13 +2487,23 @@ pub(crate) const fn ncp_capacity(default: usize, ncp: usize) -> usize {
 /// the line numbers above, which panic locations embed, unchanged).
 pub mod host_events;
 
-/// Three-tier table capacity: `default`, `ncp` with `ncp-capacity`, and
-/// `compact` with `ncp-capacity-compact` (a coordinator NCP on a part with
-/// less RAM, e.g. the CC2652P7's 144 KiB). Only evaluated in constant
-/// contexts (declared last: keeps the line numbers above unchanged).
-pub(crate) const fn ncp_capacity_tier(default: usize, ncp: usize, compact: usize) -> usize {
+/// Table capacity per tier: `default`, `ncp` with `ncp-capacity`, `compact`
+/// with `ncp-capacity-compact` (a coordinator NCP on a part with less RAM,
+/// e.g. the CC2652P7's 144 KiB) and `tiny` with `ncp-capacity-tiny` (64 KiB
+/// parts: EFR32MG21 F768/F512, TLSR8258). `compact` wins when both are
+/// enabled (`--all-features` test builds); products enable one. Only
+/// evaluated in constant contexts (declared last: keeps the line numbers
+/// above unchanged).
+pub(crate) const fn ncp_capacity_tier(
+    default: usize,
+    ncp: usize,
+    compact: usize,
+    tiny: usize,
+) -> usize {
     if cfg!(feature = "ncp-capacity-compact") {
         compact
+    } else if cfg!(feature = "ncp-capacity-tiny") {
+        tiny
     } else {
         ncp_capacity(default, ncp)
     }
@@ -2532,5 +2547,66 @@ mod ncp_capacity_compact_tests {
         }
         assert_eq!(table.len(), neighbor::MAX_NEIGHBORS);
         assert_eq!(table.children().count(), 32);
+    }
+}
+
+/// Tiny coordinator NCP table sizes (`ncp-capacity-tiny`, 64 KiB parts).
+#[cfg(all(
+    test,
+    feature = "ncp-capacity-tiny",
+    not(feature = "ncp-capacity-compact")
+))]
+mod ncp_capacity_tiny_tests {
+    use super::*;
+    use crate::neighbor::{NeighborEntry, NeighborTable, Relationship};
+
+    #[test]
+    fn tables_have_the_tiny_capacities() {
+        assert_eq!(neighbor::MAX_NEIGHBORS, 32);
+        assert_eq!(address_map::MAX_ADDRESS_MAP_ENTRIES, 64);
+        assert_eq!(routing::MAX_SOURCE_ROUTES, 32);
+        assert_eq!(indirect::MAX_INDIRECT, 8);
+        #[cfg(feature = "adaptive-indirect")]
+        assert_eq!(poll_estimate::MAX_TRACKED, 16);
+        assert_eq!(security::MAX_FRAME_COUNTER_ENTRIES, 64);
+        // 16 children plus 16 router neighbors; every neighbor (and a
+        // margin) has an NWK replay floor that is never displaced.
+        assert_eq!(nib::Nib::new().max_children, 16);
+        const { assert!(neighbor::MAX_NEIGHBORS >= 16 + 16) };
+        const { assert!(security::MAX_FRAME_COUNTER_ENTRIES > neighbor::MAX_NEIGHBORS) };
+    }
+
+    #[test]
+    fn the_neighbor_table_holds_16_children_and_16_routers() {
+        let mut table = NeighborTable::new();
+        for index in 0..neighbor::MAX_NEIGHBORS as u16 {
+            let [lo, hi] = index.to_le_bytes();
+            let mut entry = NeighborEntry::new_from_annce(
+                ShortAddress(0x1000 + index),
+                [lo, hi, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A],
+            );
+            entry.relationship = if index < 16 {
+                Relationship::Child
+            } else {
+                Relationship::Sibling
+            };
+            assert!(table.add_or_update(entry).is_ok(), "slot {index}");
+        }
+        assert_eq!(table.len(), neighbor::MAX_NEIGHBORS);
+        assert_eq!(table.children().count(), 16);
+    }
+
+    #[test]
+    fn the_source_route_cache_keeps_32_destinations() {
+        let mut table = routing::SourceRouteTable::new();
+        for index in 0..routing::MAX_SOURCE_ROUTES as u16 {
+            table.insert(ShortAddress(0x2000 + index), &[ShortAddress(index + 1)]);
+        }
+        for index in 0..routing::MAX_SOURCE_ROUTES as u16 {
+            assert_eq!(
+                table.lookup(ShortAddress(0x2000 + index)),
+                Some(&[ShortAddress(index + 1)][..])
+            );
+        }
     }
 }

@@ -7,7 +7,9 @@ The repository supports these products:
 - EFR32MG21 BRD4181A development sensor (Series 2, builds; no hardware run);
 - Home Assistant Connect ZBT-1 always-on End Device (EFR32MG21, lab-tested);
 - EFR32MG24 ZRHP NCP and Router for an RF-BM-MG24B1 dev board and the
-  SONOFF Dongle-M (Series 2, builds only; radio tables not captured).
+  SONOFF Dongle-M (Series 2, builds only; radio tables not captured);
+- EFR32MG21 tiny ZRHP NCP for the Tuya ZS3L (64 KiB; a feasibility
+  composition that does **not** link: its static RAM exceeds the SRAM).
 
 All use the shared `SensorApp`; their boards, products, clocks, storage, and
 power behavior are intentionally separate. Series 2 chips share one HAL
@@ -514,6 +516,24 @@ the ZBT-1 Router `0x794A` and the end devices `0xEE0F`, `0x9254` and
 
 Not run on hardware: the MG22 always-on ED, every BRD4181A image (no board
 in the lab), and the MG21 router on BRD4181A.
+
+### Tuya ZS3L tiny NCP (64 KiB, does not fit)
+
+`boards/tuya-zs3l` (EFR32MG21A020F768IM32: gateway UART route PD00/PD01 or
+the PA05/PA06 pads, PC01 bootloader entry), `products/efr32mg21-ncp` (F768
+and F512 maps: Gecko bootloader `0x0..0x4000` kept, 96 KiB of NV journals
+at the top of flash) and `examples/efr32mg21-ncp` compose the ZRHP NCP at
+the tiny capacity tier (`ncp-coordinator-app/tiny`: 48 Trust Center
+devices, 16 children, 4-frame link window). The image needs 78,748 B of
+static RAM, so the real link fails (`.bss` 13,412 B over the 64 KiB SRAM;
+on F512 the 450,744 B image also overflows the 400 KiB application
+window). `EFR32MG21_NCP_MEASURE=1` links a measurement-only map that
+`tools/verify-layout.py` rejects. The opt-in `efr32s2-hal/se-trng` and
+`zigbee-mac/efr32mg21-se-trng` give xG21 an entropy source (the Secure
+Engine TRNG, build-only); without them MG21 images have none.
+`efr32s2-hal/usart0-host-small` selects 4 KiB / 1 KiB host-link rings.
+Measurements, the reduction roadmap and the update path:
+[Tiny NCP tier](../advanced/tiny-ncp.md).
 
 ### Hardware crypto (Series 2)
 

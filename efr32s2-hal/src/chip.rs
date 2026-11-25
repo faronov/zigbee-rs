@@ -273,3 +273,11 @@ mod tests {
         assert_eq!(clken1, 0x0002_9FFF);
     }
 }
+
+/// xG21 has no CMU bus-clock gates (`clock::enable_bus_clock` is a no-op
+/// there); the Secure Engine mailbox keeps the xG24 name so `se` builds on
+/// both dies (`se-trng`; appended: keeps the line numbers above).
+#[cfg(feature = "efr32mg21")]
+impl BusClock {
+    pub const SEMAILBOXHOST: Self = Self::clken1(10);
+}

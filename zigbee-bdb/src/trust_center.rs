@@ -17,7 +17,7 @@ use zigbee_types::{IeeeAddress, ShortAddress};
 #[cfg(not(feature = "ncp-capacity"))]
 pub const MAX_TRUST_CENTER_DEVICES: usize = 32;
 #[cfg(feature = "ncp-capacity")]
-pub const MAX_TRUST_CENTER_DEVICES: usize = if COMPACT_TABLES { 128 } else { 256 };
+pub const MAX_TRUST_CENTER_DEVICES: usize = ncp_trust_center_devices();
 /// One pending-replacement bit per device slot.
 const PENDING_MASK_WORDS: usize = MAX_TRUST_CENTER_DEVICES.div_ceil(u32::BITS as usize);
 
@@ -1570,7 +1570,12 @@ mod tests {
 }
 
 /// Coordinator NCP Trust Center table (`ncp-capacity`, ZRHP spec 8.9).
-#[cfg(all(test, feature = "ncp-capacity", not(feature = "ncp-capacity-compact")))]
+#[cfg(all(
+    test,
+    feature = "ncp-capacity",
+    not(feature = "ncp-capacity-compact"),
+    not(feature = "ncp-capacity-tiny")
+))]
 mod ncp_capacity_tests {
     use super::*;
 
@@ -1678,6 +1683,20 @@ mod ncp_capacity_compact_tests {
 /// the line numbers above unchanged).
 #[cfg(feature = "ncp-capacity")]
 const COMPACT_TABLES: bool = cfg!(feature = "ncp-capacity-compact");
+
+/// Trust Center devices of the coordinator NCP: 256 (`ncp-capacity`), 128
+/// (`ncp-capacity-compact`) or 48 (`ncp-capacity-tiny`, 64 KiB parts; one
+/// per APS link-key slot). `compact` wins when both tiers are enabled.
+#[cfg(feature = "ncp-capacity")]
+const fn ncp_trust_center_devices() -> usize {
+    if COMPACT_TABLES {
+        128
+    } else if cfg!(feature = "ncp-capacity-tiny") {
+        48
+    } else {
+        256
+    }
+}
 
 /// Verify-Key through the platform AES provider (the MAC's engine).
 #[cfg(test)]
@@ -1794,5 +1813,62 @@ mod verify_key_provider_tests {
             Err(TrustCenterError::CipherFailure)
         );
         assert!(table.device(&DEVICE).is_none());
+    }
+}
+
+/// Tiny coordinator NCP Trust Center table (`ncp-capacity-tiny`).
+#[cfg(all(
+    test,
+    feature = "ncp-capacity-tiny",
+    not(feature = "ncp-capacity-compact")
+))]
+mod ncp_capacity_tiny_tests {
+    use super::*;
+
+    fn ieee(index: usize) -> IeeeAddress {
+        let [lo, hi] = (index as u16).to_le_bytes();
+        [lo, hi, 0x4D, 0x4D, 0x4D, 0x4D, 0x4D, 0x4D]
+    }
+
+    fn joined(index: usize) -> TrustCenterDevice {
+        TrustCenterDevice {
+            ieee_address: ieee(index),
+            parent_address: [0x11; 8],
+            short_address: ShortAddress(0x1000 + index as u16),
+            link_key: [index as u8; 16],
+            key_origin: TrustCenterKeyOrigin::GeneratedUnique,
+            key_attributes: TrustCenterKeyAttributes::Verified,
+            join_timeout_remaining_secs: 0,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn the_table_holds_48_devices_and_tracks_pending_keys_in_both_words() {
+        assert_eq!(MAX_TRUST_CENTER_DEVICES, 48);
+        assert_eq!(
+            MAX_TRUST_CENTER_DEVICES,
+            zigbee_aps::security::MAX_KEY_TABLE_ENTRIES
+        );
+        let mut table = TrustCenterTable::new();
+        for index in 0..MAX_TRUST_CENTER_DEVICES {
+            table.restore_device(joined(index)).unwrap();
+        }
+        assert_eq!(
+            table.restore_device(joined(MAX_TRUST_CENTER_DEVICES)),
+            Err(TrustCenterError::DeviceTableFull)
+        );
+        for index in [0, 31, 32, 47] {
+            table
+                .install_generated_trust_center_link_key(ieee(index), [0xA7; 16], 2)
+                .unwrap();
+        }
+        for index in 0..MAX_TRUST_CENTER_DEVICES {
+            assert_eq!(
+                table.has_pending_link_key_for(&ieee(index)),
+                matches!(index, 0 | 31 | 32 | 47),
+                "slot {index}"
+            );
+        }
     }
 }

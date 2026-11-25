@@ -53,7 +53,7 @@ pub mod power;
 pub mod radio;
 pub mod reset;
 pub mod rtcc;
-#[cfg(feature = "efr32mg24")]
+#[cfg(any(feature = "efr32mg24", feature = "se-trng"))]
 pub mod se;
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
@@ -62,3 +62,7 @@ pub mod trng;
 pub mod usart;
 pub mod vectors;
 pub mod watchdog;
+
+// Opt-in features of one die (appended: keeps the line numbers above).
+#[cfg(all(feature = "se-trng", not(feature = "efr32mg21")))]
+compile_error!("efr32s2-hal: `se-trng` is the xG21 opt-in; xG24 always builds `se`");

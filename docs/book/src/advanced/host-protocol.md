@@ -2297,6 +2297,16 @@ endpoint queues; journal formats stay those of `ncp-capacity`. The
 negotiated capacities (`SYS_NEGOTIATE`) report the smaller sizes. See the
 [CC26x2 guide](../platform-guides/cc26x2.md).
 
+**Tiny tier (`ncp-capacity-tiny`, feasibility only).** For 64 KiB parts
+(EFR32MG21 F768/F512, TLSR8258) `ncp-coordinator-app/tiny` selects 48
+Trust Center devices and link keys, a 64-entry address map, 32 neighbors
+with 16 children, 32 source routes, 64 replay floors, a 4-frame link window
+(the spec minimum) and 1 KiB endpoint queues. Measured: the NCP's static
+RAM is 78,748 B on the EFR32MG21 (69,108 B with every parameter at its
+floor), more than the part's 64 KiB before any stack, so no 64 KiB NCP
+image links. See [Tiny NCP tier](tiny-ncp.md) for the measurements, the
+reduction roadmap and the evaluation of paging (8.1, 8.6) for these parts.
+
 The streamed Trust Center journal (`trust_center_stream`) writes every chunk
 prefix first and the commit marker of the last chunk last; a snapshot is
 current only when all chunks are contiguous, agree on generation/count/

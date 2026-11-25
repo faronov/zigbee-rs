@@ -1190,9 +1190,12 @@ mod tests {
 
     #[test]
     fn a_full_256_device_snapshot_streams_across_five_chunks_and_round_trips() {
-        // 256 devices in five chunks; `ncp-capacity-compact`: 128 in three.
+        // 256 devices in five chunks; `ncp-capacity-compact`: 128 in three;
+        // `ncp-capacity-tiny`: 48 in one.
         let (devices, chunks) = if cfg!(feature = "ncp-capacity-compact") {
             (128, 3)
+        } else if cfg!(feature = "ncp-capacity-tiny") {
+            (48, 1)
         } else {
             (256, 5)
         };
@@ -1225,6 +1228,9 @@ mod tests {
         );
     }
 
+    // Multi-chunk snapshots: the largest `ncp-capacity-tiny` state (48
+    // devices) fits one chunk slot, so the tiny tier never streams more.
+    #[cfg(any(not(feature = "ncp-capacity-tiny"), feature = "ncp-capacity-compact"))]
     #[test]
     fn snapshots_append_then_roll_over_keeping_the_previous_sector_until_commit() {
         let mut journal = journal(MockFlash::new());
@@ -1283,6 +1289,9 @@ mod tests {
         }
     }
 
+    // Multi-chunk snapshots: the largest `ncp-capacity-tiny` state (48
+    // devices) fits one chunk slot, so the tiny tier never streams more.
+    #[cfg(any(not(feature = "ncp-capacity-tiny"), feature = "ncp-capacity-compact"))]
     #[test]
     fn a_missing_commit_marker_or_bad_crc_falls_back_to_the_previous_snapshot() {
         let older = state(MAX_TRUST_CENTER_DEVICES * 200 / 256, 1, false);
@@ -1408,6 +1417,9 @@ mod tests {
         assert_eq!(journal.load(), Ok(Some(last)));
     }
 
+    // Multi-chunk snapshots: the largest `ncp-capacity-tiny` state (48
+    // devices) fits one chunk slot, so the tiny tier never streams more.
+    #[cfg(any(not(feature = "ncp-capacity-tiny"), feature = "ncp-capacity-compact"))]
     #[test]
     fn a_single_slot_record_migrates_and_the_single_slot_journal_refuses_large_states() {
         // The previous NCP layout: the 4 KiB single-slot journal at the
@@ -1450,5 +1462,41 @@ mod tests {
         let data: Vec<u8> = (0..5000u32).map(|value| value as u8).collect();
         let crc = crc32_update(crc32_update(CRC_INIT, &data[..1234]), &data[1234..]);
         assert_eq!(!crc, crate::security_journal::crc32(&data));
+    }
+
+    /// `ncp-capacity-tiny`: the largest state (48 devices, every bounded
+    /// table at capacity) fits one chunk slot and one record of the
+    /// previous single-slot layout, migrates from it, and a torn newer
+    /// snapshot falls back to the older one.
+    #[cfg(all(feature = "ncp-capacity-tiny", not(feature = "ncp-capacity-compact")))]
+    #[test]
+    fn the_largest_tiny_state_fits_one_chunk_and_one_legacy_slot() {
+        assert_eq!(TRUST_CENTER_STREAM_MAX_CHUNKS, 1);
+        const { assert!(TRUST_CENTER_JOURNAL_SECTOR_SIZE == SLOT) };
+        let older = state(MAX_TRUST_CENTER_DEVICES, 5, true);
+        let mut legacy = TrustCenterDeviceJournal::new(MockFlash::new(), 0, SECTOR as u32);
+        legacy.store(&older).unwrap();
+        let mut journal = journal(legacy.into_storage());
+        assert_eq!(journal.load(), Ok(Some(older.clone())));
+        let newer = state(MAX_TRUST_CENTER_DEVICES, 6, true);
+        journal.store(&newer).unwrap();
+        let located = journal.current.unwrap();
+        assert_eq!((located.slots, located.generation), (1, 1));
+        let stored = journal.storage().bytes.clone();
+        assert_eq!(
+            journal_load(MockFlash {
+                bytes: stored.clone(),
+                ..MockFlash::new()
+            }),
+            Some(newer)
+        );
+        // The newer snapshot without its commit marker: the older one wins.
+        let mut torn = MockFlash {
+            bytes: stored,
+            ..MockFlash::new()
+        };
+        let start = located.sector * SECTOR + located.slot * SLOT;
+        torn.bytes[start + COMMIT_OFFSET..start + COMMIT_OFFSET + 4].fill(0xFF);
+        assert_eq!(journal_load(torn), Some(older));
     }
 }
