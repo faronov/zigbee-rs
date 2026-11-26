@@ -429,8 +429,10 @@ jobs:
             workspace: efr32s2-hal
             features: "efr32mg22,isr-ack"
           # EFR32MG24: SYSRTC time base, xG24 HFXO/CMU/GPIO/USART maps, the
-          # USART0 host rings, the SE mailbox TRNG framing and the explicit
-          # `Unsupported` radio (no captured xG24 tables yet).
+          # USART0 host rings, the SE mailbox TRNG framing, the xG24 radio
+          # tables captured on the BRD4187A (20 dBm PA; 39 MHz silicon and
+          # 38.4 MHz GSDK-derived channel words) and the explicit
+          # `Unsupported` 10 dBm PA radio.
           - name: EFR32 Series 2 HAL (MG24 10 dBm, 39 MHz, host UART)
             manifest: efr32s2-hal/Cargo.toml
             workspace: efr32s2-hal
@@ -439,6 +441,14 @@ jobs:
             manifest: efr32s2-hal/Cargo.toml
             workspace: efr32s2-hal
             features: "efr32mg24-pa20,isr-ack"
+          - name: EFR32 Series 2 HAL (MG24 20 dBm, 39 MHz)
+            manifest: efr32s2-hal/Cargo.toml
+            workspace: efr32s2-hal
+            features: "efr32mg24-pa20,hfxo-39mhz"
+          - name: BRD4187 (xG24 20 dBm) board on a WSTK
+            manifest: boards/efr32mg24-brd4187/Cargo.toml
+            workspace: boards/efr32mg24-brd4187
+            features: "host-uart"
           - name: RF-BM-MG24B1 board
             manifest: boards/rf-bm-mg24b1/Cargo.toml
             workspace: boards/rf-bm-mg24b1
@@ -459,6 +469,10 @@ jobs:
             manifest: products/efr32mg24/Cargo.toml
             workspace: products/efr32mg24
             features: "rf-bm-mg24b1,router"
+          - name: EFR32MG24 product (BRD4187 on a WSTK, Router)
+            manifest: products/efr32mg24/Cargo.toml
+            workspace: products/efr32mg24
+            features: "wstk-brd4187,router"
           # CC26x2/CC13x2: CCFG builder, identity decode, RF core command
           # layouts, PA tables and override lists, flash/UART/RTC logic.
           - name: CC26x2 HAL (CC2652P)
@@ -659,6 +673,7 @@ jobs:
           cargo fmt --manifest-path products/ha-connect-zbt1/Cargo.toml -- --check
           cargo fmt --manifest-path boards/rf-bm-mg24b1/Cargo.toml -- --check
           cargo fmt --manifest-path boards/sonoff-dongle-m/Cargo.toml -- --check
+          cargo fmt --manifest-path boards/efr32mg24-brd4187/Cargo.toml -- --check
           cargo fmt --manifest-path products/efr32mg24/Cargo.toml -- --check
           cargo fmt --manifest-path products/phy62x2-evk/Cargo.toml -- --check
           cargo fmt --manifest-path examples/nrf52840-router/Cargo.toml -- --check
@@ -3039,7 +3054,7 @@ jobs:
   # radio tables are not captured, so both images halt at radio init on
   # hardware until they are.
   build-efr32mg24:
-    name: Build EFR32MG24 ZRHP NCP and Router (RF-BM-MG24B1, Dongle-M)
+    name: Build EFR32MG24 ZRHP NCP and Router (RF-BM-MG24B1, Dongle-M, BRD4187)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -3064,6 +3079,12 @@ jobs:
                 --features sonoff-dongle-m --target-dir target/dongle-m
             )
           done
+          # The radio lab board (the only MG24 the xG24 radio ran on).
+          (
+            cd examples/efr32mg24-router
+            cargo build --release --locked --no-default-features \
+              --features wstk-brd4187 --target-dir target/brd4187
+          )
       - name: Clippy EFR32MG24 compositions
         run: |
           for example in ncp router; do
@@ -3075,6 +3096,12 @@ jobs:
                 --target-dir target/dongle-m -- -D warnings
             )
           done
+          (
+            cd examples/efr32mg24-router
+            cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+              --no-default-features --features wstk-brd4187 \
+              --target-dir target/brd4187 -- -D warnings
+          )
       - name: Build and lint the RF-BM-MG24B1 lab gate (clocks, SYSRTC, UART, TRNG)
         working-directory: tools/efr32s2-lab
         run: |
@@ -3083,18 +3110,28 @@ jobs:
           cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
             --no-default-features --features rfbm --bin s2-mg24-hello \
             --target-dir target/rfbm -- -D warnings
+      - name: Build and lint the BRD4187 radio console (xG24 lab gate)
+        working-directory: tools/efr32s2-lab
+        run: |
+          cargo build --release --locked --no-default-features --features brd4187 \
+            --bin s2-mg24-air --target-dir target/brd4187
+          cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+            --no-default-features --features brd4187 --bin s2-mg24-air \
+            --target-dir target/brd4187 -- -D warnings
       - name: Layout gate, AES and SE policy symbols, GBL packaging, size report
         run: |
           OUT=target/efr32mg24
           mkdir -p "$OUT"
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           for example in ncp router; do
-            for board in rf-bm-mg24b1 sonoff-dongle-m; do
-              if [ "$board" = rf-bm-mg24b1 ]; then
-                DIR="examples/efr32mg24-$example/target/thumbv8m.main-none-eabihf/release"
-              else
-                DIR="examples/efr32mg24-$example/target/dongle-m/thumbv8m.main-none-eabihf/release"
-              fi
+            BOARDS=(rf-bm-mg24b1 sonoff-dongle-m)
+            if [ "$example" = router ]; then BOARDS+=(wstk-brd4187); fi
+            for board in "${BOARDS[@]}"; do
+              case "$board" in
+                rf-bm-mg24b1) DIR="examples/efr32mg24-$example/target/thumbv8m.main-none-eabihf/release" ;;
+                sonoff-dongle-m) DIR="examples/efr32mg24-$example/target/dongle-m/thumbv8m.main-none-eabihf/release" ;;
+                wstk-brd4187) DIR="examples/efr32mg24-$example/target/brd4187/thumbv8m.main-none-eabihf/release" ;;
+              esac
               ELF="$DIR/efr32mg24-$example"
               FLAGS=()
               if [ "$example" = ncp ]; then FLAGS=(--ncp); fi
