@@ -1,6 +1,7 @@
 //! zigbee-rs ZRHP v1 network co-processor for EFR32MG24 boards
-//! (composition root): the RF-BM-MG24B1 dev board (default) or the SONOFF
-//! Dongle-M (`--features sonoff-dongle-m`).
+//! (composition root): the RF-BM-MG24B1 dev board (default), the SONOFF
+//! Dongle-M (`--features sonoff-dongle-m`) or a BRD4187 radio board on a
+//! BRD4001A WSTK (`--features wstk-brd4187`, host link on the WSTK VCOM).
 //!
 //! Brings up the HFXO, the SYSRTC time base and the host USART
 //! (`products/efr32mg24` transport policy), the radio as a parent MAC
@@ -151,6 +152,7 @@ fn start() -> Started {
         rtcc,
         wdog: _,
         flash,
+        ..
     } = BoardResources::take().unwrap_or_else(|| halt());
     // SAFETY: called once before anything logs.
     unsafe { log::set_logger_racy(&LOGGER) }.ok();
@@ -158,6 +160,10 @@ fn start() -> Started {
     if product::board::init_clocks(clocks).is_err() {
         halt()
     }
+    // The TIMER0 time base must run before anything reads it (the session
+    // cookie below); an unclocked TIMER0 read bus-faults (hardware-observed
+    // on the BRD4187A: HardFault, fatal reset, boot loop).
+    efr32s2_hal::delay::enable_cycle_counter();
     let rtcc = rtcc.start().unwrap_or_else(|_| halt());
     efr32s2_hal::time_driver::init(rtcc);
     // The journals sit at the top of 1536 KiB: refuse a smaller part.

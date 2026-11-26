@@ -637,7 +637,10 @@ Not proven on hardware:
   images (20 dBm PA, 38.4 MHz) fail radio init with `Unsupported` and
   halt, and `TX_POWER_RANGE_DBM` reports `(0, 0)`, so no host can request
   the 20 dBm PA with unverified PHY values.
-- **NCP**: has not run on any MG24.
+- **NCP**: ran on the BRD4187A only, against `hubctl` over the WSTK VCOM
+  at 115 200 (formation, join, ZCL, backup/restore, reset/resume; see
+  [ZRHP NCP](#zrhp-ncp-on-the-brd4187a-wstk-vcom)). Not run on the
+  RF-BM-MG24B1 / ESP32-S3 link, at 460 800 or 921 600, or on an MP die.
 - **Power**: EM2 and the DC-DC converter are untested.
 
 ### Crates
@@ -941,7 +944,126 @@ built for `brd2703a`:
   joined through the BRD4187A as a router child);
 - OTA and GBL upload;
 - long-duration runs;
-- the NCP.
+- the NCP on an MP die (it ran on the BRD4187A, see below).
+
+### ZRHP NCP on the BRD4187A (WSTK VCOM)
+
+**Setup**
+
+- NCP `examples/efr32mg24-ncp --features wstk-brd4187` on the BRD4187A,
+  above the GSDK 4.5.0 `bootloader-uart-xmodem` (brd4187c).
+- Host: zigbee-rs-hub `hubctl` (main `65cff43`, unmodified) on macOS,
+  `--backend zrhp` over the WSTK VCOM, 115 200 8N1, no flow control.
+- EK2703A Router as the joining device; nRF52840 sniffer on the test
+  channel; WSTK AEM for current.
+- Test network: formed by the hub on channel 25 (PAN 0x9BBF). The lab
+  networks on channels 15, 17 and 20 were not touched; the EK2703A Router
+  was first removed from the network it was in (Mgmt_Leave from that hub).
+
+**Bring-up fixes**
+
+- **Boot loop.** The first NCP image never ran: reset cause HardFault on
+  every boot. A vector catch showed a precise BusFault on `TIMER0_CNT`
+  (`0x4004_8024`). The session cookie reads `efr32s2_hal::delay::cycles()`
+  before anything had clocked TIMER0. `start()` now calls
+  `delay::enable_cycle_counter()` right after `init_clocks`. The fix applies
+  to every MG24 NCP image; none had run before.
+- **VCOM line rate.** The BRD4001A board controller runs its side of the
+  VCOM UART at its own configured rate (default 115 200), not at the host's
+  CDC rate. With the product default of 460 800 the NCP counted 1,443 framing
+  errors in a few seconds and the host decoded garbage; at 921 600 the host
+  received nothing. At 115 200 the link is clean. The `wstk-brd4187` NCP
+  therefore starts at the board's `VCOM_BAUD` (115 200) and accepts only
+  that rate in `SYS_SET_UART`, so a host cannot switch the link to a rate
+  that strands it. hwlab cannot reach the board controller's admin console,
+  so its configured rate was not read.
+
+**Results**
+
+| gate | result |
+|---|---|
+| session | `hubctl status`: session up at 115 200 in 68 ms; NCP fw 0.1.0, chip 12, board "BRD4187 on BRD4001A", capacities as `ncp-capacity` (256 TC devices). |
+| formation | `network/form` channel 25: PAN 0x9BBF, ownership `owned`. |
+| join | After a reboot, the EK2703A Router joined: Transport-Key (verified on the sniffer capture against ZigBeeAlliance09), unique TCLK (Request-Key → Verify-Key → Confirm-Key SUCCESS), Device_annce. |
+| interview | Basic, active endpoint and simple descriptor (HA Range Extender, Basic + Identify). See the join note below. |
+| ZCL | Read of 8 Basic attributes, Identify (10 s, Default Response SUCCESS), Configure / Read Reporting Configuration on Identify Time (SUCCESS). |
+| backup / restore | `network/backup` (open coordinator backup, 1 device, 1 link key), then `network/restore` of the same backup with `force`: NWK frame counter start 31,504, APS 32,528 (backup limits + 10,000). The Router stayed joined; its Link Status continued through the restore. Unicast to it then failed (see the restore note); with the hub fix, a backup/restore cycle kept it reachable. |
+| leave / rejoin | `devices/remove`: Mgmt_Leave, the Router left (`flags 0`) and factory-reset, re-armed steering after its 5-minute wait, joined again as a new address with permit open, and the hub interviewed it completely. |
+| NCP reset | nRESET through the AEM connection (hwlab ADR 0042): the host saw `peer reset (Restarted)`, `NWK_INIT` with its floors and network state 2, resumed in 265 ms. Three APS requests in flight were reported as "link reset, outcome unknown". Ownership stayed `owned`. |
+| frame counters | NCP NWK counter on the air: 20,590 before the restore, 31,504 after it; 31,527 before the reset, 41,744 after it. Never reused. |
+| reflash | Reflashing the NCP application kept the network (journals). |
+| link | `hubctl soak` (echoes) at 115 200, 10 min: 30,106 echoes, 0 failed, worst 117 ms, no resync, one session; the host retransmitted 66 of 60,304 frames. After the final reflash, 5 min: 15,033 echoes, 0 failed, worst 62 ms; host 29 retransmissions of 30,121 frames; the NCP counted 6 UART overruns (7 bad frames) and retransmitted 17. ARQ recovered every frame. |
+
+**Current (AEM, 3.3 V, DC-DC bypassed).** The coordinator keeps its
+receiver on: 10.2 mA mean with the network up and idle (7.0–7.6 mA minimum,
+24.4 mA peaks at 0 dBm TX), the same before and after a reset. The nRESET
+pulse read 0.48 mA and the NCP was back at 10 mA 23 ms after release.
+
+**UART overruns.** An overrun means the USART0 receive interrupt waited
+longer than about two character times (~170 µs at 115 200). Which code
+holds interrupts off that long (journal writes, the radio path or a critical
+section) was not traced.
+
+**RAM and stack.** The NCP's static RAM ends at `0x2002_A258`
+(`.bss` 168,536 B); the linked stack is 89,512 B. The stack high-water mark
+was not measured (the image has no stack paint).
+
+**Join note: stale Trust Center address after a Leave.** The EK2703A Router
+had been removed from another network with Mgmt_Leave (no rejoin); the
+router app then factory-resets (other apps, such as the sleepy sensor, only
+leave). On its next steering it joined our network, but rejected our
+Transport-Key as unauthenticated, waited, reset and joined again in a loop.
+The frame was valid (MIC verified on the host with the ZigBeeAlliance09
+key-transport key). The cause is in the stack: neither a Leave nor a
+factory reset cleared `aib.aps_trust_center_address`, so the old network's
+Trust Center address made our Trust Center look like an impostor. A reboot
+cleared it, and the Router then joined at once.
+
+Every Leave without rejoin (local, Mgmt_Leave, Trust Center Remove-Device,
+a failed TCLK exchange: the runtime's shared teardown), an abandoned or
+failed initial commissioning in BDB steering, and a factory reset now clear
+the address and the designated-coordinator flag (`Aib::forget_trust_center`;
+the APS frame counter is kept). Regression tests:
+
+- `mgmt_leave_without_rejoin_accepts_another_trust_center` (runtime:
+  Mgmt_Leave, then a Transport-Key from another Trust Center is accepted);
+- `factory_reset_forgets_the_trust_center_but_keeps_the_aps_counter`;
+- `abandoned_initial_commissioning_forgets_the_trust_center`.
+
+The fix is host-tested. On hardware, the factory-reset version let the
+Router leave and rejoin the same Trust Center without a reboot. A Leave from
+one Trust Center followed by a join to another, without a reboot, was not
+repeated.
+
+The hub interviewed the Router once, on its first (failed) join, and marked
+the interview partial; later joins of the same device do not restart it.
+`devices/reinterview` completed it.
+
+**Restore note: a router child came back as a sleepy end device.** The
+Router joined through the coordinator, so the NCP lists it as a child with
+the FFD capability. The hub's backup (open coordinator backup) wrote it as
+`is_child: true`, and that format has no capability, so the hub's restore
+gave it an rx-off end-device child entry (capability 0x80). From then on the
+NCP held every unicast to the Router for a data poll a router never sends:
+the interview hung, ZCL requests got no APS ACK, and the Mgmt_Leave of a
+`devices/remove` never went on air (sniffer), leaving the Router in the
+network after the hub had forgotten it. Restoring with the Router marked
+`is_child: false` brought unicast back. The NCP and the radio behaved as
+told; the hub fix (zigbee-rs-hub PR #100: router children are exported as
+plain devices) was verified on this setup with a backup, a restore
+(`children: 0`, one link key) and a ZCL read right after. An rx-on end
+device child still comes back rx-off: the backup format cannot say so.
+
+**Not verified on hardware:**
+
+- attribute reports through the NCP. Configure Reporting on the Router's
+  Identify Time succeeded, but the Router never sent a report: its runtime
+  only reports clusters the profile collects, and Basic and Identify are
+  built in (open item in the runtime);
+- the RF-BM-MG24B1 / ESP32-S3 host link at 460 800, and 921 600;
+- `SYS_RESET` into the Gecko bootloader and GBL upload;
+- children (end devices) of the NCP, many devices, long-duration runs;
+- the NCP on an MP die or with a 38.4 MHz crystal.
 
 ### Boards
 
@@ -949,7 +1071,7 @@ built for `brd2703a`:
 |---|---|---|---|---|
 | part | EFR32MG24A410F1536IM48-B (+10 dBm) | EFR32MG24A420F1536IM48 (+20 dBm), SONOFF spec page | EFR32MG24B220F1536IM48 (+20 dBm; DEVINFO, although GSDK lists BRD4187A as A020) |EFR32MG24B210F1536IM48 (+10 dBm; DEVINFO) |
 | HFXO | 39 MHz on the module; CTUNE 92 (RF-star datasheet §4, **unmeasured**) | 38.4 MHz, CTUNE 100 (community manifests, **unverified**) | 39 MHz; no `MFG_CTUNE` on this unit, so the BRD4187C default CTUNE 95 (**unmeasured**) |39 MHz; no `MFG_CTUNE`, so the GSDK board CTUNE 100 (**unmeasured**) |
-| host UART | USART0 TX PA05 (pin 12), RX PA06 (pin 13) → ESP32-S3 SuperMini; RTS PA07 / CTS PA08 claimed but unused | USART0 routed to TX PC01, RX PC02 → ESP32 GPIO13/GPIO17 (community builds use EUSART1 on the same pins, **unverified**) | USART0 to the WSTK VCOM, TX PA08, RX PA09, VCOM enable PB00; logs at 115 200 |USART0 to the J-Link OB VCOM, TX PA05, RX PA06 (RTS PA08 / CTS PA09 unused); logs at 115 200 |
+| host UART | USART0 TX PA05 (pin 12), RX PA06 (pin 13) → ESP32-S3 SuperMini; RTS PA07 / CTS PA08 claimed but unused | USART0 routed to TX PC01, RX PC02 → ESP32 GPIO13/GPIO17 (community builds use EUSART1 on the same pins, **unverified**) | USART0 to the WSTK VCOM, TX PA08, RX PA09, VCOM enable PB00; logs and the NCP's ZRHP link at 115 200 (the board controller's VCOM rate; 460 800 and 921 600 fail) |USART0 to the J-Link OB VCOM, TX PA05, RX PA06 (RTS PA08 / CTS PA09 unused); logs at 115 200 |
 | reset / boot | RESET_N (pin 36) open-drain from S3 GPIO6 (hub profile `S3_MG24_DEV`) and the J-Link; no boot-entry line (Gecko via `SYS_RESET` mode 1 once installed) | ESP32 GPIO15 → RESET (active low); GPIO12 high during reset → Gecko bootloader (the MG24 pin of that line is unknown) | WSTK J-Link (hwlab). GSDK `bootloader-uart-xmodem` (brd4187c); BTN0 (PB01) held at reset enters it |J-Link OB (hwlab). GSDK `bootloader-uart-xmodem` (brd2703a); BTN0 (PB02) held at reset enters it |
 | debug | SWDIO PA02, SWCLK PA01, SWO PA03 (never claimed) | SWD pads unknown | WSTK J-Link OB, AEM current measurement |J-Link OB; no current monitor |
 | other | 32.768 kHz LFXO, PCB antenna, no LED/button | no MG24 LED/button documented; RF path, stock TX power and LFXO unknown | LED0 PB02, LED1 PB04, BTN0 PB01, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna |LED0 PA04, LED1 PA07, BTN0 PB02, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna; mikroBUS, Qwiic |
@@ -1028,12 +1150,13 @@ would not move it.
 
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
-| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 455,580 B | 168,536 B | 89,512 B |
-| NCP, Dongle-M | 455,636 B | 168,536 B | 89,512 B |
-| Router, RF-BM-MG24B1 (GP Proxy Basic) | 344,680 B | 37,140 B | 224,492 B |
-| Router, Dongle-M | 344,872 B | 37,140 B | 224,492 B |
-| Router, BRD4187 on a WSTK | 344,928 B | 37,136 B | 224,496 B |
-| Router, EK2703A | 344,680 B | 37,136 B | 224,496 B |
+| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 455,668 B | 168,536 B | 89,512 B |
+| NCP, Dongle-M | 455,724 B | 168,536 B | 89,512 B |
+| NCP, BRD4187 on a WSTK | 455,716 B | 168,536 B | 89,512 B |
+| Router, RF-BM-MG24B1 (GP Proxy Basic) | 344,736 B | 37,140 B | 224,492 B |
+| Router, Dongle-M | 344,928 B | 37,140 B | 224,492 B |
+| Router, BRD4187 on a WSTK | 344,984 B | 37,136 B | 224,496 B |
+| Router, EK2703A | 344,736 B | 37,136 B | 224,496 B |
 
 The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
 MG24 image compared with `15ee9550`, the build-only base without a radio.
@@ -1051,6 +1174,11 @@ supervisor paths; the Router's SE check compiles away) and no static RAM or
 stack: `.data` now starts at `0x2000_0008` (8-byte aligned), and the end of
 static RAM and the linked stack are unchanged because alignment padding
 absorbs the shift.
+
+The NCP boot fix (TIMER0 enabled before the session cookie) added 48 B to
+every NCP image. Forgetting the Trust Center on every Leave and factory
+reset added 40 B to every image (56 B to the Routers, with the first
+factory-reset version). Static RAM and stack did not change.
 
 ### Hardware gates
 
@@ -1077,6 +1205,13 @@ Done on the EK2703A (xG24 MP PA, 39 MHz):
   could not be compared: the kit has no AEM.
 - **Router.** Joined through the BRD4187A Router as its parent and resumed
   after a reset.
+
+Done on the BRD4187A as ZRHP NCP (WSTK VCOM, 115 200), against `hubctl`:
+
+- session, formation, join with unique TCLK, interview, ZCL read and
+  command, backup and restore of the same network, NCP reset and resume,
+  frame counters monotonic across restore and reset, a reflash keeping the
+  network, soaks. See [ZRHP NCP](#zrhp-ncp-on-the-brd4187a-wstk-vcom).
 
 Open:
 
@@ -1109,8 +1244,10 @@ Open:
    Test with a lab build that panics or faults on demand. For the poisoned
    mailbox, use an SE that stops answering, for example a debugger-held SE
    request.
-5. **NCP.** ZRHP session over the S3, network formation, joins and
-   reset/resume.
+5. **NCP on the product link.** The ZRHP session over the RF-BM-MG24B1's
+   ESP32-S3 at 460 800 / 921 600, attribute reports from a device with a
+   reportable cluster, end-device children, the source of the NCP's UART
+   overruns, and a long run with many devices.
 6. **Gecko update path.** GBL upload over XMODEM and journal retention
    across an update.
 7. **Dongle-M.** Pins, crystal, CTUNE, bootloader-entry pin, RF path and the

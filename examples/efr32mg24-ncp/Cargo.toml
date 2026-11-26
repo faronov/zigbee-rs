@@ -11,6 +11,8 @@ autobins = false
 #   cargo build --release                                    # RF-BM-MG24B1
 #   cargo build --release --no-default-features --features sonoff-dongle-m \
 #     --target-dir target/dongle-m
+#   cargo build --release --no-default-features --features wstk-brd4187 \
+#     --target-dir target/brd4187                            # BRD4187 + WSTK
 # The image is linked above the resident Gecko bootloader (0x0800_6000);
 # `tools/efr32-gbl` turns the ELF into the raw image and a GBL.
 [[bin]]
@@ -21,6 +23,9 @@ path = "src/main.rs"
 default = ["rf-bm-mg24b1"]
 rf-bm-mg24b1 = ["efr32mg24-product/rf-bm-mg24b1", "dep:rf-bm-mg24b1"]
 sonoff-dongle-m = ["efr32mg24-product/sonoff-dongle-m", "dep:sonoff-dongle-m"]
+# BRD4187 (20 dBm PA, 39 MHz) on a BRD4001A WSTK: ZRHP over the WSTK VCOM
+# (USART0 PA8/PA9), above a GSDK Gecko bootloader.
+wstk-brd4187 = ["efr32mg24-product/wstk-brd4187", "dep:efr32mg24-brd4187"]
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
@@ -29,6 +34,7 @@ cortex-m-rt = { version = "0.7", features = ["device"] }
 efr32s2-hal = { path = "../../efr32s2-hal", features = ["rt", "time-driver", "isr-ack", "usart0-host"] }
 rf-bm-mg24b1 = { path = "../../boards/rf-bm-mg24b1", optional = true, features = ["host-uart"] }
 sonoff-dongle-m = { path = "../../boards/sonoff-dongle-m", optional = true, features = ["host-uart"] }
+efr32mg24-brd4187 = { path = "../../boards/efr32mg24-brd4187", optional = true, features = ["host-uart"] }
 efr32mg24-product = { path = "../../products/efr32mg24", default-features = false, features = ["ncp"] }
 # Full NCP capacity (256 Trust Center devices, 16-frame link window): the
 # 256 KiB SRAM holds it (see the size report in the platform guide).
