@@ -48,13 +48,19 @@ type Sink = vcom::Vcom;
 static LOG: Mutex<RefCell<Option<Sink>>> = Mutex::new(RefCell::new(None));
 
 /// Write formatted text to the log sink (no-op before [`init`]).
+///
+/// The sink is taken out of [`LOG`] in a short critical section and written
+/// with interrupts enabled: the `brd4187` VCOM ring only drains in the
+/// `USART0_TX` interrupt, so writing a line larger than its free space with
+/// interrupts masked would never finish. A line logged while the sink is
+/// out (an exception during a write) is dropped.
 pub fn log_fmt(args: core::fmt::Arguments<'_>) {
-    cortex_m::interrupt::free(|cs| {
-        if let Some(sink) = LOG.borrow(cs).borrow_mut().as_mut() {
-            let _ = sink.write_fmt(args);
-            let _ = sink.write_str("\r\n");
-        }
-    });
+    let Some(mut sink) = cortex_m::interrupt::free(|cs| LOG.borrow(cs).take()) else {
+        return;
+    };
+    let _ = sink.write_fmt(args);
+    let _ = sink.write_str("\r\n");
+    cortex_m::interrupt::free(|cs| LOG.borrow(cs).replace(Some(sink)));
 }
 
 /// Wait until the VCOM UART has shifted out every queued byte (before EM2).
@@ -71,15 +77,33 @@ pub fn log_flush() {
 mod vcom {
     //! Interrupt-driven VCOM link: log output and line input.
 
+    use efr32s2_hal::delay::{spin_cycles, us_to_cycles};
     use efr32s2_hal::usart::host::HostUart;
+
+    /// Give up on the rest of a write after this long without the TX ring
+    /// draining (one byte takes 87 us at 115 200 Bd): the `USART0_TX`
+    /// interrupt cannot run, e.g. from the panic or HardFault handler.
+    const STALL_US: u32 = 10_000;
+    const STALL_POLL_US: u32 = 10;
 
     pub struct Vcom(pub HostUart);
 
     impl core::fmt::Write for Vcom {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
             let mut bytes = s.as_bytes();
+            let mut stalled_us = 0;
             while !bytes.is_empty() {
                 let n = self.0.try_write(bytes);
+                if n == 0 {
+                    if stalled_us >= STALL_US {
+                        // Drop the rest rather than lock up.
+                        return Ok(());
+                    }
+                    spin_cycles(us_to_cycles(STALL_POLL_US));
+                    stalled_us += STALL_POLL_US;
+                } else {
+                    stalled_us = 0;
+                }
                 bytes = &bytes[n..];
             }
             Ok(())
