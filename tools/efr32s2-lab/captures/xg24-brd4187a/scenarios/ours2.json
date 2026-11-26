@@ -1,0 +1,44 @@
+{
+ "name": "mg24-ours2",
+ "duration": "40s",
+ "out": "~/.hwlab/artifacts/mg24-brd4187a/ours2",
+ "dump_ms_per_block": 250,
+ "steps": [
+  [
+   "cli",
+   "ch 26"
+  ],
+  [
+   "cli",
+   "pw 20"
+  ],
+  [
+   "cli",
+   "tx 3000 125 0"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-txw",
+   "txw-p20-0"
+  ],
+  [
+   "dump-txw",
+   "txw-p20-1"
+  ],
+  [
+   "dump-txw",
+   "txw-p20-2"
+  ],
+  [
+   "dump-txw",
+   "txw-p20-3"
+  ],
+  [
+   "dump-tx",
+   "tx-p20"
+  ]
+ ]
+}

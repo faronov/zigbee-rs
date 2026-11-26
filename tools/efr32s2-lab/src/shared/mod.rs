@@ -7,6 +7,9 @@
 //! * `zbt1` -- Home Assistant Connect ZBT-1: HFXO 38.4 MHz with the CTUNE
 //!   of the stock firmware (XTALCTRL read over SWD: 140), no user LED wired
 //!   to the EFR32. Log through a SEGGER RTT up-buffer (`JLinkRTTLogger`).
+//! * `brd4187` -- BRD4001A + BRD4187 (EFR32MG24B220, 39 MHz), resources from
+//!   the `efr32mg24-brd4187` board crate: LED0 PB2, log and line commands
+//!   on the VCOM (USART0 PA8/PA9 at 115 200, enable PB0).
 
 #![allow(dead_code)]
 
@@ -14,14 +17,14 @@ use core::cell::RefCell;
 use core::fmt::Write;
 
 use cortex_m::interrupt::Mutex;
+#[cfg(not(feature = "brd4187"))]
 use efr32s2_hal::{
-    clock::HfxoConfig,
-    gpio::{Gpio, Pin, PushPull},
-    i2c::I2c0Token,
-    peripherals::Peripherals,
+    clock::HfxoConfig, gpio::Gpio, i2c::I2c0Token, peripherals::Peripherals, usart::Usart,
+};
+use efr32s2_hal::{
+    gpio::{Pin, PushPull},
     radio::RadioToken,
     rtcc::RtccToken,
-    usart::Usart,
 };
 
 #[cfg(feature = "wstk")]
@@ -39,6 +42,8 @@ pub const HFXO: HfxoConfig = HfxoConfig {
 type Sink = efr32s2_hal::usart::UartTx;
 #[cfg(feature = "zbt1")]
 type Sink = rtt::Rtt;
+#[cfg(feature = "brd4187")]
+type Sink = vcom::Vcom;
 
 static LOG: Mutex<RefCell<Option<Sink>>> = Mutex::new(RefCell::new(None));
 
@@ -60,6 +65,57 @@ pub fn log_flush() {
             uart.flush();
         }
     });
+}
+
+#[cfg(feature = "brd4187")]
+mod vcom {
+    //! Interrupt-driven VCOM link: log output and line input.
+
+    use efr32s2_hal::usart::host::HostUart;
+
+    pub struct Vcom(pub HostUart);
+
+    impl core::fmt::Write for Vcom {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let mut bytes = s.as_bytes();
+            while !bytes.is_empty() {
+                let n = self.0.try_write(bytes);
+                bytes = &bytes[n..];
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Line input from the VCOM (`brd4187`): bytes are collected into `line`
+/// until CR/LF; returns the line once complete (without the terminator).
+#[cfg(feature = "brd4187")]
+pub fn read_line<'a>(line: &'a mut [u8; 64], len: &mut usize) -> Option<&'a str> {
+    let mut byte = [0u8; 1];
+    loop {
+        let n = cortex_m::interrupt::free(|cs| {
+            LOG.borrow(cs)
+                .borrow_mut()
+                .as_mut()
+                .map_or(0, |v| v.0.read(&mut byte))
+        });
+        if n == 0 {
+            return None;
+        }
+        match byte[0] {
+            b'\r' | b'\n' if *len > 0 => {
+                let end = *len;
+                *len = 0;
+                return core::str::from_utf8(&line[..end]).ok();
+            }
+            b'\r' | b'\n' => {}
+            b if *len < line.len() => {
+                line[*len] = b;
+                *len += 1;
+            }
+            _ => *len = 0,
+        }
+    }
 }
 
 #[cfg(feature = "zbt1")]
@@ -165,10 +221,13 @@ macro_rules! log {
 }
 
 pub struct Lab {
+    #[cfg(not(feature = "brd4187"))]
     pub gpio: Gpio,
+    #[cfg(not(feature = "brd4187"))]
     pub i2c0: I2c0Token,
     pub radio: RadioToken,
     pub rtcc: RtccToken,
+    #[cfg(not(feature = "brd4187"))]
     pub usart0: Usart,
     /// Hardware AES engine token (`s2-aes`, xG22).
     #[cfg(feature = "wstk")]
@@ -200,6 +259,47 @@ impl Led {
 }
 
 /// Bring up HFXO, the LED and the log sink; returns the remaining resources.
+#[cfg(feature = "brd4187")]
+pub fn init(name: &str) -> Lab {
+    use efr32mg24_brd4187::resources::BoardResources;
+    let BoardResources {
+        clocks,
+        host_uart,
+        radio,
+        rtcc,
+        leds,
+        ..
+    } = BoardResources::take().expect("board resources taken once");
+    let hfxo = efr32mg24_brd4187::init_clocks(clocks);
+    if hfxo.is_err() {
+        // No valid UART baud rate without the HFXO: halt for the debugger.
+        loop {
+            cortex_m::asm::bkpt();
+        }
+    }
+    efr32s2_hal::delay::enable_cycle_counter();
+    let uart = host_uart
+        .open(efr32mg24_brd4187::VCOM_BAUD)
+        .expect("VCOM baud");
+    cortex_m::interrupt::free(|cs| *LOG.borrow(cs).borrow_mut() = Some(vcom::Vcom(uart)));
+    let (led0, _led1) = leds.into_outputs();
+    log!("");
+    log!("== efr32s2-lab {} ({:?}) ==", name, efr32s2_hal::chip::CHIP);
+    log!(
+        "HFXO ok, {} Hz, CTUNE {}",
+        efr32mg24_brd4187::HCLK_HZ,
+        efr32mg24_brd4187::hfxo_ctune()
+    );
+    log!("EUI64 {:016X}", eui64());
+    Lab {
+        radio,
+        rtcc,
+        led: Led(Some(led0)),
+    }
+}
+
+/// Bring up HFXO, the LED and the log sink; returns the remaining resources.
+#[cfg(not(feature = "brd4187"))]
 pub fn init(name: &str) -> Lab {
     let Peripherals {
         mut clocks,
