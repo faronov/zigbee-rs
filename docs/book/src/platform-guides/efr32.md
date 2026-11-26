@@ -1009,20 +1009,31 @@ section) was not traced.
 was not measured (the image has no stack paint).
 
 **Join note: stale Trust Center address after a Leave.** The EK2703A Router
-had been removed from another network with Mgmt_Leave (no rejoin), which
-factory-resets it. On its next steering it joined our network, but rejected
-our Transport-Key as unauthenticated, waited, reset and joined again in a
-loop. The frame was valid (MIC verified on the host with the
-ZigBeeAlliance09 key-transport key). The cause is in the stack:
-`zigbee-bdb` `factory_reset` cleared keys and tables but not
-`aib.aps_trust_center_address`, so the old network's Trust Center address
-made our Trust Center look like an impostor. A reboot cleared it, and the
-Router then joined at once. `factory_reset` now clears the address (the APS
-frame counter is kept); regression test
-`factory_reset_forgets_the_trust_center_but_keeps_the_aps_counter`. The fix
-is host-tested. On hardware, the fixed Router left and rejoined the same
-Trust Center without a reboot; a Leave from one Trust Center followed by a
-join to another without a reboot was not repeated.
+had been removed from another network with Mgmt_Leave (no rejoin); the
+router app then factory-resets (other apps, such as the sleepy sensor, only
+leave). On its next steering it joined our network, but rejected our
+Transport-Key as unauthenticated, waited, reset and joined again in a loop.
+The frame was valid (MIC verified on the host with the ZigBeeAlliance09
+key-transport key). The cause is in the stack: neither a Leave nor a
+factory reset cleared `aib.aps_trust_center_address`, so the old network's
+Trust Center address made our Trust Center look like an impostor. A reboot
+cleared it, and the Router then joined at once.
+
+Every Leave without rejoin (local, Mgmt_Leave, Trust Center Remove-Device,
+a failed TCLK exchange: the runtime's shared teardown), an abandoned or
+failed initial commissioning in BDB steering, and a factory reset now clear
+the address and the designated-coordinator flag (`Aib::forget_trust_center`;
+the APS frame counter is kept). Regression tests:
+
+- `mgmt_leave_without_rejoin_accepts_another_trust_center` (runtime:
+  Mgmt_Leave, then a Transport-Key from another Trust Center is accepted);
+- `factory_reset_forgets_the_trust_center_but_keeps_the_aps_counter`;
+- `abandoned_initial_commissioning_forgets_the_trust_center`.
+
+The fix is host-tested. On hardware, the factory-reset version let the
+Router leave and rejoin the same Trust Center without a reboot. A Leave from
+one Trust Center followed by a join to another, without a reboot, was not
+repeated.
 
 The hub interviewed the Router once, on its first (failed) join, and marked
 the interview partial; later joins of the same device do not restart it.
@@ -1139,13 +1150,13 @@ would not move it.
 
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
-| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 455,628 B | 168,536 B | 89,512 B |
-| NCP, Dongle-M | 455,684 B | 168,536 B | 89,512 B |
-| NCP, BRD4187 on a WSTK | 455,676 B | 168,536 B | 89,512 B |
-| Router, RF-BM-MG24B1 (GP Proxy Basic) | 344,696 B | 37,140 B | 224,492 B |
-| Router, Dongle-M | 344,888 B | 37,140 B | 224,492 B |
-| Router, BRD4187 on a WSTK | 344,944 B | 37,136 B | 224,496 B |
-| Router, EK2703A | 344,696 B | 37,136 B | 224,496 B |
+| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 455,668 B | 168,536 B | 89,512 B |
+| NCP, Dongle-M | 455,724 B | 168,536 B | 89,512 B |
+| NCP, BRD4187 on a WSTK | 455,716 B | 168,536 B | 89,512 B |
+| Router, RF-BM-MG24B1 (GP Proxy Basic) | 344,736 B | 37,140 B | 224,492 B |
+| Router, Dongle-M | 344,928 B | 37,140 B | 224,492 B |
+| Router, BRD4187 on a WSTK | 344,984 B | 37,136 B | 224,496 B |
+| Router, EK2703A | 344,736 B | 37,136 B | 224,496 B |
 
 The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
 MG24 image compared with `15ee9550`, the build-only base without a radio.
@@ -1165,8 +1176,9 @@ static RAM and the linked stack are unchanged because alignment padding
 absorbs the shift.
 
 The NCP boot fix (TIMER0 enabled before the session cookie) added 48 B to
-every NCP image, and the factory-reset fix in `zigbee-bdb` (Trust Center
-address cleared) 16 B to every Router. Static RAM and stack did not change.
+every NCP image. Forgetting the Trust Center on every Leave and factory
+reset added 40 B to every image (56 B to the Routers, with the first
+factory-reset version). Static RAM and stack did not change.
 
 ### Hardware gates
 
