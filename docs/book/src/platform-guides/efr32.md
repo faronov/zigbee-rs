@@ -7,11 +7,12 @@ The repository supports these products:
 - EFR32MG21 BRD4181A development sensor (Series 2, builds; no hardware run);
 - Home Assistant Connect ZBT-1 always-on End Device (EFR32MG21, lab-tested);
 - EFR32MG24 ZRHP NCP and Router for an RF-BM-MG24B1 dev board, the SONOFF
-  Dongle-M and a BRD4187 radio board on a BRD4001A WSTK (Series 2). The
-  xG24 20 dBm (HP) radio at 39 MHz is lab-tested on the BRD4187A, where the
-  Router joined a test network. The 10 dBm PA and the 38.4 MHz crystal are
-  not enabled: the radio returns `Unsupported` on the RF-BM-MG24B1 and the
-  Dongle-M. The NCP has no hardware run.
+  Dongle-M, a BRD4187 radio board on a BRD4001A WSTK and the xG24 Explorer
+  Kit EK2703A (Series 2). The xG24 radio at 39 MHz is lab-tested with the
+  20 dBm (HP) PA on the BRD4187A and the 10 dBm (MP) PA on the EK2703A,
+  where the Router joined a test network. The 38.4 MHz crystal is not
+  enabled: the radio returns `Unsupported` on the Dongle-M. The
+  RF-BM-MG24B1 and the NCP have no hardware run.
 
 All use the shared `SensorApp`; their boards, products, clocks, storage, and
 power behavior are intentionally separate. Series 2 chips share one HAL
@@ -594,11 +595,11 @@ python3 tools/verify-layout.py \
 The ZBT-1 binary is named `ha-connect-zbt1-ed`, which keeps it apart from the
 board crate in the lockfile.
 
-## EFR32MG24 (xG24): BRD4187A radio lab, RF-BM-MG24B1 dev board, SONOFF Dongle-M
+## EFR32MG24 (xG24): BRD4187A and EK2703A radio labs, RF-BM-MG24B1 dev board, SONOFF Dongle-M
 
-**Status.** The xG24 radio runs on the 20 dBm (HP) PA with a 39 MHz
-crystal. This was lab-tested on one BRD4187A (EFR32MG24B220F1536IM48) on a
-BRD4001A WSTK:
+**Status.** The xG24 radio runs with a 39 MHz crystal on both PA variants.
+The 20 dBm (HP) PA was lab-tested on one BRD4187A (EFR32MG24B220F1536IM48)
+on a BRD4001A WSTK:
 
 - raw TX and RX over the air;
 - Imm-Acks, energy detect and RSSI;
@@ -607,17 +608,32 @@ BRD4001A WSTK:
   test network, passed the interview and resumed from its journal after a
   reset.
 
-See [Radio](#radio-captured-xg24-tables) and
-[Hardware validation](#hardware-validation-brd4187a).
+The 10 dBm (MP) PA was lab-tested on one xG24 Explorer Kit EK2703A
+(EFR32MG24B210F1536IM48):
+
+- TX output equal to RAIL's from −30 to +10 dBm (sniffer);
+- RX, Imm-Acks, energy detect and beacon reception;
+- the Router (`--features ek2703a`) joined the same network through the
+  BRD4187A router as its parent and resumed after a reset.
+
+**MP current unmeasured:** the EK2703A has no current monitor, so the
+10 dBm PA's TX current has never been compared with RAIL's.
+
+See [Radio](#radio-captured-xg24-tables),
+[Hardware validation](#hardware-validation-brd4187a) and
+[10 dBm PA](#10-dbm-mp-pa-ek2703a).
 
 Not proven on hardware:
 
-- **10 dBm (MP) PA**: no table. `efr32mg24-pa10` images, including every
-  RF-BM-MG24B1 image, fail radio init with `RadioError::Unsupported` and
-  halt.
+- **RF-BM-MG24B1**: the radio stays enabled. The board uses the same radio
+  configuration as the EK2703A (10 dBm PA, 39 MHz), with the tables captured
+  on the B210. The board-level items are unverified: the A410 die, the RF
+  path to the module's antenna, and CTUNE 92. Its first run should measure
+  the CTUNE frequency offset, the output against RAILtest and the TX
+  current.
 - **38.4 MHz tables (Dongle-M)**: derived from GSDK and never run on
   silicon. The HAL therefore supports the xG24 radio only with
-  `efr32mg24-pa20` **and** `hfxo-39mhz` (`xg24::SUPPORTED`). Dongle-M
+  `hfxo-39mhz` (`xg24::SUPPORTED`, either PA variant). Dongle-M
   images (20 dBm PA, 38.4 MHz) fail radio init with `Unsupported` and
   halt, and `TX_POWER_RANGE_DBM` reports `(0, 0)`, so no host can request
   the 20 dBm PA with unverified PHY values.
@@ -634,12 +650,13 @@ products/efr32mg24          identity, memory map, journals, Gecko record,
                             NCP transport policy, router policy
         ↓
 boards/rf-bm-mg24b1 | boards/sonoff-dongle-m | boards/efr32mg24-brd4187
+  | boards/efr32mg24-ek2703a
         ↓
 efr32s2-hal (`efr32mg24-pa10` / `efr32mg24-pa20`, `hfxo-39mhz`)
         + zigbee-mac `efr32mg24` (Efr32s2RadioPhy on SoftMacCore)
 tools/efr32-gbl             ELF → raw image, Intel HEX and GBL3
 tools/efr32s2-lab           lab gates: `s2-mg24-hello` (RF-BM), `s2-mg24-air`
-                            (BRD4187 radio console); xG24 captures
+                            (BRD4187 / EK2703A radio console); xG24 captures
 ```
 
 No PAC is used. The only published xG24 PAC (`efr32mg24-pac` 0.1.0, one
@@ -854,27 +871,88 @@ line with interrupts enabled. The run above was made with that fix. The
 Router's 60 s summary now also prints the queue-full, ACK-failure and
 maximum-turnaround counters.
 
+### 10 dBm (MP) PA: EK2703A
+
+The MP PA was captured and verified with the same method on an xG24
+Explorer Kit EK2703A (BRD2703A A02, EFR32MG24B210F1536IM48, 39 MHz,
+CTUNE 100). The kit has no current monitor, so the comparison with RAIL
+uses the nRF sniffer only. The method, raw dumps and decoded summaries,
+including a register-by-register comparison with the HP capture, are in
+`tools/efr32s2-lab/captures/xg24-ek2703a`.
+
+**What `efr32mg24-pa10` changes (`xg24::PaPhy`, MP `TX_POWER`)**
+
+| item | MP (B210) | HP (B220) |
+|---|---|---|
+| RF path | path 1: `RFPATHEN1`, `LNAMIXTRIM1`, `AGCOVERWRITE1.MANLNAMIXRFATT1` | path 0 |
+| power | `MODEM.RAMPLEV` per level (RAIL raw + 16..21) and `RAMPCTRL` 0x999/0x888/0x777/0x666; 20 levels from −30.0 to +10.0 dBm | `PACTRL` slice/power, `RAMPLEV` from DEVINFO |
+| PA words | `RAC.TX` pre-stage 0xC001_3001, ramp 0xC029_F003, steady 0xC029_C001; `PADEBUG` 0 | 0xC401_3001 / 0xC3C1_F003 / 0xC3C1_C001, `PADEBUG` manual |
+| PA trims | `PATRIM0/2/3/5`, `SYTRIM1` (no 20 dBm LO delay), `PATRIM4` unchanged in TX | HP values |
+| IR correction | `IRCALCOEFWR0/1` = 0xFFFFFFFF; RAIL ignores the DEVINFO word | DEVINFO word |
+
+The PHY, the channel values (identical on all 16 channels for both dies)
+and the per-state values of the shared blocks are the same for both
+variants. The power-up order is the same too: slices held in reset during
+the pre-stage, then the ramp clock. The runtime calibrations
+(`VCOGAIN`, `LPFCTRL2RX/TX`, `VCOCTRL`, `AUXADCTRIM`, `IFADCCAL`,
+`LNAMIXTRIM3/4`, `PGATRIM`, `PGACAL`) are the EK2703A die's values in MP
+builds, as the BRD4187A die's are in HP builds.
+
+**TX output, sniffer RSSI on channel 26** (back to back, 125-byte frames):
+
+| requested | RAILtest | zigbee-rs |
+|---|---|---|
+| −30 dBm | −73.3 dBm | −73.0 dBm |
+| −10 dBm | −51.1 dBm | −51.0 dBm |
+| 0 dBm | −42.0 dBm | −42.0 dBm |
+| 5 dBm | −37.0 dBm | −36.5 dBm |
+| 10 dBm | −32.0 dBm | −31.9 dBm |
+
+**Other results**
+
+Lab binary `s2-mg24-air --features ek2703`:
+
+- 12 of 12 Imm-Acks to the nRF's ACK-wait, and none for another address;
+- RX RSSI −49 dBm for the nRF at 0 dBm;
+- energy detect on all 16 channels with the synthesizer locked;
+- 44 beacons for one beacon request on channel 15.
+
+Router `--features ek2703a`, running above a GSDK `bootloader-uart-xmodem`
+built for `brd2703a`:
+
+- **Join.** It joined PAN 0xE2E9 on channel 20 as 0x3A55, with the BRD4187A
+  Router 0xB2B0 as its parent. This also exercises the xG24 HP Router as a
+  parent. Commissioning completed.
+- **Imm-Acks.** The sniffer saw 22 of 24 ACKed 158–169 µs after the frame
+  end, and the HAL reported a maximum turnaround of 165 µs. The two
+  misses were the first two copies of one frame right after the join,
+  during the journal writes.
+- **Coordinator ACKs.** The coordinator ACKed 30 of 30 of our frames.
+- **Resume.** The Router resumed 0x3A55 from its journals after a reset.
+
 **Not verified on hardware:**
 
-- the MP PA (EK2703A / B210 or an RF-BM-MG24B1);
+- the 10 dBm tables on an RF-BM-MG24B1 (A410) or any other MP die;
+- MP TX current (the EK2703A has no AEM);
 - the 38.4 MHz tables (Dongle-M);
-- CCA against a jammer (the Router's CSMA ran without failure);
+- CCA against a jammer (the Routers' CSMA ran without failure);
 - EM2 and DC-DC;
-- children and Frame Pending through the xG24 Router;
+- end-device children and Frame Pending through an xG24 Router (the EK2703A
+  joined through the BRD4187A as a router child);
 - OTA and GBL upload;
 - long-duration runs;
 - the NCP.
 
 ### Boards
 
-| | RF-BM-MG24B1 dev board | SONOFF Dongle-M | BRD4187A on BRD4001A (radio lab) |
-|---|---|---|---|
-| part | EFR32MG24A410F1536IM48-B (+10 dBm) | EFR32MG24A420F1536IM48 (+20 dBm), SONOFF spec page | EFR32MG24B220F1536IM48 (+20 dBm; DEVINFO, although GSDK lists BRD4187A as A020) |
-| HFXO | 39 MHz on the module; CTUNE 92 (RF-star datasheet §4, **unmeasured**) | 38.4 MHz, CTUNE 100 (community manifests, **unverified**) | 39 MHz; no `MFG_CTUNE` on this unit, so the BRD4187C default CTUNE 95 (**unmeasured**) |
-| host UART | USART0 TX PA05 (pin 12), RX PA06 (pin 13) → ESP32-S3 SuperMini; RTS PA07 / CTS PA08 claimed but unused | USART0 routed to TX PC01, RX PC02 → ESP32 GPIO13/GPIO17 (community builds use EUSART1 on the same pins, **unverified**) | USART0 to the WSTK VCOM, TX PA08, RX PA09, VCOM enable PB00; logs at 115 200 |
-| reset / boot | RESET_N (pin 36) open-drain from S3 GPIO6 (hub profile `S3_MG24_DEV`) and the J-Link; no boot-entry line (Gecko via `SYS_RESET` mode 1 once installed) | ESP32 GPIO15 → RESET (active low); GPIO12 high during reset → Gecko bootloader (the MG24 pin of that line is unknown) | WSTK J-Link (hwlab). GSDK `bootloader-uart-xmodem` (brd4187c); BTN0 (PB01) held at reset enters it |
-| debug | SWDIO PA02, SWCLK PA01, SWO PA03 (never claimed) | SWD pads unknown | WSTK J-Link OB, AEM current measurement |
-| other | 32.768 kHz LFXO, PCB antenna, no LED/button | no MG24 LED/button documented; RF path, stock TX power and LFXO unknown | LED0 PB02, LED1 PB04, BTN0 PB01, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna |
+| | RF-BM-MG24B1 dev board | SONOFF Dongle-M | BRD4187A on BRD4001A (radio lab) |EK2703A (MP radio lab) |
+|---|---|---|---|---|
+| part | EFR32MG24A410F1536IM48-B (+10 dBm) | EFR32MG24A420F1536IM48 (+20 dBm), SONOFF spec page | EFR32MG24B220F1536IM48 (+20 dBm; DEVINFO, although GSDK lists BRD4187A as A020) |EFR32MG24B210F1536IM48 (+10 dBm; DEVINFO) |
+| HFXO | 39 MHz on the module; CTUNE 92 (RF-star datasheet §4, **unmeasured**) | 38.4 MHz, CTUNE 100 (community manifests, **unverified**) | 39 MHz; no `MFG_CTUNE` on this unit, so the BRD4187C default CTUNE 95 (**unmeasured**) |39 MHz; no `MFG_CTUNE`, so the GSDK board CTUNE 100 (**unmeasured**) |
+| host UART | USART0 TX PA05 (pin 12), RX PA06 (pin 13) → ESP32-S3 SuperMini; RTS PA07 / CTS PA08 claimed but unused | USART0 routed to TX PC01, RX PC02 → ESP32 GPIO13/GPIO17 (community builds use EUSART1 on the same pins, **unverified**) | USART0 to the WSTK VCOM, TX PA08, RX PA09, VCOM enable PB00; logs at 115 200 |USART0 to the J-Link OB VCOM, TX PA05, RX PA06 (RTS PA08 / CTS PA09 unused); logs at 115 200 |
+| reset / boot | RESET_N (pin 36) open-drain from S3 GPIO6 (hub profile `S3_MG24_DEV`) and the J-Link; no boot-entry line (Gecko via `SYS_RESET` mode 1 once installed) | ESP32 GPIO15 → RESET (active low); GPIO12 high during reset → Gecko bootloader (the MG24 pin of that line is unknown) | WSTK J-Link (hwlab). GSDK `bootloader-uart-xmodem` (brd4187c); BTN0 (PB01) held at reset enters it |J-Link OB (hwlab). GSDK `bootloader-uart-xmodem` (brd2703a); BTN0 (PB02) held at reset enters it |
+| debug | SWDIO PA02, SWCLK PA01, SWO PA03 (never claimed) | SWD pads unknown | WSTK J-Link OB, AEM current measurement |J-Link OB; no current monitor |
+| other | 32.768 kHz LFXO, PCB antenna, no LED/button | no MG24 LED/button documented; RF path, stock TX power and LFXO unknown | LED0 PB02, LED1 PB04, BTN0 PB01, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna |LED0 PA04, LED1 PA07, BTN0 PB02, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna; mikroBUS, Qwiic |
 
 A programmed `MFG_CTUNE` token always wins over the board default.
 
@@ -950,17 +1028,20 @@ would not move it.
 
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
-| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 455,356 B | 168,536 B | 89,512 B |
+| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 455,580 B | 168,536 B | 89,512 B |
 | NCP, Dongle-M | 455,636 B | 168,536 B | 89,512 B |
-| Router, RF-BM-MG24B1 (GP Proxy Basic) | 344,548 B | 37,140 B | 224,492 B |
+| Router, RF-BM-MG24B1 (GP Proxy Basic) | 344,680 B | 37,140 B | 224,492 B |
 | Router, Dongle-M | 344,872 B | 37,140 B | 224,492 B |
 | Router, BRD4187 on a WSTK | 344,928 B | 37,136 B | 224,496 B |
+| Router, EK2703A | 344,680 B | 37,136 B | 224,496 B |
 
 The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
 MG24 image compared with `15ee9550`, the build-only base without a radio.
-Static RAM and stack did not change. The RF-BM-MG24B1 and Dongle-M
+Static RAM and stack did not change. The 10 dBm PA support added about
+130 B (Router) and 220 B (NCP) to the RF-BM-MG24B1 images. The BRD4187 and
+Dongle-M images are byte-identical with and without it. The Dongle-M
 images carry the shared PHY tables too, although their radio returns
-`Unsupported` (10 dBm PA, 38.4 MHz crystal).
+`Unsupported` (38.4 MHz crystal).
 
 The NCP uses 33 % of the application window and 66 % of SRAM for static
 data. The compact capacity tier is not needed. The recorded fatal resets
@@ -986,6 +1067,17 @@ Done on the BRD4187A (xG24 HP PA, 39 MHz):
   bootloader, which started the application through its
   `ApplicationProperties`.
 
+Done on the EK2703A (xG24 MP PA, 39 MHz):
+
+- **Identification and backup.** Same as on the BRD4187A. The factory
+  demo is kept in a verified backup.
+- **MP PA.** RAIL's power table, transitions and register values were
+  captured. TX output matches RAIL from −30 to +10 dBm. RX, Imm-Acks, ED
+  and beacons work. See [10 dBm PA](#10-dbm-mp-pa-ek2703a). The current
+  could not be compared: the kit has no AEM.
+- **Router.** Joined through the BRD4187A Router as its parent and resumed
+  after a reset.
+
 Open:
 
 1. **RF-BM-MG24B1.** Identify the module (`EFR32MG24AxxxF1536`), read
@@ -995,9 +1087,19 @@ Open:
    (`tools/efr32s2-lab`, feature `rfbm`, linked at `0x0800_0000` for a
    module without a bootloader). It prints the reset cause, DEVINFO, CTUNE,
    the LFRCO-vs-HFXO ratio and SE TRNG bytes, then echoes the UART.
-2. **MP (10 dBm) PA.** Capture RAIL's PA table, transitions and current on a
-   B210/A410 part (EK2703A or the RF-BM module) with the same scenarios and
-   sampler. Then set `SUPPORTED` for `efr32mg24-pa10`.
+2. **MP (10 dBm) PA: current and another die.** The MP current is
+   unmeasured. Measure the MP TX current against RAIL on a board with a
+   current monitor.
+
+   On the RF-BM-MG24B1 (enabled, same radio configuration as the EK2703A),
+   the first run should measure three things against RAILtest:
+
+   - the CTUNE frequency offset (datasheet CTUNE 92);
+   - the output;
+   - the current.
+
+   That run also checks the board-level items: the A410 die, the RF path
+   and the antenna.
 3. **38.4 MHz crystal.** Run raw TX/RX, ACK and current/output against
    RAILtest on a 38.4 MHz part (Dongle-M). Then widen `xg24::SUPPORTED`
    (today it requires `hfxo-39mhz`) and re-check the runtime trims on that

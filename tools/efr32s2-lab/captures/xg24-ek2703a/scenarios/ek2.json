@@ -1,0 +1,518 @@
+{
+ "uart": "cu.usbmodem0004403781041",
+ "jlink": "440378104",
+ "name": "mg24-ek-cap2",
+ "duration": "300s",
+ "out": "~/.hwlab/artifacts/mg24-ek2703a/ek2",
+ "dump_ms_per_block": 250,
+ "steps": [
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "config2p4GHz802154"
+  ],
+  [
+   "cli",
+   "setChannel 26"
+  ],
+  [
+   "cli",
+   "setPower -300"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-300"
+  ],
+  [
+   "cli",
+   "setPower -290"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-290"
+  ],
+  [
+   "cli",
+   "setPower -280"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-280"
+  ],
+  [
+   "cli",
+   "setPower -270"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-270"
+  ],
+  [
+   "cli",
+   "setPower -260"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-260"
+  ],
+  [
+   "cli",
+   "setPower -250"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-250"
+  ],
+  [
+   "cli",
+   "setPower -240"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-240"
+  ],
+  [
+   "cli",
+   "setPower -230"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-230"
+  ],
+  [
+   "cli",
+   "setPower -220"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-220"
+  ],
+  [
+   "cli",
+   "setPower -210"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-210"
+  ],
+  [
+   "cli",
+   "setPower -200"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-200"
+  ],
+  [
+   "cli",
+   "setPower -190"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-190"
+  ],
+  [
+   "cli",
+   "setPower -180"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-180"
+  ],
+  [
+   "cli",
+   "setPower -170"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-170"
+  ],
+  [
+   "cli",
+   "setPower -160"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-160"
+  ],
+  [
+   "cli",
+   "setPower -150"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-150"
+  ],
+  [
+   "cli",
+   "setPower -140"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-140"
+  ],
+  [
+   "cli",
+   "setPower -130"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-130"
+  ],
+  [
+   "cli",
+   "setPower -120"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-120"
+  ],
+  [
+   "cli",
+   "setPower -110"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-110"
+  ],
+  [
+   "cli",
+   "setPower -100"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-100"
+  ],
+  [
+   "cli",
+   "setPower -90"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-090"
+  ],
+  [
+   "cli",
+   "setPower -80"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-080"
+  ],
+  [
+   "cli",
+   "setPower -70"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-070"
+  ],
+  [
+   "cli",
+   "setPower -60"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-060"
+  ],
+  [
+   "cli",
+   "setPower -50"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-050"
+  ],
+  [
+   "cli",
+   "setPower -40"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-040"
+  ],
+  [
+   "cli",
+   "setPower -30"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-030"
+  ],
+  [
+   "cli",
+   "setPower -20"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-020"
+  ],
+  [
+   "cli",
+   "setPower -10"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr-010"
+  ],
+  [
+   "cli",
+   "setPower 0"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr+000"
+  ],
+  [
+   "cli",
+   "setPower 10"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr+010"
+  ],
+  [
+   "cli",
+   "setPower 20"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr+020"
+  ],
+  [
+   "cli",
+   "setPower 30"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr+030"
+  ],
+  [
+   "cli",
+   "setPower 40"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr+040"
+  ],
+  [
+   "cli",
+   "setPower 50"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr+050"
+  ],
+  [
+   "cli",
+   "setPower 60"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr+060"
+  ],
+  [
+   "cli",
+   "setPower 70"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr+070"
+  ],
+  [
+   "cli",
+   "setPower 80"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr+080"
+  ],
+  [
+   "cli",
+   "setPower 90"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr+090"
+  ],
+  [
+   "cli",
+   "setPower 100"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "dump-pa",
+   "pwr+100"
+  ],
+  [
+   "cli",
+   "getPowerConfig"
+  ]
+ ]
+}

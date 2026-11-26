@@ -1,0 +1,253 @@
+{
+ "uart": "cu.usbmodem0004403781041",
+ "jlink": "440378104",
+ "name": "mg24-ek-cap1",
+ "duration": "420s",
+ "out": "~/.hwlab/artifacts/mg24-ek2703a/ek1",
+ "steps": [
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "config2p4GHz802154"
+  ],
+  [
+   "cli",
+   "setChannel 26"
+  ],
+  [
+   "cli",
+   "setPower 100"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "cli",
+   "getPowerConfig"
+  ],
+  [
+   "cli",
+   "getCtune"
+  ],
+  [
+   "cli",
+   "getVersionVerbose"
+  ],
+  [
+   "sleep",
+   0.5
+  ],
+  [
+   "dump",
+   "idle-ch26"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.5
+  ],
+  [
+   "cli",
+   "getRadioState"
+  ],
+  [
+   "dump",
+   "rx-ch26"
+  ],
+  [
+   "cli",
+   "getRssi"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 15"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.5
+  ],
+  [
+   "dump",
+   "rx-ch15"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 26"
+  ],
+  [
+   "cli",
+   "setPower 0"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "cli",
+   "setTxTone 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "cli",
+   "getRadioState"
+  ],
+  [
+   "dump",
+   "tone-ch26-p0"
+  ],
+  [
+   "cli",
+   "setTxTone 0"
+  ],
+  [
+   "sleep",
+   0.2
+  ],
+  [
+   "cli",
+   "setPower 50"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "cli",
+   "setTxTone 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "cli",
+   "getRadioState"
+  ],
+  [
+   "dump",
+   "tone-ch26-p50"
+  ],
+  [
+   "cli",
+   "setTxTone 0"
+  ],
+  [
+   "sleep",
+   0.2
+  ],
+  [
+   "cli",
+   "setPower 100"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "cli",
+   "setTxTone 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "cli",
+   "getRadioState"
+  ],
+  [
+   "dump",
+   "tone-ch26-p100"
+  ],
+  [
+   "cli",
+   "setTxTone 0"
+  ],
+  [
+   "sleep",
+   0.2
+  ],
+  [
+   "cli",
+   "setPower -100"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "cli",
+   "setTxTone 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "cli",
+   "getRadioState"
+  ],
+  [
+   "dump",
+   "tone-ch26-p-100"
+  ],
+  [
+   "cli",
+   "setTxTone 0"
+  ],
+  [
+   "sleep",
+   0.2
+  ],
+  [
+   "cli",
+   "setPower 100"
+  ],
+  [
+   "cli",
+   "setTxStream 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump",
+   "stream-ch26-p100"
+  ],
+  [
+   "cli",
+   "setTxStream 0"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump",
+   "idle2-ch26"
+  ]
+ ]
+}

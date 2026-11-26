@@ -8,7 +8,11 @@
 //! channel and at every HP-PA level RAIL selects for -25..+20 dBm, plus an
 //! on-target sampler of RAIL's PA transitions (every ~11 us). The raw
 //! dumps, the capture method and a decoded summary are in
-//! `tools/efr32s2-lab/captures/xg24-brd4187a`. The static table is reduced
+//! `tools/efr32s2-lab/captures/xg24-brd4187a`. The 10 dBm (MP) PA values
+//! ([`PaPhy`], the MP [`TX_POWER`] table and PA words) come from the same
+//! captures on an EFR32MG24B210F1536IM48 (xG24 Explorer Kit EK2703A,
+//! BRD2703A A02, 39 MHz, CTUNE 100, DC-DC in bypass, RAIL ramp 10 us):
+//! `tools/efr32s2-lab/captures/xg24-ek2703a`. The static table is reduced
 //! to the read-write registers whose value differs from the GSDK radio
 //! configurator register map (`efr32xg24` rev A1) reset value; 192 of the
 //! 208 registers of GSDK's `sl_rail_ieee802154_config_39MHz.c` match the
@@ -45,9 +49,12 @@
 //! `hfxo-39mhz`: the tables build and are host-tested, the radio refuses to
 //! start.
 //!
-//! PA variants: only the HP PA (`efr32mg24-pa20`) has a captured power
-//! table; [`SUPPORTED`] is also `false` for `efr32mg24-pa10` (MP PA, e.g.
-//! A410/B210) until it is captured on such a part.
+//! PA variants: the HP PA (`efr32mg24-pa20`, BRD4187A, B220) and the MP PA
+//! (`efr32mg24-pa10`, EK2703A, B210) were each captured on one die. They
+//! differ in the RF path RAIL drives (0 and 1: one RF pin is bonded out),
+//! the PA trims and power programming, the PA power-up words and the IR
+//! calibration ([`PaPhy`]); the PHY, the per-state values of the shared
+//! blocks and the PA power-up order are the same.
 //!
 //! Deviations from the snapshot:
 //! - `RAC.CTRL` sets `SEQCLKDIS` and clears `CPUWAITDIS` (RAIL:
@@ -62,17 +69,20 @@
 
 use super::{
     AnalogState, CLR, Deadline, L, Layout, RAC_IF, RAC_IF_STATECHANGE, RacState, SYNTH_CHCTRL,
-    Warm, rac_state_raw, read, tx_power_entry, write,
+    Warm, rac_state_raw, read, write,
 };
 
-/// Radio tables are validated for the 20 dBm (HP) PA with a 39 MHz HFXO
-/// only (BRD4187A). The 38.4 MHz PHY (`not(hfxo-39mhz)`, e.g. the
-/// Dongle-M) is GSDK-derived and carries the 39 MHz die's runtime trims;
-/// it has never run, so such builds fail `RadioToken::init` with
-/// `Unsupported` instead of transmitting with unverified values. Widen
-/// this only after the hardware gates of the platform guide pass on that
-/// crystal.
-pub(super) const SUPPORTED: bool = cfg!(all(feature = "efr32mg24-pa20", feature = "hfxo-39mhz"));
+/// Radio tables are validated with a 39 MHz HFXO only: the 20 dBm (HP) PA
+/// on the BRD4187A and the 10 dBm (MP) PA on the EK2703A. The 38.4 MHz PHY
+/// (`not(hfxo-39mhz)`, e.g. the Dongle-M) is GSDK-derived and carries the
+/// 39 MHz dies' runtime trims; it has never run, so such builds fail
+/// `RadioToken::init` with `Unsupported` instead of transmitting with
+/// unverified values. Widen this only after the hardware gates of the
+/// platform guide pass on that crystal.
+pub(super) const SUPPORTED: bool = cfg!(all(
+    any(feature = "efr32mg24-pa20", feature = "efr32mg24-pa10"),
+    feature = "hfxo-39mhz"
+));
 
 /// `FRC_IRQn` and `RAC_RSM_IRQn` (GSDK 4.5.0 `efr32mg24*.h`).
 #[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
@@ -185,6 +195,98 @@ pub(super) const XTAL: XtalPhy = {
 };
 
 const X: XtalPhy = XTAL;
+
+// ---- PA-variant and die values ----------------------------------------------
+
+/// Registers that differ between the two captures besides the PA power
+/// programming: the PA variant (and with it the RF path: RAIL drives path 0
+/// on the 20 dBm B220 and path 1 on the 10 dBm B210, which bond out one RF
+/// pin each), and runtime calibrations RAIL wrote on each die. One die per
+/// variant was captured (BRD4187A, EK2703A), so the "die" values are that
+/// die's.
+pub(super) struct PaPhy {
+    /// `MODEM.IRCALCOEFWR0/1`. HP: RAIL's value is the DEVINFO word
+    /// ([`DEVINFO_IRCAL_APPLIES`]); MP: RAIL leaves all-ones (no IR
+    /// correction) although DEVINFO holds a word.
+    ircal: u32,
+    vcogain: u32,
+    lpfctrl2rx: u32,
+    lpfctrl2tx: u32,
+    vcoctrl: u32,
+    auxadctrim: u32,
+    ifadccal: u32,
+    lnamixtrim0: u32,
+    lnamixtrim3: u32,
+    lnamixtrim4: u32,
+    patrim2: u32,
+    patrim3: u32,
+    patrim5: u32,
+    pgatrim: u32,
+    pgacal: u32,
+    sytrim1: u32,
+    /// `RAC.RFPATHENn` of the bonded RF path (switched per state).
+    rfpathen: u32,
+    /// `RAC.PATRIM4` in TX (idle and RX: 0x4020).
+    tx_patrim4: u32,
+    /// `RAC.AGCOVERWRITE1` in TX: maximum manual LNA attenuation of the
+    /// active path (`MANLNAMIXRFATT0` or `MANLNAMIXRFATT1`).
+    tx_agcoverwrite1: u32,
+}
+
+/// 20 dBm (HP) PA, RF path 0: EFR32MG24B220 on the BRD4187A.
+#[cfg(not(feature = "efr32mg24-pa10"))]
+const P: PaPhy = PaPhy {
+    ircal: 0x80FB_FFEF,
+    vcogain: 0x0000_00CA,
+    lpfctrl2rx: 0x01CB_43A5,
+    lpfctrl2tx: 0x008D_23A5,
+    vcoctrl: 0x0000_0A4C,
+    auxadctrim: 0x16D5_55A2,
+    ifadccal: 0x0000_1A00,
+    lnamixtrim0: 0x0000_0150,
+    lnamixtrim3: 0x0000_020A,
+    lnamixtrim4: 0x3109_E702,
+    patrim2: 0x0000_0600,
+    patrim3: 0x008D_13EA,
+    patrim5: 0x001B_1500,
+    pgatrim: 0x0000_0F1D,
+    pgacal: 0x0000_1F22,
+    sytrim1: 0xCFF8_0410,
+    rfpathen: 0xB802_0160,
+    tx_patrim4: 0x00FF_4420,
+    tx_agcoverwrite1: 0x0000_007F,
+};
+
+/// 10 dBm (MP) PA, RF path 1: EFR32MG24B210 on the EK2703A (BRD2703A).
+/// `PATRIM3`/`SYTRIM1` are the values RAIL leaves after its first MP
+/// transmission (`SYLODIVLDOTRIMNDIOTX` 1 instead of 4, no 20 dBm LO
+/// delay); `LNAMIXTRIM0` is the reset value (inactive path).
+#[cfg(feature = "efr32mg24-pa10")]
+const P: PaPhy = PaPhy {
+    ircal: 0xFFFF_FFFF,
+    vcogain: 0x0000_00A9,
+    lpfctrl2rx: 0x01CB_4325,
+    lpfctrl2tx: 0x008D_2325,
+    vcoctrl: 0x0000_044C,
+    auxadctrim: 0x16D5_5522,
+    ifadccal: 0x0000_1200,
+    lnamixtrim0: 0x0000_0110,
+    lnamixtrim3: 0x0000_0288,
+    lnamixtrim4: 0x3109_2402,
+    patrim2: 0x0000_4011,
+    patrim3: 0x003A_10AA,
+    patrim5: 0x0017_1900,
+    pgatrim: 0x0000_0F19,
+    pgacal: 0x0000_2121,
+    sytrim1: 0xCFE0_0110,
+    rfpathen: 0xB802_0164,
+    tx_patrim4: 0x0000_4020,
+    tx_agcoverwrite1: 0x007F_0000,
+};
+
+/// Whether the shared driver writes the DEVINFO IR-calibration word over
+/// [`PaPhy::ircal`] (RAIL does on the HP part only).
+pub(super) const DEVINFO_IRCAL_APPLIES: bool = cfg!(not(feature = "efr32mg24-pa10"));
 
 /// Per-channel `SRCRATIO2`/`DIGMIXFREQ` from their channel-11 values. The
 /// IF ADC samples at a fixed fraction of the LO (`FREQ + IFFREQ` in synth
@@ -349,20 +451,20 @@ pub(super) const INIT: &[(u32, u32)] = &[
     (0xB8014238, 0x00000001),         // MODEM.SQI
     (0xB8014244, 0x00000014),         // MODEM.PHDMODANTDIV
     (0xB801424C, 0x04000008),         // MODEM.PHDMODCTRL
-    (0xB8014278, 0x80FBFFEF),         // MODEM.IRCALCOEFWR0 (golden; DEVINFO overrides)
-    (0xB801427C, 0x80FBFFEF),         // MODEM.IRCALCOEFWR1 (golden; DEVINFO overrides)
+    (0xB8014278, P.ircal),            // MODEM.IRCALCOEFWR0 (PA; HP: DEVINFO overrides)
+    (0xB801427C, P.ircal),            // MODEM.IRCALCOEFWR1 (PA; HP: DEVINFO overrides)
     (0xB8014280, 0x00000000),         // MODEM.ADCTRL1
     (0xB8014284, 0x00000081),         // MODEM.ADCTRL2
     (0xB8014308, 0x00000100),         // MODEM.ADFSM21
     (0xB8014400, 0x00000001),         // MODEM.SPARE
     (0xB8018004, 0x00000001),         // SYNTH.EN
     (0xB8018038, X.iffreq),           // SYNTH.IFFREQ (crystal)
-    (0xB8018058, 0x000000CA),         // SYNTH.VCOGAIN
+    (0xB8018058, P.vcogain),          // SYNTH.VCOGAIN (die)
     (0xB801809C, 0x000240EB),         // SYNTH.LPFCTRL1CAL
     (0xB80180A0, 0x00037870),         // SYNTH.LPFCTRL1RX
     (0xB80180A4, 0x0000C0D5),         // SYNTH.LPFCTRL1TX
-    (0xB80180A8, 0x01CB43A5),         // SYNTH.LPFCTRL2RX
-    (0xB80180AC, 0x008D23A5),         // SYNTH.LPFCTRL2TX
+    (0xB80180A8, P.lpfctrl2rx),       // SYNTH.LPFCTRL2RX (die)
+    (0xB80180AC, P.lpfctrl2tx),       // SYNTH.LPFCTRL2TX (die)
     (0xB80180B0, 0x02000300),         // SYNTH.DSMCTRLRX
     (0xB80180B4, 0x01000037),         // SYNTH.DSMCTRLTX
     (0xB8020004, 0x00000001),         // RAC.EN
@@ -370,28 +472,32 @@ pub(super) const INIT: &[(u32, u32)] = &[
     (0xB802003C, 0x00000011),         // RAC.SEQCTRL
     (0xB8020054, 0x01061A7F),         // RAC.STCTRL
     (0xB802009C, 0x02000C00),         // RAC.SYNTHREGCTRL
-    (0xB80200A0, 0x00000A4C),         // RAC.VCOCTRL
+    (0xB80200A0, P.vcoctrl),          // RAC.VCOCTRL (die)
     (0xB80200A4, 0x00004000),         // RAC.CHPCTRL
     (0xB80200B4, 0x0E200000),         // RAC.IFPGACTRL
     (0xB80200C0, 0x00000400),         // RAC.ANTDIV
-    (0xB80200C4, 0x16D555A2),         // RAC.AUXADCTRIM
+    (0xB80200C4, P.auxadctrim),       // RAC.AUXADCTRIM (die)
     (0xB80200EC, 0x11512F2C),         // RAC.IFADCTRIM0
     (0xB80200F0, 0x0000012B),         // RAC.IFADCTRIM1
-    (0xB80200F4, 0x00001A00),         // RAC.IFADCCAL
-    (0xB8020100, 0x00000150),         // RAC.LNAMIXTRIM0
+    (0xB80200F4, P.ifadccal),         // RAC.IFADCCAL (die)
+    (0xB8020100, P.lnamixtrim0),      // RAC.LNAMIXTRIM0 (RF path)
+    #[cfg(feature = "efr32mg24-pa10")]
+    (0xB8020104, 0x00000150), // RAC.LNAMIXTRIM1 (RF path 1)
     (0xB8020108, 0x545043D0),         // RAC.LNAMIXTRIM2
-    (0xB802010C, 0x0000020A),         // RAC.LNAMIXTRIM3
-    (0xB8020110, 0x3109E702),         // RAC.LNAMIXTRIM4
+    (0xB802010C, P.lnamixtrim3),      // RAC.LNAMIXTRIM3 (die)
+    (0xB8020110, P.lnamixtrim4),      // RAC.LNAMIXTRIM4 (die)
+    #[cfg(feature = "efr32mg24-pa10")]
+    (0xB8020120, 0x000000A4), // RAC.PATRIM0 (MP PA)
     (0xB8020124, 0x00034373),         // RAC.PATRIM1
-    (0xB8020128, 0x00000600),         // RAC.PATRIM2
-    (0xB802012C, 0x008D13EA),         // RAC.PATRIM3
-    (0xB8020134, 0x001B1500),         // RAC.PATRIM5
-    (0xB8020148, 0x00000F1D),         // RAC.PGATRIM
-    (0xB802014C, 0x00001F22),         // RAC.PGACAL
+    (0xB8020128, P.patrim2),          // RAC.PATRIM2 (PA)
+    (0xB802012C, P.patrim3),          // RAC.PATRIM3 (PA)
+    (0xB8020134, P.patrim5),          // RAC.PATRIM5 (PA)
+    (0xB8020148, P.pgatrim),          // RAC.PGATRIM (die)
+    (0xB802014C, P.pgacal),           // RAC.PGACAL (die)
     (0xB8020154, 0x30111A17),         // RAC.RFBIASCAL
     (0xB8020158, 0x00040004),         // RAC.RFBIASCTRL
     (0xB8020174, 0x0C1B8169),         // RAC.SYTRIM0
-    (0xB8020178, 0xCFF80410),         // RAC.SYTRIM1
+    (0xB8020178, P.sytrim1),          // RAC.SYTRIM1 (PA)
     (0xB8020188, 0x00000050),         // RAC.SYMMDCTRL
     (0xB8020198, 0x00000770),         // RAC.XORETIMECTRL
 ];
@@ -411,7 +517,7 @@ const RAC_STATE_REGS: [u32; STATE_REGS] = [
     0xB802_0130, // RAC.PATRIM4
     0xB802_0150, // RAC.PGACTRL
     0xB802_015C, // RAC.RADIOEN
-    0xB802_0160, // RAC.RFPATHEN0
+    P.rfpathen,  // RAC.RFPATHEN0 (HP) / RFPATHEN1 (MP)
     0xB802_0168, // RAC.RX
     0xB802_016C, // RAC.TX
     0xB802_0180, // RAC.SYEN
@@ -428,6 +534,7 @@ const MODEM_IRCAL: u32 = 0xB801_4270;
 /// the PA then takes slice and power from `RAC.PACTRL` instead of the
 /// MODEM ramp.
 const MODEM_PADEBUG: u32 = 0xB801_41B0;
+#[cfg_attr(feature = "efr32mg24-pa10", allow(dead_code))]
 const PADEBUG_MANUAL: u32 = 0x1800;
 
 /// `RAC.PAENCTRL.INVRAMPCLK`; `PARAMP` is driven by [`pa_ramp_up`].
@@ -477,22 +584,22 @@ pub(super) const TX: AnalogState = AnalogState {
     regs: &RAC_STATE_REGS,
     values: [
         0x0010_0600, PAENCTRL_IDLE, 0x0000_001E, 0x0000_0008,
-        0x00FF_4420, 0x00A2_80C1, 0x0000_0007, 0x0000_0042,
+        P.tx_patrim4, 0x00A2_80C1, 0x0000_0007, 0x0000_0042,
         0x0006_00A0, TX_PA_BIAS,   0x0000_077B, 0x0000_080E,
         // RAIL holds the LNA at manual maximum attenuation while it
         // transmits (shared antenna path).
-        0x0000_0003, 0x0000_007F,
+        0x0000_0003, P.tx_agcoverwrite1,
     ],
     extra: &[
         (SYNTH_VCDACCTRL, 0xA5),
         (SYNTH_VCORANGE, 0x158),
         (MODEM_IRCAL, 0),
-        // Manual PA slice/power (`PADEBUG_MANUAL`) from `pa_ramp_up`.
+        // HP: manual PA slice/power (`PADEBUG_MANUAL`) from `pa_ramp_up`.
         (MODEM_PADEBUG, 0),
     ],
 };
 
-// ---- HP PA power ------------------------------------------------------------
+// ---- PA power ---------------------------------------------------------------
 
 /// `(deci-dBm, MODEM.RAMPLEV, RAC.PACTRL)` as programmed by GSDK 4.5.0
 /// `RAIL_SetTxPowerDbm` on the BRD4187A (2P4GIG_HP, 3.3 V, RAIL ramp 6 us),
@@ -534,15 +641,41 @@ pub(super) const TX_POWER: &[(i16, u8, u16)] = &[
     (200, 0xD1, 0xB0E0),
 ];
 
-/// No validated MP-PA (10 dBm) table. The single entry only keeps the
-/// shared driver's table lookup total; it is never programmed because
-/// [`SUPPORTED`] is false for `efr32mg24-pa10`.
-#[cfg(not(feature = "efr32mg24-pa20"))]
-pub(super) const TX_POWER: &[(i16, u8, u16)] = &[(0, 0, 0)];
+/// `(deci-dBm, MODEM.RAMPLEV, MODEM.RAMPCTRL)` as programmed by GSDK 4.5.0
+/// `RAIL_SetTxPowerDbm` on the EK2703A (EFR32MG24B210, 2P4GIG_HIGHEST = MP
+/// PA, 3.3 V, RAIL ramp 10 us), RAIL raw levels 0..=79, with RAIL's
+/// reported output power (its PA-curve estimate). The MP PA takes its
+/// power from the MODEM ramp (`PADEBUG` stays 0, `PACTRL` holds only
+/// `TXPASELPREDRVREGVDDPA` in TX): `RAMPLEV` is the level (raw + 16..21),
+/// `RAMPCTRL` the per-band ramp rate RAIL switches with it. Ascending power.
+#[cfg(feature = "efr32mg24-pa10")]
+pub(super) const TX_POWER: &[(i16, u8, u16)] = &[
+    (-300, 0x10, 0x999),
+    (-229, 0x11, 0x999),
+    (-173, 0x12, 0x999),
+    (-118, 0x13, 0x999),
+    (-62, 0x14, 0x999),
+    (-54, 0x15, 0x999),
+    (-40, 0x16, 0x888),
+    (-28, 0x17, 0x888),
+    (-17, 0x18, 0x888),
+    (-2, 0x1A, 0x888),
+    (5, 0x1B, 0x888),
+    (16, 0x1D, 0x888),
+    (27, 0x1F, 0x888),
+    (38, 0x23, 0x888),
+    (49, 0x26, 0x888),
+    (60, 0x2B, 0x888),
+    (69, 0x31, 0x777),
+    (80, 0x3A, 0x777),
+    (90, 0x4F, 0x777),
+    (100, 0x64, 0x666),
+];
 
 /// DEVINFO bytes 0x250..0x25B: HP-PA ramp level per slice 1..=12 (on the
 /// captured die `D6 D5 D5 D5 D5 D4 D3 D3 D2 D2 D1 D0`, exactly the
 /// `MODEM.RAMPLEV` RAIL programs for each slice).
+#[cfg(not(feature = "efr32mg24-pa10"))]
 pub(super) const DEVINFO_RAMPLEV: u32 = 0x0FE0_8250;
 
 /// `MODEM.RAMPLEV` offset (0xCC on xG22).
@@ -553,6 +686,7 @@ const PACTRL_TX: u32 = 1 << 10;
 
 /// Ramp level of a `PACTRL` setting: the slice's DEVINFO byte, else
 /// `fallback`.
+#[cfg(not(feature = "efr32mg24-pa10"))]
 fn ramp_level(pa: u16, fallback: u8) -> u8 {
     let slice = u32::from((pa >> 12) & 0xF);
     if slice == 0 {
@@ -567,6 +701,7 @@ fn ramp_level(pa: u16, fallback: u8) -> u8 {
 
 /// Program a [`TX_POWER`] entry: all three ramp levels and the idle
 /// `PACTRL` (slice and power).
+#[cfg(not(feature = "efr32mg24-pa10"))]
 pub(super) fn write_tx_power(ramplev: u8, pa: u16) {
     let lev = u32::from(ramp_level(pa, ramplev));
     unsafe {
@@ -576,19 +711,44 @@ pub(super) fn write_tx_power(ramplev: u8, pa: u16) {
 }
 
 /// `PACTRL` for TX (after [`TX`] was applied).
+#[cfg(not(feature = "efr32mg24-pa10"))]
 pub(super) fn tx_state_power(ddbm: i16) {
-    let (_, _, pa) = tx_power_entry(ddbm);
+    let (_, _, pa) = super::tx_power_entry(ddbm);
     unsafe { write(RAC_PACTRL, u32::from(pa) | PACTRL_TX) };
+}
+
+/// `MODEM.RAMPCTRL` (0x555 at reset, which the HP capture kept).
+#[cfg(feature = "efr32mg24-pa10")]
+const MODEM_RAMPCTRL: u32 = 0xD8;
+
+/// Program a [`TX_POWER`] entry of the MP PA: the three ramp levels and
+/// the ramp rate; `PACTRL` carries no slice or power.
+#[cfg(feature = "efr32mg24-pa10")]
+pub(super) fn write_tx_power(ramplev: u8, rampctrl: u16) {
+    let lev = u32::from(ramplev);
+    unsafe {
+        write(L.modem + MODEM_RAMPLEV, lev | (lev << 8) | (lev << 16));
+        write(L.modem + MODEM_RAMPCTRL, u32::from(rampctrl));
+        write(RAC_PACTRL, 0);
+    }
+}
+
+/// `PACTRL` for TX on the MP PA: `TXPASELPREDRVREGVDDPA` only.
+#[cfg(feature = "efr32mg24-pa10")]
+pub(super) fn tx_state_power(_ddbm: i16) {
+    unsafe { write(RAC_PACTRL, PACTRL_TX) };
 }
 
 // ---- PA power ramp ----------------------------------------------------------
 //
-// The sequence follows RAIL's TX transition on the BRD4187A, sampled by an
-// on-target loop every 11 us at 0, 5, 10, 15 and 20 dBm (identical at every
-// level apart from `PACTRL`):
+// The sequence follows RAIL's TX transition, sampled by an on-target loop
+// every 11 us: on the BRD4187A (HP) at 0, 5, 10, 15 and 20 dBm, on the
+// EK2703A (MP) at -30, -10, 0, 5 and 10 dBm (identical at every level apart
+// from the power registers):
 //
-// 1. `PACTRL.TXPASLICERST` set, `MODEM.PADEBUG` manual slice/power,
-//    `RAC.TX` = regulators, bleeders, 20 dBm `VMID`, power/slice enables;
+// 1. `PACTRL.TXPASLICERST` set (with `TXPASELPREDRVREGVDDPA`), on the HP PA
+//    `MODEM.PADEBUG` manual slice/power, `RAC.TX` = regulators, bleeders,
+//    power/slice enables (+ the 20 dBm `VMID` on HP);
 // 2. 11..40 us later `RAC.TX` = output stages with `TXPAENRAMPCLK`, slice
 //    reset released, `PAENCTRL.PARAMP` set;
 // 3. after the ramp `RAC.TX` = steady value (bleeders and ramp clock off).
@@ -604,18 +764,42 @@ const RFSTATUS_MODRAMPUPDONE: u32 = 1 << 0;
 const RAC_PAENCTRL: u32 = 0xB802_00B8;
 const PAENCTRL_PARAMP: u32 = 1 << 8;
 const RAC_TX: u32 = 0xB802_016C;
-/// RAIL reports a 6 us ramp (`MODEM.RAMPCTRL` 0x555); bounded wait.
+/// Bounded wait for `MODRAMPUPDONE`. HP: RAIL reports a 6 us ramp
+/// (`MODEM.RAMPCTRL` 0x555). MP: RAIL ramps over 10 us and slower at low
+/// levels (`RAMPCTRL` 0x999; up to 36 us between sampled steps).
+#[cfg(not(feature = "efr32mg24-pa10"))]
 const PA_RAMP_US: u32 = 30;
+#[cfg(feature = "efr32mg24-pa10")]
+const PA_RAMP_US: u32 = 60;
 /// `PACTRL.TXPASLICERST`.
 const PACTRL_SLICERST: u32 = 1 << 16;
-/// Step 1: `TXPAENREG`, `TXPAENBLEEDPREDRVREG`, `TXPAENBLEEDREG`,
+/// Step 1 (HP): `TXPAENREG`, `TXPAENBLEEDPREDRVREG`, `TXPAENBLEEDREG`,
 /// `SYCHPBIASTRIMBUFTX`, `TXPAEN20DBMVMID`, `ENPAPOWER`, `ENPASELSLICE`.
+#[cfg(not(feature = "efr32mg24-pa10"))]
 const TX_PA_PRESTAGE: u32 = 0xC401_3001;
-/// Step 2 and `TXPD`: adds `TXPAENRAMPCLK`, `TXPAENPAOUT`,
+/// Step 2 and `TXPD` (HP): adds `TXPAENRAMPCLK`, `TXPAENPAOUT`,
 /// `TXPAENPREDRVREG` and the 20 dBm stages (bits 22..25).
+#[cfg(not(feature = "efr32mg24-pa10"))]
 const TX_PA_RAMP: u32 = 0xC3C1_F003;
-/// Step 3: steady TX.
+/// Step 3 (HP): steady TX.
+#[cfg(not(feature = "efr32mg24-pa10"))]
 const TX_PA_ON: u32 = 0xC3C1_C001;
+/// HP: slice and power come from `PACTRL` (manual), not the ramp.
+#[cfg(not(feature = "efr32mg24-pa10"))]
+const TX_PADEBUG: u32 = PADEBUG_MANUAL;
+/// Step 1 (MP): as HP without the 20 dBm `VMID`.
+#[cfg(feature = "efr32mg24-pa10")]
+const TX_PA_PRESTAGE: u32 = 0xC001_3001;
+/// Step 2 and `TXPD` (MP): `TXPAENRAMPCLK`, `TXPAENPAOUT`,
+/// `TXPAENPREDRVREG`, `TXPAEN10DBM` and `TXPAEN10DBMPREDRV`.
+#[cfg(feature = "efr32mg24-pa10")]
+const TX_PA_RAMP: u32 = 0xC029_F003;
+/// Step 3 (MP): steady TX (RAIL `0xC029C001`).
+#[cfg(feature = "efr32mg24-pa10")]
+const TX_PA_ON: u32 = 0xC029_C001;
+/// MP: the level comes from the MODEM ramp (`RAMPLEV`), `PADEBUG` stays 0.
+#[cfg(feature = "efr32mg24-pa10")]
+const TX_PADEBUG: u32 = 0;
 /// RAIL: pre-stage 11..40 us, ramp clock 11..35 us; the longer values.
 const PA_PRESTAGE_US: u32 = 40;
 const PA_RAMP_CLK_US: u32 = 16;
@@ -651,7 +835,7 @@ pub(super) const PA_RAMP_IN_TXPD: bool = true;
 pub(super) fn pa_ramp_up() {
     set_bits(RAC_PACTRL, PACTRL_SLICERST, true);
     unsafe {
-        write(MODEM_PADEBUG, PADEBUG_MANUAL);
+        write(MODEM_PADEBUG, TX_PADEBUG);
         write(RAC_TX, TX_PA_PRESTAGE);
     }
     delay_us(PA_PRESTAGE_US);
@@ -672,8 +856,15 @@ pub(super) fn pa_ramp_down() {
 }
 
 /// `RAC.TX` with the PA regulators off and their bleeders on (RAIL's
-/// `TXPD` exit, frame snapshot), then the idle value.
-const TX_BLEED: u32 = 0xC3C1_3000;
+/// `TXPD` exit, HP frame snapshot `0xC3C1_3000`), then the idle value.
+const TX_BLEED: u32 = (TX_PA_ON & !(TX_PAENREG | TX_PAENPAOUT | TX_PAENPREDRVREG)) | TX_PABLEEDERS;
+const TX_PAENREG: u32 = 1 << 0;
+const TX_PAENPAOUT: u32 = 1 << 14;
+const TX_PAENPREDRVREG: u32 = 1 << 15;
+/// `TXPAENBLEEDPREDRVREG` | `TXPAENBLEEDREG`.
+const TX_PABLEEDERS: u32 = 0x3000;
+#[cfg(not(feature = "efr32mg24-pa10"))]
+const _: () = assert!(TX_BLEED == 0xC3C1_3000);
 const RAC_AGCOVERWRITE0: u32 = 0xB802_01A0;
 const RAC_AGCOVERWRITE1: u32 = 0xB802_01A4;
 

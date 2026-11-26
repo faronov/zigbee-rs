@@ -53,7 +53,7 @@ required-features = ["rfbm"]
 [[bin]]
 name = "s2-mg24-air"
 path = "src/bin/mg24_air.rs"
-required-features = ["brd4187"]
+required-features = ["mg24-vcom"]
 
 [features]
 default = ["wstk"]
@@ -64,13 +64,20 @@ wstk = ["efr32s2-hal/efr32mg22"]
 zbt1 = ["efr32s2-hal/efr32mg21"]
 # RF-BM-MG24B1 dev board (EFR32MG24A410, 39 MHz): image at 0x0800_0000 on a
 # module without a bootloader, log on the USART0 host link (PA05/PA06).
-# Only `s2-mg24-hello` builds for it so far (no 10 dBm PA table yet).
+# Only `s2-mg24-hello` builds for it so far.
 rfbm = ["dep:rf-bm-mg24b1"]
 # BRD4001A + BRD4187 (EFR32MG24B220, 20 dBm PA, 39 MHz): image at
 # 0x0800_0000 (no bootloader on the lab board), log and commands on the
 # VCOM (USART0 PA8/PA9, enable PB0). Builds the radio gates and
 # `s2-mg24-air`.
-brd4187 = ["dep:efr32mg24-brd4187"]
+brd4187 = ["dep:efr32mg24-brd4187", "mg24-vcom"]
+# xG24 Explorer Kit EK2703A (EFR32MG24B210, 10 dBm PA, 39 MHz): image at
+# 0x0800_0000 (factory demo replaced; no bootloader), log and commands on
+# the J-Link OB VCOM (USART0 PA5/PA6). Builds `s2-mg24-air`.
+ek2703 = ["dep:efr32mg24-ek2703a", "mg24-vcom"]
+# Internal: an EFR32MG24 board crate with the interrupt-driven VCOM
+# (`brd4187`, `ek2703`).
+mg24-vcom = []
 
 [dependencies]
 efr32s2-hal = { path = "../../efr32s2-hal", features = ["rt", "time-driver"] }
@@ -80,6 +87,7 @@ cortex-m-rt = { version = "0.7", features = ["device"] }
 embedded-hal = "1.0"
 rf-bm-mg24b1 = { path = "../../boards/rf-bm-mg24b1", optional = true, features = ["host-uart"] }
 efr32mg24-brd4187 = { path = "../../boards/efr32mg24-brd4187", optional = true, features = ["host-uart"] }
+efr32mg24-ek2703a = { path = "../../boards/efr32mg24-ek2703a", optional = true, features = ["host-uart"] }
 
 [profile.dev]
 opt-level = "s"

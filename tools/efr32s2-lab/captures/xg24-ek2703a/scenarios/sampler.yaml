@@ -1,0 +1,40 @@
+name: mg24-ek-sampler
+duration: 24s
+devices:
+  vcom: {plugin: uart, device: cu.usbmodem0004403781041, baud: 115200, lines: true}
+  dbg: {plugin: jlink, device: "440378104", target: EFR32MG24BXXXF1536, control: true}
+steps:
+  - {name: c0, at: 1500ms, device: vcom, call: SerialTransport.write, args: {data: "rx 0", eol: crlf}}
+  - {name: c1, at: 1900ms, device: vcom, call: SerialTransport.write, args: {data: "config2p4GHz802154", eol: crlf}}
+  - {name: c2, at: 2300ms, device: vcom, call: SerialTransport.write, args: {data: "setChannel 26", eol: crlf}}
+  - {name: c3, at: 2700ms, device: vcom, call: SerialTransport.write, args: {data: "setTxTransitions idle idle", eol: crlf}}
+  - {name: c4, at: 3100ms, device: vcom, call: SerialTransport.write, args: {data: "setPower 100", eol: crlf}}
+  - {name: c5, at: 3500ms, device: vcom, call: SerialTransport.write, args: {data: "getPower", eol: crlf}}
+  - {name: c6, at: 3900ms, device: vcom, call: SerialTransport.write, args: {data: "setTxPayload 0 0x1f", eol: crlf}}
+  - {name: c7, at: 4300ms, device: vcom, call: SerialTransport.write, args: {data: "setTxLength 30", eol: crlf}}
+  - {name: go100, at: 4700ms, device: dbg, call: MemoryAccess.write, args: {address: "0x20000CEC", data: "01000000"}}
+  - {name: rd100, at: 5500ms, device: dbg, call: MemoryAccess.read, args: {address: "0x20000CE8", length: 27296, path: "~/.hwlab/artifacts/mg24-ek2703a/sampler/p100.bin", overwrite: true}}
+  - {name: c10, at: 6700ms, device: vcom, call: SerialTransport.write, args: {data: "setPower 50", eol: crlf}}
+  - {name: c11, at: 7100ms, device: vcom, call: SerialTransport.write, args: {data: "getPower", eol: crlf}}
+  - {name: c12, at: 7500ms, device: vcom, call: SerialTransport.write, args: {data: "setTxPayload 0 0x1f", eol: crlf}}
+  - {name: c13, at: 7900ms, device: vcom, call: SerialTransport.write, args: {data: "setTxLength 30", eol: crlf}}
+  - {name: go50, at: 8300ms, device: dbg, call: MemoryAccess.write, args: {address: "0x20000CEC", data: "01000000"}}
+  - {name: rd50, at: 9100ms, device: dbg, call: MemoryAccess.read, args: {address: "0x20000CE8", length: 27296, path: "~/.hwlab/artifacts/mg24-ek2703a/sampler/p50.bin", overwrite: true}}
+  - {name: c16, at: 10300ms, device: vcom, call: SerialTransport.write, args: {data: "setPower 0", eol: crlf}}
+  - {name: c17, at: 10700ms, device: vcom, call: SerialTransport.write, args: {data: "getPower", eol: crlf}}
+  - {name: c18, at: 11100ms, device: vcom, call: SerialTransport.write, args: {data: "setTxPayload 0 0x1f", eol: crlf}}
+  - {name: c19, at: 11500ms, device: vcom, call: SerialTransport.write, args: {data: "setTxLength 30", eol: crlf}}
+  - {name: go0, at: 11900ms, device: dbg, call: MemoryAccess.write, args: {address: "0x20000CEC", data: "01000000"}}
+  - {name: rd0, at: 12700ms, device: dbg, call: MemoryAccess.read, args: {address: "0x20000CE8", length: 27296, path: "~/.hwlab/artifacts/mg24-ek2703a/sampler/p0.bin", overwrite: true}}
+  - {name: c22, at: 13900ms, device: vcom, call: SerialTransport.write, args: {data: "setPower -100", eol: crlf}}
+  - {name: c23, at: 14300ms, device: vcom, call: SerialTransport.write, args: {data: "getPower", eol: crlf}}
+  - {name: c24, at: 14700ms, device: vcom, call: SerialTransport.write, args: {data: "setTxPayload 0 0x1f", eol: crlf}}
+  - {name: c25, at: 15100ms, device: vcom, call: SerialTransport.write, args: {data: "setTxLength 30", eol: crlf}}
+  - {name: go-100, at: 15500ms, device: dbg, call: MemoryAccess.write, args: {address: "0x20000CEC", data: "01000000"}}
+  - {name: rd-100, at: 16300ms, device: dbg, call: MemoryAccess.read, args: {address: "0x20000CE8", length: 27296, path: "~/.hwlab/artifacts/mg24-ek2703a/sampler/p-100.bin", overwrite: true}}
+  - {name: c28, at: 17500ms, device: vcom, call: SerialTransport.write, args: {data: "setPower -300", eol: crlf}}
+  - {name: c29, at: 17900ms, device: vcom, call: SerialTransport.write, args: {data: "getPower", eol: crlf}}
+  - {name: c30, at: 18300ms, device: vcom, call: SerialTransport.write, args: {data: "setTxPayload 0 0x1f", eol: crlf}}
+  - {name: c31, at: 18700ms, device: vcom, call: SerialTransport.write, args: {data: "setTxLength 30", eol: crlf}}
+  - {name: go-300, at: 19100ms, device: dbg, call: MemoryAccess.write, args: {address: "0x20000CEC", data: "01000000"}}
+  - {name: rd-300, at: 19900ms, device: dbg, call: MemoryAccess.read, args: {address: "0x20000CE8", length: 27296, path: "~/.hwlab/artifacts/mg24-ek2703a/sampler/p-300.bin", overwrite: true}}

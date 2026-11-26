@@ -1,5 +1,6 @@
 //! EFR32MG24 over-the-air radio gates (BRD4187 on a BRD4001A, feature
-//! `brd4187`), driven by line commands on the WSTK VCOM so an hwlab
+//! `brd4187`; xG24 Explorer Kit EK2703A, feature `ek2703`), driven by line
+//! commands on the board's VCOM so an hwlab
 //! experiment can line them up with the AEM, the nRF sniffer and frames
 //! injected by the nRF radio lab.
 //!

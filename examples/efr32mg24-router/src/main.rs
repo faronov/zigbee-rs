@@ -1,7 +1,8 @@
 //! zigbee-rs Router for EFR32MG24 boards (composition root): an HA Range
 //! Extender with the Green Power Proxy Basic on the RF-BM-MG24B1 dev board
-//! (default), the SONOFF Dongle-M (`--features sonoff-dongle-m`) or a
-//! BRD4187 radio board on a BRD4001A WSTK (`--features wstk-brd4187`).
+//! (default), the SONOFF Dongle-M (`--features sonoff-dongle-m`), a
+//! BRD4187 radio board on a BRD4001A WSTK (`--features wstk-brd4187`) or an
+//! xG24 Explorer Kit EK2703A (`--features ek2703a`).
 //!
 //! The radio is the pure-Rust Series 2 driver as a parent MAC (interrupt
 //! Imm-Ack, HAL-owned Frame Pending); the lifecycle is
@@ -14,9 +15,11 @@
 //! Status: on a BRD4187A (xG24 20 dBm PA, 39 MHz) it joined a test network,
 //! passed the interview, sent Imm-Acks from the interrupt in 174-181 us
 //! (sniffer) and resumed from its journals after a reset and a reflash.
-//! RF-BM-MG24B1 images (10 dBm PA, no captured table) and Dongle-M images
-//! (38.4 MHz crystal, PHY not verified) fail radio init with `Unsupported`,
-//! log it and halt.
+//! On an EK2703A (10 dBm PA) it joined the same network through the BRD4187A
+//! router as its parent, with Imm-Acks in 158-169 us, and resumed after a
+//! reset. RF-BM-MG24B1 images use those 10 dBm tables but have not run;
+//! Dongle-M images (38.4 MHz crystal, PHY not verified) fail radio init
+//! with `Unsupported`, log it and halt.
 
 #![no_std]
 #![no_main]
@@ -205,7 +208,7 @@ fn compose(
     flash: efr32s2_hal::flash::Efr32s2Flash,
 ) -> &'static mut App {
     // Fails with `Unsupported` where the xG24 tables are not validated: the
-    // 10 dBm PA (RF-BM-MG24B1) and the 38.4 MHz crystal (Dongle-M).
+    // 38.4 MHz crystal (Dongle-M).
     let mac: Mac = Efr32s2RadioPhy::new(radio)
         .map_err(|error| log::error!("[MG24] radio init failed: {error:?}"))
         .and_then(|phy| {

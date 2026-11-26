@@ -19,10 +19,10 @@
 //! mode 1 reboots into it (GBL over XMODEM at 115 200); `FW_*` is not
 //! built in.
 //!
-//! Status: builds and links; no MG24 has run it. On both boards the radio
-//! init returns `Unsupported` and the image halts before the NCP starts:
-//! the RF-BM-MG24B1 has the 10 dBm PA (no captured table) and the Dongle-M
-//! a 38.4 MHz crystal (the xG24 tables are verified at 39 MHz only; see
+//! Status: builds and links; no MG24 has run it. The RF-BM-MG24B1 image
+//! uses the 10 dBm PA tables verified on an EK2703A; on the Dongle-M (38.4
+//! MHz crystal, PHY not verified) the radio init returns `Unsupported` and
+//! the image halts before the NCP starts (see
 //! `efr32s2-hal/src/radio/xg24.rs`).
 
 #![no_std]
@@ -286,7 +286,7 @@ fn compose_device(
     profile: &Profile,
 ) -> (&'static mut ZigbeeDevice<Mac, Router>, [u8; 8]) {
     static DEVICE: StaticCell<ZigbeeDevice<Mac, Router>> = StaticCell::new();
-    // Fails with `Unsupported` on both boards (10 dBm PA, 38.4 MHz crystal).
+    // Fails with `Unsupported` on the Dongle-M (38.4 MHz crystal).
     let mac: Mac = Efr32s2RadioPhy::new(radio)
         .ok()
         .and_then(|phy| phy.into_parent_mac().ok())

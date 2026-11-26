@@ -1085,7 +1085,7 @@ fn program_phy() {
             write(address, value);
         }
         let ircal = read(chip::DEVINFO_IRCAL);
-        if ircal != u32::MAX {
+        if chip::DEVINFO_IRCAL_APPLIES && ircal != u32::MAX {
             write(chip::MODEM_IRCALCOEFWR0, ircal);
             write(chip::MODEM_IRCALCOEFWR1, ircal);
         }
@@ -1581,21 +1581,17 @@ mod tests {
         assert_eq!(TX_POWER_RANGE_DBM, (-30, 20));
         #[cfg(all(feature = "efr32mg24-pa20", feature = "hfxo-39mhz"))]
         assert_eq!(TX_POWER_RANGE_DBM, (-24, 20));
-        #[cfg(any(
-            feature = "efr32mg24-pa10",
-            all(feature = "efr32mg24-pa20", not(feature = "hfxo-39mhz"))
-        ))]
+        #[cfg(all(feature = "efr32mg24-pa10", feature = "hfxo-39mhz"))]
+        assert_eq!(TX_POWER_RANGE_DBM, (-30, 10));
+        #[cfg(all(feature = "efr32mg24", not(feature = "hfxo-39mhz")))]
         assert_eq!(TX_POWER_RANGE_DBM, (0, 0));
     }
 
     #[test]
-    #[cfg(any(
-        feature = "efr32mg24-pa10",
-        all(feature = "efr32mg24-pa20", not(feature = "hfxo-39mhz"))
-    ))]
+    #[cfg(all(feature = "efr32mg24", not(feature = "hfxo-39mhz")))]
     fn xg24_unverified_variants_are_explicitly_unsupported() {
-        // No captured MP-PA table, or the never-run 38.4 MHz PHY: init must
-        // fail before any radio access.
+        // The never-run 38.4 MHz PHY: init must fail before any radio
+        // access.
         const { assert!(!chip::SUPPORTED) };
         let token = RadioToken::new();
         assert!(matches!(token.init(), Err(RadioError::Unsupported)));
@@ -1647,6 +1643,22 @@ mod tests {
         assert_eq!(tx_power_entry(200), (200, 0xD1, 0xB0E0));
         assert_eq!(tx_power_entry(300).0, 200);
         assert_eq!(tx_power_entry(-1000).0, -249);
+    }
+
+    #[test]
+    #[cfg(feature = "efr32mg24-pa10")]
+    fn xg24_mp_power_table() {
+        // Supported only with the 39 MHz crystal the table was captured on.
+        const { assert!(chip::SUPPORTED == cfg!(feature = "hfxo-39mhz")) };
+        // RAIL_SetTxPowerDbm(0 / 50 / 100) on the EK2703A: raw levels 10,
+        // 21 and 79.
+        assert_eq!(tx_power_entry(0), (-2, 0x1A, 0x888));
+        assert_eq!(tx_power_entry(50), (49, 0x26, 0x888));
+        assert_eq!(tx_power_entry(100), (100, 0x64, 0x666));
+        assert_eq!(tx_power_entry(200).0, 100);
+        assert_eq!(tx_power_entry(-1000).0, -300);
+        // MP: no DEVINFO IR word, no 20 dBm path.
+        const { assert!(!chip::DEVINFO_IRCAL_APPLIES) };
     }
 
     #[test]
