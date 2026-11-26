@@ -1583,6 +1583,18 @@ mod tests {
         bdb
     }
 
+    /// An abandoned initial commissioning forgets the Trust Center, so the
+    /// next steering can join a network with another one.
+    #[test]
+    fn abandoned_initial_commissioning_forgets_the_trust_center() {
+        let mut bdb = steerable_bdb();
+        assert_eq!(bdb.zdo().aps().aib().aps_trust_center_address, TEST_TC_IEEE);
+        bdb.abandon_initial_commissioning();
+        assert_eq!(bdb.zdo().aps().aib().aps_trust_center_address, [0; 8]);
+        assert!(!bdb.zdo().aps().aib().aps_designated_coordinator);
+        assert!(!bdb.is_on_network());
+    }
+
     fn mac_short_address(bdb: &BdbLayer<MockMac>) -> u16 {
         match block_on(
             bdb.zdo()
@@ -3648,6 +3660,8 @@ impl<M: MacDriver> BdbLayer<M> {
             .aps_mut()
             .security_mut()
             .remove_key(tc_ieee, ApsKeyType::TrustCenterLinkKey);
+        // The next steering may find another network.
+        self.zdo.aps_mut().aib_mut().forget_trust_center();
         self.attributes.node_is_on_a_network = false;
     }
 
@@ -3675,6 +3689,8 @@ impl<M: MacDriver> BdbLayer<M> {
         }
         self.attributes.commissioning_status = crate::attributes::BdbCommissioningStatus::NoNetwork;
         let _ = self.zdo.nlme_reset(false);
+        // Nothing was committed: the next steering may find another network.
+        self.zdo.aps_mut().aib_mut().forget_trust_center();
         self.attributes.node_is_on_a_network = false;
     }
 

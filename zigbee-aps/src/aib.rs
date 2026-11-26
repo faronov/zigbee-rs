@@ -90,6 +90,20 @@ impl Aib {
         }
     }
 
+    /// Forget the network-bound Trust Center facts: the Trust Center address
+    /// (learned from the network key's Transport-Key, or set by formation)
+    /// and the designated-coordinator flag (set by formation).
+    ///
+    /// Every Leave without rejoin and every factory reset calls it. A stale
+    /// address makes the next network's Trust Center fail
+    /// `authenticated_trust_center_source`, so its Transport-Key is rejected
+    /// until a reboot. The APS outgoing frame counter is kept (counter values
+    /// must never be reused).
+    pub fn forget_trust_center(&mut self) {
+        self.aps_trust_center_address = [0u8; 8];
+        self.aps_designated_coordinator = false;
+    }
+
     /// Increment outgoing APS frame counter. Returns the pre-increment value.
     pub fn next_frame_counter(&mut self) -> u32 {
         let fc = self.aps_outgoing_frame_counter;

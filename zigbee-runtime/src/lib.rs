@@ -4342,6 +4342,24 @@ mod resume_tests {
         link_key: [u8; 16],
         frame_counter: u32,
     ) -> ([u8; 96], usize) {
+        network_transport_key_aps_payload_from(
+            network_key,
+            key_sequence,
+            link_key,
+            frame_counter,
+            COORDINATOR_IEEE,
+        )
+    }
+
+    /// [`network_transport_key_aps_payload`] from the Trust Center
+    /// `tc_ieee` (descriptor source and APS auxiliary-header source).
+    fn network_transport_key_aps_payload_from(
+        network_key: [u8; 16],
+        key_sequence: u8,
+        link_key: [u8; 16],
+        frame_counter: u32,
+        tc_ieee: [u8; 8],
+    ) -> ([u8; 96], usize) {
         use zigbee_aps::frames::{
             ApsCommandId, ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader,
         };
@@ -4356,7 +4374,7 @@ mod resume_tests {
         command[2..18].copy_from_slice(&network_key);
         command[18] = key_sequence;
         command[19..27].copy_from_slice(&IEEE_ADDRESS);
-        command[27..35].copy_from_slice(&COORDINATOR_IEEE);
+        command[27..35].copy_from_slice(&tc_ieee);
 
         let aps_header = ApsHeader {
             frame_control: ApsFrameControl {
@@ -4371,7 +4389,7 @@ mod resume_tests {
         let aps_security = ApsSecurityHeader {
             security_control: (KEY_ID_KEY_TRANSPORT << 3) | (1 << 5),
             frame_counter,
-            source_address: Some(COORDINATOR_IEEE),
+            source_address: Some(tc_ieee),
             key_seq_number: None,
         };
         let mut aps = [0u8; 96];
@@ -4741,6 +4759,67 @@ mod resume_tests {
         assert_eq!(reset.tclk_counter_limit, preserved.tclk_counter_limit);
         assert_eq!(device.bdb().zdo().aps().security().key_count(), 0);
         assert_eq!(device.remote_reporting_cluster_count(1), 0);
+    }
+
+    /// A Leave without rejoin forgets the Trust Center, so the next
+    /// network's Trust Center (another IEEE) can hand over its key. The old
+    /// address used to survive the Leave: every Transport-Key from the new
+    /// Trust Center was rejected as unauthenticated until a reboot (EK2703A
+    /// Router removed from one network and joined to another).
+    #[test]
+    fn mgmt_leave_without_rejoin_accepts_another_trust_center() {
+        const OTHER_TC: [u8; 8] = [0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00];
+        const OTHER_KEY: [u8; 16] = [0xC3; 16];
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .device_type(DeviceType::Router)
+            .build_router();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        assert_eq!(
+            device.bdb().zdo().aps().aib().aps_trust_center_address,
+            COORDINATOR_IEEE
+        );
+
+        let (aps_payload, aps_len) = mgmt_leave_aps_payload(false, false);
+        let frame = nwk_frame(
+            zigbee_nwk::frames::NwkFrameType::Data,
+            ShortAddress(OUR_SHORT),
+            &aps_payload[..aps_len],
+            1,
+            true,
+        );
+        let event = block_on(device.process_incoming_with_security_store(
+            &indication(frame),
+            &mut [],
+            &mut store,
+        ))
+        .unwrap();
+        assert!(matches!(event, Some(crate::event_loop::StackEvent::Left)));
+        let aib = device.bdb().zdo().aps().aib();
+        assert_eq!(aib.aps_trust_center_address, [0; 8]);
+        assert!(!aib.aps_designated_coordinator);
+
+        // Another network's Trust Center sends the network key, protected
+        // with the global link key, as during a join.
+        let link_key = *device.bdb().zdo().aps().security().default_tc_link_key();
+        let (aps, aps_len) =
+            network_transport_key_aps_payload_from(OTHER_KEY, 3, link_key, 9, OTHER_TC);
+        let mut decrypted = zigbee_aps::apsde::ApsFrameBuffer::new();
+        let _ = device.bdb.zdo_mut().aps_mut().process_incoming_aps_frame(
+            &aps[..aps_len],
+            ShortAddress::COORDINATOR,
+            ShortAddress(OUR_SHORT),
+            200,
+            zigbee_aps::apsde::IncomingNwkSecurity::new(false, None),
+            &mut decrypted,
+        );
+        let active = device.bdb().zdo().aps().nwk().security().active_key();
+        assert_eq!(active.map(|k| (k.key, k.seq_number)), Some((OTHER_KEY, 3)));
+        assert_eq!(
+            device.bdb().zdo().aps().aib().aps_trust_center_address,
+            OTHER_TC
+        );
     }
 
     #[test]
@@ -10772,6 +10851,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         aps.binding_table_mut().clear();
         aps.group_table_mut().clear();
         aps.security_mut().clear_keys();
+        // The next network may have another Trust Center: a Leave without
+        // rejoin (local, Mgmt_Leave, TC Remove-Device, failed TCLK exchange)
+        // must not keep the old address (`Aib::forget_trust_center`).
+        aps.aib_mut().forget_trust_center();
         self.reset_identify_clusters();
         // The interview belongs to the network that was just left; the next
         // coordinator re-runs it from scratch.

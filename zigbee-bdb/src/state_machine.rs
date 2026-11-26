@@ -355,12 +355,9 @@ impl<M: MacDriver> BdbLayer<M> {
         self.zdo.aps_mut().group_table_mut().clear();
         self.zdo.aps_mut().security_mut().clear_keys();
         self.zdo.aps_mut().cancel_all_ack_tracking();
-        // The Trust Center address was learned from the last network's
-        // Transport-Key. Left set, it makes the next network's Trust Center
-        // look like an impostor (`authenticated_trust_center_source`), so a
-        // Leave without rejoin followed by steering to another network fails
-        // until a reboot. The APS outgoing frame counter is kept.
-        self.zdo.aps_mut().aib_mut().aps_trust_center_address = [0u8; 8];
+        // The last network's Trust Center (see `Aib::forget_trust_center`);
+        // the APS outgoing frame counter is kept.
+        self.zdo.aps_mut().aib_mut().forget_trust_center();
 
         // Step 4: Reset all BDB attributes to defaults
         self.reset_attributes();
@@ -908,6 +905,7 @@ mod tests {
 
         // A later join must accept another network's Trust Center.
         assert_eq!(bdb.zdo().aps().aib().aps_trust_center_address, [0u8; 8]);
+        assert!(!bdb.zdo().aps().aib().aps_designated_coordinator);
         assert_eq!(bdb.zdo().aps().aib().aps_outgoing_frame_counter, 0x1234);
     }
 }
