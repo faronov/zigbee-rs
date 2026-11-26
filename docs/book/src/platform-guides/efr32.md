@@ -9,8 +9,9 @@ The repository supports these products:
 - EFR32MG24 ZRHP NCP and Router for an RF-BM-MG24B1 dev board, the SONOFF
   Dongle-M and a BRD4187 radio board on a BRD4001A WSTK (Series 2). The
   xG24 20 dBm (HP) radio at 39 MHz is lab-tested on the BRD4187A, where the
-  Router joined a test network. The 10 dBm PA, the 38.4 MHz crystal and the
-  NCP have no hardware run.
+  Router joined a test network. The 10 dBm PA and the 38.4 MHz crystal are
+  not enabled: the radio returns `Unsupported` on the RF-BM-MG24B1 and the
+  Dongle-M. The NCP has no hardware run.
 
 All use the shared `SensorApp`; their boards, products, clocks, storage, and
 power behavior are intentionally separate. Series 2 chips share one HAL
@@ -615,7 +616,11 @@ Not proven on hardware:
   RF-BM-MG24B1 image, fail radio init with `RadioError::Unsupported` and
   halt.
 - **38.4 MHz tables (Dongle-M)**: derived from GSDK and never run on
-  silicon.
+  silicon. The HAL therefore supports the xG24 radio only with
+  `efr32mg24-pa20` **and** `hfxo-39mhz` (`xg24::SUPPORTED`). Dongle-M
+  images (20 dBm PA, 38.4 MHz) fail radio init with `Unsupported` and
+  halt, and `TX_POWER_RANGE_DBM` reports `(0, 0)`, so no host can request
+  the 20 dBm PA with unverified PHY values.
 - **NCP**: has not run on any MG24.
 - **Power**: EM2 and the DC-DC converter are untested.
 
@@ -754,7 +759,12 @@ summaries are in `tools/efr32s2-lab/captures/xg24-brd4187a`.
 **Crystal.** The 39 MHz tables come from the silicon (`hfxo-39mhz`). The
 38.4 MHz build (Dongle-M) differs in the 21 registers in which GSDK's
 `…_38M4Hz.c` differs from the 39 MHz file. Its per-channel values use the
-scaling verified at 39 MHz. **It has not run on silicon.**
+scaling verified at 39 MHz. **It has not run on silicon**, and it also
+carries the 39 MHz die's runtime trims. The tables build and are
+host-tested, but `SUPPORTED` stays false without `hfxo-39mhz`, so the radio
+refuses to start. To enable 38.4 MHz, widen the gate in `xg24.rs` after the
+hardware gate below passes; there is no opt-in feature that would let a
+product ship it by accident.
 
 **Die-specific values.** RAIL computes some trims at run time:
 `SYNTH.LPFCTRL2RX/TX`, `RAC.IFADCTRIM0`, `LNAMIXTRIM4`, `SYTRIM1`,
@@ -943,13 +953,14 @@ would not move it.
 | NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 455,356 B | 168,536 B | 89,512 B |
 | NCP, Dongle-M | 455,636 B | 168,536 B | 89,512 B |
 | Router, RF-BM-MG24B1 (GP Proxy Basic) | 344,548 B | 37,140 B | 224,492 B |
-| Router, Dongle-M | 344,876 B | 37,140 B | 224,492 B |
+| Router, Dongle-M | 344,872 B | 37,140 B | 224,492 B |
 | Router, BRD4187 on a WSTK | 344,928 B | 37,136 B | 224,496 B |
 
 The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
 MG24 image compared with `15ee9550`, the build-only base without a radio.
-Static RAM and stack did not change. The RF-BM-MG24B1 images carry the
-shared PHY tables too, even though their 10 dBm PA is still `Unsupported`.
+Static RAM and stack did not change. The RF-BM-MG24B1 and Dongle-M
+images carry the shared PHY tables too, although their radio returns
+`Unsupported` (10 dBm PA, 38.4 MHz crystal).
 
 The NCP uses 33 % of the application window and 66 % of SRAM for static
 data. The compact capacity tier is not needed. The recorded fatal resets
@@ -987,8 +998,10 @@ Open:
 2. **MP (10 dBm) PA.** Capture RAIL's PA table, transitions and current on a
    B210/A410 part (EK2703A or the RF-BM module) with the same scenarios and
    sampler. Then set `SUPPORTED` for `efr32mg24-pa10`.
-3. **38.4 MHz crystal.** Run raw TX/RX and ACK on a 38.4 MHz part (Dongle-M)
-   before claiming the GSDK-derived tables.
+3. **38.4 MHz crystal.** Run raw TX/RX, ACK and current/output against
+   RAILtest on a 38.4 MHz part (Dongle-M). Then widen `xg24::SUPPORTED`
+   (today it requires `hfxo-39mhz`) and re-check the runtime trims on that
+   die.
 4. **SE mailbox TRNG and the recorded fatal resets.** The record must
    survive the resident Gecko bootloader and come back as `reset_reason` 6.
    Test with a lab build that panics or faults on demand. For the poisoned

@@ -64,7 +64,7 @@ wstk = ["efr32s2-hal/efr32mg22"]
 zbt1 = ["efr32s2-hal/efr32mg21"]
 # RF-BM-MG24B1 dev board (EFR32MG24A410, 39 MHz): image at 0x0800_0000 on a
 # module without a bootloader, log on the USART0 host link (PA05/PA06).
-# Only `s2-mg24-hello` builds for it so far (no xG24 radio tables yet).
+# Only `s2-mg24-hello` builds for it so far (no 10 dBm PA table yet).
 rfbm = ["dep:rf-bm-mg24b1"]
 # BRD4001A + BRD4187 (EFR32MG24B220, 20 dBm PA, 39 MHz): image at
 # 0x0800_0000 (no bootloader on the lab board), log and commands on the

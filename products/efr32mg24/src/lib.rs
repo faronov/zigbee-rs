@@ -85,11 +85,12 @@ pub const CHIP: u8 = 12;
 pub const BOARD_NAME: &str = board::BOARD_NAME;
 /// `SYS_GET_INFO.product`.
 pub const PRODUCT_NAME: &str = "zigbee-rs-ncp";
-/// Default `phyTransmitPower`: 0 dBm on every board. The 20 dBm PA table
-/// (`efr32s2_hal::radio::TX_POWER_RANGE_DBM` = `(-24, 20)`) is
-/// hardware-verified on the BRD4187A only; the 10 dBm PA has no table yet
-/// (`(0, 0)`, radio `Unsupported`). A higher product default waits for the
-/// Dongle-M's RF path and TX power limit (platform guide, hardware gates).
+/// Default `phyTransmitPower`: 0 dBm on every board. The 20 dBm PA at
+/// 39 MHz (`efr32s2_hal::radio::TX_POWER_RANGE_DBM` = `(-24, 20)`) is
+/// hardware-verified on the BRD4187A only; the RF-BM-MG24B1 (10 dBm PA)
+/// and the Dongle-M (38.4 MHz crystal) report `(0, 0)` and their radio
+/// returns `Unsupported`. A higher product default waits for the Dongle-M's
+/// RF path and TX power limit (platform guide, hardware gates).
 pub const TX_POWER_DBM: i8 = 0;
 /// Security-journal role tag of the coordinator NCP (same as the ESP and
 /// CC26x2 NCPs).

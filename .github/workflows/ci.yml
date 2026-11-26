@@ -3048,11 +3048,13 @@ jobs:
             examples/cc26x2-ncp/target/cc26x2-ncp-*.size.json
           if-no-files-found: error
 
-  # EFR32MG24 (RF-BM-MG24B1 dev board, SONOFF Dongle-M): ZRHP NCP and
-  # Router, linked above the 24 KiB Gecko bootloader and packaged as raw
-  # image + Intel HEX + plain GBL (tools/efr32-gbl). Build-only: the xG24
-  # radio tables are not captured, so both images halt at radio init on
-  # hardware until they are.
+  # EFR32MG24 (RF-BM-MG24B1 dev board, SONOFF Dongle-M, BRD4187 on a WSTK):
+  # ZRHP NCP and Router, linked above the 24 KiB Gecko bootloader and
+  # packaged as raw image + Intel HEX + plain GBL (tools/efr32-gbl). The
+  # xG24 radio is verified for the 20 dBm PA at 39 MHz (BRD4187A, where the
+  # Router ran); the RF-BM-MG24B1 (10 dBm PA) and Dongle-M (38.4 MHz)
+  # images fail radio init with `Unsupported` and halt. The NCP has not run
+  # on any MG24.
   build-efr32mg24:
     name: Build EFR32MG24 ZRHP NCP and Router (RF-BM-MG24B1, Dongle-M, BRD4187)
     runs-on: ubuntu-latest

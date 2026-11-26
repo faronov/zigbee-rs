@@ -69,10 +69,11 @@ pub const MAX_PSDU: usize = 127;
 pub const MAX_FRAME: usize = MAX_PSDU - 2;
 
 /// Calibrated transmit-power range of this chip in whole dBm `(min, max)`;
-/// `(0, 0)` when the chip has no validated PA table.
+/// `(0, 0)` when the chip has no validated PA table or the radio is not
+/// supported in this build (`RadioToken::init` returns `Unsupported`).
 pub const TX_POWER_RANGE_DBM: (i8, i8) = {
     let table = chip::TX_POWER;
-    if table.is_empty() {
+    if table.is_empty() || !chip::SUPPORTED {
         (0, 0)
     } else {
         (
@@ -1578,16 +1579,23 @@ mod tests {
         assert_eq!(TX_POWER_RANGE_DBM, (-25, 6));
         #[cfg(feature = "efr32mg21")]
         assert_eq!(TX_POWER_RANGE_DBM, (-30, 20));
-        #[cfg(feature = "efr32mg24-pa20")]
+        #[cfg(all(feature = "efr32mg24-pa20", feature = "hfxo-39mhz"))]
         assert_eq!(TX_POWER_RANGE_DBM, (-24, 20));
-        #[cfg(feature = "efr32mg24-pa10")]
+        #[cfg(any(
+            feature = "efr32mg24-pa10",
+            all(feature = "efr32mg24-pa20", not(feature = "hfxo-39mhz"))
+        ))]
         assert_eq!(TX_POWER_RANGE_DBM, (0, 0));
     }
 
     #[test]
-    #[cfg(feature = "efr32mg24-pa10")]
-    fn xg24_mp_pa_radio_is_explicitly_unsupported() {
-        // No captured MP-PA table: init must fail before any radio access.
+    #[cfg(any(
+        feature = "efr32mg24-pa10",
+        all(feature = "efr32mg24-pa20", not(feature = "hfxo-39mhz"))
+    ))]
+    fn xg24_unverified_variants_are_explicitly_unsupported() {
+        // No captured MP-PA table, or the never-run 38.4 MHz PHY: init must
+        // fail before any radio access.
         const { assert!(!chip::SUPPORTED) };
         let token = RadioToken::new();
         assert!(matches!(token.init(), Err(RadioError::Unsupported)));
@@ -1630,7 +1638,8 @@ mod tests {
     #[test]
     #[cfg(feature = "efr32mg24-pa20")]
     fn xg24_hp_power_table() {
-        const { assert!(chip::SUPPORTED) };
+        // Supported only with the 39 MHz crystal the table was captured on.
+        const { assert!(chip::SUPPORTED == cfg!(feature = "hfxo-39mhz")) };
         // RAIL_SetTxPowerDbm(0 / 100 / 200) on the BRD4187A: raw levels 10,
         // 36 and 164 (slice 1/3/11).
         assert_eq!(tx_power_entry(0), (-2, 0xD6, 0x10A0));

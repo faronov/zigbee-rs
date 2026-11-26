@@ -14,9 +14,9 @@
 //! Status: on a BRD4187A (xG24 20 dBm PA, 39 MHz) it joined a test network,
 //! passed the interview, sent Imm-Acks from the interrupt in 174-181 us
 //! (sniffer) and resumed from its journals after a reset and a reflash.
-//! RF-BM-MG24B1 images (10 dBm PA, no captured table) still fail radio init
-//! with `Unsupported`, log it and halt; the Dongle-M (38.4 MHz) image has
-//! not run.
+//! RF-BM-MG24B1 images (10 dBm PA, no captured table) and Dongle-M images
+//! (38.4 MHz crystal, PHY not verified) fail radio init with `Unsupported`,
+//! log it and halt.
 
 #![no_std]
 #![no_main]
@@ -204,8 +204,8 @@ fn compose(
     radio: efr32s2_hal::radio::RadioToken,
     flash: efr32s2_hal::flash::Efr32s2Flash,
 ) -> &'static mut App {
-    // Fails with `Unsupported` on boards whose PA variant has no validated
-    // xG24 table (the 10 dBm MP PA: RF-BM-MG24B1).
+    // Fails with `Unsupported` where the xG24 tables are not validated: the
+    // 10 dBm PA (RF-BM-MG24B1) and the 38.4 MHz crystal (Dongle-M).
     let mac: Mac = Efr32s2RadioPhy::new(radio)
         .map_err(|error| log::error!("[MG24] radio init failed: {error:?}"))
         .and_then(|phy| {

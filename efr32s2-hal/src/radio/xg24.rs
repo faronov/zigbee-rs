@@ -41,10 +41,12 @@
 //! `sl_rail_ieee802154_config_38M4Hz.c` differs from the 39 MHz file
 //! ([`XTAL`]); the per-channel values are derived from the 38.4 MHz base
 //! with the scaling verified on the 39 MHz silicon. The 38.4 MHz path is
-//! **not** hardware-verified.
+//! **not** hardware-verified, so [`SUPPORTED`] is `false` without
+//! `hfxo-39mhz`: the tables build and are host-tested, the radio refuses to
+//! start.
 //!
 //! PA variants: only the HP PA (`efr32mg24-pa20`) has a captured power
-//! table; [`SUPPORTED`] is `false` for `efr32mg24-pa10` (MP PA, e.g.
+//! table; [`SUPPORTED`] is also `false` for `efr32mg24-pa10` (MP PA, e.g.
 //! A410/B210) until it is captured on such a part.
 //!
 //! Deviations from the snapshot:
@@ -63,8 +65,14 @@ use super::{
     Warm, rac_state_raw, read, tx_power_entry, write,
 };
 
-/// Radio tables are validated for the 20 dBm (HP) PA only.
-pub(super) const SUPPORTED: bool = cfg!(feature = "efr32mg24-pa20");
+/// Radio tables are validated for the 20 dBm (HP) PA with a 39 MHz HFXO
+/// only (BRD4187A). The 38.4 MHz PHY (`not(hfxo-39mhz)`, e.g. the
+/// Dongle-M) is GSDK-derived and carries the 39 MHz die's runtime trims;
+/// it has never run, so such builds fail `RadioToken::init` with
+/// `Unsupported` instead of transmitting with unverified values. Widen
+/// this only after the hardware gates of the platform guide pass on that
+/// crystal.
+pub(super) const SUPPORTED: bool = cfg!(all(feature = "efr32mg24-pa20", feature = "hfxo-39mhz"));
 
 /// `FRC_IRQn` and `RAC_RSM_IRQn` (GSDK 4.5.0 `efr32mg24*.h`).
 #[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
