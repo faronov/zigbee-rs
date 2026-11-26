@@ -1550,10 +1550,11 @@ Rules:
 
 #### Gecko bootloader path (EFR32MG24 NCPs)
 
-EFR32MG24 NCPs (`chip` 12: the RF-BM-MG24B1 dev board and the SONOFF
-Dongle-M) keep the resident Silicon Labs Gecko bootloader and do **not**
-implement `FW_*` (`UNSUPPORTED_COMMAND`, `FW_UPDATE` capability clear). The
-host updates them through the bootloader with a GBL file:
+EFR32MG24 NCPs (`chip` 12: the RF-BM-MG24B1 dev board, the BRD4187A lab
+board and the SONOFF Dongle-M) keep the resident Silicon Labs Gecko
+bootloader and do **not** implement `FW_*` (`UNSUPPORTED_COMMAND`,
+`FW_UPDATE` capability clear). The host updates them through the bootloader
+with a GBL file:
 
 1. **Enter the bootloader.** `SYS_RESET{mode 1}`: the NCP answers, then
    stores the Gecko BOOTLOAD reset cause and resets. A host that drives the
