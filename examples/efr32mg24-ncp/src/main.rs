@@ -158,6 +158,10 @@ fn start() -> Started {
     if product::board::init_clocks(clocks).is_err() {
         halt()
     }
+    // The TIMER0 time base must run before anything reads it (the session
+    // cookie below); an unclocked TIMER0 read bus-faults (hardware-observed
+    // on the BRD4187A: HardFault, fatal reset, boot loop).
+    efr32s2_hal::delay::enable_cycle_counter();
     let rtcc = rtcc.start().unwrap_or_else(|_| halt());
     efr32s2_hal::time_driver::init(rtcc);
     // The journals sit at the top of 1536 KiB: refuse a smaller part.
