@@ -1,0 +1,338 @@
+{
+ "uart": "cu.usbmodem0004403781041",
+ "jlink": "440378104",
+ "name": "mg24-ek-cap3",
+ "duration": "200s",
+ "out": "~/.hwlab/artifacts/mg24-ek2703a/ek3",
+ "dump_ms_per_block": 250,
+ "steps": [
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "config2p4GHz802154"
+  ],
+  [
+   "cli",
+   "setChannel 11"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch11"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 12"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch12"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 13"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch13"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 14"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch14"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 15"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch15"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 16"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch16"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 17"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch17"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 18"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch18"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 19"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch19"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 20"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch20"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 21"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch21"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 22"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch22"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 23"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch23"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 24"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch24"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 25"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch25"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 26"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump-ch",
+   "ch26"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ]
+ ]
+}

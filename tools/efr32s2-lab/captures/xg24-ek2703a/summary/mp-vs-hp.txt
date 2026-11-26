@@ -1,0 +1,41 @@
+# MP (EK2703A, B210) vs HP (BRD4187A, B220) RAILtest register values
+#
+# Registers whose static value or per-state pattern differs between the two
+# captures (states: idle, RX ch26, CW tone at the first three powers; HP at
+# 0/10/20 dBm, MP at 0/5/10 dBm). S = same in every state, else the five
+# per-state values. Interrupt flags, RAIL scratch and runtime-calibrated
+# values are listed too; xg24.rs takes the PA/path/die values per variant
+# (PaPhy), the rest is shared.
+B80140D8 MODEM.RAMPCTRL         HP: -                                               MP: 00000666 00000666 00000888 00000888 00000666
+B80140DC MODEM.RAMPLEV          HP: 00D5D5D5 00D5D5D5 00D6D6D6 00D5D5D5 00D1D1D1    MP: 00646464 00646464 001A1A1A 00262626 00646464
+B80141B0 MODEM.PADEBUG          HP: 00000000 00000000 00001800 00001800 00001800    MP: -
+B8014238 MODEM.SQI              HP: S 00000001                                      MP: 00000001 00000001 001D0001 001D0001 001D0001
+B8014278 MODEM.IRCALCOEFWR0     HP: S 80FBFFEF                                      MP: S FFFFFFFF
+B801427C MODEM.IRCALCOEFWR1     HP: S 80FBFFEF                                      MP: S FFFFFFFF
+B801804C SYNTH.VCOTUNING        HP: 000082A2 00008231 00008235 00008235 00008234    MP: 000081C9 0000815D 00008168 00008168 00008166
+B8018058 SYNTH.VCOGAIN          HP: S 000000CA                                      MP: S 000000A9
+B80180A8 SYNTH.LPFCTRL2RX       HP: S 01CB43A5                                      MP: S 01CB4325
+B80180AC SYNTH.LPFCTRL2TX       HP: S 008D23A5                                      MP: S 008D2325
+B80200A0 RAC.VCOCTRL            HP: S 00000A4C                                      MP: -
+B80200C4 RAC.AUXADCTRIM         HP: S 16D555A2                                      MP: S 16D55522
+B80200F4 RAC.IFADCCAL           HP: S 00001A00                                      MP: S 00001200
+B8020100 RAC.LNAMIXTRIM0        HP: S 00000150                                      MP: -
+B8020104 RAC.LNAMIXTRIM1        HP: -                                               MP: S 00000150
+B802010C RAC.LNAMIXTRIM3        HP: S 0000020A                                      MP: S 00000288
+B8020110 RAC.LNAMIXTRIM4        HP: S 3109E702                                      MP: S 31092402
+B8020120 RAC.PATRIM0            HP: -                                               MP: S 000000A4
+B8020128 RAC.PATRIM2            HP: S 00000600                                      MP: S 00004011
+B802012C RAC.PATRIM3            HP: S 008D13EA                                      MP: 003A13AA 003A13AA 003A10AA 003A10AA 003A10AA
+B8020130 RAC.PATRIM4            HP: 00004020 00004020 00FF4420 00FF4420 00FF4420    MP: S 00004020
+B8020134 RAC.PATRIM5            HP: S 001B1500                                      MP: S 00171900
+B8020148 RAC.PGATRIM            HP: S 00000F1D                                      MP: S 00000F19
+B802014C RAC.PGACAL             HP: S 00001F22                                      MP: 00002121 00002220 00002121 00002121 00002121
+B8020160 RAC.RFPATHEN0          HP: 00000000 0000000F 00000042 00000042 00000042    MP: 00000002 00000002 00000002 00000000 00000000
+B8020164 RAC.RFPATHEN1          HP: 00000002 00000002 00000002 00000000 00000000    MP: 00000000 0000000F 00000042 00000042 00000042
+B802016C RAC.TX                 HP: 00010000 00010000 C3C1C001 C3C1C001 C3C1C001    MP: 00010000 00010000 C029C001 C029C001 C029C001
+B8020178 RAC.SYTRIM1            HP: S CFF80410                                      MP: CFE00410 CFE00410 CFE00110 CFE00110 CFE00110
+B80201A4 RAC.AGCOVERWRITE1      HP: 3FFF0000 3FFF0000 0000007F 0000007F 0000007F    MP: 3FFF0000 3FFF0000 007F0000 007F0000 007F0000
+B80201C8 RAC.PACTRL             HP: 00003460 00003460 000014A0 00003460 0000B4E0    MP: S 00000400
+B80203F8 RAC.SCRATCH6           HP: S CFF8033C                                      MP: S CFE00330
+B80203FC RAC.SCRATCH7           HP: S 00000009                                      MP: S 00000001
+B80207F8 RAC.RFLOCK0            HP: S 00060000                                      MP: S 00080000

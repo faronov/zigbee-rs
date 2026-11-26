@@ -7,12 +7,16 @@ fn main() {
     let zbt1 = env::var_os("CARGO_FEATURE_ZBT1").is_some();
     let rfbm = env::var_os("CARGO_FEATURE_RFBM").is_some();
     let brd4187 = env::var_os("CARGO_FEATURE_BRD4187").is_some();
-    let (board, chip) = match (wstk, zbt1, rfbm, brd4187) {
-        (true, false, false, false) => ("wstk-brd4183a", "efr32mg22"),
-        (false, true, false, false) => ("zbt1", "efr32mg21"),
-        (false, false, true, false) => ("rf-bm-mg24b1", "efr32mg24"),
-        (false, false, false, true) => ("wstk-brd4187", "efr32mg24"),
-        _ => panic!("enable exactly one of the `wstk`, `zbt1`, `rfbm` or `brd4187` features"),
+    let ek2703 = env::var_os("CARGO_FEATURE_EK2703").is_some();
+    let (board, chip) = match (wstk, zbt1, rfbm, brd4187, ek2703) {
+        (true, false, false, false, false) => ("wstk-brd4183a", "efr32mg22"),
+        (false, true, false, false, false) => ("zbt1", "efr32mg21"),
+        (false, false, true, false, false) => ("rf-bm-mg24b1", "efr32mg24"),
+        (false, false, false, true, false) => ("wstk-brd4187", "efr32mg24"),
+        (false, false, false, false, true) => ("ek2703a", "efr32mg24"),
+        _ => panic!(
+            "enable exactly one of the `wstk`, `zbt1`, `rfbm`, `brd4187` or `ek2703` features"
+        ),
     };
     let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     println!(
