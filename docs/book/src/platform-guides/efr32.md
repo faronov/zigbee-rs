@@ -616,15 +616,21 @@ The 10 dBm (MP) PA was lab-tested on one xG24 Explorer Kit EK2703A
 - the Router (`--features ek2703a`) joined the same network through the
   BRD4187A router as its parent and resumed after a reset.
 
+**MP current unmeasured:** the EK2703A has no current monitor, so the
+10 dBm PA's TX current has never been compared with RAIL's.
+
 See [Radio](#radio-captured-xg24-tables),
 [Hardware validation](#hardware-validation-brd4187a) and
 [10 dBm PA](#10-dbm-mp-pa-ek2703a).
 
 Not proven on hardware:
 
-- **RF-BM-MG24B1**: its A410 uses the 10 dBm tables captured on the B210.
-  The module has not run them, so its RF path, antenna and CTUNE are
-  unverified.
+- **RF-BM-MG24B1**: the radio stays enabled. The board uses the same radio
+  configuration as the EK2703A (10 dBm PA, 39 MHz), with the tables captured
+  on the B210. The board-level items are unverified: the A410 die, the RF
+  path to the module's antenna, and CTUNE 92. Its first run should measure
+  the CTUNE frequency offset, the output against RAILtest and the TX
+  current.
 - **38.4 MHz tables (Dongle-M)**: derived from GSDK and never run on
   silicon. The HAL therefore supports the xG24 radio only with
   `hfxo-39mhz` (`xg24::SUPPORTED`, either PA variant). Dongle-M
@@ -1081,10 +1087,19 @@ Open:
    (`tools/efr32s2-lab`, feature `rfbm`, linked at `0x0800_0000` for a
    module without a bootloader). It prints the reset cause, DEVINFO, CTUNE,
    the LFRCO-vs-HFXO ratio and SE TRNG bytes, then echoes the UART.
-2. **MP (10 dBm) PA on another die.** Measure MP TX current against RAIL on
-   a board with a current monitor. Run the EK2703A-captured tables on the
-   RF-BM-MG24B1's A410 (RF path, antenna, CTUNE 92) and compare its output
-   with RAILtest.
+2. **MP (10 dBm) PA: current and another die.** The MP current is
+   unmeasured. Measure the MP TX current against RAIL on a board with a
+   current monitor.
+
+   On the RF-BM-MG24B1 (enabled, same radio configuration as the EK2703A),
+   the first run should measure three things against RAILtest:
+
+   - the CTUNE frequency offset (datasheet CTUNE 92);
+   - the output;
+   - the current.
+
+   That run also checks the board-level items: the A410 die, the RF path
+   and the antenna.
 3. **38.4 MHz crystal.** Run raw TX/RX, ACK and current/output against
    RAILtest on a 38.4 MHz part (Dongle-M). Then widen `xg24::SUPPORTED`
    (today it requires `hfxo-39mhz`) and re-check the runtime trims on that
