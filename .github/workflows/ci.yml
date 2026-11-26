@@ -481,6 +481,10 @@ jobs:
             manifest: products/efr32mg24/Cargo.toml
             workspace: products/efr32mg24
             features: "wstk-brd4187,router"
+          - name: EFR32MG24 product (BRD4187 on a WSTK, NCP)
+            manifest: products/efr32mg24/Cargo.toml
+            workspace: products/efr32mg24
+            features: "wstk-brd4187,ncp"
           - name: EFR32MG24 product (EK2703A, Router)
             manifest: products/efr32mg24/Cargo.toml
             workspace: products/efr32mg24
@@ -3067,8 +3071,9 @@ jobs:
   # xG24 radio is verified at 39 MHz for the 20 dBm PA (BRD4187A) and the
   # 10 dBm PA (EK2703A), where the Router ran; the RF-BM-MG24B1 image uses
   # the 10 dBm tables without a hardware run, and the Dongle-M (38.4 MHz)
-  # images fail radio init with `Unsupported` and halt. The NCP has not run
-  # on any MG24.
+  # images fail radio init with `Unsupported` and halt. The NCP ran on the
+  # BRD4187 (WSTK VCOM at 115 200 baud) against hubctl; the RF-BM-MG24B1
+  # NCP image has not run.
   build-efr32mg24:
     name: Build EFR32MG24 ZRHP NCP and Router (RF-BM-MG24B1, Dongle-M, BRD4187, EK2703A)
     runs-on: ubuntu-latest
@@ -3097,6 +3102,11 @@ jobs:
           done
           # The radio lab boards (the MG24s the xG24 radio ran on).
           (
+            cd examples/efr32mg24-ncp
+            cargo build --release --locked --no-default-features \
+              --features wstk-brd4187 --target-dir target/brd4187
+          )
+          (
             cd examples/efr32mg24-router
             cargo build --release --locked --no-default-features \
               --features wstk-brd4187 --target-dir target/brd4187
@@ -3114,6 +3124,12 @@ jobs:
                 --target-dir target/dongle-m -- -D warnings
             )
           done
+          (
+            cd examples/efr32mg24-ncp
+            cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
+              --no-default-features --features wstk-brd4187 \
+              --target-dir target/brd4187 -- -D warnings
+          )
           (
             cd examples/efr32mg24-router
             cargo clippy --release --locked --target thumbv8m.main-none-eabihf \
@@ -3147,8 +3163,8 @@ jobs:
           mkdir -p "$OUT"
           NM=$(find "$(rustc --print sysroot)" -name llvm-nm -print -quit)
           for example in ncp router; do
-            BOARDS=(rf-bm-mg24b1 sonoff-dongle-m)
-            if [ "$example" = router ]; then BOARDS+=(wstk-brd4187 ek2703a); fi
+            BOARDS=(rf-bm-mg24b1 sonoff-dongle-m wstk-brd4187)
+            if [ "$example" = router ]; then BOARDS+=(ek2703a); fi
             for board in "${BOARDS[@]}"; do
               case "$board" in
                 rf-bm-mg24b1) DIR="examples/efr32mg24-$example/target/thumbv8m.main-none-eabihf/release" ;;

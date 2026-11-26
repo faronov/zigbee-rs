@@ -58,6 +58,11 @@ pub const VCOM_TX_PORT: Port = Port::A;
 pub const VCOM_TX_PIN: u8 = 8;
 pub const VCOM_RX_PORT: Port = Port::A;
 pub const VCOM_RX_PIN: u8 = 9;
+/// VCOM line rate. The BRD4001A board controller runs its side of the VCOM
+/// UART at its own configured rate (default 115 200, set from the WSTK
+/// admin console) rather than the host's CDC line coding: measured with
+/// the ZRHP NCP, 115 200 is clean, 460 800 and 921 600 fail with framing
+/// errors on both ends.
 pub const VCOM_BAUD: u32 = 115_200;
 
 /// HFXO CTUNE: factory `MFG_CTUNE` token, else [`DEFAULT_HFXO_CTUNE`].

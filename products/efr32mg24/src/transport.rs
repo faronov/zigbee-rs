@@ -6,7 +6,10 @@
 //! No RTS/CTS: the Dongle-M wires none, and the dev board's optional pins
 //! stay unused so both boards behave the same. ZRHP credits are the only
 //! flow control. The product default is 460 800 baud (spec 4.4, no flow
-//! control); the Gecko bootloader keeps 115 200. A flash page erase stalls
+//! control); the Gecko bootloader keeps 115 200. The WSTK BRD4187 variant
+//! runs at the board controller's VCOM rate (`efr32mg24_brd4187::VCOM_BAUD`,
+//! 115 200) and accepts no other: measured, 460 800 and 921 600 fail on the
+//! BRD4001A VCOM (framing errors on both ends). A flash page erase stalls
 //! instruction fetches for milliseconds; bytes the two-byte USART buffer
 //! cannot hold meanwhile are lost and counted as line faults, and ARQ
 //! recovers the frame.
@@ -16,15 +19,27 @@ use ncp_coordinator_app::transport::{HostTransport, LineFaults, TransportInfo, U
 
 /// Product default line rate (volatile `SYS_SET_UART` changes revert to it
 /// on reboot).
+#[cfg(not(feature = "wstk-brd4187"))]
 pub const UART_DEFAULT_BAUD: u32 = 460_800;
+/// WSTK: the board controller's fixed VCOM rate.
+#[cfg(feature = "wstk-brd4187")]
+pub const UART_DEFAULT_BAUD: u32 = crate::board::VCOM_BAUD;
 /// Line rate of the resident Gecko bootloader (XMODEM GBL upload).
 pub const BOOTLOADER_BAUD: u32 = 115_200;
 
 /// Rates `SYS_SET_UART` accepts: the spec's no-flow-control rates plus
 /// 115 200 (the stock Dongle-M rate and the bootloader's). RTS/CTS is never
 /// accepted.
+#[cfg(not(feature = "wstk-brd4187"))]
 pub const fn uart_rate_supported(baud: u32) -> bool {
     matches!(baud, 115_200 | 460_800 | 921_600)
+}
+
+/// WSTK: only the board controller's VCOM rate; a switch to any other rate
+/// would strand the link until the next reset.
+#[cfg(feature = "wstk-brd4187")]
+pub const fn uart_rate_supported(baud: u32) -> bool {
+    baud == crate::board::VCOM_BAUD
 }
 
 pub const fn check_uart_change(baud: u32, flow_control: bool) -> Result<(), UartChangeError> {
@@ -112,7 +127,13 @@ mod tests {
     fn uart_policy() {
         assert!(check_uart_change(UART_DEFAULT_BAUD, false).is_ok());
         assert!(check_uart_change(BOOTLOADER_BAUD, false).is_ok());
+        #[cfg(not(feature = "wstk-brd4187"))]
         assert!(check_uart_change(921_600, false).is_ok());
+        #[cfg(feature = "wstk-brd4187")]
+        assert_eq!(
+            check_uart_change(921_600, false),
+            Err(UartChangeError::InvalidRate)
+        );
         assert_eq!(
             check_uart_change(2_000_000, false),
             Err(UartChangeError::InvalidRate)
