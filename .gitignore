@@ -18,3 +18,5 @@
 # Local toolchain extractions (e.g. tc32 from modern-tc32/rust release)
 /.toolchains/
 /tc32-stage*/
+# Python bytecode caches
+__pycache__/
