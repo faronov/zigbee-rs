@@ -13,6 +13,8 @@ autobins = false
 #     --target-dir target/dongle-m
 #   cargo build --release --no-default-features --features wstk-brd4187 \
 #     --target-dir target/brd4187                            # BRD4187 + WSTK
+#   cargo build --release --no-default-features --features ek2703a \
+#     --target-dir target/ek2703a                            # xG24 Explorer Kit
 # Same memory map as the NCP (above the resident Gecko bootloader);
 # `tools/efr32-gbl` turns the ELF into the raw image and a GBL.
 [[bin]]
@@ -24,6 +26,7 @@ default = ["rf-bm-mg24b1"]
 rf-bm-mg24b1 = ["efr32mg24-product/rf-bm-mg24b1", "dep:rf-bm-mg24b1"]
 sonoff-dongle-m = ["efr32mg24-product/sonoff-dongle-m", "dep:sonoff-dongle-m"]
 wstk-brd4187 = ["efr32mg24-product/wstk-brd4187", "dep:efr32mg24-brd4187"]
+ek2703a = ["efr32mg24-product/ek2703a", "dep:efr32mg24-ek2703a"]
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
@@ -33,6 +36,7 @@ efr32s2-hal = { path = "../../efr32s2-hal", features = ["rt", "time-driver", "is
 rf-bm-mg24b1 = { path = "../../boards/rf-bm-mg24b1", optional = true }
 sonoff-dongle-m = { path = "../../boards/sonoff-dongle-m", optional = true }
 efr32mg24-brd4187 = { path = "../../boards/efr32mg24-brd4187", optional = true }
+efr32mg24-ek2703a = { path = "../../boards/efr32mg24-ek2703a", optional = true }
 efr32mg24-product = { path = "../../products/efr32mg24", default-features = false, features = ["router"] }
 router-app = { path = "../../apps/router", default-features = false, features = ["router", "green-power"] }
 zigbee-mac = { path = "../../zigbee-mac", features = ["efr32mg24"] }

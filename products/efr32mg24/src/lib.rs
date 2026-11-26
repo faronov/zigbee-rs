@@ -26,8 +26,9 @@
 //! Gecko path is the default and what an A/B layout would cost.
 //!
 //! The board is selected by feature: `rf-bm-mg24b1` (lab module),
-//! `sonoff-dongle-m` or `wstk-brd4187` (Silicon Labs BRD4187 radio board on
-//! a BRD4001A WSTK, the board the xG24 radio was brought up on).
+//! `sonoff-dongle-m`, `wstk-brd4187` (Silicon Labs BRD4187 radio board on
+//! a BRD4001A WSTK, where the 20 dBm xG24 radio was brought up) or
+//! `ek2703a` (xG24 Explorer Kit, where the 10 dBm radio was brought up).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -38,16 +39,20 @@ compile_error!("efr32mg24-product: enable a role (`ncp` or `router`)");
 #[cfg(any(
     all(feature = "rf-bm-mg24b1", feature = "sonoff-dongle-m"),
     all(feature = "rf-bm-mg24b1", feature = "wstk-brd4187"),
+    all(feature = "rf-bm-mg24b1", feature = "ek2703a"),
     all(feature = "sonoff-dongle-m", feature = "wstk-brd4187"),
+    all(feature = "sonoff-dongle-m", feature = "ek2703a"),
+    all(feature = "wstk-brd4187", feature = "ek2703a"),
 ))]
 compile_error!("efr32mg24-product: enable exactly one board variant");
 #[cfg(not(any(
     feature = "rf-bm-mg24b1",
     feature = "sonoff-dongle-m",
-    feature = "wstk-brd4187"
+    feature = "wstk-brd4187",
+    feature = "ek2703a"
 )))]
 compile_error!(
-    "efr32mg24-product: enable a board variant (`rf-bm-mg24b1`, `sonoff-dongle-m` or `wstk-brd4187`)"
+    "efr32mg24-product: enable a board variant (`rf-bm-mg24b1`, `sonoff-dongle-m`, `wstk-brd4187` or `ek2703a`)"
 );
 
 pub mod fatal;
@@ -61,6 +66,8 @@ pub mod transport;
 
 #[cfg(feature = "wstk-brd4187")]
 pub use efr32mg24_brd4187 as board;
+#[cfg(feature = "ek2703a")]
+pub use efr32mg24_ek2703a as board;
 #[cfg(feature = "rf-bm-mg24b1")]
 pub use rf_bm_mg24b1 as board;
 #[cfg(feature = "sonoff-dongle-m")]
@@ -79,17 +86,21 @@ pub const MODEL: &str = "Dongle-M-Router";
 pub const MODEL: &str = "BRD4187-NCP";
 #[cfg(all(feature = "wstk-brd4187", feature = "router"))]
 pub const MODEL: &str = "BRD4187-Router";
+#[cfg(all(feature = "ek2703a", feature = "ncp"))]
+pub const MODEL: &str = "EK2703A-NCP";
+#[cfg(all(feature = "ek2703a", feature = "router"))]
+pub const MODEL: &str = "EK2703A-Router";
 /// `SYS_NEGOTIATE.chip` (spec 7.1): 12 = EFR32MG24.
 pub const CHIP: u8 = 12;
 /// `SYS_GET_INFO.board`.
 pub const BOARD_NAME: &str = board::BOARD_NAME;
 /// `SYS_GET_INFO.product`.
 pub const PRODUCT_NAME: &str = "zigbee-rs-ncp";
-/// Default `phyTransmitPower`: 0 dBm on every board. The 20 dBm PA at
-/// 39 MHz (`efr32s2_hal::radio::TX_POWER_RANGE_DBM` = `(-24, 20)`) is
-/// hardware-verified on the BRD4187A only; the RF-BM-MG24B1 (10 dBm PA)
-/// and the Dongle-M (38.4 MHz crystal) report `(0, 0)` and their radio
-/// returns `Unsupported`. A higher product default waits for the Dongle-M's
+/// Default `phyTransmitPower`: 0 dBm on every board. At 39 MHz the 20 dBm
+/// PA (`efr32s2_hal::radio::TX_POWER_RANGE_DBM` = `(-24, 20)`) is
+/// hardware-verified on the BRD4187A and the 10 dBm PA (`(-30, 10)`) on the
+/// EK2703A; the Dongle-M (38.4 MHz crystal) reports `(0, 0)` and its radio
+/// returns `Unsupported`. A higher product default waits for each board's
 /// RF path and TX power limit (platform guide, hardware gates).
 pub const TX_POWER_DBM: i8 = 0;
 /// Security-journal role tag of the coordinator NCP (same as the ESP and

@@ -1,0 +1,16 @@
+[package]
+name = "efr32mg24-ek2703a"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for the xG24 Explorer Kit EK2703A (BRD2703A, EFR32MG24B210F1536IM48, +10 dBm)"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[features]
+# Interrupt-driven USART0 host link (`efr32s2-hal` `usart0-host`): defines
+# the USART0 interrupt handlers, so only images that use it enable it.
+host-uart = ["efr32s2-hal/usart0-host"]
+
+[dependencies]
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg24-pa10", "hfxo-39mhz"] }

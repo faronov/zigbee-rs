@@ -3,7 +3,7 @@ name = "efr32mg24-product"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "zigbee-rs EFR32MG24 products: ZRHP network co-processor and Router (RF-BM-MG24B1 dev board, SONOFF Dongle-M, BRD4187 on a WSTK)"
+description = "zigbee-rs EFR32MG24 products: ZRHP network co-processor and Router (RF-BM-MG24B1 dev board, SONOFF Dongle-M, BRD4187 on a WSTK, EK2703A)"
 repository = "https://github.com/faronov/zigbee-rs"
 publish = false
 
@@ -16,6 +16,9 @@ sonoff-dongle-m = ["dep:sonoff-dongle-m"]
 # Silicon Labs BRD4187 (xG24 +20 dBm) on a BRD4001A WSTK: the radio lab
 # board, with a GSDK Gecko bootloader flashed at 0x0800_0000.
 wstk-brd4187 = ["dep:efr32mg24-brd4187"]
+# Silicon Labs xG24 Explorer Kit EK2703A (BRD2703A, 10 dBm PA): the MP-PA
+# radio lab board, with a GSDK Gecko bootloader flashed at 0x0800_0000.
+ek2703a = ["dep:efr32mg24-ek2703a"]
 # Role; exactly one. Both roles share the memory map and the security
 # journal window, so a role change keeps the frame-counter reservations
 # (`select_role_tag`).
@@ -25,6 +28,7 @@ ncp = [
     "rf-bm-mg24b1?/host-uart",
     "sonoff-dongle-m?/host-uart",
     "efr32mg24-brd4187?/host-uart",
+    "efr32mg24-ek2703a?/host-uart",
     "router-app/centralized-tclk",
     "router-app/global-aps-counter",
     "router-app/ncp-capacity",
@@ -44,6 +48,7 @@ efr32s2-hal = { path = "../../efr32s2-hal" }
 rf-bm-mg24b1 = { path = "../../boards/rf-bm-mg24b1", optional = true }
 sonoff-dongle-m = { path = "../../boards/sonoff-dongle-m", optional = true }
 efr32mg24-brd4187 = { path = "../../boards/efr32mg24-brd4187", optional = true }
+efr32mg24-ek2703a = { path = "../../boards/efr32mg24-ek2703a", optional = true }
 embedded-storage = "0.3"
 ncp-coordinator-app = { path = "../../apps/ncp-coordinator", optional = true }
 router-app = { path = "../../apps/router", default-features = false }

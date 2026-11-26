@@ -90,6 +90,7 @@ exclude = [
     "boards/rf-bm-mg24b1",
     "boards/sonoff-dongle-m",
     "boards/efr32mg24-brd4187",
+    "boards/efr32mg24-ek2703a",
     "products/efr32mg24",
     "examples/efr32mg24-router",
     "examples/efr32mg24-ncp",
