@@ -355,6 +355,12 @@ impl<M: MacDriver> BdbLayer<M> {
         self.zdo.aps_mut().group_table_mut().clear();
         self.zdo.aps_mut().security_mut().clear_keys();
         self.zdo.aps_mut().cancel_all_ack_tracking();
+        // The Trust Center address was learned from the last network's
+        // Transport-Key. Left set, it makes the next network's Trust Center
+        // look like an impostor (`authenticated_trust_center_source`), so a
+        // Leave without rejoin followed by steering to another network fails
+        // until a reboot. The APS outgoing frame counter is kept.
+        self.zdo.aps_mut().aib_mut().aps_trust_center_address = [0u8; 8];
 
         // Step 4: Reset all BDB attributes to defaults
         self.reset_attributes();
@@ -890,5 +896,18 @@ mod tests {
 
         assert_eq!(block_on(bdb.factory_reset()), Ok(()));
         assert_eq!(bdb.zdo().pending_count(), 0);
+    }
+
+    #[test]
+    fn factory_reset_forgets_the_trust_center_but_keeps_the_aps_counter() {
+        let mut bdb = restored_bdb(false);
+        bdb.zdo_mut().aps_mut().aib_mut().aps_outgoing_frame_counter = 0x1234;
+        assert_eq!(bdb.zdo().aps().aib().aps_trust_center_address, TC_IEEE);
+
+        assert_eq!(block_on(bdb.factory_reset()), Ok(()));
+
+        // A later join must accept another network's Trust Center.
+        assert_eq!(bdb.zdo().aps().aib().aps_trust_center_address, [0u8; 8]);
+        assert_eq!(bdb.zdo().aps().aib().aps_outgoing_frame_counter, 0x1234);
     }
 }
