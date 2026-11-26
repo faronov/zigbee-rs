@@ -478,3 +478,7 @@ pub(super) fn select_channel(_channel: u8) {
 pub(super) fn tx_done() {
     seq_release(Warm::TxPd);
 }
+
+/// The driver writes [`DEVINFO_IRCAL`] when it is programmed (appended so
+/// the line numbers above stay unchanged).
+pub(super) const DEVINFO_IRCAL_APPLIES: bool = true;
