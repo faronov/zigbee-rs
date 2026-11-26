@@ -166,6 +166,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "efr32mg24-brd4187"
+version = "0.1.0"
+dependencies = [
+ "efr32s2-hal",
+]
+
+[[package]]
 name = "efr32mg24-ncp"
 version = "0.1.0"
 dependencies = [
@@ -194,6 +201,7 @@ dependencies = [
 name = "efr32mg24-product"
 version = "0.1.0"
 dependencies = [
+ "efr32mg24-brd4187",
  "efr32s2-hal",
  "embedded-storage",
  "ncp-coordinator-app",

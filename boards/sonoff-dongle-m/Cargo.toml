@@ -13,4 +13,7 @@ publish = false
 host-uart = ["efr32s2-hal/usart0-host"]
 
 [dependencies]
+# 20 dBm PA, 38.4 MHz crystal (no `hfxo-39mhz`). The xG24 radio tables are
+# verified at 39 MHz only, so on this board `RadioToken::init` returns
+# `Unsupported` until the 38.4 MHz PHY passes its hardware gates.
 efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg24-pa20"] }

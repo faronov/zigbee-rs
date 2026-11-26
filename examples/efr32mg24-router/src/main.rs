@@ -1,6 +1,7 @@
 //! zigbee-rs Router for EFR32MG24 boards (composition root): an HA Range
 //! Extender with the Green Power Proxy Basic on the RF-BM-MG24B1 dev board
-//! (default) or the SONOFF Dongle-M (`--features sonoff-dongle-m`).
+//! (default), the SONOFF Dongle-M (`--features sonoff-dongle-m`) or a
+//! BRD4187 radio board on a BRD4001A WSTK (`--features wstk-brd4187`).
 //!
 //! The radio is the pure-Rust Series 2 driver as a parent MAC (interrupt
 //! Imm-Ack, HAL-owned Frame Pending); the lifecycle is
@@ -10,9 +11,12 @@
 //! router-app error or a poisoned Secure Engine ends in a reset that
 //! records its cause (`product::fatal`); the next boot logs it.
 //!
-//! Status: builds and links. The xG24 radio tables are not captured yet,
-//! so the radio init fails, the image logs that and halts; no MG24 has run
-//! it.
+//! Status: on a BRD4187A (xG24 20 dBm PA, 39 MHz) it joined a test network,
+//! passed the interview, sent Imm-Acks from the interrupt in 174-181 us
+//! (sniffer) and resumed from its journals after a reset and a reflash.
+//! RF-BM-MG24B1 images (10 dBm PA, no captured table) and Dongle-M images
+//! (38.4 MHz crystal, PHY not verified) fail radio init with `Unsupported`,
+//! log it and halt.
 
 #![no_std]
 #![no_main]
@@ -75,17 +79,23 @@ impl log::Log for UartLogger {
         true
     }
     fn log(&self, record: &log::Record<'_>) {
-        cortex_m::interrupt::free(|cs| {
-            if let Some(uart) = LOG_UART.borrow(cs).borrow_mut().as_mut() {
-                let _ = writeln!(
-                    uart,
-                    "{:>8} {:5} {}",
-                    Instant::now().as_millis(),
-                    record.level(),
-                    record.args()
-                );
-            }
-        });
+        // Borrow the UART in a short critical section and write the line
+        // with interrupts enabled: a blocking line takes ~9 ms at 115 200
+        // baud, and masking interrupts that long delays the FRC interrupt's
+        // Imm-Acks past the sender's 864 us wait (sniffer-observed on the
+        // BRD4187: 21 of 105 ACKs in time during an interview). Only task
+        // code logs; a line logged while the UART is borrowed is dropped.
+        let Some(mut uart) = cortex_m::interrupt::free(|cs| LOG_UART.borrow(cs).take()) else {
+            return;
+        };
+        let _ = writeln!(
+            uart,
+            "{:>8} {:5} {}",
+            Instant::now().as_millis(),
+            record.level(),
+            record.args()
+        );
+        cortex_m::interrupt::free(|cs| LOG_UART.borrow(cs).replace(Some(uart)));
     }
     fn flush(&self) {}
 }
@@ -123,6 +133,7 @@ async fn main(_spawner: Spawner) {
         rtcc,
         wdog: _,
         flash,
+        ..
     } = BoardResources::take().unwrap_or_else(|| halt());
     if product::board::init_clocks(clocks).is_err() {
         halt()
@@ -193,7 +204,8 @@ fn compose(
     radio: efr32s2_hal::radio::RadioToken,
     flash: efr32s2_hal::flash::Efr32s2Flash,
 ) -> &'static mut App {
-    // Fails with `Unsupported` until the xG24 radio tables are captured.
+    // Fails with `Unsupported` where the xG24 tables are not validated: the
+    // 10 dBm PA (RF-BM-MG24B1) and the 38.4 MHz crystal (Dongle-M).
     let mac: Mac = Efr32s2RadioPhy::new(radio)
         .map_err(|error| log::error!("[MG24] radio init failed: {error:?}"))
         .and_then(|phy| {
@@ -277,7 +289,8 @@ fn log_summary(app: &App) {
     let radio = phy.radio_stats();
     let ack = phy.ack_stats();
     log::info!(
-        "[MG24] neighbours {} children {} routes {} rx {} rx-ovf {} tx {} tx-fail {} acks {} late {}",
+        "[MG24] neighbours {} children {} routes {} rx {} rx-ovf {} tx {} tx-fail {} acks {} late {} \
+         queue-full {} ({} unACKed) ack-fail {} max-turnaround {} us",
         neighbors.len(),
         neighbors.children().count(),
         nwk.routing_table().len(),
@@ -286,7 +299,11 @@ fn log_summary(app: &App) {
         radio.tx_frames,
         radio.tx_failures,
         ack.acks,
-        ack.late
+        ack.late,
+        ack.queue_full,
+        ack.queue_full_unacked,
+        ack.ack_tx_fail,
+        ack.max_turnaround_us
     );
 }
 

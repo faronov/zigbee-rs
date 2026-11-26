@@ -69,10 +69,11 @@ pub const MAX_PSDU: usize = 127;
 pub const MAX_FRAME: usize = MAX_PSDU - 2;
 
 /// Calibrated transmit-power range of this chip in whole dBm `(min, max)`;
-/// `(0, 0)` when the chip has no validated PA table.
+/// `(0, 0)` when the chip has no validated PA table or the radio is not
+/// supported in this build (`RadioToken::init` returns `Unsupported`).
 pub const TX_POWER_RANGE_DBM: (i8, i8) = {
     let table = chip::TX_POWER;
-    if table.is_empty() {
+    if table.is_empty() || !chip::SUPPORTED {
         (0, 0)
     } else {
         (
@@ -527,7 +528,7 @@ impl Radio {
             let was_rx = self.rx_enabled;
             self.idle();
             unsafe {
-                write(L.synth + SYNTH_CHCTRL, 0);
+                chip::select_channel(channel);
                 write(L.synth + SYNTH_FREQ, freq);
             }
             self.channel = channel;
@@ -1226,7 +1227,7 @@ fn tx_power_down() {
     if rac_state_raw() == RacState::TxPowerDown {
         chip::pa_ramp_down();
     }
-    chip::seq_release(Warm::TxPd);
+    chip::tx_done();
 }
 
 /// `RAC_RSM` interrupt: radio state change.
@@ -1578,18 +1579,109 @@ mod tests {
         assert_eq!(TX_POWER_RANGE_DBM, (-25, 6));
         #[cfg(feature = "efr32mg21")]
         assert_eq!(TX_POWER_RANGE_DBM, (-30, 20));
-        #[cfg(feature = "efr32mg24")]
+        #[cfg(all(feature = "efr32mg24-pa20", feature = "hfxo-39mhz"))]
+        assert_eq!(TX_POWER_RANGE_DBM, (-24, 20));
+        #[cfg(any(
+            feature = "efr32mg24-pa10",
+            all(feature = "efr32mg24-pa20", not(feature = "hfxo-39mhz"))
+        ))]
         assert_eq!(TX_POWER_RANGE_DBM, (0, 0));
     }
 
     #[test]
-    #[cfg(feature = "efr32mg24")]
-    fn xg24_radio_is_explicitly_unsupported() {
-        // No captured tables: init must fail before any radio access.
+    #[cfg(any(
+        feature = "efr32mg24-pa10",
+        all(feature = "efr32mg24-pa20", not(feature = "hfxo-39mhz"))
+    ))]
+    fn xg24_unverified_variants_are_explicitly_unsupported() {
+        // No captured MP-PA table, or the never-run 38.4 MHz PHY: init must
+        // fail before any radio access.
         const { assert!(!chip::SUPPORTED) };
-        assert!(chip::INIT.is_empty());
         let token = RadioToken::new();
         assert!(matches!(token.init(), Err(RadioError::Unsupported)));
+    }
+
+    #[test]
+    #[cfg(feature = "efr32mg24")]
+    fn xg24_tables() {
+        let table = chip::INIT;
+        assert!(table.windows(2).all(|w| w[0].0 < w[1].0));
+        let rac_ctrl = table.iter().find(|e| e.0 == 0xB802_0014).unwrap().1;
+        assert_ne!(rac_ctrl & (1 << 27), 0, "SEQCLKDIS must be set");
+        assert_eq!(rac_ctrl & (1 << 26), 0, "CPUWAITDIS would stall the RSM");
+        // Never taken from RAIL: boot-locked RFLOCK0, sequencer scratch,
+        // interrupt enables, the per-channel SRC/mixer pair and FREQ/CHSP.
+        for reg in [
+            0xB802_07F8,
+            0xB802_0044,
+            0xB802_0048,
+            0xB802_004C,
+            0xB802_0050,
+            0xB802_0020,
+            0xB800_406C,
+            0xB801_411C,
+            0xB801_413C,
+            0xB801_8034,
+            0xB801_8044,
+        ] {
+            assert!(table.iter().all(|e| e.0 != reg), "{reg:#x} in INIT");
+        }
+        for state in [&chip::IDLE, &chip::RX, &chip::TX] {
+            for reg in state.regs {
+                assert!(table.iter().all(|e| e.0 != *reg));
+            }
+        }
+        assert_eq!(chip::LAYOUT.bufc, 0xBA00_0000);
+        assert!(chip::TX_POWER.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    #[cfg(feature = "efr32mg24-pa20")]
+    fn xg24_hp_power_table() {
+        // Supported only with the 39 MHz crystal the table was captured on.
+        const { assert!(chip::SUPPORTED == cfg!(feature = "hfxo-39mhz")) };
+        // RAIL_SetTxPowerDbm(0 / 100 / 200) on the BRD4187A: raw levels 10,
+        // 36 and 164 (slice 1/3/11).
+        assert_eq!(tx_power_entry(0), (-2, 0xD6, 0x10A0));
+        assert_eq!(tx_power_entry(100), (99, 0xD5, 0x3060));
+        assert_eq!(tx_power_entry(200), (200, 0xD1, 0xB0E0));
+        assert_eq!(tx_power_entry(300).0, 200);
+        assert_eq!(tx_power_entry(-1000).0, -249);
+    }
+
+    #[test]
+    #[cfg(feature = "efr32mg24")]
+    fn xg24_channel_scaling_matches_silicon() {
+        // RAIL's SRCRATIO2 / DIGMIXFREQ on channels 11..=26 at 39 MHz
+        // (BRD4187A); the derivation used for 38.4 MHz must reproduce them.
+        const SRC: [u16; 16] = [
+            0x3C29, 0x3C49, 0x3C69, 0x3C89, 0x3CA9, 0x3CC9, 0x3CE9, 0x3D09, 0x3D29, 0x3D49, 0x3D69,
+            0x3D89, 0x3DA9, 0x3DC9, 0x3DE9, 0x3E09,
+        ];
+        const MIX: [u32; 16] = [
+            0x254F8, 0x253BB, 0x2527F, 0x25145, 0x2500C, 0x24ED4, 0x24D9E, 0x24C69, 0x24B35,
+            0x24A02, 0x248D1, 0x247A1, 0x24672, 0x24544, 0x24418, 0x242ED,
+        ];
+        let (src, mix) = chip::scale_channels(39_000_000, 0x47F1, 0x3C29, 0x254F8);
+        assert_eq!(src, SRC);
+        for (derived, silicon) in mix.iter().zip(MIX) {
+            assert!(derived.abs_diff(silicon) <= 1);
+        }
+        // 38.4 MHz: GSDK's channel-11 values come back unchanged.
+        let (src, mix) = chip::scale_channels(38_400_000, 0x4911, 0x281B, 0x1BFBB);
+        assert_eq!((src[0], mix[0]), (0x281B, 0x1BFBB));
+        assert!(src.windows(2).all(|w| w[0] < w[1]));
+        assert!(mix.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    #[cfg(all(feature = "efr32mg24", feature = "hfxo-39mhz"))]
+    fn xg24_39mhz_channel_words() {
+        // SYNTH.FREQ RAIL programmed on channels 11, 15 and 26. RAIL rounds
+        // to nearest, the shared driver truncates: at most one LSB (74 Hz).
+        for (channel, rail) in [(11, 0x01ED_5555u32), (15, 0x01F1_6F97), (26, 0x01FC_B7CB)] {
+            assert!(synth_freq(channel).unwrap().abs_diff(rail) <= 1);
+        }
     }
 
     #[test]

@@ -21,7 +21,8 @@ efr32mg24-pa10 = ["efr32mg24"]
 efr32mg24-pa20 = ["efr32mg24"]
 # The board's HFXO crystal is 39 MHz instead of the default 38.4 MHz
 # (selected by the board crate; the radio tables and every cycle-based
-# delay depend on it). Only EFR32MG24 boards use it so far.
+# delay depend on it). Only EFR32MG24 boards use it so far; the xG24 radio
+# is validated only with it (38.4 MHz builds return `Unsupported`).
 hfxo-39mhz = []
 # Provide `__INTERRUPTS` for cortex-m-rt's `device` feature.
 rt = []

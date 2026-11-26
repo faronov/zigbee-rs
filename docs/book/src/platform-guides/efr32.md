@@ -6,8 +6,12 @@ The repository supports these products:
 - EFR32MG22 BRD4183A development sensor (Series 2, hardware-proven);
 - EFR32MG21 BRD4181A development sensor (Series 2, builds; no hardware run);
 - Home Assistant Connect ZBT-1 always-on End Device (EFR32MG21, lab-tested);
-- EFR32MG24 ZRHP NCP and Router for an RF-BM-MG24B1 dev board and the
-  SONOFF Dongle-M (Series 2, builds only; radio tables not captured).
+- EFR32MG24 ZRHP NCP and Router for an RF-BM-MG24B1 dev board, the SONOFF
+  Dongle-M and a BRD4187 radio board on a BRD4001A WSTK (Series 2). The
+  xG24 20 dBm (HP) radio at 39 MHz is lab-tested on the BRD4187A, where the
+  Router joined a test network. The 10 dBm PA and the 38.4 MHz crystal are
+  not enabled: the radio returns `Unsupported` on the RF-BM-MG24B1 and the
+  Dongle-M. The NCP has no hardware run.
 
 All use the shared `SensorApp`; their boards, products, clocks, storage, and
 power behavior are intentionally separate. Series 2 chips share one HAL
@@ -590,13 +594,35 @@ python3 tools/verify-layout.py \
 The ZBT-1 binary is named `ha-connect-zbt1-ed`, which keeps it apart from the
 board crate in the lockfile.
 
-## EFR32MG24 (xG24): RF-BM-MG24B1 dev board and SONOFF Dongle-M
+## EFR32MG24 (xG24): BRD4187A radio lab, RF-BM-MG24B1 dev board, SONOFF Dongle-M
 
-**Status: builds, links and is host-tested. No MG24 has run any of it.**
-The xG24 radio tables are not captured yet, so the radio refuses to start
-(`RadioError::Unsupported`) and both images halt at radio init. The
-primary hardware target is an RF-star RF-BM-MG24B1 module wired as a dev
-board; the SONOFF Dongle-M follows when a unit is available.
+**Status.** The xG24 radio runs on the 20 dBm (HP) PA with a 39 MHz
+crystal. This was lab-tested on one BRD4187A (EFR32MG24B220F1536IM48) on a
+BRD4001A WSTK:
+
+- raw TX and RX over the air;
+- Imm-Acks, energy detect and RSSI;
+- TX and RX current equal to RAIL's;
+- the Router (`--features wstk-brd4187`) joined an EmberZNet-coordinated
+  test network, passed the interview and resumed from its journal after a
+  reset.
+
+See [Radio](#radio-captured-xg24-tables) and
+[Hardware validation](#hardware-validation-brd4187a).
+
+Not proven on hardware:
+
+- **10 dBm (MP) PA**: no table. `efr32mg24-pa10` images, including every
+  RF-BM-MG24B1 image, fail radio init with `RadioError::Unsupported` and
+  halt.
+- **38.4 MHz tables (Dongle-M)**: derived from GSDK and never run on
+  silicon. The HAL therefore supports the xG24 radio only with
+  `efr32mg24-pa20` **and** `hfxo-39mhz` (`xg24::SUPPORTED`). Dongle-M
+  images (20 dBm PA, 38.4 MHz) fail radio init with `Unsupported` and
+  halt, and `TX_POWER_RANGE_DBM` reports `(0, 0)`, so no host can request
+  the 20 dBm PA with unverified PHY values.
+- **NCP**: has not run on any MG24.
+- **Power**: EM2 and the DC-DC converter are untested.
 
 ### Crates
 
@@ -607,11 +633,13 @@ examples/efr32mg24-router   Router composition root    (product feature `router`
 products/efr32mg24          identity, memory map, journals, Gecko record,
                             NCP transport policy, router policy
         ↓
-boards/rf-bm-mg24b1 | boards/sonoff-dongle-m
+boards/rf-bm-mg24b1 | boards/sonoff-dongle-m | boards/efr32mg24-brd4187
         ↓
 efr32s2-hal (`efr32mg24-pa10` / `efr32mg24-pa20`, `hfxo-39mhz`)
         + zigbee-mac `efr32mg24` (Efr32s2RadioPhy on SoftMacCore)
 tools/efr32-gbl             ELF → raw image, Intel HEX and GBL3
+tools/efr32s2-lab           lab gates: `s2-mg24-hello` (RF-BM), `s2-mg24-air`
+                            (BRD4187 radio console); xG24 captures
 ```
 
 No PAC is used. The only published xG24 PAC (`efr32mg24-pac` 0.1.0, one
@@ -694,42 +722,163 @@ Not changed and not yet checked on xG24 silicon: EM2 entry (`power`), DC-DC
 (left in bypass), the LFXO (the RF-BM module has one; the time base still uses
 the LFRCO), I2C and IADC (not used by these products).
 
-### Radio
+### Radio: captured xG24 tables
 
-The xG24 register map (`efr32_multiphy_configurator/.../efr32xg24/revA1`) was
-compared field by field with xG22 rev A2:
+The xG24 register map (`efr32_multiphy_configurator/.../efr32xg24/revA1`)
+was compared field by field with xG22 rev A2:
 
-- FRC, AGC, MODEM, SYNTH, RAC and RFCRC sit at the xG22 addresses, and every
-  offset the shared driver uses is unchanged;
-- the RSM has the xG22 hand-shake (`RAC.CTRL.SEQCLKDIS`, `RAC.SEQIF` with the
-  same state bits), so the clock-gated sequencer approach carries over;
-- `MODEM.RAMPCTRL/RAMPLEV` moved to `0xD8/0xDC` and `IRCALCOEFWR0/1` to
-  `0x278/0x27C`;
-- the analog front end is new: the RAC analog registers moved, `RFPATHEN` and
-  `AGCOVERWRITE` are gone, and the PA has a 10 dBm (MP) and a 20 dBm (HP)
-  variant.
+- FRC, AGC, MODEM, SYNTH, RAC and RFCRC sit at the xG22 addresses. Every
+  offset the shared driver uses is unchanged.
+- The RSM has the xG22 handshake (`RAC.CTRL.SEQCLKDIS`, `RAC.SEQIF` with
+  the same state bits), so the clock-gated sequencer approach carries over.
+- `MODEM.RAMPCTRL/RAMPLEV` moved to `0xD8/0xDC`, and `IRCALCOEFWR0/1` moved
+  to `0x278/0x27C`.
+- The analog front end is new. The RAC analog registers moved: `RFPATHEN0`
+  0x160, `RX` 0x168, `TX` 0x16C, `SYEN` 0x180, `SYLOEN` 0x184,
+  `AGCOVERWRITE0/1` 0x1A0/0x1A4, `PACTRL` 0x1C8. The PA comes in a 10 dBm
+  (MP) and a 20 dBm (HP) variant.
 
-The per-state analog values (idle/RX/TX), the BUFC base and stride, the PA
-programming of both variants, the RSSI offset and the DEVINFO IR-calibration
-word can only come from silicon, as on xG21 and xG22. `radio/xg24.rs`
-therefore sets `SUPPORTED = false`. The GSDK 802.15.4 PHY tables for xG24
-(`rail_util_built_in_phys/efr32xg24/sl_rail_ieee802154_config_{38M4,39,40}MHz.c`)
-are a cross-check for the static part of a capture.
+The values that only silicon can give were captured on the BRD4187A.
+GSDK 4.5.0 RAILtest (`config2p4GHz802154`, 39 MHz) ran on the board and was
+read over SWD in idle, RX on every channel, CW and packet TX at every HP
+level, and during RAIL's PA transitions. The method, raw dumps and decoded
+summaries are in `tools/efr32s2-lab/captures/xg24-brd4187a`.
+
+| value | xG24 (BRD4187A, EFR32MG24B220) |
+|---|---|
+| BUFC | base `0xBA00_0000`, buffer 0 at `+0x0C`, stride `0x40` (xG22 layout) |
+| static PHY | 151 writes. 192 of the 208 registers in GSDK's `sl_rail_ieee802154_config_39MHz.c` equal the silicon. The other 16 are per-state, per-channel or runtime calibrations. |
+| per-state analog | idle, RX and TX values of 14 RAC registers, plus `SYNTH.VCDACCTRL/VCORANGE` and `MODEM.IRCAL/PADEBUG` |
+| per-channel | RAIL rescales the IF chain on every channel. At 39 MHz, `MODEM.SRCCHF.SRCRATIO2` = 0x3C29 + 0x20·(ch−11) and `DIGMIXCTRL.DIGMIXFREQ` ∝ 1/(`FREQ`+`IFFREQ`) (±1 LSB of RAIL's rounding). `SYNTH.CHCTRL` stays 0 and the channel is set through `SYNTH.FREQ`. |
+| HP PA | RAIL's 29 levels from −24.9 to +20.0 dBm. `RAC.PACTRL` = slice<<12 \| power<<4 (+ bit 10 in TX). `MODEM.RAMPLEV` = the DEVINFO byte of the slice (`0x0FE0_8250..5B`, `D6..D0` on this die). |
+| PA power-up | RAIL's order, sampled on the target: see the PA current fix below |
+| RSSI | offset −50 dB: RAIL reports `floor(FRAMERSSI/4) − 50`, and the driver's trailer RSSI matches |
+| IR calibration | DEVINFO `0x0FE0_8248/824C` → `MODEM.IRCALCOEFWR0/1` (0x80FBFFEF on this die) |
+| `RAC.RFLOCK0` | `0x0006_0000` is set at boot (0 and 10 dBm PAs locked on this part); the driver never writes it |
+
+**Crystal.** The 39 MHz tables come from the silicon (`hfxo-39mhz`). The
+38.4 MHz build (Dongle-M) differs in the 21 registers in which GSDK's
+`…_38M4Hz.c` differs from the 39 MHz file. Its per-channel values use the
+scaling verified at 39 MHz. **It has not run on silicon**, and it also
+carries the 39 MHz die's runtime trims. The tables build and are
+host-tested, but `SUPPORTED` stays false without `hfxo-39mhz`, so the radio
+refuses to start. To enable 38.4 MHz, widen the gate in `xg24.rs` after the
+hardware gate below passes; there is no opt-in feature that would let a
+product ship it by accident.
+
+**Die-specific values.** RAIL computes some trims at run time:
+`SYNTH.LPFCTRL2RX/TX`, `RAC.IFADCTRIM0`, `LNAMIXTRIM4`, `SYTRIM1`,
+`SYNTHREGCTRL` and the `AGC.CTRL0` RSSI shift. The table carries this die's
+values. Whether other dies need their own values is open.
+
+**PA current: found and fixed on hardware.** The first PA ramp followed the
+xG21 order: regulators, then stages, then slice and power enables, then the
+ramp clock. The output matched RAIL, but the PA drew more than the AEM's
+95.7 mA at every level, including 0 dBm, where RAIL draws 25 mA. Snapshots
+of steady TX registers were identical to RAIL's.
+
+An on-target sampler in RAILtest (`railtest-sampler/app.c`, one row per
+register change, every ~11 µs) showed RAIL's order:
+
+1. Hold the slices in reset (`PACTRL.TXPASLICERST`).
+2. Select slice and power manually (`MODEM.PADEBUG` =
+   `ENMANPAPOWER|ENMANPASELSLICE`).
+3. Power the regulators with their bleeders (`RAC.TX` = 0xC401_3001).
+4. After 11–40 µs, release the reset and set `PARAMP` and the output stages
+   with `TXPAENRAMPCLK` (0xC3C1_F003).
+5. After the ramp, drop the clock and the bleeders (0xC3C1_C001).
+
+`xg24::pa_ramp_up` follows this order, with 40 µs and 16 µs steps. The
+current and output now match RAIL (see the table below).
+
+### Hardware validation (BRD4187A)
+
+**Setup**
+
+- BRD4187A Rev A01 on a BRD4001A, driven through hwlab: J-Link OB, VCOM,
+  and AEM at 3.3 V with DC-DC bypassed.
+- nRF52840 802.15.4 sniffer and injector.
+- Lab binary `s2-mg24-air` (`tools/efr32s2-lab`, `--features brd4187`,
+  linked at `0x0800_0000`): a VCOM console for channel, power, TX bursts,
+  RX with Imm-Ack, ED and register dumps.
+- Router `examples/efr32mg24-router --features wstk-brd4187`, running above
+  a GSDK 4.5.0 `bootloader-uart-xmodem` built for `brd4187c` at
+  `0x0800_0000`.
+- Before any write, a verified backup of the original flash was taken
+  (fully erased as delivered, hwlab artifact
+  `jlink-flash-…-852aad42795f.bin`).
+
+**TX current and output, RAIL vs zigbee-rs**
+
+Channel 26, 125-byte frames back to back. Mean current over the burst;
+RSSI is the sniffer's reading. The two images were measured back to back.
+
+| | RAILtest | zigbee-rs |
+|---|---|---|
+| radio off | 4.1 mA | 3.6 mA |
+| RX | 10.3 mA | 9.9–10.1 mA |
+| TX 0 dBm | 24.8 mA, −53.0 dBm | 23.7 mA, −52.9 dBm |
+| TX 10 dBm | 57.3 mA, −43.0 dBm | 56.5 mA, −42.9 dBm |
+| TX 15 dBm | AEM saturated, −37.9 dBm | AEM saturated, −37.3 dBm |
+| TX 20 dBm | AEM saturated, −33.0 dBm | AEM saturated, −32.9 dBm |
+
+The two images were also measured alternately on channel 20, 4 × 500
+frames: −46, −47, −46 and −45 dBm. During one ten-minute window, the
+sniffer read both our lab binary and the Router 10–20 dB lower. Other
+devices stayed stable and the TX current did not change. The readings
+recovered by themselves. This points to the bench environment, but that is
+not confirmed.
+
+**Other gates**
+
+| gate | result |
+|---|---|
+| RX | Received frames injected by the nRF. The trailer RSSI follows RAIL's convention. |
+| synthesizer | Locked on all 16 channels for RX and TX. ED scan ran on every channel. |
+| Imm-Ack (lab) | The nRF's ACK-wait got 11 of 11 ACKs for frames to the filter address, and none for other destinations. |
+| Imm-Ack (Router, interrupt path) | During a rejoin, the coordinator sent 8 ACK-requested frames. All 8 were ACKed 174–181 µs after the frame end (sniffer). HAL: 9 ACKs, 0 late, maximum turnaround 174 µs. The coordinator ACKed our 5 of 5 at 193 µs. |
+| Router join | The test network was PAN 0xE2E9 on channel 20 (zigbee-rs-hub with an EmberZNet NCP). With `permit 120` open, the Router joined as 0xB2B0 within 3 s. Commissioning (Trust Center link key) completed, and the interview went through. |
+| reset and reflash | The Router resumed 0xB2B0 from the journals without rejoining, both after a reset and after reflashing the application. |
+
+**Router log fix.** The first Router run joined, but the sniffer saw only
+21 of 105 coordinator frames ACKed in time. The rest needed MAC
+retransmissions, and their ACKs came 0.9–5 ms late. The cause was the
+Router's UART logger: it wrote each line inside `interrupt::free`. A
+blocking line takes about 9 ms at 115 200 Bd, and masking interrupts that
+long delays the FRC interrupt that sends the Imm-Ack. The HAL cannot detect
+this delay: it times frames from interrupt entry, so its `late` counter
+stayed at 0.
+
+The logger now borrows the UART in a short critical section and writes the
+line with interrupts enabled. The run above was made with that fix. The
+Router's 60 s summary now also prints the queue-full, ACK-failure and
+maximum-turnaround counters.
+
+**Not verified on hardware:**
+
+- the MP PA (EK2703A / B210 or an RF-BM-MG24B1);
+- the 38.4 MHz tables (Dongle-M);
+- CCA against a jammer (the Router's CSMA ran without failure);
+- EM2 and DC-DC;
+- children and Frame Pending through the xG24 Router;
+- OTA and GBL upload;
+- long-duration runs;
+- the NCP.
 
 ### Boards
 
-| | RF-BM-MG24B1 dev board | SONOFF Dongle-M |
-|---|---|---|
-| part | EFR32MG24A410F1536IM48-B (+10 dBm) | EFR32MG24A420F1536IM48 (+20 dBm), SONOFF spec page |
-| HFXO | 39 MHz on the module; CTUNE 92 (RF-star datasheet §4, **unmeasured**) | 38.4 MHz, CTUNE 100 (community manifests, **unverified**) |
-| host UART | USART0 TX PA05 (pin 12), RX PA06 (pin 13) → ESP32-S3 SuperMini; RTS PA07 / CTS PA08 claimed but unused | USART0 routed to TX PC01, RX PC02 → ESP32 GPIO13/GPIO17 (community builds use EUSART1 on the same pins, **unverified**) |
-| reset / boot | RESET_N (pin 36) open-drain from S3 GPIO6 (hub profile `S3_MG24_DEV`) and the J-Link; no boot-entry line (Gecko via `SYS_RESET` mode 1 once installed) | ESP32 GPIO15 → RESET (active low); GPIO12 high during reset → Gecko bootloader (the MG24 pin of that line is unknown) |
-| debug | SWDIO PA02, SWCLK PA01, SWO PA03 (never claimed) | SWD pads unknown |
-| other | 32.768 kHz LFXO, PCB antenna, no LED/button | no MG24 LED/button documented; RF path, stock TX power and LFXO unknown |
+| | RF-BM-MG24B1 dev board | SONOFF Dongle-M | BRD4187A on BRD4001A (radio lab) |
+|---|---|---|---|
+| part | EFR32MG24A410F1536IM48-B (+10 dBm) | EFR32MG24A420F1536IM48 (+20 dBm), SONOFF spec page | EFR32MG24B220F1536IM48 (+20 dBm; DEVINFO, although GSDK lists BRD4187A as A020) |
+| HFXO | 39 MHz on the module; CTUNE 92 (RF-star datasheet §4, **unmeasured**) | 38.4 MHz, CTUNE 100 (community manifests, **unverified**) | 39 MHz; no `MFG_CTUNE` on this unit, so the BRD4187C default CTUNE 95 (**unmeasured**) |
+| host UART | USART0 TX PA05 (pin 12), RX PA06 (pin 13) → ESP32-S3 SuperMini; RTS PA07 / CTS PA08 claimed but unused | USART0 routed to TX PC01, RX PC02 → ESP32 GPIO13/GPIO17 (community builds use EUSART1 on the same pins, **unverified**) | USART0 to the WSTK VCOM, TX PA08, RX PA09, VCOM enable PB00; logs at 115 200 |
+| reset / boot | RESET_N (pin 36) open-drain from S3 GPIO6 (hub profile `S3_MG24_DEV`) and the J-Link; no boot-entry line (Gecko via `SYS_RESET` mode 1 once installed) | ESP32 GPIO15 → RESET (active low); GPIO12 high during reset → Gecko bootloader (the MG24 pin of that line is unknown) | WSTK J-Link (hwlab). GSDK `bootloader-uart-xmodem` (brd4187c); BTN0 (PB01) held at reset enters it |
+| debug | SWDIO PA02, SWCLK PA01, SWO PA03 (never claimed) | SWD pads unknown | WSTK J-Link OB, AEM current measurement |
+| other | 32.768 kHz LFXO, PCB antenna, no LED/button | no MG24 LED/button documented; RF path, stock TX power and LFXO unknown | LED0 PB02, LED1 PB04, BTN0 PB01, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna |
 
 A programmed `MFG_CTUNE` token always wins over the board default.
 
-### Memory map (both boards, both roles)
+### Memory map (every board, both roles)
 
 ```text
 0x0800_0000..0x0800_6000  Gecko bootloader (kept, never written)      24 KiB
@@ -740,6 +889,12 @@ A programmed `MFG_CTUNE` token always wins over the board default.
 0x2000_0000..0x2000_0004  Gecko BootloaderResetCause_t (outside the image)
 0x2000_0004..0x2004_0000  image RAM, stack at the top             256 KiB - 4
 ```
+
+On the BRD4187A the Gecko bootloader is the GSDK 4.5.0
+`bootloader-uart-xmodem` sample built for `brd4187c`. It is 11.6 KiB and
+uses its own reset-cause word at `0x2000_0000`. The lab binaries in
+`tools/efr32s2-lab` (`wstk-brd4187`) are linked at `0x0800_0000` and replace
+it; flash the bootloader again before going back to the Router.
 
 The journals are those of the ESP32-H2 and CC2652P7 NCPs (spec 8.9). The
 router uses the same security, child, APS and GP windows, so a reflash
@@ -795,10 +950,17 @@ would not move it.
 
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
-| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 452,960 B | 168,536 B | 89,512 B |
-| NCP, Dongle-M | 452,900 B | 168,536 B | 89,512 B |
-| Router, RF-BM-MG24B1 (GP Proxy Basic) | 341,912 B | 37,140 B | 224,492 B |
-| Router, Dongle-M | 342,068 B | 37,140 B | 224,492 B |
+| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 455,356 B | 168,536 B | 89,512 B |
+| NCP, Dongle-M | 455,636 B | 168,536 B | 89,512 B |
+| Router, RF-BM-MG24B1 (GP Proxy Basic) | 344,548 B | 37,140 B | 224,492 B |
+| Router, Dongle-M | 344,872 B | 37,140 B | 224,492 B |
+| Router, BRD4187 on a WSTK | 344,928 B | 37,136 B | 224,496 B |
+
+The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
+MG24 image compared with `15ee9550`, the build-only base without a radio.
+Static RAM and stack did not change. The RF-BM-MG24B1 and Dongle-M
+images carry the shared PHY tables too, although their radio returns
+`Unsupported` (10 dBm PA, 38.4 MHz crystal).
 
 The NCP uses 33 % of the application window and 66 % of SRAM for static
 data. The compact capacity tier is not needed. The recorded fatal resets
@@ -809,26 +971,47 @@ stack: `.data` now starts at `0x2000_0008` (8-byte aligned), and the end of
 static RAM and the linked stack are unchanged because alignment padding
 absorbs the shift.
 
-### Hardware gates (open)
+### Hardware gates
 
-1. Identify the module over SWD (J-Link device `EFR32MG24AxxxF1536`, through
-   hwlab), read DEVINFO (part, flash size, EUI-64, `MODULEINFO`), dump and
-   back up the whole flash before writing anything.
-2. HFXO start at CTUNE 92, SYSRTC tick, USART0 at 115 200 / 460 800 / 921 600
-   on PA05/PA06: lab binary `s2-mg24-hello` (`tools/efr32s2-lab`, feature
-   `rfbm`, linked at `0x0800_0000` for a module without a bootloader) prints
-   reset cause, DEVINFO, CTUNE, the LFRCO-vs-HFXO ratio and SE TRNG bytes,
-   then echoes the UART.
-3. Capture the xG24 radio tables from RAIL (`rail_soc_railtest` built for the
-   A410 at 39 MHz, halted over SWD in idle, RX and TX; static registers
-   reduced against the register-map reset values and cross-checked with the
-   GSDK PHY table), then raw TX/RX, ACK turnaround and CCA, as on xG22.
-4. SE mailbox TRNG, and the recorded fatal resets: the record must survive
-   the resident Gecko bootloader and come back as `reset_reason` 6 (a lab
-   build that panics or faults on demand; for the poisoned mailbox an SE
-   that stops answering, e.g. a debugger-held SE request).
-5. NCP: ZRHP session over the S3, network formation, joins, reset/resume.
-6. Gecko path: install a Gecko UART bootloader on the module, then GBL upload
-   and journal retention across an update.
-7. Dongle-M: pins, crystal, CTUNE, bootloader-entry pin, RF path and TX power
-   limit on a real unit.
+Done on the BRD4187A (xG24 HP PA, 39 MHz):
+
+- **Identification and backup.** The die was identified over SWD (J-Link
+  device `EFR32MG24BXXXF1536`, through hwlab). DEVINFO, USERDATA and the
+  whole flash were backed up and verified before any write.
+- **Radio tables.** Captured from RAIL. Raw TX/RX, Imm-Ack timing, ED, RSSI
+  offset and TX/RX current all match RAIL. See
+  [Hardware validation](#hardware-validation-brd4187a).
+- **Router.** Joined, interviewed and resumed in a zigbee-rs-hub test
+  network with an EmberZNet coordinator. It ran above a GSDK Gecko
+  bootloader, which started the application through its
+  `ApplicationProperties`.
+
+Open:
+
+1. **RF-BM-MG24B1.** Identify the module (`EFR32MG24AxxxF1536`), read
+   DEVINFO and `MODULEINFO`, and back up the flash. Then check HFXO start at
+   CTUNE 92, the SYSRTC tick and USART0 at 115 200 / 460 800 / 921 600 on
+   PA05/PA06. The lab binary for this is `s2-mg24-hello`
+   (`tools/efr32s2-lab`, feature `rfbm`, linked at `0x0800_0000` for a
+   module without a bootloader). It prints the reset cause, DEVINFO, CTUNE,
+   the LFRCO-vs-HFXO ratio and SE TRNG bytes, then echoes the UART.
+2. **MP (10 dBm) PA.** Capture RAIL's PA table, transitions and current on a
+   B210/A410 part (EK2703A or the RF-BM module) with the same scenarios and
+   sampler. Then set `SUPPORTED` for `efr32mg24-pa10`.
+3. **38.4 MHz crystal.** Run raw TX/RX, ACK and current/output against
+   RAILtest on a 38.4 MHz part (Dongle-M). Then widen `xg24::SUPPORTED`
+   (today it requires `hfxo-39mhz`) and re-check the runtime trims on that
+   die.
+4. **SE mailbox TRNG and the recorded fatal resets.** The record must
+   survive the resident Gecko bootloader and come back as `reset_reason` 6.
+   Test with a lab build that panics or faults on demand. For the poisoned
+   mailbox, use an SE that stops answering, for example a debugger-held SE
+   request.
+5. **NCP.** ZRHP session over the S3, network formation, joins and
+   reset/resume.
+6. **Gecko update path.** GBL upload over XMODEM and journal retention
+   across an update.
+7. **Dongle-M.** Pins, crystal, CTUNE, bootloader-entry pin, RF path and the
+   TX power limit on a real unit.
+8. **Power.** EM2, DC-DC, CCA against a jammer, children and Frame Pending
+   through an xG24 Router, and long-duration runs.

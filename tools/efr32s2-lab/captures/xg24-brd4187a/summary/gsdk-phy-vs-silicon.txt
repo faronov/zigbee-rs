@@ -1,0 +1,49 @@
+# GSDK register values quoted below come from rail_util_built_in_phys/efr32xg24/
+# sl_rail_ieee802154_config_{39,38M4}MHz.c, Copyright 2019 Silicon Laboratories Inc.,
+# SPDX-License-Identifier: Zlib.
+# GSDK 4.5.0 sl_rail_ieee802154_config_39MHz.c applied to the register-map reset values,
+# compared with the captured RX state on channel 26 (raw/cap1.tar.xz, rx-ch26).
+# Differences are per-state (RX analog values), per-channel (SRCCHF, DIGMIXCTRL;
+# GSDK holds the channel-11 values), or set by RAIL at run time (AGC.CTRL0/1
+# RSSI shift, FRC.CTRL/WCNTCMP0, ADFSM0, SYNTH.LPFCTRL2RX/TX, RAC.SYNTHREGCTRL,
+# IFADCTRIM0, LNAMIXTRIM4, SYTRIM1 calibrations: values of this die).
+  0xB8004020 FRC.WCNTCMP0                   gsdk 00000000 silicon 000000FF
+  0xB8004048 FRC.CTRL                       gsdk 030007A0 silicon 030407A0
+  0xB800C020 AGC.CTRL0                      gsdk 2138027F silicon 01293214
+  0xB800C024 AGC.CTRL1                      gsdk 00005300 silicon 00004300
+  0xB801411C MODEM.SRCCHF                   gsdk 8BC29000 silicon 8BE09000
+  0xB801413C MODEM.DIGMIXCTRL               gsdk 005254F8 silicon 005242ED
+  0xB80142B4 MODEM.ADFSM0                   gsdk 00000000 silicon 0000F00F
+  0xB80180A8 SYNTH.LPFCTRL2RX               gsdk 01CB4205 silicon 01CB43A5
+  0xB80180AC SYNTH.LPFCTRL2TX               gsdk 008D2205 silicon 008D23A5
+  0xB802009C RAC.SYNTHREGCTRL               gsdk 04000C00 silicon 02000C00
+  0xB80200EC RAC.IFADCTRIM0                 gsdk 1151200C silicon 11512F2C
+  0xB8020110 RAC.LNAMIXTRIM4                gsdk B9000002 silicon 3109E702
+  0xB8020150 RAC.PGACTRL                    gsdk 00A200C1 silicon 00A28EF1
+  0xB8020178 RAC.SYTRIM1                    gsdk DFE00410 silicon CFF80410
+  0xB8020180 RAC.SYEN                       gsdk 00000002 silicon 0000077B
+  0xB8020184 RAC.SYLOEN                     gsdk 00000000 silicon 0000001E
+# 192 equal, 16 differ
+
+# 38.4 MHz vs 39 MHz GSDK PHY (the registers xg24.rs switches with hfxo-39mhz)
+  0xB800C06C AGC.GAINSTEPLIM0               00000740 -> 000006C0
+  0xB8014068 MODEM.TXBR                     00FF0264 -> 00F00249
+  0xB8014070 MODEM.CF                       00000008 -> 00000002
+  0xB801411C MODEM.SRCCHF                   8A81B000 -> 8BC29000
+  0xB801413C MODEM.DIGMIXCTRL               0051BFBB -> 005254F8
+  0xB80141C4 MODEM.ANTSWCTRL1               0006AAAA -> 00069069
+  0xB80141E4 MODEM.CHFCOE00                 0BFFE7E6 -> 365E63DE
+  0xB80141E8 MODEM.CHFCOE01                 000AA1CD -> 00076FBF
+  0xB80141EC MODEM.CHFCOE02                 006A06BD -> 0016EA6F
+  0xB80141F0 MODEM.CHFCOE03                 004DB05E -> 00CE30E5
+  0xB80141F4 MODEM.CHFCOE04                 0E42027D -> 0ED9B9B2
+  0xB80141F8 MODEM.CHFCOE05                 0222B6A5 -> 0494844B
+  0xB80141FC MODEM.CHFCOE06                 34B225FF -> 24A91F5A
+  0xB8014200 MODEM.CHFCOE10                 0BFFE7E6 -> 365E63DE
+  0xB8014204 MODEM.CHFCOE11                 000AA1CD -> 00076FBF
+  0xB8014208 MODEM.CHFCOE12                 006A06BD -> 0016EA6F
+  0xB801420C MODEM.CHFCOE13                 004DB05E -> 00CE30E5
+  0xB8014210 MODEM.CHFCOE14                 0E42027D -> 0ED9B9B2
+  0xB8014214 MODEM.CHFCOE15                 0222B6A5 -> 0494844B
+  0xB8014218 MODEM.CHFCOE16                 34B225FF -> 24A91F5A
+  0xB8018038 SYNTH.IFFREQ                   00104911 -> 001047F1

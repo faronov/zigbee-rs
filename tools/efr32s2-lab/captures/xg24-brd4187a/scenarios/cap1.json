@@ -1,0 +1,231 @@
+{
+ "name": "mg24-railtest-cap1",
+ "duration": "520s",
+ "out": "~/.hwlab/artifacts/mg24-brd4187a/cap1",
+ "steps": [
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "config2p4GHz802154"
+  ],
+  [
+   "cli",
+   "setChannel 26"
+  ],
+  [
+   "cli",
+   "setPower 100"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "cli",
+   "getPowerConfig"
+  ],
+  [
+   "cli",
+   "getCtune"
+  ],
+  [
+   "cli",
+   "getChannel"
+  ],
+  [
+   "cli",
+   "getRadioState"
+  ],
+  [
+   "cli",
+   "getVersionVerbose"
+  ],
+  [
+   "sleep",
+   0.5
+  ],
+  [
+   "dump",
+   "idle-ch26"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.5
+  ],
+  [
+   "cli",
+   "getRadioState"
+  ],
+  [
+   "dump",
+   "rx-ch26"
+  ],
+  [
+   "cli",
+   "getRssi"
+  ],
+  [
+   "cli",
+   "getRssi"
+  ],
+  [
+   "cli",
+   "getRssi"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 15"
+  ],
+  [
+   "cli",
+   "rx 1"
+  ],
+  [
+   "sleep",
+   0.5
+  ],
+  [
+   "dump",
+   "rx-ch15"
+  ],
+  [
+   "cli",
+   "getRssi"
+  ],
+  [
+   "cli",
+   "getRssi"
+  ],
+  [
+   "cli",
+   "rx 0"
+  ],
+  [
+   "cli",
+   "setChannel 26"
+  ],
+  [
+   "cli",
+   "setPower 0"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "cli",
+   "setTxTone 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "cli",
+   "getRadioState"
+  ],
+  [
+   "dump",
+   "tone-ch26-p0"
+  ],
+  [
+   "cli",
+   "setTxTone 0"
+  ],
+  [
+   "cli",
+   "setPower 100"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "cli",
+   "setTxTone 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "cli",
+   "getRadioState"
+  ],
+  [
+   "dump",
+   "tone-ch26-p100"
+  ],
+  [
+   "cli",
+   "setTxTone 0"
+  ],
+  [
+   "cli",
+   "setPower 200"
+  ],
+  [
+   "cli",
+   "getPower"
+  ],
+  [
+   "cli",
+   "setTxTone 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "cli",
+   "getRadioState"
+  ],
+  [
+   "dump",
+   "tone-ch26-p200"
+  ],
+  [
+   "cli",
+   "setTxTone 0"
+  ],
+  [
+   "cli",
+   "setTxStream 1"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump",
+   "stream-ch26-p200"
+  ],
+  [
+   "cli",
+   "setTxStream 0"
+  ],
+  [
+   "sleep",
+   0.3
+  ],
+  [
+   "dump",
+   "idle2-ch26"
+  ],
+  [
+   "cli",
+   "status"
+  ]
+ ]
+}

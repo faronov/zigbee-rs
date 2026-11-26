@@ -32,8 +32,8 @@
 //!   [`DEVINFO_IRCAL`] when it is programmed.
 
 use super::{
-    AnalogState, CLR, Deadline, L, Layout, RAC_IF, RAC_IF_STATECHANGE, Warm, read, tx_power_entry,
-    write,
+    AnalogState, CLR, Deadline, L, Layout, RAC_IF, RAC_IF_STATECHANGE, SYNTH_CHCTRL, Warm, read,
+    tx_power_entry, write,
 };
 
 pub(super) const SUPPORTED: bool = true;
@@ -466,3 +466,15 @@ pub(super) fn seq_release(warm: Warm) {
 pub(super) const FRC_IRQN: u32 = 34;
 #[cfg_attr(not(feature = "rt"), allow(dead_code))]
 pub(super) const RAC_RSM_IRQN: u32 = 37;
+
+/// Channel-dependent PHY registers: none besides `SYNTH.FREQ` on this die.
+#[inline(always)]
+pub(super) fn select_channel(_channel: u8) {
+    unsafe { write(L.synth + SYNTH_CHCTRL, 0) };
+}
+
+/// End of a transmission (after the PA ramp-down): release `TXPD`.
+#[inline(always)]
+pub(super) fn tx_done() {
+    seq_release(Warm::TxPd);
+}

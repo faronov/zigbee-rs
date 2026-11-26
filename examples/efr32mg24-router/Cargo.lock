@@ -166,9 +166,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "efr32mg24-brd4187"
+version = "0.1.0"
+dependencies = [
+ "efr32s2-hal",
+]
+
+[[package]]
 name = "efr32mg24-product"
 version = "0.1.0"
 dependencies = [
+ "efr32mg24-brd4187",
  "efr32s2-hal",
  "embedded-storage",
  "rf-bm-mg24b1",
@@ -185,6 +193,7 @@ version = "0.1.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
+ "efr32mg24-brd4187",
  "efr32mg24-product",
  "efr32s2-hal",
  "embassy-executor",

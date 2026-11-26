@@ -1,0 +1,16 @@
+[package]
+name = "efr32mg24-brd4187"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Board support for the BRD4187 xG24 +20 dBm radio board (EFR32MG24B220F1536IM48) on a BRD4001A Wireless Starter Kit"
+repository = "https://github.com/faronov/zigbee-rs"
+publish = false
+
+[features]
+# Interrupt-driven USART0 host link (`efr32s2-hal` `usart0-host`): defines
+# the USART0 interrupt handlers, so only images that use it enable it.
+host-uart = ["efr32s2-hal/usart0-host"]
+
+[dependencies]
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg24-pa20", "hfxo-39mhz"] }
