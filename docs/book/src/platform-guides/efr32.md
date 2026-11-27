@@ -1317,8 +1317,9 @@ child: an EmberZNet backup lists devices without keys (the stack derives
 them from `hashed_tclk`), and the Trust Center refused secured rejoins of
 devices missing from its table. Fixed in the shared stack (ZRHP spec 7.5):
 secured rejoins are admitted, restored devices are registered (with their
-EmberZNet-derived keys when the backup carries `hashed_tclk`), and the
-child entry is kept. Transmission to a device, the output and the CTUNE
+EmberZNet-derived keys when the backup carries `hashed_tclk`; otherwise
+with network-level membership only, under a private key with no APS
+standing), and the child entry is kept. Transmission to a device, the output and the CTUNE
 offset remain open for the next run.
 - On first boot the stock network keys, frame counters and tables are gone.
   Take an EZSP network backup with the hub before flashing and restore it
@@ -1344,8 +1345,8 @@ values at 38.4 MHz against the shared analog states.
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
 | NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 456,956 B | 168,660 B | 89,388 B |
-| NCP, Dongle-M | 460,084 B | 168,660 B | 89,388 B |
-| NCP, BRD4187 on a WSTK | 460,084 B | 168,660 B | 89,388 B |
+| NCP, Dongle-M | 460,784 B | 168,660 B | 89,388 B |
+| NCP, BRD4187 on a WSTK | 460,792 B | 168,660 B | 89,388 B |
 | Router, RF-BM-MG24B1 (GP Proxy Basic) | 345,480 B | 37,140 B | 224,492 B |
 | Router, Dongle-M | 345,804 B | 37,140 B | 224,492 B |
 | Router, BRD4187 on a WSTK | 345,744 B | 37,136 B | 224,496 B |
@@ -1356,11 +1357,12 @@ MG24 image compared with `15ee9550`, the build-only base without a radio.
 Static RAM and stack did not change. The 10 dBm PA support added about
 130 B (Router) and 220 B (NCP) to the RF-BM-MG24B1 images. The BRD4187 and
 Dongle-M images are byte-identical with and without it. The EmberZNet
-restore support (secured-rejoin admission, hashed-TCLK root and
-derivation, `SEC_DERIVE_EZSP_KEY`) and the held boot log added 2,976 B to
-the Dongle-M and BRD4187 NCPs against `e96cd867` (457,108 → 460,084 B
-file-backed), with the same `.bss` and linked stack; the Router changed
-by 4 B.
+restore support (secured-rejoin admission with private unknown keys,
+hashed-TCLK root and derivation, `SEC_DERIVE_EZSP_KEY`, the
+application-key timeout) and the held boot log added about 3.7 KB to the
+Dongle-M and BRD4187 NCPs against `e96cd867` (Dongle-M 457,108 → 460,784 B
+file-backed), with the same `.bss` and linked stack; the Router changed by
+4 B.
 
 The NCP uses 33 % of the application window and 66 % of SRAM for static
 data. The compact capacity tier is not needed. The recorded fatal resets

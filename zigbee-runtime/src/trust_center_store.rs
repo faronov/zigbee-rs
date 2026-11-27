@@ -510,18 +510,54 @@ impl PersistentTrustCenterState {
         Ok(())
     }
 
+    /// The record version this state is written with. With `ncp-capacity`,
+    /// version 7 only once the state holds what version 6 cannot (an EZSP
+    /// hashed-TCLK root, an EZSP-hashed or unknown key); otherwise version
+    /// 6, so firmware that predates version 7 keeps reading the table.
+    pub(crate) fn record_version(&self) -> u8 {
+        #[cfg(feature = "ncp-capacity")]
+        if !self.needs_hashed_root_layout() {
+            return NCP_COUNT_HIGH_RECORD_VERSION;
+        }
+        RECORD_VERSION
+    }
+
+    #[cfg(feature = "ncp-capacity")]
+    fn needs_hashed_root_layout(&self) -> bool {
+        self.ezsp_hashed_link_key_root.is_some()
+            || self.devices.iter().any(|stored| {
+                matches!(
+                    stored.device.key_origin,
+                    TrustCenterKeyOrigin::EzspHashed | TrustCenterKeyOrigin::Unknown
+                )
+            })
+    }
+
     /// Encoded length of [`Self::encode`] for this state.
     pub fn encoded_len(&self) -> usize {
-        STATE_HEADER_LEN
+        self.encoded_len_as(RECORD_VERSION)
+    }
+
+    /// Encoded length in the layout of `version` (the current one, or with
+    /// `ncp-capacity` version 6).
+    pub(crate) fn encoded_len_as(&self, version: u8) -> usize {
+        let len = STATE_HEADER_LEN
             + self.devices.len() * DEVICE_ENCODED_LEN
             + 1
             + self.application_key_requests.len() * APPLICATION_KEY_REQUEST_ENTRY_LEN
             + ROTATION_TRAILER_LEN
             + UNKNOWN_REMOVAL_HEADER_LEN
             + self.pending_unknown_removals.len() * UNKNOWN_REMOVAL_ENTRY_LEN
-            + GLOBAL_APS_TRAILER_LEN
+            + GLOBAL_APS_TRAILER_LEN;
+        #[cfg(feature = "ncp-capacity")]
+        if version == NCP_COUNT_HIGH_RECORD_VERSION {
+            return len - HASHED_ROOT_TRAILER_LEN;
+        }
+        let _ = version;
+        len
     }
 
+    /// Encode in the current record version's layout.
     pub fn encode(&self, output: &mut [u8; MAX_ENCODED_TRUST_CENTER_STATE_LEN]) -> usize {
         output.fill(0);
         let mut sink = SliceSink::new(output);
@@ -529,12 +565,26 @@ impl PersistentTrustCenterState {
         self.encode_into(&mut sink).unwrap_or_default()
     }
 
-    /// Stream the current record version's encoding into `sink` (the
-    /// streamed multi-slot journal encodes without a full-size buffer).
+    /// Stream the current record version's encoding into `sink`.
     pub(crate) fn encode_into(
         &self,
         sink: &mut impl SnapshotSink,
     ) -> Result<usize, TrustCenterStoreError> {
+        self.encode_as(sink, RECORD_VERSION)
+    }
+
+    /// Stream the encoding of `version` (the current one, or with
+    /// `ncp-capacity` version 6, [`Self::record_version`]) into `sink`; the
+    /// journals write [`Self::record_version`] (the streamed multi-slot
+    /// journal encodes without a full-size buffer).
+    pub(crate) fn encode_as(
+        &self,
+        sink: &mut impl SnapshotSink,
+        version: u8,
+    ) -> Result<usize, TrustCenterStoreError> {
+        if version != RECORD_VERSION && version != self.record_version() {
+            return Err(TrustCenterStoreError::Corrupt);
+        }
         let mut header = [0u8; STATE_HEADER_LEN];
         header[0..8].copy_from_slice(&self.extended_pan_id);
         // Low byte; version 6 appends the high byte (see the trailer below).
@@ -579,7 +629,7 @@ impl PersistentTrustCenterState {
         #[cfg(feature = "global-aps-counter")]
         sink.put(&self.global_aps_limit.to_le_bytes())?;
         #[cfg(feature = "ncp-capacity")]
-        {
+        if version == RECORD_VERSION {
             let mut trailer = [0u8; HASHED_ROOT_TRAILER_LEN];
             if let Some(root) = self.ezsp_hashed_link_key_root {
                 trailer[0] = 1;
@@ -587,7 +637,7 @@ impl PersistentTrustCenterState {
             }
             sink.put(&trailer)?;
         }
-        Ok(self.encoded_len())
+        Ok(self.encoded_len_as(version))
     }
 
     /// Decode the current record version's encoding (by value; host and
@@ -602,16 +652,7 @@ impl PersistentTrustCenterState {
     /// without a whole-state temporary. On error `self` holds an
     /// unspecified (partially decoded) state.
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), TrustCenterStoreError> {
-        self.decode_from_into(&mut SliceSource::new(bytes))
-    }
-
-    /// Decode the current record version's encoding from `source` into
-    /// `self` in place (see [`Self::decode_into`]).
-    pub(crate) fn decode_from_into(
-        &mut self,
-        source: &mut impl SnapshotSource,
-    ) -> Result<(), TrustCenterStoreError> {
-        self.decode_version_into(source, Layout::CURRENT)
+        self.decode_version_into(&mut SliceSource::new(bytes), Layout::CURRENT)
     }
 
     /// Decode a record of `version`'s layout into `self` in place; `None`
@@ -1270,11 +1311,13 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
         state.validate()?;
         let mut record = [0xFFu8; TRUST_CENTER_JOURNAL_SLOT_SIZE];
         record[0..4].copy_from_slice(&RECORD_MAGIC);
-        record[4] = RECORD_VERSION;
+        let version = state.record_version();
+        record[4] = version;
         // Encode in place: the bytes after the encoding stay erased.
-        let encoded_len = state.encode_into(&mut SliceSink::new(
-            &mut record[RECORD_ENCODED_OFFSET..RECORD_CRC_OFFSET],
-        ))?;
+        let encoded_len = state.encode_as(
+            &mut SliceSink::new(&mut record[RECORD_ENCODED_OFFSET..RECORD_CRC_OFFSET]),
+            version,
+        )?;
         record[5..7].copy_from_slice(&(encoded_len as u16).to_le_bytes());
         record[7] = 0;
         record[8..12].copy_from_slice(&generation.to_le_bytes());
@@ -2142,7 +2185,7 @@ mod tests {
             let flash = journal.into_storage();
             assert_eq!(
                 flash.bytes[TRUST_CENTER_JOURNAL_SECTOR_SIZE + 4],
-                RECORD_VERSION
+                updated.record_version()
             );
 
             let mut reopened =
@@ -2415,7 +2458,7 @@ mod tests {
         );
         journal.store(&state).unwrap();
         let flash = journal.into_storage();
-        assert_eq!(flash.bytes[4], RECORD_VERSION);
+        assert_eq!(flash.bytes[4], state.record_version());
         let mut reopened =
             TrustCenterDeviceJournal::new(flash, 0, TRUST_CENTER_JOURNAL_SECTOR_SIZE as u32);
         assert_eq!(

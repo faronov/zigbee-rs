@@ -462,17 +462,20 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_S
         state: &PersistentTrustCenterState,
         generation: u32,
     ) -> Result<Stream, TrustCenterStoreError> {
-        let total_len = state.encoded_len();
+        // Version 6 while the state needs nothing newer: older firmware
+        // keeps reading the table.
+        let version = state.record_version();
+        let total_len = state.encoded_len_as(version);
         let chunks = total_len.div_ceil(TRUST_CENTER_STREAM_PAYLOAD_PER_CHUNK);
         if total_len == 0 || chunks > TRUST_CENTER_STREAM_MAX_CHUNKS {
             return Err(TrustCenterStoreError::Full);
         }
         let mut crc = CrcSink(CRC_INIT);
-        if state.encode_into(&mut crc)? != total_len {
+        if state.encode_as(&mut crc, version)? != total_len {
             return Err(TrustCenterStoreError::Corrupt);
         }
         Ok(Stream {
-            version: RECORD_VERSION,
+            version,
             generation,
             total_len,
             chunks,
@@ -500,7 +503,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_S
             verify,
             buffer: [0xFF; SLOT],
         };
-        let written = state.encode_into(&mut writer)?;
+        let written = state.encode_as(&mut writer, stream.version)?;
         if written != stream.total_len || writer.fill != 0 || writer.chunk != stream.chunks {
             return Err(TrustCenterStoreError::Hardware);
         }
@@ -1466,8 +1469,10 @@ mod tests {
     }
 
     /// Firmware before the hashed link-key root wrote version-6 chunks: an
-    /// update must keep reading them (the Trust Center table), and the next
-    /// store writes version 7.
+    /// update must keep reading them (the Trust Center table). It keeps
+    /// writing version 6 (readable by that firmware) until the state holds
+    /// a root or an EZSP-hashed or unknown key, then version 7, and version
+    /// 6 again once it no longer does.
     #[test]
     fn a_version_6_snapshot_is_read_and_superseded_by_version_7() {
         use crate::trust_center_store::NCP_COUNT_HIGH_RECORD_VERSION;
@@ -1499,11 +1504,25 @@ mod tests {
         let mut loaded = PersistentTrustCenterState::new([0; 8]);
         assert_eq!(journal.load_into(&mut loaded), Ok(true));
         assert_eq!(loaded, expected);
-        // The next store is version 7 with the root.
+        let version_at = |journal: &TrustCenterStreamJournal<MockFlash, SECTOR>| {
+            let current = journal.current.unwrap();
+            journal.storage().bytes[(current.sector * (SECTOR / SLOT) + current.slot) * SLOT + 4]
+        };
+        journal.store(&expected).unwrap();
+        assert_eq!(version_at(&journal), NCP_COUNT_HIGH_RECORD_VERSION);
+        // An unknown key needs version 7, and so does a root.
+        let mut unknown = expected.clone();
+        let mut device = unknown.devices()[0];
+        device.device.key_origin = zigbee_bdb::trust_center::TrustCenterKeyOrigin::Unknown;
+        unknown.upsert(device).unwrap();
+        journal.store(&unknown).unwrap();
+        assert_eq!(version_at(&journal), RECORD_VERSION);
+        journal.store(&expected).unwrap();
+        assert_eq!(version_at(&journal), NCP_COUNT_HIGH_RECORD_VERSION);
         expected.set_ezsp_hashed_link_key_root(Some([0x77; 16]));
         journal.store(&expected).unwrap();
         let current = journal.current.unwrap();
-        assert_eq!(current.generation, 8);
+        assert_eq!(current.generation, 11);
         let mut journal = reopen(journal);
         let mut reloaded = PersistentTrustCenterState::new([0; 8]);
         assert_eq!(journal.load_into(&mut reloaded), Ok(true));
