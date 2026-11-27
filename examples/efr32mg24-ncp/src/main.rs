@@ -213,8 +213,17 @@ async fn main(_spawner: Spawner) {
     let (port, opened) = compose(radio, flash);
     match opened {
         Opened::Existing => log::info!("NV journals preserved"),
-        Opened::Fresh => log::warn!("blank/foreign NV erased"),
-        Opened::ForeignNvm3 => log::warn!("NVM3 (stock EmberZNet) in the NV window: erased"),
+        Opened::Fresh => log::warn!("blank NV (no valid journal): erased"),
+        Opened::Foreign(page) => log::warn!(
+            "{} at {:#010X} (first word {:#010X}): NV window erased",
+            if page.nvm3 {
+                "NVM3 (stock EmberZNet)"
+            } else {
+                "foreign data"
+            },
+            page.address,
+            page.first_word
+        ),
         Opened::RoleChanged => log::warn!("journal of another role: keys cleared"),
     }
     let ncp_identity = NcpIdentity {

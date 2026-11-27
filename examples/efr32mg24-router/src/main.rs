@@ -256,12 +256,17 @@ fn compose(
     });
     match opened {
         Opened::Existing => log::info!("[MG24] journals preserved"),
-        Opened::Fresh => log::warn!("[MG24] blank/foreign NV erased; fresh join required"),
-        Opened::ForeignNvm3 => {
-            log::warn!(
-                "[MG24] NVM3 (stock EmberZNet) in the NV window: erased; fresh join required"
-            )
-        }
+        Opened::Fresh => log::warn!("[MG24] blank NV erased; fresh join required"),
+        Opened::Foreign(page) => log::warn!(
+            "[MG24] {} at {:#010X} (first word {:#010X}): NV erased; fresh join required",
+            if page.nvm3 {
+                "NVM3 (stock EmberZNet)"
+            } else {
+                "foreign data"
+            },
+            page.address,
+            page.first_word
+        ),
         Opened::RoleChanged => log::warn!("[MG24] journal of another role: keys cleared"),
     }
     let stores::Stores {
