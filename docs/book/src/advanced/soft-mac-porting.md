@@ -252,7 +252,11 @@ without a hardware ACK engine:
   after the ACK. Keep the decision with the frame (a record flag, or a
   reception-order log such as `ack_pending::PollAckLog` when the interrupt
   cannot mark the frame), never in a per-child table, which fills up with
-  sleepy children that never get data;
+  sleepy children that never get data. The EFR32 Series 2 and ESP32
+  parents report it; the CC26x2, nRF (`isr_phy`), Telink and BL702 parent
+  PHYs do not yet and deliver at once (a follow-up). EFR32 Series 1,
+  PHY6222 and CC2340 auto-ACK without a Frame Pending table, so arming
+  indirect data fails there and they cannot serve sleepy children;
 - it drops frames it could not ACK in time, plus ACKs and foreign frames,
   and copies the frames it keeps into a software queue, so the hardware RX
   buffer is empty after every interrupt, even while the task is blocked in
