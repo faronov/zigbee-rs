@@ -1321,12 +1321,34 @@ Checks behind the table:
   and says `NVM3 (stock EmberZNet)` when a first word carries the GSDK
   NVM3 page magic `0xB29A` (a label only). A first version recognised NVM3
   by its page header (magic, version, Berger-coded erase counts as read
-  from GSDK 4.5.0 `libnvm3`); on a real Dongle Max the EmberZNet 7.4.5
-  pages did not match, and the window was erased only because no valid
-  journal of ours was left. Host tests: the return path with NVM3-shaped
-  and with unrecognised stock pages, a foreign first word at every page
-  start beside a valid journal, and a rolled-over journal set with a torn
-  page-start magic that stays ours.
+  from GSDK 4.5.0 `libnvm3`), and a Dongle Max run seemed to show that real
+  pages did not match it (see the fourth run below: they do; that log came
+  from a second boot). Host tests: the return path with NVM3-shaped and
+  with unrecognised stock pages, a foreign first word at every page start
+  beside a valid journal, a rolled-over journal set with a torn page-start
+  magic that stays ours, and the hardware captures below.
+- **Ground truth (BRD4187, SWD dumps through hwlab).** The board's flash
+  above its Gecko bootloader was erased, SONOFF's EmberZNet 7.4.5 Dongle-M
+  NCP (`zigbee_ncp_uart_hw_donglem_v7.4.5.gbl`, SHA-256 `44b81c1e…`,
+  converted to its `0x0800_6000` program image) was programmed and run
+  for about 90 s, and `0x0804_4000..0x0818_0000` was read back. The stock
+  NVM3 is exactly the instance the image declares (`nvm3_defaultInit` at
+  `0x0804_2388`: base `0x0817_6000`, 32 KiB, cache of 200 objects): four
+  8 KiB pages at `0x0817_6000`, `…8000`, `…A000` and `…C000`, each starting
+  with `B29A0001 D0000001 0FFFFFFE FFFFFFFF FFFF903C` (magic and version,
+  erase count 1 and its complement with Berger codes, page state good,
+  format word), plus 1,856 bytes of objects in the first page. Nothing else
+  above the image was written. It lies inside our window, so
+  `efr32mg24-nv-clear.gbl` and the 40 KiB `nvm3_clear` both clear it; the
+  32 KiB `nvm3_clear` leaves our top page, as above. Our current NCP image
+  programmed over those pages logged `NVM3 (stock EmberZNet) at 0x08176000
+  (first word 0xB29A0001): NV window erased` (read from its RAM log ring
+  over SWD) and left the window erased. A commissioned NCP of ours on the
+  same board starts its pages with `ZBAT` (`0x0815_C000`), `ZBCT`
+  (`0x0816_6000`), `ZBTS` (`0x0817_0000`) and `ZBSS` (`0x0817_8000`), all
+  other page starts erased. Both captures are host-test vectors
+  (`products/efr32mg24` `stores`). The board was restored from its
+  verified backup afterwards.
 
 First run on a unit (one Dongle Max, image from `e96cd867`, build ID
 `a603b22b88fc5c2b`, reported by the hub's HIL run): it booted from the stock
@@ -1401,9 +1423,15 @@ the ED Timeout Request followed within 12 ms, with no Trust Center rejoin
 and `joins_denied` 0, and indications carried RSSI −23 to −31 dBm. The
 same run found two faults, both fixed in #23 and pending the next run:
 
-- The boot log said `blank/foreign NV erased`: the NVM3 page-header check
-  did not recognise the EmberZNet 7.4.5 pages (see the opening policy
-  above, now independent of the foreign format).
+- The boot log said `blank/foreign NV erased`, which looked as if the
+  NVM3 page-header check had missed the EmberZNet 7.4.5 pages. It had not
+  (ground truth above). The hub resets the NCP when it starts: the NCP's
+  first boot after the GBL erased the stock NVM3, its log record waited in
+  RAM for the hub's LOG credit and was lost with that reset, and the second
+  boot found the window blank. Both logged boots of that run show an NCP
+  uptime of 271 ms about 2.8 s after the hub's own boot. The opening policy
+  is now independent of the foreign format anyway; to see the first boot's
+  record, the hub must take the NCP's log before it resets the NCP.
 - Every `network/restore` of the hub made the NCP broadcast a NWK Leave
   (rejoin 0) before installing the network: the wipe ran the BDB factory
   reset, which leaves the network first. Harmless for the sleepy device,
@@ -1426,8 +1454,9 @@ Notes for flashing over the stock image:
   MG24 so far. The ESP32's GPIO12 + RESET path stays the recovery path.
 - Going back to EmberZNet: upload `efr32mg24-nv-clear.gbl` (erases
   `0x0815_8000..0x0818_0000` only, no application record, so no version or
-  product-ID check applies), then the stock GBL. Built and parsed only;
-  not run on a bootloader yet.
+  product-ID check applies), then the stock GBL. Run on a Dongle Max
+  (stock Gecko Bootloader v2.04.02, the hub's flasher: written and
+  verified, the stock image then ran and took the EZSP restore).
 
 First run on a unit (the hardware gate): the boot log line
 `HFXO 38400000 Hz CTUNE … (source), TX 10 dBm, IEEE … (source)`, raw TX
