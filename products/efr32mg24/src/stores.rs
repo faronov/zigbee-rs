@@ -235,9 +235,10 @@ const fn looks_like_nvm3(word: u32) -> bool {
 }
 
 /// The first 8 KiB page of the NV window whose first word is not
-/// [`ours`]. Independent of the foreign format: the stock EmberZNet 7.4.5
-/// NVM3 pages of a real Dongle Max were not recognised by a GSDK NVM3 page
-/// header check, so nothing here relies on knowing what is foreign.
+/// [`ours`]. Independent of the foreign format: nothing here relies on
+/// knowing what is foreign. (The stock EmberZNet 7.4.5 NVM3 does carry the
+/// GSDK page header, `0xB29A0001` first, as captured on a BRD4187; the
+/// rule covers any other format too.)
 fn foreign_page<Nv: NorFlash>(nv: &mut Nv) -> Result<Option<ForeignPage>, SecurityStoreError> {
     let mut first = None;
     let mut nvm3 = false;
@@ -653,9 +654,19 @@ mod tests {
     fn the_captured_emberznet_nvm3_is_foreign() {
         assert_eq!(nvm3_header(1), EMBERZNET_745_PAGE_HEADER);
         let region = Region::filled(0xFF);
-        // A valid journal of ours does not protect it.
+        // Our journal rolled over far enough for its newest records to sit
+        // in the top page 0x0817_E000, above the stock NVM3.
         let (mut journal, _) = region.open(crate::ROLE_TAG);
-        journal.store(&commissioned()).unwrap();
+        let mut state = commissioned();
+        for _ in 0..4 * SecurityStore::<View>::SLOTS_PER_SECTOR {
+            if region.bytes(STOCK_NVM3.end, STOCK_NVM3.end + 4) == *b"ZBSS" {
+                break;
+            }
+            state.global_counter_limit += 0x400;
+            journal.store(&state).unwrap();
+        }
+        assert_eq!(region.bytes(STOCK_NVM3.end, STOCK_NVM3.end + 4), *b"ZBSS");
+        // The stock NVM3 pages as captured, over the rest of the window.
         region.fill(
             STOCK_NVM3.start,
             &vec![0xFF; (STOCK_NVM3.end - STOCK_NVM3.start) as usize],
@@ -668,6 +679,8 @@ mod tests {
             region.fill(page, &header);
         }
         region.fill(STOCK_NVM3.start + 20, &[0x5C; 1856]);
+        // A valid journal of ours is still there and does not protect it.
+        assert_eq!(region.journal().load(), Ok(Some(state)));
         let (mut journal, opened) = region.open(crate::ROLE_TAG);
         assert_eq!(
             opened,
@@ -863,8 +876,9 @@ mod tests {
     }
 
     /// The same return path when the stock pages are of a format nothing
-    /// here recognises (the real EmberZNet 7.4.5 pages did not match the
-    /// GSDK page header check): still foreign, still erased.
+    /// here recognises (another stock image or NVM3 version; the captured
+    /// EmberZNet 7.4.5 pages do carry the GSDK header): still foreign,
+    /// still erased.
     #[test]
     fn return_from_stock_with_unrecognised_pages_erases_stale_records() {
         let region = Region::filled(0xFF);
