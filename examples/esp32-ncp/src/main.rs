@@ -373,6 +373,10 @@ fn radio_mac(
     let ieee802154 = esp_radio::ieee802154::Ieee802154::new(radio);
     let mut phy =
         zigbee_mac::esp::EspRadioPhy::new(ieee802154, esp_radio::ieee802154::Config::default());
+    log::info!(
+        "[RADIO] RSSI compensation {} dB",
+        phy.rssi_compensation_db()
+    );
     if phy.install_aes_engine(aes).is_err() {
         halt()
     }

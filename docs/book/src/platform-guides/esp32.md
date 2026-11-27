@@ -166,6 +166,20 @@ and link-cost decisions. The radio's raw LQI byte (about 7–11) maps every
 router to link cost 7, which made end-device rejoin parent selection reject
 every beacon ("none suitable as parent").
 
+**RSSI compensation (ESP32-H2).** The RSSI byte the radio writes over the
+first FCS octet is not the received power on most ESP32-H2 parts. ESP-IDF
+v5.5.1 adds `IEEE802154_RSSI_COMPENSATION_VALUE` to it for every received
+frame (`esp_ieee802154_dev.c` `ieee802154_rx_frame_info_update`); on the H2
+that is `bt_bb_get_rssi_comp()` from `libbtbb`, 10 dB unless the PHY reports
+chip version 5 (then 0), and 0 on the C6/C5. `EspRadioPhy` reads the same
+library value once the radio is enabled and adds it before deriving RSSI and
+LQI (`zigbee-mac/src/esp_rssi.rs`, `EspRadioPhy::rssi_compensation_db`; the
+NCP logs it at boot as `[RADIO] RSSI compensation … dB`). Energy-detect
+results stay uncompensated, as in ESP-IDF. Before this, every H2 image
+reported received frames 10 dB too weak (LQI about 32 too low), which
+looked like a poor radio although the RF path was normal; see the Thread BR
+measurements below.
+
 **Persistence.** The role images write a role tag (ROUTER `0x5201`,
 END_DEVICE `0x5202`) in the security journal. The SED image writes none, so
 its journal records are unchanged. The router keeps its child and APS tables
@@ -788,6 +802,46 @@ hardware only by the signed TEST-ONLY runs below and in the
 [bootloader results](../advanced/bootloader.md#esp32-h2-signed-zha-ota-2026-11-10);
 rollback is host-tested only. Neither current H2 variant above has hardware execution
 evidence. Removing artificial size budgets does not close those hardware gates.
+
+#### RF link figures on the Thread BR board (2026-11-27)
+
+ESP32-H2-MINI-1 rev v0.1 (PCB antenna, no RF switch or FEM) running the
+ZRHP NCP, coordinator of PAN `0x1C06` on channel 17, hub `tbr-hub` 0.4.0.
+Reference: the hwlab nRF52840 dongle (zigbee-rs radio lab) at a fixed spot.
+It transmitted a beacon (PAN `0xABCD`) at a set power while the hub ran an
+active scan of channel 17 (the H2 reports the beacon's RSSI), and it
+received the H2's Link Status and beacons (the H2 answered its Beacon
+Requests). Nothing was moved between the runs.
+
+| measurement | NCP 0.1.2 release | with RSSI compensation | sessions |
+|---|---|---|---|
+| H2-reported RSSI of the nRF beacon at −20 / −8 / 0 / +8 dBm | −75 / −63 / −57 / −48 dBm (LQI 79 / 117 / 137 / 165) | −65 / −53 / −47 / −38 dBm (LQI 111 / 149 / 168 / 197) | `2026-11-27T203145Z-h2rf-before-sweep-ch17`, `2026-11-27T205138Z-h2rf-after-sweep-ch17` |
+| nRF RSSI of the H2 at 20 / 9 / 0 / −12 dBm (`network/set_tx_power`, index 15 / 11 / 8 / 4) | −32 / −41 / −49 / −60.5 dBm | 9 dBm: −41 dBm (TX path unchanged) | same |
+| compensation applied | — | 10 dB: all four points moved by exactly +10 dB (the hub did not forward the NCP's boot log line) | same |
+
+Both directions use the same antennas and path, so the difference of the
+two received powers is the difference of the two transmit powers: −41 −
+(−47) = 6 dB for the H2's nominal 9 dBm against the nRF's 0 dBm (3 dB
+below nominal, inside the nRF52840's RSSI and output tolerances). The
+receive response is linear (−20…+8 dBm in, slope 0.96) and the transmit
+steps follow ESP-IDF's 3 dB table (the top step 20 → 9 dBm measured 9 dB).
+The radio and antenna are normal; the 0.1.2 images under-reported every
+received frame by 10 dB. NCP 0.1.2 and current master have the same RF
+code apart from PTA arbitration. The fixed image (current master plus the
+compensation) was programmed into `ota_0` in place through the S3 bridge
+(`hub rom`, hwlab `esprom`; full H2 backup
+`esprom-flash-esp32h2-744dbd641ece-4096K-70a8dd86b0c5` first); the hub
+resumed PAN `0x1C06` on channel 17 with its device record.
+
+Not done in ESP-IDF's way yet: ESP-IDF runs `phy_param_track_tot`
+(RF PLL capacitor and TX power tracking over temperature) every second
+while the 802.15.4 PHY is on (`phy_common.c`, `CONFIG_ESP_PHY_PLL_TRACK_PERIOD_MS`);
+esp-phy 0.1.1 / esp-radio 0.17 never call it. Room-temperature figures
+above are unaffected; behaviour over a temperature sweep is an open
+hardware gate. The H2's `register_chipv7_phy` ignores the init-data and
+calibration-data pointers (ESP-IDF passes `NULL, NULL, PHY_RF_CAL_FULL`;
+esp-phy passes a buffer and the same full calibration), so there is no
+calibration data to store on the H2.
 
 ### ESP32-C6
 
