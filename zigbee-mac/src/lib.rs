@@ -55,6 +55,9 @@ mod esp_aes;
 #[cfg(any(test, feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
 mod esp_identity;
 
+#[cfg(any(test, feature = "esp32c6", feature = "esp32h2", feature = "esp32c5"))]
+mod esp_rssi;
+
 #[cfg(any(test, feature = "nrf52840", feature = "nrf52833"))]
 mod nrf_aes;
 

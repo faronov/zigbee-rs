@@ -392,6 +392,36 @@ pub struct EspRadioPhy<'a> {
     gp_reply_src: u32,
     #[cfg(feature = "timed-tx")]
     gp_reply_outcome: Option<crate::gp_reply::GpReplyOutcome>,
+    /// dB added to the radio's raw RSSI byte of every received frame
+    /// ([`rssi_compensation_db`], `crate::esp_rssi`).
+    rssi_compensation_db: i8,
+}
+
+/// The RSSI compensation ESP-IDF v5.5.1 applies on this chip
+/// (`IEEE802154_RSSI_COMPENSATION_VALUE`, see `crate::esp_rssi`). Valid once
+/// the radio is enabled: `bt_bb_v2_init_cmplx` may clear the H2 value.
+#[cfg(feature = "esp32h2")]
+fn rssi_compensation_db() -> i8 {
+    unsafe extern "C" {
+        /// `libbtbb` (esp-wifi-sys), `hal/esp32h2/include/hal/ieee802154_ll.h`.
+        fn bt_bb_get_rssi_comp() -> u32;
+    }
+    // SAFETY: a leaf function of the linked PHY library that reads one
+    // 16-bit variable; no arguments, no side effects.
+    let library_value = unsafe { bt_bb_get_rssi_comp() };
+    crate::esp_rssi::compensation_db(library_value).unwrap_or_else(|| {
+        log::warn!(
+            "[RADIO] RSSI compensation {} dB from libbtbb is out of range; not applied",
+            library_value
+        );
+        0
+    })
+}
+
+/// ESP32-C6/C5: ESP-IDF's `IEEE802154_RSSI_COMPENSATION_VALUE` is 0.
+#[cfg(not(feature = "esp32h2"))]
+const fn rssi_compensation_db() -> i8 {
+    0
 }
 
 impl<'a> EspRadioPhy<'a> {
@@ -416,9 +446,19 @@ impl<'a> EspRadioPhy<'a> {
             gp_reply_src: 0,
             #[cfg(feature = "timed-tx")]
             gp_reply_outcome: None,
+            // After `Ieee802154::new` enabled the radio (and libbtbb).
+            rssi_compensation_db: rssi_compensation_db(),
         };
         this.rearm_receive();
         this
+    }
+
+    /// dB this PHY adds to the radio's raw RSSI of every received frame
+    /// (ESP-IDF's `IEEE802154_RSSI_COMPENSATION_VALUE`: 10 on most ESP32-H2
+    /// parts, 0 on the ESP32-C6/C5). Received RSSI and the RSSI-derived LQI
+    /// both include it; energy-detect results do not (as in ESP-IDF).
+    pub fn rssi_compensation_db(&self) -> i8 {
+        self.rssi_compensation_db
     }
 
     /// Override the data-poll response window (microseconds, non-zero).
@@ -718,7 +758,7 @@ impl<'a> EspRadioPhy<'a> {
             esp_hal::time::Instant::now() + esp_hal::time::Duration::from_micros(ACK_WINDOW_US);
         while !self.parked.is_full() && esp_hal::time::Instant::now() < deadline {
             let slot = self.parked.tail();
-            if !take_from_radio(&mut self.driver, slot) {
+            if !take_from_radio(&mut self.driver, slot, self.rssi_compensation_db) {
                 spin_micros(ACK_POLL_SPIN_US);
                 continue;
             }
@@ -775,7 +815,11 @@ impl<'a> EspRadioPhy<'a> {
 /// start command, and restarting RX on top of an inbound preamble is how
 /// frames get lost.
 #[inline(never)]
-fn take_from_radio(driver: &mut Ieee802154<'_>, frame: &mut PhyRxFrame) -> bool {
+fn take_from_radio(
+    driver: &mut Ieee802154<'_>,
+    frame: &mut PhyRxFrame,
+    rssi_compensation_db: i8,
+) -> bool {
     let Some(raw) = driver.raw_received() else {
         return false;
     };
@@ -786,12 +830,15 @@ fn take_from_radio(driver: &mut Ieee802154<'_>, frame: &mut PhyRxFrame) -> bool 
     if phr < 3 || phr >= raw.data.len() {
         return false;
     }
+    // The raw RSSI byte needs the chip's compensation (10 dB on most
+    // ESP32-H2 parts, `crate::esp_rssi`) before it is a received power.
     // The radio's own LQI byte is on an undocumented small scale (about 7 at
     // -84 dBm, 9 at -70 dBm on the C6), but NWK link costs (and an end
     // device's rejoin parent selection) need the IEEE 0..=255 scale on every
     // role, so all images apply the stack-wide RSSI policy.
-    crate::rx_rssi!(frame, raw.data[phr - 1] as i8);
-    let lqi = crate::lqi::from_rssi_dbm(raw.data[phr - 1] as i8);
+    let rssi_dbm = crate::esp_rssi::frame_rssi_dbm(raw.data[phr - 1], rssi_compensation_db);
+    crate::rx_rssi!(frame, rssi_dbm);
+    let lqi = crate::lqi::from_rssi_dbm(rssi_dbm);
     #[cfg(not(feature = "timed-tx"))]
     {
         frame.set(&raw.data[1..phr - 1], lqi).is_ok()
@@ -932,7 +979,7 @@ impl RadioPhy for EspRadioPhy<'_> {
         self.start_receive();
         let deadline = Instant::now() + embassy_time::Duration::from_micros(timeout_us.into());
         loop {
-            if take_from_radio(&mut self.driver, frame) {
+            if take_from_radio(&mut self.driver, frame, self.rssi_compensation_db) {
                 return Ok(true);
             }
             if Instant::now() >= deadline {
