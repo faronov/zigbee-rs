@@ -914,9 +914,11 @@ def build_backup():
 
 def build_ezsp_hashed():
     seed = bytes.fromhex("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
-    out = {"status": "CANDIDATES - unverified until hardware gate H5 (real ZBT-1 key readout)",
+    out = {"status": "on-air order per the GSDK 4.5.0 source (zb_sec_man_derive_key, "
+                     "TC_HASHED_LINK_KEY, over an EmberEUI64); hardware key match is gate H5",
            "algorithm": "HMAC with AES-MMO (Zigbee keyed hash), key = hashed_tclk, "
-                        "message = device EUI64; byte order of the EUI64 is the open point",
+                        "message = device EUI64 in on-air (little-endian) order; the "
+                        "big-endian column is kept as the negative case",
            "vectors": []}
     for ieee in ("0017880102a1b2c3", "842e14fffe0a0b0c"):
         le = hmac_mmo(seed, ieee_wire(ieee))

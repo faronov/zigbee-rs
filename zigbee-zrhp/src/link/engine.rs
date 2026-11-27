@@ -1006,8 +1006,10 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
         let old = self.rx_credit_edge[e];
         self.rx_credit_edge[e] = old.wrapping_add(frames);
         self.credit_dirty |= 1 << e;
-        if self.last_rx_ep_seq[e] == Some(old.wrapping_sub(1)) {
-            // R8: the peer is blocked on this endpoint.
+        // R8: the peer is blocked on this endpoint when its next `ep_seq`
+        // is the old edge, including an endpoint granted no credit at all
+        // (an embedded host's LOG endpoint, granted later).
+        if self.last_rx_ep_seq[e].map_or(0, |seq| seq.wrapping_add(1)) == old {
             self.request_ack(AckReq::Ack);
         }
     }

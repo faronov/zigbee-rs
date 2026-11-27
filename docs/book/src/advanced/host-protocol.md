@@ -722,9 +722,11 @@ On a valid DATA frame with seq `s` (`d = (s − ack) mod 256`):
 - **R7 (POLL).** Any frame with `POLL` gets an ACK immediately after it is
   processed.
 - **R8 (credits).** When a consumer frees a buffer, advance that endpoint's
-  `credit_edge` by 1. If the peer is blocked on that endpoint (the last
-  received `ep_seq == credit_edge_old − 1`), send ACK immediately. Otherwise
-  the new edge rides on the next ACK.
+  `credit_edge` by 1. If the peer is blocked on that endpoint (its next
+  `ep_seq` equals `credit_edge_old`: the last received `ep_seq ==
+  credit_edge_old − 1`, or nothing received on an endpoint granted no
+  credit, such as an embedded host's LOG endpoint granted later), send ACK
+  immediately. Otherwise the new edge rides on the next ACK.
 - **R9 (timer).** When the delayed-ack timer expires, send ACK. Sending any
   ACK or NAK cancels the timer.
 
@@ -1396,7 +1398,7 @@ Go hub's generic interviewer already do.
 | `0x0406` | `SEC_ROTATE_NETWORK_KEY` | `[16] key (0 = random), u8 mode (0 broadcast, 1 unicast to routers), u16 switch_delay_s` | accepted; `EVT_NETWORK_KEY_SWITCHED` follows | E (`prepare/commit/activate/complete_network_key_rotation`) |
 | `0x0407` | `SEC_GET_LINK_KEY` | `[8] ieee` | `[16] key, u8 type, u8 attrs, u32 tx (global limit), u32 rx_floor` | P |
 | `0x0408` | `SEC_GET_FRAME_COUNTERS` | — | `u32 nwk_current, u32 nwk_limit, u32 aps_current, u32 aps_limit, u32 stride` | P (reservation exists; global APS counter is N, see 8.4) |
-| `0x0409` | `SEC_DERIVE_EZSP_KEY` | `[8] ieee` | `[16] key` (capability bit 14; export-gated like other keys) | N |
+| `0x0409` | `SEC_DERIVE_EZSP_KEY` | `[8] ieee` | `[16] key` (capability bit 14; export-gated like other keys; `NOT_FOUND` without a restored root) | E (`derive_ezsp_hashed_link_key`) |
 | `0x040A` | `SEC_LOCK_KEY_EXPORT` | `u32 confirm` = `0x4B434F4C` ("LOCK") | — (idempotent; lasts until the next NCP reboot) | N |
 | `0x0480` | `EVT_LINK_KEY_UPDATED` | `[8] ieee, u16 nwk, u8 key_type, u8 attrs (0 provisional, 1 unverified, 2 verified), u8 origin` | event (the host then reads the key with `TBL_WRITEBACK`) | P |
 | `0x0481` | `EVT_KEY_FAILURE` | `[8] ieee, u16 nwk, u8 reason (1 verify failed, 2 request denied, 3 no key, 4 MIC failure burst)` | event | P |
@@ -1424,19 +1426,97 @@ Go hub's generic interviewer already do.
 **EZSP hashed TCLK in v1** (decision 8).
 
 - **Input.** When a restore carries `EZSP_HASHED_TCLK` (from
-  `stack_specific.ezsp.hashed_tclk`), the NCP keeps the seed and sets
-  `TC_LINK_KEY.flags` bit0.
-- **Derivation.** For every device that has no explicit link key, the NCP
-  derives the unique TCLK on demand: Silicon Labs' "AES HMAC" of the device
-  EUI64 keyed with the seed [Silabs-HLK]. We implement it as the Zigbee
-  keyed hash, HMAC with the AES-MMO hash and a 16-byte block. The derived
-  key is cached like any other key, with origin 4.
-- **Unverified.** The EUI64 byte order fed to the hash is not confirmed.
-  `ezsp_hashed_tclk.json` lists both candidates. The capability bit stays
-  clear until gate H5 (14.6) has matched a key read from a real ZBT-1.
+  `stack_specific.ezsp.hashed_tclk`), the NCP keeps the root ("seed")
+  durably with the Trust Center table (TC journal record version 7) and sets
+  `TC_LINK_KEY.flags` bit0. An export with keys carries the record again
+  (after `TC_LINK_KEY`), so a backup taken from the NCP still restores on
+  EmberZNet.
+- **Derivation.** The unique TCLK of a device is the Zigbee keyed hash
+  (HMAC with the AES-MMO hash, 16-byte block, B.1.4) of its EUI-64 in
+  **on-air (little-endian) byte order**, keyed with the root. This is what
+  GSDK 4.5.0 does: `zb_sec_man_derive_key` (`TC_HASHED_LINK_KEY`) in
+  `zigbee-security-manager-no-vault.c` runs `sl_zb_sec_man_hmac_aes_mmo`
+  over `context->eui64`, an `EmberEUI64` (stored least-significant byte
+  first), and the EmberZNet library's `sli_zigbee_get_link_key` passes the
+  partner's `EmberEUI64` unchanged. The `candidate_eui64_on_air_order`
+  column of `ezsp_hashed_tclk.json` is this derivation (the Rust
+  implementation reproduces it).
+- **Where it is used.** At `BKP_RESTORE_COMMIT`, every `DEVICE` without a
+  link block (EmberZNet backups list none) is registered with the derived
+  key, origin 4, verified. A device the Trust Center first hears about
+  later (a secured rejoin of a device that was not in the backup, see
+  below) gets it at that point. The key is then used like any other unique
+  TCLK: Transport-Key on a Trust Center rejoin, Request-Key/Verify-Key,
+  APS-encrypted commands. `SEC_DERIVE_EZSP_KEY` returns it for any IEEE
+  (export-gated).
+- **Validation.** The derivation follows the vendor source and matches the
+  independent Python vectors; the hardware key match (gate H5: a key read
+  from a real EmberZNet coordinator or from a device that completed its
+  TCLK update there) is still open. Capability bit 14 means the NCP keeps
+  the root and derives with it.
 - **Not used for new networks** (decision N3). A network formed by
   zigbee-rs uses only random per-device TCLKs, never derived ones. Hashed
   mode exists only to keep EZSP-migrated devices working.
+
+**Secured rejoins of devices the Trust Center does not know.** A device
+that rejoins secured with the current network key has proved it holds that
+key; its parent (the NCP or a router) accepts it and reports it with
+Update-Device status `0x00` (standard secured rejoin), and nothing has to
+be transported. The NCP's Trust Center admits such a device even when it is
+not in its device table (`EVT_DEVICE_JOINED` decision 0) and registers it:
+
+- in the device table with an **unknown** link key, replaced by the derived
+  key when a hashed-TCLK root is kept;
+- as a child when the NCP is its parent (it keeps its child entry).
+
+Restored devices without a key are registered the same way at
+`BKP_RESTORE_COMMIT`, so a backup that lists devices without keys, or only
+part of the network, keeps them.
+
+**An unknown key means no APS standing.** Anyone who holds the network key
+can get such an entry, for any address, without joining being open, so it
+grants nothing beyond network-level membership:
+
+- **No global-key fallback.** The device gets a random key that nobody else
+  holds, installed as its APS link key (and journaled, never exported or
+  transported). APS frames to it and from it decrypt under no key: not the
+  default global key, which APS uses for devices without an entry.
+  Unsecured and global-key APS commands from it are refused, as from any
+  device with a unique key. Its NWK-secured traffic is served normally.
+- **Not a parent.** Its Update-Devices are ignored: it cannot move another
+  device or report it gone.
+- **No key exchange.** Request-Key from it (Trust Center or application
+  key) and application keys with it as the partner are refused. Its
+  Verify-Key proves nothing. A Trust Center (unsecured) rejoin is not
+  answered, since the network key would go out under a guessed key, and
+  its entry stays.
+- **No unicast network key.** Unicast key rotation skips it and does not
+  wait for its role. Broadcast rotation still reaches it, under the current
+  network key, which it holds.
+- **No deadline.** `bdbTrustCenterRequireKeyExchange` applies to devices
+  that joined with the default global key. A secured rejoin carries no key
+  exchange, and an unknown-key device could not complete one: it has no key
+  shared with the Trust Center, and accepting the global key from it would
+  restore the fallback above. The device keeps its network-level membership
+  without a deadline. Removing it would not exclude it anyway, because it
+  holds the network key; only a network-key rotation does.
+
+EmberZNet in the same situation keeps the device too. Without hashed keys
+or a key-table entry, it uses its preconfigured key for the device; zigbee-rs
+uses none.
+
+A single pending application link key (the Trust Center delivers one at a
+time) is dropped when it cannot reach both partners: when a partner is
+unknown or has no address, or after 60 s, counted again from the first poll
+after a reboot. Other pairs are then served again.
+
+Consequence for hosts: a device the host deleted (`TBL_INVALIDATE`) but that
+still holds the network key comes back on its next secured rejoin, with
+network-level membership only. Keep it out with `NWK_REMOVE_DEVICE` (Leave,
+no rejoin) and a network-key rotation. Products that want the strict policy
+clear `BdbAttributes::trust_center_admit_secured_rejoins` (a zigbee-rs
+setting, not a BDB attribute); unknown devices are then answered with
+Remove-Device.
 
 ### 7.6 TABLES (`0x05xx`, endpoint 3)
 
@@ -1601,9 +1681,17 @@ instead of the packaged `.bin`/`.hex`/`.gbl` reports an all-zero
 | `0x0980` | `EVT_LOG_RECORD` | `u32 time_ms, u8 level (1 error … 5 trace), u8 module, u16 seq, text[]` (UTF-8, ≤ 200 B, no terminator; decision 12) | N |
 | `0x0981` | `EVT_LOG_DROPPED` | `u32 count, u16 first_seq` | N |
 
-The NCP keeps logs in a bounded ring. When the LOG endpoint has no credit,
-records are dropped and counted, then reported. Logs never take credit,
-window slots or CPU priority away from other endpoints. A record that is not
+The NCP keeps logs in a bounded ring (16 records on the MG24 and CC26x2
+NCPs). A host turns forwarding on by granting the LOG endpoint credit:
+`initial_credits[5]` at session start (`LinkConfig::desktop_host` grants 2,
+`embedded_host` 0), or later with `Link::release_credit(Endpoint::Log, n)`
+(with `auto_credit` the grant then renews itself); `LOG_CONFIG` or
+`SYS_SET_CONFIG` `log_level` set the level (default 3, info). Until there is
+a session with LOG credit, the ring waits: it keeps the first four records
+since reset (the boot log: crystal tuning and EUI-64 sources, NV state) and
+the newest ones, drops the rest and counts them, and the host receives
+`EVT_LOG_DROPPED` and the kept records once it grants credit. Logs never
+take credit, window slots or CPU priority away from other endpoints. A record that is not
 valid UTF-8 is a firmware bug; hosts replace the bad sequences and count
 them. When USB-Serial-JTAG carries ZRHP, the NCP firmware must not print to
 it through `esp-println` (section 11).
@@ -2030,7 +2118,7 @@ Only these changes make it dirty:
 | Reboot | Resume at the durable limit, as for NWK. |
 | Data structures | `ApsLinkKeyEntry.outgoing_frame_counter` / `outgoing_frame_counter_limit` are not used in global mode. The TC-device journal record drops its per-key reservation fields (new record version), which also shrinks each entry. `ApsSecurity` obtains outgoing counters from an `ApsOutgoingCounter` provider owned by the runtime. |
 | Migration from per-key counters | On the first boot of firmware in global mode over an existing per-key journal: `start = max(every per-key outgoing_frame_counter_limit in the TC-device journal and the APS key table, every TC APS reservation)`. The runtime commits the global reservation, then writes the new journal format version. Until that commit completes, no APS-secured frame is sent. |
-| Downgrade | Firmware that predates the format version must not run on migrated NV. Signed updates refuse it: the image carries a minimum NV format, and `FW_BEGIN` checks it. If old firmware is forced on through the ROM recovery path, the journal version check fails closed: the old firmware treats the NV as unknown, starts factory-new, and the host restores with floors (8.7). It never reuses a counter. |
+| Downgrade | Firmware that predates the format version must not run on migrated NV. Signed updates refuse it: the image carries a minimum NV format, and `FW_BEGIN` checks it. If old firmware is forced on through the ROM recovery path, it skips the Trust Center snapshots of a version it does not know. It resumes the newest one it can read, possibly an older snapshot with older devices, keys and APS limit, or else an empty Trust Center table. The network itself (security journal: network key, NWK counter) resumes, so this is not a factory-new start. Its APS counter can then start below values already used, and only the host's floors in `NWK_INIT` (8.7) keep it above them. The Trust Center table of the coordinator NCP is therefore written as record version 6 (readable by firmware before version 7) until it holds what only version 7 can (an EZSP hashed-TCLK root, an EZSP-hashed or unknown key), and as version 6 again once it no longer does. Records of the other coordinator builds (versions 4 and 5) carry the same origin codes after an unknown-key admission; firmware before them reads such a record as corrupt and falls back the same way. |
 | Host-visible | `SEC_GET_FRAME_COUNTERS` (`aps_current`, `aps_limit`), `EVT_FC_CHECKPOINT{domain=2}`, `NWK_INIT.aps_fc_floor`, `EVT_NCP_READY.aps_fc_limit`. |
 | Backup mapping | Export: OCB `tc_link_key.frame_counter` and **every** `devices[].link_key.tx_counter` = the durable APS limit. Import: `aps start = max(all tx counters, TCLK counter, RS_PARAMS limit) + aps_margin` (9.4). |
 
@@ -2239,7 +2327,7 @@ defines both layouts.
 | Journal | Geometry | Size | Calculation |
 |---|---|---:|---|
 | `SecurityStateJournal` (NWK and global APS reservations, keys, APS replay floors) | 2 × 16 KiB logical sectors | 32 KiB | Coordinator guide: 16 KiB sectors for the full 64-entry replay table |
-| `TrustCenterStreamJournal` (256 cached entries) | 2 × 32 KiB | 64 KiB | Implemented snapshot (record version 6): 43 B header + 256 × 75 B (per-key counter fields still encoded) + 1 + 8 × 16 B allowlist + 3 B rotation + 1 + 32 removal intents × 16 B + 5 B trailer = 19 893 B, **streamed** across 5 × 4 KiB chunk slots (4 060 B payload each) with a single commit marker after all chunks. The planned 72 B entries (rev/host-ack) and delta appends are not implemented: every store writes a full snapshot (a sector holds 8 one-chunk or one 5-chunk snapshot). |
+| `TrustCenterStreamJournal` (256 cached entries) | 2 × 32 KiB | 64 KiB | Implemented snapshot (record version 7; version 6 is still read): 43 B header + 256 × 75 B (per-key counter fields still encoded) + 1 + 8 × 16 B allowlist + 3 B rotation + 1 + 32 removal intents × 16 B + 22 B trailer (global APS limit, EZSP hashed-TCLK root) = 19 910 B, **streamed** across 5 × 4 KiB chunk slots (4 060 B payload each) with a single commit marker after all chunks. The planned 72 B entries (rev/host-ack) and delta appends are not implemented: every store writes a full snapshot (a sector holds 8 one-chunk or one 5-chunk snapshot). |
 | `ChildTableJournal` (64 children) | 2 × 4 KiB, 1 024 B slots | 8 KiB | 906 B record + trailer |
 | GP journal (Proxy 8 + Sink 16) | 2 × 8 KiB, 1 024 B slots | 16 KiB | Sink snapshot 1 + 16 × (1 + 45) = 737 B fits a slot. The proxy+sink pair uses 2 slots. 8 KiB sectors give room for adaptive counter records (32 B). |
 | APS tables (bindings, groups, application keys) | 2 × 4 KiB | 8 KiB | as on routers |
@@ -2393,7 +2481,7 @@ Real files deviate from the specification in ways an importer must tolerate:
 | `devices[].link_key.rx_counter` | `DEVICE.link.rx_floor` | Host store / NCP cache | Floor | Stored as the incoming floor (no margin) | P |
 | `internal.link_key_seqs[ieee]` | `DEVICE.link.key_seq` | Host | Stored | Stored | N |
 | `internal.route_table` | — | NCP (RAM) | Optional from `DIAG_GET_ROUTES` | **Ignored**: routes are rediscovered (MTORR at start) | — |
-| `stack_specific.ezsp.hashed_tclk` | `EZSP_HASHED_TCLK` | NCP | Stored value | Stored; devices without an explicit key get derived keys (7.5, decision 8) | N |
+| `stack_specific.ezsp.hashed_tclk` | `EZSP_HASHED_TCLK` | NCP | Stored value (export with keys) | Stored; devices without an explicit key get derived keys (7.5, decision 8) | E |
 | `stack_specific.zstack.*`, `.zboss.*`, other unknown keys | — | Host (pass-through) | Re-emitted unchanged | Not sent to the NCP | — |
 | `stack_specific.zigbee_rs.*` | `RS_PARAMS`, `GP_PROXY`, `GP_SINK` | NCP | See below | Limits become floors; GP Proxy and Sink entries restored (no GP Pairing sent) | N |
 | `stack_specific.zigbee_rs.aps_group_table` | `APS_GROUP` | NCP APS group table | Export flags bit3 (capability bit 24) | Restored on the new network (9.4); a source without it restores no coordinator groups and the host replays them with `NWK_GROUP_MEMBERSHIP` | E |
@@ -2601,8 +2689,8 @@ radio actually uses.
 
 1. Flash the zigbee-rs NCP firmware on the ESP32-H2. Check
    `SYS_NEGOTIATE`: `BACKUP_RESTORE`, `KEY_EXPORT` and `IEEE_REWRITABLE`
-   must be present. `EZSP_HASHED_TCLK` is implemented in v1, but it is
-   advertised only after gate H5 has verified it.
+   must be present. `EZSP_HASHED_TCLK` (bit 14) says the NCP keeps the
+   hashed-TCLK root and derives the device keys from it (7.5).
 2. In ZHA, start *Migrate radio → keep network*. bellows creates a fresh
    backup with `load_network_info(load_devices=True)`. This includes the
    NWK counter, the TCLK, the key table, the child table and the address
@@ -2633,10 +2721,8 @@ radio actually uses.
    - **Other radios.** From their source, zigpy-znp, zigpy-deconz and
      zigpy-zboss ignore `stack_specific.ezsp`, so migrations to those radios
      lose these keys.
-   - **Verification.** Gate H5 (14.6) proves the derivation against a key
-     read from the user's real ZBT-1 before the capability bit is set.
-     Until then the NCP still stores the seed, so a later firmware update
-     enables derivation without another migration.
+   - **Verification.** The derivation follows the GSDK source (7.5); gate
+     H5 (14.6) confirms it against a key read from real hardware.
 8. **Green Power.** zigpy's GP devices from the EZSP era are imported into
    the NCP Sink Table with `GP_SINK_TABLE_PUT` (7.11, step 7). No GP
    Pairing is sent, and the proxies keep their group-0x0B84 pairings.
@@ -3687,7 +3773,7 @@ Controls:
 | `arq_scenarios.json` | Timed receiver and sender traces (5.9) | State machine with a virtual clock emits exactly the expected frames |
 | `ocb_roundtrip.json` | OCB → records → NCP model (global APS counter) → export → OCB, restore message bytes | Host converters (Go, Python, TypeScript, Rust hub) byte- and JSON-equal |
 | `ocb_z2m_import.json` | Z2M-style backup (unpadded hex, `date`, no TCLK counter) → records with `aps_margin = 2²⁰` | Same |
-| `ezsp_hashed_tclk.json` | **Candidate** EZSP hashed-TCLK keys for both EUI64 byte orders | NCP derivation; one candidate is promoted to normative by gate H5 |
+| `ezsp_hashed_tclk.json` | EZSP hashed-TCLK keys for both EUI64 byte orders; the on-air column is the derivation (GSDK source, 7.5) | NCP derivation (`zigbee-aps` test); hardware confirmation by gate H5 |
 
 `generate.py --check` fails if a committed JSON file differs from the
 generator output; CI runs it. Implementations load the JSON files directly;
@@ -3829,7 +3915,7 @@ This is simulation-level evidence, not hardware evidence.
 | H2 | H2 UART maximum stable baud with RTS/CTS through a USB-UART bridge. |
 | H3 | Formation, then 30+ real devices joining, interviewing and reporting via zigpy (HA) and the Go hub, with sniffer captures. |
 | H4 | NCP reboot under load: no frame-counter reuse (sniffer: NWK counter strictly increasing across the reboot). Host reboot: network keeps running and queued indications are reported. |
-| H5 | **ZBT-1 hashed-TCLK verification** (decision 8): read a device's derived TCLK from the user's ZBT-1 (EZSP key export of a device that completed a TCLK update) and compare it with both candidates in `ezsp_hashed_tclk.json` computed from that network's `hashed_tclk`. The match becomes the normative vector and enables capability bit 14. Then migrate ZBT-1 → H2 → ZBT-1 with real devices, checking APS-secured exchanges (Verify-Key, network-key rotation) with a hashed-key device after each move. |
+| H5 | **Hashed-TCLK hardware verification** (decision 8): read a device's derived TCLK from a real EmberZNet coordinator (EZSP key export of a device that completed a TCLK update, or the key a zigbee-rs end device holds after joining it) and compare it with `SEC_DERIVE_EZSP_KEY` for that network's `hashed_tclk`. The on-air byte order is taken from the GSDK source (7.5); this gate confirms it on hardware. Then migrate EmberZNet → zigbee-rs NCP → EmberZNet with real devices, checking APS-secured exchanges (Verify-Key, network-key rotation) with a hashed-key device after each move. |
 | H6 | NCP firmware update with trial boot, confirm, rollback and retained network state. |
 | H7 | 24 h soak with noise injection on the UART variant (921 600, RTS/CTS). |
 | H8 | **Thread BR board UART:** 921 600 (default) and 2 000 000 with RTS/CTS on R19/R20, and the 460 800 fallback without flow control, with both chips writing flash (`rx_overflow = 0`) under the real NCP and hub (R18–R20 fitting and an RX-stall test through the phase-0 bridge passed on 2026-11-19, 11.5; the real NCP with the H2 writing flash through the phase-0 bridge passed on 2026-11-20, 11.5; the real hub with the S3 writing flash is still open). Identify the H2 module's flash size (2 MB or 4 MB) via JEDEC ID, and check the NCP's layout-mismatch refusal. ROM-path recovery via S3 GPIO7/8 with `zbnv` preserved. |
@@ -3848,7 +3934,7 @@ This is simulation-level evidence, not hardware evidence.
 | 2 | Runtime: **global APS outgoing counter** with reservation, journal format version and migration (8.4) | existing runtime | Host-tested, including migration and power-cut tests |
 | 3 | Runtime: coordinator event surface, raw APS passthrough for host endpoints, dynamic host endpoints, RSSI/last hop, APS queue with confirms, per-send source routes, ZDO forwarding/TSN rules, no-loopback guard | existing runtime | Host-tested with `MockMac` and `examples/mock-coordinator` |
 | 4 | Runtime/persistence: FC checkpoint hook and floors; IEEE override; atomic restore transaction; snapshot export; TC-device cache with writeback/eviction, `host_acked_rev`, streamed TC-journal snapshots (256 entries); child journal with 1 024-byte slots (64 children); key-export lock | 2 | Host-tested with journal fault injection |
-| 5 | Runtime: EZSP hashed-TCLK derivation (HMAC-MMO), cached with origin 4 | 4 | Host-tested against the candidate vectors; normative after H5 |
+| 5 | Runtime: EZSP hashed-TCLK derivation (HMAC-MMO over the on-air EUI-64, per the GSDK source), cached with origin 4, root persisted with the TC table | 4 | Host-tested against the vectors; hardware confirmation is H5 |
 | 6 | GP: NCP-sink mode surface (`EVT_GP_*`, `GP_*` commands, `R_GP_SINK` codec), sink table size as a product parameter (16), host-sink mode local-proxy hand-off | GP sink on master | Host-tested with zigpy golden vectors |
 | 7 | MAC/HAL: H2/C6 UART transport with UHCI RX DMA and optional RTS/CTS; USJ non-blocking pump; PTA follower in the ESP MAC | — | Host/unit tests, builds; hardware gates H1, H2, H8, PTA1 |
 | 8 | `apps/ncp-coordinator` over `TrustCenterCoordinatorApp` + GP combo | 1–6 | Host-tested against the Rust reference host over an in-memory pipe |
@@ -3907,7 +3993,8 @@ unknowns are hardware facts tracked as gates:
 
 - the USJ VID/PID and serial-number behaviour on H2/C6 (H1);
 - the H2 UART maximum rate (H2);
-- the EZSP hashed-TCLK byte order (H5);
+- the EZSP hashed-TCLK hardware key match (H5; the byte order is taken from
+  the GSDK source);
 - the BR board's UART under real flash-write load (H8; the flash variant and the R18–R20 fitting are known since 2026-11-18/19);
 - PTA behaviour under Wi-Fi load (PTA1).
 

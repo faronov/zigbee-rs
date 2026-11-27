@@ -49,8 +49,8 @@ use zigbee_zrhp::msg::network::{
     NwkSetTxPower, NwkSetTxPowerRsp,
 };
 use zigbee_zrhp::msg::security::{
-    SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecGetFrameCountersRsp,
-    SecGetNetworkKey, SecGetNetworkKeyRsp,
+    SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecDeriveEzspKey, SecDeriveEzspKeyRsp,
+    SecGetFrameCountersRsp, SecGetNetworkKey, SecGetNetworkKeyRsp,
 };
 use zigbee_zrhp::msg::system::capacity;
 use zigbee_zrhp::msg::system::{
@@ -528,6 +528,7 @@ macro_rules! setup {
             caps::TX_POWER,
             caps::ACTIVE_SCAN,
             caps::APS_GROUP_TABLE,
+            caps::EZSP_HASHED_TCLK,
         ] {
             assert_ne!(negotiated.ncp_caps & bit, 0, "capability {bit:#x}");
         }
@@ -1282,6 +1283,213 @@ fn restore_keeps_ncp_children_and_their_keys() {
     let past_end = host.response(past_end);
     let past_end: DiagGetChildrenRsp = past_end.body();
     assert_eq!((past_end.total, past_end.entries.iter().count()), (1, 0));
+}
+
+/// An EmberZNet backup (zigpy `stack_specific.ezsp.hashed_tclk`) lists its
+/// devices without link keys: the TCLK of each is derived from the root.
+const EZSP_ROOT: [u8; 16] = [
+    0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0,
+];
+
+/// TLV bytes of `record`.
+fn tlv(record: &Record<'_>) -> Vec<u8> {
+    let mut buffer = [0u8; 64];
+    let mut w = Writer::new(&mut buffer);
+    record.write(&mut w).unwrap();
+    let len = w.len();
+    buffer[..len].to_vec()
+}
+
+/// TLV of a device record without a link block (an EZSP backup's device).
+fn keyless(ieee: [u8; 8], nwk: u16, child: bool) -> Vec<u8> {
+    tlv(&Record::Device(DeviceRecord {
+        ieee: Ieee(ieee),
+        nwk,
+        flags: 0,
+        child: child.then_some(zigbee_zrhp::records::ChildInfo {
+            capability: 0x80,
+            timeout_exp: 8,
+        }),
+        link: None,
+    }))
+}
+
+#[test]
+fn restoring_an_ezsp_backup_derives_the_hashed_link_keys() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let form = host.request(&form_request(0x9BBF, 1 << 20));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let begin = host.request(&BkpExportBegin { flags: 0x03 });
+    exchange!();
+    let begin: BkpExportBeginRsp = host.response(begin).body();
+    // NODE, NETWORK, NWK key, TCLK, RS_PARAMS, END: no root yet.
+    assert_eq!(begin.record_count, 6);
+    let read = host.request(&BkpExportRead {
+        txn: begin.txn,
+        max_bytes: 480,
+    });
+    exchange!();
+    let stream = host.response(read).payload[2..].to_vec();
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+
+    // A sleepy child and a router, both without a key in the backup.
+    const ROUTER_IEEE: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    let ezsp = with_records(
+        &stream,
+        &[
+            tlv(&Record::EzspHashedTclk(EZSP_ROOT)),
+            keyless(DEVICE_IEEE, 0x12D2, true),
+            keyless(ROUTER_IEEE, 0x5D01, false),
+        ],
+    );
+    let restore = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 0,
+        aps_margin: 0,
+        expected_records: 9,
+    });
+    exchange!();
+    let txn = host.response(restore).body::<BkpRestoreBeginRsp>().txn;
+    let mut payload = txn.to_le_bytes().to_vec();
+    payload.extend_from_slice(&ezsp);
+    let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+    let commit = host.request(&BkpRestoreCommit { txn });
+    exchange!();
+    let put = host.response(put);
+    let put: BkpRestorePutRsp = put.body();
+    assert_eq!(put.notes.iter().count(), 0, "the root is kept");
+    let commit: BkpRestoreCommitRsp = host.response(commit).body();
+    assert_eq!((commit.children, commit.link_keys_on_ncp), (1, 2));
+
+    // Both devices are known with the key their EmberZNet Trust Center
+    // derived for them; the child keeps its parent and address.
+    for (ieee, nwk, child) in [(DEVICE_IEEE, 0x12D2, true), (ROUTER_IEEE, 0x5D01, false)] {
+        let view = (0..)
+            .map_while(|index| port.device(index))
+            .find(|view| view.ieee == ieee)
+            .expect("restored device");
+        assert_eq!(view.child.is_some(), child);
+        if child {
+            assert_eq!(view.nwk, Some(nwk));
+        }
+        let link = view.link.expect("derived key");
+        assert_eq!(
+            link.key,
+            zigbee_aps::security::derive_ezsp_hashed_link_key(&EZSP_ROOT, &ieee)
+        );
+        assert_eq!((link.origin, link.attrs), (4, 2));
+    }
+
+    // Any device's key on request (export-gated like the other keys).
+    let derive = host.request(&SecDeriveEzspKey {
+        ieee: Ieee(OTHER_IEEE),
+    });
+    exchange!();
+    let derived: SecDeriveEzspKeyRsp = host.response(derive).body();
+    assert_eq!(
+        derived.key,
+        zigbee_aps::security::derive_ezsp_hashed_link_key(&EZSP_ROOT, &OTHER_IEEE)
+    );
+
+    // The next backup carries the root again, and the TCLK flags it.
+    let begin = host.request(&BkpExportBegin { flags: 0x03 });
+    exchange!();
+    let begin: BkpExportBeginRsp = host.response(begin).body();
+    assert_eq!(begin.record_count, 9);
+    let mut records = Vec::new();
+    loop {
+        let read = host.request(&BkpExportRead {
+            txn: begin.txn,
+            max_bytes: 480,
+        });
+        exchange!();
+        let read = host.response(read);
+        records.extend_from_slice(&read.payload[2..]);
+        if read.payload[1] == 0 {
+            break;
+        }
+    }
+    let mut root = None;
+    let mut tclk_flags = None;
+    let mut count = 0;
+    for item in RawRecords::new(&records) {
+        let (kind, tlv) = item.unwrap();
+        count += 1;
+        match zigbee_zrhp::codec::Reader::new(tlv)
+            .read::<Record<'_>>()
+            .unwrap()
+        {
+            Record::EzspHashedTclk(seed) => root = Some(seed),
+            Record::TcLinkKey(tclk) => tclk_flags = Some(tclk.flags),
+            Record::End(end) => assert_eq!(end.record_count, 8),
+            _ => assert_ne!(kind, record_type::EZSP_HASHED_TCLK),
+        }
+    }
+    assert_eq!(count, 9);
+    assert_eq!(root, Some(EZSP_ROOT));
+    assert_eq!(tclk_flags, Some(0x01));
+}
+
+#[test]
+fn a_keyless_restored_child_is_known_without_a_root() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let form = host.request(&form_request(0x9BC0, 1 << 20));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let begin = host.request(&BkpExportBegin { flags: 0x03 });
+    exchange!();
+    let begin: BkpExportBeginRsp = host.response(begin).body();
+    let read = host.request(&BkpExportRead {
+        txn: begin.txn,
+        max_bytes: 480,
+    });
+    exchange!();
+    let stream = host.response(read).payload[2..].to_vec();
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+
+    let backup = with_records(&stream, &[keyless(DEVICE_IEEE, 0x12D2, true)]);
+    let restore = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 0,
+        aps_margin: 0,
+        expected_records: 7,
+    });
+    exchange!();
+    let txn = host.response(restore).body::<BkpRestoreBeginRsp>().txn;
+    let mut payload = txn.to_le_bytes().to_vec();
+    payload.extend_from_slice(&backup);
+    let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+    let commit = host.request(&BkpRestoreCommit { txn });
+    exchange!();
+    assert_eq!(host.response(put).status(), 0);
+    let commit: BkpRestoreCommitRsp = host.response(commit).body();
+    assert_eq!((commit.children, commit.link_keys_on_ncp), (1, 0));
+
+    // Known to the Trust Center (a secured rejoin is admitted), still a
+    // child, and exported without a link block (its key is unknown).
+    let view = port.device(0).expect("restored child");
+    assert_eq!(
+        (view.ieee, view.nwk, view.child),
+        (DEVICE_IEEE, Some(0x12D2), Some((0x80, 8)))
+    );
+    assert_eq!(view.link, None);
+    assert!(port.device(1).is_none(), "listed once");
+    assert!(
+        port.app()
+            .tc_table()
+            .device(&DEVICE_IEEE)
+            .is_some_and(|device| !device.link_key_known())
+    );
+    let derive = host.request(&SecDeriveEzspKey {
+        ieee: Ieee(DEVICE_IEEE),
+    });
+    exchange!();
+    assert_eq!(host.response(derive).status(), Status::NotFound.to_u8());
 }
 
 #[test]

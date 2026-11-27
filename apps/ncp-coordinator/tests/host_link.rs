@@ -27,6 +27,7 @@ use zigbee_zrhp::codec::{Bytes8, Rest};
 use zigbee_zrhp::frame::TX_BUFFER_LEN;
 use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent};
 use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataConfirm};
+use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord};
 use zigbee_zrhp::msg::network::{EvtNetworkState, NwkForm, NwkGetInfoRsp, NwkInit, NwkInitRsp};
 use zigbee_zrhp::msg::security::{
     EvtFcCheckpoint, SecGetFrameCountersRsp, SecGetNetworkKey, SecLockKeyExport,
@@ -148,7 +149,11 @@ struct Host {
 
 impl Host {
     fn new(now: u64) -> Self {
-        let mut link = Link::new(LinkConfig::desktop_host(), 0x1A2B_3C4D);
+        Self::with_config(now, LinkConfig::desktop_host())
+    }
+
+    fn with_config(now: u64, config: LinkConfig) -> Self {
+        let mut link = Link::new(config, 0x1A2B_3C4D);
         link.open(now, zigbee_zrhp::frame::ResetReason::HostOpen);
         Self {
             link,
@@ -689,4 +694,73 @@ fn a_response_burst_beyond_the_queue_is_answered_in_full() {
         .count();
     assert_eq!(busy + ok, ECHOES as usize);
     assert!(ok >= 16, "the queue's worth is answered: {ok}");
+}
+
+/// An embedded host grants the LOG endpoint no credit at session start
+/// (`LinkConfig::embedded_host`). The NCP keeps its boot records (and the
+/// newest ones) until the host grants credit, instead of dropping them.
+#[test]
+fn boot_logs_wait_for_log_credit() {
+    let mut security = RamSecurityStateStore::new();
+    let mut gp_store = zigbee_runtime::gp_store::RamGpProxyStore::new();
+    let mut profile = profile();
+    let mut device = device(&profile);
+    let node = ZigbeeNode::new(&mut device, &mut security, &mut profile);
+    let mut app = TrustCenterCoordinatorApp::new(
+        node,
+        PersistentChildren::new(RamChildTableStore::new()),
+        RamTrustCenterDeviceStore::new(),
+        &POLICY,
+        RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+    )
+    .unwrap();
+    app.set_green_power_store(&mut gp_store);
+    let mut port = TcPort::new(app, IEEE, clock_ms);
+    let log = LogRing::<8>::new();
+    let mut pipe = Pipe::default();
+    let mut now = 1_000u64;
+    // The boot log, before any host.
+    for n in 0..4 {
+        log.push(n, 3, format_args!("boot{n}"));
+    }
+    let mut ncp = Ncp::<8>::new(identity(), 0xC0FF_EE02, now);
+    let mut host = Host::with_config(now, LinkConfig::embedded_host());
+    macro_rules! exchange {
+        () => {
+            exchange(&mut ncp, &mut host, &mut port, &mut pipe, &log, &mut now)
+        };
+    }
+    exchange!();
+    let negotiate = host.request(&SysNegotiateReq {
+        major_min: 1,
+        major_max: 1,
+        host_caps: 0,
+        name: Bytes8(b"embedded"),
+    });
+    exchange!();
+    let _: SysNegotiateRsp = host.response(negotiate).body();
+    // The session runs without LOG credit: nothing is sent, nothing lost
+    // beyond the ring.
+    for n in 0..10 {
+        log.push(100 + n, 3, format_args!("run{n}"));
+    }
+    exchange!();
+    assert!(host.event(ids::EVT_LOG_RECORD).is_none());
+
+    host.link.release_credit(Endpoint::Log, 16);
+    exchange!();
+    let dropped = host.event(ids::EVT_LOG_DROPPED).expect("drops reported");
+    let dropped: EvtLogDropped = dropped.event();
+    assert_eq!((dropped.count, dropped.first_seq), (6, 4));
+    let mut texts = Vec::new();
+    while let Some(record) = host.event(ids::EVT_LOG_RECORD) {
+        let record: EvtLogRecord<'_> = record.event();
+        texts.push(String::from_utf8(record.text.0.to_vec()).unwrap());
+    }
+    assert_eq!(
+        texts,
+        [
+            "boot0", "boot1", "boot2", "boot3", "run6", "run7", "run8", "run9"
+        ]
+    );
 }

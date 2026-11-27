@@ -102,6 +102,12 @@ pub trait TcApp {
         attributes: zigbee_bdb::trust_center::TrustCenterKeyAttributes,
         location: Option<([u8; 8], u16)>,
     ) -> Result<(), OpError>;
+    /// The EmberZNet hashed-TCLK root of a restored network.
+    fn ezsp_hashed_root(&self) -> Option<[u8; 16]>;
+    /// Durably keep or forget the root.
+    fn set_ezsp_hashed_root(&mut self, root: Option<[u8; 16]>) -> Result<(), OpError>;
+    /// The key derived from the root for `ieee`; `None` without a root.
+    fn derive_ezsp_key(&mut self, ieee: [u8; 8]) -> Option<[u8; 16]>;
     /// Replace the durable child table (restored at the next `initialize`).
     fn store_children(
         &mut self,
@@ -293,6 +299,22 @@ where
                 location.map(|(parent, short)| (parent, ShortAddress(short))),
             )
             .map_err(|_| OpError::Storage)
+    }
+
+    fn ezsp_hashed_root(&self) -> Option<[u8; 16]> {
+        self.trust_center().ezsp_hashed_link_key_root()
+    }
+
+    fn set_ezsp_hashed_root(&mut self, root: Option<[u8; 16]>) -> Result<(), OpError> {
+        let (trust_center, device) = self.trust_center_and_device_mut();
+        trust_center
+            .set_ezsp_hashed_link_key_root(device, root)
+            .map_err(|_| OpError::Storage)
+    }
+
+    fn derive_ezsp_key(&mut self, ieee: [u8; 8]) -> Option<[u8; 16]> {
+        let (trust_center, device) = self.trust_center_and_device_mut();
+        trust_center.derive_ezsp_link_key(device, &ieee)
     }
 }
 
@@ -1554,16 +1576,21 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
                 )
                 .filter(|entry| entry.incoming_frame_counter_valid)
                 .map_or(0, |entry| entry.incoming_frame_counter);
-            let link = (device.key_origin
-                != zigbee_bdb::trust_center::TrustCenterKeyOrigin::DefaultGlobal)
+            // The global key and an unknown one (a restored device the
+            // backup listed without a key) carry no link block.
+            let link = (device.link_key_known()
+                && device.key_origin
+                    != zigbee_bdb::trust_center::TrustCenterKeyOrigin::DefaultGlobal)
                 .then_some(LinkView {
                     key: device.link_key,
                     attrs: device.key_attributes as u8,
                     origin: match device.key_origin {
-                        zigbee_bdb::trust_center::TrustCenterKeyOrigin::DefaultGlobal => 0,
+                        zigbee_bdb::trust_center::TrustCenterKeyOrigin::DefaultGlobal
+                        | zigbee_bdb::trust_center::TrustCenterKeyOrigin::Unknown => 0,
                         zigbee_bdb::trust_center::TrustCenterKeyOrigin::InstallCode => 1,
                         zigbee_bdb::trust_center::TrustCenterKeyOrigin::GeneratedUnique => 2,
                         zigbee_bdb::trust_center::TrustCenterKeyOrigin::ApplicationProvisioned => 3,
+                        zigbee_bdb::trust_center::TrustCenterKeyOrigin::EzspHashed => 4,
                     },
                     rx_floor,
                 });
@@ -1632,7 +1659,16 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             1 => TrustCenterKeyOrigin::InstallCode,
             2 => TrustCenterKeyOrigin::GeneratedUnique,
             3 => TrustCenterKeyOrigin::ApplicationProvisioned,
+            4 => TrustCenterKeyOrigin::EzspHashed,
+            crate::port::RESTORED_KEY_UNKNOWN => TrustCenterKeyOrigin::Unknown,
             _ => return Err(OpError::InvalidParameter),
+        };
+        // An unknown key is not the caller's: the runtime draws a private
+        // one (no APS standing, see `TrustCenterKeyOrigin::Unknown`).
+        let value = if origin == TrustCenterKeyOrigin::Unknown {
+            [0; 16]
+        } else {
+            key.key
         };
         let attributes = match key.attrs {
             0 => TrustCenterKeyAttributes::Provisional,
@@ -1644,7 +1680,26 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         // stays unknown until it is heard (its next Update-Device).
         let location = key.nwk.filter(|_| key.child).map(|nwk| (self.ieee, nwk));
         self.app
-            .restore_link_key(key.ieee, key.key, origin, attributes, location)
+            .restore_link_key(key.ieee, value, origin, attributes, location)
+    }
+
+    fn ezsp_hashed_supported(&self) -> bool {
+        true
+    }
+
+    fn ezsp_hashed_root(&self) -> Option<[u8; 16]> {
+        self.app.ezsp_hashed_root()
+    }
+
+    fn set_ezsp_hashed_root(&mut self, root: Option<[u8; 16]>) -> Result<(), OpError> {
+        if !self.running {
+            return Err(OpError::InvalidState);
+        }
+        self.app.set_ezsp_hashed_root(root)
+    }
+
+    fn derive_ezsp_key(&mut self, ieee: [u8; 8]) -> Option<[u8; 16]> {
+        self.app.derive_ezsp_key(ieee)
     }
 
     async fn set_ieee(&mut self, ieee: [u8; 8]) -> Result<(), OpError> {
@@ -1870,6 +1925,18 @@ impl<T: TcApp + ?Sized> TcApp for &mut T {
         location: Option<([u8; 8], u16)>,
     ) -> Result<(), OpError> {
         (**self).restore_link_key(ieee, key, origin, attributes, location)
+    }
+
+    fn ezsp_hashed_root(&self) -> Option<[u8; 16]> {
+        (**self).ezsp_hashed_root()
+    }
+
+    fn set_ezsp_hashed_root(&mut self, root: Option<[u8; 16]>) -> Result<(), OpError> {
+        (**self).set_ezsp_hashed_root(root)
+    }
+
+    fn derive_ezsp_key(&mut self, ieee: [u8; 8]) -> Option<[u8; 16]> {
+        (**self).derive_ezsp_key(ieee)
     }
 
     fn aps_counter_bound(&mut self) -> Result<u32, OpError> {

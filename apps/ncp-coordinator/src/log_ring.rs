@@ -2,10 +2,13 @@
 //!
 //! Records are UTF-8 text of at most [`MAX_LOG_TEXT`] bytes, truncated at a
 //! character boundary, so every `EVT_LOG_RECORD` is valid UTF-8. When the
-//! ring is full the oldest record is dropped and counted; the dispatcher
-//! reports drops with `EVT_LOG_DROPPED`. Logs never take credit or window
-//! slots from other endpoints: they are only sent while the LOG endpoint
-//! has credit (a host may grant it none).
+//! ring is full the oldest record is dropped and counted, except the first
+//! [`BOOT_HOLD`] records since reset (the boot log: radio crystal tuning,
+//! EUI-64 source, NV state), which stay until the host has read them; the
+//! dispatcher reports drops with `EVT_LOG_DROPPED`. Logs never take credit
+//! or window slots from other endpoints: they are only sent while the LOG
+//! endpoint has credit (a host may grant it none, or grant it later: the
+//! ring waits for it).
 //!
 //! The ring is filled from thread context through [`LogRing::push`]
 //! (a `log::Log` implementation on the platform side); interrupt handlers
@@ -18,6 +21,9 @@ use critical_section::Mutex;
 use heapless::{Deque, String};
 
 pub const MAX_LOG_TEXT: usize = 200;
+
+/// Records kept from reset until they are read (at most half the ring).
+pub const BOOT_HOLD: usize = 4;
 
 /// ZRHP log levels: 1 error … 5 trace (0 = off).
 pub const fn level_code(level: log::Level) -> u8 {
@@ -44,6 +50,8 @@ struct Inner<const N: usize> {
     level: u8,
     dropped: u32,
     first_dropped_seq: u16,
+    /// Records at the front kept from reset until read.
+    held: usize,
 }
 
 /// `N` records of up to 200 bytes each.
@@ -80,6 +88,7 @@ impl<const N: usize> LogRing<N> {
                 level: 3,
                 dropped: 0,
                 first_dropped_seq: 0,
+                held: if BOOT_HOLD < N / 2 { BOOT_HOLD } else { N / 2 },
             })),
         }
     }
@@ -105,7 +114,7 @@ impl<const N: usize> LogRing<N> {
             let seq = inner.next_seq;
             inner.next_seq = seq.wrapping_add(1);
             if inner.records.is_full()
-                && let Some(old) = inner.records.pop_front()
+                && let Some(old) = inner.evict()
             {
                 if inner.dropped == 0 {
                     inner.first_dropped_seq = old.seq;
@@ -123,7 +132,12 @@ impl<const N: usize> LogRing<N> {
 
     /// Oldest record, if any.
     pub fn pop(&self) -> Option<LogRecord> {
-        critical_section::with(|cs| self.inner.borrow_ref_mut(cs).records.pop_front())
+        critical_section::with(|cs| {
+            let mut inner = self.inner.borrow_ref_mut(cs);
+            let record = inner.records.pop_front()?;
+            inner.held = inner.held.saturating_sub(1);
+            Some(record)
+        })
     }
 
     /// Put a record back at the front (it could not be queued).
@@ -151,19 +165,18 @@ impl<const N: usize> LogRing<N> {
             })
         })
     }
+}
 
-    /// Count records the host could not receive (LOG endpoint without
-    /// credit) as dropped.
-    pub fn drop_all(&self) {
-        while let Some(record) = self.pop() {
-            critical_section::with(|cs| {
-                let mut inner = self.inner.borrow_ref_mut(cs);
-                if inner.dropped == 0 {
-                    inner.first_dropped_seq = record.seq;
-                }
-                inner.dropped = inner.dropped.saturating_add(1);
-            });
+impl<const N: usize> Inner<N> {
+    /// Remove the oldest record not held from reset: it is moved to the
+    /// front past the held ones (at most [`BOOT_HOLD`] swaps), which keep
+    /// their order.
+    fn evict(&mut self) -> Option<LogRecord> {
+        let at = self.held.min(self.records.len().saturating_sub(1));
+        for index in (1..=at).rev() {
+            self.records.swap(index, index - 1);
         }
+        self.records.pop_front()
     }
 }
 
@@ -181,12 +194,34 @@ mod tests {
         assert!(core::str::from_utf8(record.text.as_bytes()).is_ok());
         assert_eq!(record.text.len(), 200);
 
+        // A 2-record ring holds one boot record (the first was read).
         for n in 0..5 {
             ring.push(n, 2, format_args!("r{n}"));
         }
         assert_eq!(ring.take_dropped(), Some((3, 1)));
         assert_eq!(ring.pop().unwrap().text.as_str(), "r3");
         assert_eq!(ring.take_dropped(), None);
+    }
+
+    #[test]
+    fn the_boot_records_wait_for_the_host() {
+        let ring = LogRing::<8>::new();
+        for n in 0..20 {
+            ring.push(n, 3, format_args!("r{n}"));
+        }
+        // The first four stay in order; the newest four follow.
+        assert_eq!(ring.take_dropped(), Some((12, 4)));
+        let read: std::vec::Vec<_> = core::iter::from_fn(|| ring.pop())
+            .map(|record| record.text.as_str().to_owned())
+            .collect();
+        assert_eq!(read, ["r0", "r1", "r2", "r3", "r16", "r17", "r18", "r19"]);
+
+        // Once read, the ring keeps only the newest records.
+        for n in 20..30 {
+            ring.push(n, 3, format_args!("r{n}"));
+        }
+        assert_eq!(ring.take_dropped(), Some((2, 20)));
+        assert_eq!(ring.pop().unwrap().text.as_str(), "r22");
     }
 
     #[test]

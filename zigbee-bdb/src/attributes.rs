@@ -201,6 +201,11 @@ pub struct BdbAttributes {
     /// Whether well-known/default-key rejoins are accepted.
     pub trust_center_allow_rejoins: bool,
 
+    /// Whether a secured rejoin of a device the Trust Center has not
+    /// admitted is accepted (the device proved the current network key);
+    /// see `TrustCenterPolicy::admit_secured_rejoins`. Not a BDB attribute.
+    pub trust_center_admit_secured_rejoins: bool,
+
     /// Policy for Trust Center link-key replacement requests.
     pub trust_center_link_key_request_policy: TrustCenterLinkKeyRequestPolicy,
 
@@ -280,6 +285,7 @@ impl Default for BdbAttributes {
             trust_center_use_whitelist: false,
             trust_center_install_code_policy: TrustCenterInstallCodePolicy::Supported,
             trust_center_allow_rejoins: false,
+            trust_center_admit_secured_rejoins: true,
             trust_center_link_key_request_policy: TrustCenterLinkKeyRequestPolicy::ProvisionalOnly,
             trust_center_application_key_request_policy: ApplicationLinkKeyRequestPolicy::AnyPair,
             trust_center_network_key_update_period: 0,

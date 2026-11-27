@@ -1,10 +1,11 @@
 //! BACKUP group (`0x06xx`, endpoint BULK), spec 9.4–9.5.
 //!
 //! **Export** streams a record set built from the running network:
-//! `NODE`, `NETWORK`, `NETWORK_KEY`, `TC_LINK_KEY` (keys only with export
-//! flag bit0 and an unlocked key export), one `DEVICE` per Trust Center
-//! record or child (flag bit1), one `APS_GROUP` per group of the APS group
-//! table (flag bit3), `RS_PARAMS`, then `END` with the count and CRC-32C.
+//! `NODE`, `NETWORK`, `NETWORK_KEY`, `TC_LINK_KEY` and the restored
+//! `EZSP_HASHED_TCLK` root (keys only with export flag bit0 and an
+//! unlocked key export), one `DEVICE` per Trust Center record or child
+//! (flag bit1), one `APS_GROUP` per group of the APS group table (flag
+//! bit3), `RS_PARAMS`, then `END` with the count and CRC-32C.
 //! Counters are exported as durable limits; every link-key `tx_counter` is
 //! the global durable APS limit (8.4). The records are generated on demand
 //! per `BKP_EXPORT_READ` (no RAM copy): a device or group that joins or
@@ -16,7 +17,14 @@
 //! device link keys in RAM, validates every record as it arrives (9.4 rule
 //! 2) and applies them at `BKP_RESTORE_COMMIT` after checking `END`:
 //! counters by the 9.4 rule 4, the IEEE override when allowed (rule 7), the
-//! network (the previous one is wiped only at commit), then the link keys.
+//! network (the previous one is wiped only at commit), the EmberZNet
+//! hashed-TCLK root (`EZSP_HASHED_TCLK`, spec 7.5), then the link keys.
+//! A `DEVICE` without a link block is registered with the Trust Center
+//! with an unknown key ([`RESTORED_KEY_UNKNOWN`]), replaced by the key
+//! derived from the root when the restore carries one, so a restored
+//! device is known (and its secured rejoin admitted) before it is heard;
+//! keyless devices beyond the staging capacity are registered when they
+//! are first heard.
 //! Children of the NCP (`DEVICE` with a child block, up to
 //! [`MAX_STAGED_CHILDREN`]) are written to the durable child table before
 //! the resume, so they keep their parent and short address. `APS_GROUP`
@@ -24,8 +32,8 @@
 //! runs, through the port's `NWK_GROUP_MEMBERSHIP` add, and are persisted
 //! with the APS tables like it. Deviations, reported as notes: link keys
 //! beyond the staging capacity (`HOST_BACKED`), children beyond it
-//! (`CHILD_DEMOTED`: they rejoin), GP records, the EZSP hashed TCLK,
-//! unknown records and `APS_GROUP` records the group table cannot hold
+//! (`CHILD_DEMOTED`: they rejoin), GP records, the EZSP hashed TCLK on a
+//! port without it, unknown records and `APS_GROUP` records the group table cannot hold
 //! (more groups than its capacity, more than [`MAX_GROUP_ENDPOINTS`]
 //! endpoints in a group, or no group table: `IGNORED`, the record is not
 //! applied). With a group table, an `APS_GROUP` with a group above
@@ -56,7 +64,7 @@ use crate::ncp::{FC_STRIDE, QUEUE_BYTES};
 use crate::platform::NcpPlatform;
 use crate::port::{
     CoordinatorPort, GroupView, MAX_GROUP_ENDPOINTS, MAX_GROUPS, NetworkImage, NetworkState,
-    OpError, RestoredChild, RestoredKey, group_member_valid,
+    OpError, RESTORED_KEY_UNKNOWN, RestoredChild, RestoredKey, group_member_valid,
 };
 use crate::tables::{device_record, group_record};
 
@@ -92,6 +100,8 @@ pub(crate) const fn is_backup_request(id: u16) -> bool {
 pub struct Export {
     txn: u16,
     keys: bool,
+    /// The `EZSP_HASHED_TCLK` record is exported (keys and a root).
+    hashed: bool,
     /// `DEVICE` and `APS_GROUP` positions (0 without flag bit1 / bit3).
     devices: usize,
     groups: usize,
@@ -115,6 +125,8 @@ pub struct Restore {
     network: Option<NetworkRecord>,
     network_key: Option<NetworkKeyRecord>,
     tclk_counter_known: bool,
+    /// `EZSP_HASHED_TCLK` root (spec 7.5).
+    hashed_root: Option<[u8; 16]>,
     keys: Vec<RestoredKey, MAX_STAGED_KEYS>,
     host_backed: u16,
     children: Vec<RestoredChild, MAX_STAGED_CHILDREN>,
@@ -159,8 +171,8 @@ impl BackupState {
 
 impl Export {
     /// Position layout: 0 NODE, 1 NETWORK, 2 NETWORK_KEY, 3 TC_LINK_KEY,
-    /// 4.. devices, then groups, then RS_PARAMS, then END. A group record
-    /// borrows `group`, which holds its table entry.
+    /// 4 EZSP_HASHED_TCLK, 5.. devices, then groups, then RS_PARAMS, then
+    /// END. A group record borrows `group`, which holds its table entry.
     fn record<'g, C: CoordinatorPort>(
         &self,
         port: &C,
@@ -199,12 +211,14 @@ impl Export {
                     key,
                     tc_ieee: Ieee(port.ieee()),
                     tx_counter: counters.aps_limit,
-                    flags: 0,
+                    // Bit0: EZSP hashed mode (a restored root is kept).
+                    flags: u8::from(port.ezsp_hashed_root().is_some()),
                 })
             }),
-            2 | 3 => None,
+            4 if self.hashed => port.ezsp_hashed_root().map(Record::EzspHashedTclk),
+            2..=4 => None,
             _ => {
-                let index = position - 4;
+                let index = position - 5;
                 if index < self.devices {
                     port.device(index).map(|view| {
                         Record::Device(device_record(&view, self.keys, counters.aps_limit))
@@ -277,13 +291,15 @@ pub(crate) fn dispatch_backup<C: CoordinatorPort>(
             } else {
                 0
             };
-            // NODE, NETWORK, [NWK key, TCLK], devices, groups, RS_PARAMS,
-            // END.
-            let total = 6 + devices + groups;
+            let hashed = keys && port.ezsp_hashed_root().is_some();
+            // NODE, NETWORK, [NWK key, TCLK, [hashed root]], devices,
+            // groups, RS_PARAMS, END.
+            let total = 7 + devices + groups;
             let txn = state.txn();
             state.export = Some(Export {
                 txn,
                 keys,
+                hashed,
                 devices,
                 groups,
                 next: 0,
@@ -291,7 +307,7 @@ pub(crate) fn dispatch_backup<C: CoordinatorPort>(
                 crc: StreamCrc::new(),
                 table_epoch: port.table_epoch(),
             });
-            let records = total - if keys { 0 } else { 2 };
+            let records = total - if keys { 0 } else { 2 } - usize::from(!hashed);
             let response = BkpExportBeginRsp {
                 txn,
                 record_count: records as u32,
@@ -372,6 +388,7 @@ pub(crate) fn dispatch_backup<C: CoordinatorPort>(
                 network: None,
                 network_key: None,
                 tclk_counter_known: false,
+                hashed_root: None,
                 keys: Vec::new(),
                 host_backed: 0,
                 children: Vec::new(),
@@ -416,7 +433,12 @@ pub(crate) fn dispatch_backup<C: CoordinatorPort>(
                 if rtype != record_type::END {
                     restore.crc.add(tlv);
                 }
-                match stage(restore, &record, port.ieee(), port.group_capacity()) {
+                let facts = StageFacts {
+                    own_ieee: port.ieee(),
+                    group_capacity: port.group_capacity(),
+                    hashed_supported: port.ezsp_hashed_supported(),
+                };
+                match stage(restore, &record, &facts) {
                     Ok(Some(n)) => {
                         let _ = notes.push(RestoreNote { index, note: n });
                     }
@@ -501,14 +523,20 @@ fn crc_end(crc: &StreamCrc, w: &mut Writer<'_>) -> Result<(), zigbee_zrhp::codec
     Record::End(crc.end()).write(w)
 }
 
-/// Validate and stage one record; `Ok(Some(note))` reports a deviation,
-/// `Err` violates 9.4 rule 2. `group_capacity` bounds the staged groups.
-fn stage(
-    restore: &mut Restore,
-    record: &Record<'_>,
+/// What staging needs to know about the port.
+struct StageFacts {
     own_ieee: [u8; 8],
+    /// Bounds the staged groups.
     group_capacity: usize,
-) -> Result<Option<u8>, ()> {
+    /// The port keeps an EZSP hashed-TCLK root.
+    hashed_supported: bool,
+}
+
+/// Validate and stage one record; `Ok(Some(note))` reports a deviation,
+/// `Err` violates 9.4 rule 2.
+fn stage(restore: &mut Restore, record: &Record<'_>, facts: &StageFacts) -> Result<Option<u8>, ()> {
+    let own_ieee = facts.own_ieee;
+    let group_capacity = facts.group_capacity;
     restore.counters.add(record);
     match record {
         Record::Node(node) => {
@@ -564,25 +592,60 @@ fn stage(
                 Some(_) => result = Some(note::CHILD_DEMOTED),
                 None => {}
             }
-            if let Some(link) = &device.link
-                && restore
-                    .keys
-                    .push(RestoredKey {
+            let nwk = (0x0001..=0xFFF7)
+                .contains(&device.nwk)
+                .then_some(device.nwk);
+            let child = device.child.is_some();
+            match &device.link {
+                Some(link) => {
+                    let key = RestoredKey {
                         ieee: device.ieee.0,
                         key: link.key,
                         origin: link.origin,
                         attrs: link.attrs,
-                        nwk: (0x0001..=0xFFF7)
-                            .contains(&device.nwk)
-                            .then_some(device.nwk),
-                        child: device.child.is_some(),
-                    })
-                    .is_err()
-            {
-                restore.host_backed = restore.host_backed.saturating_add(1);
-                result = Some(note::HOST_BACKED);
+                        nwk,
+                        child,
+                    };
+                    // A key takes the place of a keyless registration (that
+                    // device is registered when it is heard).
+                    let staged = match restore.keys.push(key) {
+                        Ok(()) => true,
+                        Err(key) => match restore
+                            .keys
+                            .iter_mut()
+                            .rev()
+                            .find(|staged| staged.origin == RESTORED_KEY_UNKNOWN)
+                        {
+                            Some(slot) => {
+                                *slot = key;
+                                true
+                            }
+                            None => false,
+                        },
+                    };
+                    if !staged {
+                        restore.host_backed = restore.host_backed.saturating_add(1);
+                        result = Some(note::HOST_BACKED);
+                    }
+                }
+                None => {
+                    // Known to the Trust Center without a key; beyond the
+                    // staging capacity it is registered when heard.
+                    let _ = restore.keys.push(RestoredKey {
+                        ieee: device.ieee.0,
+                        key: [0; 16],
+                        origin: RESTORED_KEY_UNKNOWN,
+                        attrs: 2,
+                        nwk,
+                        child,
+                    });
+                }
             }
             Ok(result)
+        }
+        Record::EzspHashedTclk(root) if facts.hashed_supported => {
+            restore.hashed_root = Some(*root);
+            Ok(None)
         }
         Record::ApsGroup(group) => stage_group(&mut restore.groups, group, group_capacity),
         Record::RsParams(_) => Ok(None),
@@ -706,6 +769,13 @@ async fn commit<C: CoordinatorPort, P: NcpPlatform>(
     port.install_network(&image, &restore.children)
         .await
         .map_err(op_status)?;
+    if let Some(root) = restore.hashed_root
+        && let Err(error) = port.set_ezsp_hashed_root(Some(root))
+    {
+        // The devices are still admitted on a secured rejoin; their APS
+        // exchanges with the Trust Center need the root.
+        log::warn!("restore: hashed TCLK root not kept: {error:?}");
+    }
     let (on_ncp, host_backed) = restore_keys(port, &restore.keys, restore.host_backed);
     restore_groups(port, &restore.groups);
     let counters = port.frame_counters();
@@ -731,6 +801,26 @@ fn restore_keys<C: CoordinatorPort>(
         // The key keeps its origin and verification state: a factory-reset
         // device re-pairing after the restore gets the global key, and a
         // known device can secure-rejoin.
+        if key.origin == RESTORED_KEY_UNKNOWN {
+            // A device listed without a key: the EmberZNet Trust Center
+            // gave it the key derived from the root (spec 7.5); without a
+            // root it is known with an unknown key.
+            let restored = match port.derive_ezsp_key(key.ieee) {
+                Some(derived) => RestoredKey {
+                    key: derived,
+                    origin: 4,
+                    attrs: 2,
+                    ..*key
+                },
+                None => *key,
+            };
+            match port.restore_link_key(&restored) {
+                Ok(()) if restored.origin != RESTORED_KEY_UNKNOWN => on_ncp += 1,
+                Ok(()) => {}
+                Err(error) => log::warn!("restore: device not registered: {error:?}"),
+            }
+            continue;
+        }
         match port.restore_link_key(key) {
             Ok(()) => on_ncp += 1,
             Err(_) => host_backed = host_backed.saturating_add(1),

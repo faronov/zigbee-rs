@@ -16,7 +16,7 @@
 //! | DIAG | `DIAG_GET_COUNTERS`/`DIAG_RESET_COUNTERS` (link and queue groups) |
 //! | NETWORK | `NWK_INIT`, `NWK_FORM` (NCP-chosen identity), `NWK_LEAVE_RESET`, `NWK_GET_INFO`, `NWK_PERMIT_JOIN` (NCP or all routers), `NWK_ADD_ENDPOINT`; `EVT_DEVICE_JOINED`, `EVT_DEVICE_LEFT` |
 //! | DATA | `APS_DATA_REQUEST` → `EVT_APS_DATA_CONFIRM` (after the APS ACK outcome with `ack_request`); `EVT_APS_DATA_INDICATION` |
-//! | SECURITY | `SEC_GET_NETWORK_KEY`, `SEC_GET_FRAME_COUNTERS`, `SEC_LOCK_KEY_EXPORT`; `EVT_FC_CHECKPOINT` |
+//! | SECURITY | `SEC_GET_NETWORK_KEY`, `SEC_GET_FRAME_COUNTERS`, `SEC_ADD_INSTALL_CODE`, `SEC_ADD_LINK_KEY`, `SEC_DERIVE_EZSP_KEY`, `SEC_LOCK_KEY_EXPORT`; `EVT_FC_CHECKPOINT` |
 //! | LOG | `LOG_CONFIG`; `EVT_LOG_RECORD`, `EVT_LOG_DROPPED` |
 //! | GREEN POWER | all of spec 7.11, in [`crate::gp`] |
 
@@ -35,8 +35,9 @@ use zigbee_zrhp::msg::network::{
     NwkInitRsp, NwkLeaveReset, NwkPermitJoin, NwkSetTxPower, NwkSetTxPowerRsp,
 };
 use zigbee_zrhp::msg::security::{
-    EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey,
-    SecGetFrameCountersRsp, SecGetNetworkKey, SecGetNetworkKeyRsp, SecLockKeyExport,
+    EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecDeriveEzspKey,
+    SecDeriveEzspKeyRsp, SecGetFrameCountersRsp, SecGetNetworkKey, SecGetNetworkKeyRsp,
+    SecLockKeyExport,
 };
 use zigbee_zrhp::msg::system::{
     Capacity, ConfigReadItem, ConfigStatus, EvtIndicationsDropped, EvtNcpReady, SysGetConfig,
@@ -153,7 +154,7 @@ fn response_bound(id: u16, request_len: usize) -> usize {
         // Sent when the scan completes; taken only while that fits.
         ids::NWK_ACTIVE_SCAN => STATUS_RESPONSE + 1 + 18 * crate::radio::MAX_ACTIVE_SCAN_RESULTS,
         ids::NWK_INIT | ids::NWK_SET_TX_POWER => STATUS_RESPONSE + 1,
-        ids::SEC_ADD_INSTALL_CODE => STATUS_RESPONSE + 16,
+        ids::SEC_ADD_INSTALL_CODE | ids::SEC_DERIVE_EZSP_KEY => STATUS_RESPONSE + 16,
         _ => MAX_RESPONSE,
     }
 }
@@ -269,6 +270,9 @@ pub struct Ncp<const LOG_N: usize> {
     key_export_locked: bool,
     pending_reset: Option<(u8, u64)>,
     uart_switch: Option<UartSwitch>,
+    /// Log records dropped and not yet reported (`EVT_LOG_DROPPED`
+    /// `count`, `first_seq`).
+    log_drop_report: Option<(u32, u16)>,
     counters: QueueCounters,
     pending_diag: Deque<(u16, u8), 4>,
     reported_nwk_limit: u32,
@@ -329,6 +333,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             key_export_locked: false,
             pending_reset: None,
             uart_switch: None,
+            log_drop_report: None,
             counters: QueueCounters::default(),
             pending_diag: Deque::new(),
             reported_nwk_limit: 0,
@@ -941,6 +946,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 if platform.tx_power_step(0).is_some() {
                     ncp_caps |= caps::TX_POWER;
                 }
+                if port.ezsp_hashed_supported() {
+                    ncp_caps |= caps::EZSP_HASHED_TCLK;
+                }
                 *state.host_caps = request.host_caps;
                 let capacities = [
                     Capacity {
@@ -1482,6 +1490,30 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                             seq,
                             nwk_fc_limit: port.frame_counters().nwk_limit,
                         };
+                        let _ = queues.response(tid, Status::Success, Some(&response));
+                    }
+                    None if port.state() == NetworkState::None => {
+                        status_only(queues, Status::NotFormed)
+                    }
+                    None => status_only(queues, Status::NotFound),
+                }
+            }
+            ids::SEC_DERIVE_EZSP_KEY => {
+                // The unique TCLK an EmberZNet Trust Center derived for the
+                // device from the restored root (spec 7.5). Key-revealing:
+                // gated like the other keys.
+                let request = decode!(SecDeriveEzspKey);
+                if !port.ezsp_hashed_supported() {
+                    status_only(queues, Status::UnsupportedCommand);
+                    return;
+                }
+                if !state.identity.key_export || *state.key_export_locked {
+                    status_only(queues, Status::AccessDenied);
+                    return;
+                }
+                match port.derive_ezsp_key(request.ieee.0) {
+                    Some(key) => {
+                        let response = SecDeriveEzspKeyRsp { key };
                         let _ = queues.response(tid, Status::Success, Some(&response));
                     }
                     None if port.state() == NetworkState::None => {
@@ -2300,21 +2332,20 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     }
 
     fn emit_logs(&mut self, log: &LogRing<LOG_N>) {
-        if !self.host_ready() || !self.link.can_send(Endpoint::Log) {
-            if !log.is_empty() && !self.host_ready() {
-                // No session: the ring keeps the newest records.
-                return;
-            }
-            if !self.link.can_send(Endpoint::Log) {
-                log.drop_all();
-            }
-            if let Some((count, _)) = log.take_dropped() {
-                self.counters.log_dropped = self.counters.log_dropped.saturating_add(count);
-            }
-            return;
-        }
         if let Some((count, first_seq)) = log.take_dropped() {
             self.counters.log_dropped = self.counters.log_dropped.saturating_add(count);
+            self.log_drop_report = Some(match self.log_drop_report {
+                Some((pending, first)) => (pending.saturating_add(count), first),
+                None => (count, first_seq),
+            });
+        }
+        if !self.host_ready() || !self.link.can_send(Endpoint::Log) {
+            // No session, or no LOG credit (granted by the host when it
+            // wants logs, possibly never): the ring keeps the boot records
+            // and the newest ones until it can send them.
+            return;
+        }
+        if let Some((count, first_seq)) = self.log_drop_report.take() {
             self.event(Endpoint::Log, &EvtLogDropped { count, first_seq });
         }
         while self.queues.queue(Endpoint::Log).free() >= 7 + 8 + crate::log_ring::MAX_LOG_TEXT {
@@ -2583,6 +2614,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 key_export_locked: _,
                 pending_reset: _,
                 uart_switch: _,
+                log_drop_report: _,
                 counters: _,
                 pending_diag: _,
                 reported_nwk_limit: _,
@@ -2632,6 +2664,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             addr_of_mut!((*slot).key_export_locked).write(false);
             addr_of_mut!((*slot).pending_reset).write(None);
             addr_of_mut!((*slot).uart_switch).write(None);
+            addr_of_mut!((*slot).log_drop_report).write(None);
             addr_of_mut!((*slot).counters).write(QueueCounters::default());
             addr_of_mut!((*slot).pending_diag).write(Deque::new());
             addr_of_mut!((*slot).reported_nwk_limit).write(0);

@@ -792,6 +792,29 @@ fn receiver_rejects_frames_beyond_credit() {
 }
 
 #[test]
+fn granting_an_endpoint_its_first_credit_is_sent_at_once() {
+    // An embedded host grants LOG no credit at session start, so the NCP
+    // is blocked there from the start; a later grant (R8) goes out at
+    // once, not with the next ACK of other traffic.
+    let mut rig: Rig<8, 8> = Rig::established(LinkConfig::embedded_host(), 16, &[(2, 8)]);
+    rig.drain_tx(&mut NoSource);
+    let sent = rig.sent.len();
+    rig.link.release_credit(Endpoint::Log, 4);
+    rig.drain_tx(&mut NoSource);
+    let ack = rig.sent[sent..]
+        .iter()
+        .find(|s| s.header.ftype == FrameType::Ack)
+        .expect("immediate ACK");
+    assert_eq!(ack.ack_body().2, [(5, 4)]);
+    // An endpoint that still has credit is not blocked: its edge rides on
+    // the next ACK.
+    let sent = rig.sent.len();
+    rig.link.release_credit(Endpoint::Bulk, 1);
+    rig.drain_tx(&mut NoSource);
+    assert_eq!(rig.sent.len(), sent);
+}
+
+#[test]
 fn sender_reports_rejected_frames() {
     let mut rig: Rig<8, 8> = Rig::established(LinkConfig::embedded_host(), 8, &[(2, 8)]);
     let mut src = OnePerFrame::default();
