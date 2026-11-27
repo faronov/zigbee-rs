@@ -270,6 +270,9 @@ pub struct Ncp<const LOG_N: usize> {
     key_export_locked: bool,
     pending_reset: Option<(u8, u64)>,
     uart_switch: Option<UartSwitch>,
+    /// Log records dropped and not yet reported (`EVT_LOG_DROPPED`
+    /// `count`, `first_seq`).
+    log_drop_report: Option<(u32, u16)>,
     counters: QueueCounters,
     pending_diag: Deque<(u16, u8), 4>,
     reported_nwk_limit: u32,
@@ -330,6 +333,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             key_export_locked: false,
             pending_reset: None,
             uart_switch: None,
+            log_drop_report: None,
             counters: QueueCounters::default(),
             pending_diag: Deque::new(),
             reported_nwk_limit: 0,
@@ -2328,21 +2332,20 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     }
 
     fn emit_logs(&mut self, log: &LogRing<LOG_N>) {
-        if !self.host_ready() || !self.link.can_send(Endpoint::Log) {
-            if !log.is_empty() && !self.host_ready() {
-                // No session: the ring keeps the newest records.
-                return;
-            }
-            if !self.link.can_send(Endpoint::Log) {
-                log.drop_all();
-            }
-            if let Some((count, _)) = log.take_dropped() {
-                self.counters.log_dropped = self.counters.log_dropped.saturating_add(count);
-            }
-            return;
-        }
         if let Some((count, first_seq)) = log.take_dropped() {
             self.counters.log_dropped = self.counters.log_dropped.saturating_add(count);
+            self.log_drop_report = Some(match self.log_drop_report {
+                Some((pending, first)) => (pending.saturating_add(count), first),
+                None => (count, first_seq),
+            });
+        }
+        if !self.host_ready() || !self.link.can_send(Endpoint::Log) {
+            // No session, or no LOG credit (granted by the host when it
+            // wants logs, possibly never): the ring keeps the boot records
+            // and the newest ones until it can send them.
+            return;
+        }
+        if let Some((count, first_seq)) = self.log_drop_report.take() {
             self.event(Endpoint::Log, &EvtLogDropped { count, first_seq });
         }
         while self.queues.queue(Endpoint::Log).free() >= 7 + 8 + crate::log_ring::MAX_LOG_TEXT {
@@ -2611,6 +2614,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 key_export_locked: _,
                 pending_reset: _,
                 uart_switch: _,
+                log_drop_report: _,
                 counters: _,
                 pending_diag: _,
                 reported_nwk_limit: _,
@@ -2660,6 +2664,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             addr_of_mut!((*slot).key_export_locked).write(false);
             addr_of_mut!((*slot).pending_reset).write(None);
             addr_of_mut!((*slot).uart_switch).write(None);
+            addr_of_mut!((*slot).log_drop_report).write(None);
             addr_of_mut!((*slot).counters).write(QueueCounters::default());
             addr_of_mut!((*slot).pending_diag).write(Deque::new());
             addr_of_mut!((*slot).reported_nwk_limit).write(0);
