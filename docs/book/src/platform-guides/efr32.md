@@ -1300,21 +1300,32 @@ Checks behind the table:
   upload leaves the stock application in place. Whether the stock
   bootloader has it is unknown.
 - `products/efr32mg24` `stores` host tests: NVM3 pages at the stock NVM3
-  location, pseudo-random bytes with our record magic at every slot, and
-  all-zero flash are all foreign (whole window erased, then a first record
-  commits and survives the next open); a valid journal and the other
+  location, pseudo-random bytes (also with our record magic at every page
+  start, which the security journal then rejects), and all-zero flash are
+  all foreign (whole window erased, then a first record commits and
+  survives the next open); a valid journal and the other
   windows are preserved; another role's journal keeps its counters.
 - The return path "ours → 32 KiB `nvm3_clear` → stock EmberZNet → ours"
   leaves valid records of ours in the top page `0x0817_E000`. Resuming them
   would bring back the pre-stock network with frame-counter reservations
   behind what the network saw on the stock firmware (devices would drop the
   frames as replays). The opening policy therefore checks every 8 KiB page
-  start of the window for a GSDK NVM3 page header (magic `0xB29A`,
-  version, erase count with its Berger code, as written by GSDK 4.5.0
-  `libnvm3` `nvm3_pageHeaderWrite`) before the security journal, and
-  erases the whole window when it finds one (`Opened::ForeignNvm3`, logged).
-  Our journals' page starts are erased or carry an ASCII `ZB..` magic, so
-  they never match. A host test runs exactly that sequence.
+  start of the window before the security journal. Each is a slot start of
+  one of our journals (every slot size divides the page, asserted at
+  compile time), so it holds erased flash or an ASCII `ZB..` record magic,
+  possibly torn by a power loss while that word was programmed (a torn
+  word keeps every 1 bit of the magic). Any other first word is foreign and
+  the whole window is erased (`Opened::Foreign`), whatever the foreign
+  format. The boot log names the first foreign page and its first word,
+  and says `NVM3 (stock EmberZNet)` when a first word carries the GSDK
+  NVM3 page magic `0xB29A` (a label only). A first version recognised NVM3
+  by its page header (magic, version, Berger-coded erase counts as read
+  from GSDK 4.5.0 `libnvm3`); on a real Dongle Max the EmberZNet 7.4.5
+  pages did not match, and the window was erased only because no valid
+  journal of ours was left. Host tests: the return path with NVM3-shaped
+  and with unrecognised stock pages, a foreign first word at every page
+  start beside a valid journal, and a rolled-over journal set with a torn
+  page-start magic that stays ours.
 
 First run on a unit (one Dongle Max, image from `e96cd867`, build ID
 `a603b22b88fc5c2b`, reported by the hub's HIL run): it booted from the stock
@@ -1367,18 +1378,43 @@ back to a Trust Center rejoin; with the root the Trust Center derived the
 device's EmberZNet key and sent the Transport-Key, and the device sent
 Device_annce and its ED Timeout Request (answered, enum 14) and polled
 every 5 s; the hub's interview (about 30 s), reads and reports followed,
-and a 15-minute watch was clean (HIL report). The derived key therefore works on hardware. The
-fallback is not needed: with the FP = 0 flag the first secured rejoin
-completes, with or without a root. Two more findings:
+and a 15-minute watch was clean (HIL report). The derived key therefore
+works on hardware. The fallback is not needed: with the FP = 0 flag the
+first secured rejoin completes, with or without a root. Two more findings:
 
 - The NCP's log named the six Device_annce frames `UNKNOWN_ZDP 0x0013`.
   Only the log name was missing: the NCP forwarded each to the host as an
   APS data indication (spec 7.4; over that window the NCP's `aps_rx`
-  counter rose by six, matching them), and a host test checks it. The log now names announcements.
+  counter rose by six, matching them), and a host test checks it. The log
+  now names announcements.
 - Every received frame reached the host with RSSI −128: the Series 2 PHY
   dropped the per-frame RSSI (the RX trailer byte after the RSSI offset)
   that the HAL reads and derives LQI from. The PHY now passes it on; the
   ESP32 and CC26x2 PHYs already did.
+
+Fourth run (build `d99fb789c9f69dd4` from #23 at `163baae4`, restore
+without a root, sniffer capture): the secured rejoin completed on the
+first try. Two polls were acknowledged with FP = 0 and served nothing; the
+next one got FP = 1 and the Rejoin Response 6 ms later. Device_annce and
+the ED Timeout Request followed within 12 ms, with no Trust Center rejoin
+and `joins_denied` 0, and indications carried RSSI −23 to −31 dBm. The
+same run found two faults, both fixed in #23 and pending the next run:
+
+- The boot log said `blank/foreign NV erased`: the NVM3 page-header check
+  did not recognise the EmberZNet 7.4.5 pages (see the opening policy
+  above, now independent of the foreign format).
+- Every `network/restore` of the hub made the NCP broadcast a NWK Leave
+  (rejoin 0) before installing the network: the wipe ran the BDB factory
+  reset, which leaves the network first. Harmless for the sleepy device,
+  but routers drop a coordinator they hear leave. Host wipes are now local
+  (`BdbLayer::factory_reset_locally`): `NWK_LEAVE_RESET` without flags
+  bit2, the restore rule 1 wipe, a restore over a stored network and
+  `SYS_RESET` mode 2 transmit nothing; only `NWK_LEAVE_RESET` with bit2
+  broadcasts the Leave (host test over ZRHP, which fails with the old
+  wipe). This applies to every ZRHP NCP (ESP32, CC26x2, EFR32MG24).
+
+Notes for flashing over the stock image:
+
 - On first boot the stock network keys, frame counters and tables are gone.
   Take an EZSP network backup with the hub before flashing and restore it
   over ZRHP; because the IEEE is the stock one, the devices keep their Trust
@@ -1403,12 +1439,12 @@ values at 38.4 MHz against the shared analog states.
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
 | NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 456,956 B | 168,660 B | 89,388 B |
-| NCP, Dongle-M | 461,340 B | 168,676 B | 89,372 B |
-| NCP, BRD4187 on a WSTK | 461,348 B | 168,676 B | 89,372 B |
+| NCP, Dongle-M | 462,180 B | 168,660 B | 89,388 B |
+| NCP, BRD4187 on a WSTK | 462,200 B | 168,660 B | 89,388 B |
 | Router, RF-BM-MG24B1 (GP Proxy Basic) | 345,480 B | 37,140 B | 224,492 B |
 | Router, Dongle-M | 345,804 B | 37,140 B | 224,492 B |
 | Router, BRD4187 on a WSTK | 345,744 B | 37,136 B | 224,496 B |
-| Router, EK2703A | 346,144 B | 37,152 B | 224,480 B |
+| Router, EK2703A | 346,372 B | 37,136 B | 224,496 B |
 
 The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
 MG24 image compared with `15ee9550`, the build-only base without a radio.
@@ -1420,11 +1456,14 @@ hashed-TCLK root and derivation, `SEC_DERIVE_EZSP_KEY`, the
 application-key timeout) and the held boot log added about 3.7 KB to the
 Dongle-M and BRD4187 NCPs against `e96cd867` (Dongle-M 457,108 → 460,784 B
 file-backed), with the same `.bss` and linked stack; the Router changed by
-4 B. The FP = 0 record of the interrupt ACK, the per-frame RSSI and the ZDO
-log names (`0607d319` → this change) add 556 B of flash and 16 B of `.bss`
-to the Dongle-M NCP (RSSI and names: 104 B of it) and 668 B / 16 B to the
-EK2703A Router. The record is zero-initialized on purpose: in `.data` it
-moved the MG22 Router's 512-byte-aligned `.bss` past the end of SRAM.
+4 B. #23 (`0607d319` → this change) adds 1,396 B of flash to the Dongle-M
+NCP and 896 B to the EK2703A Router, with the same `.bss` and stack: the
+per-poll FP = 0 flag, the per-frame RSSI and the ZDO log names take 436 B
+(NCP) / 216 B (Router), the page-start ownership check with its boot-log
+line and the local wipe the rest. The flag lives in the RX queue record, so
+it needs no RAM; the first version's 8-entry record table cost 16 B of
+`.bss`, and in `.data` it had moved the MG22 Router's 512-byte-aligned
+`.bss` past the end of SRAM.
 
 The NCP uses 33 % of the application window and 66 % of SRAM for static
 data. The compact capacity tier is not needed. The recorded fatal resets

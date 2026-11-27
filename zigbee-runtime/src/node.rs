@@ -294,6 +294,14 @@ where
             .await
     }
 
+    /// [`Self::factory_reset`] without transmitting the NWK Leave (see
+    /// [`crate::ZigbeeDevice::local_factory_reset_with_security_store`]).
+    pub async fn local_factory_reset(&mut self) -> Result<(), StartError> {
+        self.device
+            .local_factory_reset_with_security_store(&mut *self.security_store)
+            .await
+    }
+
     pub fn configure_default_reporting(&mut self) -> Result<(), ProfileError> {
         let Self {
             device, profile, ..

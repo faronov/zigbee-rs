@@ -48,9 +48,22 @@ wire_struct! {
 wire_struct! {
     /// `NWK_LEAVE_RESET` request.
     pub struct NwkLeaveReset {
-        /// Bit0 keep IEEE override, bit1 keep host endpoints.
+        /// [`leave_reset_flags`].
         pub flags: u8,
     }
+}
+
+/// `flags` of `NWK_LEAVE_RESET`.
+pub mod leave_reset_flags {
+    /// Keep the IEEE override.
+    pub const KEEP_IEEE: u8 = 0x01;
+    /// Keep the host-endpoint registrations.
+    pub const KEEP_ENDPOINTS: u8 = 0x02;
+    /// Broadcast a NWK Leave (rejoin 0) before the wipe: an explicit "leave
+    /// network". Without it the wipe is local and nothing is transmitted,
+    /// as a wipe before a restore or a new formation must be: the routers
+    /// of the network would drop a coordinator they heard leave.
+    pub const ANNOUNCE_LEAVE: u8 = 0x04;
 }
 
 wire_struct! {

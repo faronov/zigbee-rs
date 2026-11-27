@@ -981,6 +981,11 @@ where
     last_identifying: Option<bool>,
     pending_factory_reset: bool,
     after_reset: AfterReset,
+    /// The pending reset transmits no NWK Leave (a host-driven coordinator
+    /// wipe, [`BdbLayer::factory_reset_locally`]).
+    ///
+    /// [`BdbLayer::factory_reset_locally`]: zigbee_bdb::BdbLayer::factory_reset_locally
+    reset_locally: bool,
     pending_security_indication_commit: bool,
     pending_child_lifecycle_replay_commit: bool,
     initialized: bool,
@@ -1053,6 +1058,7 @@ where
             last_identifying: None,
             pending_factory_reset: false,
             after_reset: AfterReset::Recommission,
+            reset_locally: false,
             pending_security_indication_commit: false,
             pending_child_lifecycle_replay_commit: false,
             initialized: false,
@@ -1589,10 +1595,12 @@ where
     }
 
     async fn reset_network(&mut self) -> Result<(), RouterAppError> {
-        self.node
-            .factory_reset()
-            .await
-            .map_err(RouterAppError::Start)?;
+        if self.reset_locally {
+            self.node.local_factory_reset().await
+        } else {
+            self.node.factory_reset().await
+        }
+        .map_err(RouterAppError::Start)?;
         self.parts.diagnostics.record(DiagnosticEvent::FactoryReset);
         self.clear_children()?;
         self.clear_aps_tables()?;
@@ -1658,6 +1666,17 @@ where
     }
 
     fn request_factory_reset(&mut self, after: AfterReset) {
+        self.request_reset(after, false);
+    }
+
+    /// `locally`: transmit no NWK Leave. A pending reset that announces its
+    /// Leave keeps announcing it.
+    fn request_reset(&mut self, after: AfterReset, locally: bool) {
+        self.reset_locally = if self.pending_factory_reset {
+            self.reset_locally && locally
+        } else {
+            locally
+        };
         self.after_reset = if self.pending_factory_reset {
             self.after_reset.max(after)
         } else {
@@ -1683,6 +1702,7 @@ where
         O::on_urgent_factory_reset_result(self.node.device(), result);
         result?;
         self.pending_factory_reset = false;
+        self.reset_locally = false;
         self.secure_rejoin_failures = 0;
         match core::mem::replace(&mut self.after_reset, AfterReset::Recommission) {
             AfterReset::Recommission => self.schedule_immediate_recommission(),
@@ -1705,6 +1725,13 @@ where
     /// older retry deadline is already due.
     async fn urgent_factory_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
         self.request_factory_reset(AfterReset::Recommission);
+        self.complete_pending_factory_reset_and_recommission().await
+    }
+
+    /// [`Self::urgent_factory_reset_and_recommission`] without transmitting
+    /// the NWK Leave.
+    async fn urgent_local_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
+        self.request_reset(AfterReset::Recommission, true);
         self.complete_pending_factory_reset_and_recommission().await
     }
 
@@ -3025,6 +3052,17 @@ where
         Ok(())
     }
 
+    /// [`Self::urgent_factory_reset_and_recommission`] without transmitting
+    /// the NWK Leave (a host-driven wipe before a restore or a new network).
+    pub async fn urgent_local_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
+        self.coordinator
+            .urgent_local_reset_and_recommission()
+            .await?;
+        self.trust_center
+            .clear(self.coordinator.node_mut().device_mut())?;
+        Ok(())
+    }
+
     /// See [`CoordinatorApp::request_commissioning`].
     pub fn request_commissioning(&mut self) -> bool {
         self.coordinator.request_commissioning()
@@ -3719,6 +3757,13 @@ where
 
     pub async fn urgent_factory_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
         self.core.urgent_factory_reset_and_recommission().await
+    }
+
+    /// The same reset without transmitting the NWK Leave: a host wipes the
+    /// coordinator before a restore or a new network, and the routers of
+    /// the current network must not drop it.
+    pub async fn urgent_local_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
+        self.core.urgent_local_reset_and_recommission().await
     }
 
     /// Explicitly request commissioning, normally from a button press.

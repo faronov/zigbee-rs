@@ -335,11 +335,30 @@ impl<M: MacDriver> BdbLayer<M> {
     /// After factory reset the device is in a "fresh out of box" state
     /// and must be commissioned again.
     pub async fn factory_reset(&mut self) -> Result<(), BdbStatus> {
-        log::info!("[BDB] Factory reset…");
+        self.reset_to_factory_new(true).await
+    }
+
+    /// [`Self::factory_reset`] without the NWK Leave: the same state is
+    /// cleared, and nothing is transmitted.
+    ///
+    /// For a host-driven coordinator wipe (before a backup restore, a new
+    /// formation or a factory reset of an NCP): the Leave a coordinator
+    /// broadcasts makes the routers of its network drop it from their
+    /// neighbour and routing tables, although the same network usually
+    /// comes back at once from the restored state.
+    pub async fn factory_reset_locally(&mut self) -> Result<(), BdbStatus> {
+        self.reset_to_factory_new(false).await
+    }
+
+    async fn reset_to_factory_new(&mut self, announce_leave: bool) -> Result<(), BdbStatus> {
+        log::info!(
+            "[BDB] Factory reset{}…",
+            if announce_leave { "" } else { " (local)" }
+        );
         self.state = BdbState::Initializing;
 
         // Step 1: Leave the network if we are on one
-        if self.attributes.node_is_on_a_network {
+        if announce_leave && self.attributes.node_is_on_a_network {
             let _ = self.zdo.nwk_mut().nlme_leave(false).await;
         }
 
@@ -893,6 +912,31 @@ mod tests {
 
         assert_eq!(block_on(bdb.factory_reset()), Ok(()));
         assert_eq!(bdb.zdo().pending_count(), 0);
+    }
+
+    /// The two factory resets clear the same state; only the announcing one
+    /// transmits (the NWK Leave, before the MAC reset clears the history).
+    #[test]
+    fn a_local_factory_reset_transmits_nothing() {
+        for announce in [true, false] {
+            let mut bdb = restored_bdb(false);
+            bdb.zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .mac_mut()
+                .clear_tx_history();
+            let result = if announce {
+                block_on(bdb.factory_reset())
+            } else {
+                block_on(bdb.factory_reset_locally())
+            };
+            assert_eq!(result, Ok(()));
+            let mac = bdb.zdo().aps().nwk().mac();
+            let sent = mac.tx_history_before_reset().len() + mac.tx_history().len();
+            assert_eq!(sent, usize::from(announce), "announce {announce}");
+            assert!(!bdb.is_on_network());
+            assert_eq!(bdb.zdo().aps().aib().aps_trust_center_address, [0u8; 8]);
+        }
     }
 
     #[test]

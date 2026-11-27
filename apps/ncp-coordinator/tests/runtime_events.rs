@@ -863,7 +863,7 @@ fn ack_request_confirms_wait_for_the_aps_ack_outcome() {
     // A pending send fails when the network is reset.
     let confirm = pollster::block_on(port.send(&request(4, 0x01))).unwrap();
     assert!(confirm.deferred());
-    pollster::block_on(port.leave_reset()).unwrap();
+    pollster::block_on(port.leave_reset(false)).unwrap();
     let done = port.take_data_confirm().expect("reset outcome");
     assert_eq!((done.req_tid, done.confirm.zb_status), (4, 0xA7));
 }

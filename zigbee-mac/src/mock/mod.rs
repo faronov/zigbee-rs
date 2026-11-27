@@ -53,6 +53,9 @@ pub struct MockMac {
 
     // Recorded calls for assertions
     tx_history: Vec<TxRecord, 16>,
+    /// Frames MLME-RESETs took out of `tx_history` since the last
+    /// `clear_tx_history`.
+    tx_history_before_reset: Vec<TxRecord, 16>,
     beacon_responses: Vec<MlmeBeaconResponse, 8>,
     association_responses: Vec<MlmeAssociateResponse, 8>,
     orphan_responses: Vec<MlmeOrphanResponse, 8>,
@@ -148,6 +151,7 @@ impl MockMac {
             associate_response: None,
             poll_queue: Vec::new(),
             tx_history: Vec::new(),
+            tx_history_before_reset: Vec::new(),
             beacon_responses: Vec::new(),
             association_responses: Vec::new(),
             orphan_responses: Vec::new(),
@@ -317,9 +321,18 @@ impl MockMac {
         &self.tx_history
     }
 
-    /// Clear TX history.
+    /// Clear TX history (also [`Self::tx_history_before_reset`]).
     pub fn clear_tx_history(&mut self) {
         self.tx_history.clear();
+        self.tx_history_before_reset.clear();
+    }
+
+    /// Frames that MLME-RESETs (which clear [`Self::tx_history`]) took out
+    /// of the history since the last [`Self::clear_tx_history`], oldest
+    /// first: e.g. a NWK Leave a factory reset sent just before resetting
+    /// the MAC.
+    pub fn tx_history_before_reset(&self) -> &[TxRecord] {
+        &self.tx_history_before_reset
     }
 
     /// Number of MLME-POLL requests issued.
@@ -536,7 +549,9 @@ impl MacDriver for MockMac {
             self.auto_request = true;
             self.dsn = 0;
         }
-        self.tx_history.clear();
+        for record in core::mem::take(&mut self.tx_history) {
+            let _ = self.tx_history_before_reset.push(record);
+        }
         self.beacon_responses.clear();
         self.association_responses.clear();
         self.orphan_responses.clear();

@@ -1145,7 +1145,7 @@ fields after it are shown as "→ …". Events list their full payload.
 |---|---|---|---|---|
 | `0x0001` | `SYS_NEGOTIATE` | `u8 major_min, u8 major_max, u64 host_caps, u8 name_len, name[]` | `u8 major, u8 minor, u64 ncp_caps, u8 n, n×{u8 id, u32 value}, u8 fw_len, fw[], [8] build_id, u8 chip` | N |
 | `0x0002` | `SYS_GET_INFO` | — | `[8] ieee_factory, [8] ieee_active, u8 ieee_source (0 factory, 1 override), u16 chip_rev, u32 flash_size, u8 transport (1 USJ, 2 UART), u32 uart_baud (0 for USJ), u8 uart_flow (0 none, 1 RTS/CTS), u8 board_len, board[], u8 product_len, product[]` | N |
-| `0x0003` | `SYS_RESET` | `u8 mode (0 reboot, 1 reboot to bootloader, 2 factory reset), u32 confirm` (`0x46524553` "FRES" for mode 2) | — (the response is sent before reset) | P (factory reset of stores exists) |
+| `0x0003` | `SYS_RESET` | `u8 mode (0 reboot, 1 reboot to bootloader, 2 factory reset: the `NWK_LEAVE_RESET` wipe without flags, local, then a reboot), u32 confirm` (`0x46524553` "FRES" for mode 2) | — (the response is sent before reset) | P (factory reset of stores exists) |
 | `0x0004` | `SYS_GET_STATUS` | — | `u8 network_state, u32 uptime_s, u16 free_aps_slots, u16 host_absent_queue, u16 dirty_writebacks, u8 restore_in_progress, u8 flags (bit0 key export locked, bit1 paging active, bit2 PTA coex enabled, bit3 GP sink commissioning open, bit4 permit join open)` | N |
 | `0x0005` | `SYS_SET_CONFIG` | `u8 n, n×{u16 id, u8 len, value[]}` | `u8 n, n×{u16 id, u8 status}` | N |
 | `0x0006` | `SYS_GET_CONFIG` | `u8 n, n×u16 id` | `u8 n, n×{u16 id, u8 status, u8 len, value[]}` | N |
@@ -1200,7 +1200,7 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 |---|---|---|---|---|
 | `0x0101` | `NWK_INIT` | `u32 nwk_fc_floor, u32 aps_fc_floor` (host checkpoint floors, 0 = none) | `u8 network_state`; `NOT_FORMED` if NV has no network. Completes with `EVT_NETWORK_STATE`. | E (`CoordinatorApp`/`TrustCenterCoordinatorApp::initialize` persisted path) + N (floors) |
 | `0x0102` | `NWK_FORM` | `u32 channel_mask, u16 pan_id (FFFF = random), [8] ext_pan_id (0 = random), [16] network_key (0 = random), u8 key_seq, u8 nwk_update_id, i8 tx_power (0 = keep the current power: the product default, or the last `NWK_SET_TX_POWER` of this power cycle; set exactly 0 dBm with `NWK_SET_TX_POWER` after the formation), u16 nwk_manager` | accepted; `EVT_NETWORK_STATE` follows | E (BDB formation; host-supplied parameters install the network directly on the quietest channel of the mask) |
-| `0x0103` | `NWK_LEAVE_RESET` | `u8 flags (bit0 keep IEEE override, bit1 keep host-endpoint registrations)` | — | E (`urgent_factory_reset_and_recommission`; a new network can follow in the same session) |
+| `0x0103` | `NWK_LEAVE_RESET` | `u8 flags (bit0 keep IEEE override, bit1 keep host-endpoint registrations, bit2 announce: broadcast a NWK Leave first)` | — | E (`urgent_local_reset_and_recommission`, with bit2 `urgent_factory_reset_and_recommission`; a new network can follow in the same session). Without bit2 the wipe is local and nothing is transmitted: the routers of a network that hear its coordinator leave drop it from their neighbour and routing tables, which a wipe before a restore or a new formation must not cause. Set bit2 only for an explicit "leave network". Firmware before bit2 always broadcast the Leave and ignores the bit |
 | `0x0104` | `NWK_GET_INFO` | — | `u8 state, u16 pan_id, [8] ext_pan_id, u8 channel, u32 channel_mask, u16 short, [8] ieee, u8 nwk_update_id, u16 nwk_manager, u8 key_seq, u8 security_level, i8 tx_power, u8 stack_profile`. With `state` 1 (formed, not started: after a reboot, before `NWK_INIT`) the fields are the stored network's identity: PAN ID, EPID, channel, update ID and key sequence from NV, `short` 0x0000, `nwk_manager` 0x0000, `tx_power` unknown (Z11). Otherwise `tx_power` is the antenna output the radio is programmed with (as `NWK_SET_TX_POWER.applied_dbm`), `0x7F` while unknown | E |
 | `0x0105` | `NWK_PERMIT_JOIN` | `u8 duration_s, u16 target (0xFFFC all routers + NCP, 0x0000 NCP only, else a router), u8 flags (bit0 TC significance)` | — | E (`nlme_permit_joining`, `mgmt_permit_joining_req`) |
 | `0x0106` | `NWK_ENERGY_SCAN` | `u32 channel_mask, u8 duration_exp, u8 count` | accepted; `EVT_ENERGY_SCAN_RESULT` follows strictly after the response. Works with or without a network. `channel_mask` non-empty within channels 11–26, `duration_exp` ≤ 14, `count` ≥ 1 and at most 60 s in total (`count` × channels × (2^`duration_exp` + 1) × 15.36 ms), else `INVALID_PARAMETER`; `IN_PROGRESS` while a scan runs. Each channel is one MLME-SCAN (ED) of `(2^duration_exp + 1)` superframe periods; the radio returns to the operating channel after each, and the NCP serves the link and the stack between channels. Frames sent to the NCP while it measures another channel are lost (MAC retries, SED polls); hub default `duration_exp` 4, `count` 1: 16 × 261 ms | E (capability bit 9; ESP32 and CC26x2 NCPs) |
@@ -2589,8 +2589,9 @@ Rules:
    formed but down, or absent. The previous network stays in NV, and a
    running one keeps serving, until `COMMIT`. `COMMIT`, once `END` and the
    records are checked, stops and wipes a running network like
-   `NWK_LEAVE_RESET` (its outgoing counters are retained, so a restore of
-   the same keys starts above them) and then installs the restored one.
+   `NWK_LEAVE_RESET` without bit2, so without a NWK Leave on air (its
+   outgoing counters are retained, so a restore of the same keys starts
+   above them) and then installs the restored one.
    `ABORT`, a session reset or a reboot discards the staging area and
    leaves the previous state untouched. Restore requires capability
    bit 15. (Z3: staging is RAM-only, so stopping the radio at `BEGIN` only
