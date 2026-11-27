@@ -919,6 +919,17 @@ enum RetrySchedule {
     AwaitingRequest,
 }
 
+/// Whether a pending factory reset transmits the NWK Leave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetLeave {
+    /// BDB factory reset: leave the network first.
+    Announce,
+    /// No frame ([`zigbee_bdb::BdbLayer::factory_reset_locally`]): a
+    /// host-driven coordinator wipe. A pending reset that announces keeps
+    /// announcing.
+    Local,
+}
+
 /// What follows a committed factory reset.
 ///
 /// Ordered by precedence: when several reasons are requested before the reset
@@ -979,13 +990,11 @@ where
     secure_rejoin_failures: u8,
     run_again_deadline_us: Option<u32>,
     last_identifying: Option<bool>,
-    pending_factory_reset: bool,
+    /// A factory reset is pending, and whether it transmits the NWK Leave
+    /// (one byte, as the `bool` it replaced: TLSR8258 places the app in a
+    /// fixed static slot).
+    pending_factory_reset: Option<ResetLeave>,
     after_reset: AfterReset,
-    /// The pending reset transmits no NWK Leave (a host-driven coordinator
-    /// wipe, [`BdbLayer::factory_reset_locally`]).
-    ///
-    /// [`BdbLayer::factory_reset_locally`]: zigbee_bdb::BdbLayer::factory_reset_locally
-    reset_locally: bool,
     pending_security_indication_commit: bool,
     pending_child_lifecycle_replay_commit: bool,
     initialized: bool,
@@ -1056,9 +1065,8 @@ where
             secure_rejoin_failures: 0,
             run_again_deadline_us: None,
             last_identifying: None,
-            pending_factory_reset: false,
+            pending_factory_reset: None,
             after_reset: AfterReset::Recommission,
-            reset_locally: false,
             pending_security_indication_commit: false,
             pending_child_lifecycle_replay_commit: false,
             initialized: false,
@@ -1595,7 +1603,7 @@ where
     }
 
     async fn reset_network(&mut self) -> Result<(), RouterAppError> {
-        if self.reset_locally {
+        if self.pending_factory_reset == Some(ResetLeave::Local) {
             self.node.local_factory_reset().await
         } else {
             self.node.factory_reset().await
@@ -1632,7 +1640,7 @@ where
     /// (or formation) runs on the next step. Returns `false` and does nothing
     /// while joined or while a factory reset is still pending.
     fn request_commissioning(&mut self) -> bool {
-        if self.pending_factory_reset || self.node.device().is_joined() {
+        if self.pending_factory_reset.is_some() || self.node.device().is_joined() {
             return false;
         }
         self.parts
@@ -1672,37 +1680,39 @@ where
     /// `locally`: transmit no NWK Leave. A pending reset that announces its
     /// Leave keeps announcing it.
     fn request_reset(&mut self, after: AfterReset, locally: bool) {
-        self.reset_locally = if self.pending_factory_reset {
-            self.reset_locally && locally
+        let leave = if locally {
+            ResetLeave::Local
         } else {
-            locally
+            ResetLeave::Announce
         };
-        self.after_reset = if self.pending_factory_reset {
+        self.after_reset = if self.pending_factory_reset.is_some() {
             self.after_reset.max(after)
         } else {
             after
         };
-        self.pending_factory_reset = true;
+        self.pending_factory_reset = Some(match self.pending_factory_reset {
+            Some(ResetLeave::Announce) => ResetLeave::Announce,
+            _ => leave,
+        });
         self.run_again_deadline_us = None;
         self.last_identifying = None;
         self.set_status(RouterStatus::Resetting { archetype: K::ID });
     }
 
     const fn factory_reset_pending(&self) -> bool {
-        self.pending_factory_reset
+        self.pending_factory_reset.is_some()
     }
 
     async fn complete_pending_factory_reset_and_recommission(
         &mut self,
     ) -> Result<(), RouterAppError> {
-        if !self.pending_factory_reset {
+        if self.pending_factory_reset.is_none() {
             return Ok(());
         }
         let result = self.reset_network().await;
         O::on_urgent_factory_reset_result(self.node.device(), result);
         result?;
-        self.pending_factory_reset = false;
-        self.reset_locally = false;
+        self.pending_factory_reset = None;
         self.secure_rejoin_failures = 0;
         match core::mem::replace(&mut self.after_reset, AfterReset::Recommission) {
             AfterReset::Recommission => self.schedule_immediate_recommission(),
@@ -2096,7 +2106,7 @@ where
                         if security_indication && !DEFER_SECURITY {
                             self.pending_security_indication_commit = true;
                         }
-                        if !self.pending_factory_reset {
+                        if self.pending_factory_reset.is_none() {
                             self.persist_children_if_dirty()?;
                             await_out_of_line!(self.persist_aps_tables_if_dirty())?;
                         }
@@ -2155,7 +2165,7 @@ where
         {
             self.pending_security_indication_commit = true;
         }
-        if !self.pending_factory_reset {
+        if self.pending_factory_reset.is_none() {
             self.persist_children_if_dirty()?;
             await_out_of_line!(self.persist_aps_tables_if_dirty())?;
         }
@@ -2267,7 +2277,7 @@ where
         if !self.initialized {
             return Err(RouterAppError::NotInitialized);
         }
-        if self.pending_factory_reset {
+        if self.pending_factory_reset.is_some() {
             Ok(StepEvents::default())
         } else if self.node.device().is_joined() {
             if self.network_activation_pending {
@@ -3901,7 +3911,7 @@ where
     /// still pending.
     pub fn rearm_initialize(&mut self) -> bool {
         let core = &mut self.coordinator.core;
-        if core.node.device().is_joined() || core.pending_factory_reset {
+        if core.node.device().is_joined() || core.pending_factory_reset.is_some() {
             return false;
         }
         core.initialized = false;
