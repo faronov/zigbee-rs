@@ -10874,9 +10874,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     /// (R22 §4.3.1.1 forbids reusing a counter value with a key), even when
     /// no durable security store backs the reset.
     #[inline(never)]
-    async fn factory_reset_stack(&mut self) -> Result<(), zigbee_bdb::BdbStatus> {
+    async fn factory_reset_stack(
+        &mut self,
+        announce_leave: bool,
+    ) -> Result<(), zigbee_bdb::BdbStatus> {
         let counter_floor = self.bdb.zdo().nwk().nib().outgoing_frame_counter;
-        let result = self.bdb.factory_reset().await;
+        let result = if announce_leave {
+            self.bdb.factory_reset().await
+        } else {
+            self.bdb.factory_reset_locally().await
+        };
         self.clear_network_runtime_state();
         self.basic_cluster.reset_to_factory_defaults();
         let nib = self.bdb.zdo_mut().nwk_mut().nib_mut();
@@ -10900,7 +10907,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
     pub async fn factory_reset(&mut self, nv: Option<&mut dyn NvStorage>) {
         log::info!("[Runtime] Factory reset…");
 
-        let _ = self.factory_reset_stack().await;
+        let _ = self.factory_reset_stack(true).await;
 
         // Clear NV storage if provided
         if let Some(nv) = nv {
@@ -12707,9 +12714,29 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         &mut self,
         store: &mut S,
     ) -> Result<(), event_loop::StartError> {
+        self.factory_reset_with_security_store_mode(store, true)
+            .await
+    }
+
+    /// [`Self::factory_reset_with_security_store`] without transmitting the
+    /// NWK Leave ([`zigbee_bdb::BdbLayer::factory_reset_locally`]): a host
+    /// wipes its coordinator before a restore or a new network.
+    pub async fn local_factory_reset_with_security_store<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+    ) -> Result<(), event_loop::StartError> {
+        self.factory_reset_with_security_store_mode(store, false)
+            .await
+    }
+
+    async fn factory_reset_with_security_store_mode<S: SecurityStateStore>(
+        &mut self,
+        store: &mut S,
+        announce_leave: bool,
+    ) -> Result<(), event_loop::StartError> {
         self.factory_reset_security_state(store)
             .map_err(event_loop::StartError::PersistenceFailed)?;
-        let result = self.factory_reset_stack().await;
+        let result = self.factory_reset_stack(announce_leave).await;
         // The reset state is already durable in `store`.
         self.state_dirty = false;
         result.map_err(event_loop::StartError::CommissioningFailed)
@@ -14158,7 +14185,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     .zdo_mut()
                     .aps_mut()
                     .nwk_mut()
-                    .service_child_data_request(indication.source_address)
+                    .service_child_data_request(&indication)
                     .await?;
                 if let zigbee_nwk::ChildPollOutcome::Delivered { child, kind, .. } = outcome {
                     match kind {
@@ -18375,6 +18402,7 @@ mod parent_router_tests {
             destination_address: MacAddress::Short(PAN, ROUTER),
             lqi: 170,
             security_use: false,
+            acked_without_frame_pending: false,
         })
     }
 

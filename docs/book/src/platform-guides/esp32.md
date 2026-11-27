@@ -139,7 +139,14 @@ a hook looks up the source of a MAC Data Request in the
 `zigbee_mac::ack_pending` table (16 entries, short or extended addresses)
 and sets the ACK's Frame Pending bit. The core fills the table through
 `RadioPhy::set_ack_frame_pending`. A full table fails the request with
-`PhyError::Hardware` instead of dropping a child silently.
+`PhyError::Hardware` instead of dropping a child silently. The hook also
+logs each decision with the poll's source and sequence number
+(`ack_pending::PollAckLog`, in reception order); when the PHY dequeues that
+poll it marks it `acked_without_frame_pending` if its ACK carried FP = 0,
+and the NWK then holds back a frame queued after that ACK for the next
+poll. The decision travels with the poll: the earlier per-child record
+(16 entries, never evicted) stopped working once more sleepy children had
+polled without data than it held.
 `EspRadioPhy::parent_stats()` counts Data Requests, FP ACKs, raw
 transmissions, TX errors, acknowledged transmissions and missing ACKs; the
 router logs them every 60 s.

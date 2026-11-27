@@ -742,8 +742,10 @@ async fn commit<C: CoordinatorPort, P: NcpPlatform>(
     if port.state() == NetworkState::Up {
         // Rule 1, restore begun with the network up: it served while the
         // records were staged and stops only now that they are complete
-        // (its outgoing counters are retained by the wipe).
-        await_out_of_line!(port.leave_reset()).map_err(op_status)?;
+        // (its outgoing counters are retained by the wipe). Locally: the
+        // restored network is often this one, and its routers must not hear
+        // the coordinator leave.
+        await_out_of_line!(port.leave_reset(false)).map_err(op_status)?;
     }
     // Rule 7: the IEEE override first, so the network is stored under the
     // EUI-64 the radio will use.

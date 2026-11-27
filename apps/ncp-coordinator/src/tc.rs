@@ -71,7 +71,9 @@ pub trait TcApp {
     async fn initialize(&mut self) -> Result<(), RouterAppError>;
     async fn step(&mut self) -> Result<StepEvents, RouterAppError>;
     /// Clear every durable network, child, APS and Trust Center state.
-    async fn wipe(&mut self) -> Result<(), RouterAppError>;
+    /// `announce_leave`: broadcast a NWK Leave first (only an explicit host
+    /// request does); otherwise nothing is transmitted.
+    async fn wipe(&mut self, announce_leave: bool) -> Result<(), RouterAppError>;
     /// Allow `initialize` again after a wipe (see
     /// `TrustCenterCoordinatorApp::rearm_initialize`).
     fn rearm_initialize(&mut self) -> bool;
@@ -164,8 +166,12 @@ where
         TrustCenterCoordinatorApp::step(self).await
     }
 
-    async fn wipe(&mut self) -> Result<(), RouterAppError> {
-        self.urgent_factory_reset_and_recommission().await
+    async fn wipe(&mut self, announce_leave: bool) -> Result<(), RouterAppError> {
+        if announce_leave {
+            self.urgent_factory_reset_and_recommission().await
+        } else {
+            self.urgent_local_reset_and_recommission().await
+        }
     }
 
     fn rearm_initialize(&mut self) -> bool {
@@ -1154,11 +1160,14 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         Ok(result)
     }
 
-    async fn leave_reset(&mut self) -> Result<(), OpError> {
+    async fn leave_reset(&mut self, announce_leave: bool) -> Result<(), OpError> {
         if self.stored.is_some() {
             self.retain_counter_bounds()?;
         }
-        self.app.wipe().await.map_err(|_| OpError::Storage)?;
+        self.app
+            .wipe(announce_leave)
+            .await
+            .map_err(|_| OpError::Storage)?;
         host_passthrough::clear();
         self.app
             .device_mut()
@@ -1479,8 +1488,10 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
         // starts above them whatever the image says.
         self.retain_counter_bounds()?;
         if self.stored.is_some() {
-            // The previous network's NWK, child, APS and Trust Center state.
-            self.app.wipe().await.map_err(|_| OpError::Storage)?;
+            // The previous network's NWK, child, APS and Trust Center state,
+            // wiped locally: the network about to be installed is often the
+            // same one, and its routers must not hear its coordinator leave.
+            self.app.wipe(false).await.map_err(|_| OpError::Storage)?;
             host_passthrough::clear();
             self.stored = None;
         }
@@ -1861,8 +1872,8 @@ impl<T: TcApp + ?Sized> TcApp for &mut T {
         (**self).step().await
     }
 
-    async fn wipe(&mut self) -> Result<(), RouterAppError> {
-        (**self).wipe().await
+    async fn wipe(&mut self, announce_leave: bool) -> Result<(), RouterAppError> {
+        (**self).wipe(announce_leave).await
     }
 
     fn rearm_initialize(&mut self) -> bool {

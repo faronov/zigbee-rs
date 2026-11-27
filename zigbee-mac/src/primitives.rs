@@ -243,6 +243,15 @@ pub struct MlmeDataRequestIndication {
     pub lqi: u8,
     /// Whether MAC security was enabled on the received command.
     pub security_use: bool,
+    /// The ACK to this Data Request carried Frame Pending = 0, so the child
+    /// turned its receiver off (IEEE 802.15.4-2015 6.7.3): the parent must
+    /// not answer this poll with data, even data queued after the ACK was
+    /// sent; it stays queued, Frame Pending armed, for the next poll. Set
+    /// for every poll by the software ACK path and by `hardware_auto_ack`
+    /// PHYs that report their decision per frame
+    /// ([`crate::PhyRxFrame::acked_without_frame_pending`]); `false` when the
+    /// ACK carried Frame Pending = 1 or the backend does not report it.
+    pub acked_without_frame_pending: bool,
 }
 
 /// Completion of a deferred MLME-ASSOCIATE.response transaction.

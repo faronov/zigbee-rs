@@ -20,7 +20,10 @@
 //!     sets Frame Pending in the ACK to a Data Request whose source is in
 //!     the HAL source-match table that `SoftMacCore` arms through
 //!     [`RadioPhy::set_ack_frame_pending`] (single Frame Pending owner:
-//!     [`Efr32s2RouterRole`] has no software pending table).
+//!     [`Efr32s2RouterRole`] has no software pending table). A poll it
+//!     acknowledged with FP = 0 reaches the MAC marked as such
+//!     ([`PhyRxFrame::acked_without_frame_pending`]), so a frame queued
+//!     after that ACK waits for the child's next poll.
 //! - **RX** — polled from the executor (`yield_now`) inside the receive
 //!   window. With `isr-ack` the interrupt also drops ACKs, frames for
 //!   other nodes and frames it could not acknowledge in time, which keeps
@@ -305,6 +308,10 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
         loop {
             if let Some(rx) = self.radio.receive(frame.buffer_mut()) {
                 frame.set_len(rx.len, rx.lqi)?;
+                // The HAL's per-frame RSSI (the RX trailer, dBm): reported to
+                // a ZRHP host with every indication (`rx-rssi`).
+                crate::rx_rssi!(frame, rx.rssi_dbm);
+                frame.set_acked_without_frame_pending(rx.acked_without_frame_pending);
                 return Ok(true);
             }
             if Instant::now() >= deadline {

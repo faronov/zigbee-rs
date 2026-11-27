@@ -286,8 +286,11 @@ pub trait CoordinatorPort {
     async fn form(&mut self, params: FormParams) -> Result<(), OpError>;
     async fn permit_join(&mut self, duration_s: u8, target: u16) -> Result<(), OpError>;
     async fn send(&mut self, request: &DataRequest) -> Result<DataConfirm, OpError>;
-    /// Leave and wipe the network state (`NWK_LEAVE_RESET`).
-    async fn leave_reset(&mut self) -> Result<(), OpError>;
+    /// Wipe the network state (`NWK_LEAVE_RESET`). `announce_leave`:
+    /// broadcast a NWK Leave first (flags bit2, an explicit host "leave
+    /// network"); every other wipe (a restore, a formation over a stored
+    /// network, a factory reset) transmits nothing.
+    async fn leave_reset(&mut self, announce_leave: bool) -> Result<(), OpError>;
 
     /// The Green Power combo (spec 7.11), `None` when this stack runs none
     /// (the GREEN POWER commands are then `UNSUPPORTED_COMMAND`).

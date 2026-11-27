@@ -40,10 +40,14 @@
 
 # Reviewed exception (exact symbol). One-shot boot frame: compose holds the
 # by-value Bl702RouterMac and DeviceBuilder while moving them into static
-# storage; it runs once before the run loop. Measured 5,600 B; cap rounded
-# up to the next 256 B.
+# storage; it runs once before the run loop. Measured 5,648 B (5,600 B
+# before #23: a Data Request indication carries its ACK's Frame Pending
+# decision, which makes it as large as an Association indication, so a
+# MacCommandEvent no longer keeps its tag in a niche and grows by 2 B; the
+# MAC queues 8 of them, 1,588 -> 1,604 B, and compose holds it three
+# times); cap rounded up to the next 256 B.
 --frame-allow
-bl702_router::compose=5632
+bl702_router::compose=5888
 
 # Chain budgets: worst depth below (and including) any matching function,
 # measured on the 24 KiB fix build, rounded up to the next 256 B boundary

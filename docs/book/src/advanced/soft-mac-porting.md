@@ -246,6 +246,17 @@ without a hardware ACK engine:
   starts a precomputed ACK at once;
 - FP = 1 only for a MAC Data Request whose source is in the table; data
   frames are ACKed with FP = 0;
+- a Data Request ACKed with FP = 0 is queued with that fact and delivered
+  as `PhyRxFrame::acked_without_frame_pending`: the child stopped
+  listening, so the stack does not answer that poll with a frame it queued
+  after the ACK. Keep the decision with the frame (a record flag, or a
+  reception-order log such as `ack_pending::PollAckLog` when the interrupt
+  cannot mark the frame), never in a per-child table, which fills up with
+  sleepy children that never get data. The EFR32 Series 2 and ESP32
+  parents report it; the CC26x2, nRF (`isr_phy`), Telink and BL702 parent
+  PHYs do not yet and deliver at once (a follow-up). EFR32 Series 1,
+  PHY6222 and CC2340 auto-ACK without a Frame Pending table, so arming
+  indirect data fails there and they cannot serve sleepy children;
 - it drops frames it could not ACK in time, plus ACKs and foreign frames,
   and copies the frames it keeps into a software queue, so the hardware RX
   buffer is empty after every interrupt, even while the task is blocked in

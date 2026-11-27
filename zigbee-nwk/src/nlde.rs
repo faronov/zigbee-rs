@@ -13135,9 +13135,12 @@ mod tests {
         child.rx_on_when_idle = false;
         block_on(parent.nlde_data_request(ORIGIN, 1, &[0xAA], false, false)).unwrap();
 
-        parent.mac.set_poll_acked_without_frame_pending(true);
+        let stale_poll = crate::ChildPoll {
+            source: MacAddress::Short(PAN, ORIGIN),
+            acked_without_frame_pending: true,
+        };
         assert_eq!(
-            block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap(),
+            block_on(parent.service_child_data_request(stale_poll)).unwrap(),
             crate::ChildPollOutcome::NoData
         );
         assert!(parent.mac.tx_history().is_empty());
@@ -13148,7 +13151,6 @@ mod tests {
             "Frame Pending stays armed for the next poll"
         );
 
-        parent.mac.set_poll_acked_without_frame_pending(false);
         assert_eq!(
             block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN))).unwrap(),
             crate::ChildPollOutcome::Delivered {

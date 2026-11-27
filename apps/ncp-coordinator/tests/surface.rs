@@ -46,7 +46,7 @@ use zigbee_zrhp::msg::firmware::{
 use zigbee_zrhp::msg::network::{
     EvtChannelChanged, EvtEnergyScanResult, EvtScanProgress, NwkActiveScan, NwkActiveScanRsp,
     NwkChangeChannel, NwkEnergyScan, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkLeaveReset,
-    NwkSetTxPower, NwkSetTxPowerRsp,
+    NwkSetTxPower, NwkSetTxPowerRsp, leave_reset_flags,
 };
 use zigbee_zrhp::msg::security::{
     SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecDeriveEzspKey, SecDeriveEzspKeyRsp,
@@ -805,6 +805,147 @@ fn host_identity_formation_tables_and_backup_restore() {
     assert!(after.nwk_current > before.nwk_current);
     assert!(after.aps_current > before.aps_current);
     assert_eq!(port.device(0).map(|view| view.ieee), Some(DEVICE_IEEE));
+}
+
+/// The NWK command ID of a NWK-secured command frame the NCP sent,
+/// decrypted with `key` (the command ID is in the secured payload).
+fn nwk_command(key: &[u8; 16], frame: &[u8]) -> Option<u8> {
+    use zigbee_nwk::frames::{NwkFrameType, NwkHeader};
+    use zigbee_nwk::security::{NwkSecurity, NwkSecurityHeader};
+    let (header, header_len) = NwkHeader::parse(frame)?;
+    if header.frame_control.frame_type != NwkFrameType::Command as u8 {
+        return None;
+    }
+    let (mut security, security_len) = NwkSecurityHeader::parse(&frame[header_len..])?;
+    // The level is sent as 0 and restored for the nonce and the MIC.
+    security.security_control = (security.security_control & !0x07) | 0x05;
+    let mut aad = frame[..header_len + security_len].to_vec();
+    aad[header_len] = security.security_control;
+    let plain =
+        NwkSecurity::new().decrypt(&aad, &frame[header_len + security_len..], key, &security)?;
+    plain.first().copied()
+}
+
+/// NWK Leave commands (`0x04`) among `frames`.
+fn leaves(frames: &[zigbee_mac::mock::TxRecord]) -> usize {
+    frames
+        .iter()
+        .filter(|tx| nwk_command(&NETWORK_KEY, tx.payload.as_slice()) == Some(0x04))
+        .count()
+}
+
+fn mock_mac<A: TcApp<Mac = MockMac>>(port: &mut TcPort<A>) -> &mut MockMac {
+    port.app_mut().device_mut().mac_mut()
+}
+
+/// NWK Leave commands sent since the history was last cleared, including
+/// the ones a MAC reset (the wipe's MLME-RESET) took out of the history.
+fn leaves_sent<A: TcApp<Mac = MockMac>>(port: &mut TcPort<A>) -> usize {
+    let mac = mock_mac(port);
+    leaves(mac.tx_history_before_reset()) + leaves(mac.tx_history())
+}
+
+/// Forget every recorded transmission.
+fn forget_sent<A: TcApp<Mac = MockMac>>(port: &mut TcPort<A>) {
+    mock_mac(port).clear_tx_history();
+}
+
+/// A host wipe transmits nothing: before a restore (the coordinator's
+/// Leave broadcast made the routers of a restored network drop it, hub HIL
+/// on a Dongle Max), the 9.4 rule 1 wipe of a restore committed with the
+/// network up, `NWK_LEAVE_RESET` without flags bit2 (also the path of
+/// `SYS_RESET` mode 2). Only bit2, an explicit "leave network", broadcasts
+/// the NWK Leave.
+#[test]
+fn host_wipes_transmit_no_leave_unless_it_is_announced() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let form = host.request(&form_request(0x5EA7, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let begin = host.request(&BkpExportBegin { flags: 0x03 });
+    exchange!();
+    let begin: BkpExportBeginRsp = host.response(begin).body();
+    let mut stream = Vec::new();
+    loop {
+        let read = host.request(&BkpExportRead {
+            txn: begin.txn,
+            max_bytes: 64,
+        });
+        exchange!();
+        let read = host.response(read);
+        stream.extend_from_slice(&read.payload[2..]);
+        if read.payload[1] == 0 {
+            break;
+        }
+    }
+    let end = host.request(&BkpExportEnd { txn: begin.txn });
+    exchange!();
+    assert_eq!(host.response(end).status(), 0);
+    let records: Vec<&[u8]> = RawRecords::new(&stream).map(|r| r.unwrap().1).collect();
+
+    // A restore committed with the network up (rule 1), started again.
+    forget_sent(&mut port);
+    let begin = host.request(&BkpRestoreBegin {
+        flags: 0x02,
+        nwk_margin: 10_000,
+        aps_margin: 10_000,
+        expected_records: records.len() as u32,
+    });
+    exchange!();
+    let begin: BkpRestoreBeginRsp = host.response(begin).body();
+    let mut payload = begin.txn.to_le_bytes().to_vec();
+    for record in records.iter().take(usize::from(begin.max_records_per_put)) {
+        payload.extend_from_slice(record);
+    }
+    assert!(usize::from(begin.max_records_per_put) >= records.len());
+    let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+    let commit = host.request(&BkpRestoreCommit { txn: begin.txn });
+    exchange!();
+    assert_eq!(host.response(put).status(), 0);
+    assert_eq!(host.response(commit).status(), 0);
+    assert_eq!(port.state() as u8, 2, "restored and up");
+    assert_eq!(leaves_sent(&mut port), 0, "rule 1 wipe");
+
+    // NWK_LEAVE_RESET as hosts send it before a restore (flags 0x03), and
+    // without flags.
+    for flags in [
+        leave_reset_flags::KEEP_IEEE | leave_reset_flags::KEEP_ENDPOINTS,
+        0,
+    ] {
+        if port.state() as u8 != 2 {
+            let form = host.request(&form_request(0x5EA7, 1 << 15));
+            exchange!();
+            assert_eq!(host.response(form).status(), 0);
+        }
+        forget_sent(&mut port);
+        let wipe = host.request(&NwkLeaveReset { flags });
+        exchange!();
+        assert_eq!(host.response(wipe).status(), 0);
+        assert_eq!(port.state() as u8, 0);
+        let mac = mock_mac(&mut port);
+        assert!(
+            mac.tx_history_before_reset().is_empty() && mac.tx_history().is_empty(),
+            "flags {flags:#04x}: nothing on air"
+        );
+    }
+
+    // An explicit leave announces it once, to every rx-on device.
+    let form = host.request(&form_request(0x5EA7, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    forget_sent(&mut port);
+    let leave = host.request(&NwkLeaveReset {
+        flags: leave_reset_flags::ANNOUNCE_LEAVE,
+    });
+    exchange!();
+    assert_eq!(host.response(leave).status(), 0);
+    assert_eq!(leaves_sent(&mut port), 1);
+    let frames = mock_mac(&mut port).tx_history_before_reset();
+    assert_eq!(frames.len(), 1, "only the Leave");
+    let (header, _) =
+        zigbee_nwk::frames::NwkHeader::parse(frames[0].payload.as_slice()).expect("a NWK frame");
+    assert_eq!(header.dst_addr, zigbee_types::ShortAddress(0xFFFD));
+    assert_eq!(port.state() as u8, 0);
 }
 
 #[test]

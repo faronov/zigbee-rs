@@ -297,6 +297,13 @@ pub struct RxFrame {
     pub len: usize,
     pub rssi_dbm: i8,
     pub lqi: u8,
+    /// The frame is a MAC Data Request that the `isr-ack` interrupt
+    /// acknowledged with Frame Pending = 0. The child turned its receiver
+    /// off after that ACK, so this poll must not be answered with a frame
+    /// queued since (IEEE 802.15.4-2015 6.7.3: data follows only an ACK with
+    /// Frame Pending); the frame waits for the child's next poll. Always
+    /// `false` without `isr-ack`.
+    pub acked_without_frame_pending: bool,
 }
 
 /// Unslotted CSMA-CA parameters (IEEE 802.15.4-2015 6.2.5.1).
@@ -1014,6 +1021,7 @@ impl Radio {
                 len: stored,
                 rssi_dbm: rssi,
                 lqi: lqi_from_rssi(rssi),
+                acked_without_frame_pending: false,
             });
         }
     }
@@ -1024,12 +1032,13 @@ impl Radio {
     /// decision.
     #[cfg(feature = "isr-ack")]
     fn read_frame(&mut self, out: &mut [u8; MAX_FRAME], _skip_acks: bool) -> Option<RxFrame> {
-        let (len, raw_rssi) = isr_ack::pop(out)?;
+        let (len, raw_rssi, acked_without_frame_pending) = isr_ack::pop(out)?;
         let rssi = rssi_adjust(raw_rssi as i32);
         Some(RxFrame {
             len,
             rssi_dbm: rssi,
             lqi: lqi_from_rssi(rssi),
+            acked_without_frame_pending,
         })
     }
 

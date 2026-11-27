@@ -10,6 +10,10 @@
 //! [`RadioPhy::set_ack_frame_pending`](crate::phy::RadioPhy::set_ack_frame_pending)
 //! with exactly one owner: the PHY. The core's software pending queue for
 //! this ACK path stays at `PENDING = 0`.
+//!
+//! [`PollAckLog`] carries each ACK's decision to the frame it answered, for a
+//! PHY whose interrupt cannot mark the queued frame itself
+//! ([`PhyRxFrame::acked_without_frame_pending`](crate::PhyRxFrame::acked_without_frame_pending)).
 
 use zigbee_types::{MacAddress, PanId, ShortAddress};
 
@@ -165,6 +169,75 @@ pub fn data_request_source(frame: &[u8]) -> Option<MacAddress> {
     Some(source)
 }
 
+/// The Frame Pending decisions of the auto-ACKs to received Data Requests,
+/// in reception order, until the task dequeues the polls they answered.
+///
+/// The interrupt [`record`](Self::record)s every acknowledged Data Request;
+/// the task [`take`](Self::take)s the decision when the same frame (source
+/// and sequence number) comes out of the radio's receive queue. Entries
+/// ahead of the match belong to frames the radio's queue dropped and are
+/// discarded with it. Nothing is kept per child, so any number of children
+/// is covered; `N` only has to cover the polls one receive queue can hold.
+/// When it is exceeded the oldest decision is overwritten and its poll
+/// reports `None` (the decision is unknown).
+#[derive(Debug, Clone)]
+pub struct PollAckLog<const N: usize> {
+    entries: [(MacAddress, u8, bool); N],
+    /// Index of the oldest entry.
+    head: usize,
+    len: usize,
+}
+
+impl<const N: usize> PollAckLog<N> {
+    pub const fn new() -> Self {
+        Self {
+            entries: [(EMPTY, 0, false); N],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    /// The ACK to the Data Request `sequence` from `source` carried
+    /// `frame_pending` (interrupt side).
+    pub fn record(&mut self, source: MacAddress, sequence: u8, frame_pending: bool) {
+        if N == 0 {
+            return;
+        }
+        if self.len == N {
+            self.head = (self.head + 1) % N;
+            self.len -= 1;
+        }
+        self.entries[(self.head + self.len) % N] = (source, sequence, frame_pending);
+        self.len += 1;
+    }
+
+    /// The Frame Pending bit of the ACK to the Data Request `sequence` from
+    /// `source`, now out of the receive queue; `None` if it was not
+    /// recorded or already overwritten.
+    pub fn take(&mut self, source: &MacAddress, sequence: u8) -> Option<bool> {
+        let skip = (0..self.len).find(|&i| {
+            let (address, seq, _) = &self.entries[(self.head + i) % N];
+            address == source && *seq == sequence
+        })?;
+        let (_, _, frame_pending) = self.entries[(self.head + skip) % N];
+        self.head = (self.head + skip + 1) % N;
+        self.len -= skip + 1;
+        Some(frame_pending)
+    }
+
+    /// Forget every decision (MLME-RESET).
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+}
+
+impl<const N: usize> Default for PollAckLog<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn read_u16(frame: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes([
         *frame.get(offset)?,
@@ -315,5 +388,56 @@ mod tests {
         table.clear();
         assert!(table.is_empty());
         assert!(!table.frame_pending(&request_short(1, 0x0001, 0x0000)));
+    }
+
+    #[test]
+    fn poll_ack_log_matches_each_poll_with_its_own_ack() {
+        let mut log = PollAckLog::<4>::new();
+        // Polls of more children than the log holds, each taken in turn:
+        // nothing accumulates per child.
+        for child in 0x1000u16..0x1040 {
+            log.record(short(child), child as u8, false);
+            assert_eq!(log.take(&short(child), child as u8), Some(false));
+        }
+        // Two polls queued before the task reads them: the stale one
+        // (FP = 0) and the next one (FP = 1, the response armed meanwhile).
+        log.record(short(0x12D2), 7, false);
+        log.record(short(0x12D2), 8, true);
+        assert_eq!(log.take(&short(0x12D2), 7), Some(false));
+        assert_eq!(log.take(&short(0x12D2), 8), Some(true));
+        // A MAC retransmission (same sequence) is matched in order.
+        log.record(short(0x12D2), 9, false);
+        log.record(short(0x12D2), 9, true);
+        assert_eq!(log.take(&short(0x12D2), 9), Some(false));
+        assert_eq!(log.take(&short(0x12D2), 9), Some(true));
+        assert_eq!(log.take(&short(0x12D2), 9), None);
+    }
+
+    #[test]
+    fn poll_ack_log_discards_polls_the_queue_dropped_and_bounds_itself() {
+        let mut log = PollAckLog::<4>::new();
+        let ext = MacAddress::Extended(PanId(PAN), CHILD_EXT);
+        log.record(short(0x0001), 1, false); // dropped by the radio queue
+        log.record(ext, 2, false);
+        log.record(short(0x0003), 3, true);
+        // A frame without a record (not a poll, or not acknowledged) takes
+        // nothing.
+        assert_eq!(log.take(&short(0x0009), 1), None);
+        assert_eq!(log.take(&ext, 2), Some(false));
+        // The dropped poll's decision went with it.
+        assert_eq!(log.take(&short(0x0001), 1), None);
+        assert_eq!(log.take(&short(0x0003), 3), Some(true));
+        // Full: the oldest decision is overwritten, its poll is unknown.
+        for seq in 10..15 {
+            log.record(short(0x0004), seq, false);
+        }
+        assert_eq!(log.take(&short(0x0004), 10), None);
+        assert_eq!(log.take(&short(0x0004), 11), Some(false));
+        log.clear();
+        assert_eq!(log.take(&short(0x0004), 12), None);
+        // An empty log never panics.
+        let mut none = PollAckLog::<0>::new();
+        none.record(short(0x0001), 1, false);
+        assert_eq!(none.take(&short(0x0001), 1), None);
     }
 }

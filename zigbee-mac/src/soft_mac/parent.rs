@@ -85,10 +85,13 @@ impl<const EVENTS: usize, const ASSOC: usize, const PENDING: usize> MacRole
                 if self.associations.iter().any(|entry| entry.response.device_address == *address))
     }
 
-    fn queue_command(&mut self, data: &[u8], lqi: u8) {
-        let Some(event) = parse_parent_command(data, lqi) else {
+    fn queue_command(&mut self, data: &[u8], lqi: u8, acked_without_frame_pending: bool) {
+        let Some(mut event) = parse_parent_command(data, lqi) else {
             return;
         };
+        if let MacCommandEvent::DataRequest(indication) = &mut event {
+            indication.acked_without_frame_pending = acked_without_frame_pending;
+        }
         let data_request = matches!(event, MacCommandEvent::DataRequest(_));
         if self.events.push_back(event).is_err() {
             self.dropped_events = self.dropped_events.saturating_add(1);
@@ -316,6 +319,10 @@ impl<
             return Some(event);
         };
         match indication.source_address {
+            // Its ACK told the device nothing is pending, so it is no longer
+            // listening: the Association Response (queued after that ACK)
+            // stays armed for the next poll.
+            MacAddress::Extended(_, _) if indication.acked_without_frame_pending => Some(event),
             MacAddress::Extended(_, child) => {
                 let Some(response) = self
                     .role
@@ -458,11 +465,6 @@ impl<
         pending: bool,
     ) -> Result<(), MacError> {
         self.set_frame_pending(child, pending)
-    }
-
-    fn poll_acked_without_frame_pending(&self, child: &MacAddress) -> bool {
-        self.phy.capabilities().hardware_auto_ack
-            && self.phy.data_request_acked_without_pending(child)
     }
 
     fn mcps_indirect_data(

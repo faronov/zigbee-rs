@@ -53,11 +53,13 @@ pub struct MockMac {
 
     // Recorded calls for assertions
     tx_history: Vec<TxRecord, 16>,
+    /// Frames MLME-RESETs took out of `tx_history` since the last
+    /// `clear_tx_history`.
+    tx_history_before_reset: Vec<TxRecord, 16>,
     beacon_responses: Vec<MlmeBeaconResponse, 8>,
     association_responses: Vec<MlmeAssociateResponse, 8>,
     orphan_responses: Vec<MlmeOrphanResponse, 8>,
     indirect_pending_history: Vec<(MacAddress, bool), 16>,
-    poll_acked_without_frame_pending: bool,
     joined_polls: u32,
     rx_queue: Vec<McpsDataIndication, 8>,
     command_queue: Vec<MacCommandEvent, 8>,
@@ -149,11 +151,11 @@ impl MockMac {
             associate_response: None,
             poll_queue: Vec::new(),
             tx_history: Vec::new(),
+            tx_history_before_reset: Vec::new(),
             beacon_responses: Vec::new(),
             association_responses: Vec::new(),
             orphan_responses: Vec::new(),
             indirect_pending_history: Vec::new(),
-            poll_acked_without_frame_pending: false,
             joined_polls: 0,
             rx_queue: Vec::new(),
             command_queue: Vec::new(),
@@ -301,19 +303,13 @@ impl MockMac {
         self.tx_failures = count;
     }
 
-    /// Fail the next `count` MLME-POLL requests with `MacError::NoAck`.
-    /// Report every child's latest Data Request as acknowledged with Frame
-    /// Pending = 0 ([`MacDriver::poll_acked_without_frame_pending`]).
-    pub fn set_poll_acked_without_frame_pending(&mut self, acked_without: bool) {
-        self.poll_acked_without_frame_pending = acked_without;
-    }
-
     /// Polls issued through [`MacDriver::mlme_poll_joined`] (also counted
     /// by `poll_count`).
     pub fn joined_poll_count(&self) -> u32 {
         self.joined_polls
     }
 
+    /// Fail the next `count` MLME-POLL requests with `MacError::NoAck`.
     pub fn set_poll_failures(&mut self, count: u32) {
         self.poll_failures = count;
     }
@@ -325,9 +321,18 @@ impl MockMac {
         &self.tx_history
     }
 
-    /// Clear TX history.
+    /// Clear TX history (also [`Self::tx_history_before_reset`]).
     pub fn clear_tx_history(&mut self) {
         self.tx_history.clear();
+        self.tx_history_before_reset.clear();
+    }
+
+    /// Frames that MLME-RESETs (which clear [`Self::tx_history`]) took out
+    /// of the history since the last [`Self::clear_tx_history`], oldest
+    /// first: e.g. a NWK Leave a factory reset sent just before resetting
+    /// the MAC.
+    pub fn tx_history_before_reset(&self) -> &[TxRecord] {
+        &self.tx_history_before_reset
     }
 
     /// Number of MLME-POLL requests issued.
@@ -544,7 +549,9 @@ impl MacDriver for MockMac {
             self.auto_request = true;
             self.dsn = 0;
         }
-        self.tx_history.clear();
+        for record in core::mem::take(&mut self.tx_history) {
+            let _ = self.tx_history_before_reset.push(record);
+        }
         self.beacon_responses.clear();
         self.association_responses.clear();
         self.orphan_responses.clear();
@@ -724,10 +731,6 @@ impl MacDriver for MockMac {
         self.indirect_pending_history
             .push((child, pending))
             .map_err(|_| MacError::TransactionOverflow)
-    }
-
-    fn poll_acked_without_frame_pending(&self, _child: &MacAddress) -> bool {
-        self.poll_acked_without_frame_pending
     }
 
     async fn mcps_indirect_data(

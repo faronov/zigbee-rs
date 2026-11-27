@@ -539,6 +539,7 @@ fn a_restored_child_without_a_key_is_admitted_on_its_secured_rejoin() {
         destination_address: MacAddress::Short(pan, ShortAddress::COORDINATOR),
         lqi: 180,
         security_use: false,
+        acked_without_frame_pending: false,
     }));
     steps(&mut port, 8);
     assert_eq!(
@@ -609,6 +610,185 @@ fn a_restored_child_without_a_key_is_admitted_on_its_secured_rejoin() {
         ),
     );
     assert_eq!(port.take_indication(), None);
+}
+
+/// The Dongle Max capture of a sleepy child's secured rejoin (hil107):
+///
+/// 1. Rejoin Request (NWK-secured) from 0x12D2, MAC-ACKed;
+/// 2. its Data Requests 4 and 6.5 ms later are acknowledged with Frame
+///    Pending = 0: the Rejoin Response is queued only ~15 ms after the
+///    request, so the child turns its receiver off;
+/// 3. the NCP then served the *stale* first poll and sent the response 12 ms
+///    after that ACK. The child's radio acknowledged it while idle and its
+///    stack dropped it (a receiver that is off hears nothing); later polls
+///    found nothing, the child timed out after ~0.45 s and retried, and the
+///    Trust Center had already reported the rejoin admitted.
+///
+/// A poll acknowledged without Frame Pending must leave the frame queued
+/// (armed) for the next poll, whose ACK carries Frame Pending = 1 and which
+/// the child listens after.
+#[test]
+fn a_rejoin_response_queued_after_a_poll_was_acked_waits_for_the_next_poll() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    formed_port!(port);
+    let key = network_key(&port);
+    let pan = pan(&port);
+    let child = ShortAddress(0x12D2);
+    {
+        let nwk = port.app_mut().device_mut().aps_mut().nwk_mut();
+        assert!(nwk.restore_child(PEER_IEEE, child, false, true, false, 8));
+        nwk.update_address_map(child, PEER_IEEE);
+    }
+    // A poll as the parent's MAC reports it, with its ACK's Frame Pending.
+    let poll = |port: &mut TcPort<_>, acked_frame_pending: bool| {
+        mac(port).enqueue_command_event(MacCommandEvent::DataRequest(MlmeDataRequestIndication {
+            source_address: MacAddress::Short(pan, child),
+            destination_address: MacAddress::Short(pan, ShortAddress::COORDINATOR),
+            lqi: 180,
+            security_use: false,
+            acked_without_frame_pending: !acked_frame_pending,
+        }));
+    };
+    let to_child = |port: &mut TcPort<_>| {
+        mac(port)
+            .tx_history()
+            .iter()
+            .filter(|tx| tx.dst == MacAddress::Short(pan, child))
+            .count()
+    };
+    fn queued<A: TcApp>(port: &mut TcPort<A>, child: ShortAddress) -> usize {
+        port.app_mut()
+            .device_mut()
+            .aps_mut()
+            .nwk_mut()
+            .indirect_queue()
+            .pending_count(child)
+    }
+    mac(&mut port).clear_tx_history();
+
+    // (1) + (2): the request; the response is queued; then the stack
+    // serves a poll that the radio had acknowledged before the response
+    // existed (FP = 0).
+    receive(
+        &mut port,
+        child,
+        -33,
+        secured_rejoin_request(&key, (child, PEER_IEEE), 1227, 0x80),
+    );
+    assert_eq!(queued(&mut port, child), 1, "the Rejoin Response is queued");
+    poll(&mut port, false);
+    steps(&mut port, 4);
+    assert_eq!(to_child(&mut port), 0, "nothing after an ACK without FP");
+    assert_eq!(queued(&mut port, child), 1, "the Rejoin Response waits");
+    assert!(
+        mac(&mut port)
+            .indirect_pending_history()
+            .iter()
+            .rev()
+            .find(|(address, _)| *address == MacAddress::Short(pan, child))
+            .is_some_and(|(_, armed)| *armed),
+        "Frame Pending stays armed for the next poll"
+    );
+    assert_eq!(port.take_device_event(), None, "not delivered yet");
+
+    // (3): the next poll is acknowledged with FP = 1 and gets the response.
+    poll(&mut port, true);
+    steps(&mut port, 4);
+    assert_eq!(to_child(&mut port), 1, "delivered at the next poll");
+    assert_eq!(queued(&mut port, child), 0);
+    let response: Vec<u8> = mac(&mut port)
+        .tx_history()
+        .iter()
+        .find(|tx| tx.dst == MacAddress::Short(pan, child))
+        .map(|tx| tx.payload.as_slice().to_vec())
+        .unwrap();
+    let (header, _) = NwkHeader::parse(&response).unwrap();
+    assert_eq!(header.frame_control.frame_type, NwkFrameType::Command as u8);
+    assert_eq!(header.dst_ieee, Some(PEER_IEEE));
+    // The Trust Center hears of the rejoin once the response is delivered.
+    steps(&mut port, 6);
+    assert!(matches!(
+        port.take_device_event(),
+        Some(DeviceEvent::Joined {
+            nwk: 0x12D2,
+            join_type: joined::JOIN_SECURED_REJOIN,
+            decision: joined::ADMITTED,
+            ..
+        })
+    ));
+    // The child is an authenticated child (the secured rejoin proved the
+    // network key): it never expires as unauthenticated.
+    assert!(
+        port.app()
+            .device()
+            .aps()
+            .nwk()
+            .neighbor_table()
+            .children()
+            .any(|entry| entry.network_address == child
+                && entry.relationship == zigbee_nwk::neighbor::Relationship::Child)
+    );
+    // Its Device_annce (broadcast through its parent, the NCP) reaches the
+    // host as an indication (spec 7.4: forwarded unchanged), with the
+    // last hop's RSSI.
+    while port.take_indication().is_some() {}
+    let annce = device_annce_frame(&key, child, PEER_IEEE, 0x80, 1228);
+    receive(&mut port, child, -22, annce);
+    steps(&mut port, 4);
+    let indication = port.take_indication().expect("Device_annce for the host");
+    assert_eq!(
+        (
+            indication.cluster,
+            indication.profile,
+            indication.dst_ep,
+            indication.dst_mode,
+            indication.dst
+        ),
+        (0x0013, 0, 0, 0x0F, 0xFFFD)
+    );
+    assert_eq!(indication.src_ieee, Some(PEER_IEEE));
+    assert!(!indication.handled_by_ncp);
+    assert_eq!(indication.rssi, -22);
+    assert_eq!(&indication.asdu[1..3], &child.0.to_le_bytes());
+}
+
+/// A ZDO Device_annce (`0x0013`) from `child`, NWK-broadcast to `0xFFFD`
+/// through its parent.
+fn device_annce_frame(
+    key: &[u8; 16],
+    child: ShortAddress,
+    ieee: [u8; 8],
+    capability: u8,
+    frame_counter: u32,
+) -> MacFrame {
+    let header = ApsHeader {
+        frame_control: ApsFrameControl {
+            frame_type: ApsFrameType::Data as u8,
+            delivery_mode: ApsDeliveryMode::Broadcast as u8,
+            ..Default::default()
+        },
+        dst_endpoint: Some(0),
+        cluster_id: Some(0x0013),
+        profile_id: Some(0),
+        src_endpoint: Some(0),
+        aps_counter: 0x44,
+        ..Default::default()
+    };
+    let mut aps = [0u8; 64];
+    let len = header.serialize(&mut aps);
+    let mut payload = vec![0x21];
+    payload.extend_from_slice(&child.0.to_le_bytes());
+    payload.extend_from_slice(&ieee);
+    payload.push(capability);
+    aps[len..len + payload.len()].copy_from_slice(&payload);
+    secured_nwk_frame(
+        key,
+        NwkFrameType::Data,
+        (child, ieee),
+        ShortAddress(0xFFFD),
+        frame_counter,
+        &aps[..len + payload.len()],
+    )
 }
 
 #[test]
@@ -683,7 +863,7 @@ fn ack_request_confirms_wait_for_the_aps_ack_outcome() {
     // A pending send fails when the network is reset.
     let confirm = pollster::block_on(port.send(&request(4, 0x01))).unwrap();
     assert!(confirm.deferred());
-    pollster::block_on(port.leave_reset()).unwrap();
+    pollster::block_on(port.leave_reset(false)).unwrap();
     let done = port.take_data_confirm().expect("reset outcome");
     assert_eq!((done.req_tid, done.confirm.zb_status), (4, 0xA7));
 }
@@ -745,6 +925,7 @@ fn a_long_polling_sleepy_child_is_reached_at_its_next_poll() {
             destination_address: MacAddress::Short(pan, ShortAddress::COORDINATOR),
             lqi: 180,
             security_use: false,
+            acked_without_frame_pending: false,
         }));
         steps(port, 1);
     };

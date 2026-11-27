@@ -676,6 +676,7 @@ fn data_request(child_short: u16) -> MacCommandEvent {
         destination_address: MacAddress::Short(PanId(PAN_ID), ShortAddress(SHORT_ADDRESS)),
         lqi: 170,
         security_use: false,
+        acked_without_frame_pending: false,
     })
 }
 
@@ -5792,6 +5793,7 @@ fn network_key_rotation_rearms_own_sleepy_child_and_honors_profile_window() {
         destination_address: MacAddress::Short(PanId(PAN_ID), ShortAddress::COORDINATOR),
         lqi: 180,
         security_use: false,
+        acked_without_frame_pending: false,
     }));
     block_on(app.step()).unwrap();
     assert!(
@@ -6234,6 +6236,7 @@ mod key_power_cuts {
                 destination_address: MacAddress::Short(PanId(PAN_ID), ShortAddress::COORDINATOR),
                 lqi: 180,
                 security_use: false,
+                acked_without_frame_pending: false,
             }));
         block_on(app.step()).map(|_| ())
     }

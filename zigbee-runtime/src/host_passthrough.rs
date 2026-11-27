@@ -17,9 +17,10 @@
 //! drop is reported to the host as `EVT_INDICATIONS_DROPPED`, never silent.
 //!
 //! Each record carries the last hop's RSSI (`zigbee-mac` `rx-rssi`: measured
-//! by the ESP32 PHY, `RSSI_UNKNOWN_DBM` = -128 on backends that do not
-//! measure it) and the frame's APS security separately from its NWK
-//! security, with the kind of link key that secured it.
+//! by the ESP32, CC26x2 and EFR32 Series 2 PHYs, `RSSI_UNKNOWN_DBM` = -128
+//! on backends that do not measure it) and the frame's APS security
+//! separately from its NWK security, with the kind of link key that secured
+//! it.
 
 use core::cell::RefCell;
 

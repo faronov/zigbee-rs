@@ -32,7 +32,7 @@ use zigbee_zrhp::msg::network::{
     EvtChannelChanged, EvtDeviceJoined, EvtDeviceLeft, EvtEnergyScanResult, EvtNetworkState,
     EvtPermitJoinState, EvtScanProgress, NwkActiveScan, NwkActiveScanRsp, NwkAddEndpoint,
     NwkChangeChannel, NwkEnergyScan, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkInit,
-    NwkInitRsp, NwkLeaveReset, NwkPermitJoin, NwkSetTxPower, NwkSetTxPowerRsp,
+    NwkInitRsp, NwkLeaveReset, NwkPermitJoin, NwkSetTxPower, NwkSetTxPowerRsp, leave_reset_flags,
 };
 use zigbee_zrhp::msg::security::{
     EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecDeriveEzspKey,
@@ -569,8 +569,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 self.permit_join_report = status == Status::Success;
             }
             Op::LeaveReset { flags } => {
-                let result = port.leave_reset().await;
-                if result.is_ok() && flags & 0x02 == 0 {
+                let announce = flags & leave_reset_flags::ANNOUNCE_LEAVE != 0;
+                let result = port.leave_reset(announce).await;
+                if result.is_ok() && flags & leave_reset_flags::KEEP_ENDPOINTS == 0 {
                     port.clear_endpoints();
                 }
                 let wiped = result.is_ok();
