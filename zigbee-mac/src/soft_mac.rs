@@ -1347,7 +1347,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
         // about to be sent, or the PHY's own auto-ACK as it reports it.
         let acked_without_frame_pending = match ack {
             Some((_, frame_pending)) => !frame_pending,
-            None => frame.acked_without_frame_pending,
+            None => frame.acked_without_frame_pending(),
         };
 
         let retained = matches!(want, Want::Retained).then_some(Heard::Queued);
@@ -3771,7 +3771,7 @@ mod tests {
     /// A received poll as a `hardware_auto_ack` PHY reports it.
     fn rx_auto_acked(core: &mut ParentCore, frame: &[u8], acked_without_frame_pending: bool) {
         let mut received = PhyRxFrame::from_slice(frame, 200).unwrap();
-        received.acked_without_frame_pending = acked_without_frame_pending;
+        received.set_acked_without_frame_pending(acked_without_frame_pending);
         core.phy_mut()
             .rx_frames
             .push_back(Ok(Some(received)))

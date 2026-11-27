@@ -1729,7 +1729,8 @@ where
     }
 
     /// [`Self::urgent_factory_reset_and_recommission`] without transmitting
-    /// the NWK Leave.
+    /// the NWK Leave (the coordinator frontends').
+    #[cfg(feature = "router")]
     async fn urgent_local_reset_and_recommission(&mut self) -> Result<(), RouterAppError> {
         self.request_reset(AfterReset::Recommission, true);
         self.complete_pending_factory_reset_and_recommission().await

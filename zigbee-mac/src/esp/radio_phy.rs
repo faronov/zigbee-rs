@@ -207,8 +207,8 @@ fn mark_poll_ack(frame: &mut PhyRxFrame) {
     let data = frame.as_slice();
     if let Some(source) = data_request_source(data) {
         let sequence = data[2];
-        frame.acked_without_frame_pending =
-            POLL_ACKS.with(|log| log.take(&source, sequence)) == Some(false);
+        let acked_without = POLL_ACKS.with(|log| log.take(&source, sequence)) == Some(false);
+        frame.set_acked_without_frame_pending(acked_without);
     }
 }
 

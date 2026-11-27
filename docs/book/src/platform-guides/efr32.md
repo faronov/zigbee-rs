@@ -387,7 +387,8 @@ it queues indirect data or an association response. `PENDING = 0`: the HAL
 table is the only Frame Pending owner, as on TLSR8258. A Data Request
 the interrupt acknowledged with FP = 0 is queued with a flag (bit 7 of its
 record's length byte), which reaches the stack with that poll
-(`RxFrame::acked_without_frame_pending` → `PhyRxFrame` →
+(`RxFrame::acked_without_frame_pending` → `PhyRxFrame` (bit 7 of its
+length byte) →
 `MlmeDataRequestIndication::acked_without_frame_pending`). The child turns
 its receiver off after such an ACK. When the stack serves that poll after it
 has queued a frame (the poll event waited behind slower work), the frame
@@ -1439,12 +1440,12 @@ values at 38.4 MHz against the shared analog states.
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
 | NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 456,956 B | 168,660 B | 89,388 B |
-| NCP, Dongle-M | 462,180 B | 168,660 B | 89,388 B |
-| NCP, BRD4187 on a WSTK | 462,200 B | 168,660 B | 89,388 B |
+| NCP, Dongle-M | 462,272 B | 168,660 B | 89,388 B |
+| NCP, BRD4187 on a WSTK | 462,292 B | 168,660 B | 89,388 B |
 | Router, RF-BM-MG24B1 (GP Proxy Basic) | 345,480 B | 37,140 B | 224,492 B |
 | Router, Dongle-M | 345,804 B | 37,140 B | 224,492 B |
 | Router, BRD4187 on a WSTK | 345,744 B | 37,136 B | 224,496 B |
-| Router, EK2703A | 346,372 B | 37,136 B | 224,496 B |
+| Router, EK2703A | 346,572 B | 37,136 B | 224,496 B |
 
 The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
 MG24 image compared with `15ee9550`, the build-only base without a radio.
@@ -1456,14 +1457,15 @@ hashed-TCLK root and derivation, `SEC_DERIVE_EZSP_KEY`, the
 application-key timeout) and the held boot log added about 3.7 KB to the
 Dongle-M and BRD4187 NCPs against `e96cd867` (Dongle-M 457,108 → 460,784 B
 file-backed), with the same `.bss` and linked stack; the Router changed by
-4 B. #23 (`0607d319` → this change) adds 1,396 B of flash to the Dongle-M
-NCP and 896 B to the EK2703A Router, with the same `.bss` and stack: the
-per-poll FP = 0 flag, the per-frame RSSI and the ZDO log names take 436 B
-(NCP) / 216 B (Router), the page-start ownership check with its boot-log
-line and the local wipe the rest. The flag lives in the RX queue record, so
-it needs no RAM; the first version's 8-entry record table cost 16 B of
-`.bss`, and in `.data` it had moved the MG22 Router's 512-byte-aligned
-`.bss` past the end of SRAM.
+4 B. #23 (`0607d319` → this change: the per-poll FP = 0 flag, the
+per-frame RSSI, the ZDO log names, the NV page-start check with its boot
+log line and the local wipe) adds 1,488 B of flash to the Dongle-M NCP and
+1,096 B to the EK2703A Router, with the same `.bss` and stack. The flag
+rides in bit 7 of the HAL RX queue record's and of `PhyRxFrame`'s length
+byte, so it needs no RAM: the first version's 8-entry record table cost
+16 B of `.bss` (in `.data` it had moved the MG22 Router's 512-byte-aligned
+`.bss` past the end of SRAM), and a separate `PhyRxFrame` byte pushed the
+TLSR8258 Router's `build_device` frame over its 5,120 B stack gate.
 
 The NCP uses 33 % of the application window and 66 % of SRAM for static
 data. The compact capacity tier is not needed. The recorded fatal resets

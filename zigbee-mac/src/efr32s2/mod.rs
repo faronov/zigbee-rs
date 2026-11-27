@@ -311,7 +311,7 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
                 // The HAL's per-frame RSSI (the RX trailer, dBm): reported to
                 // a ZRHP host with every indication (`rx-rssi`).
                 crate::rx_rssi!(frame, rx.rssi_dbm);
-                frame.acked_without_frame_pending = rx.acked_without_frame_pending;
+                frame.set_acked_without_frame_pending(rx.acked_without_frame_pending);
                 return Ok(true);
             }
             if Instant::now() >= deadline {

@@ -70,6 +70,8 @@ pub struct TxParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhyRxFrame {
     data: [u8; MAX_PHY_FRAME_LEN],
+    /// Length (bits 6..0) and [`Self::acked_without_frame_pending`] (bit 7,
+    /// [`ACKED_WITHOUT_FP`]): the flag costs no byte in every receive queue.
     len: u8,
     /// IEEE 802.15.4 LQI normalized to `0..=255` (larger is better); backends
     /// with another hardware scale convert first, see [`crate::lqi`].
@@ -81,16 +83,11 @@ pub struct PhyRxFrame {
     pub rx_end_us: u32,
     #[cfg(feature = "rx-rssi")]
     pub rssi_dbm: i8,
-    /// The frame is a MAC Data Request that the PHY's hardware or interrupt
-    /// auto-ACK acknowledged with Frame Pending = 0 (`hardware_auto_ack`
-    /// PHYs that report it). The child turned its receiver off after that
-    /// ACK (IEEE 802.15.4-2015 6.7.3), so this poll must not be answered
-    /// with a frame queued since: it waits for the next poll, see
-    /// [`crate::MlmeDataRequestIndication::acked_without_frame_pending`].
-    /// [`Self::set`] and [`Self::set_len`] clear it, so the PHY records it
-    /// after them.
-    pub acked_without_frame_pending: bool,
 }
+
+/// Bit 7 of [`PhyRxFrame`]'s length byte: [`PhyRxFrame::acked_without_frame_pending`].
+const ACKED_WITHOUT_FP: u8 = 0x80;
+const _: () = assert!(MAX_PHY_FRAME_LEN < ACKED_WITHOUT_FP as usize);
 
 impl PhyRxFrame {
     /// An empty frame for fixed-capacity queues and lab receive buffers.
@@ -102,7 +99,6 @@ impl PhyRxFrame {
         rx_end_us: 0,
         #[cfg(feature = "rx-rssi")]
         rssi_dbm: RSSI_UNKNOWN_DBM,
-        acked_without_frame_pending: false,
     };
 
     pub fn from_slice(data: &[u8], lqi: u8) -> Result<Self, PhyError> {
@@ -118,7 +114,6 @@ impl PhyRxFrame {
             rx_end_us: 0,
             #[cfg(feature = "rx-rssi")]
             rssi_dbm: RSSI_UNKNOWN_DBM,
-            acked_without_frame_pending: false,
         };
         frame.data[..data.len()].copy_from_slice(data);
         Ok(frame)
@@ -136,7 +131,6 @@ impl PhyRxFrame {
         self.data[..data.len()].copy_from_slice(data);
         self.len = data.len() as u8;
         self.lqi = lqi;
-        self.acked_without_frame_pending = false;
         #[cfg(feature = "timed-tx")]
         {
             self.rx_end_us = 0;
@@ -158,7 +152,6 @@ impl PhyRxFrame {
         }
         self.len = len as u8;
         self.lqi = lqi;
-        self.acked_without_frame_pending = false;
         #[cfg(feature = "timed-tx")]
         {
             self.rx_end_us = 0;
@@ -167,15 +160,35 @@ impl PhyRxFrame {
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        &self.data[..usize::from(self.len)]
+        &self.data[..self.len()]
     }
 
     pub fn len(&self) -> usize {
-        usize::from(self.len)
+        usize::from(self.len & !ACKED_WITHOUT_FP)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
+    }
+
+    /// The frame is a MAC Data Request that the PHY's hardware or interrupt
+    /// auto-ACK acknowledged with Frame Pending = 0 (`hardware_auto_ack`
+    /// PHYs that report it). The child turned its receiver off after that
+    /// ACK (IEEE 802.15.4-2015 6.7.3), so this poll must not be answered
+    /// with a frame queued since: it waits for the next poll, see
+    /// [`crate::MlmeDataRequestIndication::acked_without_frame_pending`].
+    pub const fn acked_without_frame_pending(&self) -> bool {
+        self.len & ACKED_WITHOUT_FP != 0
+    }
+
+    /// Record [`Self::acked_without_frame_pending`]. [`Self::set`] and
+    /// [`Self::set_len`] clear it, so the PHY records it after them.
+    pub fn set_acked_without_frame_pending(&mut self, acked_without: bool) {
+        if acked_without {
+            self.len |= ACKED_WITHOUT_FP;
+        } else {
+            self.len &= !ACKED_WITHOUT_FP;
+        }
     }
 }
 
@@ -531,6 +544,34 @@ mod tests {
         assert_eq!(frame.as_slice(), [0x61, 0x88, 0x2a]);
         assert_eq!(frame.len(), 3);
         assert_eq!(frame.lqi, 173);
+    }
+
+    /// The FP = 0 flag shares the length byte: lengths stay exact up to the
+    /// longest frame, and refilling the frame clears the flag.
+    #[test]
+    fn the_poll_ack_flag_rides_in_the_length_byte() {
+        let poll = [0x63, 0x88, 0x42, 0x62, 0x1A, 0x00, 0x00, 0xD2, 0x12, 0x04];
+        let mut frame = PhyRxFrame::from_slice(&poll, 200).unwrap();
+        assert!(!frame.acked_without_frame_pending());
+        frame.set_acked_without_frame_pending(true);
+        assert!(frame.acked_without_frame_pending());
+        assert_eq!(frame.as_slice(), poll);
+        assert_eq!(frame.len(), poll.len());
+        frame.set(&[0u8; MAX_PHY_FRAME_LEN], 10).unwrap();
+        assert!(!frame.acked_without_frame_pending());
+        frame.set_acked_without_frame_pending(true);
+        assert_eq!(frame.len(), MAX_PHY_FRAME_LEN);
+        frame.set_len(0, 0).unwrap();
+        assert!(frame.is_empty() && !frame.acked_without_frame_pending());
+        frame.set_acked_without_frame_pending(true);
+        assert!(frame.is_empty());
+        frame.set_acked_without_frame_pending(false);
+        assert!(!frame.acked_without_frame_pending());
+        // No byte for the flag: data, length and LQI only (receive queues
+        // hold many frames; a TLSR8258 stack gate caught one more byte).
+        if !cfg!(feature = "rx-rssi") && !cfg!(feature = "timed-tx") {
+            assert_eq!(core::mem::size_of::<PhyRxFrame>(), MAX_PHY_FRAME_LEN + 2);
+        }
     }
 
     #[test]
