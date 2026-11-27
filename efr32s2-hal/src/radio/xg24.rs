@@ -41,13 +41,17 @@
 //!   `RACTX10DBM`: only the 20 dBm PA is usable) and is never written here.
 //!
 //! Crystal: the BRD4187A capture is at 39 MHz (feature `hfxo-39mhz`). The
-//! 38.4 MHz table differs only in the 21 registers in which GSDK's
-//! `sl_rail_ieee802154_config_38M4Hz.c` differs from the 39 MHz file
-//! ([`XTAL`]); the per-channel values are derived from the 38.4 MHz base
-//! with the scaling verified on the 39 MHz silicon. The 38.4 MHz path is
-//! **not** hardware-verified, so [`SUPPORTED`] is `false` without
-//! `hfxo-39mhz`: the tables build and are host-tested, the radio refuses to
-//! start.
+//! 38.4 MHz table (feature `hfxo-38m4hz`, SONOFF Dongle-M) differs only in
+//! the 21 registers in which GSDK's `sl_rail_ieee802154_config_38M4Hz.c`
+//! differs from the 39 MHz file ([`XTAL`]). That GSDK configuration is
+//! byte-identical (304 of 304 configuration words, plus the `phyInfo`
+//! words) to the one inside the stock Dongle-M EmberZNet 7.4.5 image. The
+//! per-channel `SRCRATIO2`/`DIGMIXFREQ` are not stored in either: RAIL
+//! computes them per channel, and [`channel_words`] reproduces that
+//! computation (exact on all 16 channels of the 39 MHz silicon). The
+//! 38.4 MHz path has **not run on our stack** (first HIL pending): it also
+//! carries the 39 MHz B220 die's runtime trims ([`PaPhy`]). An xG24 build
+//! that selects neither crystal feature keeps [`SUPPORTED`] `false`.
 //!
 //! PA variants: the HP PA (`efr32mg24-pa20`, BRD4187A, B220) and the MP PA
 //! (`efr32mg24-pa10`, EK2703A, B210) were each captured on one die. They
@@ -72,16 +76,22 @@ use super::{
     Warm, rac_state_raw, read, write,
 };
 
-/// Radio tables are validated with a 39 MHz HFXO only: the 20 dBm (HP) PA
-/// on the BRD4187A and the 10 dBm (MP) PA on the EK2703A. The 38.4 MHz PHY
-/// (`not(hfxo-39mhz)`, e.g. the Dongle-M) is GSDK-derived and carries the
-/// 39 MHz dies' runtime trims; it has never run, so such builds fail
-/// `RadioToken::init` with `Unsupported` instead of transmitting with
-/// unverified values. Widen this only after the hardware gates of the
-/// platform guide pass on that crystal.
+/// The radio runs only when the board names its crystal:
+///
+/// - `hfxo-39mhz`: tables captured on the silicon and hardware-verified,
+///   the 20 dBm (HP) PA on the BRD4187A and the 10 dBm (MP) PA on the
+///   EK2703A;
+/// - `hfxo-38m4hz` (Dongle-M): the GSDK/stock-EmberZNet 38.4 MHz PHY with
+///   RAIL's per-channel words ([`channel_words`]) and the 39 MHz B220
+///   die's runtime trims. **First HIL pending**: raw TX/RX, ACK, output and
+///   CTUNE offset against the stock image on a real unit (platform guide,
+///   hardware gates).
+///
+/// Any other xG24 build fails `RadioToken::init` with `Unsupported` before
+/// touching the radio.
 pub(super) const SUPPORTED: bool = cfg!(all(
     any(feature = "efr32mg24-pa20", feature = "efr32mg24-pa10"),
-    feature = "hfxo-39mhz"
+    any(feature = "hfxo-39mhz", feature = "hfxo-38m4hz")
 ));
 
 /// `FRC_IRQn` and `RAC_RSM_IRQn` (GSDK 4.5.0 `efr32mg24*.h`).
@@ -168,12 +178,14 @@ pub(super) const XTAL: XtalPhy = XtalPhy {
     ],
 };
 
-/// 38.4 MHz (SONOFF Dongle Max, Dongle-M): GSDK `config_38M4Hz` values,
-/// per-channel columns scaled from its channel-11 base like the 39 MHz
-/// silicon ([`scale_channels`]). Not hardware-verified.
+/// 38.4 MHz (SONOFF Dongle Max, Dongle-M): GSDK 4.5.0 `config_38M4Hz`
+/// values, equal to the RAIL configuration of the stock Dongle-M EmberZNet
+/// 7.4.5 image; per-channel columns from [`channel_words`] with that
+/// configuration's `phyInfo` (`src2Denominator` 60 MHz) and `MODEM.CF`
+/// (`DEC0` = 0: decimation 3). Not run on our stack yet.
 #[cfg(not(feature = "hfxo-39mhz"))]
 pub(super) const XTAL: XtalPhy = {
-    let (srcratio, digmixfreq) = scale_channels(38_400_000, 0x4911, 0x281B, 0x1BFBB);
+    let (srcratio, digmixfreq) = channel_words(38_400_000, 0x4911, 60_000_000, 3);
     XtalPhy {
         agc_gainsteplim0: 0x0000_0740,
         txbr: 0x00FF_0264,
@@ -288,28 +300,39 @@ const P: PaPhy = PaPhy {
 /// [`PaPhy::ircal`] (RAIL does on the HP part only).
 pub(super) const DEVINFO_IRCAL_APPLIES: bool = cfg!(not(feature = "efr32mg24-pa10"));
 
-/// Per-channel `SRCRATIO2`/`DIGMIXFREQ` from their channel-11 values. The
-/// IF ADC samples at a fixed fraction of the LO (`FREQ + IFFREQ` in synth
-/// words, the LO sits above the channel), so the sample-rate converter
-/// ratio scales with the LO and the digital mixer frequency against it.
-/// On the 39 MHz silicon this reproduces RAIL's `SRCRATIO2` on all 16
-/// channels and `DIGMIXFREQ` within one LSB (RAIL rounds from a finer
-/// constant; one LSB is 9 Hz of mixer frequency).
+/// RAIL's per-channel `SRCRATIO2`/`DIGMIXFREQ` for channels 11..=26.
+///
+/// The IF ADC clock follows the LO (`f_LO = (FREQ + IFFREQ) * hfxo / 2^19`,
+/// high-side injection), so RAIL recomputes both on every channel from the
+/// PHY's `phyInfo`:
+///
+/// - `SRCRATIO2 = round(2^11 * (f_LO / 8) / src2_denominator)`
+///   (`src2Denominator`: 40 MHz in the 39 MHz PHY, 60 MHz in the 38.4 MHz
+///   one);
+/// - `DIGMIXFREQ = round(IF * dec0 * 2^20 / (f_LO / 64))`, i.e.
+///   `IFFREQ * dec0 * 2^26 / (FREQ + IFFREQ)` (GSDK radio configurator,
+///   `lynx` `calc_digmixfreq_reg` / `calc_fxo_or_fdec8`; `dec0` = 4 for
+///   `MODEM.CF.DEC0` = 2 at 39 MHz, 3 for `DEC0` = 0 at 38.4 MHz).
+///
+/// The `SRCRATIO2` expression is fitted, not taken from a source: with
+/// round-to-nearest both reproduce RAIL's words on all 16 channels of the
+/// 39 MHz silicon exactly, and GSDK's channel-11 words at both crystals
+/// (test `xg24_channel_words_match_rail`).
 #[cfg_attr(feature = "hfxo-39mhz", allow(dead_code))]
-pub(super) const fn scale_channels(
+pub(super) const fn channel_words(
     hfxo_hz: u64,
     iffreq_word: u64,
-    srcratio_11: u64,
-    digmix_11: u64,
+    src2_denominator: u64,
+    dec0: u64,
 ) -> ([u16; 16], [u32; 16]) {
     let mut src = [0u16; 16];
     let mut mix = [0u32; 16];
-    let lo11 = lo_word(11, hfxo_hz) + iffreq_word;
     let mut i = 0;
     while i < 16 {
         let lo = lo_word(11 + i as u64, hfxo_hz) + iffreq_word;
-        src[i] = ((2 * srcratio_11 * lo + lo11) / (2 * lo11)) as u16;
-        mix[i] = ((2 * digmix_11 * lo11 + lo) / (2 * lo)) as u32;
+        let den = 2048 * src2_denominator;
+        src[i] = ((2 * lo * hfxo_hz + den) / (2 * den)) as u16;
+        mix[i] = ((2 * ((iffreq_word * dec0) << 26) + lo) / (2 * lo)) as u32;
         i += 1;
     }
     (src, mix)
