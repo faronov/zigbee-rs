@@ -12,7 +12,7 @@ use zigbee_aps::apsme::{
     ApsFrameCounterReservation, ApsmeRequestKeyIndication, ApsmeSecurityIndication,
     ApsmeUpdateDeviceIndication, ApsmeVerifyKeyIndication,
 };
-use zigbee_aps::security::{ApsKeyType, ApsLinkKeyEntry};
+use zigbee_aps::security::{ApsKeyType, ApsLinkKeyEntry, DEFAULT_TC_LINK_KEY};
 pub use zigbee_bdb::attributes::NetworkKeyUpdateMethod;
 use zigbee_bdb::trust_center::{
     MAX_TRUST_CENTER_DEVICES, TrustCenterAction, TrustCenterError, TrustCenterPolicy,
@@ -108,6 +108,9 @@ pub struct TrustCenterRuntime<S> {
     initialization_pending: bool,
     initial_key_attempts: heapless::Vec<(IeeeAddress, u32), MAX_TRUST_CENTER_DEVICES>,
     network_key_propagation_started: Option<u32>,
+    /// When the pending application link key was staged (or first seen
+    /// after a reboot), for [`APPLICATION_LINK_KEY_TIMEOUT_SECS`].
+    application_key_since: Option<u32>,
     /// Durable global APS reservations committed since construction.
     #[cfg(feature = "global-aps-counter")]
     global_aps_commits: u32,
@@ -262,6 +265,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             initialization_pending: false,
             initial_key_attempts: heapless::Vec::new(),
             network_key_propagation_started: None,
+            application_key_since: None,
             #[cfg(feature = "global-aps-counter")]
             global_aps_commits: 0,
             #[cfg(feature = "host-passthrough")]
@@ -294,6 +298,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 initialization_pending: _,
                 initial_key_attempts: _,
                 network_key_propagation_started: _,
+                application_key_since: _,
                 #[cfg(feature = "global-aps-counter")]
                     global_aps_commits: _,
                 #[cfg(feature = "host-passthrough")]
@@ -315,6 +320,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             core::ptr::addr_of_mut!((*slot).initialization_pending).write(false);
             core::ptr::addr_of_mut!((*slot).initial_key_attempts).write(heapless::Vec::new());
             core::ptr::addr_of_mut!((*slot).network_key_propagation_started).write(None);
+            core::ptr::addr_of_mut!((*slot).application_key_since).write(None);
             #[cfg(feature = "global-aps-counter")]
             core::ptr::addr_of_mut!((*slot).global_aps_commits).write(0);
             #[cfg(feature = "host-passthrough")]
@@ -539,6 +545,13 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         location: Option<(IeeeAddress, ShortAddress)>,
     ) -> Result<(), TrustCenterRuntimeError> {
         self.require_initialized_network(device)?;
+        // A device restored without its key gets a private one (see
+        // `TrustCenterKeyOrigin::Unknown`), never the caller's.
+        let key = if origin == zigbee_bdb::trust_center::TrustCenterKeyOrigin::Unknown {
+            private_unknown_key(device)?
+        } else {
+            key
+        };
         self.table
             .restore_link_key(address, key, origin, attributes, location)?;
         self.upsert_table_device(device, &address, false)
@@ -865,6 +878,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         self.require_initialized_network(device)?;
         #[cfg(feature = "global-aps-counter")]
         self.maintain_global_aps_reservation(device)?;
+        self.expire_application_link_key(device)?;
         self.resume_pending(device, true).await?;
         let now = device.mac().monotonic_micros();
         let delta = u64::from(now.wrapping_sub(self.last_poll_us));
@@ -997,6 +1011,7 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             && state.devices().iter().any(|stored| {
                 stored.device.short_address.0 < 0xFFF8
                     && !stored.removal_pending
+                    && stored.device.link_key_known()
                     && stored.is_router.is_none()
             })
         {
@@ -1147,14 +1162,42 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         policy: TrustCenterPolicy,
         indication: ApsmeUpdateDeviceIndication,
     ) -> Result<(), TrustCenterRuntimeError> {
+        let mut policy = policy;
         if indication.source_address != device.aps().nwk().nib().ieee_address
-            && self.table.device(&indication.source_address).is_none()
+            && self
+                .table
+                .device(&indication.source_address)
+                .is_none_or(|parent| !parent.link_key_known())
         {
             // Possession of shared network/commissioning material does not
-            // make an unregistered forwarder an authoritative parent.
+            // make an unregistered forwarder an authoritative parent, nor
+            // does a registration with an unknown key (anyone holding the
+            // network key can get one with a secured rejoin).
             log::warn!("[TC] Ignoring Update-Device from an unregistered parent");
             return Ok(());
         }
+        // A secured rejoin may register the device with an unknown key: its
+        // private key is drawn first, so a missing entropy source denies the
+        // rejoin instead of leaving a device without one.
+        let private_key = if indication.status
+            == zigbee_aps::apsme::ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin
+            && policy.admit_secured_rejoins
+            && self
+                .table
+                .device(&indication.device_address)
+                .is_none_or(needs_private_key)
+        {
+            match private_unknown_key(device) {
+                Ok(key) => Some(key),
+                Err(error) => {
+                    log::warn!("[TC] No key for an unknown device: {error:?}");
+                    policy.admit_secured_rejoins = false;
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if indication.status == zigbee_aps::apsme::ApsUpdateDeviceStatus::DeviceLeft
             && self
                 .table
@@ -1218,7 +1261,12 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                 self.defer_transport_error(result)?;
             }
             TrustCenterAction::None => {
-                if self.table.device(&indication.device_address).is_some() {
+                if let Some(entry) = self.table.device_mut(&indication.device_address) {
+                    if let Some(key) = private_key
+                        && needs_private_key(entry)
+                    {
+                        entry.link_key = key;
+                    }
                     #[cfg(feature = "ncp-capacity")]
                     self.derive_unknown_ezsp_key(device, &indication.device_address)?;
                     self.upsert_table_device(device, &indication.device_address, false)?;
@@ -1561,6 +1609,50 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             delivered_to_responder: false,
         }));
         self.commit()?;
+        self.application_key_since = Some(device.mac().monotonic_micros());
+        Ok(())
+    }
+
+    /// Drop a pending application link key that could not be delivered to
+    /// both partners within [`APPLICATION_LINK_KEY_TIMEOUT_SECS`] (counted
+    /// from its staging, or from the first poll after a reboot): it is the
+    /// only one, and while it is pending every other pair is refused.
+    fn expire_application_link_key<M: MacDriver>(
+        &mut self,
+        device: &ZigbeeDevice<M>,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        if live_ref(&self.state, self.live)
+            .and_then(PersistentTrustCenterState::pending_application_key)
+            .is_none()
+        {
+            self.application_key_since = None;
+            return Ok(());
+        }
+        let now = device.mac().monotonic_micros();
+        let since = *self.application_key_since.get_or_insert(now);
+        if u64::from(now.wrapping_sub(since))
+            < u64::from(APPLICATION_LINK_KEY_TIMEOUT_SECS) * MICROS_PER_SECOND
+        {
+            return Ok(());
+        }
+        log::warn!("[TC] Application link key not delivered in time: dropped");
+        self.drop_application_link_key()
+    }
+
+    fn drop_application_link_key(&mut self) -> Result<(), TrustCenterRuntimeError> {
+        let state = live_mut(&mut self.state, self.live)?;
+        state.set_pending_application_key(None);
+        self.commit()?;
+        self.application_key_since = None;
+        if self.pending_delivery.is_some_and(|pending| {
+            matches!(
+                pending.kind,
+                TrustCenterDeliveryKind::ApplicationKeyInitiator
+                    | TrustCenterDeliveryKind::ApplicationKeyResponder
+            )
+        }) {
+            self.cancel_delivery();
+        }
         Ok(())
     }
 
@@ -1671,9 +1763,13 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
                     } else if let Some(address) =
                         live_ref(&self.state, self.live).and_then(|state| {
                             state.devices().iter().find_map(|stored| {
+                                // An unknown-key router shares no key to
+                                // carry the new network key: it is skipped
+                                // (broadcast distribution reaches it).
                                 (stored.is_router == Some(true)
                                     && !stored.new_network_key_delivered
                                     && !stored.removal_pending
+                                    && stored.device.link_key_known()
                                     && stored.device.short_address.0 < 0xFFF8)
                                     .then_some(stored.device.ieee_address)
                             })
@@ -1906,6 +2002,17 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         else {
             return Ok(());
         };
+        // Both partners need a key shared with this Trust Center and an
+        // address; otherwise the request can never complete.
+        let reachable = |address: &IeeeAddress| {
+            self.table
+                .device(address)
+                .is_some_and(|entry| entry.link_key_known() && entry.short_address.0 <= 0xFFF7)
+        };
+        if !reachable(&pending.initiator_address) || !reachable(&pending.responder_address) {
+            log::warn!("[TC] Application link key partner unreachable: dropped");
+            return self.drop_application_link_key();
+        }
         if !pending.delivered_to_initiator {
             match self.delivery_progress(
                 TrustCenterDeliveryKind::ApplicationKeyInitiator,
@@ -1990,6 +2097,22 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
         address: &IeeeAddress,
         network_key_pending: bool,
     ) -> Result<(), TrustCenterRuntimeError> {
+        if self.table.device(address).is_some_and(needs_private_key) {
+            // Every path draws the private key before registering; a zero
+            // key here would be a known one: drop the entry rather than keep
+            // it (fail closed).
+            match private_unknown_key(device) {
+                Ok(key) => {
+                    if let Some(entry) = self.table.device_mut(address) {
+                        entry.link_key = key;
+                    }
+                }
+                Err(error) => {
+                    self.table.revoke(address);
+                    return Err(error);
+                }
+            }
+        }
         let table_device = *self
             .table
             .device(address)
@@ -2605,6 +2728,10 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
     }
 }
 
+/// How long the single pending application link key may wait for both
+/// deliveries before it is dropped (the partners then ask again).
+pub const APPLICATION_LINK_KEY_TIMEOUT_SECS: u32 = 60;
+
 /// Pending-transaction flags of one device in `resume_pending`.
 const PENDING_REMOVAL: u8 = 0x01;
 const PENDING_NETWORK_KEY: u8 = 0x02;
@@ -2731,18 +2858,38 @@ fn reserve_end(start: u32) -> Result<u32, TrustCenterRuntimeError> {
         .ok_or(TrustCenterRuntimeError::CounterExhausted)
 }
 
+/// A device with an unknown key still gets an APS entry, under its private
+/// key: without one, APS would fall back to the default global key for it
+/// in both directions.
+fn needs_private_key(entry: &zigbee_bdb::trust_center::TrustCenterDevice) -> bool {
+    !entry.link_key_known() && (entry.link_key == [0; 16] || entry.link_key == DEFAULT_TC_LINK_KEY)
+}
+
+/// A key for a device whose real key is unknown: random, held by nobody
+/// else, never exported or transported (`TrustCenterKeyOrigin::Unknown`).
+fn private_unknown_key<M: MacDriver>(
+    device: &mut ZigbeeDevice<M>,
+) -> Result<[u8; 16], TrustCenterRuntimeError> {
+    let mut key = [0u8; 16];
+    device
+        .mac_mut()
+        .fill_random(&mut key)
+        .map_err(|_| TrustCenterRuntimeError::EntropyUnavailable)?;
+    if key == [0; 16] || key == DEFAULT_TC_LINK_KEY {
+        return Err(TrustCenterRuntimeError::EntropyUnavailable);
+    }
+    Ok(key)
+}
+
 fn install_key<M: MacDriver>(
     device: &mut ZigbeeDevice<M>,
     stored: &PersistentTrustCenterDevice,
 ) -> Result<(), TrustCenterRuntimeError> {
-    if !stored.device.link_key_known() {
-        // No key to install: frames for the device fall back to the APS
-        // default, as for any device without an entry; a stale entry goes.
-        device
-            .aps_mut()
-            .security_mut()
-            .remove_key(&stored.device.ieee_address, ApsKeyType::TrustCenterLinkKey);
-        return Ok(());
+    let mut key = stored.device.link_key;
+    if needs_private_key(&stored.device) {
+        // A journal entry without its private key (never written by this
+        // runtime): a fresh one, for this boot only.
+        key = private_unknown_key(device)?;
     }
     let reservation = ApsFrameCounterReservation::new(
         stored.outgoing_frame_counter,
@@ -2751,7 +2898,7 @@ fn install_key<M: MacDriver>(
     .ok_or(TrustCenterRuntimeError::CounterExhausted)?;
     let entry = ApsLinkKeyEntry {
         partner_address: stored.device.ieee_address,
-        key: stored.device.link_key,
+        key,
         key_type: ApsKeyType::TrustCenterLinkKey,
         outgoing_frame_counter: reservation.current(),
         outgoing_frame_counter_limit: reservation.limit(),
@@ -4717,13 +4864,18 @@ mod tests {
         assert!(!runtime.has_pending_transactions());
         assert!(runtime.pending_delivery.is_none());
         assert!(device.mac().tx_history().is_empty());
-        assert!(
-            device
-                .aps()
-                .security()
-                .find_key(&CHILD_A, ApsKeyType::TrustCenterLinkKey)
-                .is_none()
-        );
+        // No APS standing: a private key nobody else holds is installed, so
+        // APS never falls back to the default global key for the device.
+        let private = device
+            .aps()
+            .security()
+            .find_key(&CHILD_A, ApsKeyType::TrustCenterLinkKey)
+            .expect("a private key")
+            .key;
+        assert_ne!(private, DEFAULT_TC_LINK_KEY);
+        assert_ne!(private, [0; 16]);
+        assert_eq!(private, entry.link_key);
+        assert_eq!(stored.device(&CHILD_A).unwrap().device.link_key, private);
         // The child stays where it was, past any join deadline.
         block_on(runtime.poll(&mut device)).unwrap();
         assert!(
@@ -4735,6 +4887,232 @@ mod tests {
                 .any(|child| child.ieee_address == CHILD_A)
         );
         assert!(runtime.table().device(&CHILD_A).is_some());
+    }
+
+    /// A device registered with an unknown key (anyone holding the network
+    /// key can get there with a secured rejoin) is no parent: its
+    /// Update-Devices neither move a known device nor report it gone.
+    #[test]
+    fn an_unknown_key_device_is_not_an_update_device_parent() {
+        let mut device = coordinator();
+        let victim_short = add_child(&mut device, CHILD_B);
+        let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
+        block_on(runtime.initialize(&mut device)).unwrap();
+        join(&mut runtime, &mut device, CHILD_B, victim_short);
+        let victim = *runtime.table().device(&CHILD_B).unwrap();
+        let rogue_short = add_sleepy_child(&mut device, CHILD_A);
+        block_on(runtime.handle_indication(
+            &mut device,
+            ApsmeSecurityIndication::UpdateDevice(ApsmeUpdateDeviceIndication {
+                source_address: TC,
+                device_address: CHILD_A,
+                device_short_address: rogue_short,
+                status: ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+            }),
+        ))
+        .unwrap();
+        assert!(!runtime.table().device(&CHILD_A).unwrap().link_key_known());
+        #[cfg(feature = "host-passthrough")]
+        while runtime.take_host_event().is_some() {}
+        device.mac_mut().clear_tx_history();
+        for (short, status) in [
+            (0x5A5A, ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin),
+            (0x5A5A, ApsUpdateDeviceStatus::DeviceLeft),
+            (victim_short.0, ApsUpdateDeviceStatus::DeviceLeft),
+        ] {
+            block_on(runtime.handle_indication(
+                &mut device,
+                ApsmeSecurityIndication::UpdateDevice(ApsmeUpdateDeviceIndication {
+                    source_address: CHILD_A,
+                    device_address: CHILD_B,
+                    device_short_address: ShortAddress(short),
+                    status,
+                }),
+            ))
+            .unwrap();
+        }
+        assert_eq!(runtime.table().device(&CHILD_B), Some(&victim));
+        assert_eq!(
+            runtime
+                .store_mut()
+                .load()
+                .unwrap()
+                .unwrap()
+                .device(&CHILD_B)
+                .unwrap()
+                .device,
+            victim
+        );
+        #[cfg(feature = "host-passthrough")]
+        assert_eq!(runtime.take_host_event(), None);
+        assert!(device.mac().tx_history().is_empty());
+    }
+
+    /// Unicast network-key distribution needs a key shared with each
+    /// router: an unknown-key device is skipped (never sent the key under
+    /// its private or the global key) and does not block the router list.
+    #[test]
+    fn unicast_rotation_skips_unknown_key_devices() {
+        let (mut device, mut security_store) = coordinator_with_security_store();
+        let short = add_sleepy_child(&mut device, CHILD_A);
+        let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
+        block_on(runtime.initialize(&mut device)).unwrap();
+        block_on(runtime.handle_indication(
+            &mut device,
+            ApsmeSecurityIndication::UpdateDevice(ApsmeUpdateDeviceIndication {
+                source_address: TC,
+                device_address: CHILD_A,
+                device_short_address: short,
+                status: ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+            }),
+        ))
+        .unwrap();
+        let target = runtime.prepare_network_key_rotation(&mut device).unwrap();
+        device.refresh_security_state(&mut security_store).unwrap();
+        // Its role is unknown, yet it does not hold up the router list.
+        runtime
+            .commit_network_key_rotation(&device, target, NetworkKeyUpdateMethod::Unicast)
+            .unwrap();
+        // Even announced as a router, it is not a target.
+        runtime
+            .handle_device_announce(&device, CHILD_A, short, 0x8E)
+            .unwrap();
+        device.mac_mut().clear_tx_history();
+        block_on(runtime.poll(&mut device)).unwrap();
+        assert!(device.mac().tx_history().is_empty());
+        assert_eq!(
+            runtime.network_key_rotation().unwrap().phase,
+            NetworkKeyRotationPhase::WaitingForPropagation
+        );
+    }
+
+    /// An application key with an unknown-key partner could never reach it:
+    /// the request is refused and nothing is staged.
+    #[test]
+    fn an_application_key_with_an_unknown_key_partner_is_refused() {
+        let mut device = coordinator();
+        let known = add_child(&mut device, CHILD_B);
+        let unknown = add_sleepy_child(&mut device, CHILD_A);
+        let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
+        block_on(runtime.initialize(&mut device)).unwrap();
+        join(&mut runtime, &mut device, CHILD_B, known);
+        block_on(runtime.handle_indication(
+            &mut device,
+            ApsmeSecurityIndication::UpdateDevice(ApsmeUpdateDeviceIndication {
+                source_address: TC,
+                device_address: CHILD_A,
+                device_short_address: unknown,
+                status: ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+            }),
+        ))
+        .unwrap();
+        device.mac_mut().clear_tx_history();
+        for (source, partner) in [(CHILD_B, CHILD_A), (CHILD_A, CHILD_B)] {
+            block_on(runtime.handle_indication(
+                &mut device,
+                ApsmeSecurityIndication::RequestKey(ApsmeRequestKeyIndication {
+                    source_address: source,
+                    key_type: ApsRequestKeyType::ApplicationLink,
+                    partner_address: Some(partner),
+                }),
+            ))
+            .unwrap();
+        }
+        block_on(runtime.handle_indication(
+            &mut device,
+            ApsmeSecurityIndication::RequestKey(ApsmeRequestKeyIndication {
+                source_address: CHILD_A,
+                key_type: ApsRequestKeyType::TrustCenterLink,
+                partner_address: None,
+            }),
+        ))
+        .unwrap();
+        let live = runtime.live_state().unwrap();
+        assert!(live.pending_application_key().is_none());
+        assert!(live.device(&CHILD_A).unwrap().pending_link_key.is_none());
+        assert!(device.mac().tx_history().is_empty());
+    }
+
+    /// The single pending application key cannot hold every other pair off
+    /// forever: undelivered after its timeout (counted again from the first
+    /// poll after a reboot), it is dropped and another pair may ask.
+    #[test]
+    fn an_undeliverable_application_key_expires_even_across_a_reboot() {
+        let mut device = coordinator();
+        // No initial key exchange: the partners stay for the whole wait.
+        device
+            .bdb_mut()
+            .attributes_mut()
+            .trust_center_require_key_exchange = false;
+        let a = add_child(&mut device, CHILD_A);
+        let b = add_child(&mut device, CHILD_B);
+        let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
+        block_on(runtime.initialize(&mut device)).unwrap();
+        join(&mut runtime, &mut device, CHILD_A, a);
+        join(&mut runtime, &mut device, CHILD_B, b);
+        device.mac_mut().set_tx_failures(u32::MAX);
+        let request = |source, partner| {
+            ApsmeSecurityIndication::RequestKey(ApsmeRequestKeyIndication {
+                source_address: source,
+                key_type: ApsRequestKeyType::ApplicationLink,
+                partner_address: Some(partner),
+            })
+        };
+        block_on(runtime.handle_indication(&mut device, request(CHILD_A, CHILD_B))).unwrap();
+        assert!(
+            runtime
+                .live_state()
+                .unwrap()
+                .pending_application_key()
+                .is_some()
+        );
+        // Reboot: the pending key is durable, its age is not.
+        let durable = runtime.store_mut().load().unwrap().unwrap();
+        let mut store = RamTrustCenterDeviceStore::new();
+        store.store(&durable).unwrap();
+        let mut runtime = TrustCenterRuntime::new(store);
+        block_on(runtime.initialize(&mut device)).unwrap();
+        block_on(runtime.poll(&mut device)).unwrap();
+        for _ in 0..APPLICATION_LINK_KEY_TIMEOUT_SECS - 1 {
+            block_on(device.mac_mut().delay_micros(1_000_000));
+            block_on(runtime.poll(&mut device)).unwrap();
+        }
+        assert!(
+            runtime
+                .live_state()
+                .unwrap()
+                .pending_application_key()
+                .is_some(),
+            "still within its timeout"
+        );
+        block_on(device.mac_mut().delay_micros(2_000_000));
+        block_on(runtime.poll(&mut device)).unwrap();
+        assert!(
+            runtime
+                .live_state()
+                .unwrap()
+                .pending_application_key()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .store_mut()
+                .load()
+                .unwrap()
+                .unwrap()
+                .pending_application_key()
+                .is_none()
+        );
+        // Another pair is served again.
+        block_on(runtime.handle_indication(&mut device, request(CHILD_B, CHILD_A))).unwrap();
+        assert_eq!(
+            runtime
+                .live_state()
+                .unwrap()
+                .pending_application_key()
+                .map(|pending| pending.initiator_address),
+            Some(CHILD_B)
+        );
     }
 
     /// A Trust Center rejoin would need the unknown key for the network key:

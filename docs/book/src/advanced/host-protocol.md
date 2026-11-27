@@ -1427,7 +1427,7 @@ Go hub's generic interviewer already do.
 
 - **Input.** When a restore carries `EZSP_HASHED_TCLK` (from
   `stack_specific.ezsp.hashed_tclk`), the NCP keeps the root ("seed")
-  durably with the Trust Center table (TC journal format 7) and sets
+  durably with the Trust Center table (TC journal record version 7) and sets
   `TC_LINK_KEY.flags` bit0. An export with keys carries the record again
   (after `TC_LINK_KEY`), so a backup taken from the NCP still restores on
   EmberZNet.
@@ -1465,22 +1465,58 @@ Update-Device status `0x00` (standard secured rejoin), and nothing has to
 be transported. The NCP's Trust Center admits such a device even when it is
 not in its device table (`EVT_DEVICE_JOINED` decision 0) and registers it:
 
-- in the device table with an **unknown** link key (never used and never
-  exported as a link block), replaced by the derived key when a hashed-TCLK
-  root is kept;
+- in the device table with an **unknown** link key, replaced by the derived
+  key when a hashed-TCLK root is kept;
 - as a child when the NCP is its parent (it keeps its child entry).
 
-This matches EmberZNet, whose Trust Center lets secured rejoins through.
-Restored devices without a key are covered by this rule, and so is a
-backup that lists only part of the network. A Trust Center (unsecured)
-rejoin of a device whose key is unknown is not answered (no network key is
-sent under a guessed key), and the device's entry stays. Consequence for
-hosts: a device the host deleted (`TBL_INVALIDATE`) but that still holds the
-network key comes back on its next secured rejoin; keep it out with
-`NWK_REMOVE_DEVICE` (Leave) and a network-key rotation. Products that want
-the old strict policy clear the BDB attribute
-`trust_center_admit_secured_rejoins` (unknown devices are then answered
-with Remove-Device).
+Restored devices without a key are registered the same way at
+`BKP_RESTORE_COMMIT`, so a backup that lists devices without keys, or only
+part of the network, keeps them.
+
+**An unknown key means no APS standing.** Anyone who holds the network key
+can get such an entry, for any address, without joining being open, so it
+grants nothing beyond network-level membership:
+
+- **No global-key fallback.** The device gets a random key that nobody else
+  holds, installed as its APS link key (and journaled, never exported or
+  transported). APS frames to it and from it decrypt under no key: not the
+  default global key, which APS uses for devices without an entry.
+  Unsecured and global-key APS commands from it are refused, as from any
+  device with a unique key. Its NWK-secured traffic is served normally.
+- **Not a parent.** Its Update-Devices are ignored: it cannot move another
+  device or report it gone.
+- **No key exchange.** Request-Key from it (Trust Center or application
+  key) and application keys with it as the partner are refused. Its
+  Verify-Key proves nothing. A Trust Center (unsecured) rejoin is not
+  answered, since the network key would go out under a guessed key, and
+  its entry stays.
+- **No unicast network key.** Unicast key rotation skips it and does not
+  wait for its role. Broadcast rotation still reaches it, under the current
+  network key, which it holds.
+- **No deadline.** `bdbTrustCenterRequireKeyExchange` applies to devices
+  that joined with the default global key. A secured rejoin carries no key
+  exchange, and an unknown-key device could not complete one: it has no key
+  shared with the Trust Center, and accepting the global key from it would
+  restore the fallback above. The device keeps its network-level membership
+  without a deadline. Removing it would not exclude it anyway, because it
+  holds the network key; only a network-key rotation does.
+
+EmberZNet in the same situation keeps the device too. Without hashed keys
+or a key-table entry, it uses its preconfigured key for the device; zigbee-rs
+uses none.
+
+A single pending application link key (the Trust Center delivers one at a
+time) is dropped when it cannot reach both partners: when a partner is
+unknown or has no address, or after 60 s, counted again from the first poll
+after a reboot. Other pairs are then served again.
+
+Consequence for hosts: a device the host deleted (`TBL_INVALIDATE`) but that
+still holds the network key comes back on its next secured rejoin, with
+network-level membership only. Keep it out with `NWK_REMOVE_DEVICE` (Leave,
+no rejoin) and a network-key rotation. Products that want the strict policy
+clear `BdbAttributes::trust_center_admit_secured_rejoins` (a zigbee-rs
+setting, not a BDB attribute); unknown devices are then answered with
+Remove-Device.
 
 ### 7.6 TABLES (`0x05xx`, endpoint 3)
 

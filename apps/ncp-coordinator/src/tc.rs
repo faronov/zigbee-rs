@@ -1663,7 +1663,8 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             crate::port::RESTORED_KEY_UNKNOWN => TrustCenterKeyOrigin::Unknown,
             _ => return Err(OpError::InvalidParameter),
         };
-        // An unknown key is never used: none is kept.
+        // An unknown key is not the caller's: the runtime draws a private
+        // one (no APS standing, see `TrustCenterKeyOrigin::Unknown`).
         let value = if origin == TrustCenterKeyOrigin::Unknown {
             [0; 16]
         } else {

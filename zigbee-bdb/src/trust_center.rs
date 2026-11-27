@@ -33,9 +33,15 @@ pub enum TrustCenterKeyOrigin {
     EzspHashed,
     /// The device holds a link key this Trust Center does not know: it was
     /// registered from a backup without a key, or admitted by a secured
-    /// rejoin (it proved the current network key). The stored key is not
-    /// used: nothing is encrypted for the device with it, and a rejoin that
-    /// needs it (Trust Center rejoin) is refused without removing the device.
+    /// rejoin (it proved the current network key). It has **no APS
+    /// standing**: the runtime gives it a random key that nobody else holds
+    /// (never exported or transported), so APS frames to and from it
+    /// decrypt under no key at all, the default global key included, and
+    /// the Trust Center does not accept unsecured or global-key commands
+    /// from it. It is refused as a Request-Key party, a Verify-Key source,
+    /// an Update-Device parent and a unicast network-key target, and a
+    /// rejoin that needs its key (Trust Center rejoin) is refused without
+    /// removing the device. It keeps its network-level membership.
     Unknown,
 }
 
@@ -113,10 +119,11 @@ pub struct TrustCenterPolicy {
     /// not admitted (not in its table, or without a known location): the
     /// device proved the current network key, since its parent decrypted the
     /// network-secured Rejoin Request. It is registered with its link key
-    /// [`TrustCenterKeyOrigin::Unknown`] (a key already in the table stays)
-    /// and no key exchange is required. EmberZNet admits such rejoins too;
-    /// it keeps devices of a restored network that carries no per-device
-    /// keys on the network.
+    /// [`TrustCenterKeyOrigin::Unknown`] (a key already in the table stays):
+    /// network-level membership without APS standing, and no key exchange
+    /// (it could not complete one). EmberZNet admits such rejoins too; it
+    /// keeps devices of a restored network that carries no per-device keys
+    /// on the network.
     pub admit_secured_rejoins: bool,
     pub link_key_requests: TrustCenterLinkKeyRequestPolicy,
     pub application_key_requests: ApplicationLinkKeyRequestPolicy,
@@ -516,6 +523,11 @@ impl TrustCenterTable {
         let device = self
             .device(&indication.source_address)
             .ok_or(TrustCenterError::DeviceNotFound)?;
+        // A device whose key is unknown shares no key with this Trust
+        // Center: nothing could reach it (or its partner) securely.
+        if !device.link_key_known() {
+            return Err(TrustCenterError::RequestNotPermitted);
+        }
         match indication.key_type {
             ApsRequestKeyType::TrustCenterLink => {
                 let allowed = match policy.link_key_requests {
@@ -542,7 +554,9 @@ impl TrustCenterTable {
                     ApplicationLinkKeyRequestPolicy::AnyPair => true,
                 };
                 if responder == trust_center_address
-                    || self.device(&responder).is_none()
+                    || self
+                        .device(&responder)
+                        .is_none_or(|responder| !responder.link_key_known())
                     || !policy_allows
                 {
                     return Err(TrustCenterError::RequestNotPermitted);
@@ -1500,6 +1514,63 @@ mod tests {
                 responder_address: PARTNER,
             }
         );
+    }
+
+    /// A device whose key is unknown shares no key with the Trust Center:
+    /// it can neither obtain a key nor be a partner of an application key,
+    /// and its Verify-Key proves nothing.
+    #[test]
+    fn an_unknown_key_device_gets_no_key_and_verifies_nothing() {
+        let mut table = TrustCenterTable::new();
+        table
+            .handle_update_device(
+                policy(),
+                update(ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin),
+            )
+            .unwrap();
+        assert!(!table.device(&DEVICE).unwrap().link_key_known());
+        table
+            .provision_link_key(
+                PARTNER,
+                [0x52; 16],
+                TrustCenterKeyOrigin::ApplicationProvisioned,
+            )
+            .unwrap();
+        let mut any = policy();
+        any.link_key_requests = TrustCenterLinkKeyRequestPolicy::AnyDevice;
+        any.application_key_requests = ApplicationLinkKeyRequestPolicy::AnyPair;
+        let request = |source, key_type, partner_address| ApsmeRequestKeyIndication {
+            source_address: source,
+            key_type,
+            partner_address,
+        };
+        for indication in [
+            request(DEVICE, ApsRequestKeyType::TrustCenterLink, None),
+            request(DEVICE, ApsRequestKeyType::ApplicationLink, Some(PARTNER)),
+            request(PARTNER, ApsRequestKeyType::ApplicationLink, Some(DEVICE)),
+        ] {
+            assert_eq!(
+                table.handle_request_key(any, indication, TC),
+                Err(TrustCenterError::RequestNotPermitted),
+                "{indication:?}"
+            );
+        }
+        // The stored (zero) key and the global key both fail to verify.
+        for key in [[0u8; 16], DEFAULT_TC_LINK_KEY] {
+            let hash = derive_verify_key_hash(&key);
+            assert_eq!(
+                table.handle_verify_key(
+                    &mut SoftwareAesProvider,
+                    ApsmeVerifyKeyIndication {
+                        source_address: DEVICE,
+                        key_type: 0x04,
+                        hash,
+                    },
+                ),
+                Err(TrustCenterError::RequestNotPermitted)
+            );
+        }
+        assert!(!table.device(&DEVICE).unwrap().link_key_known());
     }
 
     #[test]

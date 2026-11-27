@@ -22,8 +22,8 @@ use router_app::{
 use zigbee_aps::PROFILE_HOME_AUTOMATION;
 use zigbee_aps::frames::{ApsDeliveryMode, ApsFrameControl, ApsFrameType, ApsHeader};
 use zigbee_aps::security::{
-    ApsKeyType, ApsLinkKeyEntry, ApsSecurity, ApsSecurityHeader, KEY_ID_DATA_KEY,
-    SEC_LEVEL_ENC_MIC_32,
+    ApsKeyType, ApsLinkKeyEntry, ApsSecurity, ApsSecurityHeader, DEFAULT_TC_LINK_KEY,
+    KEY_ID_DATA_KEY, SEC_LEVEL_ENC_MIC_32,
 };
 use zigbee_mac::mock::MockMac;
 use zigbee_mac::primitives::{
@@ -570,6 +570,45 @@ fn a_restored_child_without_a_key_is_admitted_on_its_secured_rejoin() {
         "its key is unknown, not the global one"
     );
     assert_eq!(port.app().tc_ieee_by_short(child.0), Some(PEER_IEEE));
+
+    // Network-level membership only: its NWK-secured frames are served,
+    // but a frame APS-secured with the default global key is not accepted
+    // from it (APS does not fall back to that key for it).
+    while port.take_indication().is_some() {}
+    let plain = aps_data_frame(0x30, None, &[0x01, 0x02, 0x00]);
+    receive(
+        &mut port,
+        child,
+        -50,
+        secured_nwk_frame(
+            &key,
+            NwkFrameType::Data,
+            (child, PEER_IEEE),
+            ShortAddress(0),
+            0x2001,
+            &plain,
+        ),
+    );
+    assert!(port.take_indication().is_some_and(|i| !i.aps_secured));
+    let global = aps_data_frame(
+        0x31,
+        Some((&DEFAULT_TC_LINK_KEY, PEER_IEEE, 0x40)),
+        &[0x01, 0x03, 0x00],
+    );
+    receive(
+        &mut port,
+        child,
+        -50,
+        secured_nwk_frame(
+            &key,
+            NwkFrameType::Data,
+            (child, PEER_IEEE),
+            ShortAddress(0),
+            0x2002,
+            &global,
+        ),
+    );
+    assert_eq!(port.take_indication(), None);
 }
 
 #[test]

@@ -536,9 +536,10 @@ pub struct Beacon {
 }
 
 /// `RestoredKey::origin` of a device the backup lists without a link key:
-/// it is registered with an unknown key (never installed for APS), which
-/// a secured rejoin keeps and an EZSP hashed-TCLK root replaces with the
-/// derived key. Not a wire origin: never exported.
+/// it is registered with an unknown key (a private one nobody else holds:
+/// network-level membership without APS standing), which a secured rejoin
+/// keeps and an EZSP hashed-TCLK root replaces with the derived key. Not a
+/// wire origin: never exported.
 pub const RESTORED_KEY_UNKNOWN: u8 = 5;
 
 /// A device link key carried by a backup (`DEVICE` record with a link
