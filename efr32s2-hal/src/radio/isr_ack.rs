@@ -9,11 +9,12 @@
 //!   Pending bit set only for a MAC Data Request whose source is in the
 //!   source-match table armed through [`super::Radio::set_frame_pending`]
 //!   (IEEE 802.15.4-2006 7.2.2.3.1 / 7.5.6.3; Zigbee R22/R23 parents). An
-//!   ACK to any other frame, data frames included, carries FP = 0. For each
-//!   acknowledged short-source Data Request it records whether that ACK
-//!   carried FP = 0 ([`super::Radio::data_request_acked_without_pending`]):
-//!   the child has then turned its receiver off, so a frame the stack
-//!   queues after that ACK must wait for the next poll;
+//!   ACK to any other frame, data frames included, carries FP = 0. A Data
+//!   Request acknowledged with FP = 0 is queued with that fact
+//!   ([`super::RxFrame::acked_without_frame_pending`]): the child has then
+//!   turned its receiver off, so the stack must not answer that poll with a
+//!   frame it queued after the ACK. The bit travels with the poll itself,
+//!   so any number of children is covered and nothing outlives the poll;
 //! * drops ACK frames, frames for another node or PAN, and frames whose ACK
 //!   can no longer be sent within the turnaround window: the sender did not
 //!   get its ACK and retransmits, so the frame must not be delivered twice;
@@ -143,47 +144,6 @@ struct Shared {
     stats: AckStats,
 }
 
-/// Short sources whose latest acknowledged Data Request got FP = 0, stored
-/// as `address + 1` (0 = free). Only short-source polls are served with NWK
-/// indirect data (an extended-source poll fetches an Association Response,
-/// armed long before the child polls). A full table forgets the record,
-/// which only restores immediate delivery. Zero-initialized, so it stays
-/// out of `.data` (whose growth can move `.bss` by its 512-byte alignment).
-#[derive(Clone, Copy)]
-struct AckedWithout([u16; FP_TABLE_LEN]);
-
-impl AckedWithout {
-    const EMPTY: Self = Self([0; FP_TABLE_LEN]);
-
-    fn set(&mut self, address: FpAddress, acked_without: bool) {
-        let FpAddress::Short(short) = address else {
-            return;
-        };
-        if short >= 0xFFFE {
-            return;
-        }
-        let _ = table_set(&mut self.0, short + 1, 0, acked_without);
-    }
-
-    fn contains(&self, address: FpAddress) -> bool {
-        matches!(address, FpAddress::Short(short) if short < 0xFFFE && self.0.contains(&(short + 1)))
-    }
-}
-
-struct AckedWithoutCell(UnsafeCell<AckedWithout>);
-
-// SAFETY: same discipline as `SharedCell`.
-unsafe impl Sync for AckedWithoutCell {}
-
-static ACKED_WITHOUT: AckedWithoutCell = AckedWithoutCell(UnsafeCell::new(AckedWithout::EMPTY));
-
-/// # Safety
-/// As [`shared`].
-#[allow(clippy::mut_from_ref)]
-unsafe fn acked_without() -> &'static mut AckedWithout {
-    unsafe { &mut *ACKED_WITHOUT.0.get() }
-}
-
 struct SharedCell(UnsafeCell<Shared>);
 
 // SAFETY: accessed only from the `FRC` handler and from task code that has
@@ -225,8 +185,9 @@ static SHARED: SharedCell = SharedCell(UnsafeCell::new(Shared {
 /// ACK; read without the lock by `Radio::is_rx_on`.
 static RX_LOST: AtomicBool = AtomicBool::new(false);
 
-/// Received frames for the stack, as `[len, MPDU without FCS, raw RSSI]`
-/// records in a byte ring.
+/// Received frames for the stack, as `[len | flags, MPDU without FCS, raw
+/// RSSI]` records in a byte ring. A stored MPDU is at most 125 bytes, so
+/// bit 7 of the length byte is free for [`ACKED_WITHOUT_FP`].
 struct RxQueue {
     bytes: [u8; RX_QUEUE_LEN],
     /// Index of the oldest record.
@@ -254,24 +215,44 @@ impl RxQueue {
     }
 
     /// Append a record; the caller checked [`free`](Self::free).
-    fn push(&mut self, mpdu: impl Iterator<Item = u8>, len: usize, rssi: u8) {
-        self.put(len as u8);
+    fn push(&mut self, mpdu: impl Iterator<Item = u8>, len: usize, rssi: u8, flags: u8) {
+        self.put(len as u8 | flags);
         for byte in mpdu.take(len) {
             self.put(byte);
         }
         self.put(rssi);
     }
 
-    /// Remove the oldest record into `out`: `(len, raw RSSI)`.
-    fn pop(&mut self, out: &mut [u8; MAX_FRAME]) -> Option<(usize, i8)> {
+    /// Remove the oldest record into `out`: `(len, raw RSSI, flags)`.
+    fn pop(&mut self, out: &mut [u8; MAX_FRAME]) -> Option<(usize, i8, u8)> {
         if self.used == 0 {
             return None;
         }
-        let len = usize::from(self.take());
+        let first = self.take();
+        let len = usize::from(first & !RECORD_FLAGS);
         for slot in out.iter_mut().take(len) {
             *slot = self.take();
         }
-        Some((len, self.take() as i8))
+        Some((len, self.take() as i8, first & RECORD_FLAGS))
+    }
+}
+
+/// Record flag: the frame is a MAC Data Request the interrupt acknowledged
+/// with Frame Pending = 0.
+const ACKED_WITHOUT_FP: u8 = 0x80;
+/// Bits of a record's length byte that are flags, not length.
+const RECORD_FLAGS: u8 = ACKED_WITHOUT_FP;
+const _: () = assert!(MAX_FRAME as u8 & RECORD_FLAGS == 0 && MAX_FRAME < 0x80);
+
+/// Record flags of a frame the interrupt keeps after `verdict` (its ACK, if
+/// any, was sent).
+fn record_flags(verdict: Verdict) -> u8 {
+    match verdict {
+        Verdict::Ack {
+            frame_pending: false,
+            poll: Some(_),
+        } => ACKED_WITHOUT_FP,
+        _ => 0,
     }
 }
 
@@ -378,20 +359,6 @@ pub(super) fn set_frame_pending(address: FpAddress, pending: bool) -> Result<(),
 pub(super) fn clear_frame_pending() {
     // SAFETY: called under the lock.
     unsafe { shared() }.table = FpTable::EMPTY;
-    // SAFETY: called under the lock.
-    *unsafe { acked_without() } = AckedWithout::EMPTY;
-}
-
-/// Whether the latest acknowledged Data Request from `address` got FP = 0.
-/// Only masks the line around the read (see [`stats`]).
-pub(super) fn acked_without_pending(address: FpAddress) -> bool {
-    mask();
-    // SAFETY: the `FRC` line is masked.
-    let recorded = unsafe { acked_without() }.contains(address);
-    if unsafe { shared() }.depth == 0 {
-        unsafe { write(NVIC_ISER1, FRC_IRQ_BIT) };
-    }
-    recorded
 }
 
 /// Snapshot of the counters. Only masks the line around the copy: the
@@ -408,10 +375,12 @@ pub(super) fn stats() -> AckStats {
     stats
 }
 
-/// Next queued frame (MPDU without FCS) and its raw RSSI.
-pub(super) fn pop(out: &mut [u8; MAX_FRAME]) -> Option<(usize, i8)> {
+/// Next queued frame (MPDU without FCS): its length, raw RSSI and whether
+/// it is a Data Request acknowledged with Frame Pending = 0.
+pub(super) fn pop(out: &mut [u8; MAX_FRAME]) -> Option<(usize, i8, bool)> {
     // SAFETY: called under the lock.
-    unsafe { queue() }.pop(out)
+    let (len, rssi, flags) = unsafe { queue() }.pop(out)?;
+    Some((len, rssi, flags & ACKED_WITHOUT_FP != 0))
 }
 
 /// Bytes `phr` occupies in the RX buffer (PHR, MPDU without FCS, trailer).
@@ -553,18 +522,13 @@ fn examine(s: &mut Shared, entry: u32, rx_done: bool) {
                 s.stats.queue_full_unacked = s.stats.queue_full_unacked.wrapping_add(1);
                 false
             }
-            Verdict::Ack {
-                frame_pending,
-                poll,
-            } => {
+            Verdict::Ack { frame_pending, .. } => {
                 let sent = send_ack(s, header[2], frame_pending, base);
                 if sent {
                     s.stats.acks = s.stats.acks.wrapping_add(1);
                     if frame_pending {
                         s.stats.fp_acks = s.stats.fp_acks.wrapping_add(1);
                     }
-                    // SAFETY: this is the `FRC` handler.
-                    note_poll_ack(unsafe { acked_without() }, poll, frame_pending);
                 } else {
                     s.stats.ack_tx_fail = s.stats.ack_tx_fail.wrapping_add(1);
                 }
@@ -575,19 +539,11 @@ fn examine(s: &mut Shared, entry: u32, rx_done: bool) {
         };
         if keep {
             let mpdu = (0..stored as u32).map(|i| rx_ram_byte(offset + 1 + i));
-            q.push(mpdu, stored, rx_ram_byte(offset + 1 + stored as u32));
+            let rssi = rx_ram_byte(offset + 1 + stored as u32);
+            q.push(mpdu, stored, rssi, record_flags(verdict));
         }
         // The frame is copied (or dropped): hand its bytes back to BUFC.
         unsafe { write(rx + BUF_READOFFSET, (offset + needed) & BUF_OFFSET_MASK) };
-    }
-}
-
-/// Record the ACK just sent to a Data Request from `poll`: with FP = 0 the
-/// child turns its receiver off, so the stack must not answer that poll
-/// with a frame it queued meanwhile; with FP = 1 it listens for one.
-fn note_poll_ack(record: &mut AckedWithout, poll: Option<FpAddress>, frame_pending: bool) {
-    if let Some(source) = poll {
-        record.set(source, !frame_pending);
     }
 }
 
@@ -976,66 +932,123 @@ mod tests {
         assert_eq!(classify(&other, other.len(), &none, &table), Verdict::Keep);
     }
 
+    /// Classify `frame` and queue it as the interrupt does once its ACK
+    /// (if any) was sent.
+    fn interrupt_keeps(q: &mut RxQueue, frame: &[u8], f: &AckFilter, table: &FpTable) -> Verdict {
+        let verdict = classify(frame, frame.len(), f, table);
+        q.push(
+            frame.iter().copied(),
+            frame.len(),
+            0xC4,
+            record_flags(verdict),
+        );
+        verdict
+    }
+
+    fn empty_queue() -> RxQueue {
+        RxQueue {
+            bytes: [0; RX_QUEUE_LEN],
+            head: 0,
+            used: 0,
+        }
+    }
+
+    /// `(source, acked without FP)` of the next queued record.
+    fn next_poll(q: &mut RxQueue) -> Option<(u16, bool)> {
+        let mut out = [0u8; MAX_FRAME];
+        let (len, _, flags) = q.pop(&mut out)?;
+        assert_eq!(len, 10, "a short-source poll");
+        Some((
+            u16::from_le_bytes([out[7], out[8]]),
+            flags == ACKED_WITHOUT_FP,
+        ))
+    }
+
     /// The hardware sequence of a sleepy child's secured rejoin: it polls
     /// before its parent queued the Rejoin Response (ACK with FP = 0, the
     /// child turns its receiver off), the response is queued and armed,
-    /// and the child's next poll is acknowledged with FP = 1.
+    /// and the child's next poll is acknowledged with FP = 1. Each poll
+    /// reaches the stack with its own ACK's decision.
     #[test]
-    fn acks_without_frame_pending_are_recorded_per_poll_source() {
+    fn each_queued_poll_carries_its_ack_decision() {
         let f = filter();
         let mut table = FpTable::EMPTY;
-        let mut acked_without = AckedWithout::EMPTY;
+        let mut q = empty_queue();
         let child = FpAddress::Short(0x12D2);
-        let poll = poll_short(0x12D2);
-        let ack = |table: &FpTable, acked_without: &mut AckedWithout| {
-            let Verdict::Ack {
-                frame_pending,
-                poll,
-            } = classify(&poll, poll.len(), &f, table)
-            else {
-                panic!("a poll is acknowledged");
-            };
-            note_poll_ack(acked_without, poll, frame_pending);
-            frame_pending
-        };
-        assert!(!ack(&table, &mut acked_without));
-        assert!(acked_without.contains(child));
-        // The response is queued after that ACK: the stack still sees the
-        // stale poll as answered without data.
+        interrupt_keeps(&mut q, &poll_short(0x12D2), &f, &table);
+        // The response is queued after that ACK, before the stack reads
+        // the stale poll.
         table.set(child, true).unwrap();
-        assert!(acked_without.contains(child));
-        assert!(ack(&table, &mut acked_without));
-        assert!(!acked_without.contains(child));
-        // An extended-source poll of the same child.
+        interrupt_keeps(&mut q, &poll_short(0x12D2), &f, &table);
+        assert_eq!(next_poll(&mut q), Some((0x12D2, true)));
+        assert_eq!(next_poll(&mut q), Some((0x12D2, false)));
+        // Address 0 is a valid child.
+        interrupt_keeps(&mut q, &poll_short(0x0000), &f, &table);
+        assert_eq!(next_poll(&mut q), Some((0x0000, true)));
+        // An extended-source poll (an Association Response fetch) carries
+        // its decision too.
         let (ext, len) = poll_ext(CHILD_EXT, true);
-        let Verdict::Ack {
-            frame_pending,
-            poll: source,
-        } = classify(&ext[..len], len, &f, &table)
-        else {
-            panic!("a poll is acknowledged");
-        };
-        // Extended-source polls are not served with NWK data: no record.
-        assert!(!frame_pending);
-        note_poll_ack(&mut acked_without, source, frame_pending);
-        assert!(!acked_without.contains(FpAddress::Extended(CHILD_EXT)));
-        // Another FP = 0 poll records the child again; a data frame (no
-        // poll) leaves the record alone.
-        note_poll_ack(&mut acked_without, Some(child), false);
-        note_poll_ack(&mut acked_without, None, true);
-        assert!(acked_without.contains(child));
-        // Address 0 is a valid child (stored as 1); sentinels never match.
-        note_poll_ack(&mut acked_without, Some(FpAddress::Short(0)), false);
-        assert!(acked_without.contains(FpAddress::Short(0)));
-        note_poll_ack(&mut acked_without, Some(FpAddress::Short(0xFFFF)), false);
-        assert!(!acked_without.contains(FpAddress::Short(0xFFFF)));
-        // A full record table forgets new records (immediate delivery).
-        let mut full = AckedWithout::EMPTY;
-        for i in 0..FP_TABLE_LEN as u16 {
-            full.set(FpAddress::Short(i + 1), true);
+        interrupt_keeps(&mut q, &ext[..len], &f, &table);
+        table.set(FpAddress::Extended(CHILD_EXT), true).unwrap();
+        interrupt_keeps(&mut q, &ext[..len], &f, &table);
+        let mut out = [0u8; MAX_FRAME];
+        assert_eq!(q.pop(&mut out), Some((len, 0xC4u8 as i8, ACKED_WITHOUT_FP)));
+        assert_eq!(q.pop(&mut out), Some((len, 0xC4u8 as i8, 0)));
+        // Frames that are not polls never carry the flag: a data frame
+        // (ACKed with FP = 0) and a broadcast (no ACK).
+        let mut data = poll_short(0x12D2);
+        data[0] = 0x61;
+        interrupt_keeps(&mut q, &data, &f, &table);
+        let broadcast = [0x41, 0x88, 0x01, 0x62, 0x1A, 0xFF, 0xFF, 0x01, 0x7C, 0x08];
+        interrupt_keeps(&mut q, &broadcast, &f, &table);
+        assert_eq!(q.pop(&mut out).map(|(_, _, flags)| flags), Some(0));
+        assert_eq!(q.pop(&mut out).map(|(_, _, flags)| flags), Some(0));
+        assert_eq!(q.pop(&mut out), None);
+    }
+
+    /// More children than the Frame Pending table holds, sleepy children
+    /// that never get data, and children that changed address: the ACK
+    /// decision lives in the poll's own record, so none of them can use
+    /// up shared state (a per-source record table filled with the first
+    /// eight children that polled without data and lost every later one).
+    #[test]
+    fn every_child_keeps_its_ack_decision_beyond_the_table_size() {
+        let f = filter();
+        let mut table = FpTable::EMPTY;
+        let mut q = empty_queue();
+        let children = 0x1000u16..0x1000 + 3 * FP_TABLE_LEN as u16;
+        // Every child polls without data, twice.
+        for _ in 0..2 {
+            for child in children.clone() {
+                interrupt_keeps(&mut q, &poll_short(child), &f, &table);
+            }
         }
-        note_poll_ack(&mut full, Some(FpAddress::Short(0x7000)), false);
-        assert!(!full.contains(FpAddress::Short(0x7000)));
+        for _ in 0..2 {
+            for child in children.clone() {
+                assert_eq!(next_poll(&mut q), Some((child, true)));
+            }
+        }
+        // Data queued for the last eight children fills the table.
+        for child in children.clone().skip(2 * FP_TABLE_LEN) {
+            table.set(FpAddress::Short(child), true).unwrap();
+        }
+        for child in children.clone() {
+            interrupt_keeps(&mut q, &poll_short(child), &f, &table);
+        }
+        for child in children.clone() {
+            let armed = child >= 0x1000 + 2 * FP_TABLE_LEN as u16;
+            assert_eq!(next_poll(&mut q), Some((child, !armed)));
+        }
+        // Child 0x1003 rejoined as 0x7A01 and child 0x1010 left with its
+        // data dropped: the new address's polls carry their own decisions,
+        // and nothing of the old addresses is left to release.
+        table.set(FpAddress::Short(0x1010), false).unwrap();
+        interrupt_keeps(&mut q, &poll_short(0x7A01), &f, &table);
+        table.set(FpAddress::Short(0x7A01), true).unwrap();
+        interrupt_keeps(&mut q, &poll_short(0x7A01), &f, &table);
+        assert_eq!(next_poll(&mut q), Some((0x7A01, true)));
+        assert_eq!(next_poll(&mut q), Some((0x7A01, false)));
+        assert_eq!(next_poll(&mut q), None);
     }
 
     #[test]
@@ -1050,13 +1063,13 @@ mod tests {
         // Fill with 125-byte frames (127-byte records) until no room.
         let mut pushed = 0u8;
         while q.free() >= record_len(125) {
-            q.push((0..125).map(|i| i as u8 ^ pushed), 125, pushed);
+            q.push((0..125).map(|i| i as u8 ^ pushed), 125, pushed, 0);
             pushed += 1;
         }
         assert_eq!(pushed as usize, RX_QUEUE_LEN / record_len(125));
         // Drain two, then refill across the end of the ring.
         for n in 0..2u8 {
-            assert_eq!(q.pop(&mut out), Some((125, n as i8)));
+            assert_eq!(q.pop(&mut out), Some((125, n as i8, 0)));
             assert!(
                 out[..125]
                     .iter()
@@ -1064,14 +1077,14 @@ mod tests {
                     .all(|(i, &b)| b == i as u8 ^ n)
             );
         }
-        q.push([0x41, 0x88, 0x07].into_iter(), 3, 0xC4);
+        q.push([0x41, 0x88, 0x07].into_iter(), 3, 0xC4, ACKED_WITHOUT_FP);
         let mut next = 2u8;
         while next < pushed {
-            assert_eq!(q.pop(&mut out), Some((125, next as i8)));
+            assert_eq!(q.pop(&mut out), Some((125, next as i8, 0)));
             assert_eq!(out[124], 124 ^ next);
             next += 1;
         }
-        assert_eq!(q.pop(&mut out), Some((3, 0xC4u8 as i8)));
+        assert_eq!(q.pop(&mut out), Some((3, 0xC4u8 as i8, ACKED_WITHOUT_FP)));
         assert_eq!(&out[..3], &[0x41, 0x88, 0x07]);
         assert_eq!(q.pop(&mut out), None);
         assert_eq!(q.free(), RX_QUEUE_LEN);

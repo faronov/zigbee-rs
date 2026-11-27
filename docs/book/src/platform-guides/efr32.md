@@ -384,15 +384,19 @@ reports `hardware_auto_ack` and the core never calls `send_ack`. The Frame
 Pending bit comes from an 8 short + 8 extended source-match table in the
 HAL that the core arms through `RadioPhy::set_ack_frame_pending` whenever
 it queues indirect data or an association response. `PENDING = 0`: the HAL
-table is the only Frame Pending owner, as on TLSR8258. The interrupt also
-records, per short poll source, whether its latest ACK to a Data Request
-carried FP = 0 (`Radio::data_request_acked_without_pending`, an 8-entry,
-zero-initialized table: 16 B of `.bss`).
-The child turns its receiver off after such an ACK. When the stack serves
-that poll after it has queued a frame (the poll event waited behind slower
-work), the frame stays queued and armed for the next poll, as on the ESP32
-parents (`MacDriver::poll_acked_without_frame_pending`). Without the record,
-the frame was sent to a child that no longer listened, and was lost. The core still
+table is the only Frame Pending owner, as on TLSR8258. A Data Request
+the interrupt acknowledged with FP = 0 is queued with a flag (bit 7 of its
+record's length byte), which reaches the stack with that poll
+(`RxFrame::acked_without_frame_pending` → `PhyRxFrame` →
+`MlmeDataRequestIndication::acked_without_frame_pending`). The child turns
+its receiver off after such an ACK. When the stack serves that poll after it
+has queued a frame (the poll event waited behind slower work), the frame
+stays queued and armed for the next poll; the soft MAC also keeps an
+Association Response armed after it. Without the flag, the frame was sent to
+a child that no longer listened, and was lost. The decision travels with the
+poll, so no per-child state exists to fill up: a first version recorded it
+in an 8-entry per-source table, which the first eight sleepy children
+polling without data occupied for good (review of #23). The core still
 builds beacons, association and orphan responses and indirect data;
 `PENDING = 0` compiles out only the core's software Frame Pending table. The ED and SED bins keep the
 polled HAL ACK: the HAL acknowledges matching frames while `receive` polls
@@ -1351,8 +1355,9 @@ that followed, whose unsecured response was queued before the poll; that
 response was accepted. That rejoin then waited for a Transport-Key the
 Trust Center cannot send under an unknown key (the restore had no
 `hashed_tclk` root), and the child aged out as unauthenticated, as
-designed. Fixed by the FP = 0 record above (host tests: the HAL record
-sequence, and the NCP serving the capture's sequence). The device's side
+designed. Fixed by the FP = 0 flag above (host tests: the HAL record
+sequence with more children than the table holds, and the NCP serving the
+capture's sequence). The device's side
 behaves as specified.
 
 Third run (same build, the EZSP backup restored with its `hashed_tclk`
@@ -1363,7 +1368,7 @@ device's EmberZNet key and sent the Transport-Key, and the device sent
 Device_annce and its ED Timeout Request (answered, enum 14) and polled
 every 5 s; the hub's interview (about 30 s), reads and reports followed,
 and a 15-minute watch was clean (HIL report). The derived key therefore works on hardware. The
-fallback is not needed: with the FP = 0 record the first secured rejoin
+fallback is not needed: with the FP = 0 flag the first secured rejoin
 completes, with or without a root. Two more findings:
 
 - The NCP's log named the six Device_annce frames `UNKNOWN_ZDP 0x0013`.

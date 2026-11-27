@@ -293,9 +293,10 @@ pub trait MacRole: role_sealed::Sealed {
         false
     }
 
-    /// Queue a received parent-side MAC command.
+    /// Queue a received parent-side MAC command. `acked_without_frame_pending`:
+    /// the frame is a Data Request whose ACK carried Frame Pending = 0.
     #[doc(hidden)]
-    fn queue_command(&mut self, _data: &[u8], _lqi: u8) {}
+    fn queue_command(&mut self, _data: &[u8], _lqi: u8, _acked_without_frame_pending: bool) {}
 
     /// True (once) after a Data Request was queued: receive loops end early
     /// so the runtime can service the child poll promptly.
@@ -1342,6 +1343,12 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
                     R::PARENT && command && self.role.frame_pending_for(&source),
                 )
             });
+        // The Frame Pending bit this poll was answered with: the software ACK
+        // about to be sent, or the PHY's own auto-ACK as it reports it.
+        let acked_without_frame_pending = match ack {
+            Some((_, frame_pending)) => !frame_pending,
+            None => frame.acked_without_frame_pending,
+        };
 
         let retained = matches!(want, Want::Retained).then_some(Heard::Queued);
         let association = if command && exact {
@@ -1362,7 +1369,8 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
         } else if command {
             if R::PARENT {
                 let lqi = frame.lqi;
-                self.role.queue_command(data, lqi);
+                self.role
+                    .queue_command(data, lqi, acked_without_frame_pending);
                 retained
             } else {
                 None
@@ -3758,6 +3766,78 @@ mod tests {
         );
         core.reset(false).unwrap();
         assert!(core.phy().hw_pending_cleared);
+    }
+
+    /// A received poll as a `hardware_auto_ack` PHY reports it.
+    fn rx_auto_acked(core: &mut ParentCore, frame: &[u8], acked_without_frame_pending: bool) {
+        let mut received = PhyRxFrame::from_slice(frame, 200).unwrap();
+        received.acked_without_frame_pending = acked_without_frame_pending;
+        core.phy_mut()
+            .rx_frames
+            .push_back(Ok(Some(received)))
+            .unwrap();
+    }
+
+    fn polled(core: &mut ParentCore) -> crate::MlmeDataRequestIndication {
+        match block_on(core.command_event(10_000)).unwrap() {
+            MacCommandEvent::DataRequest(indication) => indication,
+            other => panic!("expected a Data Request event, got {other:?}"),
+        }
+    }
+
+    /// Every Data Request event carries its own ACK's Frame Pending
+    /// decision, from the software ACK or from the PHY's auto-ACK.
+    #[test]
+    fn parent_data_request_events_carry_their_ack_decision() {
+        let mut core = parent_core();
+        let child = MacAddress::Short(PAN, CHILD_SHORT);
+        rx(&mut core, &short_data_request(0x20));
+        assert!(polled(&mut core).acked_without_frame_pending);
+        core.set_frame_pending(child, true).unwrap();
+        rx(&mut core, &short_data_request(0x21));
+        assert!(!polled(&mut core).acked_without_frame_pending);
+        assert_eq!(
+            core.phy().sent_acks.as_slice(),
+            [(0x20, false), (0x21, true)]
+        );
+
+        let mut core = parent_core();
+        core.phy_mut().capabilities.hardware_auto_ack = true;
+        rx_auto_acked(&mut core, &short_data_request(0x22), true);
+        rx_auto_acked(&mut core, &short_data_request(0x23), false);
+        assert!(polled(&mut core).acked_without_frame_pending);
+        assert!(!polled(&mut core).acked_without_frame_pending);
+        assert!(core.phy().sent_acks.is_empty());
+    }
+
+    /// An Association Response armed after the auto-ACK told the device
+    /// "nothing pending" is not sent to that poll (the device is no longer
+    /// listening); the next poll, acknowledged with Frame Pending, gets it.
+    #[test]
+    fn parent_keeps_an_association_response_for_a_poll_acked_without_frame_pending() {
+        let mut core = parent_core();
+        core.phy_mut().capabilities.hardware_auto_ack = true;
+        core.associate_response(child_response()).unwrap();
+        rx_auto_acked(&mut core, &extended_data_request(0x10), true);
+
+        let stale = polled(&mut core);
+        assert_eq!(stale.source_address, MacAddress::Extended(PAN, CHILD));
+        assert_eq!(core.phy().tx_attempts, 0, "no response to the stale poll");
+
+        rx_auto_acked(&mut core, &extended_data_request(0x11), false);
+        let response_sequence = core.pib().dsn();
+        rx(&mut core, &[0x02, 0x00, response_sequence]);
+        assert!(matches!(
+            block_on(core.command_event(10_000)).unwrap(),
+            MacCommandEvent::AssociationResponseDelivery(crate::MlmeAssociateResponseDelivery {
+                result: Ok(()),
+                ..
+            })
+        ));
+        assert_eq!(
+            parse_association_response(&core.phy().last_tx),
+            Some((CHILD_SHORT, 0))
+        );
     }
 
     #[test]

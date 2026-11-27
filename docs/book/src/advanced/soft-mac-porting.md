@@ -246,6 +246,13 @@ without a hardware ACK engine:
   starts a precomputed ACK at once;
 - FP = 1 only for a MAC Data Request whose source is in the table; data
   frames are ACKed with FP = 0;
+- a Data Request ACKed with FP = 0 is queued with that fact and delivered
+  as `PhyRxFrame::acked_without_frame_pending`: the child stopped
+  listening, so the stack does not answer that poll with a frame it queued
+  after the ACK. Keep the decision with the frame (a record flag, or a
+  reception-order log such as `ack_pending::PollAckLog` when the interrupt
+  cannot mark the frame), never in a per-child table, which fills up with
+  sleepy children that never get data;
 - it drops frames it could not ACK in time, plus ACKs and foreign frames,
   and copies the frames it keeps into a software queue, so the hardware RX
   buffer is empty after every interrupt, even while the task is blocked in

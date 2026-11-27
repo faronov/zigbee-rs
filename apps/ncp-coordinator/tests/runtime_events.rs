@@ -539,6 +539,7 @@ fn a_restored_child_without_a_key_is_admitted_on_its_secured_rejoin() {
         destination_address: MacAddress::Short(pan, ShortAddress::COORDINATOR),
         lqi: 180,
         security_use: false,
+        acked_without_frame_pending: false,
     }));
     steps(&mut port, 8);
     assert_eq!(
@@ -638,12 +639,14 @@ fn a_rejoin_response_queued_after_a_poll_was_acked_waits_for_the_next_poll() {
         assert!(nwk.restore_child(PEER_IEEE, child, false, true, false, 8));
         nwk.update_address_map(child, PEER_IEEE);
     }
-    let poll = |port: &mut TcPort<_>| {
+    // A poll as the parent's MAC reports it, with its ACK's Frame Pending.
+    let poll = |port: &mut TcPort<_>, acked_frame_pending: bool| {
         mac(port).enqueue_command_event(MacCommandEvent::DataRequest(MlmeDataRequestIndication {
             source_address: MacAddress::Short(pan, child),
             destination_address: MacAddress::Short(pan, ShortAddress::COORDINATOR),
             lqi: 180,
             security_use: false,
+            acked_without_frame_pending: !acked_frame_pending,
         }));
     };
     let to_child = |port: &mut TcPort<_>| {
@@ -673,8 +676,7 @@ fn a_rejoin_response_queued_after_a_poll_was_acked_waits_for_the_next_poll() {
         secured_rejoin_request(&key, (child, PEER_IEEE), 1227, 0x80),
     );
     assert_eq!(queued(&mut port, child), 1, "the Rejoin Response is queued");
-    mac(&mut port).set_poll_acked_without_frame_pending(true);
-    poll(&mut port);
+    poll(&mut port, false);
     steps(&mut port, 4);
     assert_eq!(to_child(&mut port), 0, "nothing after an ACK without FP");
     assert_eq!(queued(&mut port, child), 1, "the Rejoin Response waits");
@@ -690,8 +692,7 @@ fn a_rejoin_response_queued_after_a_poll_was_acked_waits_for_the_next_poll() {
     assert_eq!(port.take_device_event(), None, "not delivered yet");
 
     // (3): the next poll is acknowledged with FP = 1 and gets the response.
-    mac(&mut port).set_poll_acked_without_frame_pending(false);
-    poll(&mut port);
+    poll(&mut port, true);
     steps(&mut port, 4);
     assert_eq!(to_child(&mut port), 1, "delivered at the next poll");
     assert_eq!(queued(&mut port, child), 0);
@@ -924,6 +925,7 @@ fn a_long_polling_sleepy_child_is_reached_at_its_next_poll() {
             destination_address: MacAddress::Short(pan, ShortAddress::COORDINATOR),
             lqi: 180,
             security_use: false,
+            acked_without_frame_pending: false,
         }));
         steps(port, 1);
     };

@@ -20,10 +20,10 @@
 //!     sets Frame Pending in the ACK to a Data Request whose source is in
 //!     the HAL source-match table that `SoftMacCore` arms through
 //!     [`RadioPhy::set_ack_frame_pending`] (single Frame Pending owner:
-//!     [`Efr32s2RouterRole`] has no software pending table). It records
-//!     per poll source whether that ACK carried FP = 0
-//!     ([`RadioPhy::data_request_acked_without_pending`]), so a frame
-//!     queued after it waits for the child's next poll.
+//!     [`Efr32s2RouterRole`] has no software pending table). A poll it
+//!     acknowledged with FP = 0 reaches the MAC marked as such
+//!     ([`PhyRxFrame::acked_without_frame_pending`]), so a frame queued
+//!     after that ACK waits for the child's next poll.
 //! - **RX** — polled from the executor (`yield_now`) inside the receive
 //!   window. With `isr-ack` the interrupt also drops ACKs, frames for
 //!   other nodes and frames it could not acknowledge in time, which keeps
@@ -311,6 +311,7 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
                 // The HAL's per-frame RSSI (the RX trailer, dBm): reported to
                 // a ZRHP host with every indication (`rx-rssi`).
                 crate::rx_rssi!(frame, rx.rssi_dbm);
+                frame.acked_without_frame_pending = rx.acked_without_frame_pending;
                 return Ok(true);
             }
             if Instant::now() >= deadline {
@@ -355,8 +356,12 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
         source: &MacAddress,
         pending: bool,
     ) -> Result<(), PhyError> {
+        let address = match *source {
+            MacAddress::Short(_, short) => FpAddress::Short(short.0),
+            MacAddress::Extended(_, ieee) => FpAddress::Extended(u64::from_le_bytes(ieee)),
+        };
         self.radio
-            .set_frame_pending(fp_address(source), pending)
+            .set_frame_pending(address, pending)
             .map_err(|error| match error {
                 FpError::TableFull => PhyError::Hardware,
                 FpError::InvalidAddress | FpError::Unsupported => PhyError::Unsupported,
@@ -365,14 +370,6 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
 
     fn clear_ack_frame_pending(&mut self) {
         self.radio.clear_frame_pending();
-    }
-
-    /// The `isr-ack` interrupt's record of the ACK to the latest Data
-    /// Request from `source` (see
-    /// [`crate::MacDriver::poll_acked_without_frame_pending`]).
-    fn data_request_acked_without_pending(&self, source: &MacAddress) -> bool {
-        self.radio
-            .data_request_acked_without_pending(fp_address(source))
     }
 
     fn set_rx_on_when_idle(&mut self, enabled: bool) {
@@ -425,14 +422,6 @@ impl<const D: i8> PlatformServices for Efr32s2RadioPhy<D> {
     /// xG24: Secure Engine TRNG; xG21/xG22: none (never the xorshift).
     fn fill_random(&mut self, output: &mut [u8]) -> Result<(), MacError> {
         fill_random(output)
-    }
-}
-
-/// The HAL source-match form of a MAC address.
-fn fp_address(source: &MacAddress) -> FpAddress {
-    match *source {
-        MacAddress::Short(_, short) => FpAddress::Short(short.0),
-        MacAddress::Extended(_, ieee) => FpAddress::Extended(u64::from_le_bytes(ieee)),
     }
 }
 

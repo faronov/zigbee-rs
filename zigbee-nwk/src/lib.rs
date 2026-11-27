@@ -115,6 +115,36 @@ pub struct ParentAnnceOutcome {
     pub dropped: heapless::Vec<ShortAddress, { neighbor::MAX_NEIGHBORS }>,
 }
 
+/// One physical MAC Data Request from a possible child, as the MAC reported
+/// it ([`zigbee_mac::MlmeDataRequestIndication`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildPoll {
+    pub source: MacAddress,
+    /// The ACK to this poll carried Frame Pending = 0: the child turned its
+    /// receiver off, so the poll is not answered with data (the frame stays
+    /// queued, Frame Pending armed, for the next poll).
+    pub acked_without_frame_pending: bool,
+}
+
+/// A poll whose ACK did not say "no data" (or whose MAC does not report it).
+impl From<MacAddress> for ChildPoll {
+    fn from(source: MacAddress) -> Self {
+        Self {
+            source,
+            acked_without_frame_pending: false,
+        }
+    }
+}
+
+impl From<&zigbee_mac::MlmeDataRequestIndication> for ChildPoll {
+    fn from(indication: &zigbee_mac::MlmeDataRequestIndication) -> Self {
+        Self {
+            source: indication.source_address,
+            acked_without_frame_pending: indication.acked_without_frame_pending,
+        }
+    }
+}
+
 /// Result of servicing one MAC Data Request from a possible child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildPollOutcome {
@@ -1938,10 +1968,16 @@ impl<M: MacDriver> NwkLayer<M> {
     /// counter on every attempt, including retries after a key switch.
     /// Security/persistence failures return `SecurityError` without dequeuing
     /// or transmitting; only ciphertext for this attempt survives the await.
+    /// A poll acknowledged with Frame Pending = 0
+    /// ([`ChildPoll::acked_without_frame_pending`]) gets no frame.
     pub async fn service_child_data_request(
         &mut self,
-        source: MacAddress,
+        poll: impl Into<ChildPoll>,
     ) -> Result<ChildPollOutcome, MacError> {
+        let ChildPoll {
+            source,
+            acked_without_frame_pending,
+        } = poll.into();
         if matches!(source, MacAddress::Extended(_, _)) {
             return Ok(ChildPollOutcome::AssociationResponsePoll);
         }
@@ -1965,7 +2001,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // hardware acknowledged it), so the child has turned its receiver
         // off: a frame sent now is acknowledged by its radio and dropped by
         // its stack. It stays queued, Frame Pending armed, for the next poll.
-        if self.mac.poll_acked_without_frame_pending(&source) {
+        if acked_without_frame_pending {
             return Ok(ChildPollOutcome::NoData);
         }
         let mut refreshed = [0u8; nlde::MAX_NWK_FRAME];

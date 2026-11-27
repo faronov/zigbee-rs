@@ -82,7 +82,7 @@ use zigbee_types::IeeeAddress;
 
 use super::{AesEngineError, EspAesEngine, EspHardwareAes128};
 #[cfg(feature = "esp-parent")]
-use crate::ack_pending::{AckPendingError, AckPendingTable, data_request_source};
+use crate::ack_pending::{AckPendingError, AckPendingTable, PollAckLog, data_request_source};
 use crate::pib::{MacPib, PibAttribute, PibValue};
 use crate::{
     AckResult, AckWaitTx, EndDevice, MAX_PHY_FRAME_LEN, MacError, PhyAddressFilter,
@@ -168,14 +168,18 @@ pub type EspRouterMac<'a> = SoftMacCore<
 static ACK_PENDING: esp_sync::NonReentrantMutex<AckPendingTable<ESP_ACK_PENDING_SOURCES>> =
     esp_sync::NonReentrantMutex::new(AckPendingTable::new());
 
-/// Children whose latest Data Request was acknowledged with Frame Pending =
-/// 0 (they turned their receiver off): a frame queued after that ACK waits
-/// for the next poll ([`crate::MacDriver::poll_acked_without_frame_pending`]).
-/// A full table forgets the record, which only restores immediate delivery.
+/// The hook's Frame Pending decision for every acknowledged Data Request,
+/// until [`take_from_radio`] dequeues that poll and marks it
+/// ([`PhyRxFrame::acked_without_frame_pending`]: the child turned its
+/// receiver off, so a frame queued after the ACK waits for its next poll).
+/// Sized for the polls the esp-radio receive queue can hold, with margin;
+/// nothing is kept per child.
 #[cfg(feature = "esp-parent")]
-static ACKED_WITHOUT_PENDING: esp_sync::NonReentrantMutex<
-    AckPendingTable<ESP_ACK_PENDING_SOURCES>,
-> = esp_sync::NonReentrantMutex::new(AckPendingTable::new());
+static POLL_ACKS: esp_sync::NonReentrantMutex<PollAckLog<POLL_ACK_LOG_LEN>> =
+    esp_sync::NonReentrantMutex::new(PollAckLog::new());
+
+#[cfg(feature = "esp-parent")]
+const POLL_ACK_LOG_LEN: usize = RADIO_RX_QUEUE_DEPTH + 4;
 
 /// RX_DONE-interrupt Frame Pending decision. `frame` is the received MAC
 /// frame whose two FCS bytes the radio replaced with RSSI/LQI.
@@ -192,10 +196,20 @@ fn ack_pending_hook(frame: &[u8]) -> bool {
     if pending {
         PARENT_FP_ACKS.fetch_add(1, Ordering::Relaxed);
     }
-    ACKED_WITHOUT_PENDING.with(|table| {
-        let _ = table.set(source, !pending);
-    });
+    // `data_request_source` checked the MHR, so the sequence number is there.
+    POLL_ACKS.with(|log| log.record(source, frame[2], pending));
     pending
+}
+
+/// Mark a dequeued Data Request with its ACK's decision (see [`POLL_ACKS`]).
+#[cfg(feature = "esp-parent")]
+fn mark_poll_ack(frame: &mut PhyRxFrame) {
+    let data = frame.as_slice();
+    if let Some(source) = data_request_source(data) {
+        let sequence = data[2];
+        frame.acked_without_frame_pending =
+            POLL_ACKS.with(|log| log.take(&source, sequence)) == Some(false);
+    }
 }
 
 #[cfg(feature = "esp-parent")]
@@ -839,18 +853,16 @@ fn take_from_radio(
     let rssi_dbm = crate::esp_rssi::frame_rssi_dbm(raw.data[phr - 1], rssi_compensation_db);
     crate::rx_rssi!(frame, rssi_dbm);
     let lqi = crate::lqi::from_rssi_dbm(rssi_dbm);
-    #[cfg(not(feature = "timed-tx"))]
-    {
-        frame.set(&raw.data[1..phr - 1], lqi).is_ok()
+    if frame.set(&raw.data[1..phr - 1], lqi).is_err() {
+        return false;
     }
     #[cfg(feature = "timed-tx")]
     {
-        if frame.set(&raw.data[1..phr - 1], lqi).is_err() {
-            return false;
-        }
         frame.rx_end_us = rx_end_us(raw.timestamp_us);
-        true
     }
+    #[cfg(feature = "esp-parent")]
+    mark_poll_ack(frame);
+    true
 }
 
 /// Convert the RX_DONE time stamp (`esp_hal::time::Instant` µs) into
@@ -1064,12 +1076,7 @@ impl RadioPhy for EspRadioPhy<'_> {
     #[cfg(feature = "esp-parent")]
     fn clear_ack_frame_pending(&mut self) {
         ACK_PENDING.with(AckPendingTable::clear);
-        ACKED_WITHOUT_PENDING.with(AckPendingTable::clear);
-    }
-
-    #[cfg(feature = "esp-parent")]
-    fn data_request_acked_without_pending(&self, source: &zigbee_types::MacAddress) -> bool {
-        ACKED_WITHOUT_PENDING.with(|table| table.contains(source))
+        POLL_ACKS.with(PollAckLog::clear);
     }
 
     /// Quiesce the radio for retained light sleep.

@@ -14158,7 +14158,7 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                     .zdo_mut()
                     .aps_mut()
                     .nwk_mut()
-                    .service_child_data_request(indication.source_address)
+                    .service_child_data_request(&indication)
                     .await?;
                 if let zigbee_nwk::ChildPollOutcome::Delivered { child, kind, .. } = outcome {
                     match kind {
@@ -18375,6 +18375,7 @@ mod parent_router_tests {
             destination_address: MacAddress::Short(PAN, ROUTER),
             lqi: 170,
             security_use: false,
+            acked_without_frame_pending: false,
         })
     }
 

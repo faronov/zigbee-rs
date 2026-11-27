@@ -81,6 +81,15 @@ pub struct PhyRxFrame {
     pub rx_end_us: u32,
     #[cfg(feature = "rx-rssi")]
     pub rssi_dbm: i8,
+    /// The frame is a MAC Data Request that the PHY's hardware or interrupt
+    /// auto-ACK acknowledged with Frame Pending = 0 (`hardware_auto_ack`
+    /// PHYs that report it). The child turned its receiver off after that
+    /// ACK (IEEE 802.15.4-2015 6.7.3), so this poll must not be answered
+    /// with a frame queued since: it waits for the next poll, see
+    /// [`crate::MlmeDataRequestIndication::acked_without_frame_pending`].
+    /// [`Self::set`] and [`Self::set_len`] clear it, so the PHY records it
+    /// after them.
+    pub acked_without_frame_pending: bool,
 }
 
 impl PhyRxFrame {
@@ -93,6 +102,7 @@ impl PhyRxFrame {
         rx_end_us: 0,
         #[cfg(feature = "rx-rssi")]
         rssi_dbm: RSSI_UNKNOWN_DBM,
+        acked_without_frame_pending: false,
     };
 
     pub fn from_slice(data: &[u8], lqi: u8) -> Result<Self, PhyError> {
@@ -108,6 +118,7 @@ impl PhyRxFrame {
             rx_end_us: 0,
             #[cfg(feature = "rx-rssi")]
             rssi_dbm: RSSI_UNKNOWN_DBM,
+            acked_without_frame_pending: false,
         };
         frame.data[..data.len()].copy_from_slice(data);
         Ok(frame)
@@ -125,6 +136,7 @@ impl PhyRxFrame {
         self.data[..data.len()].copy_from_slice(data);
         self.len = data.len() as u8;
         self.lqi = lqi;
+        self.acked_without_frame_pending = false;
         #[cfg(feature = "timed-tx")]
         {
             self.rx_end_us = 0;
@@ -146,6 +158,7 @@ impl PhyRxFrame {
         }
         self.len = len as u8;
         self.lqi = lqi;
+        self.acked_without_frame_pending = false;
         #[cfg(feature = "timed-tx")]
         {
             self.rx_end_us = 0;
@@ -319,13 +332,6 @@ pub trait RadioPhy {
 
     /// Forget every armed Frame Pending source (MLME-RESET).
     fn clear_ack_frame_pending(&mut self) {}
-
-    /// Whether the hardware / ISR auto-ACK to the latest Data Request from
-    /// `source` carried Frame Pending = 0 (see
-    /// [`crate::MacDriver::poll_acked_without_frame_pending`]).
-    fn data_request_acked_without_pending(&self, _source: &MacAddress) -> bool {
-        false
-    }
 
     /// Whether [`Self::transmit_at`] is implemented and every received
     /// frame carries [`PhyRxFrame::rx_end_us`] (`timed-tx`).

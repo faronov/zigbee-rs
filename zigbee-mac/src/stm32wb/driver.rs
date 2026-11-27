@@ -233,6 +233,9 @@ impl<T: WbMacTransport> Stm32wbMac<T> {
                     ),
                     lqi: 0,
                     security_use: false,
+                    // The CPU2 MAC answers the poll itself; its ACK decision
+                    // is not reported.
+                    acked_without_frame_pending: false,
                 };
                 self.queue_command(MacCommandEvent::DataRequest(indication));
                 None
@@ -387,6 +390,7 @@ impl<T: WbMacTransport> Stm32wbMac<T> {
             destination_address: MacAddress::Short(pan_id, self.pib.short_address()),
             lqi: 0,
             security_use: false,
+            acked_without_frame_pending: false,
         }))
     }
 
