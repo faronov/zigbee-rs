@@ -597,6 +597,23 @@ impl Radio {
         self.locked(|_| isr_ack::clear_frame_pending());
     }
 
+    /// Whether the interrupt acknowledged the latest Data Request from
+    /// `address` with Frame Pending = 0. The child has turned its receiver
+    /// off after that ACK, so a frame queued for it since must wait for its
+    /// next poll (IEEE 802.15.4-2015 6.7.3: data follows only an ACK with
+    /// Frame Pending). Always `false` without `isr-ack`.
+    pub fn data_request_acked_without_pending(&self, address: FpAddress) -> bool {
+        #[cfg(feature = "isr-ack")]
+        {
+            isr_ack::acked_without_pending(address)
+        }
+        #[cfg(not(feature = "isr-ack"))]
+        {
+            let _ = address;
+            false
+        }
+    }
+
     /// Counters of the interrupt-driven Imm-Ack path.
     pub fn ack_stats(&self) -> AckStats {
         #[cfg(feature = "isr-ack")]

@@ -611,6 +611,125 @@ fn a_restored_child_without_a_key_is_admitted_on_its_secured_rejoin() {
     assert_eq!(port.take_indication(), None);
 }
 
+/// The Dongle Max capture of a sleepy child's secured rejoin (hil107):
+///
+/// 1. Rejoin Request (NWK-secured) from 0x12D2, MAC-ACKed;
+/// 2. its Data Requests 4 and 6.5 ms later are acknowledged with Frame
+///    Pending = 0: the Rejoin Response is queued only ~15 ms after the
+///    request, so the child turns its receiver off;
+/// 3. the NCP then served the *stale* first poll and sent the response 12 ms
+///    after that ACK. The child's radio acknowledged it while idle and its
+///    stack dropped it (a receiver that is off hears nothing); later polls
+///    found nothing, the child timed out after ~0.45 s and retried, and the
+///    Trust Center had already reported the rejoin admitted.
+///
+/// A poll acknowledged without Frame Pending must leave the frame queued
+/// (armed) for the next poll, whose ACK carries Frame Pending = 1 and which
+/// the child listens after.
+#[test]
+fn a_rejoin_response_queued_after_a_poll_was_acked_waits_for_the_next_poll() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    formed_port!(port);
+    let key = network_key(&port);
+    let pan = pan(&port);
+    let child = ShortAddress(0x12D2);
+    {
+        let nwk = port.app_mut().device_mut().aps_mut().nwk_mut();
+        assert!(nwk.restore_child(PEER_IEEE, child, false, true, false, 8));
+        nwk.update_address_map(child, PEER_IEEE);
+    }
+    let poll = |port: &mut TcPort<_>| {
+        mac(port).enqueue_command_event(MacCommandEvent::DataRequest(MlmeDataRequestIndication {
+            source_address: MacAddress::Short(pan, child),
+            destination_address: MacAddress::Short(pan, ShortAddress::COORDINATOR),
+            lqi: 180,
+            security_use: false,
+        }));
+    };
+    let to_child = |port: &mut TcPort<_>| {
+        mac(port)
+            .tx_history()
+            .iter()
+            .filter(|tx| tx.dst == MacAddress::Short(pan, child))
+            .count()
+    };
+    fn queued<A: TcApp>(port: &mut TcPort<A>, child: ShortAddress) -> usize {
+        port.app_mut()
+            .device_mut()
+            .aps_mut()
+            .nwk_mut()
+            .indirect_queue()
+            .pending_count(child)
+    }
+    mac(&mut port).clear_tx_history();
+
+    // (1) + (2): the request; the response is queued; then the stack
+    // serves a poll that the radio had acknowledged before the response
+    // existed (FP = 0).
+    receive(
+        &mut port,
+        child,
+        -33,
+        secured_rejoin_request(&key, (child, PEER_IEEE), 1227, 0x80),
+    );
+    assert_eq!(queued(&mut port, child), 1, "the Rejoin Response is queued");
+    mac(&mut port).set_poll_acked_without_frame_pending(true);
+    poll(&mut port);
+    steps(&mut port, 4);
+    assert_eq!(to_child(&mut port), 0, "nothing after an ACK without FP");
+    assert_eq!(queued(&mut port, child), 1, "the Rejoin Response waits");
+    assert!(
+        mac(&mut port)
+            .indirect_pending_history()
+            .iter()
+            .rev()
+            .find(|(address, _)| *address == MacAddress::Short(pan, child))
+            .is_some_and(|(_, armed)| *armed),
+        "Frame Pending stays armed for the next poll"
+    );
+    assert_eq!(port.take_device_event(), None, "not delivered yet");
+
+    // (3): the next poll is acknowledged with FP = 1 and gets the response.
+    mac(&mut port).set_poll_acked_without_frame_pending(false);
+    poll(&mut port);
+    steps(&mut port, 4);
+    assert_eq!(to_child(&mut port), 1, "delivered at the next poll");
+    assert_eq!(queued(&mut port, child), 0);
+    let response: Vec<u8> = mac(&mut port)
+        .tx_history()
+        .iter()
+        .find(|tx| tx.dst == MacAddress::Short(pan, child))
+        .map(|tx| tx.payload.as_slice().to_vec())
+        .unwrap();
+    let (header, _) = NwkHeader::parse(&response).unwrap();
+    assert_eq!(header.frame_control.frame_type, NwkFrameType::Command as u8);
+    assert_eq!(header.dst_ieee, Some(PEER_IEEE));
+    // The Trust Center hears of the rejoin once the response is delivered.
+    steps(&mut port, 6);
+    assert!(matches!(
+        port.take_device_event(),
+        Some(DeviceEvent::Joined {
+            nwk: 0x12D2,
+            join_type: joined::JOIN_SECURED_REJOIN,
+            decision: joined::ADMITTED,
+            ..
+        })
+    ));
+    // The child is an authenticated child (the secured rejoin proved the
+    // network key): it never expires as unauthenticated, and its
+    // Device_annce is served.
+    assert!(
+        port.app()
+            .device()
+            .aps()
+            .nwk()
+            .neighbor_table()
+            .children()
+            .any(|entry| entry.network_address == child
+                && entry.relationship == zigbee_nwk::neighbor::Relationship::Child)
+    );
+}
+
 #[test]
 fn ack_request_confirms_wait_for_the_aps_ack_outcome() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

@@ -9,7 +9,11 @@
 //!   Pending bit set only for a MAC Data Request whose source is in the
 //!   source-match table armed through [`super::Radio::set_frame_pending`]
 //!   (IEEE 802.15.4-2006 7.2.2.3.1 / 7.5.6.3; Zigbee R22/R23 parents). An
-//!   ACK to any other frame, data frames included, carries FP = 0;
+//!   ACK to any other frame, data frames included, carries FP = 0. For each
+//!   acknowledged short-source Data Request it records whether that ACK
+//!   carried FP = 0 ([`super::Radio::data_request_acked_without_pending`]):
+//!   the child has then turned its receiver off, so a frame the stack
+//!   queues after that ACK must wait for the next poll;
 //! * drops ACK frames, frames for another node or PAN, and frames whose ACK
 //!   can no longer be sent within the turnaround window: the sender did not
 //!   get its ACK and retransmits, so the frame must not be delivered twice;
@@ -137,6 +141,47 @@ struct Shared {
     oldest_valid: bool,
     table: FpTable,
     stats: AckStats,
+}
+
+/// Short sources whose latest acknowledged Data Request got FP = 0, stored
+/// as `address + 1` (0 = free). Only short-source polls are served with NWK
+/// indirect data (an extended-source poll fetches an Association Response,
+/// armed long before the child polls). A full table forgets the record,
+/// which only restores immediate delivery. Zero-initialized, so it stays
+/// out of `.data` (whose growth can move `.bss` by its 512-byte alignment).
+#[derive(Clone, Copy)]
+struct AckedWithout([u16; FP_TABLE_LEN]);
+
+impl AckedWithout {
+    const EMPTY: Self = Self([0; FP_TABLE_LEN]);
+
+    fn set(&mut self, address: FpAddress, acked_without: bool) {
+        let FpAddress::Short(short) = address else {
+            return;
+        };
+        if short >= 0xFFFE {
+            return;
+        }
+        let _ = table_set(&mut self.0, short + 1, 0, acked_without);
+    }
+
+    fn contains(&self, address: FpAddress) -> bool {
+        matches!(address, FpAddress::Short(short) if short < 0xFFFE && self.0.contains(&(short + 1)))
+    }
+}
+
+struct AckedWithoutCell(UnsafeCell<AckedWithout>);
+
+// SAFETY: same discipline as `SharedCell`.
+unsafe impl Sync for AckedWithoutCell {}
+
+static ACKED_WITHOUT: AckedWithoutCell = AckedWithoutCell(UnsafeCell::new(AckedWithout::EMPTY));
+
+/// # Safety
+/// As [`shared`].
+#[allow(clippy::mut_from_ref)]
+unsafe fn acked_without() -> &'static mut AckedWithout {
+    unsafe { &mut *ACKED_WITHOUT.0.get() }
 }
 
 struct SharedCell(UnsafeCell<Shared>);
@@ -333,6 +378,20 @@ pub(super) fn set_frame_pending(address: FpAddress, pending: bool) -> Result<(),
 pub(super) fn clear_frame_pending() {
     // SAFETY: called under the lock.
     unsafe { shared() }.table = FpTable::EMPTY;
+    // SAFETY: called under the lock.
+    *unsafe { acked_without() } = AckedWithout::EMPTY;
+}
+
+/// Whether the latest acknowledged Data Request from `address` got FP = 0.
+/// Only masks the line around the read (see [`stats`]).
+pub(super) fn acked_without_pending(address: FpAddress) -> bool {
+    mask();
+    // SAFETY: the `FRC` line is masked.
+    let recorded = unsafe { acked_without() }.contains(address);
+    if unsafe { shared() }.depth == 0 {
+        unsafe { write(NVIC_ISER1, FRC_IRQ_BIT) };
+    }
+    recorded
 }
 
 /// Snapshot of the counters. Only masks the line around the copy: the
@@ -404,8 +463,12 @@ enum Verdict {
     Keep,
     /// ACK frame or a frame for another node/PAN.
     Filter,
-    /// Deliver after an Imm-Ack with this Frame Pending bit.
-    Ack { frame_pending: bool },
+    /// Deliver after an Imm-Ack with this Frame Pending bit; `poll` is the
+    /// source of a MAC Data Request.
+    Ack {
+        frame_pending: bool,
+        poll: Option<FpAddress>,
+    },
 }
 
 fn classify(header: &[u8], stored: usize, filter: &AckFilter, table: &FpTable) -> Verdict {
@@ -415,8 +478,12 @@ fn classify(header: &[u8], stored: usize, filter: &AckFilter, table: &FpTable) -
     if !needs_ack(header, filter) {
         return Verdict::Keep;
     }
-    let frame_pending = data_request_source(header, stored).is_some_and(|src| table.contains(src));
-    Verdict::Ack { frame_pending }
+    let poll = data_request_source(header, stored);
+    let frame_pending = poll.is_some_and(|src| table.contains(src));
+    Verdict::Ack {
+        frame_pending,
+        poll,
+    }
 }
 
 fn examine(s: &mut Shared, entry: u32, rx_done: bool) {
@@ -486,13 +553,18 @@ fn examine(s: &mut Shared, entry: u32, rx_done: bool) {
                 s.stats.queue_full_unacked = s.stats.queue_full_unacked.wrapping_add(1);
                 false
             }
-            Verdict::Ack { frame_pending } => {
+            Verdict::Ack {
+                frame_pending,
+                poll,
+            } => {
                 let sent = send_ack(s, header[2], frame_pending, base);
                 if sent {
                     s.stats.acks = s.stats.acks.wrapping_add(1);
                     if frame_pending {
                         s.stats.fp_acks = s.stats.fp_acks.wrapping_add(1);
                     }
+                    // SAFETY: this is the `FRC` handler.
+                    note_poll_ack(unsafe { acked_without() }, poll, frame_pending);
                 } else {
                     s.stats.ack_tx_fail = s.stats.ack_tx_fail.wrapping_add(1);
                 }
@@ -507,6 +579,15 @@ fn examine(s: &mut Shared, entry: u32, rx_done: bool) {
         }
         // The frame is copied (or dropped): hand its bytes back to BUFC.
         unsafe { write(rx + BUF_READOFFSET, (offset + needed) & BUF_OFFSET_MASK) };
+    }
+}
+
+/// Record the ACK just sent to a Data Request from `poll`: with FP = 0 the
+/// child turns its receiver off, so the stack must not answer that poll
+/// with a frame it queued meanwhile; with FP = 1 it listens for one.
+fn note_poll_ack(record: &mut AckedWithout, poll: Option<FpAddress>, frame_pending: bool) {
+    if let Some(source) = poll {
+        record.set(source, !frame_pending);
     }
 }
 
@@ -833,14 +914,16 @@ mod tests {
         assert_eq!(
             classify(&poll, poll.len(), &f, &table),
             Verdict::Ack {
-                frame_pending: false
+                frame_pending: false,
+                poll: Some(FpAddress::Short(0x7C01)),
             }
         );
         table.set(FpAddress::Short(0x7C01), true).unwrap();
         assert_eq!(
             classify(&poll, poll.len(), &f, &table),
             Verdict::Ack {
-                frame_pending: true
+                frame_pending: true,
+                poll: Some(FpAddress::Short(0x7C01)),
             }
         );
         // A data frame from the same pending child: ACK with FP = 0.
@@ -850,7 +933,8 @@ mod tests {
         assert_eq!(
             classify(&data, data.len(), &f, &table),
             Verdict::Ack {
-                frame_pending: false
+                frame_pending: false,
+                poll: None,
             }
         );
         // Associating child, extended source armed by the association.
@@ -859,7 +943,8 @@ mod tests {
         assert_eq!(
             classify(&assoc[..len], len, &f, &table),
             Verdict::Ack {
-                frame_pending: true
+                frame_pending: true,
+                poll: Some(FpAddress::Extended(CHILD_EXT)),
             }
         );
         // ACK frames are dropped.
@@ -889,6 +974,68 @@ mod tests {
         // Promiscuous (unjoined) filter keeps and never ACKs.
         let none = AckFilter::default();
         assert_eq!(classify(&other, other.len(), &none, &table), Verdict::Keep);
+    }
+
+    /// The hardware sequence of a sleepy child's secured rejoin: it polls
+    /// before its parent queued the Rejoin Response (ACK with FP = 0, the
+    /// child turns its receiver off), the response is queued and armed,
+    /// and the child's next poll is acknowledged with FP = 1.
+    #[test]
+    fn acks_without_frame_pending_are_recorded_per_poll_source() {
+        let f = filter();
+        let mut table = FpTable::EMPTY;
+        let mut acked_without = AckedWithout::EMPTY;
+        let child = FpAddress::Short(0x12D2);
+        let poll = poll_short(0x12D2);
+        let ack = |table: &FpTable, acked_without: &mut AckedWithout| {
+            let Verdict::Ack {
+                frame_pending,
+                poll,
+            } = classify(&poll, poll.len(), &f, table)
+            else {
+                panic!("a poll is acknowledged");
+            };
+            note_poll_ack(acked_without, poll, frame_pending);
+            frame_pending
+        };
+        assert!(!ack(&table, &mut acked_without));
+        assert!(acked_without.contains(child));
+        // The response is queued after that ACK: the stack still sees the
+        // stale poll as answered without data.
+        table.set(child, true).unwrap();
+        assert!(acked_without.contains(child));
+        assert!(ack(&table, &mut acked_without));
+        assert!(!acked_without.contains(child));
+        // An extended-source poll of the same child.
+        let (ext, len) = poll_ext(CHILD_EXT, true);
+        let Verdict::Ack {
+            frame_pending,
+            poll: source,
+        } = classify(&ext[..len], len, &f, &table)
+        else {
+            panic!("a poll is acknowledged");
+        };
+        // Extended-source polls are not served with NWK data: no record.
+        assert!(!frame_pending);
+        note_poll_ack(&mut acked_without, source, frame_pending);
+        assert!(!acked_without.contains(FpAddress::Extended(CHILD_EXT)));
+        // Another FP = 0 poll records the child again; a data frame (no
+        // poll) leaves the record alone.
+        note_poll_ack(&mut acked_without, Some(child), false);
+        note_poll_ack(&mut acked_without, None, true);
+        assert!(acked_without.contains(child));
+        // Address 0 is a valid child (stored as 1); sentinels never match.
+        note_poll_ack(&mut acked_without, Some(FpAddress::Short(0)), false);
+        assert!(acked_without.contains(FpAddress::Short(0)));
+        note_poll_ack(&mut acked_without, Some(FpAddress::Short(0xFFFF)), false);
+        assert!(!acked_without.contains(FpAddress::Short(0xFFFF)));
+        // A full record table forgets new records (immediate delivery).
+        let mut full = AckedWithout::EMPTY;
+        for i in 0..FP_TABLE_LEN as u16 {
+            full.set(FpAddress::Short(i + 1), true);
+        }
+        note_poll_ack(&mut full, Some(FpAddress::Short(0x7000)), false);
+        assert!(!full.contains(FpAddress::Short(0x7000)));
     }
 
     #[test]

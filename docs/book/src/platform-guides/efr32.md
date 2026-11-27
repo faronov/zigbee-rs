@@ -384,7 +384,15 @@ reports `hardware_auto_ack` and the core never calls `send_ack`. The Frame
 Pending bit comes from an 8 short + 8 extended source-match table in the
 HAL that the core arms through `RadioPhy::set_ack_frame_pending` whenever
 it queues indirect data or an association response. `PENDING = 0`: the HAL
-table is the only Frame Pending owner, as on TLSR8258. The core still
+table is the only Frame Pending owner, as on TLSR8258. The interrupt also
+records, per short poll source, whether its latest ACK to a Data Request
+carried FP = 0 (`Radio::data_request_acked_without_pending`, an 8-entry,
+zero-initialized table: 16 B of `.bss`).
+The child turns its receiver off after such an ACK. When the stack serves
+that poll after it has queued a frame (the poll event waited behind slower
+work), the frame stays queued and armed for the next poll, as on the ESP32
+parents (`MacDriver::poll_acked_without_frame_pending`). Without the record,
+the frame was sent to a child that no longer listened, and was lost. The core still
 builds beacons, association and orphan responses and indirect data;
 `PENDING = 0` compiles out only the core's software Frame Pending table. The ED and SED bins keep the
 polled HAL ACK: the HAL acknowledges matching frames while `receive` polls
@@ -1321,6 +1329,31 @@ EmberZNet-derived keys when the backup carries `hashed_tclk`; otherwise
 with network-level membership only, under a private key with no APS
 standing), and the child entry is kept. Transmission to a device, the output and the CTUNE
 offset remain open for the next run.
+
+Second run (build `0907cfddf5e63609` from `0607d319`, reported by the hub's
+HIL run, with sniffer): boot log `NV journals preserved`, `HFXO 38400000 Hz
+CTUNE 100 (BoardDefault), TX 10 dBm, IEEE B0E8E8FFFE5D4D03 (Devinfo)`. The
+radio works both ways at 38.4 MHz: Link Status at −33 dBm / LQI 236 at the
+sniffer, responses decrypted and MAC-ACKed by the device. The sleepy end
+device's secured rejoin still failed, for a MAC reason:
+
+1. the Rejoin Request is decrypted and admitted;
+2. the device polls 4 and 6.5 ms later; the Rejoin Response is only queued
+   about 15 ms after the request, so the interrupt acknowledges both polls
+   with FP = 0;
+3. the stack then serves the stale first poll and sends the response 12 ms
+   after that ACK. The device's radio acknowledges it while idle and its
+   stack drops it, as a sleepy receiver must after FP = 0. Later polls find
+   nothing, and the device retries after ~0.45 s.
+
+The only ACK with FP = 1 in the capture went to the Trust Center rejoin
+that followed, whose unsecured response was queued before the poll; that
+response was accepted. That rejoin then waited for a Transport-Key the
+Trust Center cannot send under an unknown key (the restore had no
+`hashed_tclk` root), and the child aged out as unauthenticated, as
+designed. Fixed by the FP = 0 record above (host tests: the HAL record
+sequence, and the NCP serving the capture's sequence). The device's side
+behaves as specified.
 - On first boot the stock network keys, frame counters and tables are gone.
   Take an EZSP network backup with the hub before flashing and restore it
   over ZRHP; because the IEEE is the stock one, the devices keep their Trust
@@ -1345,12 +1378,12 @@ values at 38.4 MHz against the shared analog states.
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
 | NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 456,956 B | 168,660 B | 89,388 B |
-| NCP, Dongle-M | 460,784 B | 168,660 B | 89,388 B |
-| NCP, BRD4187 on a WSTK | 460,792 B | 168,660 B | 89,388 B |
+| NCP, Dongle-M | 461,236 B | 168,676 B | 89,372 B |
+| NCP, BRD4187 on a WSTK | 461,284 B | 168,660 B | 89,388 B |
 | Router, RF-BM-MG24B1 (GP Proxy Basic) | 345,480 B | 37,140 B | 224,492 B |
 | Router, Dongle-M | 345,804 B | 37,140 B | 224,492 B |
 | Router, BRD4187 on a WSTK | 345,744 B | 37,136 B | 224,496 B |
-| Router, EK2703A | 345,480 B | 37,136 B | 224,496 B |
+| Router, EK2703A | 346,044 B | 37,152 B | 224,480 B |
 
 The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
 MG24 image compared with `15ee9550`, the build-only base without a radio.
@@ -1362,7 +1395,10 @@ hashed-TCLK root and derivation, `SEC_DERIVE_EZSP_KEY`, the
 application-key timeout) and the held boot log added about 3.7 KB to the
 Dongle-M and BRD4187 NCPs against `e96cd867` (Dongle-M 457,108 → 460,784 B
 file-backed), with the same `.bss` and linked stack; the Router changed by
-4 B.
+4 B. The FP = 0 record of the interrupt ACK (`0607d319` → this change) adds
+452 B of flash and 16 B of `.bss` to the Dongle-M NCP and 568 B / 16 B to the
+EK2703A Router. The record is zero-initialized on purpose: in `.data` it
+moved the MG22 Router's 512-byte-aligned `.bss` past the end of SRAM.
 
 The NCP uses 33 % of the application window and 66 % of SRAM for static
 data. The compact capacity tier is not needed. The recorded fatal resets
