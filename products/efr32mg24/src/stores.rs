@@ -235,9 +235,10 @@ const fn looks_like_nvm3(word: u32) -> bool {
 }
 
 /// The first 8 KiB page of the NV window whose first word is not
-/// [`ours`]. Independent of the foreign format: the stock EmberZNet 7.4.5
-/// NVM3 pages of a real Dongle Max were not recognised by a GSDK NVM3 page
-/// header check, so nothing here relies on knowing what is foreign.
+/// [`ours`]. Independent of the foreign format: nothing here relies on
+/// knowing what is foreign. (The stock EmberZNet 7.4.5 NVM3 does carry the
+/// GSDK page header, `0xB29A0001` first, as captured on a BRD4187; the
+/// rule covers any other format too.)
 fn foreign_page<Nv: NorFlash>(nv: &mut Nv) -> Result<Option<ForeignPage>, SecurityStoreError> {
     let mut first = None;
     let mut nvm3 = false;
@@ -434,10 +435,10 @@ mod tests {
     /// (`0x0817_6000..0x0817_E000`, four 8 KiB pages).
     const STOCK_NVM3: core::ops::Range<u32> = 0x17_6000..0x17_E000;
 
-    /// A GSDK NVM3 page header (see [`is_nvm3_page_header`]) as a fresh
-    /// format leaves it: magic and version, erase count and complement with
-    /// Berger codes, page state erased, format word with the 8 KiB
-    /// page-size code.
+    /// A GSDK NVM3 page header as a fresh format leaves it: magic and
+    /// version, erase count and complement with Berger codes, page state
+    /// good, format word. Matches [`EMBERZNET_745_PAGE_HEADER`] for erase
+    /// count 1.
     fn nvm3_header(erase_count: u32) -> [u32; 5] {
         let coded = |value: u32| {
             let value = value & 0x07FF_FFFF;
@@ -448,9 +449,34 @@ mod tests {
             coded(erase_count),
             coded(!erase_count),
             0xFFFF_FFFF,
-            0xFFFF_8000,
+            0xFFFF_903C,
         ]
     }
+
+    /// The page header of each of the four stock NVM3 pages
+    /// (`0x0817_6000`, `0x0817_8000`, `0x0817_A000`, `0x0817_C000`) as
+    /// captured over SWD on a BRD4187 (EFR32MG24B220, 1536 KiB) about 90 s
+    /// after SONOFF's EmberZNet 7.4.5 NCP (`zigbee_ncp_uart_hw_donglem_v7.4.5.gbl`,
+    /// SHA-256 `44b81c1e…`) first booted on an erased window. Nothing else
+    /// above the image was written; the first page also held 1,856 bytes of
+    /// objects.
+    const EMBERZNET_745_PAGE_HEADER: [u32; 5] = [
+        0xB29A_0001,
+        0xD000_0001,
+        0x0FFF_FFFE,
+        0xFFFF_FFFF,
+        0xFFFF_903C,
+    ];
+
+    /// The first words of the journal pages of a commissioned NCP of ours,
+    /// captured on the same board (bus address offset, magic); every other
+    /// page start of the window was erased.
+    const CAPTURED_NCP_PAGE_STARTS: [(u32, [u8; 4]); 4] = [
+        (0x15_C000, *b"ZBAT"),
+        (0x16_6000, *b"ZBCT"),
+        (0x17_0000, *b"ZBTS"),
+        (0x17_8000, *b"ZBSS"),
+    ];
 
     /// NVM3-shaped pages: a real page header followed by object headers and
     /// payloads, deterministic. Not a dump of a unit.
@@ -621,6 +647,73 @@ mod tests {
         );
     }
 
+    /// The captured stock NVM3: our model of the header is the real one,
+    /// and the window is foreign with the NVM3 label (the boot log of an
+    /// NCP of ours on that board said exactly this).
+    #[test]
+    fn the_captured_emberznet_nvm3_is_foreign() {
+        assert_eq!(nvm3_header(1), EMBERZNET_745_PAGE_HEADER);
+        let region = Region::filled(0xFF);
+        // Our journal rolled over far enough for its newest records to sit
+        // in the top page 0x0817_E000, above the stock NVM3.
+        let (mut journal, _) = region.open(crate::ROLE_TAG);
+        let mut state = commissioned();
+        for _ in 0..4 * SecurityStore::<View>::SLOTS_PER_SECTOR {
+            if region.bytes(STOCK_NVM3.end, STOCK_NVM3.end + 4) == *b"ZBSS" {
+                break;
+            }
+            state.global_counter_limit += 0x400;
+            journal.store(&state).unwrap();
+        }
+        assert_eq!(region.bytes(STOCK_NVM3.end, STOCK_NVM3.end + 4), *b"ZBSS");
+        // The stock NVM3 pages as captured, over the rest of the window.
+        region.fill(
+            STOCK_NVM3.start,
+            &vec![0xFF; (STOCK_NVM3.end - STOCK_NVM3.start) as usize],
+        );
+        for page in STOCK_NVM3.step_by(PAGE) {
+            let header: Vec<u8> = EMBERZNET_745_PAGE_HEADER
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect();
+            region.fill(page, &header);
+        }
+        region.fill(STOCK_NVM3.start + 20, &[0x5C; 1856]);
+        // A valid journal of ours is still there and does not protect it.
+        assert_eq!(region.journal().load(), Ok(Some(state)));
+        let (mut journal, opened) = region.open(crate::ROLE_TAG);
+        assert_eq!(
+            opened,
+            Opened::Foreign(ForeignPage {
+                address: 0x0817_6000,
+                first_word: 0xB29A_0001,
+                nvm3: true,
+            })
+        );
+        assert_erased(&region);
+        assert_eq!(journal.load(), Ok(None));
+    }
+
+    /// The captured page starts of a commissioned NCP of ours are ours.
+    #[test]
+    fn the_captured_ncp_page_starts_are_ours() {
+        let region = Region::filled(0xFF);
+        let (mut journal, _) = region.open(crate::ROLE_TAG);
+        journal.store(&commissioned()).unwrap();
+        for (offset, magic) in CAPTURED_NCP_PAGE_STARTS {
+            if offset != SECURITY.start {
+                region.fill(offset, &marked(&magic, 0xA5));
+            }
+        }
+        for (offset, magic) in CAPTURED_NCP_PAGE_STARTS {
+            assert_eq!(region.bytes(offset, offset + 4), magic);
+        }
+        let before = region.bytes(NV_START, FLASH_SIZE);
+        let (_, opened) = region.open(crate::ROLE_TAG);
+        assert_eq!(opened, Opened::Existing);
+        assert_eq!(region.bytes(NV_START, FLASH_SIZE), before);
+    }
+
     #[test]
     fn page_start_ownership_is_exact() {
         assert!(ours(u32::MAX));
@@ -783,8 +876,9 @@ mod tests {
     }
 
     /// The same return path when the stock pages are of a format nothing
-    /// here recognises (the real EmberZNet 7.4.5 pages did not match the
-    /// GSDK page header check): still foreign, still erased.
+    /// here recognises (another stock image or NVM3 version; the captured
+    /// EmberZNet 7.4.5 pages do carry the GSDK header): still foreign,
+    /// still erased.
     #[test]
     fn return_from_stock_with_unrecognised_pages_erases_stale_records() {
         let region = Region::filled(0xFF);
