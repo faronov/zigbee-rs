@@ -1,6 +1,6 @@
 {
-  "status": "CANDIDATES - unverified until hardware gate H5 (real ZBT-1 key readout)",
-  "algorithm": "HMAC with AES-MMO (Zigbee keyed hash), key = hashed_tclk, message = device EUI64; byte order of the EUI64 is the open point",
+  "status": "on-air order per the GSDK 4.5.0 source (zb_sec_man_derive_key, TC_HASHED_LINK_KEY, over an EmberEUI64); hardware key match is gate H5",
+  "algorithm": "HMAC with AES-MMO (Zigbee keyed hash), key = hashed_tclk, message = device EUI64 in on-air (little-endian) order; the big-endian column is kept as the negative case",
   "vectors": [
     {
       "hashed_tclk": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",

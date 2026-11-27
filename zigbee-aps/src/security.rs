@@ -1283,6 +1283,34 @@ pub fn derive_verify_key_hash_with<P: ForwardAesProvider>(
     hmac_mmo_with(provider, link_key, &[0x03])
 }
 
+/// The unique Trust Center link key an EmberZNet Trust Center in hashed
+/// link-key mode (`EMBER_TRUST_CENTER_USES_HASHED_LINK_KEY`) uses for
+/// `device`: the keyed hash (B.1.4) of the device's EUI-64 with the root
+/// key `root` (`stack_specific.ezsp.hashed_tclk` of an EmberZNet backup).
+///
+/// GSDK 4.5.0 `protocol/zigbee/stack/security/zigbee-security-manager-
+/// no-vault.c` `zb_sec_man_derive_key` (`SL_ZB_SEC_MAN_DERIVED_KEY_TYPE_
+/// TC_HASHED_LINK_KEY`): `sl_zb_sec_man_hmac_aes_mmo(context->eui64, 8, ..)`
+/// keyed with the loaded root, the same HMAC (pads 0x36/0x5C, AES-MMO) as
+/// [`derive_key_transport_key`]; `aps-keys.c` `sli_zigbee_get_link_key`
+/// passes the `EmberEUI64` as stored, i.e. in over-the-air (little-endian)
+/// byte order, which is the order of [`IeeeAddress`] here.
+/// Software-AES wrapper over [`derive_ezsp_hashed_link_key_with`].
+pub fn derive_ezsp_hashed_link_key(root: &AesKey, device: &[u8; 8]) -> AesKey {
+    derive_ezsp_hashed_link_key_with(&mut SoftwareAesProvider::new(), root, device)
+        .expect("software AES is infallible")
+}
+
+/// [`derive_ezsp_hashed_link_key`] keyed through `provider`; `None` on an
+/// AES backend failure.
+pub fn derive_ezsp_hashed_link_key_with<P: ForwardAesProvider>(
+    provider: &mut P,
+    root: &AesKey,
+    device: &[u8; 8],
+) -> Option<AesKey> {
+    hmac_mmo_with(provider, root, device)
+}
+
 #[cfg(test)]
 mod mmo_tests {
     use super::*;
@@ -1315,6 +1343,73 @@ mod mmo_tests {
             [
                 0xC5, 0xA4, 0x70, 0x35, 0xC3, 0x32, 0xCC, 0xBF, 0x25, 0x15, 0x71, 0xD8, 0xBA, 0xDE,
                 0xD1, 0x88,
+            ]
+        );
+    }
+
+    /// Zigbee specification Annex C.6.1 (keyed hash function for message
+    /// authentication): key 0x40..=0x4F, message 0xC0.
+    #[test]
+    fn keyed_hash_specification_vector() {
+        let key: AesKey = core::array::from_fn(|i| 0x40 + i as u8);
+        assert_eq!(
+            hmac_mmo_with(&mut SoftwareAesProvider::new(), &key, &[0xC0]),
+            Some([
+                0x45, 0x12, 0x80, 0x7B, 0xF9, 0x4C, 0xB3, 0x40, 0x0F, 0x0E, 0x2C, 0x25, 0xFB, 0x76,
+                0xE9, 0x99,
+            ])
+        );
+    }
+
+    /// EmberZNet hashed link key: the keyed hash of the EUI-64 bytes in
+    /// over-the-air order. Regression vectors of this implementation, whose
+    /// keyed hash matches the specification vector above; the hardware
+    /// cross-check against a key an EmberZNet Trust Center derived is gate
+    /// H5 of the host-protocol specification.
+    #[test]
+    fn ezsp_hashed_link_key_vectors() {
+        let root: AesKey = core::array::from_fn(|i| 0x40 + i as u8);
+        // EUI-64 60:55:F9:00:00:F6:96:88, stored least-significant first.
+        let device = [0x88, 0x96, 0xF6, 0x00, 0x00, 0xF9, 0x55, 0x60];
+        assert_eq!(
+            derive_ezsp_hashed_link_key(&root, &device),
+            [
+                0x9E, 0x40, 0xBC, 0xD3, 0xF0, 0xCE, 0x15, 0x85, 0x93, 0xB9, 0x2B, 0x30, 0x32, 0xE4,
+                0x7A, 0x65,
+            ]
+        );
+        assert_eq!(
+            derive_ezsp_hashed_link_key(&ZBA09, &device),
+            [
+                0x0B, 0x6D, 0xE4, 0x0B, 0x36, 0x38, 0x61, 0xD3, 0xB9, 0xBB, 0x81, 0x66, 0x7F, 0x70,
+                0xFE, 0xF6,
+            ]
+        );
+        // The byte order matters, and every device gets its own key.
+        let mut reversed = device;
+        reversed.reverse();
+        assert_ne!(
+            derive_ezsp_hashed_link_key(&root, &device),
+            derive_ezsp_hashed_link_key(&root, &reversed)
+        );
+        // host-protocol-vectors/ezsp_hashed_tclk.json (independent Python
+        // implementation): IEEE 00:17:88:01:02:A1:B2:C3, on-air order.
+        let seed = [
+            0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2,
+            0xE1, 0xF0,
+        ];
+        assert_eq!(
+            derive_ezsp_hashed_link_key(&seed, &[0xC3, 0xB2, 0xA1, 0x02, 0x01, 0x88, 0x17, 0x00]),
+            [
+                0x89, 0x4D, 0xB2, 0x3B, 0x28, 0xA4, 0x8C, 0x56, 0x63, 0x39, 0x1D, 0x7D, 0xFF, 0x11,
+                0x05, 0x5C,
+            ]
+        );
+        assert_eq!(
+            derive_ezsp_hashed_link_key(&seed, &[0x0C, 0x0B, 0x0A, 0xFE, 0xFF, 0x14, 0x2E, 0x84]),
+            [
+                0xFF, 0x5B, 0x23, 0x60, 0x29, 0x3D, 0x50, 0x1E, 0x7C, 0x14, 0x12, 0x64, 0x81, 0xC5,
+                0x0C, 0xBD,
             ]
         );
     }
