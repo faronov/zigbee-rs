@@ -4,6 +4,10 @@
 //!
 //! Opening policy (before the stack reads anything):
 //!
+//! * a GSDK NVM3 page header at any 8 KiB page start of the window (the
+//!   stock EmberZNet NVM3 ran here since our journals were written): every
+//!   window is erased, even if older journal records of ours survive in
+//!   pages NVM3 never used ([`Opened::ForeignNvm3`]);
 //! * no valid security record (blank flash, the stock EmberZNet NVM3 or any
 //!   foreign bytes): every NCP window is erased — foreign bytes are never
 //!   interpreted;
@@ -69,6 +73,9 @@ pub enum Opened {
     Existing,
     /// Blank or foreign NV: every window erased.
     Fresh,
+    /// An NVM3 instance (stock EmberZNet) lies in the window: every window
+    /// erased, whatever older journal records of ours it still held.
+    ForeignNvm3,
     /// Another role's journal: keys cleared (counter limits kept), its
     /// other journals erased.
     RoleChanged,
@@ -131,10 +138,16 @@ pub fn open(flash: Flash, role_tag: u16) -> Result<(Stores, Opened), SecuritySto
 
 /// The opening policy over any flash: `security` is the security window,
 /// `nv` mints a view of the whole NV region (offset 0 = [`NV_START`]).
-/// Nothing in the region is interpreted unless the security journal holds a
-/// valid record: blank, EmberZNet NVM3 or any other foreign bytes fail its
-/// magic/commit/CRC checks, so `load` finds no record and the whole region
-/// is erased.
+///
+/// Nothing in the region is interpreted while an NVM3 page header sits at
+/// any of its page starts ([`nvm3_page_at`]): after "ours → clear the stock
+/// NVM3 pages → stock EmberZNet → ours", records of our earlier run can
+/// survive in a page the stock NVM3 never used (the top page
+/// `0x0817_E000`, outside the 32 KiB stock instance), and resuming them
+/// would bring back the pre-stock network with frame-counter reservations
+/// behind what the network saw in between. Otherwise nothing is
+/// interpreted unless the security journal holds a valid record: blank or
+/// foreign bytes fail its magic/commit/CRC checks.
 fn prepare<Sec, Nv>(
     security: &mut SecurityStateJournal<Sec, { SECURITY.sector }>,
     mut nv: impl FnMut() -> Nv,
@@ -145,12 +158,17 @@ where
     Nv: NorFlash,
 {
     let mut opened = Opened::Existing;
-    if security.load()?.is_none() {
+    let nvm3 = nvm3_page_at(&mut nv())?;
+    if nvm3 || security.load()?.is_none() {
         nv().erase(0, NV_SIZE as u32)
             .map_err(|_| SecurityStoreError::Hardware)?;
         // Re-read the erased journal.
         let _ = security.storage_mut();
-        opened = Opened::Fresh;
+        opened = if nvm3 {
+            Opened::ForeignNvm3
+        } else {
+            Opened::Fresh
+        };
     }
     if security.select_role_tag(role_tag)? {
         // Everything but the identity and security windows.
@@ -159,6 +177,39 @@ where
         opened = Opened::RoleChanged;
     }
     Ok(opened)
+}
+
+/// Whether any 8 KiB page of the NV window starts with a GSDK NVM3 page
+/// header.
+///
+/// GSDK 4.5.0 `libnvm3` (`nvm3_pageHeaderWrite`, `nvm3_pageGetState`,
+/// `nvm3_pageGetEraseCnt`; the header file is not shipped): word 0 is
+/// `0xB29A << 16 | version` (version 1), words 1 and 2 hold the page erase
+/// count and its complement in bits 26..0, each with a Berger code (the
+/// number of zero bits of those 27 bits) in bits 31..27. A page counts when
+/// the magic matches and either erase-count word is consistent, which no
+/// page start of our journals can satisfy: they begin with an erased word
+/// or an ASCII `ZB..` record magic.
+fn nvm3_page_at<Nv: NorFlash>(nv: &mut Nv) -> Result<bool, SecurityStoreError> {
+    let mut page = 0;
+    while page < NV_SIZE {
+        let mut header = [0u8; 12];
+        nv.read(page as u32, &mut header)
+            .map_err(|_| SecurityStoreError::Hardware)?;
+        let word = |i: usize| u32::from_le_bytes(header[4 * i..4 * i + 4].try_into().unwrap());
+        if is_nvm3_page_header(word(0), word(1), word(2)) {
+            return Ok(true);
+        }
+        page += efr32s2_hal::flash::FLASH_PAGE_SIZE;
+    }
+    Ok(false)
+}
+
+const fn is_nvm3_page_header(magic: u32, erase_count: u32, erase_count_inverse: u32) -> bool {
+    const fn berger_ok(word: u32) -> bool {
+        word >> 27 == 27 - (word & 0x07FF_FFFF).count_ones()
+    }
+    magic >> 16 == 0xB29A && (berger_ok(erase_count) || berger_ok(erase_count_inverse))
 }
 
 const _: () = {
@@ -301,21 +352,29 @@ mod tests {
     /// (`0x0817_6000..0x0817_E000`, four 8 KiB pages).
     const STOCK_NVM3: core::ops::Range<u32> = 0x17_6000..0x17_E000;
 
-    /// NVM3-shaped pages: an AN1135-style page header (magic `0xB29A`, an
-    /// erase counter and its complement, page state) followed by object
-    /// headers and payloads, deterministic. Not a dump of a unit: nothing
-    /// in the policy depends on the exact NVM3 encoding, only on the bytes
-    /// not being a valid zigbee-rs record.
+    /// A GSDK NVM3 page header (see [`is_nvm3_page_header`]) as a fresh
+    /// format leaves it: magic and version, erase count and complement with
+    /// Berger codes, page state erased, format word with the 8 KiB
+    /// page-size code.
+    fn nvm3_header(erase_count: u32) -> [u32; 5] {
+        let coded = |value: u32| {
+            let value = value & 0x07FF_FFFF;
+            value | (27 - value.count_ones()) << 27
+        };
+        [
+            0xB29A_0001,
+            coded(erase_count),
+            coded(!erase_count),
+            0xFFFF_FFFF,
+            0xFFFF_8000,
+        ]
+    }
+
+    /// NVM3-shaped pages: a real page header followed by object headers and
+    /// payloads, deterministic. Not a dump of a unit.
     fn nvm3_like_page(index: u32) -> Vec<u8> {
         let mut page = vec![0xFF; PAGE];
-        let header = [
-            0xB29A_0001u32,
-            0x0000_0003 + index,
-            !(0x0000_0003 + index),
-            0xFFFF_FFFF,
-            0xFFFF_FFFE,
-        ];
-        for (slot, word) in header.iter().enumerate() {
+        for (slot, word) in nvm3_header(3 + index).iter().enumerate() {
             page[slot * 4..slot * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         let mut seed = 0x1234_5678u32 ^ index;
@@ -369,7 +428,7 @@ mod tests {
         // security window.
         assert!(STOCK_NVM3.start < TRUST_CENTER.end() && STOCK_NVM3.end > SECURITY.start);
         let (mut journal, opened) = region.open(crate::ROLE_TAG);
-        assert_eq!(opened, Opened::Fresh);
+        assert_eq!(opened, Opened::ForeignNvm3);
         assert_erased(&region);
         assert_eq!(journal.load(), Ok(None));
         // The erased journal takes a first record and keeps it.
@@ -452,5 +511,82 @@ mod tests {
             region.bytes(IDENTITY.start, IDENTITY.start + 16),
             [0x5A; 16]
         );
+    }
+
+    #[test]
+    fn nvm3_header_detection_is_exact() {
+        let [magic, count, inverse, _, _] = nvm3_header(7);
+        assert!(is_nvm3_page_header(magic, count, inverse));
+        // Either erase-count copy is enough (NVM3 reads the second when the
+        // first is torn).
+        assert!(is_nvm3_page_header(magic, 0, inverse));
+        assert!(is_nvm3_page_header(magic, count, 0xFFFF_FFFF));
+        assert!(!is_nvm3_page_header(magic, count ^ 1, inverse ^ 1));
+        assert!(!is_nvm3_page_header(0xB29B_0001, count, inverse));
+        // Every page start of our journals: erased, or an ASCII record magic.
+        let erased = u32::MAX;
+        assert!(!is_nvm3_page_header(erased, erased, erased));
+        for magic in [
+            b"ZBSS", b"ZBSR", b"ZBTS", b"ZBCT", b"ZBGP", b"ZBGC", b"ZBGS", b"ZBAT", b"ZBST",
+        ] {
+            assert!(!is_nvm3_page_header(
+                u32::from_le_bytes(*magic),
+                count,
+                inverse
+            ));
+        }
+    }
+
+    #[test]
+    fn return_from_stock_erases_stale_records_above_the_stock_nvm3() {
+        // Our NCP ran long enough for the security journal to roll over:
+        // its newest records sit in the top page 0x0817_E000..0x0818_0000.
+        let region = Region::filled(0xFF);
+        let (mut journal, _) = region.open(crate::ROLE_TAG);
+        let mut state = commissioned();
+        let top = |region: &Region| {
+            region
+                .bytes(STOCK_NVM3.end, FLASH_SIZE)
+                .chunks(4)
+                .any(|word| word == b"ZBSS")
+        };
+        while !top(&region) {
+            state.global_counter_limit += 0x400;
+            journal.store(&state).unwrap();
+        }
+        // The 32 KiB `nvm3_clear` GBL erases 0x0817_6000..0x0817_E000 only,
+        // then the stock EmberZNet formats its NVM3 there.
+        region.fill(
+            STOCK_NVM3.start,
+            &vec![0xFF; (STOCK_NVM3.end - STOCK_NVM3.start) as usize],
+        );
+        for (index, page) in STOCK_NVM3.step_by(PAGE).enumerate() {
+            region.fill(page, &nvm3_like_page(index as u32));
+        }
+        // The stale records alone would still load: the hazard.
+        assert!(region.journal().load().unwrap().is_some());
+        // Back on our NCP: the NVM3 headers make the whole window foreign.
+        let (mut journal, opened) = region.open(crate::ROLE_TAG);
+        assert_eq!(opened, Opened::ForeignNvm3);
+        assert_erased(&region);
+        assert_eq!(journal.load(), Ok(None));
+    }
+
+    #[test]
+    fn an_nvm3_header_at_any_page_start_is_foreign() {
+        // A 40 KiB stock instance reaches the top page; other NVM3 layouts
+        // start elsewhere. A valid journal of ours does not protect them.
+        for page in [IDENTITY.start, TRUST_CENTER.start, 0x17_E000] {
+            let region = Region::filled(0xFF);
+            let (mut journal, _) = region.open(crate::ROLE_TAG);
+            journal.store(&commissioned()).unwrap();
+            region.fill(page, &nvm3_like_page(0)[..PAGE]);
+            assert_eq!(
+                region.open(crate::ROLE_TAG).1,
+                Opened::ForeignNvm3,
+                "{page:#x}"
+            );
+            assert_erased(&region);
+        }
     }
 }

@@ -257,6 +257,11 @@ fn compose(
     match opened {
         Opened::Existing => log::info!("[MG24] journals preserved"),
         Opened::Fresh => log::warn!("[MG24] blank/foreign NV erased; fresh join required"),
+        Opened::ForeignNvm3 => {
+            log::warn!(
+                "[MG24] NVM3 (stock EmberZNet) in the NV window: erased; fresh join required"
+            )
+        }
         Opened::RoleChanged => log::warn!("[MG24] journal of another role: keys cleared"),
     }
     let stores::Stores {

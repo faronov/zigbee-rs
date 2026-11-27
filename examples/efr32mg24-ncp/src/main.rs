@@ -214,6 +214,7 @@ async fn main(_spawner: Spawner) {
     match opened {
         Opened::Existing => log::info!("NV journals preserved"),
         Opened::Fresh => log::warn!("blank/foreign NV erased"),
+        Opened::ForeignNvm3 => log::warn!("NVM3 (stock EmberZNet) in the NV window: erased"),
         Opened::RoleChanged => log::warn!("journal of another role: keys cleared"),
     }
     let ncp_identity = NcpIdentity {
