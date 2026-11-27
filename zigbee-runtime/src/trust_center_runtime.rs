@@ -1219,12 +1219,89 @@ impl<S: TrustCenterDeviceStore> TrustCenterRuntime<S> {
             }
             TrustCenterAction::None => {
                 if self.table.device(&indication.device_address).is_some() {
+                    #[cfg(feature = "ncp-capacity")]
+                    self.derive_unknown_ezsp_key(device, &indication.device_address)?;
                     self.upsert_table_device(device, &indication.device_address, false)?;
                 }
             }
             other => self.execute_action(device, other).await?,
         }
         self.checkpoint_table(device)
+    }
+
+    /// A device admitted with an unknown link key gets the key an EmberZNet
+    /// Trust Center in hashed mode gave it, when a restore kept that Trust
+    /// Center's root ([`Self::set_ezsp_hashed_link_key_root`]).
+    #[cfg(feature = "ncp-capacity")]
+    fn derive_unknown_ezsp_key<M: MacDriver>(
+        &mut self,
+        device: &mut ZigbeeDevice<M>,
+        address: &IeeeAddress,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        let Some(entry) = self
+            .table
+            .device(address)
+            .filter(|entry| !entry.link_key_known())
+            .copied()
+        else {
+            return Ok(());
+        };
+        let Some(key) = self.derive_ezsp_link_key(device, address) else {
+            return Ok(());
+        };
+        let location =
+            (entry.parent_address != [0; 8]).then_some((entry.parent_address, entry.short_address));
+        self.table.restore_link_key(
+            *address,
+            key,
+            zigbee_bdb::trust_center::TrustCenterKeyOrigin::EzspHashed,
+            zigbee_bdb::trust_center::TrustCenterKeyAttributes::Verified,
+            location,
+        )?;
+        // `restore_link_key` keeps the location only when given; restore the
+        // join deadline as well (none for an admitted unknown key).
+        if let Some(stored) = self.table.device_mut(address) {
+            stored.join_timeout_remaining_secs = entry.join_timeout_remaining_secs;
+        }
+        Ok(())
+    }
+
+    /// The EZSP hashed link-key root kept from a restore.
+    #[cfg(feature = "ncp-capacity")]
+    pub fn ezsp_hashed_link_key_root(&self) -> Option<zigbee_aps::security::AesKey> {
+        live_ref(&self.state, self.live).and_then(|state| state.ezsp_hashed_link_key_root())
+    }
+
+    /// Keep (`Some`) or forget the root key of the EmberZNet Trust Center
+    /// whose network was restored (`stack_specific.ezsp.hashed_tclk`). It is
+    /// persisted with the Trust Center table; devices registered without a
+    /// key from then on get their derived key.
+    #[cfg(feature = "ncp-capacity")]
+    pub fn set_ezsp_hashed_link_key_root<M: MacDriver>(
+        &mut self,
+        device: &ZigbeeDevice<M>,
+        root: Option<zigbee_aps::security::AesKey>,
+    ) -> Result<(), TrustCenterRuntimeError> {
+        self.require_initialized_network(device)?;
+        let state = live_mut(&mut self.state, self.live)?;
+        if state.ezsp_hashed_link_key_root() == root {
+            return Ok(());
+        }
+        state.set_ezsp_hashed_link_key_root(root);
+        self.commit()
+    }
+
+    /// The link key the EmberZNet Trust Center of a restored network gave
+    /// `address`, derived with the platform AES engine; `None` without a
+    /// root or on an AES failure.
+    #[cfg(feature = "ncp-capacity")]
+    pub fn derive_ezsp_link_key<M: MacDriver>(
+        &self,
+        device: &mut ZigbeeDevice<M>,
+        address: &IeeeAddress,
+    ) -> Option<zigbee_aps::security::AesKey> {
+        let root = self.ezsp_hashed_link_key_root()?;
+        zigbee_aps::security::derive_ezsp_hashed_link_key_with(device.mac_mut(), &root, address)
     }
 
     async fn handle_request_key<M: MacDriver>(
@@ -2658,6 +2735,15 @@ fn install_key<M: MacDriver>(
     device: &mut ZigbeeDevice<M>,
     stored: &PersistentTrustCenterDevice,
 ) -> Result<(), TrustCenterRuntimeError> {
+    if !stored.device.link_key_known() {
+        // No key to install: frames for the device fall back to the APS
+        // default, as for any device without an entry; a stale entry goes.
+        device
+            .aps_mut()
+            .security_mut()
+            .remove_key(&stored.device.ieee_address, ApsKeyType::TrustCenterLinkKey);
+        return Ok(());
+    }
     let reservation = ApsFrameCounterReservation::new(
         stored.outgoing_frame_counter,
         stored.outgoing_frame_counter_limit,
@@ -4590,9 +4676,183 @@ mod tests {
         assert!(!runtime.has_pending_transactions());
     }
 
+    /// A restored child without a link key (an EZSP backup lists only its
+    /// address) rejoins its parent, the NCP, with a network-secured Rejoin
+    /// Request: the Trust Center admits it, keeps it, and installs no key.
+    #[test]
+    fn a_secured_rejoin_of_a_restored_child_without_a_key_is_admitted_and_kept() {
+        let mut device = coordinator();
+        let short = add_sleepy_child(&mut device, CHILD_A);
+        let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
+        block_on(runtime.initialize(&mut device)).unwrap();
+        device.mac_mut().clear_tx_history();
+        block_on(runtime.handle_indication(
+            &mut device,
+            ApsmeSecurityIndication::UpdateDevice(ApsmeUpdateDeviceIndication {
+                source_address: TC,
+                device_address: CHILD_A,
+                device_short_address: short,
+                status: ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+            }),
+        ))
+        .unwrap();
+        #[cfg(feature = "host-passthrough")]
+        assert!(matches!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Joined {
+                device_address: CHILD_A,
+                admitted: true,
+                ..
+            })
+        ));
+        let entry = *runtime.table().device(&CHILD_A).unwrap();
+        assert_eq!(entry.key_origin, TrustCenterKeyOrigin::Unknown);
+        assert_eq!((entry.parent_address, entry.short_address), (TC, short));
+        // Durable, without a removal or a key transport on the air.
+        let stored = runtime.store_mut().load().unwrap().unwrap();
+        assert_eq!(
+            stored.device(&CHILD_A).unwrap().device.key_origin,
+            TrustCenterKeyOrigin::Unknown
+        );
+        assert!(!runtime.has_pending_transactions());
+        assert!(runtime.pending_delivery.is_none());
+        assert!(device.mac().tx_history().is_empty());
+        assert!(
+            device
+                .aps()
+                .security()
+                .find_key(&CHILD_A, ApsKeyType::TrustCenterLinkKey)
+                .is_none()
+        );
+        // The child stays where it was, past any join deadline.
+        block_on(runtime.poll(&mut device)).unwrap();
+        assert!(
+            device
+                .aps()
+                .nwk()
+                .neighbor_table()
+                .children()
+                .any(|child| child.ieee_address == CHILD_A)
+        );
+        assert!(runtime.table().device(&CHILD_A).is_some());
+    }
+
+    /// A Trust Center rejoin would need the unknown key for the network key:
+    /// refused without a command, and the restored child entry stays.
+    #[test]
+    fn a_refused_trust_center_rejoin_keeps_the_restored_child() {
+        let mut device = coordinator();
+        let short = add_sleepy_child(&mut device, CHILD_A);
+        let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
+        block_on(runtime.initialize(&mut device)).unwrap();
+        runtime
+            .restore_link_key(
+                &mut device,
+                CHILD_A,
+                [0; 16],
+                TrustCenterKeyOrigin::Unknown,
+                TrustCenterKeyAttributes::Verified,
+                Some((TC, short)),
+            )
+            .unwrap();
+        device.mac_mut().clear_tx_history();
+        block_on(runtime.handle_indication(
+            &mut device,
+            ApsmeSecurityIndication::UpdateDevice(ApsmeUpdateDeviceIndication {
+                source_address: TC,
+                device_address: CHILD_A,
+                device_short_address: short,
+                status: ApsUpdateDeviceStatus::StandardDeviceTrustCenterRejoin,
+            }),
+        ))
+        .unwrap();
+        #[cfg(feature = "host-passthrough")]
+        assert!(matches!(
+            runtime.take_host_event(),
+            Some(TrustCenterHostEvent::Joined {
+                device_address: CHILD_A,
+                admitted: false,
+                ..
+            })
+        ));
+        assert!(runtime.pending_delivery.is_none());
+        assert!(device.mac().tx_history().is_empty());
+        assert!(runtime.table().device(&CHILD_A).is_some());
+        assert!(
+            runtime
+                .store_mut()
+                .load()
+                .unwrap()
+                .unwrap()
+                .device(&CHILD_A)
+                .is_some()
+        );
+        assert!(
+            device
+                .aps()
+                .nwk()
+                .neighbor_table()
+                .children()
+                .any(|child| child.ieee_address == CHILD_A)
+        );
+    }
+
+    /// With the root of a restored EmberZNet network, a device admitted by a
+    /// secured rejoin gets the key that Trust Center gave it, installed for
+    /// APS, and the root survives a reboot with the table.
+    #[cfg(feature = "ncp-capacity")]
+    #[test]
+    fn an_admitted_device_gets_its_ezsp_hashed_key_from_the_restored_root() {
+        let mut device = coordinator();
+        let short = add_sleepy_child(&mut device, CHILD_A);
+        let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
+        block_on(runtime.initialize(&mut device)).unwrap();
+        let root = [0x3C; 16];
+        runtime
+            .set_ezsp_hashed_link_key_root(&device, Some(root))
+            .unwrap();
+        block_on(runtime.handle_indication(
+            &mut device,
+            ApsmeSecurityIndication::UpdateDevice(ApsmeUpdateDeviceIndication {
+                source_address: TC,
+                device_address: CHILD_A,
+                device_short_address: short,
+                status: ApsUpdateDeviceStatus::StandardDeviceSecuredRejoin,
+            }),
+        ))
+        .unwrap();
+        let expected = zigbee_aps::security::derive_ezsp_hashed_link_key(&root, &CHILD_A);
+        let entry = *runtime.table().device(&CHILD_A).unwrap();
+        assert_eq!(entry.key_origin, TrustCenterKeyOrigin::EzspHashed);
+        assert_eq!(entry.key_attributes, TrustCenterKeyAttributes::Verified);
+        assert_eq!(entry.link_key, expected);
+        assert_eq!((entry.parent_address, entry.short_address), (TC, short));
+        assert_eq!(entry.join_timeout_remaining_secs, 0);
+        assert_eq!(
+            device
+                .aps()
+                .security()
+                .find_key(&CHILD_A, ApsKeyType::TrustCenterLinkKey)
+                .map(|key| key.key),
+            Some(expected)
+        );
+        let stored = runtime.store_mut().load().unwrap().unwrap();
+        assert_eq!(stored.ezsp_hashed_link_key_root(), Some(root));
+        assert_eq!(stored.device(&CHILD_A).unwrap().device.link_key, expected);
+        assert_eq!(
+            runtime.derive_ezsp_link_key(&mut device, &CHILD_A),
+            Some(expected)
+        );
+    }
+
     #[test]
     fn rejected_unknown_secured_rejoin_is_removed_without_a_device_record() {
         let mut device = coordinator();
+        // The strict policy: no secured rejoin of a device not admitted.
+        device
+            .bdb_mut()
+            .attributes_mut()
+            .trust_center_admit_secured_rejoins = false;
         let parent_short = add_child(&mut device, CHILD_A);
         let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
         block_on(runtime.initialize(&mut device)).unwrap();
@@ -4725,6 +4985,11 @@ mod tests {
     #[test]
     fn rejected_unknown_rejoin_propagates_store_failure_before_transmit() {
         let mut device = coordinator();
+        // The strict policy: no secured rejoin of a device not admitted.
+        device
+            .bdb_mut()
+            .attributes_mut()
+            .trust_center_admit_secured_rejoins = false;
         let parent_short = add_child(&mut device, CHILD_A);
         let mut runtime = TrustCenterRuntime::new(FailingStore::default());
         block_on(runtime.initialize(&mut device)).unwrap();
@@ -4789,6 +5054,11 @@ mod tests {
     #[test]
     fn unknown_rejection_finishes_if_its_parent_is_revoked_before_send_commit() {
         let mut device = coordinator();
+        // The strict policy: no secured rejoin of a device not admitted.
+        device
+            .bdb_mut()
+            .attributes_mut()
+            .trust_center_admit_secured_rejoins = false;
         let parent_short = add_child(&mut device, CHILD_A);
         let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
         block_on(runtime.initialize(&mut device)).unwrap();
@@ -4863,6 +5133,11 @@ mod tests {
     #[test]
     fn rejected_unknown_rejoin_survives_reboot_without_becoming_admitted() {
         let (mut device, mut security_store) = coordinator_with_security_store();
+        // The strict policy: no secured rejoin of a device not admitted.
+        device
+            .bdb_mut()
+            .attributes_mut()
+            .trust_center_admit_secured_rejoins = false;
         let parent_short = add_child(&mut device, CHILD_A);
         let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
         block_on(runtime.initialize(&mut device)).unwrap();
@@ -5120,6 +5395,11 @@ mod tests {
     #[cfg(feature = "host-passthrough")]
     fn trust_center_decisions_are_reported_to_the_host() {
         let mut device = coordinator();
+        // The strict policy: no secured rejoin of a device not admitted.
+        device
+            .bdb_mut()
+            .attributes_mut()
+            .trust_center_admit_secured_rejoins = false;
         let short_a = add_child(&mut device, CHILD_A);
         let mut runtime = TrustCenterRuntime::new(RamTrustCenterDeviceStore::new());
         block_on(runtime.initialize(&mut device)).unwrap();

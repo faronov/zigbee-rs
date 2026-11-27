@@ -27,11 +27,16 @@ const _: () = assert!(MAX_APPLICATION_KEY_REQUESTS <= u8::MAX as usize);
 /// Trailer the current record version appends to the version-4 encoding:
 /// the durable global outgoing APS counter limit (version 5,
 /// `global-aps-counter`), preceded by the high byte of the device count
-/// (version 6, `ncp-capacity`: up to 256 devices).
+/// (version 6, `ncp-capacity`: up to 256 devices) and followed by the EZSP
+/// hashed link-key root (version 7, `ncp-capacity`: a flag byte and 16
+/// bytes, [`HASHED_ROOT_TRAILER_LEN`]).
 #[cfg(all(feature = "global-aps-counter", not(feature = "ncp-capacity")))]
 const GLOBAL_APS_TRAILER_LEN: usize = 4;
 #[cfg(feature = "ncp-capacity")]
-const GLOBAL_APS_TRAILER_LEN: usize = 5;
+const GLOBAL_APS_TRAILER_LEN: usize = 5 + HASHED_ROOT_TRAILER_LEN;
+/// Version-7 trailer: `u8 present (0/1)`, `[16] root` (zero when absent).
+#[cfg(feature = "ncp-capacity")]
+const HASHED_ROOT_TRAILER_LEN: usize = 17;
 #[cfg(not(feature = "global-aps-counter"))]
 const GLOBAL_APS_TRAILER_LEN: usize = 0;
 #[cfg(not(feature = "ncp-capacity"))]
@@ -143,6 +148,12 @@ pub struct PersistentTrustCenterState {
     /// the migration, version <= 4).
     #[cfg(feature = "global-aps-counter")]
     global_aps_limit: u32,
+    /// Root key of an EmberZNet Trust Center in hashed link-key mode, kept
+    /// from a restored EZSP backup (`ncp-capacity`, record version 7): every
+    /// device the table does not know gets the key that Trust Center gave
+    /// it (`zigbee_aps::security::derive_ezsp_hashed_link_key`).
+    #[cfg(feature = "ncp-capacity")]
+    ezsp_hashed_link_key_root: Option<[u8; 16]>,
 }
 
 impl PersistentTrustCenterState {
@@ -156,6 +167,8 @@ impl PersistentTrustCenterState {
             pending_unknown_removals: Vec::new(),
             #[cfg(feature = "global-aps-counter")]
             global_aps_limit: 0,
+            #[cfg(feature = "ncp-capacity")]
+            ezsp_hashed_link_key_root: None,
         }
     }
 
@@ -176,6 +189,8 @@ impl PersistentTrustCenterState {
                 pending_unknown_removals: _,
                 #[cfg(feature = "global-aps-counter")]
                     global_aps_limit: _,
+                #[cfg(feature = "ncp-capacity")]
+                    ezsp_hashed_link_key_root: _,
             } = state;
         };
         unsafe {
@@ -187,7 +202,21 @@ impl PersistentTrustCenterState {
             core::ptr::addr_of_mut!((*slot).pending_unknown_removals).write(Vec::new());
             #[cfg(feature = "global-aps-counter")]
             core::ptr::addr_of_mut!((*slot).global_aps_limit).write(0);
+            #[cfg(feature = "ncp-capacity")]
+            core::ptr::addr_of_mut!((*slot).ezsp_hashed_link_key_root).write(None);
         }
+    }
+
+    /// The EZSP hashed link-key root kept from a restore, if any.
+    #[cfg(feature = "ncp-capacity")]
+    pub const fn ezsp_hashed_link_key_root(&self) -> Option<[u8; 16]> {
+        self.ezsp_hashed_link_key_root
+    }
+
+    /// Keep (or forget) the EZSP hashed link-key root.
+    #[cfg(feature = "ncp-capacity")]
+    pub fn set_ezsp_hashed_link_key_root(&mut self, root: Option<[u8; 16]>) {
+        self.ezsp_hashed_link_key_root = root;
     }
 
     /// Durable limit of the global outgoing APS counter (0 = none yet).
@@ -549,6 +578,15 @@ impl PersistentTrustCenterState {
         sink.put(&[(self.devices.len() >> 8) as u8])?;
         #[cfg(feature = "global-aps-counter")]
         sink.put(&self.global_aps_limit.to_le_bytes())?;
+        #[cfg(feature = "ncp-capacity")]
+        {
+            let mut trailer = [0u8; HASHED_ROOT_TRAILER_LEN];
+            if let Some(root) = self.ezsp_hashed_link_key_root {
+                trailer[0] = 1;
+                trailer[1..].copy_from_slice(&root);
+            }
+            sink.put(&trailer)?;
+        }
         Ok(self.encoded_len())
     }
 
@@ -583,18 +621,18 @@ impl PersistentTrustCenterState {
         version: u8,
         bytes: &[u8],
     ) -> Option<Result<(), TrustCenterStoreError>> {
-        let layout = match version {
-            RECORD_VERSION => Layout::CURRENT,
-            #[cfg(feature = "ncp-capacity")]
-            GLOBAL_APS_RECORD_VERSION => Layout::V5,
-            #[cfg(feature = "global-aps-counter")]
-            GLOBAL_APS_RECORD_VERSION_PREDECESSOR => Layout::V4,
-            UNKNOWN_REMOVAL_RECORD_VERSION => Layout::V3,
-            ROTATION_RECORD_VERSION => Layout::V2,
-            LEGACY_RECORD_VERSION => Layout::V1,
-            _ => return None,
-        };
-        Some(self.decode_version_into(&mut SliceSource::new(bytes), layout))
+        Some(self.decode_version_into(&mut SliceSource::new(bytes), layout_of(version)?))
+    }
+
+    /// Decode a snapshot of `version`'s layout from `source` (the streamed
+    /// journal); `None` for a version this build cannot read.
+    #[cfg(feature = "ncp-capacity")]
+    pub(crate) fn decode_source_version_into(
+        &mut self,
+        version: u8,
+        source: &mut impl SnapshotSource,
+    ) -> Option<Result<(), TrustCenterStoreError>> {
+        Some(self.decode_version_into(source, layout_of(version)?))
     }
 
     #[cfg(test)]
@@ -633,6 +671,10 @@ impl PersistentTrustCenterState {
         {
             self.global_aps_limit = 0;
         }
+        #[cfg(feature = "ncp-capacity")]
+        {
+            self.ezsp_hashed_link_key_root = None;
+        }
     }
 
     /// Overwrite `self` with `other` element by element (no whole-state
@@ -653,6 +695,10 @@ impl PersistentTrustCenterState {
         {
             self.global_aps_limit = other.global_aps_limit;
         }
+        #[cfg(feature = "ncp-capacity")]
+        {
+            self.ezsp_hashed_link_key_root = other.ezsp_hashed_link_key_root;
+        }
     }
 
     /// Decode into `self` in place: every field is overwritten, nothing of
@@ -663,7 +709,9 @@ impl PersistentTrustCenterState {
         layout: Layout,
     ) -> Result<(), TrustCenterStoreError> {
         let total = source.remaining();
-        let trailer_len = usize::from(layout.count_high) + if layout.global_limit { 4 } else { 0 };
+        let trailer_len = usize::from(layout.count_high)
+            + if layout.global_limit { 4 } else { 0 }
+            + if layout.hashed_root { 17 } else { 0 };
         let body_len = total
             .checked_sub(trailer_len)
             .ok_or(TrustCenterStoreError::Corrupt)?;
@@ -802,6 +850,23 @@ impl PersistentTrustCenterState {
             {
                 state.global_aps_limit = u32::from_le_bytes(limit);
             }
+        }
+        if layout.hashed_root {
+            let mut trailer = [0u8; 17];
+            source.take(&mut trailer)?;
+            let mut root = [0u8; 16];
+            root.copy_from_slice(&trailer[1..]);
+            let root = match trailer[0] {
+                0 if root == [0; 16] => None,
+                1 => Some(root),
+                _ => return Err(TrustCenterStoreError::Corrupt),
+            };
+            #[cfg(feature = "ncp-capacity")]
+            {
+                state.ezsp_hashed_link_key_root = root;
+            }
+            #[cfg(not(feature = "ncp-capacity"))]
+            let _ = root;
         }
         if source.remaining() != 0 {
             return Err(TrustCenterStoreError::Corrupt);
@@ -950,8 +1015,13 @@ pub const TRUST_CENTER_JOURNAL_FORMAT_VERSION: u8 = 5;
 /// bounds removal intents at [`MAX_PENDING_UNKNOWN_REMOVALS`]. Its full
 /// snapshot no longer fits one 4 KiB slot; the NCP stores it with the
 /// streamed multi-slot `trust_center_stream::TrustCenterStreamJournal`.
+/// Version 7 (`ncp-capacity`) appends the EZSP hashed link-key root kept
+/// from a restored EmberZNet backup; version 6 snapshots stay readable.
 #[cfg(feature = "ncp-capacity")]
-pub const TRUST_CENTER_JOURNAL_FORMAT_VERSION: u8 = 6;
+pub const TRUST_CENTER_JOURNAL_FORMAT_VERSION: u8 = 7;
+/// The `ncp-capacity` format before the hashed link-key root.
+#[cfg(feature = "ncp-capacity")]
+pub(crate) const NCP_COUNT_HIGH_RECORD_VERSION: u8 = 6;
 #[cfg(feature = "global-aps-counter")]
 const GLOBAL_APS_RECORD_VERSION_PREDECESSOR: u8 = 4;
 #[cfg(feature = "ncp-capacity")]
@@ -1059,6 +1129,7 @@ impl<S: NorFlash> TrustCenterDeviceJournal<S> {
                 | UNKNOWN_REMOVAL_RECORD_VERSION
                 | GLOBAL_APS_RECORD_VERSION_PREDECESSOR
                 | GLOBAL_APS_RECORD_VERSION
+                | NCP_COUNT_HIGH_RECORD_VERSION
                 | RECORD_VERSION
         );
         #[cfg(all(feature = "global-aps-counter", not(feature = "ncp-capacity")))]
@@ -1363,12 +1434,18 @@ impl<S: NorFlash> TrustCenterDeviceStore for TrustCenterDeviceJournal<S> {
     }
 }
 
+/// Key origin codes of a device record. 4 and 5 (EZSP-hashed, unknown)
+/// appear only once a device of a restored EmberZNet network or one
+/// admitted by a secured rejoin exists; earlier firmware reads such a
+/// snapshot as corrupt.
 fn encode_origin(origin: TrustCenterKeyOrigin) -> u8 {
     match origin {
         TrustCenterKeyOrigin::DefaultGlobal => 0,
         TrustCenterKeyOrigin::InstallCode => 1,
         TrustCenterKeyOrigin::ApplicationProvisioned => 2,
         TrustCenterKeyOrigin::GeneratedUnique => 3,
+        TrustCenterKeyOrigin::EzspHashed => 4,
+        TrustCenterKeyOrigin::Unknown => 5,
     }
 }
 
@@ -1378,6 +1455,8 @@ fn decode_origin(value: u8) -> Result<TrustCenterKeyOrigin, TrustCenterStoreErro
         1 => Ok(TrustCenterKeyOrigin::InstallCode),
         2 => Ok(TrustCenterKeyOrigin::ApplicationProvisioned),
         3 => Ok(TrustCenterKeyOrigin::GeneratedUnique),
+        4 => Ok(TrustCenterKeyOrigin::EzspHashed),
+        5 => Ok(TrustCenterKeyOrigin::Unknown),
         _ => Err(TrustCenterStoreError::Corrupt),
     }
 }
@@ -1405,6 +1484,8 @@ struct Layout {
     count_high: bool,
     /// Version 5: durable global outgoing APS limit.
     global_limit: bool,
+    /// Version 7: EZSP hashed link-key root after the global limit.
+    hashed_root: bool,
 }
 
 impl Layout {
@@ -1414,6 +1495,7 @@ impl Layout {
         router_capability: false,
         count_high: false,
         global_limit: false,
+        hashed_root: false,
     };
     const V2: Self = Self {
         rotation: true,
@@ -1437,12 +1519,34 @@ impl Layout {
         count_high: true,
         ..Self::V5
     };
+    #[cfg(feature = "ncp-capacity")]
+    const V7: Self = Self {
+        hashed_root: true,
+        ..Self::V6
+    };
     #[cfg(not(feature = "global-aps-counter"))]
     const CURRENT: Self = Self::V4;
     #[cfg(all(feature = "global-aps-counter", not(feature = "ncp-capacity")))]
     const CURRENT: Self = Self::V5;
     #[cfg(feature = "ncp-capacity")]
-    const CURRENT: Self = Self::V6;
+    const CURRENT: Self = Self::V7;
+}
+
+/// The layout of record `version`; `None` for one this build cannot read.
+fn layout_of(version: u8) -> Option<Layout> {
+    Some(match version {
+        RECORD_VERSION => Layout::CURRENT,
+        #[cfg(feature = "ncp-capacity")]
+        NCP_COUNT_HIGH_RECORD_VERSION => Layout::V6,
+        #[cfg(feature = "ncp-capacity")]
+        GLOBAL_APS_RECORD_VERSION => Layout::V5,
+        #[cfg(feature = "global-aps-counter")]
+        GLOBAL_APS_RECORD_VERSION_PREDECESSOR => Layout::V4,
+        UNKNOWN_REMOVAL_RECORD_VERSION => Layout::V3,
+        ROTATION_RECORD_VERSION => Layout::V2,
+        LEGACY_RECORD_VERSION => Layout::V1,
+        _ => return None,
+    })
 }
 
 /// Sequential byte sink of the snapshot encoder.
@@ -2287,7 +2391,15 @@ mod tests {
         );
         let mut encoded = [0u8; MAX_ENCODED_TRUST_CENTER_STATE_LEN];
         let len = state.encode(&mut encoded);
-        assert_eq!(&encoded[len - 4..len], &0x0012_3400u32.to_le_bytes());
+        // Version 7 (`ncp-capacity`) appends the hashed-root trailer.
+        #[cfg(feature = "ncp-capacity")]
+        let limit_end = len - HASHED_ROOT_TRAILER_LEN;
+        #[cfg(not(feature = "ncp-capacity"))]
+        let limit_end = len;
+        assert_eq!(
+            &encoded[limit_end - 4..limit_end],
+            &0x0012_3400u32.to_le_bytes()
+        );
         assert_eq!(
             PersistentTrustCenterState::decode(&encoded[..len]),
             Ok(state.clone())
@@ -2310,5 +2422,66 @@ mod tests {
             reopened.load().unwrap().unwrap().global_aps_limit(),
             0x0012_3400
         );
+    }
+
+    #[cfg(feature = "ncp-capacity")]
+    #[test]
+    fn version_7_keeps_the_ezsp_hashed_root_and_version_6_reads_without_it() {
+        let mut state = state();
+        assert_eq!(state.ezsp_hashed_link_key_root(), None);
+        let mut encoded = [0u8; MAX_ENCODED_TRUST_CENTER_STATE_LEN];
+        let len = state.encode(&mut encoded);
+        assert_eq!(&encoded[len - HASHED_ROOT_TRAILER_LEN..len], &[0u8; 17]);
+        state.set_ezsp_hashed_link_key_root(Some([0x3C; 16]));
+        let len = state.encode(&mut encoded);
+        assert_eq!(encoded[len - HASHED_ROOT_TRAILER_LEN], 1);
+        let decoded = PersistentTrustCenterState::decode(&encoded[..len]).unwrap();
+        assert_eq!(decoded.ezsp_hashed_link_key_root(), Some([0x3C; 16]));
+        assert_eq!(decoded, state);
+        // The same snapshot as version 6 (no trailer) reads without a root.
+        let mut v6 = PersistentTrustCenterState::new([0; 8]);
+        v6.decode_record_version_into(
+            NCP_COUNT_HIGH_RECORD_VERSION,
+            &encoded[..len - HASHED_ROOT_TRAILER_LEN],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(v6.ezsp_hashed_link_key_root(), None);
+        assert_eq!(v6.devices(), state.devices());
+        // A malformed trailer is corrupt, not an absent root.
+        let mut bad = encoded;
+        bad[len - HASHED_ROOT_TRAILER_LEN] = 2;
+        assert_eq!(
+            PersistentTrustCenterState::decode(&bad[..len]),
+            Err(TrustCenterStoreError::Corrupt)
+        );
+        let mut bad = encoded;
+        bad[len - HASHED_ROOT_TRAILER_LEN] = 0;
+        assert_eq!(
+            PersistentTrustCenterState::decode(&bad[..len]),
+            Err(TrustCenterStoreError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn hashed_and_unknown_key_origins_round_trip() {
+        for origin in [
+            TrustCenterKeyOrigin::EzspHashed,
+            TrustCenterKeyOrigin::Unknown,
+        ] {
+            let mut state = state();
+            state.device_mut(&DEVICE).unwrap().device.key_origin = origin;
+            let mut encoded = [0u8; MAX_ENCODED_TRUST_CENTER_STATE_LEN];
+            let len = state.encode(&mut encoded);
+            assert_eq!(
+                PersistentTrustCenterState::decode(&encoded[..len])
+                    .unwrap()
+                    .device(&DEVICE)
+                    .unwrap()
+                    .device
+                    .key_origin,
+                origin
+            );
+        }
     }
 }

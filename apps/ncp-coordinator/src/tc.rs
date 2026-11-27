@@ -1554,16 +1554,21 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
                 )
                 .filter(|entry| entry.incoming_frame_counter_valid)
                 .map_or(0, |entry| entry.incoming_frame_counter);
-            let link = (device.key_origin
-                != zigbee_bdb::trust_center::TrustCenterKeyOrigin::DefaultGlobal)
+            // The global key and an unknown one (a restored device the
+            // backup listed without a key) carry no link block.
+            let link = (device.link_key_known()
+                && device.key_origin
+                    != zigbee_bdb::trust_center::TrustCenterKeyOrigin::DefaultGlobal)
                 .then_some(LinkView {
                     key: device.link_key,
                     attrs: device.key_attributes as u8,
                     origin: match device.key_origin {
-                        zigbee_bdb::trust_center::TrustCenterKeyOrigin::DefaultGlobal => 0,
+                        zigbee_bdb::trust_center::TrustCenterKeyOrigin::DefaultGlobal
+                        | zigbee_bdb::trust_center::TrustCenterKeyOrigin::Unknown => 0,
                         zigbee_bdb::trust_center::TrustCenterKeyOrigin::InstallCode => 1,
                         zigbee_bdb::trust_center::TrustCenterKeyOrigin::GeneratedUnique => 2,
                         zigbee_bdb::trust_center::TrustCenterKeyOrigin::ApplicationProvisioned => 3,
+                        zigbee_bdb::trust_center::TrustCenterKeyOrigin::EzspHashed => 4,
                     },
                     rx_floor,
                 });

@@ -11,7 +11,7 @@
 //! | offset      | size | field                                              |
 //! |-------------|------|----------------------------------------------------|
 //! | 0           | 4    | magic `ZBTS`                                       |
-//! | 4           | 1    | encoding version (Trust Center record version 6)   |
+//! | 4           | 1    | encoding version (Trust Center record version 7; 6 is still read) |
 //! | 5           | 1    | chunk index `k`                                    |
 //! | 6           | 1    | chunk count `n`                                    |
 //! | 7           | 1    | reserved, 0                                        |
@@ -69,9 +69,9 @@
 use embedded_storage::nor_flash::NorFlash;
 
 use crate::trust_center_store::{
-    MAX_ENCODED_TRUST_CENTER_STATE_LEN, PersistentTrustCenterState, RECORD_MAGIC, RECORD_VERSION,
-    SnapshotSink, SnapshotSource, TRUST_CENTER_JOURNAL_SLOT_SIZE, TrustCenterDeviceJournal,
-    TrustCenterDeviceStore, TrustCenterStoreError,
+    MAX_ENCODED_TRUST_CENTER_STATE_LEN, NCP_COUNT_HIGH_RECORD_VERSION, PersistentTrustCenterState,
+    RECORD_MAGIC, RECORD_VERSION, SnapshotSink, SnapshotSource, TRUST_CENTER_JOURNAL_SLOT_SIZE,
+    TrustCenterDeviceJournal, TrustCenterDeviceStore, TrustCenterStoreError,
 };
 
 /// Size of one chunk slot (also the single-slot journal's record size).
@@ -129,6 +129,8 @@ struct Located {
 /// Snapshot geometry shared by the writer, the verifier and the reader.
 #[derive(Debug, Clone, Copy)]
 struct Stream {
+    /// Trust Center record version of the payload encoding.
+    version: u8,
     generation: u32,
     total_len: usize,
     chunks: usize,
@@ -397,11 +399,12 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_S
             buffer: &mut buffer,
             error: None,
         };
-        let decoded = state.decode_from_into(&mut source);
+        let version = stream.version;
+        let decoded = state.decode_source_version_into(version, &mut source);
         if let Some(error) = source.error {
             return Err(error);
         }
-        Ok(decoded.is_ok())
+        Ok(decoded.is_some_and(|result| result.is_ok()))
     }
 
     /// Newest complete snapshot by framing and CRCs (no decode), with a
@@ -469,6 +472,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterStreamJournal<S, SECTOR_S
             return Err(TrustCenterStoreError::Corrupt);
         }
         Ok(Stream {
+            version: RECORD_VERSION,
             generation,
             total_len,
             chunks,
@@ -635,7 +639,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> TrustCenterDeviceStore
 /// 0), from its header only; full validation follows.
 fn candidate_generation(slot: &[u8]) -> Option<u32> {
     if slot[0..4] == RECORD_MAGIC
-        || (slot[0..4] == CHUNK_MAGIC && slot[4] == RECORD_VERSION && slot[5] == 0)
+        || (slot[0..4] == CHUNK_MAGIC && readable_version(slot[4]) && slot[5] == 0)
     {
         Some(u32::from_le_bytes([slot[8], slot[9], slot[10], slot[11]]))
     } else {
@@ -645,7 +649,7 @@ fn candidate_generation(slot: &[u8]) -> Option<u32> {
 
 /// Snapshot geometry announced by chunk `index`'s header (no CRC check).
 fn chunk_header(slot: &[u8; SLOT], index: usize) -> Option<Stream> {
-    if slot[0..4] != CHUNK_MAGIC || slot[4] != RECORD_VERSION || usize::from(slot[5]) != index {
+    if slot[0..4] != CHUNK_MAGIC || !readable_version(slot[4]) || usize::from(slot[5]) != index {
         return None;
     }
     let chunks = usize::from(slot[6]);
@@ -659,6 +663,7 @@ fn chunk_header(slot: &[u8; SLOT], index: usize) -> Option<Stream> {
         return None;
     }
     Some(Stream {
+        version: slot[4],
         generation: u32::from_le_bytes([slot[8], slot[9], slot[10], slot[11]]),
         total_len,
         chunks,
@@ -674,7 +679,8 @@ fn chunk_matches(slot: &[u8; SLOT], stream: &Stream, index: usize) -> bool {
     };
     let payload_len = stream.payload_len(index);
     let last = index + 1 == stream.chunks;
-    header.generation == stream.generation
+    header.version == stream.version
+        && header.generation == stream.generation
         && header.total_len == stream.total_len
         && header.chunks == stream.chunks
         && header.crc == stream.crc
@@ -687,6 +693,13 @@ fn chunk_matches(slot: &[u8; SLOT], stream: &Stream, index: usize) -> bool {
         && u32::from_le_bytes(word(slot, CHUNK_CRC_OFFSET))
             == crate::security_journal::crc32(&slot[..CHUNK_CRC_OFFSET])
         && (!last || slot[COMMIT_OFFSET..COMMIT_OFFSET + 4] == COMMIT)
+}
+
+/// Chunk encodings this build reads: the current one, and version 6 (before
+/// the EZSP hashed link-key root), so an update keeps the Trust Center
+/// table; the next store writes the current version.
+fn readable_version(version: u8) -> bool {
+    version == RECORD_VERSION || version == NCP_COUNT_HIGH_RECORD_VERSION
 }
 
 fn word(slot: &[u8; SLOT], offset: usize) -> [u8; 4] {
@@ -743,7 +756,7 @@ impl<S: NorFlash, const SECTOR_SIZE: usize> ChunkWriter<'_, S, SECTOR_SIZE> {
         }
         let buffer = &mut self.buffer;
         buffer[0..4].copy_from_slice(&CHUNK_MAGIC);
-        buffer[4] = RECORD_VERSION;
+        buffer[4] = self.stream.version;
         buffer[5] = index as u8;
         buffer[6] = self.stream.chunks as u8;
         buffer[7] = 0;
@@ -1450,5 +1463,52 @@ mod tests {
         let data: Vec<u8> = (0..5000u32).map(|value| value as u8).collect();
         let crc = crc32_update(crc32_update(CRC_INIT, &data[..1234]), &data[1234..]);
         assert_eq!(!crc, crate::security_journal::crc32(&data));
+    }
+
+    /// Firmware before the hashed link-key root wrote version-6 chunks: an
+    /// update must keep reading them (the Trust Center table), and the next
+    /// store writes version 7.
+    #[test]
+    fn a_version_6_snapshot_is_read_and_superseded_by_version_7() {
+        use crate::trust_center_store::NCP_COUNT_HIGH_RECORD_VERSION;
+        let mut expected = state(3, 1, false);
+        let mut encoded = [0u8; MAX_ENCODED_TRUST_CENTER_STATE_LEN];
+        let len = expected.encode(&mut encoded);
+        // Version 6 = version 7 without the 17-byte root trailer.
+        let payload = &encoded[..len - 17];
+        assert!(payload.len() <= TRUST_CENTER_STREAM_PAYLOAD_PER_CHUNK);
+        let mut slot = [0xFFu8; SLOT];
+        slot[0..4].copy_from_slice(&CHUNK_MAGIC);
+        slot[4] = NCP_COUNT_HIGH_RECORD_VERSION;
+        slot[5] = 0;
+        slot[6] = 1;
+        slot[7] = 0;
+        slot[8..12].copy_from_slice(&7u32.to_le_bytes());
+        slot[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        slot[16..18].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+        slot[18..20].fill(0);
+        slot[HEADER_LEN..HEADER_LEN + payload.len()].copy_from_slice(payload);
+        let stream_crc = crate::security_journal::crc32(payload);
+        slot[STREAM_CRC_OFFSET..STREAM_CRC_OFFSET + 4].copy_from_slice(&stream_crc.to_le_bytes());
+        let chunk_crc = crate::security_journal::crc32(&slot[..CHUNK_CRC_OFFSET]);
+        slot[CHUNK_CRC_OFFSET..CHUNK_CRC_OFFSET + 4].copy_from_slice(&chunk_crc.to_le_bytes());
+        slot[COMMIT_OFFSET..COMMIT_OFFSET + 4].copy_from_slice(&COMMIT);
+        let mut flash = MockFlash::new();
+        flash.bytes[..SLOT].copy_from_slice(&slot);
+        let mut journal = journal(flash);
+        let mut loaded = PersistentTrustCenterState::new([0; 8]);
+        assert_eq!(journal.load_into(&mut loaded), Ok(true));
+        assert_eq!(loaded, expected);
+        // The next store is version 7 with the root.
+        expected.set_ezsp_hashed_link_key_root(Some([0x77; 16]));
+        journal.store(&expected).unwrap();
+        let current = journal.current.unwrap();
+        assert_eq!(current.generation, 8);
+        let mut journal = reopen(journal);
+        let mut reloaded = PersistentTrustCenterState::new([0; 8]);
+        assert_eq!(journal.load_into(&mut reloaded), Ok(true));
+        assert_eq!(reloaded.ezsp_hashed_link_key_root(), Some([0x77; 16]));
+        let first = (current.sector * (SECTOR / SLOT) + current.slot) * SLOT;
+        assert_eq!(journal.into_storage().bytes[first + 4], RECORD_VERSION);
     }
 }

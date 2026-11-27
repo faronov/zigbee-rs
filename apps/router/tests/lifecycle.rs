@@ -5137,6 +5137,9 @@ fn trust_center_device_left_replay_failure_retries_ack_after_tc_commit() {
     assert_eq!(aps_replay_count(&mut security), 1);
 }
 
+/// The strict policy (`trust_center_admit_secured_rejoins` off): a
+/// secured rejoin of a device the Trust Center does not know is denied.
+/// The default admits it (it proved the network key), as EmberZNet does.
 #[cfg(feature = "trust-center")]
 #[test]
 fn trust_center_app_handles_repeated_device_left_and_denied_unknown_secured_rejoin() {
@@ -5189,6 +5192,11 @@ fn trust_center_app_handles_repeated_device_left_and_denied_unknown_secured_rejo
     .unwrap()
     .with_test_gp_store();
     block_on(app.initialize()).unwrap();
+    app.node_mut()
+        .device_mut()
+        .bdb_mut()
+        .attributes_mut()
+        .trust_center_admit_secured_rejoins = false;
     app.node_mut().device_mut().mac_mut().clear_tx_history();
     for (index, status) in [
         ApsUpdateDeviceStatus::DeviceLeft, // revoke the existing device

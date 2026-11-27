@@ -462,6 +462,116 @@ fn joins_departures_and_aged_children_are_device_events() {
     );
 }
 
+/// A NWK Rejoin Request (R22 3.4.6) from `source`, secured with the
+/// network key, to the parent at `0x0000`.
+fn secured_rejoin_request(
+    key: &[u8; 16],
+    source: (ShortAddress, [u8; 8]),
+    frame_counter: u32,
+    capability: u8,
+) -> MacFrame {
+    let header = NwkHeader {
+        frame_control: NwkFrameControl {
+            frame_type: NwkFrameType::Command as u8,
+            protocol_version: 0x02,
+            security: true,
+            src_ieee_present: true,
+            ..Default::default()
+        },
+        dst_addr: ShortAddress(0),
+        src_addr: source.0,
+        radius: 1,
+        seq_number: frame_counter as u8,
+        dst_ieee: None,
+        src_ieee: Some(source.1),
+        multicast_control: None,
+        source_route: None,
+    };
+    let mut bytes = [0u8; 128];
+    let header_len = header.serialize(&mut bytes);
+    let security_header = NwkSecurityHeader {
+        security_control: NwkSecurityHeader::ZIGBEE_DEFAULT,
+        frame_counter,
+        source_address: source.1,
+        key_seq_number: 0,
+    };
+    let security_len = security_header.serialize(&mut bytes[header_len..]);
+    let aad_len = header_len + security_len;
+    let payload = [NwkCommandId::RejoinRequest as u8, capability];
+    let encrypted = NwkSecurity::new()
+        .encrypt(&bytes[..aad_len], &payload, key, &security_header)
+        .unwrap();
+    bytes[aad_len..aad_len + encrypted.len()].copy_from_slice(&encrypted);
+    bytes[header_len] &= !0x07;
+    MacFrame::from_slice(&bytes[..aad_len + encrypted.len()]).unwrap()
+}
+
+/// The restored-network case seen on hardware: a sleepy child restored
+/// into the child table without a Trust Center record or key (an EZSP
+/// backup) rejoins secured with the network key while joining is closed.
+/// The Trust Center admits it (it proved the network key) and it stays a
+/// child, instead of the removal that dropped it.
+#[test]
+fn a_restored_child_without_a_key_is_admitted_on_its_secured_rejoin() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    formed_port!(port);
+    let key = network_key(&port);
+    let child = ShortAddress(0x12D2);
+    {
+        let nwk = port.app_mut().device_mut().aps_mut().nwk_mut();
+        assert!(nwk.restore_child(PEER_IEEE, child, false, true, false, 8));
+        nwk.update_address_map(child, PEER_IEEE);
+    }
+    assert!(port.app().tc_table().device(&PEER_IEEE).is_none());
+
+    // Capability: security capable, allocate address; sleepy RFD.
+    receive(
+        &mut port,
+        child,
+        -48,
+        secured_rejoin_request(&key, (child, PEER_IEEE), 0x2000, 0x80 | 0x40),
+    );
+    // It polls for the Rejoin Response (indirect: the Trust Center hears
+    // of the rejoin once it is delivered).
+    let pan = pan(&port);
+    mac(&mut port).enqueue_command_event(MacCommandEvent::DataRequest(MlmeDataRequestIndication {
+        source_address: MacAddress::Short(pan, child),
+        destination_address: MacAddress::Short(pan, ShortAddress::COORDINATOR),
+        lqi: 180,
+        security_use: false,
+    }));
+    steps(&mut port, 8);
+    assert_eq!(
+        port.take_device_event(),
+        Some(DeviceEvent::Joined {
+            nwk: child.0,
+            ieee: PEER_IEEE,
+            parent_nwk: 0x0000,
+            join_type: joined::JOIN_SECURED_REJOIN,
+            capability: 0x80 | 0x40,
+            decision: joined::ADMITTED,
+        })
+    );
+    steps(&mut port, 10);
+    assert_eq!(port.take_device_event(), None, "not removed afterwards");
+    assert!(
+        port.app()
+            .device()
+            .aps()
+            .nwk()
+            .neighbor_table()
+            .children()
+            .any(|entry| entry.ieee_address == PEER_IEEE && entry.network_address == child),
+        "still a child at its address"
+    );
+    let record = *port.app().tc_table().device(&PEER_IEEE).expect("known");
+    assert!(
+        !record.link_key_known(),
+        "its key is unknown, not the global one"
+    );
+    assert_eq!(port.app().tc_ieee_by_short(child.0), Some(PEER_IEEE));
+}
+
 #[test]
 fn ack_request_confirms_wait_for_the_aps_ack_outcome() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
