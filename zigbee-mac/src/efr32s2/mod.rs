@@ -308,6 +308,9 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
         loop {
             if let Some(rx) = self.radio.receive(frame.buffer_mut()) {
                 frame.set_len(rx.len, rx.lqi)?;
+                // The HAL's per-frame RSSI (the RX trailer, dBm): reported to
+                // a ZRHP host with every indication (`rx-rssi`).
+                crate::rx_rssi!(frame, rx.rssi_dbm);
                 return Ok(true);
             }
             if Instant::now() >= deadline {

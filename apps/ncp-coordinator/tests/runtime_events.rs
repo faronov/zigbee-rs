@@ -716,8 +716,7 @@ fn a_rejoin_response_queued_after_a_poll_was_acked_waits_for_the_next_poll() {
         })
     ));
     // The child is an authenticated child (the secured rejoin proved the
-    // network key): it never expires as unauthenticated, and its
-    // Device_annce is served.
+    // network key): it never expires as unauthenticated.
     assert!(
         port.app()
             .device()
@@ -728,6 +727,67 @@ fn a_rejoin_response_queued_after_a_poll_was_acked_waits_for_the_next_poll() {
             .any(|entry| entry.network_address == child
                 && entry.relationship == zigbee_nwk::neighbor::Relationship::Child)
     );
+    // Its Device_annce (broadcast through its parent, the NCP) reaches the
+    // host as an indication (spec 7.4: forwarded unchanged), with the
+    // last hop's RSSI.
+    while port.take_indication().is_some() {}
+    let annce = device_annce_frame(&key, child, PEER_IEEE, 0x80, 1228);
+    receive(&mut port, child, -22, annce);
+    steps(&mut port, 4);
+    let indication = port.take_indication().expect("Device_annce for the host");
+    assert_eq!(
+        (
+            indication.cluster,
+            indication.profile,
+            indication.dst_ep,
+            indication.dst_mode,
+            indication.dst
+        ),
+        (0x0013, 0, 0, 0x0F, 0xFFFD)
+    );
+    assert_eq!(indication.src_ieee, Some(PEER_IEEE));
+    assert!(!indication.handled_by_ncp);
+    assert_eq!(indication.rssi, -22);
+    assert_eq!(&indication.asdu[1..3], &child.0.to_le_bytes());
+}
+
+/// A ZDO Device_annce (`0x0013`) from `child`, NWK-broadcast to `0xFFFD`
+/// through its parent.
+fn device_annce_frame(
+    key: &[u8; 16],
+    child: ShortAddress,
+    ieee: [u8; 8],
+    capability: u8,
+    frame_counter: u32,
+) -> MacFrame {
+    let header = ApsHeader {
+        frame_control: ApsFrameControl {
+            frame_type: ApsFrameType::Data as u8,
+            delivery_mode: ApsDeliveryMode::Broadcast as u8,
+            ..Default::default()
+        },
+        dst_endpoint: Some(0),
+        cluster_id: Some(0x0013),
+        profile_id: Some(0),
+        src_endpoint: Some(0),
+        aps_counter: 0x44,
+        ..Default::default()
+    };
+    let mut aps = [0u8; 64];
+    let len = header.serialize(&mut aps);
+    let mut payload = vec![0x21];
+    payload.extend_from_slice(&child.0.to_le_bytes());
+    payload.extend_from_slice(&ieee);
+    payload.push(capability);
+    aps[len..len + payload.len()].copy_from_slice(&payload);
+    secured_nwk_frame(
+        key,
+        NwkFrameType::Data,
+        (child, ieee),
+        ShortAddress(0xFFFD),
+        frame_counter,
+        &aps[..len + payload.len()],
+    )
 }
 
 #[test]

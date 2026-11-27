@@ -1345,13 +1345,14 @@ at 65535.
 
 Map: **E** (runtime `host-passthrough`). `rssi` is the received signal
 strength of the last hop as measured by the radio (`zigbee-mac` `rx-rssi`:
-the ESP32-H2/C6/C5 PHY; `-128` on backends that do not measure it). The
-ESP32 PHY adds ESP-IDF's per-chip RSSI compensation to the radio's raw
-byte (`IEEE802154_RSSI_COMPENSATION_VALUE`: 10 dB on most ESP32-H2 parts,
-read from `libbtbb` at boot; 0 on the C6/C5), so `rssi`, `lqi` and the
-`NWK_ACTIVE_SCAN` values read like ESP-IDF's. Flags
-bit0 and `key_source` come from the APS layer's verification of the frame
-(`ApsLayer::last_rx_security`), independently of bit1.
+the ESP32-H2/C6/C5, CC26x2 and EFR32 Series 2 PHYs; `-128` on backends that
+do not measure it). The ESP32 PHY adds ESP-IDF's per-chip RSSI
+compensation to the radio's raw byte (`IEEE802154_RSSI_COMPENSATION_VALUE`:
+10 dB on most ESP32-H2 parts, read from `libbtbb` at boot; 0 on the
+C6/C5), so `rssi`, `lqi` and the `NWK_ACTIVE_SCAN` values read like
+ESP-IDF's. Flags bit0 and `key_source` come from the APS layer's
+verification of the frame (`ApsLayer::last_rx_security`), independently of
+bit1.
 
 ### 7.4 ZDO (`0x03xx`, endpoint 2)
 

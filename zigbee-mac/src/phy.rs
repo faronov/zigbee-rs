@@ -440,8 +440,10 @@ pub(crate) fn transmit_with_deadline(
 /// (`rx-rssi`): [`PhyRxFrame::rssi_dbm`] and `MacFrame::rssi_dbm` carry the
 /// received signal strength of the frame in dBm, or this value.
 ///
-/// Measured today by the ESP32-C6/H2/C5 PHY (the RSSI byte the radio stores
-/// in place of the FCS); every other backend reports this value.
+/// Measured by the ESP32-C6/H2/C5 PHY (the RSSI byte the radio stores in
+/// place of the FCS), the CC26x2 PHY (the RF core's RX entry) and the EFR32
+/// Series 2 PHY (the RX trailer through the HAL); every other backend reports
+/// this value.
 #[cfg(feature = "rx-rssi")]
 pub const RSSI_UNKNOWN_DBM: i8 = -128;
 

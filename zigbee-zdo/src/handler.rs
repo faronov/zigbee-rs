@@ -138,6 +138,11 @@ fn zdp_cluster_name(cluster: u16) -> &'static str {
         crate::MGMT_LEAVE_REQ => "MGMT_LEAVE_REQ",
         crate::MGMT_PERMIT_JOINING_REQ => "MGMT_PERMIT_JOINING_REQ",
         crate::MGMT_NWK_UPDATE_REQ => "MGMT_NWK_UPDATE_REQ",
+        // Announcements are named too: an "unknown" one in the log read as
+        // a frame that was not handled (or not forwarded to an NCP host).
+        crate::DEVICE_ANNCE => "DEVICE_ANNCE",
+        crate::PARENT_ANNCE => "PARENT_ANNCE",
+        cluster if cluster & 0x8000 != 0 => "ZDP_RESPONSE",
         _ => "UNKNOWN_ZDP",
     }
 }
