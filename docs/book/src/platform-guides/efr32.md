@@ -12,9 +12,10 @@ The repository supports these products:
   20 dBm (HP) PA on the BRD4187A and the 10 dBm (MP) PA on the EK2703A,
   where the Router joined a test network; the NCP ran on the BRD4187A
   against `hubctl`. The Dongle-M (38.4 MHz) uses the PHY of its stock
-  EmberZNet image and is packaged for its stock Gecko bootloader, but has
-  not run on a unit (first HIL pending). The RF-BM-MG24B1 has no hardware
-  run.
+  EmberZNet image and is packaged for its stock Gecko bootloader; the NCP
+  has run on one unit with a restored EmberZNet network and received at
+  38.4 MHz, while its transmission to devices is not yet proven (first
+  HIL, partial). The RF-BM-MG24B1 has no hardware run.
 
 All use the shared `SensorApp`; their boards, products, clocks, storage, and
 power behavior are intentionally separate. Series 2 chips share one HAL
@@ -636,8 +637,12 @@ Not proven on hardware:
 - **Dongle-M (38.4 MHz, 20 dBm PA)**: the radio is enabled
   (`hfxo-38m4hz`) with the stock Dongle-M EmberZNet image's PHY, which is
   GSDK's 38.4 MHz 802.15.4 configuration byte for byte, and RAIL's
-  per-channel words. **First HIL pending**: nothing has run on a unit, and
-  the table still carries the 39 MHz B220 die's runtime trims. See
+  per-channel words. **First HIL (one unit, partial)**: the NCP image,
+  uploaded through the stock bootloader, ran 22 minutes at 460 800 Bd with
+  the EmberZNet network restored onto it (channel 20) and decrypted the
+  NWK-secured rejoins of an end device; transmission to a device, the
+  output and the CTUNE offset are not yet measured, and the table still
+  carries the 39 MHz B220 die's runtime trims. See
   [SONOFF Dongle-M over the stock firmware](#sonoff-dongle-m-over-the-stock-firmware).
   An xG24 build that names no crystal keeps the radio `Unsupported`.
 - **NCP**: ran on the BRD4187A only, against `hubctl` over the WSTK VCOM
@@ -1252,8 +1257,8 @@ would not move it.
 The Dongle-M NCP image (`efr32mg24-ncp-sonoff-dongle-m.gbl`, CI artifact
 `efr32mg24-firmware` with `SHA256SUMS`) is meant to be uploaded through the
 unit's stock Gecko bootloader: ESP32 GPIO12 high during a GPIO15 reset,
-then XMODEM at 115 200 (menu `1. upload gbl`, then `2. run`). Nothing below
-has run on a Dongle-M; this is what the image is checked against.
+then XMODEM at 115 200 (menu `1. upload gbl`, then `2. run`). The table
+is what the image is checked against; the first run on a unit is below it.
 
 What the stock side is (stock GBL `zigbee_ncp_uart_hw_donglem_v7.4.5.gbl`,
 SHA-256 `44b81c1e…a311fa`, and a read-only probe of one unit through the
@@ -1298,6 +1303,23 @@ Checks behind the table:
   erases the whole window when it finds one (`Opened::ForeignNvm3`, logged).
   Our journals' page starts are erased or carry an ASCII `ZB..` magic, so
   they never match. A host test runs exactly that sequence.
+
+First run on a unit (one Dongle Max, image from `e96cd867`, build ID
+`a603b22b88fc5c2b`, reported by the hub's HIL run): it booted from the stock
+bootloader, kept the stock IEEE (DEVINFO EUI-64; the unit has neither
+`MFG_CUSTOM_EUI_64` nor `MFG_CTUNE` programmed, so CTUNE came from
+`MODXOCAL` or the default), ran 22 minutes at 460 800 Bd without a reset,
+and took the hub's restore of the unit's EmberZNet backup (channel 20, the
+network key, NWK counter from 153 428, one child, no link keys). An end
+device's NWK-secured rejoins were received and decrypted, so reception at
+38.4 MHz works. Its Trust Center then denied each rejoin and dropped the
+child: an EmberZNet backup lists devices without keys (the stack derives
+them from `hashed_tclk`), and the Trust Center refused secured rejoins of
+devices missing from its table. Fixed in the shared stack (ZRHP spec 7.5):
+secured rejoins are admitted, restored devices are registered (with their
+EmberZNet-derived keys when the backup carries `hashed_tclk`), and the
+child entry is kept. Transmission to a device, the output and the CTUNE
+offset remain open for the next run.
 - On first boot the stock network keys, frame counters and tables are gone.
   Take an EZSP network backup with the hub before flashing and restore it
   over ZRHP; because the IEEE is the stock one, the devices keep their Trust
@@ -1322,8 +1344,8 @@ values at 38.4 MHz against the shared analog states.
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
 | NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 456,956 B | 168,660 B | 89,388 B |
-| NCP, Dongle-M | 457,120 B | 168,660 B | 89,388 B |
-| NCP, BRD4187 on a WSTK | 457,112 B | 168,660 B | 89,388 B |
+| NCP, Dongle-M | 460,084 B | 168,660 B | 89,388 B |
+| NCP, BRD4187 on a WSTK | 460,084 B | 168,660 B | 89,388 B |
 | Router, RF-BM-MG24B1 (GP Proxy Basic) | 345,480 B | 37,140 B | 224,492 B |
 | Router, Dongle-M | 345,804 B | 37,140 B | 224,492 B |
 | Router, BRD4187 on a WSTK | 345,744 B | 37,136 B | 224,496 B |
@@ -1333,7 +1355,12 @@ The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
 MG24 image compared with `15ee9550`, the build-only base without a radio.
 Static RAM and stack did not change. The 10 dBm PA support added about
 130 B (Router) and 220 B (NCP) to the RF-BM-MG24B1 images. The BRD4187 and
-Dongle-M images are byte-identical with and without it.
+Dongle-M images are byte-identical with and without it. The EmberZNet
+restore support (secured-rejoin admission, hashed-TCLK root and
+derivation, `SEC_DERIVE_EZSP_KEY`) and the held boot log added 2,976 B to
+the Dongle-M and BRD4187 NCPs against `e96cd867` (457,108 → 460,084 B
+file-backed), with the same `.bss` and linked stack; the Router changed
+by 4 B.
 
 The NCP uses 33 % of the application window and 66 % of SRAM for static
 data. The compact capacity tier is not needed. The recorded fatal resets
@@ -1414,8 +1441,8 @@ Open:
 
    That run also checks the board-level items: the A410 die, the RF path
    and the antenna.
-3. **38.4 MHz crystal (enabled, first HIL pending).** On a Dongle-M,
-   compare raw TX/RX, ACK timing, output and the CTUNE frequency offset
+3. **38.4 MHz crystal (enabled; reception seen on one unit).** On a
+   Dongle-M, compare raw TX/RX, ACK timing, output and the CTUNE frequency offset
    with the stock EmberZNet image (nRF sniffer). Capture RAIL's per-state
    and per-channel values at 38.4 MHz (stock image over SWD, if the pads
    are found) and re-check the runtime trims on that die. If the radio
