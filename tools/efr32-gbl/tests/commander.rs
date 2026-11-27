@@ -8,7 +8,10 @@
 //! (`--metadata meta.json` for golden-meta.gbl; `odd.bin` is the same
 //! image plus 3 bytes for golden-odd.gbl).
 
-use efr32_gbl::{find_app_properties, parse, prepare_app_image, write};
+use efr32_gbl::{
+    GeckoTarget, find_app_properties, gecko_boot_check, parse, prepare_app_image, program_image,
+    write,
+};
 
 const BASE: u32 = 0x0800_6000;
 
@@ -84,4 +87,36 @@ fn word13_is_patched_and_conflicts_are_refused() {
     let mut bad_sp = fixture("app13.bin");
     bad_sp[0..4].copy_from_slice(&0x1000_0000u32.to_le_bytes());
     assert!(prepare_app_image(&mut bad_sp, BASE, 0x2000_0000..0x2004_0000).is_err());
+}
+
+#[test]
+fn gecko_start_up_checks() {
+    let target = GeckoTarget::MG24_F1536;
+    let image = fixture("app13.bin");
+    let boot = gecko_boot_check(&image, BASE, target).unwrap();
+    assert_eq!(
+        (boot.initial_sp, boot.reset_vector, boot.properties.address),
+        (0x2004_0000, 0x0800_6181, 0x0800_6100)
+    );
+    // The program data of the GBL is the same image.
+    let parsed = parse(&fixture("golden-plain.gbl")).unwrap();
+    assert_eq!(program_image(&parsed), Some((BASE, image.clone())));
+
+    let patched = |at: usize, word: u32| {
+        let mut bad = image.clone();
+        bad[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        gecko_boot_check(&bad, BASE, target)
+    };
+    // SP past the end of SRAM, reset vector in the bootloader or ARM mode,
+    // word 13 not set (or inside the first 64 bytes), signed image.
+    assert!(patched(0, 0x2004_0004).is_err());
+    assert!(patched(4, 0x0800_0101).is_err());
+    assert!(patched(4, 0x0800_6180).is_err());
+    assert!(patched(52, 0).is_err());
+    assert!(patched(52, 0x0800_6020).is_err());
+    assert!(patched(0x100 + 20, 1).is_err());
+    // Struct major 2 would be refused by every GSDK 3.x/4.x bootloader.
+    assert!(patched(0x100 + 16, 0x0000_0202).is_err());
+    // Linked elsewhere than the application space.
+    assert!(gecko_boot_check(&image, 0x0800_4000, target).is_err());
 }

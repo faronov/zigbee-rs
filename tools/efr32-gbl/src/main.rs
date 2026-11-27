@@ -12,7 +12,9 @@
 //!            with the ZRHP metadata record for NCP images)
 //! efr32-gbl parse <GBL>
 //!     verifies the CRC and lists the records, the application data, the
-//!     program ranges and any signature/encryption tags
+//!     program ranges and any signature/encryption tags; an application
+//!     GBL for the EFR32MG24 F1536 application space (0x08006000) must also
+//!     pass the Gecko bootloader's start-up checks (`gecko_boot_check`)
 //! ```
 //!
 //! Defaults match `products/efr32mg24` (EFR32MG24 F1536 above the
@@ -22,8 +24,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use efr32_gbl::{
-    Error, ZrhpBuild, elf_flash_image, intel_hex, parse, prepare_app_image, prepare_zrhp_build,
-    write,
+    Error, GeckoTarget, ZrhpBuild, elf_flash_image, gecko_boot_check, intel_hex, parse,
+    prepare_app_image, prepare_zrhp_build, program_image, write,
 };
 
 fn number(text: &str) -> Result<u32, String> {
@@ -99,6 +101,17 @@ fn app(args: &[String]) -> Result<(), String> {
     };
     let gbl = write(&props.app, base, &image, metadata.as_deref());
     parse(&gbl).map_err(|e| format!("self-check of the written GBL failed: {e}"))?;
+    gecko_boot_check(
+        &image,
+        base,
+        GeckoTarget {
+            app_space_start: app_start,
+            sram: (0x2000_0000, ram_end),
+            // Stricter than the bootloader (end of flash): the application window.
+            flash_end: app_end,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     for (suffix, data) in [
         ("bin", image.clone()),
         ("hex", intel_hex(&image, base).into_bytes()),
@@ -188,6 +201,31 @@ fn describe(path: &str) -> Result<(), String> {
         "  signed: {}, encrypted: {}, updates bootloader/SE: {}",
         parsed.signed, parsed.encrypted, parsed.updates_bootloader
     );
+    // An application GBL for an EFR32MG24 F1536 above a 24 KiB Gecko
+    // bootloader (the products/efr32mg24 and stock Dongle-M layout) must
+    // pass the bootloader's start-up checks.
+    if parsed.application.is_some() && !parsed.encrypted {
+        let target = GeckoTarget::MG24_F1536;
+        match program_image(&parsed) {
+            Some((base, image)) if base == target.app_space_start => {
+                let boot = gecko_boot_check(&image, base, target).map_err(|e| e.to_string())?;
+                println!(
+                    "  Gecko start-up check (MG24 F1536, app space {:#010x}): SP {:#010x}, reset \
+                     {:#010x}, properties at {:#010x} v{:#06x}, signature NONE: ok",
+                    target.app_space_start,
+                    boot.initial_sp,
+                    boot.reset_vector,
+                    boot.properties.address,
+                    boot.properties.struct_version
+                );
+            }
+            Some((base, _)) => println!(
+                "  Gecko start-up check skipped: program starts at {base:#010x}, not the MG24 \
+                 F1536 application space"
+            ),
+            None => println!("  Gecko start-up check skipped: compressed or no program records"),
+        }
+    }
     Ok(())
 }
 
