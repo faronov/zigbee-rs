@@ -48,6 +48,7 @@ pub mod gpio;
 pub mod i2c;
 #[cfg(feature = "efr32mg22")]
 pub mod iadc;
+pub mod ldma;
 pub mod peripherals;
 pub mod power;
 pub mod radio;

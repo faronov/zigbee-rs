@@ -1,7 +1,7 @@
 //! ZRHP host transport: USART0 to the host MCU (RF-BM-MG24B1: the
 //! ESP32-S3 on PA05/PA06; Dongle-M: the ESP32 on PC01/PC02), spec 4.1,
-//! interrupt-driven 8 KiB receive and 2 KiB transmit rings
-//! (`efr32s2-hal` `usart0-host`).
+//! an LDMA-fed 8 KiB receive ring and an interrupt-driven 2 KiB transmit
+//! ring (`efr32s2-hal` `usart0-host`).
 //!
 //! No RTS/CTS: the Dongle-M wires none, and the dev board's optional pins
 //! stay unused so both boards behave the same. ZRHP credits are the only
@@ -9,10 +9,12 @@
 //! control); the Gecko bootloader keeps 115 200. The WSTK BRD4187 variant
 //! runs at the board controller's VCOM rate (`efr32mg24_brd4187::VCOM_BAUD`,
 //! 115 200) and accepts no other: measured, 460 800 and 921 600 fail on the
-//! BRD4001A VCOM (framing errors on both ends). A flash page erase stalls
-//! instruction fetches for milliseconds; bytes the two-byte USART buffer
-//! cannot hold meanwhile are lost and counted as line faults, and ARQ
-//! recovers the frame.
+//! BRD4001A VCOM (framing errors on both ends). The LDMA keeps receiving
+//! while interrupts are held off (the radio's Imm-Ack interrupt runs about
+//! 650 µs; a flash page erase stalls instruction fetches for about 12 ms),
+//! so the two-byte USART buffer no longer overruns. Overruns (a reader more
+//! than 6 KiB behind stalls the DMA) and framing errors are still counted
+//! as line faults, and ARQ recovers the frame.
 
 use efr32s2_hal::usart::host::{HostUart, HostUartError};
 use ncp_coordinator_app::transport::{HostTransport, LineFaults, TransportInfo, UartChangeError};

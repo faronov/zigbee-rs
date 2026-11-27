@@ -68,6 +68,7 @@ impl BoardResources {
             clocks: peripherals.clocks,
             host_uart: HostUartToken {
                 usart: peripherals.usart0,
+                ldma: peripherals.ldma,
                 tx,
                 rx,
                 enable,
@@ -85,13 +86,16 @@ impl BoardResources {
 /// Exclusive USART0 + PA8/PA9 + the WSTK VCOM enable (PB0).
 pub struct HostUartToken {
     usart: Usart,
+    /// The host link's receiver DMA.
+    ldma: efr32s2_hal::ldma::Ldma,
     tx: Pin<Disabled>,
     rx: Pin<Disabled>,
     enable: Pin<Disabled>,
 }
 
 impl HostUartToken {
-    /// Interrupt-driven 8N1 link to the VCOM without flow control. Requires
+    /// 8N1 link to the VCOM without flow control (LDMA receiver,
+    /// interrupt-driven transmitter). Requires
     /// the HFXO. The VCOM enable stays driven high for the image's life.
     #[cfg(feature = "host-uart")]
     pub fn open(
@@ -102,6 +106,7 @@ impl HostUartToken {
         let _vcom_enable = self.enable.into_push_pull(Level::High);
         efr32s2_hal::usart::host::HostUart::open(
             self.usart,
+            self.ldma,
             self.tx.into_push_pull(Level::High),
             self.rx.into_input(Pull::Up),
             baud,
@@ -110,7 +115,7 @@ impl HostUartToken {
 
     /// Blocking transmit-only UART (logs) on the VCOM. Requires the HFXO.
     pub fn into_uart_tx(self, baud: u32) -> UartTx {
-        let _unused = self.rx;
+        let _unused = (self.rx, self.ldma);
         // `Pin` has no `Drop`: the enable keeps driving high.
         let _vcom_enable = self.enable.into_push_pull(Level::High);
         self.usart

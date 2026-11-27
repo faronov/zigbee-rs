@@ -57,6 +57,7 @@ impl BoardResources {
             clocks: peripherals.clocks,
             host_uart: HostUartToken {
                 usart: peripherals.usart0,
+                ldma: peripherals.ldma,
                 tx,
                 rx,
             },
@@ -71,12 +72,15 @@ impl BoardResources {
 /// Exclusive USART0 + PC01/PC02 (the link to the ESP32, no RTS/CTS).
 pub struct HostUartToken {
     usart: Usart,
+    /// The host link's receiver DMA.
+    ldma: efr32s2_hal::ldma::Ldma,
     tx: Pin<Disabled>,
     rx: Pin<Disabled>,
 }
 
 impl HostUartToken {
-    /// Interrupt-driven 8N1 host link without flow control. Requires the
+    /// 8N1 host link without flow control (LDMA receiver, interrupt-driven
+    /// transmitter). Requires the
     /// HFXO.
     #[cfg(feature = "host-uart")]
     pub fn open(
@@ -85,6 +89,7 @@ impl HostUartToken {
     ) -> Result<efr32s2_hal::usart::host::HostUart, efr32s2_hal::usart::host::HostUartError> {
         efr32s2_hal::usart::host::HostUart::open(
             self.usart,
+            self.ldma,
             self.tx.into_push_pull(Level::High),
             self.rx.into_input(efr32s2_hal::gpio::Pull::Up),
             baud,
@@ -93,7 +98,7 @@ impl HostUartToken {
 
     /// Blocking transmit-only UART (lab logs). Requires the HFXO.
     pub fn into_uart_tx(self, baud: u32) -> UartTx {
-        let _unused = self.rx;
+        let _unused = (self.rx, self.ldma);
         self.usart
             .into_uart_tx(self.tx.into_push_pull(Level::High), baud)
     }
