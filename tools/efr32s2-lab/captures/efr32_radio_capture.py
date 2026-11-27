@@ -29,6 +29,14 @@ programming and the RSSI offset. This tool keeps that work reproducible.
 ``manifest``
     SHA-256 of every dump under a capture directory.
 
+``stock-gbl``
+    Look for GSDK's 802.15.4 PHY tables (every crystal variant of
+    ``rail_util_built_in_phys/<chip>``) in the application of a vendor GBL,
+    print the matching ``phyInfo`` and the per-channel ``SRCRATIO2`` /
+    ``DIGMIXFREQ`` RAIL derives from it (``xg24::channel_words``). Used to
+    show that the stock SONOFF Dongle-M EmberZNet image runs GSDK's
+    38.4 MHz PHY (``captures/dongle-m-stock``). The GBL is only read.
+
 The RAILtest image, the GSDK and the register map stay outside the
 repository (lab-only tools under the Silicon Labs licence). Only our own
 measurements, the raw register dumps, are committed next to this script.
@@ -469,6 +477,105 @@ def cmd_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Vendor GBL: which GSDK PHY table does the application carry?
+# ---------------------------------------------------------------------------
+
+_GBL_PROG_TAGS = (0xFD0303FD, 0xFE0101FE)
+_PHY_ARRAY = re.compile(r"const uint32_t (\w+modemConfig(?:Base)?)\[\] = \{(.*?)\};", re.S)
+
+
+def gbl_application(path: str) -> tuple[int, bytes]:
+    """Program data of a plain GBL3 merged at its lowest address."""
+    data = open(path, "rb").read()
+    chunks, offset = [], 0
+    while offset + 8 <= len(data):
+        tag, length = struct.unpack_from("<II", data, offset)
+        body = data[offset + 8 : offset + 8 + length]
+        if tag in _GBL_PROG_TAGS:
+            chunks.append((struct.unpack_from("<I", body)[0], body[4:]))
+        offset += 8 + length
+        if tag == 0xFC0404FC:
+            break
+    base = min(c[0] for c in chunks)
+    end = max(c[0] + len(c[1]) for c in chunks)
+    image = bytearray(b"\xff" * (end - base))
+    for address, body in chunks:
+        image[address - base : address - base + len(body)] = body
+    return base, bytes(image)
+
+
+def phy_arrays(path: str) -> dict[str, list[int | None]]:
+    """The radio-configurator word lists of a GSDK PHY file (pointers as None)."""
+    text = open(path).read()
+    out = {}
+    for m in _PHY_ARRAY.finditer(text):
+        body = re.sub(r"/\*.*?\*/", "", m.group(2), flags=re.S)
+        body = re.sub(r"//[^\n]*", "", body)
+        words: list[int | None] = []
+        for token in (t.strip() for t in body.split(",")):
+            if token:
+                words.append(None if token.startswith("(uint32_t)") else int(token.rstrip("UL"), 0))
+        out[m.group(1)] = words
+    return out
+
+
+def best_match(words: list[int | None], image_words: tuple[int, ...]) -> tuple[int, int]:
+    """(matching concrete words, word index) of the best alignment."""
+    first = next(i for i, w in enumerate(words) if w is not None)
+    best = (0, -1)
+    for i, w in enumerate(image_words):
+        start = i - first
+        if w != words[first] or start < 0 or start + len(words) > len(image_words):
+            continue
+        same = sum(1 for j, x in enumerate(words) if x is not None and image_words[start + j] == x)
+        best = max(best, (same, start))
+    return best
+
+
+def lo_word(channel: int, hfxo: int) -> int:
+    return ((2_405_000_000 + 5_000_000 * (channel - 11)) << 19) // hfxo
+
+
+def channel_words(hfxo: int, iffreq: int, src2_denominator: int, dec0: int) -> list[tuple[int, int]]:
+    """RAIL's per-channel SRCRATIO2 / DIGMIXFREQ (efr32s2-hal xg24::channel_words)."""
+    out = []
+    for channel in range(11, 27):
+        lo = lo_word(channel, hfxo) + iffreq
+        den = 2048 * src2_denominator
+        out.append(((2 * lo * hfxo + den) // (2 * den), (2 * ((iffreq * dec0) << 26) + lo) // (2 * lo)))
+    return out
+
+
+def cmd_stock_gbl(args: argparse.Namespace) -> int:
+    base, image = gbl_application(args.gbl)
+    words = struct.unpack_from(f"<{len(image) // 4}I", image)
+    print(f"# {os.path.basename(args.gbl)}: sha256 {hashlib.sha256(open(args.gbl, 'rb').read()).hexdigest()}")
+    print(f"# application {base:#010x}..{base + len(image):#010x}")
+    root = os.path.join(args.gsdk, "platform/radio/rail_lib/plugin/rail_util_built_in_phys", args.chip)
+    for path in sorted(glob.glob(os.path.join(root, "sl_rail_ieee802154_config_*.c"))):
+        for name, phy in phy_arrays(path).items():
+            concrete = sum(1 for w in phy if w is not None)
+            same, at = best_match(phy, words)
+            print(f"  {name:62s} {same:4d}/{concrete:4d} at {base + 4 * at:#010x}")
+            if same != concrete or not name.endswith("_modemConfig"):
+                continue
+            # 0x03014FFC, &phyInfo is the first entry of a modemConfig.
+            info_at = words[at + 1] - base
+            info = struct.unpack_from("<20I", image, info_at)
+            hfxo = 38_400_000 if "38M4Hz" in path else int(re.search(r"_(\d+)MHz", path).group(1)) * 1_000_000
+            cache = info[10]
+            dec0 = {0: 3, 1: 4, 3: 8}[(cache >> 22) & 3]
+            print(f"    phyInfo at {base + info_at:#010x}: freqOffsetFactor {info[1]:#010x}, "
+                  f"src2Denominator {info[7]}, synthCache {cache:#010x} (IFFREQ {cache & 0xFFFFF:#x}, dec0 {dec0})")
+            for channel, (src, mix) in zip(range(11, 27), channel_words(hfxo, cache & 0xFFFFF, info[7], dec0)):
+                print(f"    ch{channel}: SRCRATIO2 {src:#06x} DIGMIXFREQ {mix:#07x}")
+    # RAIL_TxPowerConfig_t {mode, voltage mV, ramp us} with GSDK defaults
+    for m in re.finditer(rb"[\x00-\x0f]\x00\xe4\x0c\x0a\x00", image):
+        print(f"  PA config candidate at {base + m.start():#010x}: mode {image[m.start()]}, 3300 mV, 10 us")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -501,6 +608,12 @@ def main() -> int:
     m = sub.add_parser("manifest", help="sha256 of every dump")
     m.add_argument("capture")
     m.set_defaults(func=cmd_manifest)
+
+    v = sub.add_parser("stock-gbl", help="find GSDK PHY tables in a vendor GBL")
+    v.add_argument("gbl")
+    v.add_argument("--gsdk", default=DEFAULT_GSDK)
+    v.add_argument("--chip", default="efr32xg24")
+    v.set_defaults(func=cmd_stock_gbl)
 
     args = p.parse_args()
     return args.func(args)
