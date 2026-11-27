@@ -10,6 +10,10 @@
 //!            <PREFIX>.hex (same image, Intel HEX for J-Link) and
 //!            <PREFIX>.gbl (plain GBL3 for the Gecko UART/XMODEM bootloader;
 //!            with the ZRHP metadata record for NCP images)
+//! efr32-gbl clear --out <GBL> [--from 0x08158000] [--to 0x08180000]
+//!     writes a GBL that only erases [from, to) (default: the
+//!     products/efr32mg24 NV journal window), e.g. before going back to a
+//!     stock EmberZNet image; no application record
 //! efr32-gbl parse <GBL>
 //!     verifies the CRC and lists the records, the application data, the
 //!     program ranges and any signature/encryption tags; an application
@@ -25,7 +29,7 @@ use std::process::ExitCode;
 
 use efr32_gbl::{
     Error, GeckoTarget, ZrhpBuild, elf_flash_image, gecko_boot_check, intel_hex, parse,
-    prepare_app_image, prepare_zrhp_build, program_image, write,
+    prepare_app_image, prepare_zrhp_build, program_image, write, write_erase,
 };
 
 fn number(text: &str) -> Result<u32, String> {
@@ -151,6 +155,36 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn clear(args: &[String]) -> Result<(), String> {
+    let mut out = None;
+    let mut from = 0x0815_8000u32;
+    let mut to = 0x0818_0000u32;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let mut value = || iter.next().cloned().ok_or(format!("{arg} needs a value"));
+        match arg.as_str() {
+            "--out" => out = Some(value()?),
+            "--from" => from = number(&value()?)?,
+            "--to" => to = number(&value()?)?,
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let out = out.ok_or("--out is required")?;
+    // Never the 24 KiB Gecko bootloader.
+    if from < 0x0800_6000 {
+        return Err(format!("{from:#010x} is inside the Gecko bootloader"));
+    }
+    let gbl = write_erase(from, to, 8192).map_err(|e| e.to_string())?;
+    parse(&gbl).map_err(|e| format!("self-check of the written GBL failed: {e}"))?;
+    std::fs::write(&out, &gbl).map_err(|e| format!("{out}: {e}"))?;
+    println!(
+        "{out}: erases {from:#010x}..{to:#010x} ({} B), GBL {} B (plain, no application record)",
+        to - from,
+        gbl.len()
+    );
+    Ok(())
+}
+
 fn describe(path: &str) -> Result<(), String> {
     let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     let parsed = parse(&data).map_err(|e| e.to_string())?;
@@ -233,9 +267,12 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("app") => app(&args[1..]),
+        Some("clear") => clear(&args[1..]),
         Some("parse") if args.len() == 2 => describe(&args[1]),
         _ => Err(
-            "usage: efr32-gbl app --elf <ELF> --out <PREFIX> [...] | efr32-gbl parse <GBL>".into(),
+            "usage: efr32-gbl app --elf <ELF> --out <PREFIX> [...] | efr32-gbl clear --out <GBL> \
+             [--from A --to B] | efr32-gbl parse <GBL>"
+                .into(),
         ),
     };
     match result {

@@ -10,7 +10,7 @@
 
 use efr32_gbl::{
     GeckoTarget, find_app_properties, gecko_boot_check, parse, prepare_app_image, program_image,
-    write,
+    write, write_erase,
 };
 
 const BASE: u32 = 0x0800_6000;
@@ -119,4 +119,21 @@ fn gecko_start_up_checks() {
     assert!(patched(0x100 + 16, 0x0000_0202).is_err());
     // Linked elsewhere than the application space.
     assert!(gecko_boot_check(&image, 0x0800_4000, target).is_err());
+}
+
+#[test]
+fn nv_clear_gbl_erases_only_its_window() {
+    let gbl = write_erase(0x0815_8000, 0x0818_0000, 8192).unwrap();
+    let parsed = parse(&gbl).unwrap();
+    assert_eq!(parsed.gbl_type, 0);
+    assert!(parsed.application.is_none() && parsed.metadata.is_none());
+    assert!(!parsed.signed && !parsed.encrypted && !parsed.updates_bootloader);
+    assert_eq!(parsed.programs, vec![(0x0815_8000, 0x2_8000)]);
+    let (base, image) = program_image(&parsed).unwrap();
+    assert_eq!(base, 0x0815_8000);
+    assert!(image.iter().all(|b| *b == 0xFF));
+    // Unaligned or empty ranges are refused.
+    assert!(write_erase(0x0815_8000, 0x0815_8001, 8192).is_err());
+    assert!(write_erase(0x0815_9000, 0x0818_0000, 8192).is_err());
+    assert!(write_erase(0x0818_0000, 0x0818_0000, 8192).is_err());
 }

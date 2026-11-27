@@ -1189,10 +1189,18 @@ erases the pages it programs, so the journals survive a firmware update.
 The stock EmberZNet NVM3 (`0x0817_6000..0x0817_E000`) sits inside the
 journal window; the first boot treats it as foreign and erases it, together
 with the stock network key, frame counters and tables (host-tested, see
-[SONOFF Dongle-M over the stock firmware](#sonoff-dongle-m-over-the-stock-firmware)). **On a Dongle-M in service, the hub must take an
-EZSP network backup before flashing**: nothing can be recovered from the
-erased NVM3. Before going back to EmberZNet, clear the window (an "app
-clear" GBL or SWD erase), because NVM3 does not expect our journals there.
+[SONOFF Dongle-M over the stock firmware](#sonoff-dongle-m-over-the-stock-firmware)).
+An NVM3 page header at any page start of the window makes the whole window
+foreign even when older records of ours survive above the stock NVM3 (after
+a return from a stock image). **On a Dongle-M in service, the hub must take
+an EZSP network backup before flashing**: nothing can be recovered from the
+erased NVM3. Before going back to EmberZNet, erase the whole window
+`0x0815_8000..0x0818_0000`: upload `efr32mg24-nv-clear.gbl` (CI artifact,
+`efr32-gbl clear`) or erase it over SWD. NVM3 does not expect our journals
+in its pages, and a clear of the stock NVM3 pages alone (the 32 KiB
+`nvm3_clear` GBL, `0x0817_6000..0x0817_E000`) leaves our records in the
+top page `0x0817_E000..0x0818_0000`. The 40 KiB `nvm3_clear` variant
+(`0x0817_6000..0x0818_0000`) also covers that page.
 
 ### Firmware update path: Gecko bootloader kept
 
@@ -1258,7 +1266,7 @@ ESP32):
 | application | `ApplicationProperties_t` v1.2 at `0x0803_C148`, type ZIGBEE, signature NONE, version 1, product ID zero | v1.2, type ZIGBEE, signature NONE, version `0x0001_0000`, zigbee-rs product ID |
 | PHY | GSDK 4.5.0 38.4 MHz 802.15.4 configuration, byte for byte | the same (`hfxo-38m4hz`) with RAIL's per-channel words |
 | PA | `2P4GIG_HIGHEST`, 3300 mV, 10 µs ramp; power set by the EZSP host | 20 dBm PA table of the BRD4187A; fixed +10 dBm (no `NWK_SET_TX_POWER` on the MG24 NCP yet) |
-| NV | NVM3 at `0x0817_6000..0x0817_E000` | journals at `0x0815_8000..0x0818_0000`: the first boot finds no valid security record and erases the whole window |
+| NV | NVM3 at `0x0817_6000..0x0817_E000` | journals at `0x0815_8000..0x0818_0000`: the first boot finds NVM3 page headers (or no valid security record) and erases the whole window |
 | IEEE | EZSP EUI-64 `B0E8E8FFFE5D4D03` on the probed unit | `MFG_CUSTOM_EUI_64` if programmed, else DEVINFO: the same IEEE as stock either way |
 | CTUNE | `MODXOCAL` → `MFG_CTUNE` → 100 | the same order; value and source logged at boot |
 | host UART | EUSART1 PC01/PC02, 115 200, no flow control | USART0 on PC01/PC02 at 115 200; the LDMA receiver uses the USART0 request, independent of the pins |
@@ -1274,11 +1282,22 @@ Checks behind the table:
   APPLICATION record is parsed, before any program record, so a rejected
   upload leaves the stock application in place. Whether the stock
   bootloader has it is unknown.
-- `products/efr32mg24` `stores` host tests: NVM3-shaped pages at the stock
-  NVM3 location, pseudo-random bytes with our record magic at every slot,
-  and all-zero flash are all foreign (whole window erased, then a first
-  record commits and survives the next open); a valid journal and the other
+- `products/efr32mg24` `stores` host tests: NVM3 pages at the stock NVM3
+  location, pseudo-random bytes with our record magic at every slot, and
+  all-zero flash are all foreign (whole window erased, then a first record
+  commits and survives the next open); a valid journal and the other
   windows are preserved; another role's journal keeps its counters.
+- The return path "ours → 32 KiB `nvm3_clear` → stock EmberZNet → ours"
+  leaves valid records of ours in the top page `0x0817_E000`. Resuming them
+  would bring back the pre-stock network with frame-counter reservations
+  behind what the network saw on the stock firmware (devices would drop the
+  frames as replays). The opening policy therefore checks every 8 KiB page
+  start of the window for a GSDK NVM3 page header (magic `0xB29A`,
+  version, erase count with its Berger code, as written by GSDK 4.5.0
+  `libnvm3` `nvm3_pageHeaderWrite`) before the security journal, and
+  erases the whole window when it finds one (`Opened::ForeignNvm3`, logged).
+  Our journals' page starts are erased or carry an ASCII `ZB..` magic, so
+  they never match. A host test runs exactly that sequence.
 - On first boot the stock network keys, frame counters and tables are gone.
   Take an EZSP network backup with the hub before flashing and restore it
   over ZRHP; because the IEEE is the stock one, the devices keep their Trust
@@ -1287,8 +1306,10 @@ Checks behind the table:
 - `SYS_RESET` mode 1 writes `0xF00F0202` (BOOTLOAD reason, valid signature)
   to `0x2000_0000` and resets, the EmberZNet mechanism; untested on any
   MG24 so far. The ESP32's GPIO12 + RESET path stays the recovery path.
-- Going back to EmberZNet: upload the stock GBL the same way, after
-  clearing the journal window (NVM3 does not expect our data there).
+- Going back to EmberZNet: upload `efr32mg24-nv-clear.gbl` (erases
+  `0x0815_8000..0x0818_0000` only, no application record, so no version or
+  product-ID check applies), then the stock GBL. Built and parsed only;
+  not run on a bootloader yet.
 
 First run on a unit (the hardware gate): the boot log line
 `HFXO 38400000 Hz CTUNE … (source), TX 10 dBm, IEEE … (source)`, raw TX
@@ -1300,13 +1321,13 @@ values at 38.4 MHz against the shared analog states.
 
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
-| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 456,628 B | 168,660 B | 89,388 B |
-| NCP, Dongle-M | 456,800 B | 168,660 B | 89,388 B |
-| NCP, BRD4187 on a WSTK | 456,784 B | 168,660 B | 89,388 B |
-| Router, RF-BM-MG24B1 (GP Proxy Basic) | 345,144 B | 37,140 B | 224,492 B |
-| Router, Dongle-M | 345,468 B | 37,140 B | 224,492 B |
-| Router, BRD4187 on a WSTK | 345,408 B | 37,136 B | 224,496 B |
-| Router, EK2703A | 345,144 B | 37,136 B | 224,496 B |
+| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 456,956 B | 168,660 B | 89,388 B |
+| NCP, Dongle-M | 457,120 B | 168,660 B | 89,388 B |
+| NCP, BRD4187 on a WSTK | 457,112 B | 168,660 B | 89,388 B |
+| Router, RF-BM-MG24B1 (GP Proxy Basic) | 345,480 B | 37,140 B | 224,492 B |
+| Router, Dongle-M | 345,804 B | 37,140 B | 224,492 B |
+| Router, BRD4187 on a WSTK | 345,744 B | 37,136 B | 224,496 B |
+| Router, EK2703A | 345,480 B | 37,136 B | 224,496 B |
 
 The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
 MG24 image compared with `15ee9550`, the build-only base without a radio.
@@ -1334,8 +1355,9 @@ taken from the linked stack; the Routers moved by 0 to −16 B.
 Enabling the Dongle-M radio (`hfxo-38m4hz`), GSDK's CTUNE and EUI-64
 precedence, and the boot log line with their sources added 596–684 B to
 the NCP images and 292–416 B to the Routers compared with `8b91c3fc`
-(Dongle-M: +608 B NCP, +416 B Router). Static RAM and the linked stack did
-not change.
+(Dongle-M: +608 B NCP, +416 B Router). The NVM3 page-header scan of the
+opening policy and its log line added another 320–336 B. Static RAM and the
+linked stack did not change.
 
 ### Hardware gates
 
@@ -1416,6 +1438,7 @@ Open:
    EZSP backup; confirm the boot log (CTUNE and IEEE sources), the UART
    pins, the journal takeover of the stock NVM3, `SYS_RESET` mode 1 into
    Gecko, the restore of the EZSP backup under the same IEEE, the RF path
-   and the TX power limit.
+   and the TX power limit; then the return path (`efr32mg24-nv-clear.gbl`,
+   stock GBL, ours again: logged `ForeignNvm3`).
 8. **Power.** EM2, DC-DC, CCA against a jammer, children and Frame Pending
    through an xG24 Router, and long-duration runs.

@@ -3222,6 +3222,9 @@ jobs:
               ./tools/firmware-size-report.sh "$NAME" "$OUT/$NAME.bin" "$OUT/$NAME.size.json"
             done
           done
+          # Erases the NV journal window only (going back to a stock image).
+          cargo run --quiet --locked -p efr32-gbl -- clear --out "$OUT/efr32mg24-nv-clear.gbl"
+          cargo run --quiet --locked -p efr32-gbl -- parse "$OUT/efr32mg24-nv-clear.gbl"
           (cd "$OUT" && sha256sum ./*.gbl ./*.bin ./*.hex > SHA256SUMS && cat SHA256SUMS)
       - name: Upload EFR32MG24 firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

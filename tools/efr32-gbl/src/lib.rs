@@ -289,6 +289,33 @@ pub fn write(
     out
 }
 
+/// A GBL that erases `[from, to)` and programs nothing else: one
+/// erase-and-program record of `0xFF` bytes (the shape of Silicon Labs'
+/// `nvm3_clear` GBLs), no application record, so no application-version or
+/// rollback check applies and the installed application stays. The Gecko
+/// bootloader erases every page the record covers; `from`/`to` must be
+/// page-aligned (`page`).
+pub fn write_erase(from: u32, to: u32, page: u32) -> Result<Vec<u8>, Error> {
+    if from >= to || !from.is_multiple_of(page) || !to.is_multiple_of(page) {
+        return Err(Error::Layout(format!(
+            "erase range {from:#010x}..{to:#010x} is empty or not {page}-byte aligned"
+        )));
+    }
+    let mut out = Vec::with_capacity((to - from) as usize + 64);
+    let mut header = [0u8; 8];
+    header[0..4].copy_from_slice(&GBL_VERSION.to_le_bytes());
+    push_tag(&mut out, TAG_HEADER, &header);
+    let mut prog = Vec::with_capacity(4 + (to - from) as usize);
+    prog.extend_from_slice(&from.to_le_bytes());
+    prog.resize(4 + (to - from) as usize, 0xFF);
+    push_tag(&mut out, TAG_ERASEPROG, &prog);
+    out.extend_from_slice(&TAG_END.to_le_bytes());
+    out.extend_from_slice(&4u32.to_le_bytes());
+    let crc = crc32(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    Ok(out)
+}
+
 /// One parsed record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
