@@ -1267,11 +1267,15 @@ would not move it.
 
 ### SONOFF Dongle-M over the stock firmware
 
-The Dongle-M NCP image (`efr32mg24-ncp-sonoff-dongle-m.gbl`, CI artifact
-`efr32mg24-firmware` with `SHA256SUMS`) is meant to be uploaded through the
-unit's stock Gecko bootloader: ESP32 GPIO12 high during a GPIO15 reset,
-then XMODEM at 115 200 (menu `1. upload gbl`, then `2. run`). The table
-is what the image is checked against; the first run on a unit is below it.
+The Dongle-M NCP image (`efr32mg24-ncp-sonoff-dongle-m.gbl`) and the NV
+clear image (`efr32mg24-nv-clear.gbl`) are assets of every NCP release
+from `ncp-v0.1.3` on. They are listed under `gecko_images` in
+`release-manifest.json` and in `SHA256SUMS`, but not in the web flasher.
+Every CI run also builds them into the artifact `efr32mg24-firmware`. The
+NCP image is meant to be uploaded through the unit's stock Gecko
+bootloader: ESP32 GPIO12 high during a GPIO15 reset, then XMODEM at
+115 200 (menu `1. upload gbl`, then `2. run`). The table is what the image
+is checked against; the first run on a unit is below it.
 
 What the stock side is (stock GBL `zigbee_ncp_uart_hw_donglem_v7.4.5.gbl`,
 SHA-256 `44b81c1e…a311fa`, and a read-only probe of one unit through the

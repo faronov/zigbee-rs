@@ -194,19 +194,37 @@ not boot; the release notes list the commands for that release.
 | `…-merged.bin` | full flash image at offset 0 (NCP: all 4 MB, so it erases `zbnv`; hub: bootloader to the end of the app) |
 | `…-bootloader.bin`, `…-partition-table.bin`, `…-otadata-blank.bin`, `…-app.bin` | the parts the flasher writes |
 | `…-fw-signed.bin` (NCP) | `FW_*` update over ZRHP, signed for the NCP's trusted key |
+| `efr32mg24-ncp-sonoff-dongle-m.gbl` (NCP, 0.1.3 on) | ZRHP NCP for the SONOFF Dongle Max's EFR32MG24, for its Gecko bootloader (UART XMODEM, e.g. the hub's NCP update); not on this page |
+| `efr32mg24-nv-clear.gbl` (NCP, 0.1.3 on) | erases the NCP's NV window `0x08158000..0x08180000` (no application record): installed before the stock EmberZNet GBL on the way back |
 | `release-manifest.json` | machine-readable description (below) |
 | `SHA256SUMS` | SHA-256 of every asset |
 
-The version in the tag must equal the firmware's version
-(`examples/esp32-ncp/Cargo.toml` and its `Cargo.lock` entry; for the hub
-`firmware/hub/Cargo.toml` and `CONFIG_APP_PROJECT_VER`); the workflow also
-reads the version back from the built image's app descriptor and fails on a
-mismatch. A tag with a suffix (`ncp-v0.2.0-rc.1`) makes a pre-release.
+The version in the tag must equal the firmware's version. For the NCP,
+`tools/ncp-release/esp_release.py versions` checks every source and CI
+runs it on every push: the `[package]` version of `examples/esp32-ncp`,
+`examples/cc26x2-ncp`, `examples/efr32mg24-ncp` and `products/efr32mg24`
+(the Gecko application version), and their `Cargo.lock` entries. For the
+hub the sources are `firmware/hub/Cargo.toml` and `CONFIG_APP_PROJECT_VER`.
+The workflow also reads the version back from every built image (the ESP
+app descriptor; the GBL's application record and ZRHP record) and fails on
+a mismatch. A tag with a suffix (`ncp-v0.2.0-rc.1`) makes a pre-release.
+A stable NCP release needs its notes in `docs/releases/ncp-v<version>.md`;
+the release text starts with them, followed by the generated list of
+merged pull requests.
+
+**Dry run.** `ncp-release.yml` also runs without a tag, from *Run
+workflow* and on pull requests that touch the workflow, `tools/ncp-release`,
+`docs/releases` or an NCP version. Such a run builds, checks and describes
+every image under the version the tree carries. It uploads the release
+directory and the notes as the `ncp-release-dry-run` artifact. It signs,
+publishes and deploys nothing.
 
 Builds are reproducible from the tag: pinned toolchains and tools,
 `--locked`, no build cache, `SOURCE_DATE_EPOCH` from the commit, and on the
-NCP `ZRHP_BUILD_ID` = the first 8 bytes of the commit, which the NCP reports
-as `SYS_GET_INFO.build_id` (zero in other builds, which stay byte-identical).
+ESP NCP `ZRHP_BUILD_ID` = the first 8 bytes of the commit, which the NCP
+reports as `SYS_GET_INFO.build_id` (zero in other builds, which stay
+byte-identical). The EFR32MG24 build ID is the first 8 bytes of the image's
+SHA-256, which `tools/efr32-gbl` writes into the image.
 
 **NCP update files.** Shipped NCP firmware accepts only signed `FW_*`
 images. The release signs them when the repository secret
@@ -238,12 +256,26 @@ over ZRHP; flashing over USB is not affected.
     "preserved": [{"name": "zbnv", "offset": 4005888, "size": 196608, "what": "…"}],
     "fw_update": {"signed": true, "file": {"name": "…", "size": …, "sha256": "…"},
                   "version_word": "0x00010000"}
+  }],
+  "gecko_images": [{                      // NCP only, 0.1.3 on; the page ignores it
+    "id": "sonoff-dongle-m-mg24-ncp", "title": "…", "chip_family": "EFR32MG24",
+    "kind": "application",                // or "maintenance" (nv-clear: no application record)
+    "install": "Gecko bootloader (UART XMODEM), …",
+    "program": [{"start": "0x08006000", "end": "0x08076cf0"}],
+    "file": {"name": "efr32mg24-ncp-sonoff-dongle-m.gbl", "size": …, "sha256": "…"},
+    "app_version": "0.1.3", "build_id": "<16 hex>"   // application images only
   }]
 }
 ```
 
 `flash` lists the parts the flasher writes, in order; their offsets must not
-overlap. Hub manifests add `components` (e.g. the bundled bridge version)
+overlap. `gecko_images` lists EFR32 GBL files (plain, unsigned GBL v3). A
+browser cannot reach a chip that only its Gecko bootloader can install, so
+they are kept out of `boards`, and the page neither lists nor installs
+them. Hosts and the hub's NCP update use them. The release tooling refuses
+a GBL with a bad CRC, any signature, encryption or bootloader record, or a
+write below `0x08006000`. For application images it also checks the Gecko
+version and the ZRHP firmware version against the release. Hub manifests add `components` (e.g. the bundled bridge version)
 and, once the hub speaks Improv Serial, `improv` (`firmware` name and wait
 time) for ESP Web Tools. A board with `"web_install": false` (default
 `true`) is never installed through ESP Web Tools; `flash` then lists the
