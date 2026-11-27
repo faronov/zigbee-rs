@@ -66,14 +66,22 @@ pub const APP_PROPERTIES_VECTOR_WORD: usize = 13;
 pub enum Error {
     Truncated,
     BadHeader,
-    BadCrc { stored: u32, computed: u32 },
+    BadCrc {
+        stored: u32,
+        computed: u32,
+    },
     MissingEnd,
     NoAppProperties,
     AmbiguousAppProperties,
-    Word13Conflict { found: u32, expected: u32 },
+    Word13Conflict {
+        found: u32,
+        expected: u32,
+    },
     BadVectorTable(&'static str),
     Elf(&'static str),
     Layout(String),
+    /// The resident bootloader would not start (or not accept) the image.
+    GeckoBoot(String),
 }
 
 impl fmt::Display for Error {
@@ -102,6 +110,7 @@ impl fmt::Display for Error {
             Error::BadVectorTable(what) => write!(f, "vector table: {what}"),
             Error::Elf(what) => write!(f, "ELF: {what}"),
             Error::Layout(what) => write!(f, "layout: {what}"),
+            Error::GeckoBoot(what) => write!(f, "Gecko bootloader check: {what}"),
         }
     }
 }
@@ -278,6 +287,33 @@ pub fn write(
         out.push(0xFF);
     }
     out
+}
+
+/// A GBL that erases `[from, to)` and programs nothing else: one
+/// erase-and-program record of `0xFF` bytes (the shape of Silicon Labs'
+/// `nvm3_clear` GBLs), no application record, so no application-version or
+/// rollback check applies and the installed application stays. The Gecko
+/// bootloader erases every page the record covers; `from`/`to` must be
+/// page-aligned (`page`).
+pub fn write_erase(from: u32, to: u32, page: u32) -> Result<Vec<u8>, Error> {
+    if from >= to || !from.is_multiple_of(page) || !to.is_multiple_of(page) {
+        return Err(Error::Layout(format!(
+            "erase range {from:#010x}..{to:#010x} is empty or not {page}-byte aligned"
+        )));
+    }
+    let mut out = Vec::with_capacity((to - from) as usize + 64);
+    let mut header = [0u8; 8];
+    header[0..4].copy_from_slice(&GBL_VERSION.to_le_bytes());
+    push_tag(&mut out, TAG_HEADER, &header);
+    let mut prog = Vec::with_capacity(4 + (to - from) as usize);
+    prog.extend_from_slice(&from.to_le_bytes());
+    prog.resize(4 + (to - from) as usize, 0xFF);
+    push_tag(&mut out, TAG_ERASEPROG, &prog);
+    out.extend_from_slice(&TAG_END.to_le_bytes());
+    out.extend_from_slice(&4u32.to_le_bytes());
+    let crc = crc32(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    Ok(out)
 }
 
 /// One parsed record.
@@ -494,6 +530,132 @@ pub fn elf_flash_image(elf: &[u8], flash: core::ops::Range<u32>) -> Result<(u32,
         image[at..at + data.len()].copy_from_slice(data);
     }
     Ok((base, image))
+}
+
+/// The memory map a resident Gecko bootloader checks an application
+/// against (`mainBootloaderTable->startOfAppSpace`, `SRAM_BASE`/`SRAM_SIZE`,
+/// `FLASH_BASE + FLASH_SIZE` of the part).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeckoTarget {
+    pub app_space_start: u32,
+    pub sram: (u32, u32),
+    pub flash_end: u32,
+}
+
+impl GeckoTarget {
+    /// EFR32MG24 F1536 above a 24 KiB Gecko bootloader (the stock Dongle-M
+    /// layout and `products/efr32mg24`): 256 KiB SRAM.
+    pub const MG24_F1536: Self = Self {
+        app_space_start: 0x0800_6000,
+        sram: (0x2000_0000, 0x2004_0000),
+        flash_end: 0x0818_0000,
+    };
+}
+
+/// What [`gecko_boot_check`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeckoBoot {
+    pub initial_sp: u32,
+    pub reset_vector: u32,
+    pub properties: AppProperties,
+}
+
+/// The checks of the Gecko bootloader's `bootload_verifyApplication` for an
+/// application without secure boot (GSDK 4.5.0 `core/btl_bootload.c`; the
+/// same code path in the 2.4.x bootloaders of GSDK 4.4, e.g. the stock
+/// Dongle-M's v2.04.02), made strict: the application must carry
+/// `ApplicationProperties_t`.
+///
+/// - initial SP inside SRAM (`SRAM_BASE..=SRAM_BASE + SRAM_SIZE`);
+/// - reset vector inside the application space (and Thumb);
+/// - vector word 13 at or above `startOfAppSpace + 64`, inside the image,
+///   pointing at the properties magic;
+/// - struct version major 1 (`APPLICATION_PROPERTIES_VERSION_MAJOR` of
+///   every GSDK 3.x/4.x bootloader);
+/// - signature type NONE: the bootloader starts it without verification
+///   (CRC32 and ECDSA images need their signature, not written here).
+///
+/// `image` is the program data at `base` (normally `app_space_start`).
+pub fn gecko_boot_check(image: &[u8], base: u32, target: GeckoTarget) -> Result<GeckoBoot, Error> {
+    let fail = |what: String| Err(Error::GeckoBoot(what));
+    if base != target.app_space_start {
+        return fail(format!(
+            "image at {base:#010x}, the application space starts at {:#010x}",
+            target.app_space_start
+        ));
+    }
+    if image.len() < 4 * (APP_PROPERTIES_VECTOR_WORD + 1) {
+        return fail("image shorter than the vector table".into());
+    }
+    let word = |i: usize| u32::from_le_bytes(image[4 * i..4 * i + 4].try_into().unwrap());
+    let (sp, reset, props) = (word(0), word(1), word(APP_PROPERTIES_VECTOR_WORD));
+    if sp < target.sram.0 || sp > target.sram.1 {
+        return fail(format!("initial SP {sp:#010x} outside SRAM"));
+    }
+    if reset < target.app_space_start || reset > target.flash_end || reset & 1 == 0 {
+        return fail(format!(
+            "reset vector {reset:#010x} outside the application or not Thumb"
+        ));
+    }
+    let end = base as u64 + image.len() as u64;
+    if props < target.app_space_start + 64 || props as u64 + APP_PROPERTIES_LEN as u64 > end {
+        return fail(format!(
+            "vector word 13 ({props:#010x}) does not point at properties inside the image"
+        ));
+    }
+    let at = (props - base) as usize;
+    if image[at..at + 16] != APP_PROPERTIES_MAGIC {
+        return fail(format!("no ApplicationProperties_t magic at {props:#010x}"));
+    }
+    let field = |i: usize| u32::from_le_bytes(image[at + i..at + i + 4].try_into().unwrap());
+    let properties = AppProperties {
+        address: props,
+        struct_version: field(16),
+        signature_type: field(20),
+        app: ApplicationData::from_bytes(&image[at + 28..at + 56]).unwrap(),
+    };
+    if properties.struct_version & 0xFF != 1 {
+        return fail(format!(
+            "ApplicationProperties_t version {:#06x}: major must be 1",
+            properties.struct_version
+        ));
+    }
+    if properties.signature_type != 0 {
+        return fail(format!(
+            "signature type {} needs verification by the bootloader",
+            properties.signature_type
+        ));
+    }
+    Ok(GeckoBoot {
+        initial_sp: sp,
+        reset_vector: reset,
+        properties,
+    })
+}
+
+/// The application image a plain GBL programs: its uncompressed program
+/// records merged at their addresses (gaps `0xFF`). `None` without program
+/// records or with compressed ones.
+pub fn program_image(parsed: &Parsed) -> Option<(u32, Vec<u8>)> {
+    let mut chunks = Vec::new();
+    for record in &parsed.records {
+        match record.tag {
+            TAG_PROG | TAG_ERASEPROG if record.body.len() >= 4 => {
+                let address = u32::from_le_bytes(record.body[0..4].try_into().unwrap());
+                chunks.push((address, &record.body[4..]));
+            }
+            TAG_PROG_LZ4 | TAG_PROG_LZMA => return None,
+            _ => {}
+        }
+    }
+    let base = chunks.iter().map(|c| c.0).min()?;
+    let end = chunks.iter().map(|c| c.0 as u64 + c.1.len() as u64).max()?;
+    let mut image = vec![0xFF; (end - base as u64) as usize];
+    for (address, data) in chunks {
+        let at = (address - base) as usize;
+        image[at..at + data.len()].copy_from_slice(data);
+    }
+    Some((base, image))
 }
 
 /// Intel HEX of `image` at `base` (extended linear addressing, 16-byte

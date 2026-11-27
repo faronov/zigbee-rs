@@ -18,8 +18,8 @@
 //! On an EK2703A (10 dBm PA) it joined the same network through the BRD4187A
 //! router as its parent, with Imm-Acks in 158-169 us, and resumed after a
 //! reset. RF-BM-MG24B1 images use those 10 dBm tables but have not run;
-//! Dongle-M images (38.4 MHz crystal, PHY not verified) fail radio init
-//! with `Unsupported`, log it and halt.
+//! Dongle-M images use the stock image's 38.4 MHz PHY (`hfxo-38m4hz`) and
+//! have not run on a unit (first HIL pending).
 
 #![no_std]
 #![no_main]
@@ -154,12 +154,15 @@ async fn main(_spawner: Spawner) {
         halt()
     });
     efr32s2_hal::time_driver::init(rtcc);
+    let (ctune, ctune_source) = product::board::hfxo_ctune_with_source();
     log::info!(
-        "[MG24] {} on {} ({}), CTUNE {}, TX {} dBm, reset {cause:?} ({raw:#x})",
+        "[MG24] {} on {} ({}), HFXO {} Hz CTUNE {} ({:?}), TX {} dBm, reset {cause:?} ({raw:#x})",
         product::MODEL,
         product::BOARD_NAME,
         product::board::MCU_PART,
-        product::board::hfxo_ctune(),
+        product::board::HCLK_HZ,
+        ctune,
+        ctune_source,
         product::TX_POWER_DBM
     );
     if let Some(fatal) = previous {
@@ -207,8 +210,7 @@ fn compose(
     radio: efr32s2_hal::radio::RadioToken,
     flash: efr32s2_hal::flash::Efr32s2Flash,
 ) -> &'static mut App {
-    // Fails with `Unsupported` where the xG24 tables are not validated: the
-    // 38.4 MHz crystal (Dongle-M).
+    // Fails with `Unsupported` on an xG24 board that names no crystal.
     let mac: Mac = Efr32s2RadioPhy::new(radio)
         .map_err(|error| log::error!("[MG24] radio init failed: {error:?}"))
         .and_then(|phy| {
@@ -221,7 +223,11 @@ fn compose(
         log::error!("[MG24] no valid DEVINFO EUI-64");
         halt()
     }
-    log::info!("[MG24] EUI-64 {:02X?}", ieee);
+    log::info!(
+        "[MG24] EUI-64 {:02X?} ({:?})",
+        ieee,
+        efr32s2_hal::devinfo::ieee_address().1
+    );
 
     static SECURITY: StaticCell<stores::SecurityStore> = StaticCell::new();
     static PROFILE: StaticCell<RouterProfile> = StaticCell::new();
@@ -251,6 +257,11 @@ fn compose(
     match opened {
         Opened::Existing => log::info!("[MG24] journals preserved"),
         Opened::Fresh => log::warn!("[MG24] blank/foreign NV erased; fresh join required"),
+        Opened::ForeignNvm3 => {
+            log::warn!(
+                "[MG24] NVM3 (stock EmberZNet) in the NV window: erased; fresh join required"
+            )
+        }
         Opened::RoleChanged => log::warn!("[MG24] journal of another role: keys cleared"),
     }
     let stores::Stores {

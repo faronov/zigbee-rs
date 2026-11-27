@@ -10,9 +10,11 @@ The repository supports these products:
   Dongle-M, a BRD4187 radio board on a BRD4001A WSTK and the xG24 Explorer
   Kit EK2703A (Series 2). The xG24 radio at 39 MHz is lab-tested with the
   20 dBm (HP) PA on the BRD4187A and the 10 dBm (MP) PA on the EK2703A,
-  where the Router joined a test network. The 38.4 MHz crystal is not
-  enabled: the radio returns `Unsupported` on the Dongle-M. The
-  RF-BM-MG24B1 and the NCP have no hardware run.
+  where the Router joined a test network; the NCP ran on the BRD4187A
+  against `hubctl`. The Dongle-M (38.4 MHz) uses the PHY of its stock
+  EmberZNet image and is packaged for its stock Gecko bootloader, but has
+  not run on a unit (first HIL pending). The RF-BM-MG24B1 has no hardware
+  run.
 
 All use the shared `SensorApp`; their boards, products, clocks, storage, and
 power behavior are intentionally separate. Series 2 chips share one HAL
@@ -631,12 +633,13 @@ Not proven on hardware:
   path to the module's antenna, and CTUNE 92. Its first run should measure
   the CTUNE frequency offset, the output against RAILtest and the TX
   current.
-- **38.4 MHz tables (Dongle-M)**: derived from GSDK and never run on
-  silicon. The HAL therefore supports the xG24 radio only with
-  `hfxo-39mhz` (`xg24::SUPPORTED`, either PA variant). Dongle-M
-  images (20 dBm PA, 38.4 MHz) fail radio init with `Unsupported` and
-  halt, and `TX_POWER_RANGE_DBM` reports `(0, 0)`, so no host can request
-  the 20 dBm PA with unverified PHY values.
+- **Dongle-M (38.4 MHz, 20 dBm PA)**: the radio is enabled
+  (`hfxo-38m4hz`) with the stock Dongle-M EmberZNet image's PHY, which is
+  GSDK's 38.4 MHz 802.15.4 configuration byte for byte, and RAIL's
+  per-channel words. **First HIL pending**: nothing has run on a unit, and
+  the table still carries the 39 MHz B220 die's runtime trims. See
+  [SONOFF Dongle-M over the stock firmware](#sonoff-dongle-m-over-the-stock-firmware).
+  An xG24 build that names no crystal keeps the radio `Unsupported`.
 - **NCP**: ran on the BRD4187A only, against `hubctl` over the WSTK VCOM
   at 115 200 (formation, join, ZCL, backup/restore, reset/resume; see
   [ZRHP NCP](#zrhp-ncp-on-the-brd4187a-wstk-vcom)). Not run on the
@@ -655,7 +658,7 @@ products/efr32mg24          identity, memory map, journals, Gecko record,
 boards/rf-bm-mg24b1 | boards/sonoff-dongle-m | boards/efr32mg24-brd4187
   | boards/efr32mg24-ek2703a
         ↓
-efr32s2-hal (`efr32mg24-pa10` / `efr32mg24-pa20`, `hfxo-39mhz`)
+efr32s2-hal (`efr32mg24-pa10` / `efr32mg24-pa20`, `hfxo-39mhz` / `hfxo-38m4hz`)
         + zigbee-mac `efr32mg24` (Efr32s2RadioPhy on SoftMacCore)
 tools/efr32-gbl             ELF → raw image, Intel HEX and GBL3
 tools/efr32s2-lab           lab gates: `s2-mg24-hello` (RF-BM), `s2-mg24-air`
@@ -678,7 +681,8 @@ are unchanged.
 | flash | at `0x0`, 512 KiB / 1 MiB | at `0x0800_0000`, 1536 KiB, 8 KiB pages; `flash` offsets are relative to `chip::FLASH_BASE` |
 | SRAM | 64/96 KiB / 32 KiB | 256 KiB |
 | HFXO | `0x4000_C000`; `CTRL.FORCEEN`/`DISONDEMAND` bits 0/1; `FSMLOCK` (+ `MANUALOVERRIDE` on xG22) | `0x4A00_4000`; bits 16/24; no `FSMLOCK`, wait for `STATUS.SYNCBUSY`; XO CTUNE = XI + 40; fixed capacitor on XO only on 20 dBm parts ([PM-5131]) |
-| crystal | 38.4 MHz | 38.4 MHz (Dongle-M, per community manifests) or 39 MHz (RF-BM-MG24B1, feature `hfxo-39mhz`) |
+| crystal | 38.4 MHz | named by the board: `hfxo-38m4hz` (Dongle-M, 38.4 MHz) or `hfxo-39mhz` (RF-BM-MG24B1, BRD4187A, EK2703A); neither = radio `Unsupported` |
+| identity and CTUNE | DEVINFO EUI-64; `MFG_CTUNE` | `devinfo::ieee_address`: `MFG_CUSTOM_EUI_64` (`0x0FE0_0002`) unless all `FF`, else DEVINFO (EmberZNet's precedence; xG21/xG22 MACs keep DEVINFO). `devinfo::hfxo_ctune`: `MODXOCAL` when `MODULEINFO.HFXOCALVAL` is valid, then `MFG_CTUNE` (`0x0FE0_0100`), then the board default (GSDK `sl_device_init_hfxo`); MG24 images log value and source at boot |
 | bus clocks | xG22 `CLKEN0/1` | `CLKEN0/1` at other bit positions (GPIO 26, HFXO0 20, USART0 9, LFRCO 22, SYSRTC0 30, MSC 16 in CLKEN1, SE mailbox 10) |
 | GPIO | ports at `+0x00` | ports at `+0x30`; USART0 route at `0x720` |
 | time base | RTCC | **SYSRTC0** group 0 (compare 0/1, OVF/CMP0/CMP1 at bits 0/1/2), same `rtcc` API and time driver (`SYSRTC_APP` IRQ 67) |
@@ -778,14 +782,29 @@ summaries are in `tools/efr32s2-lab/captures/xg24-brd4187a`.
 | `RAC.RFLOCK0` | `0x0006_0000` is set at boot (0 and 10 dBm PAs locked on this part); the driver never writes it |
 
 **Crystal.** The 39 MHz tables come from the silicon (`hfxo-39mhz`). The
-38.4 MHz build (Dongle-M) differs in the 21 registers in which GSDK's
-`…_38M4Hz.c` differs from the 39 MHz file. Its per-channel values use the
-scaling verified at 39 MHz. **It has not run on silicon**, and it also
-carries the 39 MHz die's runtime trims. The tables build and are
-host-tested, but `SUPPORTED` stays false without `hfxo-39mhz`, so the radio
-refuses to start. To enable 38.4 MHz, widen the gate in `xg24.rs` after the
-hardware gate below passes; there is no opt-in feature that would let a
-product ship it by accident.
+38.4 MHz build (`hfxo-38m4hz`, Dongle-M) differs in the 21 registers in
+which GSDK's `…_38M4Hz.c` differs from the 39 MHz file. Evidence for it:
+
+- The stock Dongle-M image (`zigbee_ncp_uart_hw_donglem_v7.4.5.gbl`)
+  contains GSDK 4.5.0's `sl_rail_ieee802154_phy_2G4Hz_38M4Hz_modemConfigBase`
+  and `_modemConfig` byte for byte (238 + 66 configuration words; the
+  pointers differ) and the same `phyInfo` (`src2Denominator` 60 MHz,
+  `synthCache` `0x02104911`). The FEM and antenna-diversity variants
+  match only partly, and no 39 MHz value occurs
+  (`tools/efr32s2-lab/captures/dongle-m-stock`, reproducible with
+  `efr32_radio_capture.py stock-gbl`).
+- RAIL computes `SRCRATIO2` and `DIGMIXFREQ` per channel at run time; they
+  are not in the image. `xg24::channel_words` reproduces the computation:
+  `SRCRATIO2 = round(2^11 · (f_LO/8) / src2Denominator)` (fitted) and
+  `DIGMIXFREQ = round(IFFREQ · dec0 · 2^26 / (FREQ + IFFREQ))` (GSDK radio
+  configurator, `lynx`). Both reproduce all 16 channels of the 39 MHz
+  silicon exactly, and GSDK's channel-11 words at both crystals. The
+  earlier proportional scaling was within one LSB.
+
+**It has not run on silicon**, and it carries the 39 MHz B220 die's
+runtime trims (below). The first run on a Dongle-M must compare raw TX/RX,
+ACKs, output and the CTUNE offset against the stock image, and capture
+RAIL's per-state values at 38.4 MHz to confirm the shared analog states.
 
 **Die-specific values.** RAIL computes some trims at run time:
 `SYNTH.LPFCTRL2RX/TX`, `RAC.IFADCTRIM0`, `LNAMIXTRIM4`, `SYTRIM1`,
@@ -1132,13 +1151,17 @@ device child still comes back rx-off: the backup format cannot say so.
 | | RF-BM-MG24B1 dev board | SONOFF Dongle-M | BRD4187A on BRD4001A (radio lab) |EK2703A (MP radio lab) |
 |---|---|---|---|---|
 | part | EFR32MG24A410F1536IM48-B (+10 dBm) | EFR32MG24A420F1536IM48 (+20 dBm), SONOFF spec page | EFR32MG24B220F1536IM48 (+20 dBm; DEVINFO, although GSDK lists BRD4187A as A020) |EFR32MG24B210F1536IM48 (+10 dBm; DEVINFO) |
-| HFXO | 39 MHz on the module; CTUNE 92 (RF-star datasheet §4, **unmeasured**) | 38.4 MHz, CTUNE 100 (community manifests, **unverified**) | 39 MHz; no `MFG_CTUNE` on this unit, so the BRD4187C default CTUNE 95 (**unmeasured**) |39 MHz; no `MFG_CTUNE`, so the GSDK board CTUNE 100 (**unmeasured**) |
-| host UART | USART0 TX PA05 (pin 12), RX PA06 (pin 13) → ESP32-S3 SuperMini; RTS PA07 / CTS PA08 claimed but unused | USART0 routed to TX PC01, RX PC02 → ESP32 GPIO13/GPIO17 (community builds use EUSART1 on the same pins, **unverified**) | USART0 to the WSTK VCOM, TX PA08, RX PA09, VCOM enable PB00; logs and the NCP's ZRHP link at 115 200 (the board controller's VCOM rate; 460 800 and 921 600 fail) |USART0 to the J-Link OB VCOM, TX PA05, RX PA06 (RTS PA08 / CTS PA09 unused); logs at 115 200 |
-| reset / boot | RESET_N (pin 36) open-drain from S3 GPIO6 (hub profile `S3_MG24_DEV`) and the J-Link; no boot-entry line (Gecko via `SYS_RESET` mode 1 once installed) | ESP32 GPIO15 → RESET (active low); GPIO12 high during reset → Gecko bootloader (the MG24 pin of that line is unknown) | WSTK J-Link (hwlab). GSDK `bootloader-uart-xmodem` (brd4187c); BTN0 (PB01) held at reset enters it |J-Link OB (hwlab). GSDK `bootloader-uart-xmodem` (brd2703a); BTN0 (PB02) held at reset enters it |
+| HFXO | 39 MHz on the module; CTUNE 92 (RF-star datasheet §4, **unmeasured**) | 38.4 MHz (stock image PHY); CTUNE: `MODXOCAL` → `MFG_CTUNE` → 100 (community manifests), unit value **not read** | 39 MHz; no `MFG_CTUNE` on this unit, so the BRD4187C default CTUNE 95 (**unmeasured**) |39 MHz; no `MFG_CTUNE`, so the GSDK board CTUNE 100 (**unmeasured**) |
+| host UART | USART0 TX PA05 (pin 12), RX PA06 (pin 13) → ESP32-S3 SuperMini; RTS PA07 / CTS PA08 claimed but unused | USART0 routed to TX PC01, RX PC02 → ESP32 GPIO13/GPIO17, 115 200, no flow control (community builds use EUSART1 on the same pins; GSDK routes USART0 to PC01/PC02 on the BRD4187C; **unverified** on a unit) | USART0 to the WSTK VCOM, TX PA08, RX PA09, VCOM enable PB00; logs and the NCP's ZRHP link at 115 200 (the board controller's VCOM rate; 460 800 and 921 600 fail) |USART0 to the J-Link OB VCOM, TX PA05, RX PA06 (RTS PA08 / CTS PA09 unused); logs at 115 200 |
+| reset / boot | RESET_N (pin 36) open-drain from S3 GPIO6 (hub profile `S3_MG24_DEV`) and the J-Link; no boot-entry line (Gecko via `SYS_RESET` mode 1 once installed) | ESP32 GPIO15 → RESET (active low); GPIO12 high during reset → stock Gecko Bootloader v2.04.02 (probed through the ESP32; the MG24 pin of that line is unknown) | WSTK J-Link (hwlab). GSDK `bootloader-uart-xmodem` (brd4187c); BTN0 (PB01) held at reset enters it |J-Link OB (hwlab). GSDK `bootloader-uart-xmodem` (brd2703a); BTN0 (PB02) held at reset enters it |
 | debug | SWDIO PA02, SWCLK PA01, SWO PA03 (never claimed) | SWD pads unknown | WSTK J-Link OB, AEM current measurement |J-Link OB; no current monitor |
-| other | 32.768 kHz LFXO, PCB antenna, no LED/button | no MG24 LED/button documented; RF path, stock TX power and LFXO unknown | LED0 PB02, LED1 PB04, BTN0 PB01, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna |LED0 PA04, LED1 PA07, BTN0 PB02, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna; mikroBUS, Qwiic |
+| other | 32.768 kHz LFXO, PCB antenna, no LED/button | no MG24 LED/button documented; RF path and LFXO unknown; stock PA configuration highest PA, 3300 mV, 10 µs (GSDK defaults); our default +10 dBm | LED0 PB02, LED1 PB04, BTN0 PB01, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna |LED0 PA04, LED1 PA07, BTN0 PB02, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna; mikroBUS, Qwiic |
 
-A programmed `MFG_CTUNE` token always wins over the board default.
+A valid module calibration (`DEVINFO.MODXOCAL`) or a programmed
+`MFG_CTUNE` token always wins over the board default (GSDK's order); the
+DEVINFO module fields are erased on the BRD4187A and EK2703A dies, so their
+images use the board defaults. Every MG24 image logs the CTUNE, its source
+and the IEEE source at boot (the NCP on the ZRHP LOG endpoint).
 
 ### Memory map (every board, both roles)
 
@@ -1163,12 +1186,21 @@ router uses the same security, child, APS and GP windows, so a reflash
 between the NCP (role tag `0x5203`) and the router (`0x5201`) keeps the
 frame-counter reservations and erases the other role's tables. A GBL only
 erases the pages it programs, so the journals survive a firmware update.
-The stock EmberZNet NVM3 sits inside the journal window; the first boot
-treats it as foreign and erases it, together with the stock network key,
-frame counters and tables. **On a Dongle-M in service, the hub must take an
-EZSP network backup before flashing**: nothing can be recovered from the
-erased NVM3. Before going back to EmberZNet, clear the window (an "app
-clear" GBL or SWD erase), because NVM3 does not expect our journals there.
+The stock EmberZNet NVM3 (`0x0817_6000..0x0817_E000`) sits inside the
+journal window; the first boot treats it as foreign and erases it, together
+with the stock network key, frame counters and tables (host-tested, see
+[SONOFF Dongle-M over the stock firmware](#sonoff-dongle-m-over-the-stock-firmware)).
+An NVM3 page header at any page start of the window makes the whole window
+foreign even when older records of ours survive above the stock NVM3 (after
+a return from a stock image). **On a Dongle-M in service, the hub must take
+an EZSP network backup before flashing**: nothing can be recovered from the
+erased NVM3. Before going back to EmberZNet, erase the whole window
+`0x0815_8000..0x0818_0000`: upload `efr32mg24-nv-clear.gbl` (CI artifact,
+`efr32-gbl clear`) or erase it over SWD. NVM3 does not expect our journals
+in its pages, and a clear of the stock NVM3 pages alone (the 32 KiB
+`nvm3_clear` GBL, `0x0817_6000..0x0817_E000`) leaves our records in the
+top page `0x0817_E000..0x0818_0000`. The 40 KiB `nvm3_clear` variant
+(`0x0817_6000..0x0818_0000`) also covers that page.
 
 ### Firmware update path: Gecko bootloader kept
 
@@ -1182,6 +1214,13 @@ The NCP keeps the resident Gecko bootloader and does not build in `FW_*`:
   startup files do), an Intel HEX for J-Link, and a plain GBL3. Its output is
   byte-identical to Simplicity Commander 1v22p1 `gbl create` (golden tests
   with Commander output, and the real NCP image compared locally).
+- Every packaged image passes the start-up checks of the Gecko
+  bootloader's `bootload_verifyApplication` (`efr32_gbl::gecko_boot_check`,
+  also run by `efr32-gbl parse`): initial SP in SRAM, reset vector in the
+  application space, vector word 13 → `ApplicationProperties_t` (magic,
+  struct version 1.x), signature type NONE. The packager refuses an ELF
+  with anything outside `0x0800_6000..0x0815_8000`, so no GBL writes the
+  bootloader or the journals.
 - Signing: the stock Dongle-M GBLs (EmberZNet 7.4.5, OpenThread, multi-PAN)
   and the community Dongle-M GBLs carry no signature or encryption tag, and
   SONOFF's flasher accepts the community images, so the stock bootloader does
@@ -1208,25 +1247,93 @@ make every update depend on our loader's correctness on a device we cannot
 yet test. The journal window is placed so that a later A/B layout below it
 would not move it.
 
+### SONOFF Dongle-M over the stock firmware
+
+The Dongle-M NCP image (`efr32mg24-ncp-sonoff-dongle-m.gbl`, CI artifact
+`efr32mg24-firmware` with `SHA256SUMS`) is meant to be uploaded through the
+unit's stock Gecko bootloader: ESP32 GPIO12 high during a GPIO15 reset,
+then XMODEM at 115 200 (menu `1. upload gbl`, then `2. run`). Nothing below
+has run on a Dongle-M; this is what the image is checked against.
+
+What the stock side is (stock GBL `zigbee_ncp_uart_hw_donglem_v7.4.5.gbl`,
+SHA-256 `44b81c1e…a311fa`, and a read-only probe of one unit through the
+ESP32):
+
+| item | stock | our image |
+|---|---|---|
+| bootloader | Gecko Bootloader v2.04.02 (GSDK 4.4.x), XMODEM menu | kept, never written |
+| GBL | v3 header `0x0300_0000`, type 0; HEADER, APPLICATION, one ERASEPROG at `0x0800_6000`, END | the same records in the same order, plus the ZRHP METADATA record (a tag the GBL parser skips); `efr32_gbl::write` reproduces the stock file byte for byte from its records (CI) |
+| application | `ApplicationProperties_t` v1.2 at `0x0803_C148`, type ZIGBEE, signature NONE, version 1, product ID zero | v1.2, type ZIGBEE, signature NONE, version `0x0001_0000`, zigbee-rs product ID |
+| PHY | GSDK 4.5.0 38.4 MHz 802.15.4 configuration, byte for byte | the same (`hfxo-38m4hz`) with RAIL's per-channel words |
+| PA | `2P4GIG_HIGHEST`, 3300 mV, 10 µs ramp; power set by the EZSP host | 20 dBm PA table of the BRD4187A; fixed +10 dBm (no `NWK_SET_TX_POWER` on the MG24 NCP yet) |
+| NV | NVM3 at `0x0817_6000..0x0817_E000` | journals at `0x0815_8000..0x0818_0000`: the first boot finds NVM3 page headers (or no valid security record) and erases the whole window |
+| IEEE | EZSP EUI-64 `B0E8E8FFFE5D4D03` on the probed unit | `MFG_CUSTOM_EUI_64` if programmed, else DEVINFO: the same IEEE as stock either way |
+| CTUNE | `MODXOCAL` → `MFG_CTUNE` → 100 | the same order; value and source logged at boot |
+| host UART | EUSART1 PC01/PC02, 115 200, no flow control | USART0 on PC01/PC02 at 115 200; the LDMA receiver uses the USART0 request, independent of the pins |
+
+Checks behind the table:
+
+- The GBL parser requires header major version 3 (`0x03xx_xxxx`), and
+  signature or encryption flags only when the bootloader is built to
+  require them; the stock file and ours carry the same plain header. The
+  application-version and
+  anti-rollback checks are optional bootloader components: with the
+  version check built in, a different product ID is refused while the
+  APPLICATION record is parsed, before any program record, so a rejected
+  upload leaves the stock application in place. Whether the stock
+  bootloader has it is unknown.
+- `products/efr32mg24` `stores` host tests: NVM3 pages at the stock NVM3
+  location, pseudo-random bytes with our record magic at every slot, and
+  all-zero flash are all foreign (whole window erased, then a first record
+  commits and survives the next open); a valid journal and the other
+  windows are preserved; another role's journal keeps its counters.
+- The return path "ours → 32 KiB `nvm3_clear` → stock EmberZNet → ours"
+  leaves valid records of ours in the top page `0x0817_E000`. Resuming them
+  would bring back the pre-stock network with frame-counter reservations
+  behind what the network saw on the stock firmware (devices would drop the
+  frames as replays). The opening policy therefore checks every 8 KiB page
+  start of the window for a GSDK NVM3 page header (magic `0xB29A`,
+  version, erase count with its Berger code, as written by GSDK 4.5.0
+  `libnvm3` `nvm3_pageHeaderWrite`) before the security journal, and
+  erases the whole window when it finds one (`Opened::ForeignNvm3`, logged).
+  Our journals' page starts are erased or carry an ASCII `ZB..` magic, so
+  they never match. A host test runs exactly that sequence.
+- On first boot the stock network keys, frame counters and tables are gone.
+  Take an EZSP network backup with the hub before flashing and restore it
+  over ZRHP; because the IEEE is the stock one, the devices keep their Trust
+  Center address. The MG24 NCP has no `SYS_SET_IEEE` (no `NcpPlatform`),
+  so a backup from another coordinator cannot be restored with its IEEE.
+- `SYS_RESET` mode 1 writes `0xF00F0202` (BOOTLOAD reason, valid signature)
+  to `0x2000_0000` and resets, the EmberZNet mechanism; untested on any
+  MG24 so far. The ESP32's GPIO12 + RESET path stays the recovery path.
+- Going back to EmberZNet: upload `efr32mg24-nv-clear.gbl` (erases
+  `0x0815_8000..0x0818_0000` only, no application record, so no version or
+  product-ID check applies), then the stock GBL. Built and parsed only;
+  not run on a bootloader yet.
+
+First run on a unit (the hardware gate): the boot log line
+`HFXO 38400000 Hz CTUNE … (source), TX 10 dBm, IEEE … (source)`, raw TX
+and RX against the stock image with the nRF sniffer (frequency offset,
+output, RSSI), ACK timing, formation and a join, then RAIL's per-state
+values at 38.4 MHz against the shared analog states.
+
 ### Size and RAM (release, `nightly-2026-03-23`)
 
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
-| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 456,036 B | 168,660 B | 89,388 B |
-| NCP, Dongle-M | 456,216 B | 168,660 B | 89,388 B |
-| NCP, BRD4187 on a WSTK | 456,116 B | 168,660 B | 89,388 B |
-| Router, RF-BM-MG24B1 (GP Proxy Basic) | 344,720 B | 37,140 B | 224,492 B |
-| Router, Dongle-M | 344,920 B | 37,140 B | 224,492 B |
-| Router, BRD4187 on a WSTK | 344,984 B | 37,136 B | 224,496 B |
-| Router, EK2703A | 344,720 B | 37,136 B | 224,496 B |
+| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 456,956 B | 168,660 B | 89,388 B |
+| NCP, Dongle-M | 457,120 B | 168,660 B | 89,388 B |
+| NCP, BRD4187 on a WSTK | 457,112 B | 168,660 B | 89,388 B |
+| Router, RF-BM-MG24B1 (GP Proxy Basic) | 345,480 B | 37,140 B | 224,492 B |
+| Router, Dongle-M | 345,804 B | 37,140 B | 224,492 B |
+| Router, BRD4187 on a WSTK | 345,744 B | 37,136 B | 224,496 B |
+| Router, EK2703A | 345,480 B | 37,136 B | 224,496 B |
 
 The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
 MG24 image compared with `15ee9550`, the build-only base without a radio.
 Static RAM and stack did not change. The 10 dBm PA support added about
 130 B (Router) and 220 B (NCP) to the RF-BM-MG24B1 images. The BRD4187 and
-Dongle-M images are byte-identical with and without it. The Dongle-M
-images carry the shared PHY tables too, although their radio returns
-`Unsupported` (38.4 MHz crystal).
+Dongle-M images are byte-identical with and without it.
 
 The NCP uses 33 % of the application window and 66 % of SRAM for static
 data. The compact capacity tier is not needed. The recorded fatal resets
@@ -1244,6 +1351,13 @@ factory-reset version). Static RAM and stack did not change. The LDMA host
 receiver added 368–492 B of flash and 124 B of static RAM to the NCP images
 (the 128-byte descriptor chain; the 8 KiB ring replaces the interrupt ring),
 taken from the linked stack; the Routers moved by 0 to −16 B.
+
+Enabling the Dongle-M radio (`hfxo-38m4hz`), GSDK's CTUNE and EUI-64
+precedence, and the boot log line with their sources added 596–684 B to
+the NCP images and 292–416 B to the Routers compared with `8b91c3fc`
+(Dongle-M: +608 B NCP, +416 B Router). The NVM3 page-header scan of the
+opening policy and its log line added another 320–336 B. Static RAM and the
+linked stack did not change.
 
 ### Hardware gates
 
@@ -1300,10 +1414,13 @@ Open:
 
    That run also checks the board-level items: the A410 die, the RF path
    and the antenna.
-3. **38.4 MHz crystal.** Run raw TX/RX, ACK and current/output against
-   RAILtest on a 38.4 MHz part (Dongle-M). Then widen `xg24::SUPPORTED`
-   (today it requires `hfxo-39mhz`) and re-check the runtime trims on that
-   die.
+3. **38.4 MHz crystal (enabled, first HIL pending).** On a Dongle-M,
+   compare raw TX/RX, ACK timing, output and the CTUNE frequency offset
+   with the stock EmberZNet image (nRF sniffer). Capture RAIL's per-state
+   and per-channel values at 38.4 MHz (stock image over SWD, if the pads
+   are found) and re-check the runtime trims on that die. If the radio
+   misbehaves, take `hfxo-38m4hz` off the board crate: the radio is then
+   `Unsupported` again.
 4. **SE mailbox TRNG and the recorded fatal resets.** The record must
    survive the resident Gecko bootloader and come back as `reset_reason` 6.
    Test with a lab build that panics or faults on demand. For the poisoned
@@ -1316,7 +1433,12 @@ Open:
    460 800 / 921 600 need the S3 or the Dongle-M link.
 6. **Gecko update path.** GBL upload over XMODEM and journal retention
    across an update.
-7. **Dongle-M.** Pins, crystal, CTUNE, bootloader-entry pin, RF path and the
-   TX power limit on a real unit.
+7. **Dongle-M.** Upload `efr32mg24-ncp-sonoff-dongle-m.gbl` through the
+   stock Gecko Bootloader v2.04.02 (ESP32 GPIO12 + RESET, XMODEM) after an
+   EZSP backup; confirm the boot log (CTUNE and IEEE sources), the UART
+   pins, the journal takeover of the stock NVM3, `SYS_RESET` mode 1 into
+   Gecko, the restore of the EZSP backup under the same IEEE, the RF path
+   and the TX power limit; then the return path (`efr32mg24-nv-clear.gbl`,
+   stock GBL, ours again: logged `ForeignNvm3`).
 8. **Power.** EM2, DC-DC, CCA against a jammer, children and Frame Pending
    through an xG24 Router, and long-duration runs.

@@ -20,11 +20,12 @@
 //! mode 1 reboots into it (GBL over XMODEM at 115 200); `FW_*` is not
 //! built in.
 //!
-//! Status: builds and links; no MG24 has run it. The RF-BM-MG24B1 image
-//! uses the 10 dBm PA tables verified on an EK2703A; on the Dongle-M (38.4
-//! MHz crystal, PHY not verified) the radio init returns `Unsupported` and
-//! the image halts before the NCP starts (see
-//! `efr32s2-hal/src/radio/xg24.rs`).
+//! Status: ran on the BRD4187A (WSTK VCOM, 115 200) against `hubctl`. The
+//! RF-BM-MG24B1 image uses the 10 dBm PA tables verified on an EK2703A and
+//! has not run. The Dongle-M image uses the stock image's 38.4 MHz PHY
+//! (`efr32s2-hal` `hfxo-38m4hz`) and is packaged for its stock Gecko
+//! bootloader; it has not run on a unit (first HIL pending, see
+//! `efr32s2-hal/src/radio/xg24.rs` and the platform guide).
 
 #![no_std]
 #![no_main]
@@ -194,7 +195,7 @@ async fn main(_spawner: Spawner) {
         log::error!("previous reset: fatal {:?}", fatal);
     }
 
-    let ieee_factory = efr32s2_hal::devinfo::eui64();
+    let (ieee_factory, eui_source) = efr32s2_hal::devinfo::ieee_address();
     // Session cookie: not from the SE TRNG (unproven on hardware, and a
     // boot-time failure would leave the NCP without a session), so it
     // mixes the EUI-64 with the HFXO/LFRCO start-up timing. It only has to
@@ -213,6 +214,7 @@ async fn main(_spawner: Spawner) {
     match opened {
         Opened::Existing => log::info!("NV journals preserved"),
         Opened::Fresh => log::warn!("blank/foreign NV erased"),
+        Opened::ForeignNvm3 => log::warn!("NVM3 (stock EmberZNet) in the NV window: erased"),
         Opened::RoleChanged => log::warn!("journal of another role: keys cleared"),
     }
     let ncp_identity = NcpIdentity {
@@ -235,6 +237,18 @@ async fn main(_spawner: Spawner) {
         ncp_identity.fw_version,
         product::BOARD_NAME,
         cause
+    );
+    // The first run on a new board reads the crystal tuning and identity
+    // sources here (ZRHP LOG endpoint).
+    let (ctune, ctune_source) = product::board::hfxo_ctune_with_source();
+    log::info!(
+        "HFXO {} Hz CTUNE {} ({:?}), TX {} dBm, IEEE {:016X} ({:?})",
+        product::board::HCLK_HZ,
+        ctune,
+        ctune_source,
+        product::TX_POWER_DBM,
+        u64::from_le_bytes(ieee_factory),
+        eui_source
     );
     static NCP: StaticCell<Ncp<LOG_RECORDS>> = StaticCell::new();
     static PORT: StaticCell<Port> = StaticCell::new();
@@ -292,7 +306,7 @@ fn compose_device(
     profile: &Profile,
 ) -> (&'static mut ZigbeeDevice<Mac, Router>, [u8; 8]) {
     static DEVICE: StaticCell<ZigbeeDevice<Mac, Router>> = StaticCell::new();
-    // Fails with `Unsupported` on the Dongle-M (38.4 MHz crystal).
+    // Fails with `Unsupported` on an xG24 board that names no crystal.
     let mac: Mac = Efr32s2RadioPhy::new(radio)
         .ok()
         .and_then(|phy| phy.into_parent_mac().ok())

@@ -22,8 +22,15 @@ efr32mg24-pa20 = ["efr32mg24"]
 # The board's HFXO crystal is 39 MHz instead of the default 38.4 MHz
 # (selected by the board crate; the radio tables and every cycle-based
 # delay depend on it). Only EFR32MG24 boards use it so far; the xG24 radio
-# is validated only with it (38.4 MHz builds return `Unsupported`).
+# is hardware-validated with it.
 hfxo-39mhz = []
+# EFR32MG24 board with a 38.4 MHz crystal (the default frequency): enables
+# the xG24 38.4 MHz radio PHY. The board crate opts in explicitly, so an
+# xG24 build that names no crystal keeps the radio `Unsupported`. The PHY
+# equals the stock SONOFF Dongle-M EmberZNet image's RAIL configuration
+# (GSDK `config_38M4Hz`) but has not run on our stack yet (first HIL
+# pending, platform guide).
+hfxo-38m4hz = []
 # Provide `__INTERRUPTS` for cortex-m-rt's `device` feature.
 rt = []
 # Embassy time driver on the RTCC (32,768 Hz, runs in EM2). Defines the

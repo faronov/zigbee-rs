@@ -431,8 +431,9 @@ jobs:
           # EFR32MG24: SYSRTC time base, xG24 HFXO/CMU/GPIO/USART maps, the
           # USART0 host rings, the SE mailbox TRNG framing, the xG24 radio
           # tables captured on the BRD4187A (20 dBm PA) and the EK2703A
-          # (10 dBm PA) at 39 MHz, the GSDK-derived 38.4 MHz channel words
-          # and the explicit `Unsupported` 38.4 MHz radio.
+          # (10 dBm PA) at 39 MHz, RAIL's per-channel words (exact against
+          # the 39 MHz silicon) for the 38.4 MHz PHY (`hfxo-38m4hz`), and the
+          # explicit `Unsupported` radio of an xG24 build naming no crystal.
           - name: EFR32 Series 2 HAL (MG24 10 dBm, 39 MHz, host UART)
             manifest: efr32s2-hal/Cargo.toml
             workspace: efr32s2-hal
@@ -445,6 +446,10 @@ jobs:
             manifest: efr32s2-hal/Cargo.toml
             workspace: efr32s2-hal
             features: "efr32mg24-pa20,hfxo-39mhz"
+          - name: EFR32 Series 2 HAL (MG24 20 dBm, 38.4 MHz, host UART)
+            manifest: efr32s2-hal/Cargo.toml
+            workspace: efr32s2-hal
+            features: "efr32mg24-pa20,hfxo-38m4hz,usart0-host"
           - name: EFR32 Series 2 HAL (MG24 10 dBm, 39 MHz, ISR Imm-Ack)
             manifest: efr32s2-hal/Cargo.toml
             workspace: efr32s2-hal
@@ -473,6 +478,10 @@ jobs:
             manifest: products/efr32mg24/Cargo.toml
             workspace: products/efr32mg24
             features: "sonoff-dongle-m,ncp"
+          - name: EFR32MG24 product (Dongle-M, Router)
+            manifest: products/efr32mg24/Cargo.toml
+            workspace: products/efr32mg24
+            features: "sonoff-dongle-m,router"
           - name: EFR32MG24 product (RF-BM-MG24B1, Router)
             manifest: products/efr32mg24/Cargo.toml
             workspace: products/efr32mg24
@@ -3067,13 +3076,15 @@ jobs:
 
   # EFR32MG24 (RF-BM-MG24B1 dev board, SONOFF Dongle-M, BRD4187 on a WSTK,
   # EK2703A): ZRHP NCP and Router, linked above the 24 KiB Gecko bootloader
-  # and packaged as raw image + Intel HEX + plain GBL (tools/efr32-gbl). The
-  # xG24 radio is verified at 39 MHz for the 20 dBm PA (BRD4187A) and the
-  # 10 dBm PA (EK2703A), where the Router ran; the RF-BM-MG24B1 image uses
-  # the 10 dBm tables without a hardware run, and the Dongle-M (38.4 MHz)
-  # images fail radio init with `Unsupported` and halt. The NCP ran on the
-  # BRD4187 (WSTK VCOM at 115 200 baud) against hubctl; the RF-BM-MG24B1
-  # NCP image has not run.
+  # and packaged as raw image + Intel HEX + plain GBL (tools/efr32-gbl),
+  # each checked against the Gecko bootloader's start-up checks. The xG24
+  # radio is verified at 39 MHz for the 20 dBm PA (BRD4187A) and the 10 dBm
+  # PA (EK2703A), where the Router ran; the RF-BM-MG24B1 image uses the
+  # 10 dBm tables without a hardware run. The Dongle-M (38.4 MHz) images
+  # use the stock EmberZNet image's PHY and have not run on a unit (first
+  # HIL pending); efr32mg24-ncp-sonoff-dongle-m.gbl is the image for its
+  # stock Gecko bootloader (XMODEM). The NCP ran on the BRD4187 (WSTK VCOM
+  # at 115 200 baud) against hubctl; the RF-BM-MG24B1 NCP image has not run.
   build-efr32mg24:
     name: Build EFR32MG24 ZRHP NCP and Router (RF-BM-MG24B1, Dongle-M, BRD4187, EK2703A)
     runs-on: ubuntu-latest
@@ -3157,6 +3168,21 @@ jobs:
               --no-default-features --features "$board" --bin s2-mg24-air \
               --target-dir "target/$board" -- -D warnings
           done
+      # The stock Dongle-M GBL (not redistributed; pinned by commit and
+      # SHA-256): our GBL writer must reproduce it byte for byte and its
+      # application must pass the same start-up check as ours. A failed
+      # download only warns; a different file or a failed check fails.
+      - name: Stock Dongle-M GBL round trip (tools/efr32-gbl)
+        run: |
+          STOCK="$RUNNER_TEMP/donglem-stock-7.4.5.gbl"
+          URL=https://raw.githubusercontent.com/iHost-Open-Source-Project/hassio-ihost-sonoff-dongle-flasher/136ab2fe736a1e5e9c880c2334d2c95adf1e2f25/firmware-build/donglem_mg24_zigbee_stable_1.0.0_115200_7.4.5.gbl
+          if curl -fsSL --retry 3 -o "$STOCK" "$URL"; then
+            echo "44b81c1ecf81032b98d625388ae44c10d7c8a6abd1dcea10b2e2d934d7a311fa  $STOCK" | sha256sum -c -
+            EFR32_GBL_STOCK_DONGLE_M="$STOCK" cargo test --quiet --locked -p efr32-gbl --test stock_dongle_m
+            cargo run --quiet --locked -p efr32-gbl -- parse "$STOCK"
+          else
+            echo "::warning::stock Dongle-M GBL not downloadable; round trip skipped"
+          fi
       - name: Layout gate, AES and SE policy symbols, GBL packaging, size report
         run: |
           OUT=target/efr32mg24
@@ -3196,6 +3222,10 @@ jobs:
               ./tools/firmware-size-report.sh "$NAME" "$OUT/$NAME.bin" "$OUT/$NAME.size.json"
             done
           done
+          # Erases the NV journal window only (going back to a stock image).
+          cargo run --quiet --locked -p efr32-gbl -- clear --out "$OUT/efr32mg24-nv-clear.gbl"
+          cargo run --quiet --locked -p efr32-gbl -- parse "$OUT/efr32mg24-nv-clear.gbl"
+          (cd "$OUT" && sha256sum ./*.gbl ./*.bin ./*.hex > SHA256SUMS && cat SHA256SUMS)
       - name: Upload EFR32MG24 firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -3205,6 +3235,7 @@ jobs:
             target/efr32mg24/*.hex
             target/efr32mg24/*.gbl
             target/efr32mg24/*.size.json
+            target/efr32mg24/SHA256SUMS
           if-no-files-found: error
 
   build-efr32mg22:

@@ -1579,18 +1579,36 @@ mod tests {
         assert_eq!(TX_POWER_RANGE_DBM, (-25, 6));
         #[cfg(feature = "efr32mg21")]
         assert_eq!(TX_POWER_RANGE_DBM, (-30, 20));
-        #[cfg(all(feature = "efr32mg24-pa20", feature = "hfxo-39mhz"))]
+        #[cfg(all(
+            feature = "efr32mg24-pa20",
+            any(feature = "hfxo-39mhz", feature = "hfxo-38m4hz")
+        ))]
         assert_eq!(TX_POWER_RANGE_DBM, (-24, 20));
-        #[cfg(all(feature = "efr32mg24-pa10", feature = "hfxo-39mhz"))]
+        #[cfg(all(
+            feature = "efr32mg24-pa10",
+            any(feature = "hfxo-39mhz", feature = "hfxo-38m4hz")
+        ))]
         assert_eq!(TX_POWER_RANGE_DBM, (-30, 10));
-        #[cfg(all(feature = "efr32mg24", not(feature = "hfxo-39mhz")))]
+        #[cfg(all(
+            feature = "efr32mg24",
+            not(any(feature = "hfxo-39mhz", feature = "hfxo-38m4hz"))
+        ))]
         assert_eq!(TX_POWER_RANGE_DBM, (0, 0));
     }
 
     #[test]
-    #[cfg(all(feature = "efr32mg24", not(feature = "hfxo-39mhz")))]
-    fn xg24_unverified_variants_are_explicitly_unsupported() {
-        // The never-run 38.4 MHz PHY: init must fail before any radio
+    #[cfg(feature = "efr32mg24")]
+    fn xg24_radio_needs_an_explicit_crystal() {
+        const { assert!(chip::SUPPORTED == cfg!(any(feature = "hfxo-39mhz", feature = "hfxo-38m4hz"))) };
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "efr32mg24",
+        not(any(feature = "hfxo-39mhz", feature = "hfxo-38m4hz"))
+    ))]
+    fn xg24_without_a_crystal_feature_is_explicitly_unsupported() {
+        // No board named the crystal: init must fail before any radio
         // access.
         const { assert!(!chip::SUPPORTED) };
         let token = RadioToken::new();
@@ -1634,8 +1652,6 @@ mod tests {
     #[test]
     #[cfg(feature = "efr32mg24-pa20")]
     fn xg24_hp_power_table() {
-        // Supported only with the 39 MHz crystal the table was captured on.
-        const { assert!(chip::SUPPORTED == cfg!(feature = "hfxo-39mhz")) };
         // RAIL_SetTxPowerDbm(0 / 100 / 200) on the BRD4187A: raw levels 10,
         // 36 and 164 (slice 1/3/11).
         assert_eq!(tx_power_entry(0), (-2, 0xD6, 0x10A0));
@@ -1648,8 +1664,6 @@ mod tests {
     #[test]
     #[cfg(feature = "efr32mg24-pa10")]
     fn xg24_mp_power_table() {
-        // Supported only with the 39 MHz crystal the table was captured on.
-        const { assert!(chip::SUPPORTED == cfg!(feature = "hfxo-39mhz")) };
         // RAIL_SetTxPowerDbm(0 / 50 / 100) on the EK2703A: raw levels 10,
         // 21 and 79.
         assert_eq!(tx_power_entry(0), (-2, 0x1A, 0x888));
@@ -1663,9 +1677,10 @@ mod tests {
 
     #[test]
     #[cfg(feature = "efr32mg24")]
-    fn xg24_channel_scaling_matches_silicon() {
+    fn xg24_channel_words_match_rail() {
         // RAIL's SRCRATIO2 / DIGMIXFREQ on channels 11..=26 at 39 MHz
-        // (BRD4187A); the derivation used for 38.4 MHz must reproduce them.
+        // (BRD4187A, capture cap4); the expressions used for 38.4 MHz must
+        // reproduce every one of them.
         const SRC: [u16; 16] = [
             0x3C29, 0x3C49, 0x3C69, 0x3C89, 0x3CA9, 0x3CC9, 0x3CE9, 0x3D09, 0x3D29, 0x3D49, 0x3D69,
             0x3D89, 0x3DA9, 0x3DC9, 0x3DE9, 0x3E09,
@@ -1674,16 +1689,21 @@ mod tests {
             0x254F8, 0x253BB, 0x2527F, 0x25145, 0x2500C, 0x24ED4, 0x24D9E, 0x24C69, 0x24B35,
             0x24A02, 0x248D1, 0x247A1, 0x24672, 0x24544, 0x24418, 0x242ED,
         ];
-        let (src, mix) = chip::scale_channels(39_000_000, 0x47F1, 0x3C29, 0x254F8);
-        assert_eq!(src, SRC);
-        for (derived, silicon) in mix.iter().zip(MIX) {
-            assert!(derived.abs_diff(silicon) <= 1);
-        }
-        // 38.4 MHz: GSDK's channel-11 values come back unchanged.
-        let (src, mix) = chip::scale_channels(38_400_000, 0x4911, 0x281B, 0x1BFBB);
+        // 39 MHz PHY: IFFREQ 0x47F1, src2Denominator 40 MHz, DEC0 = 2 (4).
+        assert_eq!(
+            chip::channel_words(39_000_000, 0x47F1, 40_000_000, 4),
+            (SRC, MIX)
+        );
+        // 38.4 MHz PHY: GSDK's (and the stock Dongle-M image's) channel-11
+        // words come back, and the columns move with the LO.
+        let (src, mix) = chip::channel_words(38_400_000, 0x4911, 60_000_000, 3);
         assert_eq!((src[0], mix[0]), (0x281B, 0x1BFBB));
         assert!(src.windows(2).all(|w| w[0] < w[1]));
         assert!(mix.windows(2).all(|w| w[0] > w[1]));
+        // Spot values (channels 15, 20, 26) as computed for the Dongle-M.
+        assert_eq!((src[4], mix[4]), (0x2871, 0x1BC0B));
+        assert_eq!((src[9], mix[9]), (0x28DB, 0x1B783));
+        assert_eq!((src[15], mix[15]), (0x295B, 0x1B233));
     }
 
     #[test]

@@ -31,6 +31,10 @@ compile_error!(
 compile_error!("efr32s2-hal: enable only one of `efr32mg24-pa10` / `efr32mg24-pa20`");
 #[cfg(all(feature = "hfxo-39mhz", not(feature = "efr32mg24")))]
 compile_error!("efr32s2-hal: `hfxo-39mhz` is only supported on EFR32MG24");
+#[cfg(all(feature = "hfxo-38m4hz", not(feature = "efr32mg24")))]
+compile_error!("efr32s2-hal: `hfxo-38m4hz` selects the xG24 38.4 MHz radio PHY (EFR32MG24 only)");
+#[cfg(all(feature = "hfxo-38m4hz", feature = "hfxo-39mhz"))]
+compile_error!("efr32s2-hal: enable only one of `hfxo-38m4hz` / `hfxo-39mhz`");
 #[cfg(all(feature = "usart0-host", not(feature = "rt"), target_os = "none"))]
 compile_error!("efr32s2-hal: `usart0-host` firmware needs the `rt` feature");
 

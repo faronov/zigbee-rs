@@ -98,6 +98,25 @@ pub const EFR32S2_ROUTER_PENDING_RX: usize = 8;
 pub type Efr32s2RouterMac<const DEFAULT_TX_DBM: i8 = 0> =
     SoftMacCore<Efr32s2RadioPhy<DEFAULT_TX_DBM>, Efr32s2RouterRole, EFR32S2_ROUTER_PENDING_RX>;
 
+/// The factory IEEE address of this die, over-the-air byte order.
+///
+/// xG24: EmberZNet's precedence (`efr32s2_hal::devinfo::ieee_address`): the
+/// `MFG_CUSTOM_EUI_64` token when programmed, else DEVINFO, so a stick
+/// moved from its stock EmberZNet NCP keeps the coordinator IEEE its
+/// devices know as the Trust Center. xG21/xG22 keep the DEVINFO EUI-64
+/// their deployed images were commissioned with (switching would move the
+/// IEEE of a unit with a custom token and reset its network state).
+pub fn factory_ieee() -> IeeeAddress {
+    #[cfg(feature = "efr32mg24")]
+    {
+        efr32s2_hal::devinfo::ieee_address().0
+    }
+    #[cfg(not(feature = "efr32mg24"))]
+    {
+        efr32s2_hal::devinfo::eui64()
+    }
+}
+
 impl<const D: i8> Efr32s2RadioPhy<D> {
     /// Program the 802.15.4 PHY. The HFXO must already be running.
     ///
@@ -106,7 +125,7 @@ impl<const D: i8> Efr32s2RadioPhy<D> {
         let radio = token.init().map_err(map_radio_error)?;
         Ok(Self {
             radio,
-            ieee: efr32s2_hal::devinfo::eui64(),
+            ieee: factory_ieee(),
             rx_on_when_idle: false,
             asleep: false,
             last_error: None,
@@ -115,7 +134,8 @@ impl<const D: i8> Efr32s2RadioPhy<D> {
         })
     }
 
-    /// Factory EUI-64 (DEVINFO), over-the-air byte order.
+    /// The node's factory IEEE address ([`factory_ieee`]), over-the-air
+    /// byte order.
     pub fn extended_address(&self) -> IeeeAddress {
         self.ieee
     }

@@ -65,9 +65,16 @@ pub const VCOM_RX_PIN: u8 = 9;
 /// errors on both ends.
 pub const VCOM_BAUD: u32 = 115_200;
 
-/// HFXO CTUNE: factory `MFG_CTUNE` token, else [`DEFAULT_HFXO_CTUNE`].
+/// HFXO CTUNE and where it came from, with GSDK's precedence: the module
+/// calibration (`DEVINFO.MODXOCAL`, Silicon Labs modules only), the
+/// factory `MFG_CTUNE` token, then [`DEFAULT_HFXO_CTUNE`].
+pub fn hfxo_ctune_with_source() -> (u16, devinfo::CtuneSource) {
+    devinfo::hfxo_ctune(DEFAULT_HFXO_CTUNE)
+}
+
+/// HFXO CTUNE ([`hfxo_ctune_with_source`]).
 pub fn hfxo_ctune() -> u16 {
-    devinfo::mfg_ctune().map_or(DEFAULT_HFXO_CTUNE, u16::from)
+    hfxo_ctune_with_source().0
 }
 
 /// Start the 39 MHz HFXO before radio, UART or time-driver use.
