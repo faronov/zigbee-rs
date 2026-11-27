@@ -682,7 +682,8 @@ are unchanged.
 | bus clocks | xG22 `CLKEN0/1` | `CLKEN0/1` at other bit positions (GPIO 26, HFXO0 20, USART0 9, LFRCO 22, SYSRTC0 30, MSC 16 in CLKEN1, SE mailbox 10) |
 | GPIO | ports at `+0x00` | ports at `+0x30`; USART0 route at `0x720` |
 | time base | RTCC | **SYSRTC0** group 0 (compare 0/1, OVF/CMP0/CMP1 at bits 0/1/2), same `rtcc` API and time driver (`SYSRTC_APP` IRQ 67) |
-| UART | USART0/1 | USART0 only (+ EUSART0/1, not supported); new interrupt-driven host link `usart::host` (feature `usart0-host`): 8 KiB RX / 2 KiB TX rings, overrun and framing counters |
+| UART | USART0/1 | USART0 only (+ EUSART0/1, not supported); host link `usart::host` (feature `usart0-host`): LDMA receive into an 8 KiB ring with SYNC-gated quarters (no RX interrupt), interrupt-driven 2 KiB TX ring, overrun and framing counters |
+| LDMA | — | `ldma`: register map and descriptors (same on xG21/xG22/xG24 except the LDMAXBAR `REQSEL` offset); one user, the host UART receiver (channel 0, `SYNCTRIG` bits 0..=3) |
 | IRQs | 61 / 64 | 76 (15 and 64 reserved); FRC 33, RAC_RSM 36, USART0_RX/TX 9/10 |
 | WDOG0, I2C0 | `0x4A01_8000`, `0x4A01_0000` | `0x4B00_4000`, `0x4B00_0000` |
 | TRNG | xG22 CRYPTOACC; xG21 none | Secure Engine mailbox `TRNG_GET_RANDOM` (`se`), wired to `PlatformServices::fill_random` on xG24 only |
@@ -999,13 +1000,74 @@ receiver on: 10.2 mA mean with the network up and idle (7.0–7.6 mA minimum,
 24.4 mA peaks at 0 dBm TX), the same before and after a reset. The nRESET
 pulse read 0.48 mA and the NCP was back at 10 mA 23 ms after release.
 
-**UART overruns.** An overrun means the USART0 receive interrupt waited
-longer than about two character times (~170 µs at 115 200). Which code
-holds interrupts off that long (journal writes, the radio path or a critical
-section) was not traced.
+**UART overruns: cause and the LDMA receiver.** An overrun means the
+USART0 receive interrupt waited longer than about two character times
+(~170 µs at 115 200). A temporary probe build timestamped every `RXOF`, every
+`FRC` interrupt longer than 100 µs and every flash operation (TIMER0 cycles,
+read over SWD). Under 90 s of ZCL reads (12 overruns), every overrun was
+serviced 3 µs after an `FRC` interrupt that had run 646–661 µs:
 
-**RAM and stack.** The NCP's static RAM ends at `0x2002_A258`
-(`.bss` 168,536 B); the linked stack is 89,512 B. The stack high-water mark
+- **The radio interrupt.** With `isr-ack` the `FRC` handler sends the
+  Imm-Ack itself: turnaround, 352 µs of ACK airtime, then TX done, all inside
+  the interrupt. The USART0 RX interrupt has the same NVIC priority and
+  cannot preempt it. Each ZCL read brings about two acknowledged frames (APS
+  ACK and response), about 1,300 such interrupts in 90 s.
+- **Flash writes**, the second source. A page erase took 12.5 ms and
+  stalls every interrupt handler fetched from flash. None fell inside that
+  run, but frame-counter reservations and Trust Center records write the
+  journals during traffic.
+
+The receiver now runs on the LDMA, with no receive interrupt
+(`efr32s2_hal::usart::host`). Channel 0 copies `RXDATA` into an 8 KiB ring of
+four 2 KiB quarters (`XFERCNT` allows at most 2048 transfers per descriptor).
+Each quarter sits behind a SYNC descriptor that closes the previous quarter's
+`SYNCTRIG` gate and waits for its own. The reader reopens a quarter once it
+has read the next one. The DMA therefore leads by at most 6 KiB, never
+overwrites unread bytes, and needs no interrupt. A reader that falls behind
+stalls the DMA, and the USART `RXOF` then counts it. The read position comes
+from the channel's `DST`, or, at a gate, from `LINK`.
+
+Same image and traffic, interrupt receiver (master) against LDMA, 90 s:
+
+| counter | interrupt RX | LDMA RX |
+|---|---|---|
+| USART overruns (HAL) | 8 | 0 |
+| NCP `rx_bad_frame` / `rx_overflow` / NAKs sent | 12 / 8 / 10 | 0 / 0 / 0 |
+| host retransmissions (NAK-driven) | 13 (10) | 29 (0) |
+
+**Soak with the LDMA receiver**: 35 min, `hubctl` v0.4.1, 115 200, the
+EK2703A Router. Three phases:
+
+1. 15 min of back-to-back Basic reads with bursts of 16 every 30 s
+   (6,073 reads, 0 failed, p99 154 ms);
+2. a leave and rejoin: `devices/remove`, the Router's 5-minute re-arm,
+   permit join, a fresh join and a complete interview;
+3. 15 min of reads with bursts of 32 every 20 s.
+
+| counter | result |
+|---|---|
+| USART overruns and framing errors (HAL, since boot) | 0, 0 |
+| ZRHP framing | NCP `rx_bad_frame` 0, `rx_overflow` 0; NAKs 0 both ways |
+| traffic | host → NCP 50,857 frames (1.48 MB); NCP → host 50,529 frames (2.16 MB) |
+| journal writes during traffic | 13 frame-counter reservations, plus the Trust Center writes of the leave and rejoin |
+| retransmissions | NCP 724, host 464, each matched by duplicates on the other side (724, 461): timing, not loss |
+
+The retransmissions already happen with the interrupt receiver (31 from
+the NCP in the 90 s A/B run). Without flow control at 115 200, an ACK waits
+behind the frames already queued (the 2 KiB TX ring drains in ~180 ms).
+The adaptive RTO, 25 ms at its floor, expires first.
+
+In phase 3, 219 of 6,465 reads failed with `not_delivered`:
+
+- 204 `busy_responses`: 32 concurrent requests exceed the NCP's 16 APS
+  in-flight slots;
+- radio-side APS failures, `aps_tx_failed` 1,588 of 7,038.
+
+The APS failure rate is the same with both receivers (27/638 and 32/641 in
+the A/B run); it is not part of this change.
+
+**RAM and stack.** The NCP's static RAM ends at `0x2002_A2D4`
+(`.bss` 168,660 B, with the LDMA receiver); the linked stack is 89,388 B. The stack high-water mark
 was not measured (the image has no stack paint).
 
 **Join note: stale Trust Center address after a Leave.** The EK2703A Router
@@ -1150,13 +1212,13 @@ would not move it.
 
 | image | file-backed flash | `.bss` | linked stack |
 |---|---:|---:|---:|
-| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 455,668 B | 168,536 B | 89,512 B |
-| NCP, Dongle-M | 455,724 B | 168,536 B | 89,512 B |
-| NCP, BRD4187 on a WSTK | 455,716 B | 168,536 B | 89,512 B |
-| Router, RF-BM-MG24B1 (GP Proxy Basic) | 344,736 B | 37,140 B | 224,492 B |
-| Router, Dongle-M | 344,928 B | 37,140 B | 224,492 B |
+| NCP, RF-BM-MG24B1 (full `ncp-capacity`, 256 TC devices) | 456,036 B | 168,660 B | 89,388 B |
+| NCP, Dongle-M | 456,216 B | 168,660 B | 89,388 B |
+| NCP, BRD4187 on a WSTK | 456,116 B | 168,660 B | 89,388 B |
+| Router, RF-BM-MG24B1 (GP Proxy Basic) | 344,720 B | 37,140 B | 224,492 B |
+| Router, Dongle-M | 344,920 B | 37,140 B | 224,492 B |
 | Router, BRD4187 on a WSTK | 344,984 B | 37,136 B | 224,496 B |
-| Router, EK2703A | 344,736 B | 37,136 B | 224,496 B |
+| Router, EK2703A | 344,720 B | 37,136 B | 224,496 B |
 
 The xG24 radio tables and PA sequence added 2.5–2.8 KB of flash to every
 MG24 image compared with `15ee9550`, the build-only base without a radio.
@@ -1178,7 +1240,10 @@ absorbs the shift.
 The NCP boot fix (TIMER0 enabled before the session cookie) added 48 B to
 every NCP image. Forgetting the Trust Center on every Leave and factory
 reset added 40 B to every image (56 B to the Routers, with the first
-factory-reset version). Static RAM and stack did not change.
+factory-reset version). Static RAM and stack did not change. The LDMA host
+receiver added 368–492 B of flash and 124 B of static RAM to the NCP images
+(the 128-byte descriptor chain; the 8 KiB ring replaces the interrupt ring),
+taken from the linked stack; the Routers moved by 0 to −16 B.
 
 ### Hardware gates
 
@@ -1246,8 +1311,9 @@ Open:
    request.
 5. **NCP on the product link.** The ZRHP session over the RF-BM-MG24B1's
    ESP32-S3 at 460 800 / 921 600, attribute reports from a device with a
-   reportable cluster, end-device children, the source of the NCP's UART
-   overruns, and a long run with many devices.
+   reportable cluster, end-device children, and a long run with many
+   devices. The LDMA receiver ran only at 115 200 on the WSTK VCOM;
+   460 800 / 921 600 need the S3 or the Dongle-M link.
 6. **Gecko update path.** GBL upload over XMODEM and journal retention
    across an update.
 7. **Dongle-M.** Pins, crystal, CTUNE, bootloader-entry pin, RF path and the
