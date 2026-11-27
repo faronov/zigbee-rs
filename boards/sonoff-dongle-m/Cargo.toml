@@ -13,7 +13,8 @@ publish = false
 host-uart = ["efr32s2-hal/usart0-host"]
 
 [dependencies]
-# 20 dBm PA, 38.4 MHz crystal (no `hfxo-39mhz`). The xG24 radio tables are
-# verified at 39 MHz only, so on this board `RadioToken::init` returns
-# `Unsupported` until the 38.4 MHz PHY passes its hardware gates.
-efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg24-pa20"] }
+# 20 dBm PA, 38.4 MHz crystal. `hfxo-38m4hz` enables the xG24 38.4 MHz PHY:
+# the RAIL configuration of the stock Dongle-M EmberZNet image (GSDK
+# `config_38M4Hz`, byte-identical) with RAIL's per-channel words. It has not
+# run on our stack yet (first HIL pending, platform guide).
+efr32s2-hal = { path = "../../efr32s2-hal", features = ["efr32mg24-pa20", "hfxo-38m4hz"] }

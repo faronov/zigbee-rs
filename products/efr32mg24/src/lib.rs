@@ -96,12 +96,21 @@ pub const CHIP: u8 = 12;
 pub const BOARD_NAME: &str = board::BOARD_NAME;
 /// `SYS_GET_INFO.product`.
 pub const PRODUCT_NAME: &str = "zigbee-rs-ncp";
-/// Default `phyTransmitPower`: 0 dBm on every board. At 39 MHz the 20 dBm
-/// PA (`efr32s2_hal::radio::TX_POWER_RANGE_DBM` = `(-24, 20)`) is
-/// hardware-verified on the BRD4187A and the 10 dBm PA (`(-30, 10)`) on the
-/// EK2703A; the Dongle-M (38.4 MHz crystal) reports `(0, 0)` and its radio
-/// returns `Unsupported`. A higher product default waits for each board's
-/// RF path and TX power limit (platform guide, hardware gates).
+/// Default `phyTransmitPower`. The MG24 NCP has no `NcpPlatform` yet, so
+/// `NWK_SET_TX_POWER` is unsupported and this is the NCP's operating power.
+///
+/// - Dongle-M: +10 dBm on the 20 dBm PA (`TX_POWER_RANGE_DBM` `(-24,
+///   20)`), GSDK's `SL_RAIL_UTIL_PA_POWER_DECI_DBM` default; the stock
+///   image's PA configuration is GSDK's default one (highest PA, 3300 mV,
+///   10 us ramp), its runtime power comes from the EZSP host. Certification
+///   limit of the product unknown; output not yet measured (first HIL).
+/// - Every other board: 0 dBm. At 39 MHz the 20 dBm PA is
+///   hardware-verified on the BRD4187A and the 10 dBm PA (`(-30, 10)`) on
+///   the EK2703A; a higher default waits for each board's RF path and TX
+///   power limit (platform guide, hardware gates).
+#[cfg(feature = "sonoff-dongle-m")]
+pub const TX_POWER_DBM: i8 = 10;
+#[cfg(not(feature = "sonoff-dongle-m"))]
 pub const TX_POWER_DBM: i8 = 0;
 /// Security-journal role tag of the coordinator NCP (same as the ESP and
 /// CC26x2 NCPs).
@@ -139,5 +148,12 @@ mod tests {
     fn default_tx_power_is_inside_the_validated_hal_range() {
         let (min, max) = efr32s2_hal::radio::TX_POWER_RANGE_DBM;
         assert!((min..=max).contains(&TX_POWER_DBM));
+        // Every board names its crystal, so its radio is supported.
+        const {
+            assert!(
+                efr32s2_hal::radio::TX_POWER_RANGE_DBM.1 > efr32s2_hal::radio::TX_POWER_RANGE_DBM.0
+            )
+        };
+        const { assert!(TX_POWER_DBM <= board::PA_MAX_DBM) };
     }
 }

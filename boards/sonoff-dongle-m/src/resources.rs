@@ -20,9 +20,8 @@ static TAKEN: AtomicBool = AtomicBool::new(false);
 pub struct BoardResources {
     pub clocks: ClockControl,
     pub host_uart: HostUartToken,
-    /// 802.15.4 radio (needs the HFXO). The xG24 tables are verified on the
-    /// 39 MHz BRD4187A only; with this board's 38.4 MHz crystal
-    /// `RadioToken::init` returns `Unsupported`.
+    /// 802.15.4 radio (needs the HFXO): the 38.4 MHz PHY of the stock
+    /// image (`hfxo-38m4hz`), 20 dBm PA. First HIL pending.
     pub radio: RadioToken,
     /// LFRCO-clocked SYSRTC0 (the HAL's `rtcc` module): time base.
     pub rtcc: RtccToken,

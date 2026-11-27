@@ -259,10 +259,13 @@ efr32mg22 = [
     "dep:embassy-time", "dep:embassy-futures",
 ]
 # EFR32MG24: the board crate also selects the PA variant
-# (`efr32s2-hal/efr32mg24-pa10` or `-pa20`) and the crystal. The xG24 radio
-# is validated with `hfxo-39mhz` only (both PA variants); a 38.4 MHz build
-# makes `Efr32s2RadioPhy::new` return `PhyError::Hardware` (HAL
-# `RadioError::Unsupported`), while the stack above it builds and links.
+# (`efr32s2-hal/efr32mg24-pa10` or `-pa20`) and the crystal
+# (`efr32s2-hal/hfxo-39mhz`, hardware-validated on both PA variants, or
+# `hfxo-38m4hz`, the stock Dongle-M PHY, first HIL pending). A build that
+# names no crystal makes `Efr32s2RadioPhy::new` return `PhyError::Hardware`
+# (HAL `RadioError::Unsupported`), while the stack above it builds and
+# links. The IEEE address follows EmberZNet's precedence on xG24
+# (`MFG_CUSTOM_EUI_64` token, else DEVINFO).
 efr32mg24 = [
     "dep:efr32s2-hal", "efr32s2-hal/efr32mg24",
     "dep:embassy-time", "dep:embassy-futures",
