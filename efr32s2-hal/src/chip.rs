@@ -139,6 +139,10 @@ impl BusClock {
         Self { register: 1, bit }
     }
 
+    /// LDMA and LDMAXBAR (`_CMU_CLKEN0_LDMA/LDMAXBAR_SHIFT`, xG22 and xG24).
+    pub const LDMA: Self = Self::clken0(0);
+    pub const LDMAXBAR: Self = Self::clken0(1);
+
     #[cfg(not(feature = "efr32mg24"))]
     pub const TIMER0: Self = Self::clken0(4);
     #[cfg(not(feature = "efr32mg24"))]

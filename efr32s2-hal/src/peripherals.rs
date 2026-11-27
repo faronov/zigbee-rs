@@ -32,6 +32,8 @@ pub struct Peripherals {
     pub radio: RadioToken,
     pub rtcc: RtccToken,
     pub wdog: WdogToken,
+    /// LDMA controller and crossbar (the host UART receiver's).
+    pub ldma: crate::ldma::Ldma,
     /// Hardware AES-128 engine (xG22 CRYPTOACC); see [`crate::crypto`].
     #[cfg(feature = "efr32mg22")]
     pub crypto: crate::crypto::Crypto,
@@ -65,6 +67,7 @@ impl Peripherals {
                 radio: RadioToken::new(),
                 rtcc: RtccToken::new(),
                 wdog: WdogToken::new(),
+                ldma: crate::ldma::Ldma::new(),
                 #[cfg(feature = "efr32mg22")]
                 crypto: crate::crypto::Crypto::new(),
                 #[cfg(feature = "efr32mg22")]
@@ -89,6 +92,7 @@ mod tests {
         assert_eq!(size_of::<I2c0Token>(), 0);
         assert_eq!(size_of::<RtccToken>(), 0);
         assert_eq!(size_of::<WdogToken>(), 0);
+        assert_eq!(size_of::<crate::ldma::Ldma>(), 0);
         #[cfg(feature = "efr32mg22")]
         assert_eq!(size_of::<crate::crypto::Crypto>(), 0);
         #[cfg(feature = "efr32mg22")]
