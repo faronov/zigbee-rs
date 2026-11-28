@@ -75,9 +75,16 @@ talks to the device. When it runs out the windows close,
 `AnomalyReason::FastPoll` is recorded and the device polls slowly until a
 quarter of the budget has refilled. Poll Control client requests, OTA
 sessions, pending protocol work and Identify keep their own bounds and are
-not charged. The budget is RAM state; a reboot starts it full. A product
-must configure a budget that covers each of its windows
-(`SensorPolicy::is_valid`).
+not charged. Windows the user opens — a button join, a force-report press
+(how a slow-polling product is reached for an OTA install,
+`SensorPolicy::ota_reachable`), Finding & Binding — are charged but never
+blocked or closed by an empty budget. A new network session starts with a
+full budget: a Leave (the hub removing the device), a button join, and the
+fresh join after a product gives its network up
+(`secure_rejoin_failure_limit`), so a pair → remove → pair-again cycle never
+leaves the next interview on the slow poll. Otherwise the budget is RAM
+state; a reboot starts it full. A product must configure a budget that
+covers each of its windows (`SensorPolicy::is_valid`).
 
 Status: host-tested (`apps/sensor-sed/tests/lifecycle.rs`, runtime and
 budget unit tests). The interview time on hardware and the current drawn by

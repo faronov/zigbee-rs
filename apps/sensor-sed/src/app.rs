@@ -128,6 +128,10 @@ where
     /// expires so a narrow platform counter cannot make an old start mark
     /// look recent again after rollover.
     fast_poll: Option<(R::Mark, u32)>,
+    /// The open [`fast_poll`](Self::fast_poll) window was opened by the user
+    /// (a button join, a force-report press, Finding & Binding): it is
+    /// charged to the hourly budget but never blocked or closed by it.
+    fast_poll_by_user: bool,
     /// Fast-poll window kept open by network activity `(start, duration)`
     /// (see [`SensorPolicy::activity_fast_ms`]); every unicast APS data
     /// frame from the parent and every Device_annce restarts it.
@@ -250,6 +254,7 @@ where
             last_report: now,
             last_tick: now,
             fast_poll: None,
+            fast_poll_by_user: false,
             activity_fast: None,
             last_poll: None,
             join_backoff_ms: policy.join_retry_ms,
@@ -401,12 +406,34 @@ where
         W::elapsed_ms(self.mark(), since)
     }
 
-    /// Open (or replace) the timed fast-poll window, unless the hourly
-    /// fast-poll budget is exhausted.
+    /// Open (or replace) the timed fast-poll window the device opens on its
+    /// own, unless the hourly fast-poll budget is exhausted.
+    ///
+    /// An empty budget blocks it, except that it may still shorten a window
+    /// the user opened (the interview-complete grace ends a button join's
+    /// window early, as it would with budget left).
     fn start_fast_poll(&mut self, duration_ms: u32) {
+        let now = self.mark();
         if self.fast_budget.allows() {
-            self.fast_poll = Some((self.mark(), duration_ms));
+            self.fast_poll = Some((now, duration_ms));
+            self.fast_poll_by_user = false;
+        } else if self.fast_poll_by_user
+            && Self::window_remaining_ms(now, &mut self.fast_poll)
+                .is_some_and(|remaining_ms| duration_ms < remaining_ms)
+        {
+            self.fast_poll = Some((now, duration_ms));
         }
+    }
+
+    /// Open (or replace) a fast-poll window the user asked for: charged to
+    /// the hourly budget, but opened even when it is empty and never closed
+    /// by it. A button press cannot drain a battery on its own, and the
+    /// window may be the only way to reach the device (a button join's
+    /// interview; a force-report press before an OTA install, see
+    /// [`SensorPolicy::ota_reachable`]).
+    fn start_user_fast_poll(&mut self, duration_ms: u32) {
+        self.fast_poll = Some((self.mark(), duration_ms));
+        self.fast_poll_by_user = true;
     }
 
     /// Network activity: a unicast APS data frame arrived or a Device_annce
@@ -614,6 +641,11 @@ where
         self.network_up = false;
         self.fast_poll = None;
         self.activity_fast = None;
+        // The network session ended: the next commissioning (by the button,
+        // or by the backoff on a product without one) starts with a full
+        // fast-poll budget, so a pair -> remove -> pair-again cycle cannot
+        // leave the next interview on the slow poll.
+        self.fast_budget = FastPollBudget::default();
         self.run_again = None;
         self.reset_join_backoff();
         self.resources.status.set(SensorStatus::Off);
@@ -644,7 +676,8 @@ where
         if result.is_err() {
             return Err(FindingBindingTargetError::Rejected);
         }
-        self.start_fast_poll(self.policy.fresh_join_fast_ms);
+        // Finding & Binding target mode is a user action (BDB 8.6).
+        self.start_user_fast_poll(self.policy.fresh_join_fast_ms);
         Ok(())
     }
 
@@ -879,14 +912,17 @@ where
             self.fast_bound.reset();
             self.note_anomaly(AnomalyReason::FastPoll);
         }
-        // The hourly budget closes only the windows charged to it; a Poll
-        // Control client's fast poll keeps its own bound.
+        // The hourly budget closes only the windows the device opened on its
+        // own: a Poll Control client's fast poll keeps its own bound, and a
+        // window the user opened is charged but stays open.
         let budgeted = self.budgeted_window_open();
         if self
             .fast_budget
             .step(budgeted, delta_ms, recovery.fast_poll_budget_ms)
         {
-            self.fast_poll = None;
+            if !self.fast_poll_by_user {
+                self.fast_poll = None;
+            }
             self.activity_fast = None;
             windows_closed = true;
             self.note_anomaly(AnomalyReason::FastPoll);
@@ -1106,7 +1142,13 @@ where
     /// an explicit leave waits for the user instead (see
     /// [`enter_factory_new_after_leave`](Self::enter_factory_new_after_leave)).
     async fn rejoin_after_reset(&mut self) -> bool {
-        if self.factory_reset().await && self.join_or_resume().await {
+        if !self.factory_reset().await {
+            return false;
+        }
+        // The old network is given up: the fresh join is a new session and
+        // its interview gets a full fast-poll budget.
+        self.fast_budget = FastPollBudget::default();
+        if self.join_or_resume().await {
             self.reset_post_join_state();
             true
         } else {
@@ -1838,9 +1880,16 @@ where
             .record(DiagnosticEvent::ButtonJoin);
         self.awaiting_button = false;
         self.reset_join_backoff();
+        // A user's commissioning attempt is a new session: full budget.
+        self.fast_budget = FastPollBudget::default();
         self.blink_join_attempt().await;
         let joined_now = self.join_or_resume_with_rejoin_tracking().await;
         self.finish_unjoined_attempt(joined_now);
+        if self.node.device().is_joined() {
+            // The join window is the user's: the interview it covers must
+            // not depend on the budget.
+            self.start_user_fast_poll(self.policy.fresh_join_fast_ms);
+        }
     }
 
     async fn force_report_from_button(&mut self) {
@@ -1859,7 +1908,7 @@ where
         self.node.device_mut().reporting_mut().force_all_due();
         self.tick_and_handle(0).await;
         self.last_report = self.mark();
-        self.start_fast_poll(self.policy.interview_complete_grace_ms);
+        self.start_user_fast_poll(self.policy.interview_complete_grace_ms);
         self.resources
             .status
             .set(SensorStatus::Reporting { on: false });

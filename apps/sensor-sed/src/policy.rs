@@ -194,9 +194,12 @@ pub struct RecoveryPolicy {
     /// is recorded, and the device polls slowly until a quarter has
     /// refilled. Poll Control fast polling requested by a client, OTA
     /// sessions, pending protocol work and Identify have their own bounds
-    /// and are not charged. `0` leaves the windows unbudgeted; a non-zero
-    /// value must cover the longest configured window and be at most one
-    /// hour.
+    /// and are not charged. Windows the user opens (a button join, a
+    /// force-report press, Finding & Binding) are charged but never blocked
+    /// or closed by an empty budget, and a new network session (a Leave, a
+    /// button join, the fresh join after giving a network up) starts with
+    /// a full one. `0` leaves the windows unbudgeted; a non-zero value must
+    /// cover the longest configured window and be at most one hour.
     pub fast_poll_budget_ms: u32,
     /// Count a missed report as one parent-loss strike: no acknowledged
     /// report within the shortest configured reporting maximum interval

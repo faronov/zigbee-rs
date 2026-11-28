@@ -5432,3 +5432,396 @@ fn a_device_announce_retry_opens_the_activity_window() {
     // Two retries, 300 ms of 10 ms polls each.
     assert_eq!(fast_waits_after_cold_join(300), 2 * 30);
 }
+
+// ── User windows and an exhausted fast-poll budget ──────────────────────
+
+/// Wake controller with a button the test presses between steps; time
+/// advances by each timer wait.
+struct ButtonWake<'a> {
+    now: &'a Cell<u32>,
+    press: &'a Cell<bool>,
+    waits: &'a RefCell<Vec<(u32, WaitRequest)>>,
+}
+
+impl WakeController<MockMac> for ButtonWake<'_> {
+    type Mark = u32;
+    type Error = WaitFailure;
+
+    fn is_recoverable(error: &WaitFailure) -> bool {
+        error.recoverable
+    }
+
+    fn error_code(error: &WaitFailure) -> u32 {
+        error.code
+    }
+
+    fn mark(&self) -> u32 {
+        self.now.get()
+    }
+
+    fn add_ms(mark: u32, duration_ms: u32) -> u32 {
+        mark.wrapping_add(duration_ms)
+    }
+
+    fn elapsed_ms(later: u32, earlier: u32) -> u32 {
+        later.wrapping_sub(earlier)
+    }
+
+    async fn wait(
+        &mut self,
+        mac: &mut MockMac,
+        request: WaitRequest,
+    ) -> Result<WakeReason, WaitFailure> {
+        self.waits.borrow_mut().push((self.now.get(), request));
+        if self.press.take() {
+            return Ok(WakeReason::Button);
+        }
+        self.now
+            .set(self.now.get().wrapping_add(request.timeout_ms));
+        mac.delay_micros(request.timeout_ms.saturating_mul(1_000))
+            .await;
+        Ok(WakeReason::Timer)
+    }
+
+    async fn button_held_for(&mut self, _duration_ms: u32) -> bool {
+        false
+    }
+
+    async fn delay_ms(&mut self, duration_ms: u32) {
+        self.now.set(self.now.get().wrapping_add(duration_ms));
+    }
+}
+
+/// Small-scale policy whose 2 s hourly budget a talkative peer exhausts
+/// within a few hundred 10 ms fast polls (activity windows of 100 ms). The
+/// join window (2 s) outlasts the bounded pending work of the scripted cold
+/// join (300 ms), so the waits after a join show whether it opened.
+const fn budget_policy() -> SensorPolicy {
+    SensorPolicy {
+        fresh_join_fast_ms: 2_000,
+        restored_fast_ms: 100,
+        interview_complete_grace_ms: 500,
+        activity_fast_ms: 100,
+        join_retry_ms: 100,
+        recovery: sensor_sed_app::RecoveryPolicy {
+            fast_poll_budget_ms: 2_000,
+            max_active_ms: 300,
+            ..DETERMINISTIC_RECOVERY
+        },
+        ..BASE_POLICY
+    }
+}
+
+/// Fast-poll time in the waits that started at or after `from` (ms of the
+/// wake clock), up to `span` later.
+fn fast_ms_after(waits: &RefCell<Vec<(u32, WaitRequest)>>, from: u32, span: u32) -> u32 {
+    waits
+        .borrow()
+        .iter()
+        .filter(|(at, wait)| (from..from + span).contains(at) && wait.timeout_ms == 10)
+        .map(|(_, wait)| wait.timeout_ms)
+        .sum()
+}
+
+/// Run a resumed sensor with `actions` until a peer that never stops
+/// talking (an Identify Query every iteration) has exhausted its fast-poll
+/// budget, then let it go quiet; `then` continues the run.
+fn with_exhausted_budget<A: sensor_sed_app::UserActionPolicy>(
+    policy: &'static SensorPolicy,
+    actions: A,
+    then: impl FnOnce(
+        &mut dyn FnMut(),
+        &mut dyn FnMut(&mut dyn FnMut(&mut ZigbeeDevice<MockMac, EndDevice>)),
+        &Cell<bool>,
+        &dyn Fn() -> u32,
+    ),
+) -> (Vec<(u32, WaitRequest)>, Vec<DiagnosticEvent>) {
+    let press = Cell::new(false);
+    let clock = Cell::new(0);
+    let waits = RefCell::new(Vec::new());
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::with_state(commissioned_state(0x02), &store_calls);
+    let mut profile = test_profile();
+    let mut device = test_device(&profile, policy);
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake = ButtonWake {
+            now: &clock,
+            press: &press,
+            waits: &waits,
+        };
+        let app = RefCell::new(
+            SensorApp::new(
+                node,
+                policy,
+                SensorSedParts {
+                    wake,
+                    status: NoStatus,
+                    environment: CountingEnvironment {
+                        samples: &environment_samples,
+                    },
+                    battery: CountingBattery {
+                        samples: &battery_samples,
+                    },
+                    ota: NoOta,
+                    actions,
+                    supervisor: RecordingSupervisor {
+                        heartbeats: &heartbeats,
+                    },
+                    diagnostics: RecordingDiagnostics {
+                        events: &diagnostics,
+                    },
+                },
+            )
+            .expect("valid budget policy"),
+        );
+        block_on(app.borrow_mut().initialize()).unwrap();
+        let exhausted = |events: &RefCell<Vec<DiagnosticEvent>>| {
+            events.borrow().iter().any(|event| {
+                matches!(
+                    event,
+                    DiagnosticEvent::Anomaly {
+                        reason: sensor_sed_app::AnomalyReason::FastPoll,
+                        ..
+                    }
+                )
+            })
+        };
+        let mut counter = 0x100u32;
+        for _ in 0..2_000 {
+            if exhausted(&diagnostics) {
+                break;
+            }
+            counter += 1;
+            app.borrow_mut()
+                .device_mut()
+                .mac_mut()
+                .enqueue_poll_response(identify_query_frame(counter));
+            block_on(app.borrow_mut().step()).unwrap();
+        }
+        assert!(exhausted(&diagnostics), "the peer exhausted the budget");
+        // Quiet: only slow polls are left (the budget refills 2 s per hour).
+        for _ in 0..5 {
+            block_on(app.borrow_mut().step()).unwrap();
+        }
+        let quiet = waits.borrow().last().unwrap().1;
+        assert_eq!(quiet.timeout_ms, policy.slow_poll_ms, "{quiet:?}");
+        let mut step = || block_on(app.borrow_mut().step()).unwrap();
+        let mut with_device = |f: &mut dyn FnMut(&mut ZigbeeDevice<MockMac, EndDevice>)| {
+            f(app.borrow_mut().device_mut())
+        };
+        let now = || clock.get();
+        then(&mut step, &mut with_device, &press, &now);
+    }
+    (waits.into_inner(), diagnostics.into_inner())
+}
+
+/// ForceReport is how a product with a slow poll is reached for an OTA
+/// install (`SensorPolicy::ota_reachable`): its window opens even when the
+/// budget is empty (it is charged, not blocked).
+#[test]
+fn a_force_report_press_opens_its_window_with_an_exhausted_budget() {
+    static POLICY: SensorPolicy = budget_policy();
+    let pressed_at = Cell::new(0);
+    let (waits, _) = with_exhausted_budget(
+        &POLICY,
+        sensor_sed_app::ForceReportAction,
+        |step, _, press, now| {
+            pressed_at.set(now());
+            press.set(true);
+            for _ in 0..80 {
+                step();
+            }
+        },
+    );
+    let waits = RefCell::new(waits);
+    let fast = fast_ms_after(&waits, pressed_at.get(), 2_000);
+    assert!(
+        (490..=520).contains(&fast),
+        "the 500 ms force-report window: {fast} ms of fast polls"
+    );
+}
+
+/// Ordinary troubleshooting: the hub removes a device whose interview
+/// failed (a Leave), the user pairs it again with the button. The new join
+/// gets its join window although the previous session had used up the
+/// budget.
+#[test]
+fn a_button_join_after_a_removal_gets_its_join_window_with_an_exhausted_budget() {
+    static POLICY: SensorPolicy = budget_policy();
+    let joined_at = Cell::new(0);
+    let (waits, diagnostics) = with_exhausted_budget(
+        &POLICY,
+        sensor_sed_app::ToggleJoinAction,
+        |step, with_device, press, now| {
+            with_device(&mut |device| {
+                device
+                    .mac_mut()
+                    .enqueue_poll_response(leave_request(false, 0x900))
+            });
+            for _ in 0..3 {
+                step();
+            }
+            with_device(&mut |device| {
+                assert!(!device.is_joined(), "the hub removed it");
+                script_cold_join(device);
+            });
+            press.set(true);
+            step();
+            with_device(&mut |device| assert!(device.is_joined(), "the button joined it"));
+            joined_at.set(now());
+            for _ in 0..400 {
+                step();
+            }
+        },
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::ButtonJoin))
+    );
+    let waits = RefCell::new(waits);
+    let fast = fast_ms_after(&waits, joined_at.get(), 3_000);
+    assert!(
+        fast >= 1_900,
+        "the 2 s join window, not only the 300 ms of pending work: {fast} ms"
+    );
+}
+
+/// The same removal on a product without a commissioning button: the
+/// device joins again on its own after the backoff, and that join also
+/// gets its window (a Leave ends the session and refills the budget).
+#[test]
+fn an_automatic_join_after_a_removal_gets_its_join_window() {
+    static POLICY: SensorPolicy = budget_policy();
+    let joined_at = Cell::new(None);
+    let (waits, _) = with_exhausted_budget(&POLICY, NoUserAction, |step, with_device, _, now| {
+        with_device(&mut |device| {
+            device
+                .mac_mut()
+                .enqueue_poll_response(leave_request(false, 0x900))
+        });
+        step();
+        with_device(&mut |device| {
+            assert!(!device.is_joined(), "the hub removed it");
+            script_cold_join(device);
+        });
+        for _ in 0..400 {
+            step();
+            let mut joined = false;
+            with_device(&mut |device| joined = device.is_joined());
+            if joined && joined_at.get().is_none() {
+                joined_at.set(Some(now()));
+            }
+        }
+    });
+    let joined_at = joined_at.get().expect("the backoff joined it again");
+    let waits = RefCell::new(waits);
+    let fast = fast_ms_after(&waits, joined_at, 3_000);
+    assert!(fast >= 1_900, "the 2 s join window: {fast} ms");
+}
+
+/// No Leave in between: the parent asked for a rejoin that failed, so the
+/// device is off the network with its budget still exhausted. The user's
+/// button join (here the pending secure rejoin) still gets the join window.
+#[test]
+fn a_button_join_without_a_leave_gets_its_join_window_with_an_exhausted_budget() {
+    static POLICY: SensorPolicy = SensorPolicy {
+        secure_rejoin_failure_limit: 0,
+        // Not before the button: the device stays off the network.
+        join_retry_ms: 60_000,
+        recovery: sensor_sed_app::RecoveryPolicy {
+            join_retry_max_ms: 60_000,
+            ..budget_policy().recovery
+        },
+        ..budget_policy()
+    };
+    let joined_at = Cell::new(0);
+    let (waits, diagnostics) = with_exhausted_budget(
+        &POLICY,
+        sensor_sed_app::JoinOnlyAction,
+        |step, with_device, press, now| {
+            with_device(&mut |device| {
+                device.mac_mut().add_beacon(join_beacon(false));
+                device
+                    .mac_mut()
+                    .enqueue_poll_response(leave_request(true, 0x900));
+            });
+            step();
+            with_device(&mut |device| {
+                assert!(!device.is_joined(), "the rejoin got no response");
+                assert!(device.secure_rejoin_pending());
+                device
+                    .mac_mut()
+                    .enqueue_poll_response(secured_rejoin_response(0x901));
+            });
+            press.set(true);
+            step();
+            with_device(&mut |device| {
+                assert!(device.is_joined(), "the button rejoined it");
+                assert_eq!(device.short_address(), NEW_SHORT.0);
+            });
+            joined_at.set(now());
+            for _ in 0..400 {
+                step();
+            }
+        },
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::ButtonJoin))
+    );
+    let waits = RefCell::new(waits);
+    let fast = fast_ms_after(&waits, joined_at.get(), 3_000);
+    assert!(fast >= 1_900, "the 2 s join window: {fast} ms");
+}
+
+/// A product that gives its network up after failed secure rejoins
+/// (`secure_rejoin_failure_limit`) joins afresh: a new session, whose
+/// interview gets the join window although the old one used the budget up.
+#[test]
+fn a_fresh_join_after_giving_the_network_up_gets_its_join_window() {
+    static POLICY: SensorPolicy = SensorPolicy {
+        secure_rejoin_failure_limit: 1,
+        ..budget_policy()
+    };
+    let joined_at = Cell::new(0);
+    let (waits, diagnostics) =
+        with_exhausted_budget(&POLICY, NoUserAction, |step, with_device, _, now| {
+            // The parent asks for a rejoin; the secure rejoin then fails
+            // without polling, which reaches the limit.
+            with_device(&mut |device| {
+                device
+                    .mac_mut()
+                    .enqueue_poll_response(leave_request(true, 0x900));
+                device.mac_mut().set_tx_failures(ONE_REJOIN_TX_FAILURES);
+                script_cold_join(device);
+            });
+            for _ in 0..3 {
+                step();
+                let mut joined = false;
+                with_device(&mut |device| joined = device.is_joined());
+                if joined {
+                    break;
+                }
+            }
+            with_device(&mut |device| assert!(device.is_joined(), "joined afresh"));
+            joined_at.set(now());
+            for _ in 0..400 {
+                step();
+            }
+        });
+    assert!(
+        diagnostics
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::SecureRejoinLimitReached { .. }))
+    );
+    let waits = RefCell::new(waits);
+    let fast = fast_ms_after(&waits, joined_at.get(), 3_000);
+    assert!(fast >= 1_900, "the 2 s join window: {fast} ms");
+}
