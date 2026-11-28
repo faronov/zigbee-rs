@@ -3050,6 +3050,7 @@ fn child_polls<A: TcApp<Mac = MockMac>>(port: &mut TcPort<A>, nwk: u16) {
         lqi: 180,
         security_use: false,
         acked_without_frame_pending: true,
+        ack_frame_pending: Some(false),
     }));
     for _ in 0..2 {
         pollster::block_on(port.step()).unwrap();

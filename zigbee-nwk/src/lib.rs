@@ -124,23 +124,9 @@ pub struct ChildPoll {
     /// receiver off, so the poll is not answered with data (the frame stays
     /// queued, Frame Pending armed, for the next poll).
     pub acked_without_frame_pending: bool,
-    /// The MAC knows the ACK's decision both ways
-    /// ([`zigbee_mac::MlmeDataRequestIndication::ack_frame_pending_reported`]).
-    pub ack_frame_pending_reported: bool,
-}
-
-impl ChildPoll {
-    /// Frame Pending of the ACK to this poll, `None` when the MAC does not
-    /// report it ([`zigbee_mac::MlmeDataRequestIndication::ack_frame_pending`]).
-    pub const fn ack_frame_pending(&self) -> Option<bool> {
-        if self.acked_without_frame_pending {
-            Some(false)
-        } else if self.ack_frame_pending_reported {
-            Some(true)
-        } else {
-            None
-        }
-    }
+    /// Frame Pending of the ACK to this poll where the MAC knows it exactly
+    /// ([`zigbee_mac::MlmeDataRequestIndication::ack_frame_pending`]).
+    pub ack_frame_pending: Option<bool>,
 }
 
 /// A poll whose ACK did not say "no data" (or whose MAC does not report it).
@@ -149,7 +135,7 @@ impl From<MacAddress> for ChildPoll {
         Self {
             source,
             acked_without_frame_pending: false,
-            ack_frame_pending_reported: false,
+            ack_frame_pending: None,
         }
     }
 }
@@ -159,7 +145,7 @@ impl From<&zigbee_mac::MlmeDataRequestIndication> for ChildPoll {
         Self {
             source: indication.source_address,
             acked_without_frame_pending: indication.acked_without_frame_pending,
-            ack_frame_pending_reported: indication.ack_frame_pending_reported,
+            ack_frame_pending: indication.ack_frame_pending,
         }
     }
 }
@@ -2103,7 +2089,7 @@ impl<M: MacDriver> NwkLayer<M> {
         #[cfg(feature = "adaptive-indirect")]
         self.poll_estimates
             .note_poll(child, self.mac.monotonic_micros());
-        crate::host_events::host_event!(self.host_note_poll(&source, poll.ack_frame_pending()));
+        crate::host_events::host_event!(self.host_note_poll(&source, poll.ack_frame_pending));
         // The ACK to this poll said "no data" (the frame was queued after the
         // hardware acknowledged it), so the child has turned its receiver
         // off: a frame sent now is acknowledged by its radio and dropped by

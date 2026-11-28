@@ -435,8 +435,9 @@ pub enum AckFramePending {
     /// `1`: the ACK carried Frame Pending = 1. The NCP had a frame queued
     /// for the child, which stays awake to receive it.
     Set,
-    /// `2` (and the reserved `3`): the NCP's radio backend does not report
-    /// the decision of its automatic ACK.
+    /// `2` (and the reserved `3`): the NCP does not know the decision
+    /// exactly (its radio backend acknowledges in hardware without an exact
+    /// per-poll record).
     Unknown,
 }
 

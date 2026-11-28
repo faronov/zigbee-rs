@@ -597,7 +597,7 @@ pub fn parse_parent_command(data: &[u8], lqi: u8) -> Option<MacCommandEvent> {
                 security_use: false,
                 // The receive path that knows the ACK sets them.
                 acked_without_frame_pending: false,
-                ack_frame_pending_reported: false,
+                ack_frame_pending: None,
             }))
         }
         // Orphan Notification: broadcast destination in the broadcast PAN,

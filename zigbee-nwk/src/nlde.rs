@@ -13139,7 +13139,7 @@ mod tests {
         let stale_poll = crate::ChildPoll {
             source: MacAddress::Short(PAN, ORIGIN),
             acked_without_frame_pending: true,
-            ack_frame_pending_reported: true,
+            ack_frame_pending: Some(false),
         };
         assert_eq!(
             block_on(parent.service_child_data_request(stale_poll)).unwrap(),
@@ -14468,13 +14468,15 @@ mod tests {
 
         let mut parent = parent_with_sleepy_child();
         let source = MacAddress::Short(PAN, ORIGIN);
-        let poll = |acked_without_frame_pending, ack_frame_pending_reported| crate::ChildPoll {
+        let poll = |acked_without_frame_pending, ack_frame_pending| crate::ChildPoll {
             source,
             acked_without_frame_pending,
-            ack_frame_pending_reported,
+            ack_frame_pending,
         };
-        for (acked_without, reported) in [(true, true), (false, true), (false, false)] {
-            let _ = block_on(parent.service_child_data_request(poll(acked_without, reported)));
+        // The exact value is passed on as is, also for a mark the MAC does
+        // not vouch for (FP = 0 mark, value unknown).
+        for (acked_without, exact) in [(true, Some(false)), (false, Some(true)), (true, None)] {
+            let _ = block_on(parent.service_child_data_request(poll(acked_without, exact)));
         }
         let recorded: heapless::Vec<_, 4> =
             core::iter::from_fn(|| parent.take_host_poll()).collect();

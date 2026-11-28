@@ -547,7 +547,7 @@ fn a_restored_child_without_a_key_is_admitted_on_its_secured_rejoin() {
         lqi: 180,
         security_use: false,
         acked_without_frame_pending: false,
-        ack_frame_pending_reported: false,
+        ack_frame_pending: None,
     }));
     steps(&mut port, 8);
     assert_eq!(
@@ -655,7 +655,7 @@ fn a_rejoin_response_queued_after_a_poll_was_acked_waits_for_the_next_poll() {
             lqi: 180,
             security_use: false,
             acked_without_frame_pending: !acked_frame_pending,
-            ack_frame_pending_reported: true,
+            ack_frame_pending: Some(acked_frame_pending),
         }));
     };
     let to_child = |port: &mut TcPort<_>| {
@@ -935,7 +935,7 @@ fn a_long_polling_sleepy_child_is_reached_at_its_next_poll() {
             lqi: 180,
             security_use: false,
             acked_without_frame_pending: false,
-            ack_frame_pending_reported: false,
+            ack_frame_pending: None,
         }));
         steps(port, 1);
     };
@@ -1535,7 +1535,7 @@ fn child_polled<A: TcApp<Mac = MockMac>>(
         lqi: 180,
         security_use: false,
         acked_without_frame_pending: ack == Some(false),
-        ack_frame_pending_reported: ack.is_some(),
+        ack_frame_pending: ack,
     }));
 }
 

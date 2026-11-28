@@ -163,7 +163,7 @@ pub struct ChildPoll {
     /// `None` when the NCP does not know it.
     pub ieee: Option<[u8; 8]>,
     /// Frame Pending of the MAC ACK to the poll; `None` when the radio
-    /// backend does not report it.
+    /// backend does not know it exactly.
     pub ack_frame_pending: Option<bool>,
 }
 

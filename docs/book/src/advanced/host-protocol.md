@@ -1226,7 +1226,7 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | `0x0189` | `EVT_CHANNEL_CHANGED` | `u8 channel, u8 nwk_update_id, u16 req_tid` | event (`channel` is the one the radio is on; a failed tune reports the old channel, NV already holds the new one) | E |
 | `0x018A` | `EVT_ENERGY_SCAN_RESULT` | `u16 req_tid, u8 status, u8 n, n×{u8 channel, i8 max_rssi_dbm, u8 energy}` | event: channels in ascending order, the highest value of the `count` passes. `energy` is the IEEE 802.15.4 ED scale (0..255); `max_rssi_dbm` its dBm value by the radio's mapping (ESP32: linear −100…+5 dBm), `-128` when the platform does not know it (CC26x2). A failed measurement ends the scan: `status` `FAILURE` with the channels measured so far | E |
 | `0x018B` | `EVT_SCAN_PROGRESS` | `u16 req_tid, u8 scan (0 energy, 1 active), u8 channel, u8 channels_done, u8 channels_total, u8 networks_found` | event, best effort (dropped when the queue is full; no capability bit): after each channel of a running `NWK_ENERGY_SCAN` (`channels_total` = channels × `count`, `channels_done` counted across passes, `networks_found` 0) or `NWK_ACTIVE_SCAN` (before its response; `networks_found` = beacons recorded so far). Not sent for the NCP's internal scans (formation, rejoin) | E |
-| `0x018C` | `EVT_CHILD_POLL` | `u16 nwk, [8] ieee (all zero when unknown), u8 flags (bits 1–0 ack_frame_pending: 0 the ACK carried Frame Pending = 0, 1 Frame Pending = 1, 2 not reported by the radio backend, 3 reserved and read as 2; bits 7–2 reserved, 0), u16 unreported` | event, only with capability bit 25 and only to a host that set `host_caps` bit4: a child of the NCP polled it (MAC Data Request). Rate-limited per child and globally; `unreported` counts this child's polls since its previous report that were not reported. See "Child poll events" below | E (host-tested) |
+| `0x018C` | `EVT_CHILD_POLL` | `u16 nwk, [8] ieee (all zero when unknown), u8 flags (bits 1–0 ack_frame_pending: 0 the ACK carried Frame Pending = 0, 1 Frame Pending = 1, 2 not known exactly, 3 reserved and read as 2; bits 7–2 reserved, 0), u16 unreported` | event, only with capability bit 25 and only to a host that set `host_caps` bit4: a child of the NCP polled it (MAC Data Request). Rate-limited per child and globally; `unreported` counts this child's polls since its previous report that were not reported. See "Child poll events" below | E (host-tested) |
 
 **RF front-end modules (external PA/LNA).** Every power and level on this
 interface is **antenna-referred**, with or without a FEM, so no capability
@@ -1265,21 +1265,27 @@ polled, so that a host holding frames for a silent device knows it is awake.
   (saturating) this child's polls since its previous report that the NCP
   did not report, 0 when there were none or the NCP started tracking the
   child with this poll. 13 bytes; 20 with the message header.
-- **Frame Pending.** 1: the NCP had a frame queued for the child when its
-  radio acknowledged the poll; the child stays awake to receive it. 0:
-  nothing was queued; the child turned its receiver off after the ACK, so a
-  frame queued now waits for its next poll. 2: the radio backend
-  acknowledges in hardware and does not report its decision. Per NCP image:
+- **Frame Pending.** The bit the NCP built the poll's MAC ACK with (also
+  for an ACK the radio then abandoned as late; the child repeats an
+  unacknowledged poll). 1: a frame was queued for the child; the child stays
+  awake to receive it. 0: nothing was queued; the child turned its receiver
+  off after the ACK, so a frame queued now waits for its next poll. 2: not
+  known exactly. A value is reported only when it cannot be wrong: a backend
+  whose record can be wrong, even in a documented race, reports 2
+  (`zigbee-mac` `PollAckReport`). Per NCP image:
 
   | NCP image | Value | Source |
   |---|---|---|
   | EFR32MG24 (EFR32 Series 2, HAL `isr-ack`) | 0 or 1, exact | The `FRC` interrupt queues every poll it acknowledged with its ACK's bit; a poll it could not acknowledge in time is dropped, never reported |
-  | ESP32-H2 / ESP32-C6 | 0 or 1 | The RX-done hook's decision, matched to the dequeued poll through a log sized for the radio receive queue + 4. A decision the log no longer holds (at least 5 polls the full receive queue dropped while an earlier poll waited) reads as 1 |
-  | CC2652P7 (CC26x2) | 2 | The RF core sends the ACK and does not report the bit |
+  | ESP32-H2 / ESP32-C6 | 0 or 1, exact | The RX-done hook's decision, matched to the dequeued poll through a log of (source, sequence, bit). A poll whose decision the log lost, or cannot tell from a retransmission acknowledged the other way, is dropped by the PHY (as if the radio queue had dropped it), never reported |
+  | CC2652P7 (CC26x2) | 0 or 1, exact | The RF core's own source-match index appended to each frame: auto-pend set the ACK's bit from that same match |
 
-  Other backends (no NCP image today): software-ACK PHYs report 0 or 1
-  exactly; the nRF interrupt PHY, Telink, BL702 parent, EFR32 Series 1,
-  PHY6222 and CC2340 report 2.
+  Other parents (no NCP image today): software-ACK PHYs and the nRF52
+  interrupt PHY report 0 or 1 exactly; TLSR8258 reports 0 for the polls its
+  ACK path marked and 2 for the rest (a poll without PAN ID compression is
+  acknowledged with 0 unmarked); BL702 reports 2 (its marks are derived from
+  a table mirror and a table update can race them either way); EFR32
+  Series 1, PHY6222 and CC2340 report 2 (no Frame Pending table).
 - **Rate limits.** A poll is *due* when it is the first poll of a child the
   NCP tracks, when its Frame Pending value differs from the child's last
   report, or when `child_poll_interval_ms` (config `0x000B`, default 2000,
@@ -1306,9 +1312,10 @@ polled, so that a host holding frames for a silent device knows it is awake.
   End Device Timeout and `EVT_DEVICE_LEFT` as the liveness authority, and
   read `DIAG_GET_CHILDREN.last_poll_ms` for an exact age.
 - **Validation.** Host-tested only: the `zigbee-zrhp` codec and the
-  `messages.json` vectors, the NWK poll queue, and the NCP over a mock MAC
-  (opt-in, fields, per-child interval, Frame Pending change, global cap,
-  config, counters). No hardware run.
+  `messages.json` vectors, the MAC's report per `PollAckReport` level (and
+  the CC26x2 and nRF52 marks both ways), the NWK poll queue, and the NCP
+  over a mock MAC (opt-in, fields, per-child interval, Frame Pending change,
+  global cap, config, counters). No hardware run.
 
 ### 7.3 DATA (`0x02xx`, endpoint 2)
 

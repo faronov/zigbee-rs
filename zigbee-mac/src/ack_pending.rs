@@ -213,16 +213,21 @@ impl<const N: usize> PollAckLog<N> {
 
     /// The Frame Pending bit of the ACK to the Data Request `sequence` from
     /// `source`, now out of the receive queue; `None` if it was not
-    /// recorded or already overwritten.
+    /// recorded, was overwritten, or cannot be told apart: a later record of
+    /// the same poll (a MAC retransmission after a lost ACK) with the other
+    /// decision, which this frame is if the queue dropped the first copy.
     pub fn take(&mut self, source: &MacAddress, sequence: u8) -> Option<bool> {
-        let skip = (0..self.len).find(|&i| {
+        let is_poll = |i: usize| {
             let (address, seq, _) = &self.entries[(self.head + i) % N];
             address == source && *seq == sequence
-        })?;
+        };
+        let skip = (0..self.len).find(|&i| is_poll(i))?;
         let (_, _, frame_pending) = self.entries[(self.head + skip) % N];
+        let ambiguous = (skip + 1..self.len)
+            .any(|i| is_poll(i) && self.entries[(self.head + i) % N].2 != frame_pending);
         self.head = (self.head + skip + 1) % N;
         self.len -= skip + 1;
-        Some(frame_pending)
+        (!ambiguous).then_some(frame_pending)
     }
 
     /// Forget every decision (MLME-RESET).
@@ -405,12 +410,35 @@ mod tests {
         log.record(short(0x12D2), 8, true);
         assert_eq!(log.take(&short(0x12D2), 7), Some(false));
         assert_eq!(log.take(&short(0x12D2), 8), Some(true));
-        // A MAC retransmission (same sequence) is matched in order.
-        log.record(short(0x12D2), 9, false);
+        // A MAC retransmission (same sequence) with the same decision is
+        // matched in order.
         log.record(short(0x12D2), 9, true);
-        assert_eq!(log.take(&short(0x12D2), 9), Some(false));
+        log.record(short(0x12D2), 9, true);
+        assert_eq!(log.take(&short(0x12D2), 9), Some(true));
         assert_eq!(log.take(&short(0x12D2), 9), Some(true));
         assert_eq!(log.take(&short(0x12D2), 9), None);
+    }
+
+    /// A retransmitted poll whose two ACKs differ: the first copy cannot be
+    /// told from the second when the radio queue may have dropped the first,
+    /// so it is unknown; the second (the last record) is not.
+    #[test]
+    fn poll_ack_log_never_guesses_between_retransmissions() {
+        let mut log = PollAckLog::<4>::new();
+        // Both copies dequeued.
+        log.record(short(0x12D2), 9, false);
+        log.record(short(0x12D2), 9, true);
+        assert_eq!(log.take(&short(0x12D2), 9), None);
+        assert_eq!(log.take(&short(0x12D2), 9), Some(true));
+        // The first copy was dropped by the radio queue: the one dequeued
+        // (the retransmission, FP = 1) is not given the first ACK's FP = 0.
+        log.record(short(0x12D2), 10, false);
+        log.record(short(0x12D2), 10, true);
+        log.record(short(0x0003), 3, false);
+        assert_eq!(log.take(&short(0x12D2), 10), None);
+        // The lingering record is discarded with the next poll's match.
+        assert_eq!(log.take(&short(0x0003), 3), Some(false));
+        assert_eq!(log.take(&short(0x12D2), 10), None);
     }
 
     #[test]

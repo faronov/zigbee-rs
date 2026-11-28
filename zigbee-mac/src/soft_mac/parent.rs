@@ -85,13 +85,19 @@ impl<const EVENTS: usize, const ASSOC: usize, const PENDING: usize> MacRole
                 if self.associations.iter().any(|entry| entry.response.device_address == *address))
     }
 
-    fn queue_command(&mut self, data: &[u8], lqi: u8, ack_frame_pending: Option<bool>) {
+    fn queue_command(
+        &mut self,
+        data: &[u8],
+        lqi: u8,
+        acked_without_frame_pending: bool,
+        ack_frame_pending: Option<bool>,
+    ) {
         let Some(mut event) = parse_parent_command(data, lqi) else {
             return;
         };
         if let MacCommandEvent::DataRequest(indication) = &mut event {
-            indication.acked_without_frame_pending = ack_frame_pending == Some(false);
-            indication.ack_frame_pending_reported = ack_frame_pending.is_some();
+            indication.acked_without_frame_pending = acked_without_frame_pending;
+            indication.ack_frame_pending = ack_frame_pending;
         }
         let data_request = matches!(event, MacCommandEvent::DataRequest(_));
         if self.events.push_back(event).is_err() {

@@ -945,6 +945,11 @@ impl<R: RngInstance> RadioPhy for NrfIsrRadioPhy<'_, R> {
     /// polling against EmberZNet and ZHA parents).
     const POLL_RESPONSE_WAIT_US: u32 = 1_500_000;
     const POLL_EXTENDED_FALLBACK: bool = true;
+    /// The RADIO handler writes the Frame Pending bit it built the Imm-Ack
+    /// with into the poll's own RX slot ([`committed_phr`]), also for an ACK
+    /// it then abandoned as late; a frame the ring could not keep takes its
+    /// decision with it.
+    const POLL_ACK_REPORT: crate::PollAckReport = crate::PollAckReport::Exact;
 
     fn capabilities(&self) -> PhyCapabilities {
         PhyCapabilities {

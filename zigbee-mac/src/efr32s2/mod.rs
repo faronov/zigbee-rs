@@ -251,7 +251,11 @@ impl<const D: i8> RadioPhy for Efr32s2RadioPhy<D> {
     /// The `isr-ack` interrupt queues every Data Request it acknowledged
     /// with its ACK's Frame Pending bit (a frame it could not acknowledge in
     /// time is dropped, never delivered). Parents require `isr-ack`.
-    const ACK_FRAME_PENDING_REPORTED: bool = radio::ISR_ACK;
+    const POLL_ACK_REPORT: crate::PollAckReport = if radio::ISR_ACK {
+        crate::PollAckReport::Exact
+    } else {
+        crate::PollAckReport::Unknown
+    };
 
     fn capabilities(&self) -> PhyCapabilities {
         PhyCapabilities {

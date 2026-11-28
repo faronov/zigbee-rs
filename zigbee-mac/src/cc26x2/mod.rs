@@ -232,6 +232,11 @@ impl<const D: i8> RadioPhy for Cc26x2RadioPhy<D> {
     const POLL_RESPONSE_WAIT_US: u32 = 1_500_000;
     /// EmberZNet parents queue Rejoin Response / Transport-Key by EUI-64.
     const POLL_EXTENDED_FALLBACK: bool = true;
+    /// Every Data Request the RF core auto-acknowledged is marked from its
+    /// own appended source-match index: auto-pend set the ACK's Frame
+    /// Pending from that same match, and every enabled entry is pending
+    /// ([`mark_poll_ack`]). No table change after the ACK can alter it.
+    const POLL_ACK_REPORT: crate::PollAckReport = crate::PollAckReport::Exact;
 
     fn capabilities(&self) -> PhyCapabilities {
         let (min, max) = rf::settings::range(cc26x2_hal::chip::HIGH_PA);
@@ -518,6 +523,22 @@ mod tests {
         next[2] = 0x43;
         let served = received(&next, &info(next.len(), true, true));
         assert!(!served.acked_without_frame_pending());
+    }
+
+    /// `PollAckReport::Exact`: every Data Request the RF core acknowledged
+    /// carries its decision both ways (short and extended sources), so an
+    /// unmarked one was source-matched, i.e. acknowledged with FP = 1.
+    #[test]
+    fn every_acknowledged_poll_carries_its_decision_both_ways() {
+        let parent = MacAddress::Short(zigbee_types::PanId(0x1A62), zigbee_types::ShortAddress(0));
+        let extended = crate::frames::build_data_request(0x44, &parent, &[0xC1; 8]);
+        for poll in [&POLL[..], &extended[..]] {
+            assert!(crate::ack_pending::data_request_source(poll).is_some());
+            for source_matched in [false, true] {
+                let frame = received(poll, &info(poll.len(), true, source_matched));
+                assert_eq!(frame.acked_without_frame_pending(), !source_matched);
+            }
+        }
     }
 
     #[test]

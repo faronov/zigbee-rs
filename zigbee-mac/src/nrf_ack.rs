@@ -591,6 +591,43 @@ mod tests {
         }
     }
 
+    /// `NrfIsrRadioPhy` reports `PollAckReport::Exact`: every Data Request
+    /// the handler acknowledges carries the ACK's Frame Pending both ways,
+    /// short and extended sources alike, so an unmarked one was FP = 1.
+    #[test]
+    fn every_acknowledged_poll_carries_its_decision_both_ways() {
+        let child_ext = [0xC1; 8];
+        let polls = [
+            data_request(0x12D2, 0x20).to_vec(),
+            crate::frames::build_data_request(
+                0x21,
+                &MacAddress::Short(PAN, ShortAddress(0x1234)),
+                &child_ext,
+            )
+            .to_vec(),
+        ];
+        let sources = [
+            MacAddress::Short(PAN, ShortAddress(0x12D2)),
+            MacAddress::Extended(PAN, child_ext),
+        ];
+        let mut slot = [0u8; 128];
+        for (poll, source) in polls.iter().zip(sources) {
+            assert!(data_request_source(poll).is_some());
+            for armed in [false, true] {
+                let mut pending = PendingTable::new();
+                pending.set(source, armed).unwrap();
+                let RxClass::Queue {
+                    ack: Some((_, frame_pending)),
+                } = commit(&mut slot, poll, &filter(), &pending)
+                else {
+                    panic!("an exact, ACK-requesting poll is acknowledged");
+                };
+                assert_eq!(frame_pending, armed);
+                assert_eq!(take(&slot).acked_without_frame_pending(), !frame_pending);
+            }
+        }
+    }
+
     #[test]
     fn committed_slots_outside_the_frame_are_rejected() {
         let mut frame = PhyRxFrame::EMPTY;

@@ -15,7 +15,7 @@
 //! the Trust Center (Update-Device) are the Trust Center runtime's.
 //!
 //! Every MAC Data Request of a child of this node is recorded as well, with
-//! the Frame Pending bit of its MAC ACK when the MAC reports it, in a second
+//! the Frame Pending bit of its MAC ACK where the MAC knows it, in a second
 //! bounded queue (`NwkLayer::take_host_poll`): the host learns that a
 //! sleepy child is awake (ZRHP `EVT_CHILD_POLL`, rate-limited by the NCP).
 //!
@@ -46,7 +46,7 @@ pub const HOST_POLL_QUEUE_LEN: usize = 8;
 pub struct NwkChildPoll {
     pub short_address: ShortAddress,
     /// Frame Pending of the MAC ACK to this poll; `None` when the MAC does
-    /// not report it ([`crate::ChildPoll::ack_frame_pending`]).
+    /// not know it exactly ([`crate::ChildPoll::ack_frame_pending`]).
     pub ack_frame_pending: Option<bool>,
 }
 

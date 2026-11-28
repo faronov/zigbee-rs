@@ -252,26 +252,14 @@ pub struct MlmeDataRequestIndication {
     /// ([`crate::PhyRxFrame::acked_without_frame_pending`]); `false` when the
     /// ACK carried Frame Pending = 1 or the backend does not report it.
     pub acked_without_frame_pending: bool,
-    /// The MAC knows this poll's ACK decision both ways: the software ACK
-    /// path, and `hardware_auto_ack` PHYs with
-    /// [`crate::RadioPhy::ACK_FRAME_PENDING_REPORTED`]. Then
-    /// `acked_without_frame_pending == false` means Frame Pending = 1; see
-    /// [`Self::ack_frame_pending`].
-    pub ack_frame_pending_reported: bool,
-}
-
-impl MlmeDataRequestIndication {
-    /// Frame Pending of the ACK to this poll: `Some(false)` FP = 0,
-    /// `Some(true)` FP = 1, `None` when the backend does not report it.
-    pub const fn ack_frame_pending(&self) -> Option<bool> {
-        if self.acked_without_frame_pending {
-            Some(false)
-        } else if self.ack_frame_pending_reported {
-            Some(true)
-        } else {
-            None
-        }
-    }
+    /// Frame Pending of the ACK to this poll as the MAC knows it exactly:
+    /// `Some(false)` FP = 0, `Some(true)` FP = 1, `None` when not reported
+    /// exactly. Known for every poll on the software ACK path; with
+    /// `hardware_auto_ack`, as far as the PHY's
+    /// [`crate::RadioPhy::POLL_ACK_REPORT`] makes its marks exact. It is the
+    /// decision the parent built the ACK with, whether or not that ACK got
+    /// on air (the child repeats an unacknowledged poll).
+    pub ack_frame_pending: Option<bool>,
 }
 
 /// Completion of a deferred MLME-ASSOCIATE.response transaction.
