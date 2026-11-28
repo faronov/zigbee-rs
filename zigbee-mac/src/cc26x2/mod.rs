@@ -306,6 +306,7 @@ impl<const D: i8> RadioPhy for Cc26x2RadioPhy<D> {
         loop {
             if let Some(info) = self.radio.receive(frame.buffer_mut()) {
                 frame.set_len(info.len, crate::lqi::from_rssi_dbm(info.rssi_dbm))?;
+                mark_poll_ack(frame, &info);
                 #[cfg(feature = "rx-rssi")]
                 {
                     frame.rssi_dbm = info.rssi_dbm;
@@ -458,5 +459,81 @@ fn map_error(error: RadioError) -> PhyError {
         | RadioError::Op(_)
         | RadioError::Timeout
         | RadioError::Off => PhyError::Hardware,
+    }
+}
+
+/// Carry the RF core's Frame Pending decision with a received Data Request
+/// ([`PhyRxFrame::acked_without_frame_pending`]): the child turned its
+/// receiver off after an ACK without Frame Pending, so the NWK keeps a frame
+/// queued since for its next poll. The decision is the RF core's own
+/// per-frame source-match result ([`rf::RxInfo::source_matched`]), appended
+/// to the frame by the same matching that set the ACK's bit, so no table
+/// change between the ACK and this dequeue can alter it. Call after
+/// [`PhyRxFrame::set_len`], which clears the flag.
+fn mark_poll_ack(frame: &mut PhyRxFrame, info: &rf::RxInfo) {
+    if info.auto_acked && crate::ack_pending::data_request_source(frame.as_slice()).is_some() {
+        frame.set_acked_without_frame_pending(!info.source_matched);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Data Request from short 0x12D2 to the parent 0x0000 (PAN 0x1A62).
+    const POLL: [u8; 10] = [0x63, 0x88, 0x42, 0x62, 0x1A, 0x00, 0x00, 0xD2, 0x12, 0x04];
+
+    fn info(len: usize, auto_acked: bool, source_matched: bool) -> rf::RxInfo {
+        rf::RxInfo {
+            len,
+            rssi_dbm: -60,
+            correlation: 40,
+            crc_ok: true,
+            auto_acked,
+            source_matched,
+        }
+    }
+
+    /// What the PHY hands the MAC for one dequeued RX entry.
+    fn received(frame: &[u8], info: &rf::RxInfo) -> PhyRxFrame {
+        let mut out = PhyRxFrame::EMPTY;
+        out.buffer_mut()[..frame.len()].copy_from_slice(frame);
+        // A stale flag from the slot's previous frame must not survive.
+        out.set_acked_without_frame_pending(true);
+        out.set_len(info.len, 200).unwrap();
+        mark_poll_ack(&mut out, info);
+        out
+    }
+
+    /// The secured-rejoin sequence of #23 on a CC26x2 parent: the first
+    /// poll found no source match (FP = 0), the response was armed, the next
+    /// poll matched (FP = 1). Each poll carries its own entry's decision.
+    #[test]
+    fn each_poll_carries_its_own_source_match() {
+        let stale = received(&POLL, &info(POLL.len(), true, false));
+        assert!(stale.acked_without_frame_pending());
+        assert_eq!(stale.as_slice(), POLL);
+
+        let mut next = POLL;
+        next[2] = 0x43;
+        let served = received(&next, &info(next.len(), true, true));
+        assert!(!served.acked_without_frame_pending());
+    }
+
+    #[test]
+    fn only_acknowledged_data_requests_are_marked() {
+        // No auto-ACK (promiscuous scan receiver, broadcast destination).
+        assert!(!received(&POLL, &info(POLL.len(), false, false)).acked_without_frame_pending());
+        // A data frame ACKed with FP = 0 is not a poll.
+        let mut data = POLL;
+        data[0] = 0x61;
+        assert!(!received(&data, &info(data.len(), true, false)).acked_without_frame_pending());
+        // An Association Request (command 0x01) is not a poll either.
+        let mut association = POLL;
+        association[9] = 0x01;
+        assert!(
+            !received(&association, &info(association.len(), true, false))
+                .acked_without_frame_pending()
+        );
     }
 }

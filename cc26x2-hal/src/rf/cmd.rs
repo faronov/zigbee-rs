@@ -168,6 +168,9 @@ pub mod rx_config {
     pub const AUTO_FLUSH_IGN: u8 = 1 << 1;
     pub const APPEND_RSSI: u8 = 1 << 4;
     pub const APPEND_CORR_CRC: u8 = 1 << 5;
+    /// Append the index of the source-matching entry the RF core found for
+    /// the frame's source address, or `0xFF` (TRM SWCU185 25.5.3.1).
+    pub const APPEND_SRC_IND: u8 = 1 << 6;
 }
 
 /// `frameFiltOpt` bits of [`CmdIeeeRx`] / [`CmdIeeeModFilt`].
