@@ -137,6 +137,7 @@ class GeckoTest(unittest.TestCase):
         self.assertEqual([e["id"] for e in entries], ["sonoff-dongle-max-ncp", "efr32mg24-nv-clear"])
         app, nv = entries
         self.assertEqual(app["app_version"], "0.1.3")
+        self.assertEqual(app["gecko_version"], "0.1.3")
         self.assertEqual(app["build_id"], "0001020304050607")
         self.assertEqual(app["program"], [{"start": "0x08006000", "end": "0x08006040"}])
         self.assertEqual(app["file"]["sha256"], hashlib.sha256(ncp.read_bytes()).hexdigest())
@@ -159,6 +160,37 @@ class GeckoTest(unittest.TestCase):
             with self.subTest(name), self.assertRaises(REL.ReleaseError):
                 REL.cmd_gecko(gecko_args(self.write("image.gbl", data), out, kind))
         self.assertFalse((out / "gecko.json").exists())
+
+    def test_pre_release(self):
+        """The Gecko word has no room for `-rc.1` (gecko.rs drops it); the
+        ZRHP record carries the full version."""
+        out = self.dir / "gecko"
+        rc = self.write("rc.gbl", app_gbl(fw="0.2.0-rc.1", version_word=0x0002_0000))
+        with mock.patch("builtins.print"):
+            REL.cmd_gecko(gecko_args(rc, out, "application", expect="0.2.0-rc.1"))
+        entry = json.loads((out / "gecko.json").read_text())[0]
+        self.assertEqual((entry["app_version"], entry["gecko_version"]), ("0.2.0-rc.1", "0.2.0"))
+        cases = [
+            ("final image for an rc tag", app_gbl(fw="0.2.0", version_word=0x0002_0000)),
+            ("other rc", app_gbl(fw="0.2.0-rc.2", version_word=0x0002_0000)),
+            ("Gecko word of another release", app_gbl(fw="0.2.0-rc.1", version_word=0x0001_0900)),
+        ]
+        for name, data in cases:
+            with self.subTest(name), self.assertRaises(REL.ReleaseError):
+                REL.cmd_gecko(gecko_args(self.write("image.gbl", data), out, "application",
+                                         expect="0.2.0-rc.1"))
+        # Without a release to compare with, the two records must still agree.
+        with self.assertRaises(REL.ReleaseError):
+            REL.cmd_gecko(gecko_args(self.write("image.gbl", app_gbl(fw="0.2.0-rc.1", version_word=0x0001_0900)),
+                                     out, "application", expect=None))
+
+    def test_core_version(self):
+        self.assertEqual(REL.core_version("0.2.0-rc.1"), "0.2.0")
+        self.assertEqual(REL.core_version("1.2.3+build.5"), "1.2.3")
+        self.assertEqual(REL.core_version("0.1.3"), "0.1.3")
+        for bad in ("0.2", "v0.2.0", "0.2.0rc1", ""):
+            with self.subTest(bad), self.assertRaises(REL.ReleaseError):
+                REL.core_version(bad)
 
 
 class ManifestTest(unittest.TestCase):
@@ -228,6 +260,19 @@ class ManifestTest(unittest.TestCase):
     def test_gecko_image_of_another_version_is_refused(self):
         with self.assertRaises(REL.ReleaseError):
             self.manifest([self.esp_board("0.1.3")], [self.gecko_dir(fw="0.1.2", word=0x0001_0200)])
+
+    def test_pre_release_manifest(self):
+        manifest = self.manifest([self.esp_board("0.2.0-rc.1")],
+                                 [self.gecko_dir(fw="0.2.0-rc.1", word=0x0002_0000)], version="0.2.0-rc.1")
+        self.assertTrue(manifest["prerelease"])
+        app = manifest["gecko_images"][0]
+        self.assertEqual((app["app_version"], app["gecko_version"]), ("0.2.0-rc.1", "0.2.0"))
+        SITE.validate_manifest(manifest, "ncp-v0.2.0-rc.1")
+
+    def test_gecko_image_of_another_pre_release_is_refused(self):
+        with self.assertRaises(REL.ReleaseError):
+            self.manifest([self.esp_board("0.2.0-rc.2")],
+                          [self.gecko_dir(fw="0.2.0-rc.1", word=0x0002_0000)], version="0.2.0-rc.2")
 
     def test_gecko_image_changed_after_description_is_refused(self):
         gecko = self.gecko_dir()

@@ -263,7 +263,9 @@ over ZRHP; flashing over USB is not affected.
     "install": "Gecko bootloader (UART XMODEM), …",
     "program": [{"start": "0x08006000", "end": "0x08076cf0"}],
     "file": {"name": "efr32mg24-ncp-sonoff-dongle-m.gbl", "size": …, "sha256": "…"},
-    "app_version": "0.1.3", "build_id": "<16 hex>"   // application images only
+    "app_version": "0.1.3",               // application images only: the ZRHP firmware version,
+    "gecko_version": "0.1.3",             // and the Gecko word (MAJOR.MINOR.PATCH, no suffix)
+    "build_id": "<16 hex>"
   }]
 }
 ```
@@ -274,8 +276,13 @@ browser cannot reach a chip that only its Gecko bootloader can install, so
 they are kept out of `boards`, and the page neither lists nor installs
 them. Hosts and the hub's NCP update use them. The release tooling refuses
 a GBL with a bad CRC, any signature, encryption or bootloader record, or a
-write below `0x08006000`. For application images it also checks the Gecko
-version and the ZRHP firmware version against the release. Hub manifests add `components` (e.g. the bundled bridge version)
+write below `0x08006000`. For application images it also checks the
+versions against the release. The ZRHP record's firmware version must
+equal the release version, pre-release suffix included. The Gecko
+application version word (`0xMMmmpp00`) has no room for a suffix, so it
+must equal the release's `MAJOR.MINOR.PATCH`: a `0.2.0-rc.1` image carries
+`0.2.0` there. The Gecko bootloader therefore cannot tell a release
+candidate from its final release. Hub manifests add `components` (e.g. the bundled bridge version)
 and, once the hub speaks Improv Serial, `improv` (`firmware` name and wait
 time) for ESP Web Tools. A board with `"web_install": false` (default
 `true`) is never installed through ESP Web Tools; `flash` then lists the
