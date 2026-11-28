@@ -123,7 +123,13 @@ impl<R: MacRole, const RX: usize> SoftMacCore<TelinkRadioPhy, R, RX> {
     /// not repeat across resets.
     #[inline(never)]
     pub fn with_extended_address(extended_address: IeeeAddress) -> Result<Self, MacError> {
-        let phy = TelinkRadioPhy::take()?;
+        let mut phy = TelinkRadioPhy::take()?;
+        if R::PARENT {
+            // Each poll's ACK decision reaches the parent role with the poll
+            // (`PhyRxFrame::acked_without_frame_pending`). End devices leave
+            // it off and keep the check out of their `.ram_code`.
+            phy.radio.record_poll_acks();
+        }
         let seed = timer::now_ticks();
         let pib = MacPib::new(extended_address, seed as u8, (seed >> 8) as u8);
         Self::new_custom(phy, pib)
@@ -254,6 +260,8 @@ impl RadioPhy for TelinkRadioPhy {
 
     /// Frames that fail the hardware length/CRC checks are skipped inside the
     /// same bounded window, so this returns only valid frames or `false`.
+    /// A Data Request the HAL's interrupt ACK answered with Frame Pending = 0
+    /// keeps that decision ([`PhyRxFrame::acked_without_frame_pending`]).
     async fn receive(&mut self, timeout_us: u32, frame: &mut PhyRxFrame) -> Result<bool, PhyError> {
         let mut received = false;
         self.radio
@@ -262,6 +270,7 @@ impl RadioPhy for TelinkRadioPhy {
                     return false;
                 };
                 received = frame.set(rx.as_slice(), rx.lqi).is_ok();
+                frame.set_acked_without_frame_pending(rx.acked_without_frame_pending());
                 received
             });
         Ok(received)
