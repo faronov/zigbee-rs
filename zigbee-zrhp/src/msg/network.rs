@@ -425,6 +425,121 @@ wire_struct! {
     }
 }
 
+/// Frame Pending of the MAC ACK that answered a child's poll
+/// (`EVT_CHILD_POLL.flags` bits 1–0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AckFramePending {
+    /// `0`: the ACK carried Frame Pending = 0. The child turned its receiver
+    /// off after it: nothing was waiting in the NCP for it at that instant.
+    Clear,
+    /// `1`: the ACK carried Frame Pending = 1. The NCP had a frame queued
+    /// for the child, which stays awake to receive it.
+    Set,
+    /// `2` (and the reserved `3`): the NCP does not know the decision
+    /// exactly (its radio backend acknowledges in hardware without an exact
+    /// per-poll record).
+    Unknown,
+}
+
+impl AckFramePending {
+    /// Bits 1–0 of `EVT_CHILD_POLL.flags`; the reserved value 3 reads as
+    /// [`Self::Unknown`].
+    pub const fn from_flags(flags: u8) -> Self {
+        match flags & child_poll::ACK_FRAME_PENDING_MASK {
+            0 => Self::Clear,
+            1 => Self::Set,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// The two-bit wire value.
+    pub const fn bits(self) -> u8 {
+        match self {
+            Self::Clear => 0,
+            Self::Set => 1,
+            Self::Unknown => 2,
+        }
+    }
+
+    /// From the MAC's report (`None`: not reported).
+    pub const fn from_report(frame_pending: Option<bool>) -> Self {
+        match frame_pending {
+            Some(false) => Self::Clear,
+            Some(true) => Self::Set,
+            None => Self::Unknown,
+        }
+    }
+
+    /// The Frame Pending bit, when known.
+    pub const fn known(self) -> Option<bool> {
+        match self {
+            Self::Clear => Some(false),
+            Self::Set => Some(true),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// `EVT_CHILD_POLL` values.
+pub mod child_poll {
+    /// `flags` bits 1–0: [`super::AckFramePending`]. Bits 7–2 are reserved
+    /// (sent as 0, ignored by receivers).
+    pub const ACK_FRAME_PENDING_MASK: u8 = 0x03;
+    /// `child_poll_interval_ms` default.
+    pub const DEFAULT_INTERVAL_MS: u16 = 2_000;
+    /// Smallest accepted `child_poll_interval_ms`.
+    pub const MIN_INTERVAL_MS: u16 = 250;
+    /// Largest accepted `child_poll_interval_ms`.
+    pub const MAX_INTERVAL_MS: u16 = 60_000;
+}
+
+wire_struct! {
+    /// `EVT_CHILD_POLL`: a child of the NCP polled it (MAC Data Request),
+    /// rate-limited per child and globally (spec 7.2).
+    pub struct EvtChildPoll {
+        /// The child's short address.
+        pub nwk: u16,
+        /// The child's IEEE address; all zero when the NCP does not know it.
+        pub ieee: Ieee,
+        /// Bits 1–0 [`AckFramePending`]; bits 7–2 reserved.
+        pub flags: u8,
+        /// This child's polls since its previous `EVT_CHILD_POLL` that were
+        /// not reported (per-child interval, global cap, full queue),
+        /// saturating; 0 for the first report the NCP remembers.
+        pub unreported: u16,
+    }
+}
+
+impl EvtChildPoll {
+    /// The report of one poll (`ieee` `None`: unknown, sent as all zero).
+    pub const fn new(
+        nwk: u16,
+        ieee: Option<Ieee>,
+        ack_frame_pending: AckFramePending,
+        unreported: u16,
+    ) -> Self {
+        Self {
+            nwk,
+            ieee: match ieee {
+                Some(ieee) => ieee,
+                None => Ieee([0; 8]),
+            },
+            flags: ack_frame_pending.bits(),
+            unreported,
+        }
+    }
+
+    /// Frame Pending of the ACK to this poll.
+    pub const fn ack_frame_pending(&self) -> AckFramePending {
+        AckFramePending::from_flags(self.flags)
+    }
+
+    /// The child's IEEE address, `None` when the NCP did not know it.
+    pub fn known_ieee(&self) -> Option<Ieee> {
+        (self.ieee != Ieee([0; 8])).then_some(self.ieee)
+    }
+}
+
 message_def! {
     NwkInit = ids::NWK_INIT, Request;
     NwkInitRsp = ids::NWK_INIT, Response;
@@ -455,4 +570,59 @@ message_def! {
     EvtChannelChanged = ids::EVT_CHANNEL_CHANGED, Event;
     EvtEnergyScanResult<'a> = ids::EVT_ENERGY_SCAN_RESULT, Event;
     EvtScanProgress = ids::EVT_SCAN_PROGRESS, Event;
+    EvtChildPoll = ids::EVT_CHILD_POLL, Event;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msg::{Batch, BatchWriter, Kind};
+
+    #[test]
+    fn child_poll_round_trips_with_its_frame_pending_report() {
+        let ieee = Ieee::from_u64(0x0015_8d00_04c5_d6e7);
+        let event = EvtChildPoll::new(0x4F21, Some(ieee), AckFramePending::Set, 3);
+        let mut buf = [0u8; 32];
+        let mut w = BatchWriter::new(&mut buf);
+        w.event(9, &event).unwrap();
+        let wire = w.written();
+        assert_eq!(
+            wire,
+            [
+                0x80, 0x8C, 0x01, 0x09, 0x00, 0x0D, 0x00, // header: event 0x018C, seq 9
+                0x21, 0x4F, 0xE7, 0xD6, 0xC5, 0x04, 0x00, 0x8D, 0x15, 0x00, 0x01, 0x03, 0x00,
+            ]
+        );
+        let batch = Batch::parse(wire).unwrap();
+        let message = batch.iter().next().unwrap();
+        assert_eq!(
+            (message.header.kind, message.header.msg_id),
+            (Kind::Event, ids::EVT_CHILD_POLL)
+        );
+        let decoded: EvtChildPoll = message.decode().unwrap();
+        assert_eq!(decoded, event);
+        assert_eq!(decoded.ack_frame_pending(), AckFramePending::Set);
+        assert_eq!(decoded.ack_frame_pending().known(), Some(true));
+        assert_eq!(decoded.known_ieee(), Some(ieee));
+    }
+
+    #[test]
+    fn child_poll_unknown_values_read_as_unknown() {
+        let event = EvtChildPoll::new(0x1234, None, AckFramePending::from_report(None), 0);
+        assert_eq!(event.flags, 2);
+        assert_eq!(event.known_ieee(), None);
+        // The reserved value 3 and reserved bits 7–2 (a later minor).
+        for flags in [0x03, 0xFE, 0x82] {
+            let event = EvtChildPoll {
+                flags,
+                ..event.clone()
+            };
+            assert_eq!(event.ack_frame_pending(), AckFramePending::Unknown);
+        }
+        let cleared = EvtChildPoll {
+            flags: 0xFC,
+            ..event
+        };
+        assert_eq!(cleared.ack_frame_pending().known(), Some(false));
+    }
 }

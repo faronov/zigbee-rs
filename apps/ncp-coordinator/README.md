@@ -27,7 +27,8 @@ composition; this crate has no board, product or vendor dependency.
   `NCP_FW_UPDATE`, `IEEE_REWRITABLE`, `PTA_COEX`; `BACKUP_RESTORE`),
   `SYS_GET_INFO` (factory/active IEEE), `SYS_RESET` (modes 0/1/2),
   `SYS_GET_STATUS` (PTA, restore, permit-join flags), `SYS_SET_CONFIG`/
-  `SYS_GET_CONFIG` (log level, `coex_enable`, `coex_tx_priority_mask`),
+  `SYS_GET_CONFIG` (log level, `coex_enable`, `coex_tx_priority_mask`,
+  `child_poll_interval_ms`),
   `SYS_ECHO`, `SYS_SET_IEEE` (persisted override, applied to the MAC and NIB
   at once when no network runs; `FF…` reverts), `SYS_SET_UART` (UART
   images), `EVT_FATAL` on a flash-layout mismatch.
@@ -41,7 +42,10 @@ composition; this crate has no board, product or vendor dependency.
   in the same session), `NWK_GET_INFO`, `NWK_PERMIT_JOIN`,
   `NWK_ADD_ENDPOINT`, `EVT_NETWORK_STATE`, `EVT_DEVICE_JOINED`,
   `EVT_DEVICE_AUTHORIZED` (network key used / unique TCLK verified),
-  `EVT_DEVICE_LEFT`.
+  `EVT_DEVICE_LEFT`, `EVT_CHILD_POLL` (capability bit 25, for a host that
+  sets `host_caps` bit4: the polls of the NCP's children with their ACK's
+  Frame Pending, rate-limited per child (`child_poll_interval_ms`) and
+  globally; `src/child_poll.rs`).
 * DATA: `APS_DATA_REQUEST` → `EVT_APS_DATA_CONFIRM` (after the APS ACK
   outcome for `ack_request` unicasts), `EVT_APS_DATA_INDICATION` with
   last-hop RSSI, APS security and key source.

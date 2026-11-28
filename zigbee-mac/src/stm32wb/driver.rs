@@ -236,6 +236,7 @@ impl<T: WbMacTransport> Stm32wbMac<T> {
                     // The CPU2 MAC answers the poll itself; its ACK decision
                     // is not reported.
                     acked_without_frame_pending: false,
+                    ack_frame_pending: None,
                 };
                 self.queue_command(MacCommandEvent::DataRequest(indication));
                 None
@@ -391,6 +392,7 @@ impl<T: WbMacTransport> Stm32wbMac<T> {
             lqi: 0,
             security_use: false,
             acked_without_frame_pending: false,
+            ack_frame_pending: None,
         }))
     }
 

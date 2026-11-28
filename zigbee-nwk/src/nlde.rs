@@ -13139,6 +13139,7 @@ mod tests {
         let stale_poll = crate::ChildPoll {
             source: MacAddress::Short(PAN, ORIGIN),
             acked_without_frame_pending: true,
+            ack_frame_pending: Some(false),
         };
         assert_eq!(
             block_on(parent.service_child_data_request(stale_poll)).unwrap(),
@@ -14455,5 +14456,57 @@ mod tests {
         assert_eq!(parent.take_host_departures_dropped(), 0);
         parent.clear_host_departures();
         assert_eq!(parent.take_host_departure(), None);
+    }
+
+    /// Every poll of a child is recorded with its ACK's Frame Pending as
+    /// the MAC reported it; polls from non-children are not. The queue keeps
+    /// the newest polls and counts the ones it dropped.
+    #[test]
+    #[cfg(all(feature = "router", feature = "host-passthrough"))]
+    fn child_polls_are_recorded_for_the_host() {
+        use crate::host_events::{HOST_POLL_QUEUE_LEN, NwkChildPoll};
+
+        let mut parent = parent_with_sleepy_child();
+        let source = MacAddress::Short(PAN, ORIGIN);
+        let poll = |acked_without_frame_pending, ack_frame_pending| crate::ChildPoll {
+            source,
+            acked_without_frame_pending,
+            ack_frame_pending,
+        };
+        // The exact value is passed on as is, also for a mark the MAC does
+        // not vouch for (FP = 0 mark, value unknown).
+        for (acked_without, exact) in [(true, Some(false)), (false, Some(true)), (true, None)] {
+            let _ = block_on(parent.service_child_data_request(poll(acked_without, exact)));
+        }
+        let recorded: heapless::Vec<_, 4> =
+            core::iter::from_fn(|| parent.take_host_poll()).collect();
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|poll| (poll.short_address, poll.ack_frame_pending))
+                .collect::<heapless::Vec<_, 4>>(),
+            [(ORIGIN, Some(false)), (ORIGIN, Some(true)), (ORIGIN, None)]
+        );
+
+        // Not a child of this node.
+        let stranger = MacAddress::Short(PAN, ShortAddress(0x5A5A));
+        let _ = block_on(parent.service_child_data_request(stranger));
+        assert_eq!(parent.take_host_poll(), None);
+
+        for index in 0..HOST_POLL_QUEUE_LEN + 2 {
+            parent.host_note_poll(&source, Some(index % 2 == 0));
+        }
+        assert_eq!(parent.take_host_polls_dropped(), 2);
+        assert_eq!(parent.take_host_polls_dropped(), 0);
+        assert_eq!(
+            parent.take_host_poll(),
+            Some(NwkChildPoll {
+                short_address: ORIGIN,
+                ack_frame_pending: Some(true),
+            }),
+            "the two oldest were dropped"
+        );
+        parent.clear_host_departures();
+        assert_eq!(parent.take_host_poll(), None);
     }
 }

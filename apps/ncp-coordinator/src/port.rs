@@ -156,6 +156,17 @@ pub enum DeviceEvent {
     },
 }
 
+/// A MAC Data Request of a child of the NCP (`EVT_CHILD_POLL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildPoll {
+    pub nwk: u16,
+    /// `None` when the NCP does not know it.
+    pub ieee: Option<[u8; 8]>,
+    /// Frame Pending of the MAC ACK to the poll; `None` when the radio
+    /// backend does not know it exactly.
+    pub ack_frame_pending: Option<bool>,
+}
+
 /// Formation parameters from `NWK_FORM` (zero/`FFFF` = NCP chooses).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormParams {
@@ -278,6 +289,20 @@ pub trait CoordinatorPort {
     fn take_indication(&mut self) -> Option<Indication>;
     /// Next device event, if any.
     fn take_device_event(&mut self) -> Option<DeviceEvent>;
+    /// `CHILD_POLL_EVENTS` capability: [`Self::take_child_poll`] reports
+    /// the polls of the NCP's children.
+    fn child_polls_supported(&self) -> bool {
+        false
+    }
+    /// Next poll of a child of the NCP, oldest first. Drained on every
+    /// service pass, whether a host consumes them or not.
+    fn take_child_poll(&mut self) -> Option<ChildPoll> {
+        None
+    }
+    /// Polls the stack's bounded queue lost since the last call.
+    fn take_child_polls_dropped(&mut self) -> u32 {
+        0
+    }
 
     /// Resume the network from NV, then raise the outgoing counters to the
     /// host floors before the first transmission.

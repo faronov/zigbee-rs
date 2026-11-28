@@ -1083,7 +1083,8 @@ Capability bits (`u64`, NCP → host):
 | 9 | `ENERGY_SCAN` | 19 | `INTERPAN` (reserved) |
 | 20 | `GREEN_POWER_SINK` (combo sink, 7.11) | 21 | `PTA_COEX` (external 802.15.4/Wi-Fi coexistence wired and supported, 11.5) |
 | 22 | `UART_FLOW_CONTROL` (RTS/CTS active on this link) | 23 | `ACTIVE_SCAN` (`NWK_ACTIVE_SCAN`) |
-| 24 | `APS_GROUP_TABLE` (`TBL_READ`/`TBL_STATS` of table `0x0D`, `BKP_EXPORT_BEGIN` flags bit3, `APS_GROUP` restore; 8.5, 9.3–9.5) | 25–63 | reserved |
+| 24 | `APS_GROUP_TABLE` (`TBL_READ`/`TBL_STATS` of table `0x0D`, `BKP_EXPORT_BEGIN` flags bit3, `APS_GROUP` restore; 8.5, 9.3–9.5) | 25 | `CHILD_POLL_EVENTS` (`EVT_CHILD_POLL` once the host sets `host_caps` bit4; config `0x000B`; 7.2) |
+| 26–63 | reserved | | |
 
 Capacities (`{u8 id, u32 value}` list):
 
@@ -1171,6 +1172,7 @@ Config IDs (v1):
 | `0x0008` | `log_level` |
 | `0x0009` | `coex_enable` (0/1; volatile, default 0; only when `PTA_COEX`; the embedded hub drives it from its Wi-Fi state, 11.5; reads 0 once the NCP has turned PTA off after an OS-adapter fault, and setting 1 then fails with `FAILURE` until the next boot) |
 | `0x000A` | `coex_tx_priority_mask` (bit0 MAC ACK frames, bit1 GP timed TX, bit2 TC/key transport, bit3 all) |
+| `0x000B` | `child_poll_interval_ms` (`u16`, 250..=60000, default 2000; volatile; only with `CHILD_POLL_EVENTS`, else `UNSUPPORTED_COMMAND`): the shortest time between two `EVT_CHILD_POLL` of one child (7.2) |
 
 `reset_reason` values: 0 unknown, 1 power-on, 2 software, 3 watchdog, 4
 brown-out, 5 firmware update, 6 fatal, 7 host request, 8 host EN/BOOT line
@@ -1224,6 +1226,7 @@ has RTS/CTS wired (`UART_FLOW_CONTROL` capability semantics, 11.5).
 | `0x0189` | `EVT_CHANNEL_CHANGED` | `u8 channel, u8 nwk_update_id, u16 req_tid` | event (`channel` is the one the radio is on; a failed tune reports the old channel, NV already holds the new one) | E |
 | `0x018A` | `EVT_ENERGY_SCAN_RESULT` | `u16 req_tid, u8 status, u8 n, n×{u8 channel, i8 max_rssi_dbm, u8 energy}` | event: channels in ascending order, the highest value of the `count` passes. `energy` is the IEEE 802.15.4 ED scale (0..255); `max_rssi_dbm` its dBm value by the radio's mapping (ESP32: linear −100…+5 dBm), `-128` when the platform does not know it (CC26x2). A failed measurement ends the scan: `status` `FAILURE` with the channels measured so far | E |
 | `0x018B` | `EVT_SCAN_PROGRESS` | `u16 req_tid, u8 scan (0 energy, 1 active), u8 channel, u8 channels_done, u8 channels_total, u8 networks_found` | event, best effort (dropped when the queue is full; no capability bit): after each channel of a running `NWK_ENERGY_SCAN` (`channels_total` = channels × `count`, `channels_done` counted across passes, `networks_found` 0) or `NWK_ACTIVE_SCAN` (before its response; `networks_found` = beacons recorded so far). Not sent for the NCP's internal scans (formation, rejoin) | E |
+| `0x018C` | `EVT_CHILD_POLL` | `u16 nwk, [8] ieee (all zero when unknown), u8 flags (bits 1–0 ack_frame_pending: 0 the ACK carried Frame Pending = 0, 1 Frame Pending = 1, 2 not known exactly, 3 reserved and read as 2; bits 7–2 reserved, 0), u16 unreported` | event, only with capability bit 25 and only to a host that set `host_caps` bit4: a child of the NCP polled it (MAC Data Request). Rate-limited per child and globally; `unreported` counts this child's polls since its previous report that were not reported. See "Child poll events" below | E (host-tested) |
 
 **RF front-end modules (external PA/LNA).** Every power and level on this
 interface is **antenna-referred**, with or without a FEM, so no capability
@@ -1238,6 +1241,81 @@ example 18 for a request of 20 with a 22 dB PA. RSSI, LQI and energy-scan
 values exclude the LNA gain. This is `zigbee-mac` `fem`, with the nRF52
 backend `nrf-fem`, which is hardware-unverified; see the nRF platform
 guide. No current NCP image has a FEM.
+
+**Child poll events (`EVT_CHILD_POLL`, capability bit 25).** A sleepy end
+device is reachable only right after it polls its parent with a MAC Data
+Request. `EVT_CHILD_POLL` tells the host that a child of the NCP just
+polled, so that a host holding frames for a silent device knows it is awake.
+
+- **Opt-in.** The NCP announces bit 25 `CHILD_POLL_EVENTS`; it sends the
+  event only in a session whose `SYS_NEGOTIATE` set `host_caps` bit4
+  `CHILD_POLL_EVENTS` (8.8). A host that does not set the bit never
+  receives it. Every negotiation starts the rate limiter afresh (no child
+  tracked, full bucket). Polls received while no such host is negotiated
+  are discarded, never reported late.
+- **Which polls.** Data Requests with a short source on the NCP's PAN from a
+  child of the NCP (neighbour relationship child or unauthenticated child),
+  serviced by the stack. Polls with an extended source (a device fetching
+  its Association Response) and polls of devices that are not children are
+  not reported. Children of other routers poll their own parent; the NCP
+  never sees those polls.
+- **Payload.** `nwk`; `ieee` from the neighbour table, the address map or
+  the Trust Center table, all zero when none knows it; `flags` bits 1–0 the
+  Frame Pending bit of the MAC ACK that answered this poll; `unreported`
+  (saturating) this child's polls since its previous report that the NCP
+  did not report, 0 when there were none or the NCP started tracking the
+  child with this poll. 13 bytes; 20 with the message header.
+- **Frame Pending.** The bit the NCP built the poll's MAC ACK with (also
+  for an ACK the radio then abandoned as late; the child repeats an
+  unacknowledged poll). 1: a frame was queued for the child; the child stays
+  awake to receive it. 0: nothing was queued; the child turned its receiver
+  off after the ACK, so a frame queued now waits for its next poll. 2: not
+  known exactly. A value is reported only when it cannot be wrong: a backend
+  whose record can be wrong, even in a documented race, reports 2
+  (`zigbee-mac` `PollAckReport`). Per NCP image:
+
+  | NCP image | Value | Source |
+  |---|---|---|
+  | EFR32MG24 (EFR32 Series 2, HAL `isr-ack`) | 0 or 1, exact | The `FRC` interrupt queues every poll it acknowledged with its ACK's bit; a poll it could not acknowledge in time is dropped, never reported |
+  | ESP32-H2 / ESP32-C6 | 0 or 1, exact | The RX-done hook's decision, matched to the dequeued poll through a log of (source, sequence, bit). A poll whose decision the log lost, or cannot tell from a retransmission acknowledged the other way, is dropped by the PHY (as if the radio queue had dropped it), never reported |
+  | CC2652P7 (CC26x2) | 0 or 1, exact | The RF core's own source-match index appended to each frame: auto-pend set the ACK's bit from that same match |
+
+  Other parents (no NCP image today): software-ACK PHYs and the nRF52
+  interrupt PHY report 0 or 1 exactly; TLSR8258 reports 0 for the polls its
+  ACK path marked and 2 for the rest (a poll without PAN ID compression is
+  acknowledged with 0 unmarked); BL702 reports 2 (its marks are derived from
+  a table mirror and a table update can race them either way); EFR32
+  Series 1, PHY6222 and CC2340 report 2 (no Frame Pending table).
+- **Rate limits.** A poll is *due* when it is the first poll of a child the
+  NCP tracks, when its Frame Pending value differs from the child's last
+  report, or when `child_poll_interval_ms` (config `0x000B`, default 2000,
+  250..=60000) has passed since that report. Other polls are coalesced into
+  the next report's `unreported`. A due poll is reported if a global token
+  is available (bucket of 16, one token per 100 ms: 10 reports/s, about
+  350 B/s on the wire, 3 % of 115 200 baud) and the ZIGBEE queue can still
+  take a full-size `EVT_APS_DATA_INDICATION` after the report; otherwise it
+  is dropped and the child's next poll is due again. The NCP tracks 32
+  children (16 in the compact CC2652P7 image) and replaces the least
+  recently reported one; a replaced child's next poll counts as a first
+  poll, still bounded by the global bucket. Counters `0x0706`–`0x0708`
+  (7.8) count reports, coalesced polls and dropped polls of an opted-in
+  session.
+- **Host guidance.** Treat a report as "this device is awake and polling
+  now": refresh its last-seen time and flush the frames held for it with
+  `APS_DATA_REQUEST` (`tx_options` bit5, extended timeout, within
+  `max_aps_inflight`). The NCP queues them indirectly and delivers each at
+  a following poll; a device that keeps polling quickly after an exchange
+  receives them within its fast-poll interval. With value 1 the NCP is
+  already delivering a queued frame; its `EVT_APS_DATA_CONFIRM` follows.
+  With value 2 assume nothing about the queue. Absence of reports is not
+  absence of polls (rate limits, drops, children of other routers): keep
+  End Device Timeout and `EVT_DEVICE_LEFT` as the liveness authority, and
+  read `DIAG_GET_CHILDREN.last_poll_ms` for an exact age.
+- **Validation.** Host-tested only: the `zigbee-zrhp` codec and the
+  `messages.json` vectors, the MAC's report per `PollAckReport` level (and
+  the CC26x2 and nRF52 marks both ways), the NWK poll queue, and the NCP
+  over a mock MAC (opt-in, fields, per-child interval, Frame Pending change,
+  global cap, config, counters). No hardware run.
 
 ### 7.3 DATA (`0x02xx`, endpoint 2)
 
@@ -1592,6 +1670,9 @@ other kinds above stay reserved until a cheap source exists.
 | `0x0504` | `authorization_failures` | TCLK verification failed | all |
 | `0x0505` | `devices_left` | `EVT_DEVICE_LEFT` reports | all |
 | `0x0701`–`0x0705` | queues | APS queue high-water, `BUSY` responses, indications dropped, log records dropped, malformed batches | all |
+| `0x0706` | `child_poll_events` | `EVT_CHILD_POLL` sent (7.2) | all |
+| `0x0707` | `child_polls_coalesced` | Child polls within the child's `child_poll_interval_ms` and with unchanged Frame Pending, not reported | all |
+| `0x0708` | `child_polls_dropped` | Due child polls not reported: no global token, no queue room, or the stack's poll queue overflowed | all |
 
 ### 7.9 FIRMWARE (`0x08xx`, endpoint 4)
 
@@ -2287,6 +2368,7 @@ Host capability bits (`host_caps`):
 | 1 | `FC_CHECKPOINTS`: the host keeps the checkpoint log |
 | 2 | `RETRY_CACHE`: the host uses 6.5 |
 | 3 | `GP_SHADOW`: the host mirrors NCP-sink GPDs into its own GP layer (7.11) |
+| 4 | `CHILD_POLL_EVENTS`: the host consumes `EVT_CHILD_POLL` (7.2; sent only by an NCP with capability bit 25) |
 
 ### 8.9 ESP32-H2 NCP budget (decision 9)
 
@@ -3727,6 +3809,7 @@ flash size at boot:
 | Profile | Embedded (3.3): RX window 8, LOG credit 0 by default |
 | Paging | `HOST_TABLES` set; standalone until the NCP cache fills (8.1) |
 | GP | `NCP_SINK` with the hub as GP shadow (`host_caps` bit3), security level 0x00 |
+| Sleepy devices | `host_caps` bit4 when the NCP announces capability bit 25: on `EVT_CHILD_POLL` the hub marks the device awake and flushes its held frames (7.2, "Child poll events") |
 | PTA | `coex_enable` follows the hub's Wi-Fi state (decision N7), re-applied in resume |
 | NCP images | None on the S3. Updates are streamed into `FW_*`; rollback is the H2's A/B slots and bootloader (decision N6, amended 2026-11-18). H2 flash size from `SYS_GET_INFO.flash_size` (decision N4). |
 | Resume | Seamless (12.1 steps). The hub owns EN/BOOT, so after the resume budget it can reset the NCP itself. A ROM-path reflash happens only on an explicit operator request with a supplied image (11.5). |
@@ -3806,7 +3889,7 @@ Controls:
 | `crc32c.json` | Check value + edge inputs | Rust, Go, Python, TypeScript |
 | `cobs.json` | Empty, zeros, 254/255 runs, max frame | Encode **and** decode |
 | `link_frames.json` | RESET_REQ/ACK, DATA (single, batched, RETX\|POLL), ACK, NAK (gap, CRC), credits, keepalive, REJECT, max payload; epoch derivation | Build byte-exact and parse back to fields |
-| `messages.json` | NEGOTIATE, NCP_READY, APS request (plain, source-routed), accept/BUSY, confirm, indication, permit join, joined, route record, install code (+ derived key), FC checkpoint, TBL lookup/writeback, `SEC_LOCK_KEY_EXPORT`, `SYS_SET_UART`, UTF-8 `EVT_LOG_RECORD`, `GP_SINK_CONFIG` (zigpy profile), `GP_SINK_COMMISSIONING`, `EVT_GP_COMMISSIONED` with `R_GP_SINK`, `EVT_GP_FRAME` | Build and parse |
+| `messages.json` | NEGOTIATE, NCP_READY, APS request (plain, source-routed), accept/BUSY, confirm, indication, permit join, joined, route record, install code (+ derived key), FC checkpoint, `EVT_CHILD_POLL` (Frame Pending known and unknown), TBL lookup/writeback, `SEC_LOCK_KEY_EXPORT`, `SYS_SET_UART`, UTF-8 `EVT_LOG_RECORD`, `GP_SINK_CONFIG` (zigpy profile), `GP_SINK_COMMISSIONING`, `EVT_GP_COMMISSIONED` with `R_GP_SINK`, `EVT_GP_FRAME` | Build and parse |
 | `arq_scenarios.json` | Timed receiver and sender traces (5.9) | State machine with a virtual clock emits exactly the expected frames |
 | `ocb_roundtrip.json` | OCB → records → NCP model (global APS counter) → export → OCB, restore message bytes | Host converters (Go, Python, TypeScript, Rust hub) byte- and JSON-equal |
 | `ocb_z2m_import.json` | Z2M-style backup (unpadded hex, `date`, no TCLK counter) → records with `aps_margin = 2²⁰` | Same |

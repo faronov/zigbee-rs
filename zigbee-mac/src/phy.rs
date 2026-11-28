@@ -48,6 +48,28 @@ pub struct PhyCapabilities {
     pub tx_power_max: i8,
 }
 
+/// How a `hardware_auto_ack` parent PHY reports the Frame Pending decision
+/// of the ACK it sent to each MAC Data Request ([`RadioPhy::POLL_ACK_REPORT`]).
+///
+/// The parent MAC reports a decision only for a poll that requested an ACK,
+/// named this node exactly, arrived with the address filter on (not
+/// promiscuous) and that [`crate::ack_pending::data_request_source`]
+/// recognises. A mark that may be wrong, even in a race, makes a PHY
+/// [`Self::Unknown`]: a value is never reported as known when it can be
+/// wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollAckReport {
+    /// Every poll's decision is unknown (marks still hold frames back).
+    Unknown,
+    /// A marked poll was acknowledged with Frame Pending = 0; an unmarked
+    /// poll may have had either.
+    MarkedClear,
+    /// Every such poll it delivers is marked exactly: marked FP = 0,
+    /// unmarked FP = 1. A poll whose decision the PHY lost is dropped, not
+    /// delivered.
+    Exact,
+}
+
 /// Matching Imm-Ack observed for an acknowledged transmission.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AckResult {
@@ -345,6 +367,12 @@ pub trait RadioPhy {
 
     /// Forget every armed Frame Pending source (MLME-RESET).
     fn clear_ack_frame_pending(&mut self) {}
+
+    /// How exactly this `hardware_auto_ack` PHY's marks
+    /// ([`PhyRxFrame::acked_without_frame_pending`]) report each poll's ACK
+    /// decision, for [`crate::MlmeDataRequestIndication::ack_frame_pending`].
+    /// The software ACK path knows its own decision and ignores it.
+    const POLL_ACK_REPORT: PollAckReport = PollAckReport::Unknown;
 
     /// Whether [`Self::transmit_at`] is implemented and every received
     /// frame carries [`PhyRxFrame::rx_end_us`] (`timed-tx`).

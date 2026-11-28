@@ -58,6 +58,11 @@ pub mod caps {
     /// `APS_GROUP` `0x0D`) and backed up (`BKP_EXPORT_BEGIN` flags bit3,
     /// `APS_GROUP` records restored).
     pub const APS_GROUP_TABLE: u64 = 1 << 24;
+    /// `EVT_CHILD_POLL`: rate-limited reports of the MAC Data Requests of
+    /// the NCP's children, sent once the host sets
+    /// [`super::host_caps::CHILD_POLL_EVENTS`]; `child_poll_interval_ms`
+    /// ([`super::config::CHILD_POLL_INTERVAL_MS`]) tunes them.
+    pub const CHILD_POLL_EVENTS: u64 = 1 << 25;
 }
 
 /// Host capability bits (`host_caps`, 8.8).
@@ -70,6 +75,9 @@ pub mod host_caps {
     pub const RETRY_CACHE: u64 = 1 << 2;
     /// The host mirrors NCP-sink GPDs (7.11).
     pub const GP_SHADOW: u64 = 1 << 3;
+    /// The host consumes `EVT_CHILD_POLL` (only an NCP with
+    /// [`super::caps::CHILD_POLL_EVENTS`] sends it).
+    pub const CHILD_POLL_EVENTS: u64 = 1 << 4;
 }
 
 /// Capacity IDs (6.6).
@@ -135,6 +143,9 @@ pub mod config {
     pub const COEX_ENABLE: u16 = 0x0009;
     /// `coex_tx_priority_mask`
     pub const COEX_TX_PRIORITY_MASK: u16 = 0x000A;
+    /// `child_poll_interval_ms` (`u16`, 250..=60000, default 2000): the
+    /// shortest time between two `EVT_CHILD_POLL` of one child.
+    pub const CHILD_POLL_INTERVAL_MS: u16 = 0x000B;
 }
 
 /// `SYS_RESET` confirm word for factory reset ("FRES").

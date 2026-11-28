@@ -18480,6 +18480,7 @@ mod parent_router_tests {
             lqi: 170,
             security_use: false,
             acked_without_frame_pending: false,
+            ack_frame_pending: None,
         })
     }
 

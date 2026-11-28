@@ -25,13 +25,6 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-#[cfg(any(
-    feature = "esp-parent",
-    feature = "cc26x2",
-    feature = "nrf-isr-phy",
-    feature = "bl702",
-    test
-))]
 pub mod ack_pending;
 #[cfg(any(test, feature = "fem"))]
 pub mod fem;
@@ -109,7 +102,7 @@ pub mod mock;
 // Re-exports for convenience
 pub use phy::{
     AckResult, MAX_PHY_FRAME_LEN, PhyAddressFilter, PhyCapabilities, PhyError, PhyRxFrame,
-    RadioPhy, TxParams,
+    PollAckReport, RadioPhy, TxParams,
 };
 pub use pib::{MacPib, PibAttribute, PibError, PibValue};
 pub use platform::{ForwardAesProvider, PlatformServices, WrappingTickExtender};

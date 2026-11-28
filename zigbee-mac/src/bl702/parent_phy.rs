@@ -530,6 +530,11 @@ impl RadioPhy for Bl702ParentRadioPhy {
     /// Software CSMA-CA and ACK wait; the receive side is hardware-ACKed.
     type Tx = crate::SoftwareTx;
 
+    /// The marks are derived from the table mirror, not read from the
+    /// M154: a poll straddling a table update can be marked either way
+    /// wrongly (module documentation), so no decision is reported as known.
+    const POLL_ACK_REPORT: crate::PollAckReport = crate::PollAckReport::Unknown;
+
     fn capabilities(&self) -> PhyCapabilities {
         PhyCapabilities {
             hardware_auto_ack: true,

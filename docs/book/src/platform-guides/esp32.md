@@ -144,7 +144,11 @@ logs each decision with the poll's source and sequence number
 (`ack_pending::PollAckLog`, in reception order); when the PHY dequeues that
 poll it marks it `acked_without_frame_pending` if its ACK carried FP = 0,
 and the NWK then holds back a frame queued after that ACK for the next
-poll. The decision travels with the poll: the earlier per-child record
+poll. A poll whose decision the log no longer holds, or cannot tell from a
+retransmission of it acknowledged the other way, is dropped like a poll the
+receive queue dropped (the child polls again), so every delivered poll's
+decision is exact (`PollAckReport::Exact`, reported to a ZRHP host in
+`EVT_CHILD_POLL`). The decision travels with the poll: the earlier per-child record
 (16 entries, never evicted) stopped working once more sleepy children had
 polled without data than it held.
 `EspRadioPhy::parent_stats()` counts Data Requests, FP ACKs, raw

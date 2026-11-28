@@ -9,6 +9,8 @@
 //! * [`transport::HostTransport`] — the non-blocking byte stream the
 //!   product provides (ESP32-H2: USB-Serial-JTAG or UART with DMA receive).
 //! * [`log_ring::LogRing`] — UTF-8 records for the LOG endpoint.
+//! * [`child_poll`] — `EVT_CHILD_POLL` rate limiting (per child and
+//!   globally).
 //! * [`gp`] — the GREEN POWER group over the runtime's GP combo (sink mode
 //!   switch, Sink/Proxy Table access, `EVT_GP_*`); [`gp_remote`] — remote
 //!   GP provisioning of other sinks and proxies (`EVT_GP_REMOTE_*`).
@@ -31,6 +33,7 @@ macro_rules! await_out_of_line {
 }
 
 pub mod backup;
+pub mod child_poll;
 pub mod diag;
 pub mod firmware;
 pub mod gp;

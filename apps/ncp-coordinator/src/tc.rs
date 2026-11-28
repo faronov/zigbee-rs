@@ -23,6 +23,8 @@
 //!   Trust Center removals. The NCP's own child departures reach the Trust
 //!   Center as a local Update-Device as well; they are reported once, from
 //!   the NWK Leave.
+//! * `EVT_CHILD_POLL` — every MAC Data Request of a child of the NCP, with
+//!   its ACK's Frame Pending as the MAC reports it (the NCP rate-limits).
 //! * `EVT_APS_DATA_CONFIRM` of an `ack_request` unicast — deferred until its
 //!   APS ACK arrives or its retries are exhausted; the stack keeps stepping
 //!   in between ([`TcPort::step`] polls the outcome).
@@ -50,9 +52,9 @@ use zigbee_runtime::trust_center_store::TrustCenterDeviceStore;
 use zigbee_types::ShortAddress;
 
 use crate::port::{
-    CoordinatorPort, DataConfirm, DataRequest, DeferredConfirm, Destination, DeviceEvent,
-    EndpointError, FormParams, FrameCounters, HostEndpoint, Indication, MAX_HOST_ENDPOINTS,
-    NetworkInfo, NetworkState, OpError, joined, left,
+    ChildPoll, CoordinatorPort, DataConfirm, DataRequest, DeferredConfirm, Destination,
+    DeviceEvent, EndpointError, FormParams, FrameCounters, HostEndpoint, Indication,
+    MAX_HOST_ENDPOINTS, NetworkInfo, NetworkState, OpError, joined, left,
 };
 use crate::port::{DeviceView, LinkView, NetworkImage, RestoredChild, RestoredKey};
 use zigbee_mac::{MacDriver as _, PlatformServices as _};
@@ -986,6 +988,40 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
             self.collect_device_events();
         }
         self.events.pop_front()
+    }
+
+    fn child_polls_supported(&self) -> bool {
+        true
+    }
+
+    fn take_child_poll(&mut self) -> Option<ChildPoll> {
+        if !self.running {
+            return None;
+        }
+        let poll = self.app.device_mut().aps_mut().nwk_mut().take_host_poll()?;
+        let nwk = poll.short_address;
+        let ieee = self
+            .app
+            .device()
+            .aps()
+            .nwk()
+            .find_ieee_by_short(nwk)
+            .or_else(|| self.app.tc_ieee_by_short(nwk.0));
+        Some(ChildPoll {
+            nwk: nwk.0,
+            ieee,
+            ack_frame_pending: poll.ack_frame_pending,
+        })
+    }
+
+    fn take_child_polls_dropped(&mut self) -> u32 {
+        u32::from(
+            self.app
+                .device_mut()
+                .aps_mut()
+                .nwk_mut()
+                .take_host_polls_dropped(),
+        )
     }
 
     async fn init(&mut self, nwk_fc_floor: u32, aps_fc_floor: u32) -> Result<(), OpError> {

@@ -206,6 +206,13 @@ impl RadioPhy for TelinkRadioPhy {
     /// for the next [`Self::receive`].
     type Tx = FullTx;
 
+    /// The `.ram_code` ACK path marks a Data Request it answered with Frame
+    /// Pending = 0. An unmarked poll is not known to have had FP = 1: polls
+    /// without PAN ID compression are answered FP = 0 unmarked, and a frame
+    /// the path declined to acknowledge (its status and length checks) can
+    /// still reach the MAC unmarked.
+    const POLL_ACK_REPORT: crate::PollAckReport = crate::PollAckReport::MarkedClear;
+
     #[inline]
     fn capabilities(&self) -> PhyCapabilities {
         PhyCapabilities {

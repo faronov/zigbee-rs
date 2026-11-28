@@ -47,14 +47,21 @@ use zigbee_zrhp::codec::{Bytes8, List};
 use zigbee_zrhp::frame::TX_BUFFER_LEN;
 use zigbee_zrhp::link::{Link, LinkConfig, LinkEvent};
 use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataConfirm};
-use zigbee_zrhp::msg::network::{EvtPermitJoinState, NwkAddEndpoint, NwkLeaveReset, NwkPermitJoin};
-use zigbee_zrhp::msg::system::{SysNegotiateReq, SysNegotiateRsp};
+use zigbee_zrhp::msg::diag::{DiagGetCounters, DiagGetCountersRsp};
+use zigbee_zrhp::msg::network::{
+    AckFramePending, EvtChildPoll, EvtPermitJoinState, NwkAddEndpoint, NwkLeaveReset, NwkPermitJoin,
+};
+use zigbee_zrhp::msg::system::{
+    ConfigValue, SysGetConfig, SysGetConfigRsp, SysNegotiateReq, SysNegotiateRsp, SysSetConfig,
+    SysSetConfigRsp, caps, config, host_caps,
+};
 use zigbee_zrhp::msg::{Batch, Kind, MsgHeader, RawMessage, ids};
 use zigbee_zrhp::queue::EndpointQueues;
-use zigbee_zrhp::types::Status;
+use zigbee_zrhp::types::{Ieee, Status};
 
 const IEEE: [u8; 8] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
 const PEER_IEEE: [u8; 8] = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
+const IEEE_B: [u8; 8] = [0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8];
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -540,6 +547,7 @@ fn a_restored_child_without_a_key_is_admitted_on_its_secured_rejoin() {
         lqi: 180,
         security_use: false,
         acked_without_frame_pending: false,
+        ack_frame_pending: None,
     }));
     steps(&mut port, 8);
     assert_eq!(
@@ -647,6 +655,7 @@ fn a_rejoin_response_queued_after_a_poll_was_acked_waits_for_the_next_poll() {
             lqi: 180,
             security_use: false,
             acked_without_frame_pending: !acked_frame_pending,
+            ack_frame_pending: Some(acked_frame_pending),
         }));
     };
     let to_child = |port: &mut TcPort<_>| {
@@ -926,6 +935,7 @@ fn a_long_polling_sleepy_child_is_reached_at_its_next_poll() {
             lqi: 180,
             security_use: false,
             acked_without_frame_pending: false,
+            ack_frame_pending: None,
         }));
         steps(port, 1);
     };
@@ -1110,12 +1120,16 @@ impl Host {
     }
 
     fn status(&mut self, tid: u16) -> u8 {
+        self.response(tid).payload[0]
+    }
+
+    fn response(&mut self, tid: u16) -> Received {
         let index = self
             .inbox
             .iter()
             .position(|m| m.kind == Kind::Response && m.tid == tid)
             .unwrap_or_else(|| panic!("no response to tid {tid}: {:?}", self.inbox));
-        self.inbox.remove(index).payload[0]
+        self.inbox.remove(index)
     }
 
     fn event(&mut self, msg_id: u16) -> Option<Received> {
@@ -1154,6 +1168,11 @@ struct Session {
 
 impl Session {
     fn negotiated<A: TcApp>(port: &mut TcPort<A>) -> Self {
+        Self::negotiated_with(port, 0).0
+    }
+
+    /// A session negotiated with `host_caps`; also returns the `ncp_caps`.
+    fn negotiated_with<A: TcApp>(port: &mut TcPort<A>, host_caps: u64) -> (Self, u64) {
         let now = 1_000;
         let mut session = Self {
             ncp: Ncp::new(identity(), 0xC0FF_EE02, now),
@@ -1165,7 +1184,7 @@ impl Session {
         let negotiate = session.host.request(&SysNegotiateReq {
             major_min: 1,
             major_max: 1,
-            host_caps: 0,
+            host_caps,
             name: Bytes8(b"pipe-host"),
         });
         session.exchange(port);
@@ -1183,7 +1202,7 @@ impl Session {
             .body
             .unwrap();
         assert_eq!(negotiated.capacity(8), Some(8), "max_host_endpoints");
-        session
+        (session, negotiated.ncp_caps)
     }
 
     fn exchange<A: TcApp>(&mut self, port: &mut TcPort<A>) {
@@ -1489,5 +1508,260 @@ fn a_provisional_child_is_not_exported_as_a_child() {
             0x80 | 0x40 | 0x08 | 0x04,
             zigbee_nwk::frames::ED_TIMEOUT_ENUM_DEFAULT
         ))
+    );
+}
+
+// ── EVT_CHILD_POLL (spec 7.2) ───────────────────────────────────────
+
+/// A sleepy end-device child of the NCP (as a restore leaves it).
+fn sleepy_child<A: TcApp>(port: &mut TcPort<A>, short: u16, ieee: [u8; 8]) -> ShortAddress {
+    let child = ShortAddress(short);
+    let nwk = port.app_mut().device_mut().aps_mut().nwk_mut();
+    assert!(nwk.restore_child(ieee, child, false, true, false, 8));
+    child
+}
+
+/// A MAC Data Request of `child` as the parent's MAC reports it: `ack` the
+/// Frame Pending of its ACK, `None` when the MAC does not report it.
+fn child_polled<A: TcApp<Mac = MockMac>>(
+    port: &mut TcPort<A>,
+    child: ShortAddress,
+    ack: Option<bool>,
+) {
+    let pan = pan(port);
+    mac(port).enqueue_command_event(MacCommandEvent::DataRequest(MlmeDataRequestIndication {
+        source_address: MacAddress::Short(pan, child),
+        destination_address: MacAddress::Short(pan, ShortAddress::COORDINATOR),
+        lqi: 180,
+        security_use: false,
+        acked_without_frame_pending: ack == Some(false),
+        ack_frame_pending: ack,
+    }));
+}
+
+fn child_poll_events(session: &mut Session) -> Vec<EvtChildPoll> {
+    let mut out = Vec::new();
+    while let Some(event) = session.host.event(ids::EVT_CHILD_POLL) {
+        out.push(event.raw().decode::<EvtChildPoll>().unwrap());
+    }
+    out
+}
+
+/// `(nwk, ack_frame_pending bits, unreported)` of each report.
+fn poll_reports(session: &mut Session) -> Vec<(u16, u8, u16)> {
+    child_poll_events(session)
+        .iter()
+        .map(|event| {
+            (
+                event.nwk,
+                event.ack_frame_pending().bits(),
+                event.unreported,
+            )
+        })
+        .collect()
+}
+
+/// `child_poll_events`, `child_polls_coalesced`, `child_polls_dropped`.
+fn child_poll_counters(session: &mut Session, port: &mut TcPort<impl TcApp>) -> [u32; 3] {
+    let tid = session.host.request(&DiagGetCounters { group_mask: 0x40 });
+    session.exchange(port);
+    let response = session.host.response(tid);
+    let counters: DiagGetCountersRsp = response
+        .raw()
+        .decode_response::<DiagGetCountersRsp>()
+        .unwrap()
+        .body
+        .unwrap();
+    let value = |id| {
+        counters
+            .counters
+            .iter()
+            .find(|counter| counter.id == id)
+            .map(|counter| counter.value)
+            .unwrap_or_else(|| panic!("counter {id:#06x}"))
+    };
+    [value(0x0706), value(0x0707), value(0x0708)]
+}
+
+/// An opted-in host learns of a child's polls with the child's IEEE and its
+/// ACK's Frame Pending: the first at once, then at most one per
+/// `child_poll_interval_ms`, except when the Frame Pending decision
+/// changes; `unreported` counts what was coalesced in between.
+#[test]
+fn child_polls_reach_an_opted_in_host_rate_limited_per_child() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    formed_port!(port);
+    let child = sleepy_child(&mut port, 0x12D2, PEER_IEEE);
+    let other = sleepy_child(&mut port, 0x3C4D, IEEE_B);
+    let (mut session, ncp_caps) = Session::negotiated_with(&mut port, host_caps::CHILD_POLL_EVENTS);
+    assert_ne!(ncp_caps & caps::CHILD_POLL_EVENTS, 0);
+
+    child_polled(&mut port, child, Some(false));
+    session.exchange(&mut port);
+    let events = child_poll_events(&mut session);
+    assert_eq!(
+        events,
+        [EvtChildPoll::new(
+            0x12D2,
+            Some(Ieee(PEER_IEEE)),
+            AckFramePending::Clear,
+            0
+        )]
+    );
+
+    // Within the interval: coalesced, until the Frame Pending changes.
+    child_polled(&mut port, child, Some(false));
+    child_polled(&mut port, child, Some(false));
+    session.exchange(&mut port);
+    assert_eq!(poll_reports(&mut session), []);
+    child_polled(&mut port, child, Some(true));
+    child_polled(&mut port, child, Some(true));
+    session.exchange(&mut port);
+    assert_eq!(poll_reports(&mut session), [(0x12D2, 1, 2)]);
+
+    // A radio that does not report its ACK's decision; children are
+    // limited independently.
+    child_polled(&mut port, other, None);
+    session.exchange(&mut port);
+    let events = child_poll_events(&mut session);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].known_ieee(), Some(Ieee(IEEE_B)));
+    assert_eq!(events[0].ack_frame_pending(), AckFramePending::Unknown);
+    assert_eq!(events[0].flags, 2);
+
+    // The interval (default 2 s) elapses.
+    session.now += 2_000_000;
+    child_polled(&mut port, child, Some(true));
+    session.exchange(&mut port);
+    assert_eq!(poll_reports(&mut session), [(0x12D2, 1, 1)]);
+
+    // `child_poll_interval_ms` (250..=60000, u16).
+    let set = |session: &mut Session, value: &[u8]| {
+        session.host.request(&SysSetConfig {
+            values: List::new(&[ConfigValue {
+                id: config::CHILD_POLL_INTERVAL_MS,
+                value: Bytes8(value),
+            }]),
+        })
+    };
+    let short = set(&mut session, &100u16.to_le_bytes());
+    let odd = set(&mut session, &[0xFA, 0x00, 0x00]);
+    let ok = set(&mut session, &250u16.to_le_bytes());
+    let get = session.host.request(&SysGetConfig {
+        ids: List::new(&[config::CHILD_POLL_INTERVAL_MS]),
+    });
+    session.exchange(&mut port);
+    let statuses = |session: &mut Session, tid| -> Vec<Status> {
+        let response = session.host.response(tid);
+        let response: SysSetConfigRsp = response
+            .raw()
+            .decode_response::<SysSetConfigRsp>()
+            .unwrap()
+            .body
+            .unwrap();
+        response
+            .results
+            .iter()
+            .map(|result| result.status)
+            .collect()
+    };
+    assert_eq!(statuses(&mut session, short), [Status::InvalidParameter]);
+    assert_eq!(statuses(&mut session, odd), [Status::InvalidParameter]);
+    assert_eq!(statuses(&mut session, ok), [Status::Success]);
+    let response = session.host.response(get);
+    let read: SysGetConfigRsp = response
+        .raw()
+        .decode_response::<SysGetConfigRsp>()
+        .unwrap()
+        .body
+        .unwrap();
+    let item = read.items.iter().next().unwrap();
+    assert_eq!(
+        (item.status, item.value.0),
+        (Status::Success, &[0xFA, 0x00][..])
+    );
+
+    session.now += 250_000;
+    child_polled(&mut port, child, Some(true));
+    session.exchange(&mut port);
+    assert_eq!(poll_reports(&mut session), [(0x12D2, 1, 0)]);
+
+    // Reported, coalesced, dropped.
+    assert_eq!(child_poll_counters(&mut session, &mut port), [5, 3, 0]);
+}
+
+/// Without the host's opt-in (`host_caps` bit 4) the NCP still announces the
+/// capability but sends nothing and counts nothing; polls from before a
+/// session that opts in are not reported late.
+#[test]
+fn child_polls_stay_off_unless_the_host_opts_in() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    formed_port!(port);
+    let child = sleepy_child(&mut port, 0x12D2, PEER_IEEE);
+    let (mut session, ncp_caps) = Session::negotiated_with(&mut port, 0);
+    assert_ne!(ncp_caps & caps::CHILD_POLL_EVENTS, 0, "capability present");
+
+    child_polled(&mut port, child, Some(true));
+    session.exchange(&mut port);
+    child_polled(&mut port, child, Some(false));
+    session.exchange(&mut port);
+    assert_eq!(poll_reports(&mut session), []);
+    assert_eq!(child_poll_counters(&mut session, &mut port), [0, 0, 0]);
+
+    // A stack step without a service pass in between leaves the poll
+    // queued in the stack; the next pass discards it.
+    child_polled(&mut port, child, Some(true));
+    steps(&mut port, 4);
+    let (mut session, _) = Session::negotiated_with(&mut port, host_caps::CHILD_POLL_EVENTS);
+    assert_eq!(poll_reports(&mut session), [], "no stale report");
+    child_polled(&mut port, child, Some(true));
+    session.exchange(&mut port);
+    assert_eq!(poll_reports(&mut session), [(0x12D2, 1, 0)]);
+}
+
+/// The global bucket (16 reports, then one per 100 ms) bounds a burst of
+/// first polls from many children; a dropped report is retried at the
+/// child's next poll and carries the lost poll in `unreported`.
+#[test]
+fn child_polls_are_capped_globally() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    formed_port!(port);
+    let children: Vec<ShortAddress> = (0..20u16)
+        .map(|index| {
+            let mut ieee = PEER_IEEE;
+            ieee[0] = index as u8;
+            sleepy_child(&mut port, 0x2000 + index, ieee)
+        })
+        .collect();
+    let (mut session, _) = Session::negotiated_with(&mut port, host_caps::CHILD_POLL_EVENTS);
+
+    // Batches the mock MAC's command queue holds; 4 × 8 ms < 100 ms.
+    for batch in children.chunks(5) {
+        for &child in batch {
+            child_polled(&mut port, child, Some(false));
+        }
+        session.exchange(&mut port);
+    }
+    let reported = poll_reports(&mut session);
+    assert_eq!(reported.len(), 16);
+    assert!(
+        reported
+            .iter()
+            .all(|&(_, ack, unreported)| ack == 0 && unreported == 0)
+    );
+    assert_eq!(child_poll_counters(&mut session, &mut port), [16, 0, 4]);
+
+    // Ten tokens later the four dropped children report, each with the
+    // lost poll.
+    session.now += 1_000_000;
+    let late: Vec<u16> = children[16..].iter().map(|child| child.0).collect();
+    for &child in &children[16..] {
+        child_polled(&mut port, child, Some(false));
+    }
+    session.exchange(&mut port);
+    let reported = poll_reports(&mut session);
+    assert_eq!(
+        reported,
+        late.iter().map(|&nwk| (nwk, 0, 1)).collect::<Vec<_>>()
     );
 }

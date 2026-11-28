@@ -202,13 +202,23 @@ fn ack_pending_hook(frame: &[u8]) -> bool {
 }
 
 /// Mark a dequeued Data Request with its ACK's decision (see [`POLL_ACKS`]).
+/// `false`: the decision is unknown (the log lost it, or cannot tell the
+/// poll from a retransmission acknowledged the other way), so the poll is
+/// dropped like one the radio queue dropped: the child polls again, and an
+/// unmarked poll is never served as if its ACK had said FP = 1.
 #[cfg(feature = "esp-parent")]
-fn mark_poll_ack(frame: &mut PhyRxFrame) {
+fn mark_poll_ack(frame: &mut PhyRxFrame) -> bool {
     let data = frame.as_slice();
-    if let Some(source) = data_request_source(data) {
-        let sequence = data[2];
-        let acked_without = POLL_ACKS.with(|log| log.take(&source, sequence)) == Some(false);
-        frame.set_acked_without_frame_pending(acked_without);
+    let Some(source) = data_request_source(data) else {
+        return true;
+    };
+    let sequence = data[2];
+    match POLL_ACKS.with(|log| log.take(&source, sequence)) {
+        Some(frame_pending) => {
+            frame.set_acked_without_frame_pending(!frame_pending);
+            true
+        }
+        None => false,
     }
 }
 
@@ -861,7 +871,9 @@ fn take_from_radio(
         frame.rx_end_us = rx_end_us(raw.timestamp_us);
     }
     #[cfg(feature = "esp-parent")]
-    mark_poll_ack(frame);
+    if !mark_poll_ack(frame) {
+        return false;
+    }
     true
 }
 
@@ -891,6 +903,15 @@ impl RadioPhy for EspRadioPhy<'_> {
     /// EUI-64 source, which retrieves Rejoin Responses / Transport-Keys a
     /// parent queued by extended address.
     const POLL_EXTENDED_FALLBACK: bool = true;
+
+    /// A parent marks every dequeued poll with its ACK's decision
+    /// (`POLL_ACKS`); a poll whose decision the log lost or cannot tell
+    /// apart is dropped, not delivered unmarked.
+    const POLL_ACK_REPORT: crate::PollAckReport = if cfg!(feature = "esp-parent") {
+        crate::PollAckReport::Exact
+    } else {
+        crate::PollAckReport::Unknown
+    };
 
     fn poll_response_wait_us(&self) -> u32 {
         self.poll_response_wait_us
