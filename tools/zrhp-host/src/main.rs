@@ -568,6 +568,11 @@ fn smoke<S: ByteStream>(host: &mut Host<S>, form: bool, floors: (u32, u32)) -> R
         info.board.as_str(),
         info.product.as_str()
     );
+    // A UART NCP: give the link its line rate (ACK-first pacing and the
+    // RTO floor, spec 5.6); USB-Serial-JTAG (transport 1) has none.
+    if info.transport == 2 {
+        host.link.set_line_rate(info.uart_baud);
+    }
     // Echo round-trip latency over 10 requests.
     let mut worst = Duration::ZERO;
     for i in 0..10u8 {
@@ -739,6 +744,7 @@ fn set_uart<S: ByteStream>(host: &mut Host<S>, baud: u32, flow: bool) -> Result<
     }
     std::thread::sleep(Duration::from_millis(u64::from(APPLY_DELAY_MS) + 50));
     host.stream.set_baud(baud)?;
+    host.link.set_line_rate(baud);
     let started = Instant::now();
     let tid = host.request(&SysEcho {
         data: Rest(b"rate switch"),

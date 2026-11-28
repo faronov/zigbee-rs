@@ -204,6 +204,11 @@ impl Uart0 {
         TX_RING.is_empty()
     }
 
+    /// Bytes waiting in the transmit ring (not counting the 32-byte FIFO).
+    pub fn tx_pending(&self) -> usize {
+        TX_RING.len()
+    }
+
     /// Move received bytes from the ring into `out`; returns the count.
     pub fn read(&mut self, out: &mut [u8]) -> usize {
         RING.pop(out)
@@ -277,6 +282,11 @@ impl<const N: usize> Ring<N> {
 
     fn is_empty(&self) -> bool {
         self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
+    }
+
+    fn len(&self) -> usize {
+        let head = self.head.load(Ordering::Acquire);
+        head.wrapping_sub(self.tail.load(Ordering::Acquire)) as usize
     }
 
     /// Producer.

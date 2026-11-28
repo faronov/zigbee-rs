@@ -2477,6 +2477,9 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
     // ── Transmit ────────────────────────────────────────────────────
 
     fn transmit<T: HostTransport>(&mut self, now_us: u64, transport: &mut T) {
+        // UART: the link models the line (RTO floor, ACK-first pacing) and
+        // follows `SYS_SET_UART` switches; USB reports 0 (unknown).
+        self.link.set_line_rate(transport.info().baud);
         loop {
             if self.tx_len != 0 {
                 if self.need_delimiter && transport.write(&[0]) == 1 {
@@ -2508,10 +2511,12 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 self.tx_len = 0;
                 self.tx_off = 0;
             }
-            match self
-                .link
-                .poll_transmit(now_us, &mut self.queues, &mut self.tx)
-            {
+            match self.link.poll_transmit_with_backlog(
+                now_us,
+                &mut self.queues,
+                &mut self.tx,
+                transport.tx_backlog(),
+            ) {
                 Some(length) => {
                     self.tx_len = length;
                     self.tx_off = 0;

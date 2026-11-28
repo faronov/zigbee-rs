@@ -87,6 +87,10 @@ impl HostTransport for Host {
         self.uart.try_write(data)
     }
 
+    fn tx_backlog(&self) -> usize {
+        self.uart.tx_pending()
+    }
+
     fn take_line_faults(&mut self) -> LineFaults {
         let overruns = self.uart.rx_overruns();
         let line_errors = self.uart.rx_line_errors();

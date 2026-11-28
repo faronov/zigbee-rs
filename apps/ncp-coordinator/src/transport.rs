@@ -43,6 +43,14 @@ pub trait HostTransport {
     fn end_burst(&mut self) -> bool {
         true
     }
+    /// Bytes [`write`](Self::write) accepted that have not left the
+    /// transmitter yet (transmit ring or DMA buffer), or 0 when unknown.
+    /// The link holds DATA back while this, or its own model of a UART at
+    /// [`TransportInfo::baud`], reaches `ACK_FIRST_BACKLOG`, so ACKs never
+    /// queue behind a deep ring (ZRHP spec 5.6).
+    fn tx_backlog(&self) -> usize {
+        0
+    }
     fn take_line_faults(&mut self) -> LineFaults {
         LineFaults::default()
     }

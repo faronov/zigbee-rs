@@ -1,8 +1,8 @@
 //! The link state machine. See the module docs of [`crate::link`].
 
 use super::{
-    Instant, LinkConfig, LinkCounters, LinkEvent, LinkState, PeerChange, SessionInfo, TxFailure,
-    inc,
+    ACK_FIRST_BACKLOG, BITS_PER_BYTE, Instant, LinkConfig, LinkCounters, LinkEvent, LinkState,
+    PeerChange, SessionInfo, TxFailure, inc, rto_floor_us, wire_time_us,
 };
 use crate::cobs::{Accumulator, Feed};
 use crate::frame::{
@@ -25,6 +25,9 @@ const STARVATION_FRAMES: u8 = 8;
 const REJECT_QUEUE: usize = 4;
 /// Pending control-event queue.
 const CTL_QUEUE: usize = 4;
+/// Re-check interval while DATA waits behind a transport backlog of
+/// unknown drain rate.
+const GATE_RETRY_US: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TxState {
@@ -44,8 +47,9 @@ struct TxSlot {
     needs_retx: bool,
     retx_poll: bool,
     retx_count: u8,
-    first_tx: Instant,
-    last_tx: Instant,
+    /// When the last byte of the latest copy leaves our line (the time it
+    /// was produced while the line rate is unknown); its RTO runs from here.
+    wire_done: Instant,
     last_tx_order: u64,
     payload: [u8; MAX_PAYLOAD],
 }
@@ -61,8 +65,7 @@ impl TxSlot {
         needs_retx: false,
         retx_poll: false,
         retx_count: 0,
-        first_tx: 0,
-        last_tx: 0,
+        wire_done: 0,
         last_tx_order: 0,
         payload: [0; MAX_PAYLOAD],
     };
@@ -129,6 +132,7 @@ enum Lent {
 struct Peer {
     rx_window: u8,
     rx_mtu: u16,
+    ack_delay_us: u16,
     keepalive_ms: u16,
     link_timeout_ms: u16,
     credits: [u8; NEP],
@@ -138,6 +142,7 @@ impl Peer {
     const NONE: Self = Self {
         rx_window: 4,
         rx_mtu: MAX_PAYLOAD as u16,
+        ack_delay_us: 1000,
         keepalive_ms: 500,
         link_timeout_ms: 3000,
         credits: [0; NEP],
@@ -197,6 +202,16 @@ struct Core<const TXW: usize, const RXW: usize> {
     srtt: Option<u64>,
     rttvar: u64,
     rto: u64,
+    /// RTO lower bound: `rto_min` raised by the line-rate terms.
+    rto_floor: u64,
+    /// Line model: when our transmit line drains (line rate known).
+    wire_free_at: Instant,
+    /// Bytes the transport reported still queued at this poll.
+    reported_backlog: usize,
+    /// DATA was ready but held back by the ACK-first rule ...
+    data_gated: bool,
+    /// ... until about this time.
+    gate_open_at: Instant,
     blocked_since: Option<Instant>,
     blocked_by_window: bool,
     consecutive_high: u8,
@@ -289,9 +304,37 @@ impl<const TXW: usize, const RXW: usize> Link<TXW, RXW> {
         self.core.counters = LinkCounters::default();
     }
 
-    /// Current retransmission timeout (µs).
+    /// Current retransmission timeout (µs), counted from the moment a frame
+    /// has left our line.
     pub fn rto_us(&self) -> u64 {
         self.core.rto
+    }
+
+    /// Lower bound of the RTO (µs): `rto_min_us`, raised by the line-rate
+    /// terms of [`rto_floor_us`](super::rto_floor_us) once the line rate and
+    /// the peer's `ack_delay` are known.
+    pub fn rto_floor_us(&self) -> u64 {
+        self.core.rto_floor
+    }
+
+    /// Transport line rate (baud), 0 when unknown.
+    pub fn line_rate(&self) -> u32 {
+        self.core.cfg.line_rate_bps
+    }
+
+    /// Set the transport line rate (baud; 0 = unknown, e.g. USB) after a
+    /// `SYS_SET_UART` switch or a host line change. See
+    /// [`LinkConfig::line_rate_bps`].
+    pub fn set_line_rate(&mut self, bps: u32) {
+        self.core.set_line_rate(bps);
+    }
+
+    /// Bytes still waiting ahead on our transmit side at `now`: the line
+    /// model's estimate, or the transport figure passed to the last
+    /// [`poll_transmit_with_backlog`](Self::poll_transmit_with_backlog) if
+    /// larger.
+    pub fn tx_backlog(&self, now: Instant) -> usize {
+        self.core.tx_backlog(now)
     }
 
     /// Oldest unacknowledged sequence number.
@@ -396,13 +439,36 @@ impl<const TXW: usize, const RXW: usize> Link<TXW, RXW> {
     /// number of bytes to write, or `None` when nothing is due. Call it until
     /// it returns `None`, then sleep until [`next_deadline`](Self::next_deadline)
     /// or new input.
+    ///
+    /// ACK-first (spec 5.6): ACK, NAK, REJECT and RESET frames come first
+    /// and are always produced; DATA (new or retransmitted) only while less
+    /// than [`ACK_FIRST_BACKLOG`](super::ACK_FIRST_BACKLOG) bytes are
+    /// waiting on our transmit side. Without a line rate and a reported
+    /// backlog nothing is held back.
     pub fn poll_transmit(
         &mut self,
         now: Instant,
         src: &mut impl TxSource,
         out: &mut [u8; TX_BUFFER_LEN],
     ) -> Option<usize> {
+        self.poll_transmit_with_backlog(now, src, out, 0)
+    }
+
+    /// [`poll_transmit`](Self::poll_transmit) for a transport that knows how
+    /// many bytes it has accepted but not yet sent (`tx_backlog`: its
+    /// transmit ring or DMA buffer). The link holds DATA back while that
+    /// figure, or its own line model, reaches
+    /// [`ACK_FIRST_BACKLOG`](super::ACK_FIRST_BACKLOG), and starts the
+    /// frame's RTO only after those bytes and the frame itself are out.
+    pub fn poll_transmit_with_backlog(
+        &mut self,
+        now: Instant,
+        src: &mut impl TxSource,
+        out: &mut [u8; TX_BUFFER_LEN],
+        tx_backlog: usize,
+    ) -> Option<usize> {
         self.core.release_lent();
+        self.core.reported_backlog = tx_backlog;
         self.core.handle_timers(now);
         self.core.transmit(now, src, out)
     }
@@ -455,6 +521,15 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
             srtt: None,
             rttvar: 0,
             rto: cfg.rto_initial_us as u64,
+            rto_floor: rto_floor_us(
+                cfg.line_rate_bps,
+                Peer::NONE.ack_delay_us as u32,
+                cfg.rto_min_us,
+            ),
+            wire_free_at: 0,
+            reported_backlog: 0,
+            data_gated: false,
+            gate_open_at: 0,
             blocked_since: None,
             blocked_by_window: false,
             consecutive_high: 0,
@@ -507,6 +582,7 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
                 rx_stale_reset: 0,
                 peer_restarted: 0,
                 peer_resync: 0,
+                tx_spurious_retx: 0,
             },
         }
     }
@@ -561,6 +637,7 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
         self.peer = Peer {
             rx_window: body.rx_window.clamp(4, 32),
             rx_mtu: body.rx_mtu.min(MAX_PAYLOAD as u16),
+            ack_delay_us: body.ack_delay_us,
             keepalive_ms: body.keepalive_ms.max(1),
             link_timeout_ms: body.link_timeout_ms,
             credits,
@@ -669,7 +746,14 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
         self.next_ep_seq = [0; NEP];
         self.srtt = None;
         self.rttvar = 0;
-        self.rto = self.cfg.rto_initial_us as u64;
+        self.update_rto_floor();
+        self.rto = if self.cfg.line_rate_bps == 0 {
+            self.cfg.rto_initial_us as u64
+        } else {
+            let (lo, hi) = self.rto_bounds();
+            (self.cfg.rto_initial_us as u64).clamp(lo, hi)
+        };
+        self.data_gated = false;
         self.blocked_since = None;
         self.consecutive_high = 0;
         // Receive ARQ.
@@ -1024,33 +1108,39 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
         }
         let mut d: Option<u64> = None;
         let mut sample: Option<u64> = None;
+        let mut spurious = 0u32;
         let base = self.base;
         for s in &mut self.tx {
             if s.state != TxState::InFlight {
                 continue;
             }
             let off = s.seq.wrapping_sub(base);
-            if off < adv {
-                if !s.sacked {
-                    d = Some(d.map_or(s.last_tx_order, |x| x.max(s.last_tx_order)));
-                    if s.retx_count == 0 {
-                        sample = Some(now.saturating_sub(s.first_tx));
-                    }
-                }
-                s.state = TxState::Free;
-                s.needs_retx = false;
-            } else if let Some(bits) = sack {
-                let i = s.seq.wrapping_sub(ack).wrapping_sub(1);
-                if i < SACK_SPAN && bits & (1 << i) != 0 && !s.sacked {
-                    s.sacked = true;
-                    s.needs_retx = false;
-                    d = Some(d.map_or(s.last_tx_order, |x| x.max(s.last_tx_order)));
-                    if s.retx_count == 0 {
-                        sample = Some(now.saturating_sub(s.first_tx));
-                    }
+            let sacked_now = off >= adv
+                && sack.is_some_and(|bits| {
+                    let i = s.seq.wrapping_sub(ack).wrapping_sub(1);
+                    i < SACK_SPAN && bits & (1 << i) != 0
+                });
+            if (off < adv || sacked_now) && !s.sacked {
+                d = Some(d.map_or(s.last_tx_order, |x| x.max(s.last_tx_order)));
+                if s.retx_count == 0 {
+                    // From the moment the frame left our line (Karn: only
+                    // frames sent once).
+                    sample = Some(now.saturating_sub(s.wire_done));
+                } else if now < s.wire_done {
+                    // The latest copy has not even left our line: the peer
+                    // acknowledged an earlier one.
+                    spurious += 1;
                 }
             }
+            if off < adv {
+                s.state = TxState::Free;
+                s.needs_retx = false;
+            } else if sacked_now {
+                s.sacked = true;
+                s.needs_retx = false;
+            }
         }
+        self.counters.tx_spurious_retx = self.counters.tx_spurious_retx.saturating_add(spurious);
         self.base = ack;
         if let Some(r) = sample.filter(|_| self.cfg.adaptive_rto) {
             self.rtt_sample(r);
@@ -1145,7 +1235,63 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
             }
         }
         let rto = self.srtt.unwrap_or(r) + 4 * self.rttvar;
-        self.rto = rto.clamp(self.cfg.rto_min_us as u64, self.cfg.rto_max_us as u64);
+        let (lo, hi) = self.rto_bounds();
+        self.rto = rto.clamp(lo, hi);
+    }
+
+    /// `(RTO lower bound, RTO_max)`; the line-rate floor wins over `RTO_max`
+    /// on a line too slow for it.
+    fn rto_bounds(&self) -> (u64, u64) {
+        let lo = self.rto_floor;
+        (lo, (self.cfg.rto_max_us as u64).max(lo))
+    }
+
+    fn update_rto_floor(&mut self) {
+        self.rto_floor = rto_floor_us(
+            self.cfg.line_rate_bps,
+            self.peer.ack_delay_us as u32,
+            self.cfg.rto_min_us,
+        );
+    }
+
+    fn set_line_rate(&mut self, bps: u32) {
+        if bps == self.cfg.line_rate_bps {
+            return;
+        }
+        self.cfg.line_rate_bps = bps;
+        self.update_rto_floor();
+        if self.state == LinkState::Established {
+            let (lo, _) = self.rto_bounds();
+            self.rto = self.rto.max(lo);
+        }
+    }
+
+    /// Bytes still waiting ahead on our transmit side at `now`: the line
+    /// model's or the transport's figure, whichever is larger.
+    fn tx_backlog(&self, now: Instant) -> usize {
+        let bps = self.cfg.line_rate_bps as u64;
+        let modelled = if bps == 0 || self.wire_free_at <= now {
+            0
+        } else {
+            ((self.wire_free_at - now) * bps).div_ceil(BITS_PER_BYTE * 1_000_000) as usize
+        };
+        modelled.max(self.reported_backlog)
+    }
+
+    /// ACK-first rule: `true` (and the time to look again recorded) while
+    /// DATA must wait for the transmit backlog to drain.
+    fn data_held_back(&mut self, now: Instant) -> bool {
+        let backlog = self.tx_backlog(now);
+        if backlog < ACK_FIRST_BACKLOG {
+            return false;
+        }
+        let bps = self.cfg.line_rate_bps;
+        self.gate_open_at = if bps == 0 {
+            now + GATE_RETRY_US
+        } else {
+            now + wire_time_us(backlog + 1 - ACK_FIRST_BACKLOG, bps).max(1)
+        };
+        true
     }
 
     // ── Timers ──────────────────────────────────────────────────────────
@@ -1197,11 +1343,13 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
                 // S3: RTO on the oldest unacked, unsacked frame.
                 if let Some(i) = self.oldest_unsacked() {
                     let s = &self.tx[i];
-                    if !s.needs_retx && now >= s.last_tx + self.rto {
+                    if !s.needs_retx && now >= s.wire_done + self.rto {
                         inc(&mut self.counters.tx_rto_expiries);
                         self.tx[i].needs_retx = true;
                         self.tx[i].retx_poll = true;
-                        self.rto = (self.rto * 2).min(self.cfg.rto_max_us as u64);
+                        // Backoff, capped at max(RTO_max, floor) like every
+                        // other RTO update: never below the line-rate floor.
+                        self.rto = (self.rto * 2).min(self.rto_bounds().1);
                     }
                 }
                 if now >= self.last_tx + self.keepalive_us {
@@ -1239,10 +1387,11 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
                     || self.ack_req != AckReq::None
                     || self.keepalive_due
                     || self.rejects.iter().any(Option::is_some)
-                    || self
-                        .tx
-                        .iter()
-                        .any(|s| s.state == TxState::InFlight && s.needs_retx);
+                    || (!self.data_gated
+                        && self
+                            .tx
+                            .iter()
+                            .any(|s| s.state == TxState::InFlight && s.needs_retx));
                 if immediate {
                     return Some(0);
                 }
@@ -1253,10 +1402,13 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
                     t = min_opt(t, self.crc_holdoff_until);
                 }
                 if let Some(i) = self.oldest_unsacked() {
-                    t = min_opt(t, Some(self.tx[i].last_tx + self.rto));
+                    t = min_opt(t, Some(self.tx[i].wire_done + self.rto));
                 }
                 if let Some(b) = self.blocked_since {
                     t = min_opt(t, Some(b + self.keepalive_us));
+                }
+                if self.data_gated {
+                    t = min_opt(t, Some(self.gate_open_at));
                 }
                 t
             }
@@ -1271,10 +1423,19 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
         lead
     }
 
-    fn sent(&mut self, now: Instant, n: usize) {
+    /// Account a frame of `n` wire bytes produced at `now`; returns when its
+    /// last byte leaves our line (`now` while the line rate is unknown).
+    fn sent(&mut self, now: Instant, n: usize) -> Instant {
         self.last_tx = now;
         inc(&mut self.counters.tx_frames);
         self.counters.tx_bytes = self.counters.tx_bytes.saturating_add(n as u32);
+        let bps = self.cfg.line_rate_bps;
+        if bps == 0 {
+            return now;
+        }
+        let ahead = now + wire_time_us(self.reported_backlog, bps);
+        self.wire_free_at = self.wire_free_at.max(ahead) + wire_time_us(n, bps);
+        self.wire_free_at
     }
 
     fn transmit(
@@ -1309,11 +1470,22 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
             let poll = false;
             return Some(self.send_ack(kind, poll, false, now, out));
         }
-        if let Some(n) = self.send_retransmission(now, out) {
-            return Some(n);
-        }
-        if let Some(n) = self.send_new(now, src, out) {
-            return Some(n);
+        // ACK-first: control frames above never wait; DATA only joins a
+        // short transmit backlog.
+        if self.data_held_back(now) {
+            self.data_gated = self
+                .tx
+                .iter()
+                .any(|s| s.state == TxState::InFlight && s.needs_retx)
+                || Endpoint::DATA.iter().any(|e| src.ready(*e));
+        } else {
+            self.data_gated = false;
+            if let Some(n) = self.send_retransmission(now, out) {
+                return Some(n);
+            }
+            if let Some(n) = self.send_new(now, src, out) {
+                return Some(n);
+            }
         }
         if self.keepalive_due {
             self.keepalive_due = false;
@@ -1435,7 +1607,6 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
         let s = &mut self.tx[i];
         s.needs_retx = false;
         s.retx_count += 1;
-        s.last_tx = now;
         s.last_tx_order = order;
         let mut h = Header::new(FrameType::Data);
         h.epoch = epoch;
@@ -1447,7 +1618,7 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
         h.poll = core::mem::take(&mut s.retx_poll);
         let n = frame::encode_wire(&h, &[&s.payload[..s.len as usize]], lead, out).ok()?;
         inc(&mut self.counters.tx_retransmissions);
-        self.sent(now, n);
+        self.tx[i].wire_done = self.sent(now, n);
         Some(n)
     }
 
@@ -1557,8 +1728,7 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
         s.needs_retx = false;
         s.retx_poll = false;
         s.retx_count = 0;
-        s.first_tx = now;
-        s.last_tx = now;
+        s.wire_done = now;
         s.last_tx_order = order;
         let mut h = Header::new(FrameType::Data);
         h.epoch = self.epoch;
@@ -1567,7 +1737,7 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
         h.ack = self.rx_ack;
         h.ep_seq = ep_seq;
         let w = frame::encode_wire(&h, &[&self.tx[i].payload[..n]], lead, out).ok()?;
-        self.sent(now, w);
+        self.tx[i].wire_done = self.sent(now, w);
         Some(w)
     }
 
