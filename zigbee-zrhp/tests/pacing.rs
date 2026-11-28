@@ -640,6 +640,37 @@ fn rto_runs_from_when_the_frame_left_the_line() {
 }
 
 #[test]
+fn backoff_never_drops_below_the_floor_when_rto_max_is_lower() {
+    // RTO_max (50 ms) below the 115 200 floor (~108 ms): the cap of the
+    // backoff is max(RTO_max, floor), as for every other RTO update.
+    let cfg = LinkConfig {
+        line_rate_bps: BAUD,
+        rto_max_us: 50_000,
+        ..LinkConfig::ncp()
+    };
+    let mut r: Rig<16, 16> = Rig::established(cfg, 16, &[(1, 4), (2, 64), (3, 4), (4, 2), (5, 0)]);
+    let floor = r.link.rto_floor_us();
+    assert!(floor > 50_000);
+    assert_eq!(r.link.rto_us(), floor);
+    let mut src = OnePerFrame::default();
+    src.push(Endpoint::Zigbee, 1);
+    let mut out = [0u8; TX_BUFFER_LEN];
+    r.link.poll_transmit(0, &mut src, &mut out).unwrap();
+    let mut due = r.link.next_deadline().unwrap();
+    for expiry in 1..=3 {
+        r.link.poll_transmit(due, &mut NoSource, &mut out).unwrap();
+        assert_eq!(r.link.counters().tx_rto_expiries, expiry);
+        assert_eq!(r.link.rto_us(), floor, "expiry {expiry}");
+        let next = r.link.next_deadline().unwrap();
+        assert!(
+            next >= due + floor,
+            "expiry {expiry}: {next} < {due} + {floor}"
+        );
+        due = next;
+    }
+}
+
+#[test]
 fn ack_of_an_earlier_copy_counts_a_spurious_retransmission() {
     let mut r = rig(BAUD);
     let mut src = OnePerFrame::default();

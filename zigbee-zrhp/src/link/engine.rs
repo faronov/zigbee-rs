@@ -1347,7 +1347,9 @@ impl<const TXW: usize, const RXW: usize> Core<TXW, RXW> {
                         inc(&mut self.counters.tx_rto_expiries);
                         self.tx[i].needs_retx = true;
                         self.tx[i].retx_poll = true;
-                        self.rto = (self.rto * 2).min(self.cfg.rto_max_us as u64);
+                        // Backoff, capped at max(RTO_max, floor) like every
+                        // other RTO update: never below the line-rate floor.
+                        self.rto = (self.rto * 2).min(self.rto_bounds().1);
                     }
                 }
                 if now >= self.last_tx + self.keepalive_us {
