@@ -59,6 +59,8 @@ struct Pipe {
     uart_busy: u8,
     /// Every applied `(baud, flow)`.
     uart_applied: Vec<(u32, bool)>,
+    /// Reported as the transmit ring's unsent bytes.
+    tx_pending: usize,
 }
 
 impl HostTransport for Pipe {
@@ -72,6 +74,9 @@ impl HostTransport for Pipe {
     fn write(&mut self, data: &[u8]) -> usize {
         self.to_host.extend_from_slice(data);
         data.len()
+    }
+    fn tx_backlog(&self) -> usize {
+        self.tx_pending
     }
     fn info(&self) -> TransportInfo {
         match self.uart {
@@ -694,6 +699,44 @@ fn a_response_burst_beyond_the_queue_is_answered_in_full() {
         .count();
     assert_eq!(busy + ok, ECHOES as usize);
     assert!(ok >= 16, "the queue's worth is answered: {ok}");
+}
+
+/// ACK-first on a UART (spec 5.6): the NCP hands the link the line rate
+/// and its transmit ring's fill level. Behind a full ring the host's
+/// requests are still acknowledged at once while the responses wait; they
+/// follow once the ring has drained.
+#[test]
+fn a_full_uart_ring_holds_responses_but_not_acks() {
+    negotiated_session!(ncp, host, port, pipe, log, now);
+    pipe.uart = Some((115_200, false));
+    pipe.tx_pending = 4096;
+    let tids: Vec<u16> = (0..8u8)
+        .map(|index| {
+            host.request(&SysEcho {
+                data: Rest(&[index; 64]),
+            })
+        })
+        .collect();
+    exchange(&mut ncp, &mut host, &mut port, &mut pipe, &log, &mut now);
+    assert_eq!(ncp.link().line_rate(), 115_200);
+    assert_eq!(
+        ncp.link().rto_floor_us(),
+        zigbee_zrhp::link::rto_floor_us(115_200, 1000, 25_000)
+    );
+    assert_eq!(host.link.tx_unacked().count(), 0, "requests acknowledged");
+    assert!(
+        !host.inbox.iter().any(|m| m.msg_id == ids::SYS_ECHO),
+        "responses wait behind the ring"
+    );
+    pipe.tx_pending = 0;
+    for _ in 0..20 {
+        now += 20_000;
+        exchange(&mut ncp, &mut host, &mut port, &mut pipe, &log, &mut now);
+    }
+    for tid in tids {
+        assert_eq!(host.response(tid).status(), Status::Success.to_u8());
+    }
+    assert_eq!(ncp.link().counters().tx_retransmissions, 0);
 }
 
 /// An embedded host grants the LOG endpoint no credit at session start

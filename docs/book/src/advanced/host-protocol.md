@@ -644,9 +644,11 @@ Sender state:
 - `base`: the oldest unacked seq.
 - `next_seq`.
 - A buffer of up to `W` unacked frames. Each buffered frame carries its
-  bytes, `endpoint`, `ep_seq`, `sacked`, `last_tx_time`, `retx_count` and
-  `last_tx_order`. `tx_order` is a monotonically increasing counter
-  incremented at every (re)transmission.
+  bytes, `endpoint`, `ep_seq`, `sacked`, `wire_done` (when its latest copy
+  has left the sender's line; the (re)transmission time when the line rate
+  is unknown, see "Line model" below), `retx_count` and `last_tx_order`.
+  `tx_order` is a monotonically increasing counter incremented at every
+  (re)transmission.
 - `nbad_handled`.
 - RTO estimator state.
 
@@ -674,10 +676,12 @@ Rules:
   `nbad = k > nbad_handled`, retransmit `F[nbad_handled..k]` and set
   `nbad_handled = k`. Whenever `D_max` increases, reset `nbad_handled = 0`.
 - **S3 (RTO, tail loss).** If the oldest unacked, unsacked frame satisfies
-  `now − last_tx_time ≥ RTO`, retransmit it with `RETX | POLL`, double `RTO`
-  (capped at `RTO_max`), and do not take RTT samples from retransmitted
-  frames (Karn). After an RTT sample, recompute
-  `RTO = clamp(SRTT + 4·RTTVAR, RTO_min, RTO_max)` as in RFC 6298.
+  `now − wire_done ≥ RTO`, retransmit it with `RETX | POLL`, double `RTO`
+  (capped at `max(RTO_max, RTO_floor)`), and do not take RTT samples from
+  retransmitted frames (Karn). An RTT sample is `t_ack − wire_done`. After
+  a sample, recompute
+  `RTO = clamp(SRTT + 4·RTTVAR, RTO_floor, max(RTO_max, RTO_floor))` as in
+  RFC 6298. `RTO_floor` is `RTO_min` when the line rate is unknown.
 - **S4 (failure).** When a frame that was already retransmitted
   `N_retx_max` (10) times needs another retransmission, the link is
   declared failed. The sender reports `LINK_FAILED` and starts a reset with
@@ -685,6 +689,56 @@ Rules:
 - **S5 (blocked sender).** A sender that is blocked on credit or window for
   more than `keepalive_ms` sends `ACK | POLL` to elicit a fresh credit and
   ack state.
+- **S6 (ACK-first).** Control frames (RESET, REJECT, ACK, NAK, `ACK|POLL`)
+  go out before any DATA and are never held back. DATA, new or
+  retransmitted, is produced only while fewer than `B_ack` = 256 bytes wait
+  on the sender's transmit side: the figure the transport reports for its
+  transmit ring or DMA buffer, or the line model below, whichever is
+  larger. A control frame therefore waits behind fewer than
+  `B_peer = B_ack + 657` = 913 bytes of DATA, not behind a whole transmit
+  ring. Without it, the EFR32MG24 NCP's 2 KiB ring held ACKs for
+  ~180 ms at 115 200 while the RTO sat at 25 ms (soak in the EFR32 guide).
+
+**Line model and RTO floor.** A sender that knows its UART rate
+(`T_byte = 10 / baud`, 8N1) keeps `wire_free`, the time its line will have
+sent everything produced so far. A frame of `n` wire bytes (COBS, the
+delimiter and a leading `0x00` included) produced at `now`, while the
+transport still holds `b` bytes, leaves the line at
+`wire_done = max(wire_free, now + b·T_byte) + n·T_byte`; then
+`wire_free = wire_done`. The frame's RTO runs from `wire_done` (S3), so time
+spent queued behind our own output is not mistaken for a lost ACK. The RTO
+never falls below
+
+```text
+RTO_floor = (B_peer + L_ack)·T_byte + ack_delay_peer + RTO_min
+```
+
+`B_peer` bounds what an ACK-first peer (S6) may still have to send before
+the ACK, `L_ack` = 31 bytes is the longest ACK/NAK on the wire,
+`ack_delay_peer` comes from the peer's `RESET_*`, and `RTO_min` remains the
+margin for scheduling and USB latency. The floor holds the adaptive RTO up;
+exponential backoff still doubles it. Loss mid-stream is still repaired at
+once by S1 and S2; only tail loss waits for the floor.
+
+| Line rate | `RTO_floor` (ack_delay 1 ms, `RTO_min` 25 ms) | Longest wait of an ACK behind DATA |
+|---|---:|---:|
+| 115 200 | 81.9 + 1 + 25 = 107.9 ms | 912 B = 79.2 ms |
+| 460 800 | 20.5 + 1 + 25 = 46.5 ms | 19.8 ms |
+| 921 600 | 10.2 + 1 + 25 = 36.2 ms | 9.9 ms |
+| unknown (USB-Serial-JTAG) | `RTO_min` = 25 ms | not modelled (a reported transport backlog still holds DATA) |
+
+**Host guidance.** Both sides run S6 and the line model; an implementation
+that does not still interoperates (it only risks spurious retransmissions
+and the duplicates R4 discards). A host behind a UART, a USB-UART bridge
+included, must give its link the line rate (Rust: `LinkConfig::line_rate_bps`,
+and `Link::set_line_rate` after every `SYS_SET_UART` or line change). It
+must write control frames ahead of queued DATA and must not push DATA into
+OS serial buffers beyond `B_ack`: with the Rust link, write what
+`poll_transmit` returns and wake at `next_deadline()`, which includes the
+time the modelled backlog drops below `B_ack`. A platform that can read its
+transmit ring's fill level passes it to `poll_transmit_with_backlog` (the
+NCPs: `HostTransport::tx_backlog`). Counter `tx_spurious_retx` (5.12) counts
+retransmissions acknowledged before their copy could have left the line.
 
 Retransmitted frames keep their `seq`, `ep_seq` and payload byte-for-byte.
 Only `ctrl.RETX`, `ctrl.POLL`, `ack` and the CRC may change, so
@@ -749,15 +803,18 @@ keepalive.
 
 ### 5.8 Timers and defaults
 
-`T_byte = 10 / baud` for UART. `T_frame_max = 656 · T_byte`. `T_host` is the
-host's scheduling slack. Its default is 10 ms, and it should be raised to
-30 ms for Python on busy hosts.
+`T_byte = 10 / baud` for UART. `T_frame_max = 656 · T_byte`. `RTO_min`
+covers the host's scheduling slack and USB latency on top of the line
+terms of `RTO_floor` (5.6); raise it (for example to 45 ms) for Python on
+busy hosts.
 
 | Timer / constant | Formula | 460 800 (BR fallback) | 921 600 | 2 M | 3 M | USB-Serial-JTAG | Range |
 |---|---|---:|---:|---:|---:|---:|---|
 | `T_frame_max` | 656·T_byte | 14.2 ms | 7.1 ms | 3.3 ms | 2.2 ms | ≤ 11 ms (11 × 64 B packets at 1 packet per 1 ms frame, worst case) | — |
 | `ack_delay` | ≤ T_frame_max/2, ≤ 2 ms | 2 ms | 1 ms | 1 ms | 0.5 ms | 1 ms | 0.2–5 ms |
-| `RTO_min` | max(10 ms, 2·T_frame_max + ack_delay + T_host) | 41 ms | 25 ms | 18 ms | 16 ms | 33 ms | — |
+| `RTO_min` | scheduling and USB margin beyond the line terms of `RTO_floor` | 25 ms | 25 ms | 25 ms | 25 ms | 25 ms | ≥ 10 ms |
+| `RTO_floor` | (913 + 31)·T_byte + ack_delay + `RTO_min` (5.6); `RTO_min` when the rate is unknown | 46.5 ms | 36.2 ms | 30.7 ms | 29.1 ms | 25 ms | — |
+| `B_ack` | DATA is held back at this transmit backlog (S6) | 256 B | ← | ← | ← | ← | — |
 | `RTO_initial` | — | 100 ms | 100 ms | 100 ms | 100 ms | 100 ms | 20–1000 ms |
 | `RTO_max` | — | 1000 ms | 1000 ms | 1000 ms | 1000 ms | 1000 ms | — |
 | `N_retx_max` | — | 10 | 10 | 10 | 10 | 10 | 4–16 |
@@ -892,6 +949,7 @@ with `DIAG_GET_COUNTERS` (group `0x01`).
 | 0x010A | `naks_received` | 0x011A | `rx_stale_reset` |
 | 0x010B | `sessions_established` | 0x011B | `peer_restarted` |
 | 0x010C | `link_down_events` | 0x011C | `peer_resync` |
+| 0x010D | `tx_spurious_retx` (retransmission acknowledged before it left the line; needs the line rate, lower bound) | | |
 
 ### 5.13 Behaviour under faults
 
@@ -901,7 +959,7 @@ with `DIAG_GET_COUNTERS` (group `0x01`).
 | Noise inserts `0x00` (frame split) | Both halves fail length/CRC | Same as above | Same |
 | Delimiter destroyed (frames merged) | Length/CRC mismatch, or >656 bytes | Both frames NAKed via `nbad`, or a later gap triggers S1 | Two retransmissions |
 | Lost frame mid-stream | Gap at the next frame (R2) | S1 FIFO inference | ~1 RTT |
-| Lost last frame | No following frame | S3 RTO with POLL | `RTO_min`..`RTO` |
+| Lost last frame | No following frame | S3 RTO with POLL | `RTO_floor`..`RTO` after it left the line |
 | Lost ACK/NAK | Next ACK/NAK carries the full state; RTO+POLL | S1/S3 | Possible duplicate, suppressed by R4 |
 | Duplicated frame | sack bitmap / behind window | R4, ACK | None |
 | Reordering | Impossible on a byte stream; would look like loss + duplicate | S1 + R4 | Retransmission |

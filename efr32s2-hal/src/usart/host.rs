@@ -380,6 +380,12 @@ impl HostUart {
         count
     }
 
+    /// Bytes waiting in the transmit ring (not counting the USART's
+    /// two-byte buffer).
+    pub fn tx_pending(&self) -> usize {
+        TX.len()
+    }
+
     /// Nothing queued and the shift register empty.
     pub fn tx_idle(&self) -> bool {
         TX.is_empty() && unsafe { read(base() + STATUS) } & STATUS_TXC != 0

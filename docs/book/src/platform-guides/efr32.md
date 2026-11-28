@@ -1094,6 +1094,17 @@ the NCP in the 90 s A/B run). Without flow control at 115 200, an ACK waits
 behind the frames already queued (the 2 KiB TX ring drains in ~180 ms).
 The adaptive RTO, 25 ms at its floor, expires first.
 
+Fixed in the link layer since (host protocol 5.6, S6 and "Line model and
+RTO floor"): ACKs go out ahead of DATA, the NCP passes its line rate and
+its TX ring's fill level to the link, which keeps less than 256 bytes of
+DATA queued ahead of an ACK, starts each frame's RTO only once the frame
+has left the line, and holds the RTO at 107.9 ms or more at 115 200.
+Host-tested (`zigbee-zrhp/tests/pacing.rs`: the same traffic shape at
+115 200 over a simulated 2 KiB ring, 154 spurious retransmissions in 20 s
+before, 0 after; lost frames are still repaired); the BRD4187 soak is
+pending. The host must pass its line rate too (`hubctl`: the baud of its
+line), otherwise its own frames are still resent.
+
 In phase 3, 219 of 6,465 reads failed with `not_delivered`:
 
 - 204 `busy_responses`: 32 concurrent requests exceed the NCP's 16 APS

@@ -19,9 +19,9 @@
 //!
 //! | Profile | `TXW` | `RXW` | `size_of::<Link>()` (x86-64) |
 //! |---|---:|---:|---:|
-//! | ESP32-H2 NCP | 16 | 16 | 22 528 B |
-//! | ESP32-S3 embedded host | 8 (or 4) | 8 (or 4) | 11 872 B (6 544 B) |
-//! | Desktop host | 32 | 32 | 43 840 B |
+//! | ESP32-H2 NCP | 16 | 16 | 22 440 B |
+//! | ESP32-S3 embedded host | 8 (or 4) | 8 (or 4) | 11 848 B (6 552 B) |
+//! | Desktop host | 32 | 32 | 43 624 B |
 //!
 //! (`tests/size.rs` keeps these within `slots × (640 + 48) + 656 + 1024`.)
 //!
@@ -53,11 +53,56 @@ mod engine;
 
 pub use engine::Link;
 
-use crate::frame::Role;
+use crate::frame::{CRC_LEN, HEADER_LEN, Role, TX_BUFFER_LEN};
 use crate::types::Endpoint;
 
 /// Monotonic time in microseconds, supplied by the caller.
 pub type Instant = u64;
+
+/// Bits on the line per byte (UART 8N1: start + 8 data + stop).
+pub const BITS_PER_BYTE: u64 = 10;
+
+/// ACK-first rule (spec 5.6): a new or retransmitted DATA frame is only
+/// produced while fewer than this many bytes are waiting ahead on our
+/// transmit side (modelled from the line rate, or reported by the
+/// transport). ACK, NAK, REJECT and RESET frames are never held back, so a
+/// control frame waits behind fewer than [`PEER_ACK_AHEAD`] bytes of DATA.
+pub const ACK_FIRST_BACKLOG: usize = 256;
+
+/// Bound on what an ACK-first peer can have queued ahead of the ACK it
+/// owes us: less than [`ACK_FIRST_BACKLOG`] plus one maximum wire frame.
+pub const PEER_ACK_AHEAD: usize = ACK_FIRST_BACKLOG + TX_BUFFER_LEN;
+
+/// Longest ACK/NAK on the wire: header, `sack`, `nbad`, five credit
+/// entries and CRC, COBS-encoded, with a leading and a trailing `0x00`.
+pub const ACK_WIRE_MAX: usize = crate::cobs::max_encoded_len(HEADER_LEN + 6 + 2 * 5 + CRC_LEN) + 2;
+
+/// Time (µs, rounded up) to serialise `bytes` at `line_rate_bps` (8N1);
+/// 0 when the line rate is unknown (0).
+pub const fn wire_time_us(bytes: usize, line_rate_bps: u32) -> u64 {
+    if line_rate_bps == 0 {
+        return 0;
+    }
+    (bytes as u64 * BITS_PER_BYTE * 1_000_000).div_ceil(line_rate_bps as u64)
+}
+
+/// Lower bound of the RTO (µs), measured from the moment a frame has left
+/// our wire (spec 5.6 S3): the peer may first have to send up to
+/// [`PEER_ACK_AHEAD`] bytes it had queued, then the ACK itself
+/// ([`ACK_WIRE_MAX`]); it may hold the ACK for its `ack_delay`; and
+/// `rto_min_us` stays as the margin for scheduling and USB latency. With an
+/// unknown line rate this is `rto_min_us`, the fixed floor.
+///
+/// 115 200 baud, `ack_delay` 1 ms, `RTO_min` 25 ms:
+/// `T(913 + 31 B) + 1 ms + 25 ms = 81.9 + 1 + 25 ≈ 108 ms`.
+pub const fn rto_floor_us(line_rate_bps: u32, peer_ack_delay_us: u32, rto_min_us: u32) -> u64 {
+    if line_rate_bps == 0 {
+        return rto_min_us as u64;
+    }
+    wire_time_us(PEER_ACK_AHEAD + ACK_WIRE_MAX, line_rate_bps)
+        + peer_ack_delay_us as u64
+        + rto_min_us as u64
+}
 
 /// Link configuration (local side). See spec 5.8 for the defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +137,14 @@ pub struct LinkConfig {
     /// is polled. Disable to call [`Link::release_credit`] explicitly when
     /// the consumer frees its buffer.
     pub auto_credit: bool,
+    /// Transport line rate in baud (8N1 UART), or 0 when unknown (USB).
+    /// When known, the link models its own wire: every frame's RTO runs
+    /// from the moment its last byte has left the line (bytes queued ahead
+    /// of it included), the RTO never falls below [`rto_floor_us`], and DATA
+    /// is held back while [`ACK_FIRST_BACKLOG`] bytes or more are still
+    /// waiting to go out, so ACKs never queue behind a deep transmit buffer
+    /// (spec 5.6). Change it at runtime with [`Link::set_line_rate`].
+    pub line_rate_bps: u32,
 }
 
 impl LinkConfig {
@@ -113,6 +166,7 @@ impl LinkConfig {
             reset_retry_max_ms: 2000,
             initial_credits: [0, 4, 8, 4, 2, 0],
             auto_credit: true,
+            line_rate_bps: 0,
         }
     }
 
@@ -258,11 +312,15 @@ pub struct LinkCounters {
     pub rx_stale_reset: u32,
     pub peer_restarted: u32,
     pub peer_resync: u32,
+    /// Retransmissions acknowledged before their copy could have left our
+    /// line, i.e. the peer had acknowledged an earlier copy (spurious). A
+    /// lower bound; 0 while the line rate is unknown.
+    pub tx_spurious_retx: u32,
 }
 
 impl LinkCounters {
     /// `(counter ID, value)` pairs for `DIAG_GET_COUNTERS` group `0x01`.
-    pub fn entries(&self) -> [(u16, u32); 24] {
+    pub fn entries(&self) -> [(u16, u32); 25] {
         [
             (0x0101, self.tx_frames),
             (0x0102, self.tx_bytes),
@@ -276,6 +334,7 @@ impl LinkCounters {
             (0x010A, self.naks_received),
             (0x010B, self.sessions_established),
             (0x010C, self.link_down_events),
+            (0x010D, self.tx_spurious_retx),
             (0x0111, self.rx_frames),
             (0x0112, self.rx_bytes),
             (0x0113, self.rx_bad_frame),
