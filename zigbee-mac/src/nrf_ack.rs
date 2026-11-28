@@ -9,8 +9,9 @@
 //! in software (`SoftMacCore::accepts_destination` /
 //! `SoftMacCore::is_exact_destination`).
 
+use crate::ack_pending::data_request_source;
 use crate::frames::{build_ack, parse_mac_addresses};
-use crate::phy::PhyAddressFilter;
+use crate::phy::{PhyAddressFilter, PhyError, PhyRxFrame};
 use zigbee_types::{MacAddress, PanId};
 
 /// aTurnaroundTime: last bit of the received frame to first bit of the ACK.
@@ -173,6 +174,49 @@ pub fn classify(
 pub const fn ack_dma_image(sequence: u8, frame_pending: bool) -> [u8; 4] {
     let psdu = build_ack(sequence, frame_pending);
     [psdu.len() as u8 + 2, psdu[0], psdu[1], psdu[2]]
+}
+
+/// Bit 7 of a committed RX slot's PHR byte (reserved by IEEE 802.15.4; the
+/// length is bits 6..0): the frame is a MAC Data Request whose Imm-Ack the
+/// RADIO handler built with Frame Pending = 0
+/// ([`PhyRxFrame::acked_without_frame_pending`]).
+pub const PHR_POLL_ACKED_WITHOUT_FRAME_PENDING: u8 = 0x80;
+
+/// The PHR byte the RADIO handler stores back into the slot of a retained
+/// frame (`phr` as received, `frame` its PSDU without FCS): the length, plus
+/// [`PHR_POLL_ACKED_WITHOUT_FRAME_PENDING`] when [`classify`]'s ACK decision
+/// `ack` for a Data Request is Frame Pending = 0.
+///
+/// The flag is the decision written into the Imm-Ack image itself, so it is
+/// set even when that ACK was then abandoned as late (the child retries its
+/// poll), as the software-ACK path reports its decision whether or not the
+/// ACK got on air. The flag lives in the frame's own slot: nothing is kept
+/// per child, and a frame the ring could not keep takes its decision with
+/// it.
+pub fn committed_phr(phr: u8, frame: &[u8], ack: Option<(u8, bool)>) -> u8 {
+    let length = phr & !PHR_POLL_ACKED_WITHOUT_FRAME_PENDING;
+    if matches!(ack, Some((_, false))) && data_request_source(frame).is_some() {
+        length | PHR_POLL_ACKED_WITHOUT_FRAME_PENDING
+    } else {
+        length
+    }
+}
+
+/// Copy a committed RX slot (PHR from [`committed_phr`], PSDU without FCS,
+/// then the LQI the RADIO wrote over the first FCS octet) into `frame`,
+/// with its poll flag. `lqi` maps the RADIO's LQI byte to the MAC scale.
+pub fn read_committed_slot(
+    slot: &[u8],
+    frame: &mut PhyRxFrame,
+    lqi: impl FnOnce(u8) -> u8,
+) -> Result<(), PhyError> {
+    let phr = *slot.first().ok_or(PhyError::FrameTooLong)?;
+    let len = usize::from(phr & !PHR_POLL_ACKED_WITHOUT_FRAME_PENDING).saturating_sub(2);
+    let data = slot.get(1..1 + len).ok_or(PhyError::FrameTooLong)?;
+    let quality = *slot.get(1 + len).ok_or(PhyError::FrameTooLong)?;
+    frame.set(data, lqi(quality))?;
+    frame.set_acked_without_frame_pending(phr & PHR_POLL_ACKED_WITHOUT_FRAME_PENDING != 0);
+    Ok(())
 }
 
 /// TIMER compare value that triggers TXEN so the ACK's first bit leaves
@@ -437,6 +481,133 @@ mod tests {
     fn ack_image_has_phr_and_frame_pending() {
         assert_eq!(ack_dma_image(0x42, false), [5, 0x02, 0x00, 0x42]);
         assert_eq!(ack_dma_image(0x42, true), [5, 0x12, 0x00, 0x42]);
+    }
+
+    /// One RX slot as the handler leaves it: EasyDMA's PHR (PSDU + FCS
+    /// length), the PSDU, the LQI over the first FCS octet; then the handler
+    /// classifies the frame and stores the committed PHR.
+    fn commit(
+        slot: &mut [u8; 128],
+        frame: &[u8],
+        filter: &PhyAddressFilter,
+        pending: &PendingTable,
+    ) -> RxClass {
+        // A previous occupant's flag must not survive (EasyDMA rewrites the
+        // PHR, but the handler is the only writer of bit 7).
+        slot.fill(0xFF);
+        slot[0] = frame.len() as u8 + 2;
+        slot[1..=frame.len()].copy_from_slice(frame);
+        slot[1 + frame.len()] = 0x30;
+        let class = classify(frame, Some(filter), pending);
+        if let RxClass::Queue { ack } = class {
+            slot[0] = committed_phr(slot[0], frame, ack);
+        }
+        class
+    }
+
+    fn take(slot: &[u8; 128]) -> PhyRxFrame {
+        let mut frame = PhyRxFrame::EMPTY;
+        read_committed_slot(slot, &mut frame, |lqi| lqi).unwrap();
+        frame
+    }
+
+    /// The secured-rejoin sequence of #23 through the handler's slot
+    /// commit: a poll acknowledged before the response was armed carries
+    /// FP = 0 with it, the next poll (FP = 1) does not, and both polls keep
+    /// their own decision while queued together.
+    #[test]
+    fn each_committed_poll_carries_its_own_ack_decision() {
+        let child = MacAddress::Short(PAN, ShortAddress(0x12D2));
+        let mut pending = PendingTable::new();
+        let mut ring = [[0u8; 128]; 3];
+
+        let stale = data_request(0x12D2, 0x10);
+        assert_eq!(
+            commit(&mut ring[0], &stale, &filter(), &pending),
+            RxClass::Queue {
+                ack: Some((0x10, false))
+            }
+        );
+        // The Rejoin Response is queued after that ACK.
+        pending.set(child, true).unwrap();
+        let next = data_request(0x12D2, 0x11);
+        assert_eq!(
+            commit(&mut ring[1], &next, &filter(), &pending),
+            RxClass::Queue {
+                ack: Some((0x11, true))
+            }
+        );
+
+        let first = take(&ring[0]);
+        assert_eq!((first.as_slice(), first.lqi), (&stale[..], 0x30));
+        assert!(first.acked_without_frame_pending());
+        let second = take(&ring[1]);
+        assert_eq!(second.as_slice(), next);
+        assert!(!second.acked_without_frame_pending());
+
+        // Another child's poll is FP = 0 again, in whatever slot it lands.
+        let other = data_request(0x3344, 0x12);
+        commit(&mut ring[2], &other, &filter(), &pending);
+        assert!(take(&ring[2]).acked_without_frame_pending());
+        // Slot reuse: the armed child's poll replaces a flagged frame.
+        commit(
+            &mut ring[0],
+            &data_request(0x12D2, 0x13),
+            &filter(),
+            &pending,
+        );
+        assert!(!take(&ring[0]).acked_without_frame_pending());
+    }
+
+    #[test]
+    fn only_acknowledged_data_requests_are_flagged() {
+        let pending = PendingTable::new();
+        let mut slot = [0u8; 128];
+        // A data frame ACKed with FP = 0 is not a poll.
+        let mut data = data_request(0x5678, 1);
+        data[0] = 0x61;
+        commit(&mut slot, &data, &filter(), &pending);
+        assert!(!take(&slot).acked_without_frame_pending());
+        // A Data Request without an ACK request gets no ACK.
+        let mut unacked = data_request(0x5678, 2);
+        unacked[0] = 0x43;
+        commit(&mut slot, &unacked, &filter(), &pending);
+        assert!(!take(&slot).acked_without_frame_pending());
+        // An Association Request from an EUI-64 (command 0x01).
+        let mut association = [0u8; 19];
+        association[..9].copy_from_slice(&[0x23, 0xC8, 3, 0xE9, 0xDF, 0x34, 0x12, 0xFF, 0xFF]);
+        association[9..17].copy_from_slice(&[9; 8]);
+        association[17] = 0x01;
+        association[18] = 0x8E;
+        assert!(matches!(
+            commit(&mut slot, &association, &filter(), &pending),
+            RxClass::Queue { ack: Some(_) }
+        ));
+        assert!(!take(&slot).acked_without_frame_pending());
+        // The length bits are never touched by the flag.
+        for len in 0u8..=127 {
+            let phr = committed_phr(len | 0x80, &data_request(1, 1), Some((1, false)));
+            assert_eq!(phr & 0x7F, len);
+        }
+    }
+
+    #[test]
+    fn committed_slots_outside_the_frame_are_rejected() {
+        let mut frame = PhyRxFrame::EMPTY;
+        assert_eq!(
+            read_committed_slot(&[], &mut frame, |lqi| lqi),
+            Err(PhyError::FrameTooLong)
+        );
+        // PHR 127 needs 1 + 125 + 1 bytes.
+        let slot = [127u8; 126];
+        assert_eq!(
+            read_committed_slot(&slot, &mut frame, |lqi| lqi),
+            Err(PhyError::FrameTooLong)
+        );
+        let slot = [0x80 | 127u8; 127];
+        read_committed_slot(&slot, &mut frame, |lqi| lqi).unwrap();
+        assert_eq!(frame.len(), 125);
+        assert!(frame.acked_without_frame_pending());
     }
 
     #[test]

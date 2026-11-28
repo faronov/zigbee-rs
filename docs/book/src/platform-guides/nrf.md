@@ -159,7 +159,13 @@ Frame Pending follows the core's `PENDING = 0` model: `NrfRouterMac` is
 `SoftMacCore<NrfIsrRadioPhy, Parent<8, 8, 0>>`, and the core arms a 16-entry
 HAL source-match table (short and extended addresses) through
 `RadioPhy::set_ack_frame_pending`; the ISR sets FP in the ACK to a Data
-Request from a matching source.
+Request from a matching source. A Data Request whose ACK it built with
+FP = 0 keeps that decision in bit 7 (reserved) of its ring slot's PHR byte
+(`nrf_ack::committed_phr`), written after the ACK is armed so the check
+never delays it; `receive` reports it as
+`PhyRxFrame::acked_without_frame_pending` and the NWK keeps a frame queued
+since for the child's next poll (host-tested and build-checked; no
+hardware run yet).
 
 `NrfRadioCounters` counts received frames, CRC errors, ring overflows, ACKs
 sent, ACKs with FP, late ACKs, the turnaround estimate and TX results. The
