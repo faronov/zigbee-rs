@@ -1292,7 +1292,7 @@ device child still comes back rx-off: the backup format cannot say so.
 | host UART | USART0 TX PA05 (pin 12), RX PA06 (pin 13) → ESP32-S3 SuperMini; RTS PA07 / CTS PA08 claimed but unused | USART0 routed to TX PC01, RX PC02 → ESP32 GPIO13/GPIO17, 115 200, no flow control (community builds use EUSART1 on the same pins; GSDK routes USART0 to PC01/PC02 on the BRD4187C; **unverified** on a unit) | USART0 to the WSTK VCOM, TX PA08, RX PA09, VCOM enable PB00; logs and the NCP's ZRHP link at 115 200 (the board controller's VCOM rate; 460 800 and 921 600 fail) |USART0 to the J-Link OB VCOM, TX PA05, RX PA06 (RTS PA08 / CTS PA09 unused); logs at 115 200 |
 | reset / boot | RESET_N (pin 36) open-drain from S3 GPIO6 (hub profile `S3_MG24_DEV`) and the J-Link; no boot-entry line (Gecko via `SYS_RESET` mode 1 once installed) | ESP32 GPIO15 → RESET (active low); GPIO12 high during reset → stock Gecko Bootloader v2.04.02 (probed through the ESP32; the MG24 pin of that line is unknown) | WSTK J-Link (hwlab). GSDK `bootloader-uart-xmodem` (brd4187c); BTN0 (PB01) held at reset enters it |J-Link OB (hwlab). GSDK `bootloader-uart-xmodem` (brd2703a); BTN0 (PB02) held at reset enters it |
 | debug | SWDIO PA02, SWCLK PA01, SWO PA03 (never claimed) | SWD pads unknown | WSTK J-Link OB, AEM current measurement |J-Link OB; no current monitor |
-| other | 32.768 kHz LFXO, PCB antenna, no LED/button | no MG24 LED/button documented; RF path and LFXO unknown; stock PA configuration highest PA, 3300 mV, 10 µs (GSDK defaults); our default +10 dBm | LED0 PB02, LED1 PB04, BTN0 PB01, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna |LED0 PA04, LED1 PA07, BTN0 PB02, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna; mikroBUS, Qwiic |
+| other | 32.768 kHz LFXO, PCB antenna, no LED/button | no MG24 LED/button documented; RF path and LFXO unknown; stock PA configuration highest PA, 3300 mV, 10 µs (GSDK defaults); our default +8 dBm | LED0 PB02, LED1 PB04, BTN0 PB01, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna |LED0 PA04, LED1 PA07, BTN0 PB02, BTN1 PB03; 32.768 kHz LFXO; on-board 2.4 GHz antenna; mikroBUS, Qwiic |
 
 A valid module calibration (`DEVINFO.MODXOCAL`) or a programmed
 `MFG_CTUNE` token always wins over the board default (GSDK's order); the
@@ -1406,7 +1406,7 @@ ESP32):
 | GBL | v3 header `0x0300_0000`, type 0; HEADER, APPLICATION, one ERASEPROG at `0x0800_6000`, END | the same records in the same order, plus the ZRHP METADATA record (a tag the GBL parser skips); `efr32_gbl::write` reproduces the stock file byte for byte from its records (CI) |
 | application | `ApplicationProperties_t` v1.2 at `0x0803_C148`, type ZIGBEE, signature NONE, version 1, product ID zero | v1.2, type ZIGBEE, signature NONE, version `0x0001_0000`, zigbee-rs product ID |
 | PHY | GSDK 4.5.0 38.4 MHz 802.15.4 configuration, byte for byte | the same (`hfxo-38m4hz`) with RAIL's per-channel words |
-| PA | `2P4GIG_HIGHEST`, 3300 mV, 10 µs ramp; power set by the EZSP host | 20 dBm PA table of the BRD4187A; +10 dBm default, `NWK_SET_TX_POWER` −24…+20 dBm ([Transmit power](#transmit-power-nwk_set_tx_power)) |
+| PA | `2P4GIG_HIGHEST`, 3300 mV, 10 µs ramp; power set by the EZSP host | 20 dBm PA table of the BRD4187A; +8 dBm default, `NWK_SET_TX_POWER` −24…+20 dBm ([Transmit power](#transmit-power-nwk_set_tx_power)) |
 | NV | NVM3 at `0x0817_6000..0x0817_E000` | journals at `0x0815_8000..0x0818_0000`: the first boot finds NVM3 page headers (or no valid security record) and erases the whole window |
 | IEEE | EZSP EUI-64 `B0E8E8FFFE5D4D03` on the probed unit | `MFG_CUSTOM_EUI_64` if programmed, else DEVINFO: the same IEEE as stock either way |
 | CTUNE | `MODXOCAL` → `MFG_CTUNE` → 100 | the same order; value and source logged at boot |
@@ -1606,9 +1606,11 @@ bit 18).
   −24…+20 dBm on the Dongle-M and BRD4187A, −30…+10 dBm on the EK2703A
   and RF-BM-MG24B1. The cap is the fitted PA (`board::PA_MAX_DBM`); the NCP
   applies no regulatory limit.
-- **Default.** Until the host sets a power, the NCP uses +10 dBm on the
-  Dongle-M and 0 dBm on the other boards (`TX_POWER_DBM`). The setting is
-  volatile: the host replays it after an NCP reset, as on the ESP32 NCPs.
+- **Default.** Until the host sets a power, the NCP uses +8 dBm on the
+  Dongle-M (the 7.9 dBm entry, an exact step) and 0 dBm on the other boards
+  (`TX_POWER_DBM`). The Dongle-M value is a user decision; see the EU limits
+  below. The setting is volatile: the host replays it after an NCP reset,
+  as on the ESP32 NCPs.
 
 **EU limits (ETSI EN 300 328).** For 802.15.4 the binding EU limit is
 the power spectral density (PSD) limit, not the 20 dBm (100 mW) EIRP limit
@@ -1629,9 +1631,12 @@ simulated chip stream; we have not measured it on these radios. So:
   Max's antenna is about 5 dBi (SONOFF does not publish the gain, and we
   have not measured it). That gives about +6.5 dBm conducted, or +8 dBm
   with the half-power assumption.
-- **The Dongle-M default.** Its default of +10 dBm is therefore above the
-  EU PSD limit with that antenna: about 15 dBm EIRP, or roughly
-  13.5 dBm/MHz.
+- **The Dongle-M default.** The default is +8 dBm by user decision. By
+  this estimate it is about 1.4 dB over the EU PSD limit with a 5 dBi
+  antenna: about 13 dBm EIRP, roughly 11.4 dBm/MHz. +6 dBm is the
+  compliant setting by the same estimate. The user can lower or raise the
+  power through `NWK_SET_TX_POWER` (the hub's TX-power setting). Until NCP
+  0.1.3 the default was +10 dBm, about 3.4 dB over the estimate.
 - **Responsibility.** The NCP applies no regional limit (the cap is the
   fitted PA). The user, or a host acting for them, is responsible for the
   regional limit. Only a PSD measurement of the product with its antenna

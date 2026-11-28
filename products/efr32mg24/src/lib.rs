@@ -102,22 +102,24 @@ pub const PRODUCT_NAME: &str = "zigbee-rs-ncp";
 /// `NWK_SET_TX_POWER` (the NCP: [`platform::Mg24Platform`]; volatile, the
 /// host replays it after a reset).
 ///
-/// - Dongle-M: +10 dBm on the 20 dBm PA (`TX_POWER_RANGE_DBM` `(-24,
-///   20)`), GSDK's `SL_RAIL_UTIL_PA_POWER_DECI_DBM` default; the stock
-///   image's PA configuration is GSDK's default one (highest PA, 3300 mV,
-///   10 us ramp), its runtime power comes from the EZSP host. Certification
-///   limit of the product unknown. In the EU the binding limit for
-///   802.15.4 is EN 300 328's 10 dBm/MHz EIRP power spectral density: about
-///   11.5 dBm EIRP for the 2 Mchip/s O-QPSK spectrum (about +6.5 dBm
-///   conducted with the ~5 dBi antenna; the PSD scales with antenna gain).
-///   This +10 dBm default is above that; the regional limit is the user's
-///   responsibility (platform guide, "Transmit power").
+/// - Dongle-M: +8 dBm on the 20 dBm PA (`TX_POWER_RANGE_DBM` `(-24,
+///   20)`; the 7.9 dBm table entry, an exact step), by user decision. The
+///   stock image's PA configuration is GSDK's default one (highest PA,
+///   3300 mV, 10 us ramp), its runtime power comes from the EZSP host.
+///   Certification limit of the product unknown. In the EU the binding
+///   limit for 802.15.4 is EN 300 328's 10 dBm/MHz EIRP power spectral
+///   density: about 11.5 dBm EIRP for the 2 Mchip/s O-QPSK spectrum (about
+///   +6.5 dBm conducted with the ~5 dBi antenna; the PSD scales with
+///   antenna gain), so +8 dBm is about 1.4 dB over that estimate and +6 dBm
+///   would comply by it. The host can lower or raise the power
+///   (`NWK_SET_TX_POWER`); the regional limit is the user's responsibility
+///   (platform guide, "Transmit power").
 /// - Every other board: 0 dBm. At 39 MHz the 20 dBm PA is
 ///   hardware-verified on the BRD4187A and the 10 dBm PA (`(-30, 10)`) on
 ///   the EK2703A; a higher default waits for each board's RF path and TX
 ///   power limit (platform guide, hardware gates).
 #[cfg(feature = "sonoff-dongle-m")]
-pub const TX_POWER_DBM: i8 = 10;
+pub const TX_POWER_DBM: i8 = 8;
 #[cfg(not(feature = "sonoff-dongle-m"))]
 pub const TX_POWER_DBM: i8 = 0;
 /// Security-journal role tag of the coordinator NCP (same as the ESP and
@@ -163,5 +165,19 @@ mod tests {
             )
         };
         const { assert!(TX_POWER_DBM <= board::PA_MAX_DBM) };
+        // The default is a PA table step, so a host reading it back and
+        // setting it again changes nothing.
+        assert_eq!(
+            efr32s2_hal::radio::tx_power_step_dbm(TX_POWER_DBM),
+            TX_POWER_DBM
+        );
+    }
+
+    /// Dongle-M: +8 dBm by user decision (about 1.4 dB over the EU PSD
+    /// estimate with a 5 dBi antenna; platform guide, "Transmit power").
+    #[test]
+    #[cfg(feature = "sonoff-dongle-m")]
+    fn dongle_m_default_is_8_dbm() {
+        assert_eq!(TX_POWER_DBM, 8);
     }
 }
