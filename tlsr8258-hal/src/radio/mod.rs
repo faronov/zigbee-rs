@@ -146,40 +146,53 @@ impl AckPendingTable {
     /// ordered search.
     #[cfg(test)]
     fn data_request_pending(&self, psdu: &[u8]) -> bool {
-        // SAFETY: every read below is bounds-checked against `psdu.len()`.
-        unsafe { self.data_request_pending_raw(psdu.as_ptr(), psdu.len()) }
+        self.poll_ack(psdu) == Some(true)
     }
 
-    /// [`Self::data_request_pending`] over a raw PSDU.
+    /// The ACK path's decision for `psdu`: `None` when it is not a Data
+    /// Request the table can answer, else its Frame Pending bit.
+    #[cfg(test)]
+    fn poll_ack(&self, psdu: &[u8]) -> Option<bool> {
+        // SAFETY: every read below is bounds-checked against `psdu.len()`.
+        unsafe { self.poll_ack_raw(psdu.as_ptr(), psdu.len()) }
+    }
+
+    /// [`Self::poll_ack`] over a raw PSDU.
     ///
     /// # Safety
     ///
     /// `psdu` must be valid for reads of `len` bytes.
     #[cfg(test)]
-    unsafe fn data_request_pending_raw(&self, psdu: *const u8, len: usize) -> bool {
+    unsafe fn poll_ack_raw(&self, psdu: *const u8, len: usize) -> Option<bool> {
         if len < 8 {
-            return false;
+            return None;
         }
         let frame_control = unsafe { *psdu as u16 | (*psdu.add(1) as u16) << 8 };
         let destination_pan = unsafe { *psdu.add(3) as u16 | (*psdu.add(4) as u16) << 8 };
-        unsafe { self.data_request_pending_parsed(psdu, len, frame_control, destination_pan) }
+        unsafe { self.poll_ack_parsed(psdu, len, frame_control, destination_pan) }
     }
 
     /// The Data Request match once the frame control and destination PAN
     /// are known, which the ACK path has already read. No slice bounds
     /// checks (and their out-of-line panic calls) end up in `.ram_code`.
     ///
+    /// `None`: not a Data Request this table can answer (its ACK carries
+    /// Frame Pending = 0 and needs no record). `Some(pending)`: a poll and
+    /// the Frame Pending bit of its ACK. `Some(false)` is recorded with the
+    /// queued frame ([`ReceivedFrame::acked_without_frame_pending`]); arming
+    /// its source makes the child's next poll `Some(true)`.
+    ///
     /// # Safety
     ///
     /// `psdu` must be valid for reads of `len` bytes.
     #[inline(always)]
-    unsafe fn data_request_pending_parsed(
+    unsafe fn poll_ack_parsed(
         &self,
         psdu: *const u8,
         len: usize,
         frame_control: u16,
         destination_pan: u16,
-    ) -> bool {
+    ) -> Option<bool> {
         let byte = |index: usize| unsafe { *psdu.add(index) };
         let word = |index: usize| byte(index) as u16 | (byte(index + 1) as u16) << 8;
         // An unsecured, intra-PAN (PAN ID compression) MAC command with ACK
@@ -188,7 +201,7 @@ impl AckPendingTable {
         // the destination PAN is the source PAN to match; entries never hold
         // PAN 0xFFFF.
         if frame_control & 0x886F != 0x8863 {
-            return false;
+            return None;
         }
         let offset = if frame_control & 0x0400 == 0 { 7 } else { 13 };
         let source_pan = destination_pan;
@@ -197,7 +210,7 @@ impl AckPendingTable {
         if len != offset + address_len + 1
             || byte(offset + address_len) != frame::CMD_ID_DATA_REQUEST
         {
-            return false;
+            return None;
         }
         let entries = self.entries.as_ptr();
         // `set` keeps `len <= MAX_ACK_PENDING_ADDRESSES`.
@@ -220,11 +233,11 @@ impl AckPendingTable {
                 }
             };
             if hit {
-                return true;
+                return Some(true);
             }
             index += 1;
         }
-        false
+        Some(false)
     }
 
     #[cfg(test)]
@@ -450,10 +463,17 @@ fn dma_buffer_layout_valid(addresses: [u32; 4]) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub struct ReceivedFrame {
     data: [u8; MAX_MAC_FRAME_LEN],
+    /// Length (bits 6..0) and [`Self::acked_without_frame_pending`] (bit 7,
+    /// [`POLL_ACKED_WITHOUT_FRAME_PENDING`]): no extra byte per queue slot.
     len: u8,
     pub lqi: u8,
     pub rssi: i8,
 }
+
+/// Bit 7 of [`ReceivedFrame`]'s length byte (frames are at most
+/// [`MAX_MAC_FRAME_LEN`] = 125 bytes).
+const POLL_ACKED_WITHOUT_FRAME_PENDING: u8 = 0x80;
+const _: () = assert!(MAX_MAC_FRAME_LEN < POLL_ACKED_WITHOUT_FRAME_PENDING as usize);
 
 impl ReceivedFrame {
     /// Empty frame used to initialize the bounded receive queue's storage.
@@ -486,15 +506,32 @@ impl ReceivedFrame {
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len as usize]
+        &self.data[..self.len()]
     }
 
     pub fn len(&self) -> usize {
-        self.len as usize
+        (self.len & !POLL_ACKED_WITHOUT_FRAME_PENDING) as usize
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
+    }
+
+    /// The frame is a Data Request that the interrupt ACK path matched
+    /// against the Frame Pending table and acknowledged with Frame Pending =
+    /// 0: the child turned its receiver off, so a frame queued after that
+    /// ACK must wait for its next poll. The decision is recorded with the
+    /// frame when the ACK is sent, never looked up later, once a parent has
+    /// enabled the record ([`Radio::record_poll_acks`]).
+    pub fn acked_without_frame_pending(&self) -> bool {
+        self.len & POLL_ACKED_WITHOUT_FRAME_PENDING != 0
+    }
+
+    /// OR `poll_flag` ([`POLL_ACKED_WITHOUT_FRAME_PENDING`] or 0) into the
+    /// length byte: the ACK path's record for this frame.
+    #[cfg(any(target_arch = "tc32", test))]
+    fn add_poll_flag(&mut self, poll_flag: u8) {
+        self.len |= poll_flag;
     }
 }
 
@@ -1006,6 +1043,17 @@ impl Radio {
         hw::clear_ack_frame_pending();
     }
 
+    /// Record, with every queued Data Request the interrupt ACK path
+    /// answered with Frame Pending = 0, that decision
+    /// ([`ReceivedFrame::acked_without_frame_pending`]). A parent MAC turns
+    /// it on once, before it receives; it survives [`Radio::init`]. An end
+    /// device never calls this, which lets the Data Request check compile out
+    /// of its RAM-resident ACK path.
+    #[cfg(target_arch = "tc32")]
+    pub fn record_poll_acks(&mut self) {
+        hw::record_poll_acks();
+    }
+
     #[cfg(target_arch = "tc32")]
     pub fn transmit(&mut self, frame: &[u8]) -> TxOutcome {
         hw::send_mac_frame(frame)
@@ -1195,6 +1243,92 @@ mod tests {
         ];
         assert!(data_request_source(&explicit).is_some());
         assert!(!table.data_request_pending(&explicit));
+        // Its ACK is always FP = 0 and it is never flagged as a poll the
+        // table answered: arming cannot turn its next ACK into FP = 1, so a
+        // flag would hold the child's frame for good.
+        assert_eq!(table.poll_ack(&explicit), None);
+    }
+
+    /// The ACK path's decision for each Data Request is recorded with that
+    /// frame: the secured-rejoin sequence of #23 on a TLSR8258 parent.
+    #[test]
+    fn ack_path_reports_each_polls_frame_pending_decision() {
+        let mut table = AckPendingTable::new();
+        let child = AckPendingAddress::Short {
+            pan_id: 0x1A62,
+            address: 0x12D2,
+        };
+        let stale = frame::data_request_associated_short(0x10, 0x1A62, 0x0000, 0x12D2);
+        // Polled before the Rejoin Response was queued: FP = 0, recorded.
+        assert_eq!(table.poll_ack(&stale), Some(false));
+        table.set(child, true).unwrap();
+        let next = frame::data_request_associated_short(0x11, 0x1A62, 0x0000, 0x12D2);
+        assert_eq!(table.poll_ack(&next), Some(true));
+        // Another child's poll stays FP = 0; non-polls are not decisions.
+        let other = frame::data_request_associated_short(0x12, 0x1A62, 0x0000, 0x3344);
+        assert_eq!(table.poll_ack(&other), Some(false));
+        assert_eq!(
+            table.poll_ack(&frame::data_frame_short(0x13, 0x1A62, 0x0000, 0x12D2)),
+            None
+        );
+        let mut secured = next;
+        secured[0] |= 1 << 3;
+        assert_eq!(table.poll_ack(&secured), None);
+        // Extended-source poll (association / rejoin candidate) unarmed.
+        let candidate = frame::data_request_short(0x14, 0x1A62, 0x0000, [7; 8]);
+        assert_eq!(table.poll_ack(&candidate), Some(false));
+        // Disarmed after delivery: the next poll is FP = 0 again.
+        table.set(child, false).unwrap();
+        assert_eq!(table.poll_ack(&next), Some(false));
+    }
+
+    #[test]
+    fn the_poll_flag_rides_in_the_length_byte_through_the_queue() {
+        let poll = frame::data_request_associated_short(0x10, 0x1A62, 0x0000, 0x12D2);
+        let mut flagged = ReceivedFrame::new(&poll, 0xF0, -40);
+        assert!(!flagged.acked_without_frame_pending());
+        flagged.add_poll_flag(POLL_ACKED_WITHOUT_FRAME_PENDING);
+        assert!(flagged.acked_without_frame_pending());
+        assert_eq!(flagged.as_slice(), poll);
+        assert_eq!(flagged.len(), poll.len());
+        let mut longest = ReceivedFrame::new(&[0x41; MAX_MAC_FRAME_LEN], 0, 0);
+        longest.add_poll_flag(POLL_ACKED_WITHOUT_FRAME_PENDING);
+        assert_eq!(longest.len(), MAX_MAC_FRAME_LEN);
+        assert!(!longest.is_empty());
+
+        // Queued between other frames, evicted and reused slots: each frame
+        // keeps its own flag (nothing per child, nothing per slot).
+        let mut queue = RxQueue::new();
+        let next = ReceivedFrame::new(
+            &frame::data_request_associated_short(0x11, 0x1A62, 0x0000, 0x12D2),
+            0xF0,
+            -40,
+        );
+        for _ in 0..IRQ_RX_QUEUE_CAPACITY / 2 {
+            assert_eq!(queue.push(flagged, RxPriority::Local), RxQueuePush::Queued);
+            assert_eq!(queue.push(next, RxPriority::Local), RxQueuePush::Queued);
+        }
+        for _ in 0..IRQ_RX_QUEUE_CAPACITY / 2 {
+            let first = queue.pop().unwrap();
+            assert!(first.acked_without_frame_pending() && first.as_slice()[2] == 0x10);
+            let second = queue.pop().unwrap();
+            assert!(!second.acked_without_frame_pending() && second.as_slice()[2] == 0x11);
+        }
+        // A full queue evicts a broadcast, never a poll's decision.
+        let broadcast = ReceivedFrame::new(&frame::data_frame_short(1, 0x1A62, 0xFFFF, 1), 0, 0);
+        assert_eq!(
+            queue.push(broadcast, RxPriority::Broadcast),
+            RxQueuePush::Queued
+        );
+        for _ in 1..IRQ_RX_QUEUE_CAPACITY {
+            queue.push(next, RxPriority::Local);
+        }
+        assert_eq!(queue.push(flagged, RxPriority::Local), RxQueuePush::Evicted);
+        for _ in 1..IRQ_RX_QUEUE_CAPACITY {
+            assert!(!queue.pop().unwrap().acked_without_frame_pending());
+        }
+        assert!(queue.pop().unwrap().acked_without_frame_pending());
+        assert!(queue.pop().is_none());
     }
 
     #[test]
@@ -1918,6 +2052,9 @@ mod hw {
     static mut SOFTWARE_ACK_COUNT: u32 = 0;
     static mut SOFTWARE_ACK_TIMEOUT_COUNT: u32 = 0;
     static mut SOFTWARE_ACK_WITHHELD_COUNT: u32 = 0;
+    /// Set once by a parent ([`record_poll_acks`]); never written in an end
+    /// device image, so there the poll check below folds away.
+    static mut POLL_ACK_RECORD: bool = false;
     static mut ACTIVE_RX_INDEX: u8 = 0;
     static mut RX_ARMED_AFTER_TX: u8 = 0;
     static mut RX_ON_WHEN_IDLE: u8 = 0;
@@ -2110,6 +2247,20 @@ mod hw {
             core::ptr::write_volatile(core::ptr::addr_of_mut!(ACK_PENDING_ACTIVE), next as u8);
         }
         Ok(())
+    }
+
+    pub fn record_poll_acks() {
+        // SAFETY: a single byte written once, before the parent receives;
+        // the ACK path only reads it.
+        unsafe { core::ptr::addr_of_mut!(POLL_ACK_RECORD).write(true) };
+    }
+
+    /// Plain (non-volatile) read: an image that never calls
+    /// [`record_poll_acks`] keeps the initial `false`, so the compiler drops
+    /// the poll check from the ACK path.
+    #[inline(always)]
+    fn poll_ack_record() -> bool {
+        unsafe { core::ptr::addr_of!(POLL_ACK_RECORD).read() }
     }
 
     pub fn clear_ack_frame_pending() {
@@ -2757,13 +2908,21 @@ mod hw {
         phy::set_tx_mode();
         set_rx_armed(false);
         prepare_rx_dma(next_rx_ptr);
-        if !maybe_send_software_ack(completed_rx_ptr, rx_complete_ticks) {
+        let ack = maybe_send_software_ack(completed_rx_ptr, rx_complete_ticks);
+        if ack == AckPath::NotSent {
             rearm_rx(next_rx_ptr);
         }
 
         let completed =
             unsafe { core::slice::from_raw_parts(completed_rx_ptr.cast_const(), DMA_BUF_LEN) };
-        let outcome = decode_received_frame(completed);
+        // The poll's ACK decision travels with its frame through the queue
+        // (parents only: in an end device the flag folds to 0).
+        let poll_flag = if poll_ack_record() && ack == AckPath::PollWithoutPending {
+            super::POLL_ACKED_WITHOUT_FRAME_PENDING
+        } else {
+            0
+        };
+        let outcome = decode_received_frame(completed, poll_flag);
         #[cfg(feature = "lab-radio-log")]
         lab_radio_log::record_rx(
             completed,
@@ -3345,22 +3504,35 @@ mod hw {
         }
     }
 
+    /// What [`maybe_send_software_ack`] did with a completed frame.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AckPath {
+        /// No ACK; the caller re-arms RX.
+        NotSent,
+        /// The ACK path ran and restored RX (even when TX timed out).
+        Sent,
+        /// As `Sent`, for a Data Request answered with Frame Pending = 0
+        /// while a parent asked for that record ([`record_poll_acks`]).
+        PollWithoutPending,
+    }
+
+    /// Send the Imm-Ack for the completed frame at `rx_ptr` if it is due.
     #[inline(never)]
     #[unsafe(link_section = ".ram_code")]
-    fn maybe_send_software_ack(rx_ptr: *mut u8, rx_complete_ticks: u32) -> bool {
+    fn maybe_send_software_ack(rx_ptr: *mut u8, rx_complete_ticks: u32) -> AckPath {
         let filter = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ACK_FILTER)) };
         if filter.enabled == 0 {
-            return false;
+            return AckPath::NotSent;
         }
 
         let total_len = unsafe { core::ptr::read_volatile(rx_ptr) } as usize;
         let payload_len = unsafe { core::ptr::read_volatile(rx_ptr.add(4)) } as usize;
         if total_len == 0 || total_len > 136 || total_len != payload_len + 9 || payload_len < 7 {
-            return false;
+            return AckPath::NotSent;
         }
         let status = unsafe { core::ptr::read_volatile(rx_ptr.add(total_len + 3)) };
         if status & 0x51 != 0x10 {
-            return false;
+            return AckPath::NotSent;
         }
 
         let frame_control =
@@ -3370,7 +3542,7 @@ mod hw {
                 }],
             );
         if frame_control & (1 << 5) == 0 {
-            return false;
+            return AckPath::NotSent;
         }
 
         let destination_pan =
@@ -3380,7 +3552,7 @@ mod hw {
                 }],
             );
         if destination_pan != filter.pan_id && destination_pan != 0xFFFF {
-            return false;
+            return AckPath::NotSent;
         }
 
         let destination_mode = (frame_control >> 10) & 0x03;
@@ -3405,7 +3577,7 @@ mod hw {
             _ => false,
         };
         if !addressed_to_us {
-            return false;
+            return AckPath::NotSent;
         }
         // An ACK-requested frame addressed to us classifies as
         // `RxPriority::Local`. If the receive queue is already full of
@@ -3422,11 +3594,11 @@ mod hw {
                 let ptr = core::ptr::addr_of_mut!(SOFTWARE_ACK_WITHHELD_COUNT);
                 core::ptr::write_volatile(ptr, core::ptr::read_volatile(ptr).wrapping_add(1));
             }
-            return false;
+            return AckPath::NotSent;
         }
 
         let sequence = unsafe { core::ptr::read_volatile(rx_ptr.add(7)) };
-        let frame_pending = if payload_len >= 2 {
+        let poll: Option<bool> = if payload_len >= 2 {
             let psdu = unsafe {
                 core::slice::from_raw_parts(rx_ptr.add(5), payload_len.saturating_sub(2))
             };
@@ -3443,17 +3615,12 @@ mod hw {
                     .add(active)
             };
             unsafe {
-                table.data_request_pending_parsed(
-                    psdu.as_ptr(),
-                    psdu.len(),
-                    frame_control,
-                    destination_pan,
-                )
+                table.poll_ack_parsed(psdu.as_ptr(), psdu.len(), frame_control, destination_pan)
             }
         } else {
-            false
+            None
         };
-        let sent = send_ack_fast(sequence, frame_pending, rx_complete_ticks);
+        let sent = send_ack_fast(sequence, poll == Some(true), rx_complete_ticks);
         #[cfg(feature = "lab-radio-log")]
         lab_radio_log::note_ack(if sent {
             lab_radio_log::ACK_SENT
@@ -3479,8 +3646,15 @@ mod hw {
             }
         }
         // The next DMA buffer was armed before filtering; send_ack_fast()
-        // restores RX even when TX completion times out.
-        true
+        // restores RX even when TX completion times out. A poll answered
+        // with Frame Pending = 0 is reported for its queued frame; as on the
+        // core's software-ACK path this is the decision, whether or not the
+        // ACK got on air (the child repeats an unacknowledged poll).
+        if poll_ack_record() && poll == Some(false) {
+            AckPath::PollWithoutPending
+        } else {
+            AckPath::Sent
+        }
     }
 
     #[inline(never)]
@@ -3521,7 +3695,9 @@ mod hw {
         sent
     }
 
-    fn decode_received_frame(buf: &[u8]) -> RawRxOutcome {
+    /// `poll_flag` is ORed into the frame's length byte
+    /// ([`ReceivedFrame::acked_without_frame_pending`]).
+    fn decode_received_frame(buf: &[u8], poll_flag: u8) -> RawRxOutcome {
         if !frame::packet_length_ok(buf) {
             increment_counter(core::ptr::addr_of_mut!(RX_INVALID_LENGTH_COUNT));
             return RawRxOutcome::InvalidLength;
@@ -3543,7 +3719,9 @@ mod hw {
         };
         let frame_len = dma_len - 2;
         increment_counter(core::ptr::addr_of_mut!(RX_VALID_FRAME_COUNT));
-        RawRxOutcome::Frame(ReceivedFrame::new(&psdu[..frame_len], lqi, rssi))
+        let mut frame = ReceivedFrame::new(&psdu[..frame_len], lqi, rssi);
+        frame.add_poll_flag(poll_flag);
+        RawRxOutcome::Frame(frame)
     }
 
     fn classify_and_report(received: &ReceivedFrame, on_frame: &mut impl FnMut(RxOutcome)) {

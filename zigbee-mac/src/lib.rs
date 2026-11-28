@@ -25,7 +25,13 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-#[cfg(any(feature = "esp-parent", test))]
+#[cfg(any(
+    feature = "esp-parent",
+    feature = "cc26x2",
+    feature = "nrf-isr-phy",
+    feature = "bl702",
+    test
+))]
 pub mod ack_pending;
 #[cfg(any(test, feature = "fem"))]
 pub mod fem;

@@ -68,9 +68,15 @@ pub const ACK_WAIT_US: u32 = 864;
 /// CCA energy threshold in dBm.
 pub const CCA_THRESHOLD_DBM: i8 = -75;
 
-/// 8-byte entry header + length byte + frame + RSSI + correlation/CRC.
-const ENTRY_DATA: usize = 1 + MAX_FRAME + 2;
+/// 8-byte entry header + length byte + frame + RSSI + correlation/CRC +
+/// source-matching index.
+const ENTRY_DATA: usize = 1 + MAX_FRAME + APPENDED;
 const ENTRY_SIZE: usize = (8 + ENTRY_DATA + 3) & !3;
+/// Status bytes the RF core appends to every stored frame (`rxConfig`):
+/// RSSI, correlation/CRC, source-matching index.
+const APPENDED: usize = 3;
+/// Appended source index of a frame whose source matched no enabled entry.
+const SOURCE_NO_MATCH: u8 = 0xFF;
 
 /// Ownership token for the RF core.
 pub struct RadioToken(pub(crate) ());
@@ -144,6 +150,20 @@ pub struct RxInfo {
     /// [`Radio::receive_any`] with [`Radio::set_keep_crc_errors`] returns
     /// failed frames.
     pub crc_ok: bool,
+    /// The RF core auto-acknowledged the frame: the address filter was on
+    /// (auto-ACK enabled) when it was dequeued and it requests an ACK from
+    /// a unicast destination (TRM SWCU185 25.5.4.1.3).
+    pub auto_acked: bool,
+    /// The RF core's source matching found the frame's source in an enabled
+    /// Frame Pending entry (the appended source index is not `0xFF`).
+    ///
+    /// Auto-pend sets the ACK's Frame Pending bit from the same match
+    /// (`srcPendEn` of the matched entry, Data Requests only, default 0),
+    /// and [`Radio::set_frame_pending`] keeps every enabled entry's pending
+    /// bit set. So the auto-ACK to a Data Request carried Frame Pending
+    /// exactly when this is true: the RF core's own per-frame record, not
+    /// a later table lookup.
+    pub source_matched: bool,
 }
 
 /// Board RF front-end switch (`rfDriverCallbackAntennaSwitching` of the TI
@@ -239,8 +259,9 @@ struct ExtTable {
 
 const _: () = assert!(FP_TABLE_LEN <= 32);
 
-/// Everything the RF core reads or writes. One static instance; only the
-/// [`Radio`] created from the unique [`RadioToken`] touches it.
+/// Everything the RF core reads or writes except the RX data entries
+/// ([`RX_DATA_ENTRIES`]). One static instance; only the [`Radio`] created
+/// from the unique [`RadioToken`] touches it.
 #[repr(C, align(4))]
 struct RfMem {
     start_rat: CmdSyncRat,
@@ -251,7 +272,6 @@ struct RfMem {
     rx: CmdIeeeRx,
     rx_output: IeeeRxOutput,
     queue: DataQueue,
-    entries: [Entry; RX_ENTRIES],
     short_fp: ShortTable,
     ext_fp: ExtTable,
     csma: CmdIeeeCsma,
@@ -290,7 +310,6 @@ static mut RF_MEM: RfMem = RfMem {
         curr_entry: 0,
         last_entry: 0,
     },
-    entries: [const { Entry([0; ENTRY_SIZE]) }; RX_ENTRIES],
     short_fp: ShortTable {
         enable: 0,
         pending: 0,
@@ -321,6 +340,18 @@ static mut RF_MEM: RfMem = RfMem {
     },
     tx_buf: [0; 128],
 };
+
+/// The RX data entries the RF core writes received frames into.
+///
+/// Zero-initialized and kept out of [`RF_MEM`]: that static has non-zero
+/// command headers, so it is `.data` and every byte of it, zeros included,
+/// is also stored in flash. Here the entries are `.bss` (the CC2652P router
+/// image has no flash to spare). Only the [`Radio`] created from the unique
+/// [`RadioToken`] touches them.
+#[repr(C, align(4))]
+struct RxEntries([Entry; RX_ENTRIES]);
+
+static mut RX_DATA_ENTRIES: RxEntries = RxEntries([const { Entry([0; ENTRY_SIZE]) }; RX_ENTRIES]);
 
 fn addr<T>(p: *const T) -> u32 {
     p as usize as u32
@@ -409,17 +440,25 @@ impl Radio {
         unsafe { &mut *self.mem }
     }
 
+    fn entries(&mut self) -> &mut [Entry; RX_ENTRIES] {
+        // SAFETY: as for `m`: `RX_DATA_ENTRIES` belongs to the unique radio;
+        // the RF core writes entry status and data, which are read volatile.
+        unsafe { &mut (*addr_of_mut!(RX_DATA_ENTRIES)).0 }
+    }
+
     fn init_queue(&mut self) {
-        let m = self.m();
+        let entries = self.entries();
         for i in 0..RX_ENTRIES {
-            let next = addr(m.entries[(i + 1) % RX_ENTRIES].0.as_ptr());
-            let e = &mut m.entries[i].0;
+            let next = addr(entries[(i + 1) % RX_ENTRIES].0.as_ptr());
+            let e = &mut entries[i].0;
             e[0..4].copy_from_slice(&next.to_le_bytes());
             e[4] = DATA_ENTRY_PENDING;
             e[5] = DATA_ENTRY_CONFIG_GEN_LEN1;
             e[6..8].copy_from_slice(&(ENTRY_DATA as u16).to_le_bytes());
         }
-        m.queue.curr_entry = addr(m.entries[0].0.as_ptr());
+        let first = addr(entries[0].0.as_ptr());
+        let m = self.m();
+        m.queue.curr_entry = first;
         m.queue.last_entry = 0;
         self.read_index = 0;
     }
@@ -549,11 +588,7 @@ impl Radio {
     fn start_rx(&mut self) -> Result<(), RadioError> {
         let channel = self.channel;
         let filter = self.filter;
-        let flush_crc = if self.keep_crc_errors {
-            0
-        } else {
-            rx_config::AUTO_FLUSH_CRC
-        };
+        let rx_config = receive_config(self.keep_crc_errors);
         let m = self.m();
         let rx = &mut m.rx;
         rx.status = status::IDLE;
@@ -561,10 +596,7 @@ impl Radio {
         rx.start_trigger = TRIG_NOW;
         rx.condition = COND_NEVER;
         rx.channel = channel;
-        rx.rx_config = flush_crc
-            | rx_config::AUTO_FLUSH_IGN
-            | rx_config::APPEND_RSSI
-            | rx_config::APPEND_CORR_CRC;
+        rx.rx_config = rx_config;
         rx.rx_queue = addr(addr_of!(m.queue));
         rx.output = addr(addr_of!(m.rx_output));
         rx.frame_types = ft::BEACON | ft::DATA | ft::MAC_CMD;
@@ -705,37 +737,25 @@ impl Radio {
         }
         for _ in 0..RX_ENTRIES {
             let index = self.read_index;
-            let m = self.m();
-            let entry = m.entries[index].0.as_mut_ptr();
+            let entry = self.entries()[index].0.as_mut_ptr();
             let state = unsafe { read_volatile(entry.add(4)) };
             match state {
                 DATA_ENTRY_FINISHED => {
                     let data = unsafe { entry.add(8) };
                     let n = usize::from(unsafe { read_volatile(data) });
-                    let result = if (2..=MAX_FRAME + 2).contains(&n) {
-                        let len = n - 2;
-                        for (i, b) in out.iter_mut().take(len).enumerate() {
-                            *b = unsafe { read_volatile(data.add(1 + i)) };
-                        }
-                        let rssi = unsafe { read_volatile(data.add(n - 1)) } as i8;
-                        let corr = unsafe { read_volatile(data.add(n)) };
-                        Some(RxInfo {
-                            len,
-                            rssi_dbm: rssi,
-                            correlation: corr & 0x3F,
-                            crc_ok: corr & 0x80 == 0,
-                        })
-                    } else {
-                        None
-                    };
+                    // SAFETY: `decode_element` reads only indices `1..=n`,
+                    // and `n` is checked against `ENTRY_DATA` there.
+                    let result = decode_element(n, |i| unsafe { read_volatile(data.add(i)) }, out);
                     unsafe { write_volatile(entry.add(4), DATA_ENTRY_PENDING) };
                     self.read_index = (index + 1) % RX_ENTRIES;
-                    if let Some(info) = result {
+                    if let Some(mut info) = result {
                         if !info.crc_ok {
                             self.stats.rx_crc_errors += 1;
                         } else {
                             self.stats.rx_frames += 1;
-                            if self.filter.is_some() && acked_unicast(&out[..info.len]) {
+                            info.auto_acked =
+                                self.filter.is_some() && acked_unicast(&out[..info.len]);
+                            if info.auto_acked {
                                 self.stats.rx_ack_requested += 1;
                             }
                         }
@@ -919,6 +939,12 @@ impl Radio {
 
     /// Arm (`pending`) or clear the Frame Pending bit the RF core's auto-ACK
     /// sends to a Data Request from `address`.
+    ///
+    /// An entry is enabled exactly while it is pending (`bEnable` and
+    /// `srcPend` always change together, and clearing disables the entry),
+    /// so a source match in the RX queue ([`RxInfo::source_matched`]) means
+    /// the ACK carried Frame Pending. Keep that invariant: an enabled entry
+    /// with its pending bit clear would make the match report a wrong ACK.
     pub fn set_frame_pending(&mut self, address: FpAddress, pending: bool) -> Result<(), FpError> {
         let running = self.is_rx_on();
         let m = self.m();
@@ -1036,6 +1062,51 @@ impl Radio {
     }
 }
 
+/// `rxConfig` of the background receiver: frames without PHY header or FCS,
+/// followed by the [`APPENDED`] bytes [`decode_element`] reads.
+const fn receive_config(keep_crc_errors: bool) -> u8 {
+    let flush_crc = if keep_crc_errors {
+        0
+    } else {
+        rx_config::AUTO_FLUSH_CRC
+    };
+    flush_crc
+        | rx_config::AUTO_FLUSH_IGN
+        | rx_config::APPEND_RSSI
+        | rx_config::APPEND_CORR_CRC
+        | rx_config::APPEND_SRC_IND
+}
+
+/// Decode one finished RX queue element whose length byte is `n`;
+/// `byte(i)` reads element byte `i` (`1..=n`). The RF core stores the frame
+/// (MHR + payload, no FCS) followed by the [`APPENDED`] status bytes
+/// configured in `rxConfig`: RSSI, correlation/CRC and the source-matching
+/// index (TRM SWCU185 25.5.3.1). `None` for a length that cannot hold them
+/// or a frame longer than [`MAX_FRAME`]. [`RxInfo::auto_acked`] is left
+/// false for the caller, which knows the address filter.
+fn decode_element(
+    n: usize,
+    byte: impl Fn(usize) -> u8,
+    out: &mut [u8; MAX_FRAME],
+) -> Option<RxInfo> {
+    if !(APPENDED..=MAX_FRAME + APPENDED).contains(&n) {
+        return None;
+    }
+    let len = n - APPENDED;
+    for (i, b) in out.iter_mut().take(len).enumerate() {
+        *b = byte(1 + i);
+    }
+    let corr = byte(len + 2);
+    Some(RxInfo {
+        len,
+        rssi_dbm: byte(len + 1) as i8,
+        correlation: corr & 0x3F,
+        crc_ok: corr & 0x80 == 0,
+        auto_acked: false,
+        source_matched: byte(len + 3) != SOURCE_NO_MATCH,
+    })
+}
+
 /// AR = 1 and a destination that is not the broadcast short address.
 fn acked_unicast(frame: &[u8]) -> bool {
     let [fc0, fc1, ..] = *frame else {
@@ -1071,8 +1142,88 @@ mod tests {
 
     #[test]
     fn entry_fits_the_largest_frame() {
-        const { assert!(ENTRY_SIZE >= 8 + 1 + MAX_FRAME + 2) };
+        const { assert!(ENTRY_SIZE >= 8 + 1 + MAX_FRAME + APPENDED) };
         const { assert!(ENTRY_SIZE.is_multiple_of(4)) };
+    }
+
+    /// An RX queue element as the RF core stores it with this `rxConfig`:
+    /// length byte, frame, RSSI, correlation/CRC, source-matching index.
+    fn element(frame: &[u8], rssi: i8, corr: u8, source_index: u8) -> ([u8; ENTRY_DATA], usize) {
+        let mut element = [0u8; ENTRY_DATA];
+        let n = frame.len() + APPENDED;
+        element[0] = n as u8;
+        element[1..=frame.len()].copy_from_slice(frame);
+        element[frame.len() + 1..=n].copy_from_slice(&[rssi as u8, corr, source_index]);
+        (element, n)
+    }
+
+    fn decode(frame: &[u8], rssi: i8, corr: u8, source_index: u8) -> (RxInfo, [u8; MAX_FRAME]) {
+        let (element, n) = element(frame, rssi, corr, source_index);
+        let mut out = [0u8; MAX_FRAME];
+        let info = decode_element(n, |i| element[i], &mut out).expect("valid element");
+        assert_eq!(&out[..info.len], frame);
+        (info, out)
+    }
+
+    /// The receiver appends the source-matching index, and the decoder
+    /// reports a match exactly when it is not 0xFF: the auto-pend decision
+    /// of that frame's ACK (every enabled entry is pending).
+    #[test]
+    fn decoder_reads_the_appended_source_match_of_each_frame() {
+        // Data Request 0x12D2 -> 0x0000 (PAN 0x1A62, PAN-ID compression, AR).
+        let poll = [0x63, 0x88, 0x42, 0x62, 0x1A, 0x00, 0x00, 0xD2, 0x12, 0x04];
+
+        // FP = 0 poll: nothing armed, no match.
+        let (info, _) = decode(&poll, -61, 0x2A, 0xFF);
+        assert_eq!(
+            info,
+            RxInfo {
+                len: poll.len(),
+                rssi_dbm: -61,
+                correlation: 0x2A,
+                crc_ok: true,
+                auto_acked: false,
+                source_matched: false,
+            }
+        );
+        // The response was armed in short entry 3 before the next poll.
+        let (info, _) = decode(&poll, -60, 0x2B, 3);
+        assert!(info.source_matched && info.crc_ok);
+        // Index 0 is a match too; a CRC failure keeps its own verdict.
+        let (info, _) = decode(&poll, -60, 0x80 | 0x10, 0);
+        assert!(info.source_matched && !info.crc_ok);
+
+        // The largest frame still fits the entry with all three bytes.
+        let long = [0x41u8; MAX_FRAME];
+        let (info, _) = decode(&long, -90, 0x05, 0xFF);
+        assert_eq!(
+            (info.len, info.rssi_dbm, info.source_matched),
+            (MAX_FRAME, -90, false)
+        );
+
+        // Lengths that cannot hold the status bytes or overflow the entry.
+        let mut out = [0u8; MAX_FRAME];
+        for n in [0, 1, 2, MAX_FRAME + APPENDED + 1, 255] {
+            assert_eq!(decode_element(n, |_| 0, &mut out), None, "n = {n}");
+        }
+        assert_eq!(decode_element(APPENDED, |_| 0, &mut out).unwrap().len, 0);
+    }
+
+    #[test]
+    fn receiver_appends_what_the_decoder_reads() {
+        for keep_crc_errors in [false, true] {
+            let config = receive_config(keep_crc_errors);
+            let appended = [
+                rx_config::APPEND_RSSI,
+                rx_config::APPEND_CORR_CRC,
+                rx_config::APPEND_SRC_IND,
+            ];
+            assert!(appended.iter().all(|bit| config & bit != 0));
+            assert_eq!(appended.len(), APPENDED);
+            // No PHY header, CRC or timestamp in the element.
+            assert_eq!(config & (1 << 2 | 1 << 3 | 1 << 7), 0);
+            assert_eq!(config & rx_config::AUTO_FLUSH_CRC == 0, keep_crc_errors);
+        }
     }
 
     #[test]

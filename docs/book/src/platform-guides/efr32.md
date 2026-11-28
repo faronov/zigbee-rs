@@ -144,7 +144,11 @@ shrink alone makes it fit. CI asserts the link failure.
 Frame Pending for a parent would have to come from the FRC ISR that already
 sends the Imm-Ack, consulting a short-address table armed through
 `RadioPhy::set_ack_frame_pending` (core `PENDING = 0`). That table does not
-exist yet, so the parent MAC fails explicitly. Role tags: `0x5201` router,
+exist yet, so the parent MAC fails explicitly: arming indirect data or an
+Association Response returns `Unsupported`, every Imm-Ack carries FP = 0,
+and a Series 1 parent cannot serve sleepy children. It would also have to
+record each poll's FP = 0 decision with the queued poll
+([which parent PHYs report it](../advanced/soft-mac-porting.md#which-parent-phys-report-the-per-poll-fp--0-decision)). Role tags: `0x5201` router,
 `0x5202` End Device; the original SED writes none. The End Device is build-,
 layout-, clippy- and symbol-checked only.
 

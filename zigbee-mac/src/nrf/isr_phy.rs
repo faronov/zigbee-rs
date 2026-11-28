@@ -25,7 +25,11 @@
 //! Frame Pending comes from a bounded source-address table armed by the
 //! parent role through [`RadioPhy::set_ack_frame_pending`] (the
 //! `Parent<EVENTS, ASSOC, 0>` model); a full table is reported, never
-//! truncated.
+//! truncated. A Data Request whose ACK the handler built with Frame Pending
+//! = 0 keeps that decision in its own RX slot (bit 7 of the PHR,
+//! [`crate::nrf_ack::committed_phr`]) and reaches the MAC as
+//! [`PhyRxFrame::acked_without_frame_pending`], so a frame queued after that
+//! ACK waits for the child's next poll.
 //!
 //! Transmit is one CCA-gated attempt (`RXEN → CCASTART → TXEN → START`) and,
 //! for acknowledged frames, an RX window matched against the sequence number
@@ -53,7 +57,7 @@ use super::embassy_nrf::{Peripheral, PeripheralRef, into_ref, peripherals};
 use super::{NrfAesError, NrfAesState, NrfEcbToken, NrfHardwareAes128, Rng, RngInstance};
 use crate::nrf_ack::{
     NrfRadioCounters, PendingTable, RxClass, ack_dma_image, ack_turnaround, ack_txen_compare,
-    classify,
+    classify, committed_phr, read_committed_slot,
 };
 use crate::pib::MacPib;
 use crate::{
@@ -442,6 +446,15 @@ impl Shared {
                         if self.schedule_ack(sequence, frame_pending) => {}
                     _ => self.rx_or_off(),
                 }
+                // The poll's ACK decision rides in its own slot's PHR. Written
+                // after the ACK is armed (PPI-timed), so the Data Request check
+                // never delays it; the task reads committed slots only inside
+                // this critical section, so it never sees the slot unmarked.
+                let marked = committed_phr(phr as u8, frame, ack);
+                // SAFETY: the slot was just committed and holds this frame;
+                // EasyDMA now targets the next slot and the task waits for
+                // the critical section.
+                unsafe { slot.write(marked) };
                 true
             }
         }
@@ -851,19 +864,15 @@ impl<'a, R: RngInstance> NrfIsrRadioPhy<'a, R> {
         })
     }
 
-    /// Copy the oldest retained frame into `frame`.
+    /// Copy the oldest retained frame into `frame`, with its poll flag
+    /// ([`committed_phr`]).
     fn take_frame(frame: &mut PhyRxFrame) -> Option<Result<(), PhyError>> {
         let head = with_shared(|shared| (shared.count > 0).then_some(shared.head))?;
-        let slot = rx_slot(head);
         // SAFETY: committed slots are never written by EasyDMA or the
         // handler until released below.
-        let result = unsafe {
-            let phr = usize::from(slot.read() & 0x7F);
-            let len = phr.saturating_sub(2);
-            let data = core::slice::from_raw_parts(slot.add(1), len);
-            let lqi = slot.add(1 + len).read();
-            frame.set(data, super::nrf_lqi(lqi))
-        };
+        let slot =
+            unsafe { core::slice::from_raw_parts(rx_slot(head).cast_const(), DMA_FRAME_LEN) };
+        let result = read_committed_slot(slot, frame, super::nrf_lqi);
         with_shared(|shared| {
             shared.head = (shared.head + 1) % NRF_ISR_RX_SLOTS;
             shared.count -= 1;

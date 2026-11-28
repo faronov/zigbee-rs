@@ -134,6 +134,9 @@ jobs:
       # NCP receive metadata and host events (RSSI, departures, host
       # endpoints); APS and runtime are covered by their --all-features runs.
       - run: cargo test -p zigbee-mac --features rx-rssi,mock --lib --locked
+      # CC26x2 parent PHY: each Data Request carries the RF core's
+      # source-match result as its ACK's Frame Pending decision.
+      - run: cargo test -p zigbee-mac --features cc26x2,cc26x2-hal/cc2652p --lib cc26x2 --locked
       - run: cargo test -p zigbee-nwk --features router,host-passthrough --locked
       # NCP sleepy-destination timing: adaptive indirect hold (NWK) and the
       # matching APS ACK wait.
@@ -651,6 +654,7 @@ jobs:
       - run: cargo clippy -p zigbee-mac --features stm32wb --all-targets --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --features efr32mg24,efr32s2-hal/efr32mg24-pa10 --all-targets --locked -- -D warnings
       - run: cargo clippy -p zigbee-mac --features nrf-fem --all-targets --locked -- -D warnings
+      - run: cargo clippy -p zigbee-mac --features cc26x2,cc26x2-hal/cc2652p --all-targets --locked -- -D warnings
       - run: cargo clippy -p zigbee-runtime --no-default-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --no-default-features --locked -- -D warnings
       - run: cargo clippy -p zigbee-zcl --no-default-features --features float32 --locked -- -D warnings

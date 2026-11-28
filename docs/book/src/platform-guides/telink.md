@@ -34,7 +34,16 @@ HAL RX-completion path, never from task context. The router uses
 (`SoftMacCore<TelinkRadioPhy, Parent<8, 8, 0>>`, eight retained data frames).
 Beacon, association and orphan responses, command events and indirect data
 come from the core; Frame Pending is armed in the HAL's ISR source-match
-table. The shared-core router, ED and sensor images have run on a TB-04
+table. On the router the ACK path also records, with each queued Data
+Request it answered with FP = 0, that decision (bit 7 of `ReceivedFrame`'s
+length byte, `ReceivedFrame::acked_without_frame_pending` →
+`PhyRxFrame::acked_without_frame_pending`), so the NWK holds a frame queued
+after that ACK for the next poll. The parent MAC switches the record on at
+construction (`Radio::record_poll_acks`); the sensor and ED never do, so the
+check folds out of their `.ram_code` (unchanged at 3,476 B / 2,916 B; the
+router's grows by 60 B). Polls without PAN ID compression, which the
+`.ram_code` matcher never answers with FP = 1, are not recorded
+(host-tested, stack-gated; no hardware run yet). The shared-core router, ED and sensor images have run on a TB-04
 against ZHA (see [Validation](#validation)); the MAC unification section of
 the firmware-size chapter has their footprint.
 

@@ -225,7 +225,7 @@ that bit:
 
 | ACK path | `hardware_auto_ack` | FP source | `PENDING` |
 |---|---|---|---|
-| Hardware or ISR auto-ACK (TLSR8258, BL702 router, nRF52 `NrfIsrRadioPhy`, EFR32 Series 2 routers with `isr-ack`) | `true` | HAL source-match table, armed through `RadioPhy::set_ack_frame_pending` | `0` |
+| Hardware or ISR auto-ACK (CC26x2 RF core, TLSR8258, BL702 router, nRF52 `NrfIsrRadioPhy`, EFR32 Series 2 routers with `isr-ack`) | `true` | HAL source-match table, armed through `RadioPhy::set_ack_frame_pending` | `0` |
 | Radio auto-ACK, FP decided in the RX_DONE interrupt (ESP32-C6/H2) | `true` | `zigbee_mac::ack_pending` table, consulted by the esp-radio `ieee802154-ack-pending` hook before the ACK goes out, armed through `RadioPhy::set_ack_frame_pending` | `0` |
 | Task-context software ACK | `false` | core `PENDING` table; the core passes FP to `send_ack` | ≥ the child count |
 
@@ -252,17 +252,36 @@ without a hardware ACK engine:
   after the ACK. Keep the decision with the frame (a record flag, or a
   reception-order log such as `ack_pending::PollAckLog` when the interrupt
   cannot mark the frame), never in a per-child table, which fills up with
-  sleepy children that never get data. The EFR32 Series 2 and ESP32
-  parents report it; the CC26x2, nRF (`isr_phy`), Telink and BL702 parent
-  PHYs do not yet and deliver at once (a follow-up). EFR32 Series 1,
-  PHY6222 and CC2340 auto-ACK without a Frame Pending table, so arming
-  indirect data fails there and they cannot serve sleepy children;
+  sleepy children that never get data. Which parent PHYs report it is
+  listed below;
 - it drops frames it could not ACK in time, plus ACKs and foreign frames,
   and copies the frames it keeps into a software queue, so the hardware RX
   buffer is empty after every interrupt, even while the task is blocked in
   NWK delays;
 - task-side radio operations mask the interrupt, and `receive` pops only
   from that queue, so the ACK decision always comes before delivery.
+
+#### Which parent PHYs report the per-poll FP = 0 decision
+
+A parent PHY whose hardware or interrupt ACKs polls must report, with each
+dequeued Data Request, whether that ACK carried FP = 0. Without it a frame
+queued between the ACK and the dequeue is sent to a child that already
+turned its receiver off: its radio may even acknowledge it, so the NWK
+counts it delivered while the child's stack drops it. Software-ACK parents
+need nothing: the core records the FP bit it passes to `send_ack`. Every
+record below is the decision written into the ACK, kept with the frame
+(even when that ACK was then abandoned as late, as on the software path);
+nothing is kept per child.
+
+| Parent PHY | Source of truth | Where the decision travels | Residual race | Validation |
+|---|---|---|---|---|
+| EFR32 Series 2 (`efr32s2-hal` `isr-ack`) | FP bit the FRC interrupt writes into its ACK | bit 7 of the RX queue record's length byte | none | host-tested; the stale-poll fix is HIL-proven on a Dongle Max (#23) |
+| ESP32-C6/H2/C5 (`esp-parent`) | FP returned by the RX_DONE `ack_pending` hook | `ack_pending::PollAckLog` (source, sequence, FP) in reception order, taken when the poll is dequeued | none; an overwritten entry reports "unknown" (immediate delivery) | host-tested |
+| CC26x2/CC13x2 (`cc26x2`) | the RF core's appended source-match index (`rxConfig.bAppendSrcInd`): auto-pend sets FP from the same match, and the HAL keeps every enabled entry pending | `cc26x2_hal::rf::RxInfo::source_matched` → `PhyRxFrame` | none: the RF core's own per-frame result | host-tested, build-checked; not hardware-tested |
+| nRF52833/nRF52840 `NrfIsrRadioPhy` (`nrf-isr-phy`) | FP the RADIO handler writes into the ACK DMA image (`nrf_ack::classify`) | bit 7 (reserved) of the slot's PHR byte (`nrf_ack::committed_phr`) | none: the decision and the slot commit share one critical section | host-tested, build-checked; not hardware-tested |
+| TLSR8258 (`tlsr8258-hal` RX-completion ACK) | FP the `.ram_code` ACK path matched (`poll_ack_parsed`); recorded once the parent MAC calls `Radio::record_poll_acks`, so end-device images compile it out | bit 7 of `ReceivedFrame`'s length byte | none. Polls the ACK path cannot match (no PAN ID compression) always get FP = 0 and are not marked, so arming could never release them | host-tested, build- and stack-gate-checked; not hardware-tested |
+| BL702 router (`Bl702ParentRadioPhy`) | derived: the M154 reports no per-frame FP, so the interrupt evaluates the mirror of the M154 table when it copies the poll; `set_ack_frame_pending` first queues the frames completed under the old table | the ring's `PhyRxFrame` | a poll whose reception straddles a table update that arms its source can be reported FP = 1 although the M154 sent FP = 0, and is served at once (the earlier behaviour); the reverse only delays a frame by one poll | host-tested, build- and stack-gate-checked; the parent path has not run on hardware |
+| EFR32 Series 1, PHY6222, CC2340 | no Frame Pending table: every Imm-Ack has FP = 0 | — | — | `set_ack_frame_pending` returns `Unsupported`, so arming indirect data and Association Responses fails explicitly: these parents cannot serve sleepy children. Their router builds are size probes that do not fit the part |
 
 ### Role template (one example crate per board)
 
