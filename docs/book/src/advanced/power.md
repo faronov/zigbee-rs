@@ -86,9 +86,32 @@ leaves the next interview on the slow poll. Otherwise the budget is RAM
 state; a reboot starts it full. A product must configure a budget that
 covers each of its windows (`SensorPolicy::is_valid`).
 
+Hardware (2026-11-28, ESP32-C6 light-sleep sensor, 5 s long poll, a sleepy
+child of the EFR32MG24 ZRHP NCP on the SONOFF Dongle Max, hub
+`devices/reinterview` 150 s after a resume, sniffer on the channel): the
+interview (8 requests) took 20.19 s with the image before activity windows
+(`65e7f8ed`) and 6.30 s and 4.17 s with them (`df05d3c0`). On air, from the
+first delivered request to the last answer: 15.44 s before (three requests
+each waited one 5 s poll), 1.17 s after (about 0.27 s per exchange). Only
+the first request still waits for the long poll (2.9–5.0 s here). See the
+ESP32 guide for the sessions.
+
+Cost: the 30 s tail after the last frame was 120 polls (4.0/s) in both
+runs, against 6 polls in the same 30 s at the long poll; the cadence then
+returned to 5 s. No power meter was available for this board and the USB
+console vetoes light sleep, so the current is **not measured**. Radio-on
+time, calculated from the captured frames: an empty poll (10-byte Data
+Request and its ACK) keeps the radio busy about 1.25 ms (128 µs CCA, 576 µs
+TX, 192 µs turnaround, 352 µs ACK), so a tail costs about 150 ms of radio
+time against 7.5 ms at the long poll (about 20×), i.e. about 140 ms extra
+per burst of hub traffic. At an assumed 80 mA while the radio is active that
+is roughly 12 mC against 0.6 mC per 30 s; CPU wake-ups are not included.
+The current of the tail on a battery (power-only supply, a meter) remains a
+hardware gate.
+
 Status: host-tested (`apps/sensor-sed/tests/lifecycle.rs`, runtime and
-budget unit tests). The interview time on hardware and the current drawn by
-the activity windows are not measured yet.
+budget unit tests); interview time and poll cadence measured on one
+ESP32-C6 as above.
 
 ## Atomic platform wait
 

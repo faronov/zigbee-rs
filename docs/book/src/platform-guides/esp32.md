@@ -964,7 +964,26 @@ land in the poll. The earlier NO_ACK after 38 s needs a poll phase that
 misses all four 8 s copies, and these rounds could not force that. The
 host tests are the discriminating evidence.
 
-Open hardware gates:Open hardware gates:
+Network-activity fast poll (2026-11-28, `df05d3c0`, the activity windows
+of `SensorPolicy::activity_fast_ms`, see the power guide). The ESP32-C6
+light-sleep sensor (5 s long poll, OTA version 3) is a sleepy child
+(`0x12D2`) of the EFR32MG24 ZRHP NCP on the SONOFF Dongle Max (channel 20,
+PAN `0xE2E9`, hub 0.4.1). Each image went into `ota_0` only (network state
+kept, verified esprom backups first), the sensor was reset and resumed
+silently, and the hub reinterviewed it 150 s later (8 requests; its
+configure step was unchanged and skipped):
+
+| image | hub: reinterview → done | first request delivered after | first request → last answer (air) | 30 s after the last answer | sniffer sessions |
+|---|---|---|---|---|---|
+| `65e7f8ed` (before) | 20.19 s | 4.62 s | 15.44 s (gaps 0.27, 0.01, 0.03, 5.03, 0.03, 5.03, 5.04 s) | 6 polls (5 s) | `2026-11-28T114044Z-sniffer-capture` |
+| `df05d3c0` (after) | 6.30 s | 4.99 s | 1.17 s (gaps 0.03–0.28 s) | 120 polls (4.0/s), then 5 s again | `2026-11-28T114814Z-sniffer-capture` |
+| `df05d3c0` (after) | 4.17 s | 2.88 s | 1.17 s (gaps 0.03–0.27 s) | 120 polls (4.0/s), then 5 s again | `2026-11-28T115418Z-sniffer-capture` |
+
+The current was not measured (no meter for this board; the USB console
+vetoes light sleep). The radio-on estimate is in the power guide. The
+sensor stays on `df05d3c0`, joined.
+
+Open hardware gates:
 
 - The C6 router uses the same patch but has not been rerun on hardware.
 - No sleepy child has polled an ESP router for a long run, so Frame Pending
