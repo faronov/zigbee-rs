@@ -3158,6 +3158,7 @@ mod tests {
                     lqi: 200,
                     security_use: false,
                     acked_without_frame_pending: false,
+                    ack_frame_pending_reported: false,
                 },
             ));
         block_on(device.service_parent_commands());

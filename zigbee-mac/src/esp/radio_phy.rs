@@ -892,6 +892,12 @@ impl RadioPhy for EspRadioPhy<'_> {
     /// parent queued by extended address.
     const POLL_EXTENDED_FALLBACK: bool = true;
 
+    /// A parent marks every dequeued poll with its ACK's decision
+    /// (`POLL_ACKS`). The log covers the polls the radio's receive queue
+    /// holds plus 4; a decision it no longer holds (at least 5 polls the
+    /// full queue dropped while an earlier one waited) reads as FP = 1.
+    const ACK_FRAME_PENDING_REPORTED: bool = cfg!(feature = "esp-parent");
+
     fn poll_response_wait_us(&self) -> u32 {
         self.poll_response_wait_us
     }

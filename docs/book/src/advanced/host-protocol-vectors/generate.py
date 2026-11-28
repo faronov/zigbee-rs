@@ -145,6 +145,7 @@ EP_LINK, EP_SYSTEM, EP_ZIGBEE, EP_TABLES, EP_BULK, EP_LOG = 0, 1, 2, 3, 4, 5
 SYS_NEGOTIATE, SYS_GET_STATUS, SYS_ECHO, SYS_SET_UART = 0x0001, 0x0004, 0x0007, 0x0009
 EVT_NCP_READY = 0x0080
 NWK_PERMIT_JOIN, EVT_DEVICE_JOINED, EVT_ROUTE_RECORD = 0x0105, 0x0181, 0x0185
+EVT_CHILD_POLL = 0x018C
 APS_DATA_REQUEST, EVT_APS_DATA_INDICATION, EVT_APS_DATA_CONFIRM = 0x0201, 0x0280, 0x0281
 SEC_ADD_INSTALL_CODE, SEC_LOCK_KEY_EXPORT, EVT_FC_CHECKPOINT = 0x0403, 0x040A, 0x0483
 GP_SINK_CONFIG, GP_SINK_COMMISSIONING = 0x0A01, 0x0A03
@@ -659,6 +660,15 @@ def build_messages():
     add("evt_route_record", EP_ZIGBEE, K_EVENT, EVT_ROUTE_RECORD, 0x0014,
         struct.pack("<H", 0x8F3E) + ieee_wire("00158d0004c5d6e7") + struct.pack("<BHH", 2, 0x3C4D, 0x1A2B),
         "relays in Route Record order (first entry nearest the originator)")
+    add("evt_child_poll", EP_ZIGBEE, K_EVENT, EVT_CHILD_POLL, 0x001B,
+        struct.pack("<H", 0x4F21) + ieee_wire("842e14fffe0a0b0c") + struct.pack("<BH", 0x01, 3),
+        "child 0x4f21 polled; its ACK carried Frame Pending = 1; 3 earlier polls not reported",
+        {"nwk": "0x4f21", "ieee": "842e14fffe0a0b0c", "ack_frame_pending": 1, "unreported": 3})
+    add("evt_child_poll_unknown", EP_ZIGBEE, K_EVENT, EVT_CHILD_POLL, 0x001C,
+        struct.pack("<H", 0x1A2C) + bytes(8) + struct.pack("<BH", 0x02, 0),
+        "first report of child 0x1a2c: IEEE unknown (all zero), the radio does not report "
+        "its ACK's Frame Pending (2)",
+        {"nwk": "0x1a2c", "ieee": None, "ack_frame_pending": 2, "unreported": 0})
     code = SILABS_INSTALL_CODE
     add("sec_add_install_code", EP_ZIGBEE, K_REQUEST, SEC_ADD_INSTALL_CODE, 0x0105,
         ieee_wire("842e14fffe0a0b0c") + struct.pack("<B", len(code)) + code,

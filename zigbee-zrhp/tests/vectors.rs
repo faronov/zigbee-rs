@@ -458,6 +458,26 @@ fn message_vectors() {
                     (0x4F21, 0x1A2B, 0, 0x80, 0)
                 );
             }
+            "evt_child_poll" | "evt_child_poll_unknown" => {
+                let e: EvtChildPoll = rt(&m, &whole);
+                assert_eq!(e.nwk as u64, fields.at("nwk").int(), "{name}");
+                let ieee = fields.at("ieee");
+                let expected_ieee = (!ieee.is_null()).then(|| ieee_be(ieee.str()));
+                assert_eq!(e.known_ieee(), expected_ieee, "{name}");
+                assert_eq!(
+                    e.ack_frame_pending().bits() as u64,
+                    fields.at("ack_frame_pending").u64(),
+                    "{name}"
+                );
+                assert_eq!(e.unreported as u64, fields.at("unreported").u64(), "{name}");
+                let built = EvtChildPoll::new(
+                    e.nwk,
+                    expected_ieee,
+                    AckFramePending::from_flags(fields.at("ack_frame_pending").u64() as u8),
+                    e.unreported,
+                );
+                assert_eq!(built, e, "{name}");
+            }
             "evt_route_record" => {
                 let e: EvtRouteRecord = rt(&m, &whole);
                 assert_eq!(e.relays.iter().collect::<Vec<_>>(), [0x3C4D, 0x1A2B]);

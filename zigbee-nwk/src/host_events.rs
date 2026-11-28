@@ -1,4 +1,5 @@
-//! Device departures for a network co-processor host (`host-passthrough`).
+//! Device departures and child polls for a network co-processor host
+//! (`host-passthrough`).
 //!
 //! A coordinator NCP reports every device that leaves its tables to the
 //! host (ZRHP `EVT_DEVICE_LEFT`). Two departures are only visible here:
@@ -13,13 +14,18 @@
 //! root with [`NwkLayer::take_host_departure`]. Departures reported through
 //! the Trust Center (Update-Device) are the Trust Center runtime's.
 //!
+//! Every MAC Data Request of a child of this node is recorded as well, with
+//! the Frame Pending bit of its MAC ACK when the MAC reports it, in a second
+//! bounded queue (`NwkLayer::take_host_poll`): the host learns that a
+//! sleepy child is awake (ZRHP `EVT_CHILD_POLL`, rate-limited by the NCP).
+//!
 //! Without the feature [`HostNwkEvents`] is zero-sized and the recording
 //! hooks expand to nothing, so other images are unchanged.
 
 #[cfg(feature = "host-passthrough")]
 use zigbee_mac::MacDriver;
 #[cfg(feature = "host-passthrough")]
-use zigbee_types::{IeeeAddress, ShortAddress};
+use zigbee_types::{IeeeAddress, MacAddress, ShortAddress};
 
 #[cfg(feature = "host-passthrough")]
 use crate::NwkLayer;
@@ -27,6 +33,22 @@ use crate::NwkLayer;
 /// Departures held until the composition root drains them.
 #[cfg(feature = "host-passthrough")]
 pub const HOST_DEPARTURE_QUEUE_LEN: usize = 16;
+
+/// Child polls held until the composition root drains them (after every
+/// stack step; one step services at most a few polls). When full, the
+/// oldest poll is dropped: the newest says more about who is awake.
+#[cfg(feature = "host-passthrough")]
+pub const HOST_POLL_QUEUE_LEN: usize = 8;
+
+/// One MAC Data Request of a child of this node.
+#[cfg(feature = "host-passthrough")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NwkChildPoll {
+    pub short_address: ShortAddress,
+    /// Frame Pending of the MAC ACK to this poll; `None` when the MAC does
+    /// not report it ([`crate::ChildPoll::ack_frame_pending`]).
+    pub ack_frame_pending: Option<bool>,
+}
 
 /// Why a device left this node's tables.
 #[cfg(feature = "host-passthrough")]
@@ -54,12 +76,17 @@ pub struct NwkDeparture {
     pub cause: NwkDepartureCause,
 }
 
-/// The bounded departure queue; zero-sized without `host-passthrough`.
+/// The bounded departure and poll queues; zero-sized without
+/// `host-passthrough`.
 pub(crate) struct HostNwkEvents {
     #[cfg(feature = "host-passthrough")]
     queue: heapless::Deque<NwkDeparture, HOST_DEPARTURE_QUEUE_LEN>,
     #[cfg(feature = "host-passthrough")]
     dropped: u16,
+    #[cfg(feature = "host-passthrough")]
+    polls: heapless::Deque<NwkChildPoll, HOST_POLL_QUEUE_LEN>,
+    #[cfg(feature = "host-passthrough")]
+    polls_dropped: u16,
 }
 
 impl HostNwkEvents {
@@ -69,6 +96,10 @@ impl HostNwkEvents {
             queue: heapless::Deque::new(),
             #[cfg(feature = "host-passthrough")]
             dropped: 0,
+            #[cfg(feature = "host-passthrough")]
+            polls: heapless::Deque::new(),
+            #[cfg(feature = "host-passthrough")]
+            polls_dropped: 0,
         }
     }
 
@@ -140,9 +171,39 @@ impl<M: MacDriver> NwkLayer<M> {
         core::mem::take(&mut self.host_events.dropped)
     }
 
-    /// Forget recorded departures (the network was left or reset).
+    /// Forget recorded departures and polls (the network was left or
+    /// reset).
     pub fn clear_host_departures(&mut self) {
         self.host_events.queue.clear();
         self.host_events.dropped = 0;
+        self.host_events.polls.clear();
+        self.host_events.polls_dropped = 0;
+    }
+
+    /// Record a MAC Data Request from `source` if it is a child of this
+    /// node.
+    pub(crate) fn host_note_poll(&mut self, source: &MacAddress, ack_frame_pending: Option<bool>) {
+        let Some(short_address) = self.known_child_short(source) else {
+            return;
+        };
+        let events = &mut self.host_events;
+        if events.polls.is_full() {
+            events.polls.pop_front();
+            events.polls_dropped = events.polls_dropped.saturating_add(1);
+        }
+        let _ = events.polls.push_back(NwkChildPoll {
+            short_address,
+            ack_frame_pending,
+        });
+    }
+
+    /// Oldest recorded child poll (`host-passthrough`).
+    pub fn take_host_poll(&mut self) -> Option<NwkChildPoll> {
+        self.host_events.polls.pop_front()
+    }
+
+    /// Child polls lost because the queue was full, since the last call.
+    pub fn take_host_polls_dropped(&mut self) -> u16 {
+        core::mem::take(&mut self.host_events.polls_dropped)
     }
 }

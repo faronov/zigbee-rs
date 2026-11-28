@@ -346,6 +346,16 @@ pub trait RadioPhy {
     /// Forget every armed Frame Pending source (MLME-RESET).
     fn clear_ack_frame_pending(&mut self) {}
 
+    /// Every acknowledged MAC Data Request that [`Self::receive`] hands
+    /// over carries the Frame Pending bit of the automatic ACK this PHY sent
+    /// for it: [`PhyRxFrame::acked_without_frame_pending`] set for FP = 0,
+    /// clear for FP = 1. The parent MAC then reports each poll's decision
+    /// ([`crate::MlmeDataRequestIndication::ack_frame_pending`]). Only read
+    /// with `hardware_auto_ack` (the software ACK path knows its own
+    /// decision). A PHY that marks only some polls keeps `false`: its clear
+    /// flag means "FP = 1 or not reported".
+    const ACK_FRAME_PENDING_REPORTED: bool = false;
+
     /// Whether [`Self::transmit_at`] is implemented and every received
     /// frame carries [`PhyRxFrame::rx_end_us`] (`timed-tx`).
     #[cfg(feature = "timed-tx")]

@@ -293,10 +293,11 @@ pub trait MacRole: role_sealed::Sealed {
         false
     }
 
-    /// Queue a received parent-side MAC command. `acked_without_frame_pending`:
-    /// the frame is a Data Request whose ACK carried Frame Pending = 0.
+    /// Queue a received parent-side MAC command. `ack_frame_pending`: the
+    /// Frame Pending bit of the ACK to a Data Request, `None` when not
+    /// reported.
     #[doc(hidden)]
-    fn queue_command(&mut self, _data: &[u8], _lqi: u8, _acked_without_frame_pending: bool) {}
+    fn queue_command(&mut self, _data: &[u8], _lqi: u8, _ack_frame_pending: Option<bool>) {}
 
     /// True (once) after a Data Request was queued: receive loops end early
     /// so the runtime can service the child poll promptly.
@@ -1344,10 +1345,14 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
                 )
             });
         // The Frame Pending bit this poll was answered with: the software ACK
-        // about to be sent, or the PHY's own auto-ACK as it reports it.
-        let acked_without_frame_pending = match ack {
-            Some((_, frame_pending)) => !frame_pending,
-            None => frame.acked_without_frame_pending(),
+        // about to be sent, or the PHY's own auto-ACK as it reports it (a
+        // PHY that does not report it only ever marks FP = 0).
+        let ack_requested = data[0] & (1 << 5) != 0 && exact;
+        let ack_frame_pending = match ack {
+            Some((_, frame_pending)) => Some(frame_pending),
+            None if frame.acked_without_frame_pending() => Some(false),
+            None if ack_requested && P::ACK_FRAME_PENDING_REPORTED => Some(true),
+            None => None,
         };
 
         let retained = matches!(want, Want::Retained).then_some(Heard::Queued);
@@ -1369,8 +1374,7 @@ impl<P: RadioPhy + PlatformServices, R: MacRole, const RX: usize> SoftMacCore<P,
         } else if command {
             if R::PARENT {
                 let lqi = frame.lqi;
-                self.role
-                    .queue_command(data, lqi, acked_without_frame_pending);
+                self.role.queue_command(data, lqi, ack_frame_pending);
                 retained
             } else {
                 None
@@ -1691,8 +1695,14 @@ mod tests {
     const IEEE: [u8; 8] = [0x02, 1, 2, 3, 4, 5, 6, 7];
 
     /// `T`: transmit offload marker. `FALLBACK` = `POLL_EXTENDED_FALLBACK`.
-    /// `POWER` = `DEFAULT_TX_POWER_DBM`.
-    struct TestPhy<T: TxOffload = SoftwareTx, const FALLBACK: bool = false, const POWER: i8 = 0> {
+    /// `POWER` = `DEFAULT_TX_POWER_DBM`. `REPORTED` =
+    /// `ACK_FRAME_PENDING_REPORTED`.
+    struct TestPhy<
+        T: TxOffload = SoftwareTx,
+        const FALLBACK: bool = false,
+        const POWER: i8 = 0,
+        const REPORTED: bool = false,
+    > {
         offload: core::marker::PhantomData<T>,
         channel: u8,
         tx_power: i8,
@@ -1721,7 +1731,9 @@ mod tests {
         poll_wait_us: Option<u32>,
     }
 
-    impl<T: TxOffload, const FALLBACK: bool, const POWER: i8> TestPhy<T, FALLBACK, POWER> {
+    impl<T: TxOffload, const FALLBACK: bool, const POWER: i8, const REPORTED: bool>
+        TestPhy<T, FALLBACK, POWER, REPORTED>
+    {
         fn new() -> Self {
             Self {
                 offload: core::marker::PhantomData,
@@ -1755,12 +1767,13 @@ mod tests {
         }
     }
 
-    impl<T: TxOffload + 'static, const FALLBACK: bool, const POWER: i8> RadioPhy
-        for TestPhy<T, FALLBACK, POWER>
+    impl<T: TxOffload + 'static, const FALLBACK: bool, const POWER: i8, const REPORTED: bool>
+        RadioPhy for TestPhy<T, FALLBACK, POWER, REPORTED>
     {
         type Tx = T;
         const POLL_EXTENDED_FALLBACK: bool = FALLBACK;
         const DEFAULT_TX_POWER_DBM: i8 = POWER;
+        const ACK_FRAME_PENDING_REPORTED: bool = REPORTED;
 
         fn poll_response_wait_us(&self) -> u32 {
             self.poll_wait_us.unwrap_or(Self::POLL_RESPONSE_WAIT_US)
@@ -1874,12 +1887,12 @@ mod tests {
         }
     }
 
-    impl<T: TxOffload, const FALLBACK: bool, const POWER: i8> zigbee_crypto::ForwardAesProvider
-        for TestPhy<T, FALLBACK, POWER>
+    impl<T: TxOffload, const FALLBACK: bool, const POWER: i8, const REPORTED: bool>
+        zigbee_crypto::ForwardAesProvider for TestPhy<T, FALLBACK, POWER, REPORTED>
     {
     }
-    impl<T: TxOffload + 'static, const FALLBACK: bool, const POWER: i8> PlatformServices
-        for TestPhy<T, FALLBACK, POWER>
+    impl<T: TxOffload + 'static, const FALLBACK: bool, const POWER: i8, const REPORTED: bool>
+        PlatformServices for TestPhy<T, FALLBACK, POWER, REPORTED>
     {
         fn monotonic_micros(&self) -> u32 {
             self.now_us
@@ -3525,7 +3538,9 @@ mod tests {
     const ROUTER: ShortAddress = ShortAddress(0x0001);
     const CHILD_SHORT: ShortAddress = ShortAddress(0x4321);
 
-    type ParentCore = SoftMacCore<TestPhy, Parent<4, 2, 2>, 4>;
+    type ParentCoreOf<const REPORTED: bool> =
+        SoftMacCore<TestPhy<SoftwareTx, false, 0, REPORTED>, Parent<4, 2, 2>, 4>;
+    type ParentCore = ParentCoreOf<false>;
 
     fn router_start(channel: u8) -> MlmeStartRequest {
         MlmeStartRequest {
@@ -3539,7 +3554,12 @@ mod tests {
     }
 
     fn parent_core() -> ParentCore {
-        let mut core = ParentCore::new_custom(TestPhy::new(), MacPib::new(IEEE, 1, 2)).unwrap();
+        parent_core_of()
+    }
+
+    fn parent_core_of<const REPORTED: bool>() -> ParentCoreOf<REPORTED> {
+        let mut core =
+            ParentCoreOf::<REPORTED>::new_custom(TestPhy::new(), MacPib::new(IEEE, 1, 2)).unwrap();
         core.start(router_start(15)).unwrap();
         core.set_pib(
             PibAttribute::MacShortAddress,
@@ -3557,7 +3577,7 @@ mod tests {
         }
     }
 
-    fn rx(core: &mut ParentCore, frame: &[u8]) {
+    fn rx<const REPORTED: bool>(core: &mut ParentCoreOf<REPORTED>, frame: &[u8]) {
         core.phy_mut()
             .rx_frames
             .push_back(Ok(Some(PhyRxFrame::from_slice(frame, 200).unwrap())))
@@ -3769,7 +3789,11 @@ mod tests {
     }
 
     /// A received poll as a `hardware_auto_ack` PHY reports it.
-    fn rx_auto_acked(core: &mut ParentCore, frame: &[u8], acked_without_frame_pending: bool) {
+    fn rx_auto_acked<const REPORTED: bool>(
+        core: &mut ParentCoreOf<REPORTED>,
+        frame: &[u8],
+        acked_without_frame_pending: bool,
+    ) {
         let mut received = PhyRxFrame::from_slice(frame, 200).unwrap();
         received.set_acked_without_frame_pending(acked_without_frame_pending);
         core.phy_mut()
@@ -3778,7 +3802,9 @@ mod tests {
             .unwrap();
     }
 
-    fn polled(core: &mut ParentCore) -> crate::MlmeDataRequestIndication {
+    fn polled<const REPORTED: bool>(
+        core: &mut ParentCoreOf<REPORTED>,
+    ) -> crate::MlmeDataRequestIndication {
         match block_on(core.command_event(10_000)).unwrap() {
             MacCommandEvent::DataRequest(indication) => indication,
             other => panic!("expected a Data Request event, got {other:?}"),
@@ -3792,22 +3818,46 @@ mod tests {
         let mut core = parent_core();
         let child = MacAddress::Short(PAN, CHILD_SHORT);
         rx(&mut core, &short_data_request(0x20));
-        assert!(polled(&mut core).acked_without_frame_pending);
+        let poll = polled(&mut core);
+        assert!(poll.acked_without_frame_pending);
+        assert_eq!(poll.ack_frame_pending(), Some(false));
         core.set_frame_pending(child, true).unwrap();
         rx(&mut core, &short_data_request(0x21));
-        assert!(!polled(&mut core).acked_without_frame_pending);
+        let poll = polled(&mut core);
+        assert!(!poll.acked_without_frame_pending);
+        assert_eq!(
+            poll.ack_frame_pending(),
+            Some(true),
+            "the software ACK knows"
+        );
         assert_eq!(
             core.phy().sent_acks.as_slice(),
             [(0x20, false), (0x21, true)]
         );
 
+        // An auto-ACK PHY that does not report its decision: only its FP = 0
+        // marks are known.
         let mut core = parent_core();
         core.phy_mut().capabilities.hardware_auto_ack = true;
         rx_auto_acked(&mut core, &short_data_request(0x22), true);
         rx_auto_acked(&mut core, &short_data_request(0x23), false);
-        assert!(polled(&mut core).acked_without_frame_pending);
-        assert!(!polled(&mut core).acked_without_frame_pending);
+        let poll = polled(&mut core);
+        assert!(poll.acked_without_frame_pending);
+        assert_eq!(poll.ack_frame_pending(), Some(false));
+        let poll = polled(&mut core);
+        assert!(!poll.acked_without_frame_pending);
+        assert_eq!(poll.ack_frame_pending(), None, "FP = 1 or not reported");
         assert!(core.phy().sent_acks.is_empty());
+
+        // `ACK_FRAME_PENDING_REPORTED`: an unmarked poll had FP = 1.
+        let mut core = parent_core_of::<true>();
+        core.phy_mut().capabilities.hardware_auto_ack = true;
+        rx_auto_acked(&mut core, &short_data_request(0x24), true);
+        rx_auto_acked(&mut core, &short_data_request(0x25), false);
+        assert_eq!(polled(&mut core).ack_frame_pending(), Some(false));
+        let poll = polled(&mut core);
+        assert!(!poll.acked_without_frame_pending);
+        assert_eq!(poll.ack_frame_pending(), Some(true));
     }
 
     /// An Association Response armed after the auto-ACK told the device

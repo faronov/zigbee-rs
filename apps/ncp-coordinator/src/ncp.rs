@@ -12,9 +12,9 @@
 //!
 //! | Group | Commands |
 //! |---|---|
-//! | SYSTEM | `SYS_NEGOTIATE`, `SYS_GET_INFO`, `SYS_RESET`, `SYS_GET_STATUS`, `SYS_SET_CONFIG`/`SYS_GET_CONFIG` (`log_level`), `SYS_ECHO`, `SYS_SET_UART` |
+//! | SYSTEM | `SYS_NEGOTIATE`, `SYS_GET_INFO`, `SYS_RESET`, `SYS_GET_STATUS`, `SYS_SET_CONFIG`/`SYS_GET_CONFIG` (`log_level`, `child_poll_interval_ms`), `SYS_ECHO`, `SYS_SET_UART` |
 //! | DIAG | `DIAG_GET_COUNTERS`/`DIAG_RESET_COUNTERS` (link and queue groups) |
-//! | NETWORK | `NWK_INIT`, `NWK_FORM` (NCP-chosen identity), `NWK_LEAVE_RESET`, `NWK_GET_INFO`, `NWK_PERMIT_JOIN` (NCP or all routers), `NWK_ADD_ENDPOINT`; `EVT_DEVICE_JOINED`, `EVT_DEVICE_LEFT` |
+//! | NETWORK | `NWK_INIT`, `NWK_FORM` (NCP-chosen identity), `NWK_LEAVE_RESET`, `NWK_GET_INFO`, `NWK_PERMIT_JOIN` (NCP or all routers), `NWK_ADD_ENDPOINT`; `EVT_DEVICE_JOINED`, `EVT_DEVICE_LEFT`, `EVT_CHILD_POLL` (host opt-in, [`crate::child_poll`]) |
 //! | DATA | `APS_DATA_REQUEST` → `EVT_APS_DATA_CONFIRM` (after the APS ACK outcome with `ack_request`); `EVT_APS_DATA_INDICATION` |
 //! | SECURITY | `SEC_GET_NETWORK_KEY`, `SEC_GET_FRAME_COUNTERS`, `SEC_ADD_INSTALL_CODE`, `SEC_ADD_LINK_KEY`, `SEC_DERIVE_EZSP_KEY`, `SEC_LOCK_KEY_EXPORT`; `EVT_FC_CHECKPOINT` |
 //! | LOG | `LOG_CONFIG`; `EVT_LOG_RECORD`, `EVT_LOG_DROPPED` |
@@ -29,10 +29,11 @@ use zigbee_zrhp::msg::data::{ApsDataRequest, ApsDst, EvtApsDataConfirm, EvtApsDa
 use zigbee_zrhp::msg::diag::{Counter, DiagGetCounters, DiagResetCounters};
 use zigbee_zrhp::msg::log::{EvtLogDropped, EvtLogRecord, LogConfig};
 use zigbee_zrhp::msg::network::{
-    EvtChannelChanged, EvtDeviceJoined, EvtDeviceLeft, EvtEnergyScanResult, EvtNetworkState,
-    EvtPermitJoinState, EvtScanProgress, NwkActiveScan, NwkActiveScanRsp, NwkAddEndpoint,
-    NwkChangeChannel, NwkEnergyScan, NwkForm, NwkGetInfoRsp, NwkGroupMembership, NwkInit,
-    NwkInitRsp, NwkLeaveReset, NwkPermitJoin, NwkSetTxPower, NwkSetTxPowerRsp, leave_reset_flags,
+    AckFramePending, EvtChannelChanged, EvtChildPoll, EvtDeviceJoined, EvtDeviceLeft,
+    EvtEnergyScanResult, EvtNetworkState, EvtPermitJoinState, EvtScanProgress, NwkActiveScan,
+    NwkActiveScanRsp, NwkAddEndpoint, NwkChangeChannel, NwkEnergyScan, NwkForm, NwkGetInfoRsp,
+    NwkGroupMembership, NwkInit, NwkInitRsp, NwkLeaveReset, NwkPermitJoin, NwkSetTxPower,
+    NwkSetTxPowerRsp, leave_reset_flags,
 };
 use zigbee_zrhp::msg::security::{
     EvtFcCheckpoint, SecAddInstallCode, SecAddInstallCodeRsp, SecAddLinkKey, SecDeriveEzspKey,
@@ -42,12 +43,13 @@ use zigbee_zrhp::msg::security::{
 use zigbee_zrhp::msg::system::{
     Capacity, ConfigReadItem, ConfigStatus, EvtIndicationsDropped, EvtNcpReady, SysGetConfig,
     SysGetConfigRsp, SysGetInfoRsp, SysGetStatusRsp, SysNegotiateReq, SysNegotiateRsp, SysReset,
-    SysSetConfig, SysSetConfigRsp, SysSetIeee, SysSetUart, capacity, caps, config,
+    SysSetConfig, SysSetConfigRsp, SysSetIeee, SysSetUart, capacity, caps, config, host_caps,
 };
 use zigbee_zrhp::msg::{Batch, Kind, RawMessage, home_endpoint, ids};
 use zigbee_zrhp::queue::EndpointQueues;
 use zigbee_zrhp::types::{Endpoint, Ieee, Status};
 
+use crate::child_poll::{Admit, PollLimiter};
 use crate::log_ring::LogRing;
 use crate::platform::{NcpPlatform, NoPlatform};
 use crate::port::{
@@ -61,7 +63,7 @@ use zigbee_zrhp::msg::tables::EvtTblEpochChanged;
 pub const WINDOW: usize = [16, 8][cfg!(feature = "compact") as usize];
 /// Counters one `DIAG_GET_COUNTERS` response carries: 6 B each, so that
 /// the response fits a frame (spec 7.8). Every group of this NCP fits (all
-/// groups with PTA: 72).
+/// groups with PTA: 75).
 pub const MAX_COUNTERS: usize = 100;
 /// Bytes of queued outgoing messages per endpoint.
 pub const QUEUE_BYTES: usize = [1536, 1024][cfg!(feature = "compact") as usize];
@@ -210,6 +212,12 @@ struct QueueCounters {
     indications_dropped: u32,
     log_dropped: u32,
     bad_batches: u32,
+    /// `EVT_CHILD_POLL` sent / polls coalesced within a child's interval /
+    /// due polls lost (global cap, full queue, stack queue overflow), while
+    /// a host consumes them.
+    child_poll_events: u32,
+    child_polls_coalesced: u32,
+    child_polls_dropped: u32,
     /// APS group (spec 7.8 `0x04xx`).
     aps: [u32; 3],
     /// Security / TC group (`0x05xx`).
@@ -305,6 +313,8 @@ pub struct Ncp<const LOG_N: usize> {
     tx_power_request: Option<i8>,
     /// The radio's programmed transmit power as last read.
     tx_power: Option<i8>,
+    /// `EVT_CHILD_POLL` opt-in and rate limits.
+    child_polls: PollLimiter,
 }
 
 impl<const LOG_N: usize> Ncp<LOG_N> {
@@ -354,6 +364,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             active_scan: None,
             tx_power_request: None,
             tx_power: None,
+            child_polls: PollLimiter::new(),
         }
     }
 
@@ -422,6 +433,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         if self.host_ready() {
             self.emit_stack_events(now_us, port);
         }
+        self.service_child_polls(now_us, port);
         self.emit_logs(log);
         self.transmit(now_us, transport);
         self.flush_deferred();
@@ -743,6 +755,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                                 energy_scan: &mut self.energy_scan,
                                 active_scan: &mut self.active_scan,
                                 tx_power: self.tx_power,
+                                child_polls: &mut self.child_polls,
                             };
                             for message in batch.iter() {
                                 let header = message.header;
@@ -950,7 +963,15 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 if port.ezsp_hashed_supported() {
                     ncp_caps |= caps::EZSP_HASHED_TCLK;
                 }
+                let child_polls = port.child_polls_supported();
+                if child_polls {
+                    ncp_caps |= caps::CHILD_POLL_EVENTS;
+                }
                 *state.host_caps = request.host_caps;
+                state.child_polls.restart(
+                    child_polls && request.host_caps & host_caps::CHILD_POLL_EVENTS != 0,
+                    ms_of(now_us),
+                );
                 let capacities = [
                     Capacity {
                         id: capacity::MAX_APS_INFLIGHT,
@@ -1137,6 +1158,19 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                         config::COEX_ENABLE | config::COEX_TX_PRIORITY_MASK => {
                             Status::InvalidParameter
                         }
+                        config::CHILD_POLL_INTERVAL_MS if !port.child_polls_supported() => {
+                            Status::UnsupportedCommand
+                        }
+                        config::CHILD_POLL_INTERVAL_MS => match item.value.0 {
+                            &[low, high]
+                                if state
+                                    .child_polls
+                                    .set_interval_ms(u16::from_le_bytes([low, high])) =>
+                            {
+                                Status::Success
+                            }
+                            _ => Status::InvalidParameter,
+                        },
                         _ => Status::UnsupportedCommand,
                     };
                     if results
@@ -1160,12 +1194,15 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 let coex_enable = [u8::from(coex_on(state.coex.0, platform))];
                 let coex_mask = [state.coex.1];
                 let pta = platform.pta_supported();
+                let child_poll_interval = state.child_polls.interval_ms().to_le_bytes();
+                let child_polls = port.child_polls_supported();
                 let mut items: Vec<ConfigReadItem<'_>, 16> = Vec::new();
                 for config_id in request.ids.iter() {
                     let value: Option<&[u8]> = match config_id {
                         config::LOG_LEVEL => Some(&level),
                         config::COEX_ENABLE if pta => Some(&coex_enable),
                         config::COEX_TX_PRIORITY_MASK if pta => Some(&coex_mask),
+                        config::CHILD_POLL_INTERVAL_MS if child_polls => Some(&child_poll_interval),
                         _ => None,
                     };
                     let item = if let Some(value) = value {
@@ -2326,6 +2363,47 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
         }
     }
 
+    /// Drain the polls of the NCP's children: `EVT_CHILD_POLL` for a
+    /// negotiated host that opted in, as [`PollLimiter`] admits them, and
+    /// only while the ZIGBEE queue could still take a full-size indication
+    /// after the report. Without such a host they are discarded.
+    #[inline(never)]
+    fn service_child_polls<C: CoordinatorPort>(&mut self, now_us: u64, port: &mut C) {
+        // The 13-byte report, then a full-size indication.
+        const ROOM: usize = zigbee_zrhp::msg::HEADER_LEN
+            + 13
+            + zigbee_zrhp::msg::HEADER_LEN
+            + 32
+            + crate::port::MAX_INDICATION_ASDU;
+        let live = self.child_polls.enabled() && self.host_ready();
+        let lost = port.take_child_polls_dropped();
+        if live {
+            self.counters.child_polls_dropped =
+                self.counters.child_polls_dropped.wrapping_add(lost);
+        }
+        let now_ms = ms_of(now_us);
+        while let Some(poll) = port.take_child_poll() {
+            if !live {
+                continue;
+            }
+            let ack = AckFramePending::from_report(poll.ack_frame_pending);
+            let room = self.queues.queue(Endpoint::Zigbee).free() >= ROOM;
+            match self.child_polls.admit(poll.nwk, ack, now_ms, room) {
+                Admit::Report { unreported } => {
+                    let event = EvtChildPoll::new(poll.nwk, poll.ieee.map(Ieee), ack, unreported);
+                    let counter = if self.event(Endpoint::Zigbee, &event) {
+                        &mut self.counters.child_poll_events
+                    } else {
+                        &mut self.counters.child_polls_dropped
+                    };
+                    QueueCounters::bump(counter);
+                }
+                Admit::Coalesced => QueueCounters::bump(&mut self.counters.child_polls_coalesced),
+                Admit::Dropped => QueueCounters::bump(&mut self.counters.child_polls_dropped),
+            }
+        }
+    }
+
     /// Record indications the stack dropped (its queue was full).
     pub fn note_indications_dropped(&mut self, count: u32) {
         self.indication_drops_unreported = self.indication_drops_unreported.saturating_add(count);
@@ -2506,6 +2584,7 @@ struct DispatchState<'s> {
     energy_scan: &'s mut Option<crate::radio::EnergyScan>,
     active_scan: &'s mut Option<crate::radio::ActiveScan>,
     tx_power: Option<i8>,
+    child_polls: &'s mut PollLimiter,
 }
 
 fn next_seq(seqs: &mut [u16; Endpoint::COUNT], endpoint: Endpoint) -> u16 {
@@ -2520,6 +2599,11 @@ fn next_seq(seqs: &mut [u16; Endpoint::COUNT], endpoint: Endpoint) -> u16 {
 /// Ops answered after completion carry the request TID in the time slot.
 fn accepted_tid(slot: u64) -> u16 {
     slot as u16
+}
+
+/// Wrapping milliseconds of the NCP clock.
+fn ms_of(now_us: u64) -> u32 {
+    (now_us / 1000) as u32
 }
 
 /// `NWK_ADD_ENDPOINT` as a [`HostEndpoint`]; `None` when a cluster list is
@@ -2636,6 +2720,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                 active_scan: _,
                 tx_power_request: _,
                 tx_power: _,
+                child_polls: _,
             } = ncp;
         };
         let reason = match identity.reset_reason {
@@ -2686,6 +2771,7 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
             addr_of_mut!((*slot).active_scan).write(None);
             addr_of_mut!((*slot).tx_power_request).write(None);
             addr_of_mut!((*slot).tx_power).write(None);
+            addr_of_mut!((*slot).child_polls).write(PollLimiter::new());
             let ncp = &mut *slot;
             ncp.link.open(now_us, reason);
             ncp
@@ -2747,6 +2833,9 @@ fn visit_counters<C: CoordinatorPort, P: NcpPlatform>(
             (0x0703, counters.indications_dropped),
             (0x0704, counters.log_dropped),
             (0x0705, counters.bad_batches),
+            (0x0706, counters.child_poll_events),
+            (0x0707, counters.child_polls_coalesced),
+            (0x0708, counters.child_polls_dropped),
         ] {
             sink(id, value);
         }
