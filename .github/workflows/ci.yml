@@ -53,6 +53,11 @@ jobs:
         run: python3 -m unittest discover -s tools -p 'test_prepare_pages.py' -v
       - name: Test the release web flasher site
         run: python3 -m unittest discover -s tools -p 'test_flasher_site.py' -v
+      - name: Test NCP release tooling (versions, Gecko images, manifest)
+        run: python3 -m unittest discover -s tools -p 'test_ncp_release.py' -v
+      # The tag `ncp-v<version>` must match every NCP image (ncp-release.yml).
+      - name: Check every NCP version source agrees
+        run: python3 tools/ncp-release/esp_release.py versions
       - name: Test firmware size reporting
         run: python3 -m unittest discover -s tools -p 'test_firmware_size_report.py' -v
       - name: Test BL702 OTA release tooling

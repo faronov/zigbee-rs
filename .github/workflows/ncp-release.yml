@@ -2,15 +2,27 @@ name: NCP release
 
 # Tagged ZRHP NCP release: `git tag ncp-v0.1.0 && git push origin ncp-v0.1.0`.
 #
-# The tag must match `examples/esp32-ncp/Cargo.toml` (the version the
-# firmware reports in its app descriptor, SYS_GET_INFO.fw_version and FW_*);
+# The tag must match every NCP version source (`esp_release.py versions`:
+# the ESP32, CC26x2 and EFR32MG24 NCP crates, the EFR32MG24 product crate
+# that sets the Gecko application version, and their Cargo.lock entries);
 # a tag with a suffix (`ncp-v0.2.0-rc.1`) needs the same Cargo version and
-# makes a pre-release. Per board (tools/ncp-release/boards.json) the release
-# carries the full 4 MB flash image, bootloader, partition table, blank
-# otadata, app, the FW_* update file, release-manifest.json (the web
-# flasher's input) and SHA256SUMS. Builds are reproducible from the tag:
-# pinned toolchain and espflash, --locked, no build cache, SOURCE_DATE_EPOCH
-# and ZRHP_BUILD_ID from the commit.
+# makes a pre-release. Per ESP board (tools/ncp-release/boards.json) the
+# release carries the full 4 MB flash image, bootloader, partition table,
+# blank otadata, app and the FW_* update file. It also carries Gecko
+# bootloader images for the SONOFF Dongle Max's EFR32MG24 (the Dongle-M ZRHP
+# NCP GBL and the NV clear GBL; listed under `gecko_images`, never in the
+# web flasher, which cannot reach that chip), release-manifest.json (the web
+# flasher's input) and SHA256SUMS. The hand-written notes come from
+# docs/releases/<tag without pre-release suffix>.md. Builds are
+# reproducible from the tag: pinned toolchains and espflash, --locked, no
+# build cache, SOURCE_DATE_EPOCH and ZRHP_BUILD_ID from the commit (the
+# EFR32MG24 build ID is the image hash, filled in by tools/efr32-gbl).
+#
+# Dry run (`workflow_dispatch`, and pull requests that touch this workflow,
+# tools/ncp-release, docs/releases or the NCP versions): every image is
+# built, checked and described, and the release directory and notes are
+# uploaded as the `ncp-release-dry-run` artifact; nothing is signed,
+# published or deployed.
 #
 # FW_* update files are signed only when the repository secret
 # NCP_FW_SIGNING_KEY (PEM, ECDSA P-256, the key behind
@@ -24,6 +36,16 @@ name: NCP release
 on:
     push:
         tags: ['ncp-v*']
+    workflow_dispatch:
+    pull_request:
+        paths:
+            - .github/workflows/ncp-release.yml
+            - tools/ncp-release/**
+            - docs/releases/**
+            - examples/esp32-ncp/Cargo.toml
+            - examples/cc26x2-ncp/Cargo.toml
+            - examples/efr32mg24-ncp/Cargo.toml
+            - products/efr32mg24/Cargo.toml
 
 permissions:
     contents: read
@@ -35,6 +57,8 @@ concurrency:
 env:
     CARGO_TERM_COLOR: always
     ESP_PHY_RUST_TOOLCHAIN: nightly-2026-08-01
+    # EFR32MG24 images: the toolchain ci.yml builds and tests them with.
+    MG24_RUST_TOOLCHAIN: nightly-2026-03-23
     ESPFLASH_VERSION: 4.5.0
     IMGTOOL_VERSION: 2.4.0
 
@@ -44,6 +68,8 @@ jobs:
         runs-on: ubuntu-latest
         outputs:
             version: ${{ steps.meta.outputs.version }}
+            tag: ${{ steps.meta.outputs.tag }}
+            dry_run: ${{ steps.meta.outputs.dry_run }}
             prerelease: ${{ steps.meta.outputs.prerelease }}
             matrix: ${{ steps.meta.outputs.matrix }}
             epoch: ${{ steps.meta.outputs.epoch }}
@@ -52,19 +78,28 @@ jobs:
             - id: meta
               run: |
                   set -euo pipefail
-                  tag="${GITHUB_REF_NAME}"
-                  version="${tag#ncp-v}"
-                  if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-                    echo "::error::tag $tag is not ncp-vMAJOR.MINOR.PATCH[-PRE]"; exit 1
+                  if [ "$GITHUB_REF_TYPE" = tag ]; then
+                    tag="${GITHUB_REF_NAME}"
+                    version="${tag#ncp-v}"
+                    dry_run=false
+                    if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+                      echo "::error::tag $tag is not ncp-vMAJOR.MINOR.PATCH[-PRE]"; exit 1
+                    fi
+                    python3 tools/ncp-release/esp_release.py versions --expect "$version" \
+                      || { echo "::error::tag $tag does not match the NCP versions (cargo update -p <crate> after a bump)"; exit 1; }
+                  else
+                    version=$(python3 tools/ncp-release/esp_release.py versions)
+                    tag="ncp-v$version"
+                    dry_run=true
+                    echo "::notice::dry run of $tag: nothing is signed, published or deployed"
                   fi
-                  cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' examples/esp32-ncp/Cargo.toml | head -1)
-                  if [ "$cargo_version" != "$version" ]; then
-                    echo "::error::tag $tag but examples/esp32-ncp/Cargo.toml has version $cargo_version"; exit 1
+                  notes="docs/releases/ncp-v${version%%-*}.md"
+                  if [[ "$version" != *-* ]] && [ ! -s "$notes" ]; then
+                    echo "::error::$notes (the release notes) is missing"; exit 1
                   fi
-                  grep -q "^name = \"esp32-ncp\"" examples/esp32-ncp/Cargo.lock
-                  awk '/^name = "esp32-ncp"$/{getline; print}' examples/esp32-ncp/Cargo.lock | grep -qx "version = \"$version\"" \
-                    || { echo "::error::examples/esp32-ncp/Cargo.lock is not at $version (cargo update -p esp32-ncp)"; exit 1; }
                   echo "version=$version" >>"$GITHUB_OUTPUT"
+                  echo "tag=$tag" >>"$GITHUB_OUTPUT"
+                  echo "dry_run=$dry_run" >>"$GITHUB_OUTPUT"
                   echo "prerelease=$([[ "$version" == *-* ]] && echo true || echo false)" >>"$GITHUB_OUTPUT"
                   echo "matrix=$(python3 tools/ncp-release/esp_release.py boards)" >>"$GITHUB_OUTPUT"
                   echo "epoch=$(git log -1 --format=%ct)" >>"$GITHUB_OUTPUT"
@@ -106,6 +141,7 @@ jobs:
                     --stem "zrhp-ncp-${{ matrix.name }}-${{ needs.meta.outputs.version }}" \
                     --out "out/${{ matrix.name }}" --expect-version "${{ needs.meta.outputs.version }}"
             - name: Sign the FW_* update file
+              if: needs.meta.outputs.dry_run != 'true'
               env:
                   NCP_FW_SIGNING_KEY: ${{ secrets.NCP_FW_SIGNING_KEY }}
               run: |
@@ -128,9 +164,60 @@ jobs:
                   path: out/${{ matrix.name }}/
                   if-no-files-found: error
 
+    gecko:
+        # The SONOFF Dongle Max's EFR32MG24 (Dongle-M): only its Gecko
+        # bootloader can install it (UART XMODEM, e.g. the hub's NCP update).
+        name: Dongle-M (EFR32MG24) Gecko images
+        needs: meta
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@master
+              with:
+                  toolchain: ${{ env.MG24_RUST_TOOLCHAIN }}
+                  targets: thumbv8m.main-none-eabihf
+                  components: rust-src
+            - name: Build the Dongle-M ZRHP NCP
+              working-directory: examples/efr32mg24-ncp
+              run: |
+                  cargo +"$MG24_RUST_TOOLCHAIN" build --release --locked \
+                    --no-default-features --features sonoff-dongle-m --target-dir target/dongle-m
+            - name: Package and describe the GBLs
+              env:
+                  VERSION: ${{ needs.meta.outputs.version }}
+              run: |
+                  set -euo pipefail
+                  ELF=examples/efr32mg24-ncp/target/dongle-m/thumbv8m.main-none-eabihf/release/efr32mg24-ncp
+                  python3 examples/efr32mg24-ncp/tools/verify-layout.py --ncp "$ELF"
+                  mkdir -p gbl
+                  cargo +"$MG24_RUST_TOOLCHAIN" run --quiet --locked -p efr32-gbl -- \
+                    app --elf "$ELF" --out gbl/efr32mg24-ncp-sonoff-dongle-m
+                  cargo +"$MG24_RUST_TOOLCHAIN" run --quiet --locked -p efr32-gbl -- \
+                    clear --out gbl/efr32mg24-nv-clear.gbl
+                  for f in gbl/*.gbl; do
+                    cargo +"$MG24_RUST_TOOLCHAIN" run --quiet --locked -p efr32-gbl -- parse "$f"
+                  done
+                  python3 tools/ncp-release/esp_release.py gecko \
+                    --gbl gbl/efr32mg24-ncp-sonoff-dongle-m.gbl --id sonoff-dongle-m-mg24-ncp \
+                    --title "SONOFF Dongle Max (Dongle-M), EFR32MG24: ZRHP NCP" --kind application \
+                    --install "Gecko bootloader (UART XMODEM), e.g. the hub's NCP update; take an EZSP network backup first when it replaces EmberZNet" \
+                    --out out/gecko --expect-version "$VERSION"
+                  python3 tools/ncp-release/esp_release.py gecko \
+                    --gbl gbl/efr32mg24-nv-clear.gbl --id efr32mg24-nv-clear \
+                    --title "EFR32MG24: erase the ZRHP NV window 0x08158000..0x08180000 (way back to EmberZNet)" \
+                    --kind maintenance \
+                    --install "Gecko bootloader (UART XMODEM), before the stock EmberZNet GBL" \
+                    --out out/gecko
+                  cat out/gecko/gecko.json
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: gecko-mg24
+                  path: out/gecko/
+                  if-no-files-found: error
+
     release:
         name: GitHub release
-        needs: [meta, build]
+        needs: [meta, build, gecko]
         runs-on: ubuntu-latest
         permissions:
             contents: write
@@ -143,26 +230,35 @@ jobs:
               with:
                   pattern: ncp-*
                   path: boards
+            - uses: actions/download-artifact@v4
+              with:
+                  name: gecko-mg24
+                  path: gecko/mg24
             - name: Release manifest and checksums
               env:
                   VERSION: ${{ needs.meta.outputs.version }}
+                  TAG: ${{ needs.meta.outputs.tag }}
               run: |
                   set -euo pipefail
                   toolchain=$(jq -cn --arg rust "$ESP_PHY_RUST_TOOLCHAIN" --arg espflash "$ESPFLASH_VERSION" \
-                    '{rust: $rust, espflash: $espflash}')
-                  python3 tools/ncp-release/esp_release.py manifest --dirs boards/ncp-* --out dist \
-                    --tag "$GITHUB_REF_NAME" --version "$VERSION" --commit "$GITHUB_SHA" \
+                    --arg rust_efr32 "$MG24_RUST_TOOLCHAIN" '{rust: $rust, espflash: $espflash, rust_efr32: $rust_efr32}')
+                  python3 tools/ncp-release/esp_release.py manifest --dirs boards/ncp-* --gecko gecko/mg24 --out dist \
+                    --tag "$TAG" --version "$VERSION" --commit "$GITHUB_SHA" \
                     --date "$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)" \
                     --toolchain "$toolchain"
                   ls -l dist
             - name: Release notes
               env:
                   VERSION: ${{ needs.meta.outputs.version }}
+                  TAG: ${{ needs.meta.outputs.tag }}
               run: |
                   set -euo pipefail
                   python3 - <<'EOF' >notes.md
-                  import json, os
+                  import json, os, pathlib
                   m = json.load(open("dist/release-manifest.json"))
+                  written = pathlib.Path(f"docs/releases/ncp-v{m['version'].split('-')[0]}.md")
+                  if written.exists():
+                      print(written.read_text().rstrip() + "\n\n---\n")
                   print(f"ZRHP NCP {m['version']} (ZRHP {m['zrhp']['protocol']}), commit `{m['commit'][:12]}`, build_id `{m['build_id']}`.\n")
                   print("**Web flasher:** https://faronov.github.io/zigbee-rs/flasher/ (Chrome or Edge; updates keep the Zigbee network unless you choose to erase).\n")
                   print("| Board | Chip | Full flash image (offset 0x0, erases the network) | App (update, offset 0x10000) | FW_* update |")
@@ -175,13 +271,33 @@ jobs:
                   print("```\nesptool --chip <esp32h2|esp32c6> --port <PORT> write-flash 0x0 <...-merged.bin>\n```")
                   print("Update keeping the network (also resets `otadata` so the new app in ota_0 boots):")
                   print("```\nesptool --chip <chip> --port <PORT> write-flash 0x0 <...-bootloader.bin> 0x8000 <...-partition-table.bin> 0x9000 <...-otadata-blank.bin> 0x10000 <...-app.bin>\n```")
-                  print("Verify downloads with `SHA256SUMS`. `release-manifest.json` describes every image (offsets, layout, versions).\n")
+                  gecko = m.get("gecko_images", [])
+                  if gecko:
+                      print("\n**SONOFF Dongle Max (EFR32MG24):** Gecko bootloader images, not in the web flasher (the browser cannot reach that chip). "
+                            "Install them through the Gecko bootloader (UART XMODEM), e.g. the hub's NCP update.\n")
+                      print("| Image | File | Writes | Version / build ID |")
+                      print("|---|---|---|---|")
+                      for g in gecko:
+                          writes = ", ".join(f"{p['start']}..{p['end']}" for p in g["program"])
+                          ident = f"{g['app_version']} / `{g['build_id']}`" if g["kind"] == "application" else "maintenance (no application)"
+                          print(f"| {g['title']} | `{g['file']['name']}` | {writes} | {ident} |")
+                  print("\nVerify downloads with `SHA256SUMS`. `release-manifest.json` describes every image (offsets, layout, versions).\n")
                   EOF
-                  prev=$(git tag --list 'ncp-v*' --sort=-v:refname | grep -vx "$GITHUB_REF_NAME" | head -1 || true)
+                  prev=$(git tag --list 'ncp-v*' --sort=-v:refname | grep -vx "$TAG" | head -1 || true)
                   echo "previous tag: ${prev:-none}"
                   echo "prev=$prev" >>"$GITHUB_ENV"
                   cat notes.md
+            - name: Dry run result
+              if: needs.meta.outputs.dry_run == 'true'
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ncp-release-dry-run
+                  path: |
+                      dist/
+                      notes.md
+                  if-no-files-found: error
             - name: Publish
+              if: needs.meta.outputs.dry_run != 'true'
               env:
                   GH_TOKEN: ${{ github.token }}
                   PRERELEASE: ${{ needs.meta.outputs.prerelease }}
@@ -192,6 +308,7 @@ jobs:
                   [ "$PRERELEASE" = true ] && args+=(--prerelease)
                   gh release create "$GITHUB_REF_NAME" "${args[@]}" dist/*
             - name: Rebuild the web flasher
+              if: needs.meta.outputs.dry_run != 'true'
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
