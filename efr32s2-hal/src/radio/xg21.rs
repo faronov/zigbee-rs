@@ -482,3 +482,42 @@ pub(super) fn tx_done() {
 /// The driver writes [`DEVINFO_IRCAL`] when it is programmed (appended so
 /// the line numbers above stay unchanged).
 pub(super) const DEVINFO_IRCAL_APPLIES: bool = true;
+
+/// `TIMER0_IRQn` (GSDK 4.5.0 `IRQn_Type`).
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+pub(super) const TIMER0_IRQN: u32 = 6;
+
+/// The xG21 ramp has no pre-stage.
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+pub(super) const PA_PRESTAGE_US: u32 = 0;
+/// Time from [`pa_ramp_start`] to a steady PA: a full ramp takes about
+/// 20 us (`MODEM.RAMPCTRL` = `0x679`).
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+pub(super) const PA_RAMP_LEAD_US: u32 = 24;
+
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+#[inline(always)]
+pub(super) fn pa_prestage() {}
+
+/// [`pa_ramp_up`] up to its wait: returns the ramp's cycle stamp for
+/// [`pa_ramp_finish`].
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+pub(super) fn pa_ramp_start() -> u32 {
+    let started = crate::delay::cycles();
+    unsafe { write(RAC_PAENCTRL, PAENCTRL_PARAMP) };
+    set_bits(RAC_APC, APC_ENAPCSW, true);
+    set_bits(RAC_TX, TX_PAENPAOUT, true);
+    set_bits(RAC_PACTRL, PACTRL_PAENPOWERRAMPINGCLK, true);
+    started
+}
+
+/// The rest of [`pa_ramp_up`] for a ramp started at `started`.
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+pub(super) fn pa_ramp_finish(started: u32) {
+    let limit = crate::delay::us_to_cycles(PA_RAMP_US);
+    while unsafe { read(RAC_RFSTATUS) } & RFSTATUS_MODRAMPUPDONE == 0
+        && crate::delay::cycles().wrapping_sub(started) < limit
+    {}
+    set_bits(RAC_PACTRL, PACTRL_PAENPOWERRAMPINGCLK, false);
+    set_bits(RAC_APC, APC_ENAPCSW, false);
+}

@@ -9,6 +9,10 @@
 //! It stops in EM2/EM3 like the DWT would: use it for the radio's
 //! sub-millisecond timing (ACK turnaround, CSMA backoff, ACK wait), not as a
 //! wall clock across deep sleep. This module owns TIMER0.
+//!
+//! With `isr-ack`, compare channel 2 is the radio's step [`alarm`]: the
+//! `TIMER0` interrupt at a cycle stamp, which times the interrupt-driven
+//! Imm-Ack (`radio::isr_ack`).
 
 const CMU_EM01GRPACLKCTRL: u32 = 0x4000_8120;
 const EM01GRPACLK_HFXO: u32 = 2;
@@ -19,6 +23,12 @@ const TIMER_STATUS: u32 = TIMER0 + 0x10;
 const TIMER_TOP: u32 = TIMER0 + 0x1C;
 const TIMER_CNT: u32 = TIMER0 + 0x24;
 const TIMER_EN: u32 = TIMER0 + 0x30;
+/// `CC[2].CFG` (`CC[n]` at `0x60 + 0x20 * n`, the same on xG21/xG22/xG24).
+#[cfg(feature = "isr-ack")]
+const TIMER_CC2_CFG: u32 = TIMER0 + 0xA0;
+/// `CC_CFG.MODE` = `OUTPUTCOMPARE` (no pin action: `CC_CTRL` stays at reset).
+#[cfg(feature = "isr-ack")]
+const CC_CFG_OUTPUTCOMPARE: u32 = 2;
 const TIMER_CMD_START: u32 = 1;
 const TIMER_STATUS_RUNNING: u32 = 1;
 const TIMER_STATUS_SYNCBUSY: u32 = 1 << 6;
@@ -38,7 +48,14 @@ pub fn enable_cycle_counter() {
         use core::ptr::{read_volatile as rd, write_volatile as wr};
         // Unclocked peripheral access bus-faults on Series 2: clock first.
         crate::clock::enable_bus_clock(crate::chip::BusClock::TIMER0);
-        if rd(TIMER_EN as *const u32) & 1 != 0
+        // The channel configuration is only writable with the timer
+        // disabled, so a running timer without the alarm channel restarts.
+        #[cfg(feature = "isr-ack")]
+        let configured = rd(TIMER_CC2_CFG as *const u32) == CC_CFG_OUTPUTCOMPARE;
+        #[cfg(not(feature = "isr-ack"))]
+        let configured = true;
+        if configured
+            && rd(TIMER_EN as *const u32) & 1 != 0
             && rd(TIMER_STATUS as *const u32) & TIMER_STATUS_RUNNING != 0
         {
             return;
@@ -46,6 +63,8 @@ pub fn enable_cycle_counter() {
         wr(CMU_EM01GRPACLKCTRL as *mut u32, EM01GRPACLK_HFXO);
         wr(TIMER_EN as *mut u32, 0);
         wr(TIMER_CFG as *mut u32, 0); // up-count, DIV1, HFXO-derived
+        #[cfg(feature = "isr-ack")]
+        wr(TIMER_CC2_CFG as *mut u32, CC_CFG_OUTPUTCOMPARE);
         wr(TIMER_EN as *mut u32, 1);
         wr(TIMER_TOP as *mut u32, u32::MAX);
         while rd(TIMER_STATUS as *const u32) & TIMER_STATUS_SYNCBUSY != 0 {}
@@ -152,6 +171,63 @@ impl embedded_hal::delay::DelayNs for Delay {
             let step = remaining.min(10_000_000);
             spin_cycles(us_to_cycles(step));
             remaining -= step;
+        }
+    }
+}
+
+/// Compare channel 2 of the time base as a one-shot alarm: the `TIMER0`
+/// interrupt (handled by `radio::isr_ack`) once the counter reaches a
+/// cycle stamp. Shared with that handler only, which runs with the radio's
+/// interrupt lines masked by the same lock.
+#[cfg(feature = "isr-ack")]
+pub(crate) mod alarm {
+    use super::TIMER0;
+
+    const TIMER_IF: u32 = TIMER0 + 0x14;
+    const TIMER_IEN: u32 = TIMER0 + 0x18;
+    const TIMER_CC2_OC: u32 = TIMER0 + 0xA8;
+    const IF_CC2: u32 = 1 << 6;
+    const SET: u32 = 0x1000;
+    const CLR: u32 = 0x2000;
+
+    /// Raise the interrupt at cycle `at`, or at once if `at` is (about to
+    /// be) past: the channel matches `CNT == OC` exactly, so a stamp the
+    /// counter passes before the write lands would otherwise wait a full
+    /// counter wrap.
+    pub(crate) fn set(at: u32) {
+        #[cfg(all(target_arch = "arm", target_os = "none"))]
+        unsafe {
+            use core::ptr::write_volatile as wr;
+            wr(TIMER_CC2_OC as *mut u32, at);
+            wr((TIMER_IF + CLR) as *mut u32, IF_CC2);
+            wr((TIMER_IEN + SET) as *mut u32, IF_CC2);
+            if at.wrapping_sub(super::cycles()) as i32 <= LEAD as i32 {
+                wr((TIMER_IF + SET) as *mut u32, IF_CC2);
+            }
+        }
+        #[cfg(not(all(target_arch = "arm", target_os = "none")))]
+        let _ = at;
+    }
+
+    /// Cycles ahead of a stamp below which [`set`] raises the interrupt at
+    /// once (the handler then waits out the rest).
+    pub(crate) const LEAD: u32 = super::CYCLES_PER_10_US / 5;
+
+    /// Disarm and drop a pending match.
+    pub(crate) fn clear() {
+        #[cfg(all(target_arch = "arm", target_os = "none"))]
+        unsafe {
+            use core::ptr::write_volatile as wr;
+            wr((TIMER_IEN + CLR) as *mut u32, IF_CC2);
+            wr((TIMER_IF + CLR) as *mut u32, IF_CC2);
+        }
+    }
+
+    /// In the handler: acknowledge the match.
+    pub(crate) fn acknowledge() {
+        #[cfg(all(target_arch = "arm", target_os = "none"))]
+        unsafe {
+            core::ptr::write_volatile((TIMER_IF + CLR) as *mut u32, IF_CC2);
         }
     }
 }

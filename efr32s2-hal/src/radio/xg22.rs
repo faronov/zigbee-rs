@@ -351,3 +351,27 @@ pub(super) fn tx_done() {
 /// The driver writes [`DEVINFO_IRCAL`] when it is programmed (appended so
 /// the line numbers above stay unchanged).
 pub(super) const DEVINFO_IRCAL_APPLIES: bool = true;
+
+/// `TIMER0_IRQn` (GSDK 4.5.0 `IRQn_Type`).
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+pub(super) const TIMER0_IRQN: u32 = 7;
+
+/// No PA pre-stage or CPU ramp on this die (see [`PA_RAMP_IN_TXPD`]).
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+pub(super) const PA_PRESTAGE_US: u32 = 0;
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+pub(super) const PA_RAMP_LEAD_US: u32 = 0;
+
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+#[inline(always)]
+pub(super) fn pa_prestage() {}
+
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+#[inline(always)]
+pub(super) fn pa_ramp_start() -> u32 {
+    0
+}
+
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+#[inline(always)]
+pub(super) fn pa_ramp_finish(_started: u32) {}
