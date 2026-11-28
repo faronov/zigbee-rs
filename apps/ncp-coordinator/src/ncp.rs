@@ -972,7 +972,11 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                     child_polls && request.host_caps & host_caps::CHILD_POLL_EVENTS != 0,
                     ms_of(now_us),
                 );
-                let capacities = [
+                // `NWK_SET_TX_POWER` clamps to the platform's range.
+                let tx_power_range = platform
+                    .tx_power_step(i8::MIN)
+                    .zip(platform.tx_power_step(i8::MAX));
+                let mut capacities = [
                     Capacity {
                         id: capacity::MAX_APS_INFLIGHT,
                         value: MAX_APS_INFLIGHT as u32,
@@ -1039,12 +1043,27 @@ impl<const LOG_N: usize> Ncp<LOG_N> {
                         id: capacity::HOST_RESPONSE_BYTES,
                         value: HOST_RESPONSE_BYTES as u32,
                     },
+                    // Filled below when the power is settable.
+                    Capacity { id: 0, value: 0 },
+                    Capacity { id: 0, value: 0 },
                 ];
+                let mut listed = capacities.len() - 2;
+                if let Some((min, max)) = tx_power_range {
+                    capacities[listed] = Capacity {
+                        id: capacity::TX_POWER_MIN_DBM,
+                        value: i32::from(min) as u32,
+                    };
+                    capacities[listed + 1] = Capacity {
+                        id: capacity::TX_POWER_MAX_DBM,
+                        value: i32::from(max) as u32,
+                    };
+                    listed += 2;
+                }
                 let response = SysNegotiateRsp {
                     major: MAJOR,
                     minor: MINOR,
                     ncp_caps,
-                    capacities: List::new(&capacities),
+                    capacities: List::new(&capacities[..listed]),
                     fw: Bytes8(state.identity.fw_version.as_bytes()),
                     build_id: state.identity.build_id,
                     chip: state.identity.chip,

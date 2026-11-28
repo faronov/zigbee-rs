@@ -38,7 +38,6 @@ use efr32s2_hal::reset::take_reset_cause;
 use embassy_executor::Spawner;
 use embassy_time::{Instant, Timer};
 use ncp_coordinator_app::log_ring::level_code;
-use ncp_coordinator_app::platform::NoPlatform;
 use ncp_coordinator_app::tc::TcPort;
 use ncp_coordinator_app::{LogRing, Ncp, NcpIdentity, PlatformRequest};
 use product::board::resources::BoardResources;
@@ -372,7 +371,7 @@ fn new_ncp(
 }
 
 async fn run(ncp: &mut Ncp<LOG_RECORDS>, host: &mut Host, port: &mut Port) -> ! {
-    let mut platform = NoPlatform;
+    let mut platform = product::platform::Mg24Platform;
     loop {
         // After every stack step: a poisoned Secure Engine never recovers
         // without a reset, and the NCP cannot form or key a network
@@ -421,7 +420,7 @@ async fn run(ncp: &mut Ncp<LOG_RECORDS>, host: &mut Host, port: &mut Port) -> ! 
 #[inline(never)]
 fn fatal_reset(ncp: &mut Ncp<LOG_RECORDS>, host: &mut Host, port: &mut Port, fatal: Fatal) -> ! {
     log::error!("fatal: {:?}; controlled reset", fatal);
-    let mut platform = NoPlatform;
+    let mut platform = product::platform::Mg24Platform;
     let started = Instant::now();
     while started.elapsed().as_millis() < FATAL_REPORT_MS {
         let _ = ncp.service_with(now_us(), host, port, &mut platform, &LOG);

@@ -381,6 +381,10 @@ fn host_negotiates_forms_reads_counters_and_sends_data() {
     assert_ne!(negotiated.ncp_caps & caps::KEY_EXPORT, 0);
     assert_ne!(negotiated.ncp_caps & caps::BACKUP_RESTORE, 0);
     assert_eq!(negotiated.ncp_caps & caps::NCP_FW_UPDATE, 0, "NoPlatform");
+    // No settable TX power: no range capacities either.
+    assert_eq!(negotiated.ncp_caps & caps::TX_POWER, 0, "NoPlatform");
+    assert_eq!(negotiated.capacity(20), None, "tx_power_min_dbm");
+    assert_eq!(negotiated.tx_power_range(), None);
     assert_eq!(negotiated.capacity(1), Some(16), "max_aps_inflight");
     assert_eq!(negotiated.capacity(7), Some(0x400), "fc_stride");
     // `ncp-capacity` table sizes (spec 8.9), halved by `compact`.
