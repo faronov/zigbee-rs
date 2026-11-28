@@ -29,6 +29,7 @@ extern crate alloc;
     feature = "esp-parent",
     feature = "cc26x2",
     feature = "nrf-isr-phy",
+    feature = "bl702",
     test
 ))]
 pub mod ack_pending;
