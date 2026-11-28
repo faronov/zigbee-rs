@@ -60,6 +60,12 @@
 //!   [`AnomalyRecord`] a product may persist and expose.
 //! - Construction rejects a device whose runtime automatic parent polling is
 //!   still enabled, so the bounded manual poll window has exactly one owner.
+//! - Network activity keeps the poll fast: every unicast APS data frame the
+//!   parent delivers and every Device_annce retry (re)opens a window of
+//!   `SensorPolicy::activity_fast_ms`, so a hub's sequential interview
+//!   proceeds at the fast cadence even after the join window has closed.
+//!   The windows the device opens on its own share an hourly budget
+//!   (`RecoveryPolicy::fast_poll_budget_ms`).
 
 use zigbee_mac::MacDriver;
 use zigbee_runtime::event_loop::{StackEvent, StartError, TickResult};
@@ -70,7 +76,7 @@ use zigbee_zcl::ClusterId;
 use zigbee_zcl::clusters::poll_control::{CMD_CHECK_IN, FastPollEvent};
 use zigbee_zcl::foundation::reporting::ReportDirection;
 
-use crate::anomaly::{AnomalyReason, AnomalyRecord, AwakeBound, BoundStep};
+use crate::anomaly::{AnomalyReason, AnomalyRecord, AwakeBound, BoundStep, FastPollBudget};
 use crate::battery::BatterySource;
 use crate::capabilities::{
     SensorStatus, StatusSink, Supervisor, WaitRequest, WakeController, WakeReason,
@@ -122,6 +128,10 @@ where
     /// expires so a narrow platform counter cannot make an old start mark
     /// look recent again after rollover.
     fast_poll: Option<(R::Mark, u32)>,
+    /// Fast-poll window kept open by network activity `(start, duration)`
+    /// (see [`SensorPolicy::activity_fast_ms`]); every unicast APS data
+    /// frame from the parent and every Device_annce restarts it.
+    activity_fast: Option<(R::Mark, u32)>,
     /// Last bounded MAC poll window; `None` until the first one runs.
     last_poll: Option<R::Mark>,
     /// Delay applied after the next failed unjoined commissioning attempt.
@@ -159,6 +169,8 @@ where
     ota_bound: AwakeBound,
     identify_bound: AwakeBound,
     fast_bound: AwakeBound,
+    /// Hourly budget of the timed and activity windows.
+    fast_budget: FastPollBudget,
     /// When the budgets were last advanced (once per joined wait request).
     last_bound_check: R::Mark,
     /// Parent-loss strikes from bounded pending work and missed reports
@@ -238,6 +250,7 @@ where
             last_report: now,
             last_tick: now,
             fast_poll: None,
+            activity_fast: None,
             last_poll: None,
             join_backoff_ms: policy.join_retry_ms,
             join_wait_ms: 0,
@@ -258,6 +271,7 @@ where
             ota_bound: AwakeBound::default(),
             identify_bound: AwakeBound::default(),
             fast_bound: AwakeBound::default(),
+            fast_budget: FastPollBudget::default(),
             last_bound_check: now,
             active_bound_strikes: 0,
             report_proof_ms: 0,
@@ -387,11 +401,43 @@ where
         W::elapsed_ms(self.mark(), since)
     }
 
+    /// Open (or replace) the timed fast-poll window, unless the hourly
+    /// fast-poll budget is exhausted.
     fn start_fast_poll(&mut self, duration_ms: u32) {
-        self.fast_poll = Some((self.mark(), duration_ms));
+        if self.fast_budget.allows() {
+            self.fast_poll = Some((self.mark(), duration_ms));
+        }
     }
 
-    /// Remaining time in the timed fast-poll window, clearing it on expiry.
+    /// Network activity: a unicast APS data frame arrived or a Device_annce
+    /// went out. Keep polling fast until
+    /// [`activity_fast_ms`](SensorPolicy::activity_fast_ms) after it, so a
+    /// peer's next request in a sequential exchange (a hub interview) waits
+    /// one fast poll at the parent instead of one slow poll.
+    fn note_network_activity(&mut self) {
+        let duration_ms = self.policy.activity_fast_ms;
+        if duration_ms == 0 || !self.fast_budget.allows() {
+            return;
+        }
+        if self.fast_poll_remaining_ms().is_none() {
+            self.resources
+                .diagnostics
+                .record(DiagnosticEvent::FastPollStarted { duration_ms });
+        }
+        self.activity_fast = Some((self.mark(), duration_ms));
+    }
+
+    /// Whether an OTA session holds the fast poll.
+    fn ota_session_active(&self) -> bool {
+        O::ENABLED && self.resources.ota.is_active(self.node.profile())
+    }
+
+    /// Consume the runtime's record of an inbound unicast APS data frame.
+    fn take_inbound_unicast(&mut self) -> bool {
+        self.node.device_mut().power_mut().take_inbound_unicast()
+    }
+
+    /// Remaining time in the fast-poll windows, clearing expired ones.
     ///
     /// Called on every service iteration (through
     /// [`next_wait_ms`](Self::next_wait_ms)), so an expired window is dropped
@@ -399,11 +445,15 @@ where
     fn fast_poll_remaining_ms(&mut self) -> Option<u32> {
         let now = self.mark();
         let timed = Self::window_remaining_ms(now, &mut self.fast_poll);
+        let activity = Self::window_remaining_ms(now, &mut self.activity_fast);
         let requested = Self::window_remaining_ms(now, &mut self.poll_control_fast);
-        match (timed, requested) {
-            (Some(timed), Some(requested)) => Some(timed.max(requested)),
-            (timed, requested) => timed.or(requested),
-        }
+        [timed, activity, requested].into_iter().flatten().max()
+    }
+
+    /// Whether a window charged to the hourly budget is open (expired ones
+    /// are cleared by [`fast_poll_remaining_ms`](Self::fast_poll_remaining_ms)).
+    const fn budgeted_window_open(&self) -> bool {
+        self.fast_poll.is_some() || self.activity_fast.is_some()
     }
 
     fn window_remaining_ms(now: W::Mark, window: &mut Option<(W::Mark, u32)>) -> Option<u32> {
@@ -451,10 +501,17 @@ where
         self.slow_poll_ms = slow_ms;
         self.fast_poll_ms = fast_ms;
         match event {
+            // A client's explicit decision governs the fast poll: the
+            // activity window its own Check-in Response or Fast Poll Stop
+            // opened must not extend it (later frames reopen one).
             Some(FastPollEvent::Start { timeout_qs }) => {
                 self.poll_control_fast = Some((now, u32::from(timeout_qs) * QS_MS));
+                self.activity_fast = None;
             }
-            Some(FastPollEvent::Stop) => self.poll_control_fast = None,
+            Some(FastPollEvent::Stop) => {
+                self.poll_control_fast = None;
+                self.activity_fast = None;
+            }
             None => {}
         }
         if check_in_ms == 0 {
@@ -556,6 +613,7 @@ where
         self.fallback_rejoin_due = false;
         self.network_up = false;
         self.fast_poll = None;
+        self.activity_fast = None;
         self.run_again = None;
         self.reset_join_backoff();
         self.resources.status.set(SensorStatus::Off);
@@ -709,6 +767,10 @@ where
             .status
             .set(SensorStatus::Joined { active: true });
         self.start_fast_poll(self.policy.fresh_join_fast_ms);
+        // The join window covers the first exchanges; frames the join itself
+        // carried are not activity of the new network session.
+        self.activity_fast = None;
+        let _ = self.take_inbound_unicast();
         self.last_tick = now;
         self.last_poll = None;
         self.network_up = true;
@@ -779,7 +841,7 @@ where
             step => step.allows(),
         };
 
-        let ota = O::ENABLED && self.resources.ota.is_active(self.node.profile());
+        let ota = self.ota_session_active();
         let ota = match self
             .ota_bound
             .step(ota, delta_ms, recovery.max_ota_awake_ms)
@@ -806,14 +868,27 @@ where
                 step => step.allows(),
             };
 
-        let windows_closed = self
+        let mut windows_closed = self
             .fast_bound
             .step(windows, delta_ms, recovery.max_fast_poll_ms)
             == BoundStep::Fired;
         if windows_closed {
             self.fast_poll = None;
+            self.activity_fast = None;
             self.poll_control_fast = None;
             self.fast_bound.reset();
+            self.note_anomaly(AnomalyReason::FastPoll);
+        }
+        // The hourly budget closes only the windows charged to it; a Poll
+        // Control client's fast poll keeps its own bound.
+        let budgeted = self.budgeted_window_open();
+        if self
+            .fast_budget
+            .step(budgeted, delta_ms, recovery.fast_poll_budget_ms)
+        {
+            self.fast_poll = None;
+            self.activity_fast = None;
+            windows_closed = true;
             self.note_anomaly(AnomalyReason::FastPoll);
         }
         (pending, ota, identifying, windows_closed)
@@ -1160,6 +1235,8 @@ where
         self.interview_done = false;
         self.node.reset_remote_reporting();
         let joined = self.node.device().is_joined();
+        // Frames of the join or resume above are not network activity.
+        let _ = self.take_inbound_unicast();
         self.was_fast_polling = joined;
         self.was_identifying = false;
         self.identify_phase_on = false;
@@ -1330,6 +1407,9 @@ where
                         },
                     );
                     self.start_fast_poll(self.policy.interview_complete_grace_ms);
+                    // The short grace replaces the activity window this
+                    // Configure Reporting opened; later frames reopen it.
+                    self.activity_fast = None;
                     self.interview_done = true;
                     self.resources
                         .status
@@ -1494,6 +1574,14 @@ where
                         Ok(event) => event,
                         Err(error) => self.node_failure(error),
                     };
+                    // Before the event: an interview completion or a leave
+                    // handled below overrides the activity window. An OTA
+                    // session holds the fast poll itself (bounded by
+                    // `max_ota_awake_ms`); its blocks are not activity.
+                    let activity = self.take_inbound_unicast() && !self.ota_session_active();
+                    if activity {
+                        self.note_network_activity();
+                    }
                     if let Some(event) = &event {
                         // Matches the original firmware's early `break`: a
                         // rejoin/leave/factory-reset event stops this
@@ -1507,6 +1595,12 @@ where
                         );
                         if self.handle_control_event(event).await {
                             self.start_fast_poll(self.policy.fresh_join_fast_ms);
+                        }
+                        // A session this frame started (an Image Notify)
+                        // holds the fast poll from now on, and leaves no
+                        // activity tail when it ends.
+                        if activity && self.ota_session_active() {
+                            self.activity_fast = None;
                         }
                         if recommission {
                             break;
@@ -1631,6 +1725,9 @@ where
             self.checkpoint_security();
             let _ = self.node.device_mut().send_device_annce().await;
             self.checkpoint_security();
+            // A coordinator that hears the announcement starts talking to
+            // this device now.
+            self.note_network_activity();
         }
 
         self.check_parent_loss().await;
@@ -1675,6 +1772,7 @@ where
             // one immediate attempt, so continue with the backoff.
             self.network_up = false;
             self.fast_poll = None;
+            self.activity_fast = None;
             if !self.awaiting_button {
                 self.reset_join_backoff();
                 self.schedule_join_backoff();
@@ -1787,7 +1885,14 @@ where
             if let Some(watchdog_ms) = self.resources.supervisor.max_wait_ms() {
                 wait_ms = shorten(wait_ms, watchdog_ms);
             }
-            self.last_bound_check = self.mark();
+            // Unjoined time refills the fast-poll budget.
+            let now = self.mark();
+            self.fast_budget.step(
+                false,
+                W::elapsed_ms(now, self.last_bound_check),
+                self.policy.recovery.fast_poll_budget_ms,
+            );
+            self.last_bound_check = now;
             return (wait_ms.max(1), false, self.policy.slow_sleep_depth);
         }
 
@@ -1796,7 +1901,9 @@ where
         let (pending_protocol_work, ota_active, identifying, windows_closed) =
             self.apply_awake_bounds(now, fast_poll_remaining_ms.is_some());
         if windows_closed {
-            fast_poll_remaining_ms = None;
+            // What a fired bound left open (a Poll Control client's window
+            // survives an exhausted hourly budget).
+            fast_poll_remaining_ms = self.fast_poll_remaining_ms();
         }
         let in_fast_poll =
             fast_poll_remaining_ms.is_some() || identifying || ota_active || pending_protocol_work;

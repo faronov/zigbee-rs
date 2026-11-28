@@ -39,6 +39,7 @@ pub mod reset_cause;
 
 pub use anomaly::{
     ANOMALY_RECORD_LEN, AnomalyJournal, AnomalyReason, AnomalyRecord, AwakeBound, BoundStep,
+    FAST_POLL_BUDGET_PERIOD_MS, FastPollBudget,
 };
 pub use app::{FindingBindingTargetError, SensorApp, SensorAppError, SensorLifecycleError};
 pub use battery::{

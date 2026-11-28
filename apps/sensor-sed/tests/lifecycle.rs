@@ -68,6 +68,9 @@ const BASE_POLICY: SensorPolicy = SensorPolicy {
     announce_retries: 0,
     secure_rejoin_failure_limit: 2,
     interview_complete_grace_ms: 5,
+    // Off in the scripted tests (their wait sequences predate it); the
+    // activity tests below enable it.
+    activity_fast_ms: 0,
     button: ButtonPolicy {
         long_press_ms: None,
         debounce_ms: 1,
@@ -95,6 +98,7 @@ const DETERMINISTIC_RECOVERY: sensor_sed_app::RecoveryPolicy = sensor_sed_app::R
     max_ota_awake_ms: 0,
     max_identify_awake_ms: 0,
     max_fast_poll_ms: 0,
+    fast_poll_budget_ms: 0,
     missed_report_grace_ms: 0,
     sleep_failure_limit: 0,
 };
@@ -4567,4 +4571,864 @@ fn trigger_effect_blinks_until_it_ends_or_is_stopped() {
         "Stop ended the effect: {:?}",
         run.status
     );
+}
+
+// ── Hub interview simulation ────────────────────────────────────────────
+
+/// A ZDO request from the coordinator (profile 0, endpoint 0).
+fn zdo_request_frame(cluster_id: u16, payload: &[u8], frame_counter: u32) -> MacFrame {
+    let aps_header = ApsHeader {
+        frame_control: ApsFrameControl {
+            frame_type: ApsFrameType::Data as u8,
+            delivery_mode: ApsDeliveryMode::Unicast as u8,
+            ..Default::default()
+        },
+        dst_endpoint: Some(0),
+        cluster_id: Some(cluster_id),
+        profile_id: Some(0x0000),
+        src_endpoint: Some(0),
+        aps_counter: frame_counter as u8,
+        ..Default::default()
+    };
+    let mut aps = [0u8; 96];
+    let aps_len = aps_header.serialize(&mut aps);
+    aps[aps_len..aps_len + payload.len()].copy_from_slice(payload);
+    secured_nwk_frame(
+        NwkFrameType::Data,
+        OLD_SHORT,
+        COORDINATOR,
+        None,
+        None,
+        frame_counter,
+        frame_counter as u8,
+        &aps[..aps_len + payload.len()],
+    )
+}
+
+/// ZCL Read Attributes (global 0x00, client to server).
+fn read_attributes_frame(
+    cluster_id: ClusterId,
+    attributes: &[u16],
+    frame_counter: u32,
+) -> MacFrame {
+    let frame_control = ZclFrameHeader::build_frame_control(
+        ZclFrameType::Global,
+        false,
+        ClusterDirection::ClientToServer,
+        false,
+    );
+    let payload: Vec<u8> = attributes
+        .iter()
+        .flat_map(|attribute| attribute.to_le_bytes())
+        .collect();
+    zcl_data_frame(
+        cluster_id,
+        frame_control,
+        frame_counter as u8,
+        0x00,
+        &payload,
+        frame_counter,
+    )
+}
+
+/// The coordinator's APS acknowledgement of `acked` (a data frame the
+/// device sent with the ACK request bit).
+fn aps_ack_frame(acked: &ApsHeader, frame_counter: u32) -> MacFrame {
+    let header = ApsHeader {
+        frame_control: ApsFrameControl {
+            frame_type: ApsFrameType::Ack as u8,
+            delivery_mode: ApsDeliveryMode::Unicast as u8,
+            ..Default::default()
+        },
+        dst_endpoint: acked.src_endpoint,
+        cluster_id: acked.cluster_id,
+        profile_id: acked.profile_id,
+        src_endpoint: acked.dst_endpoint,
+        aps_counter: acked.aps_counter,
+        ..Default::default()
+    };
+    let mut aps = [0u8; 32];
+    let aps_len = header.serialize(&mut aps);
+    secured_nwk_frame(
+        NwkFrameType::Data,
+        OLD_SHORT,
+        COORDINATOR,
+        None,
+        None,
+        frame_counter,
+        frame_counter as u8,
+        &aps[..aps_len],
+    )
+}
+
+/// APS header of a NWK data frame the device transmitted.
+fn transmitted_aps_header(bytes: &[u8]) -> Option<ApsHeader> {
+    let (nwk, nwk_len) = NwkHeader::parse(bytes)?;
+    if nwk.frame_control.frame_type != NwkFrameType::Data as u8 || !nwk.frame_control.security {
+        return None;
+    }
+    let (security_header, security_len) = NwkSecurityHeader::parse(&bytes[nwk_len..])?;
+    let aad_len = nwk_len + security_len;
+    let mut aad = [0u8; 64];
+    aad[..aad_len].copy_from_slice(&bytes[..aad_len]);
+    aad[nwk_len] = (aad[nwk_len] & !0x07) | 0x05;
+    let plaintext = NwkSecurity::new().decrypt(
+        &aad[..aad_len],
+        &bytes[aad_len..],
+        &NETWORK_KEY,
+        &security_header,
+    )?;
+    ApsHeader::parse(&plaintext).map(|(header, _)| header)
+}
+
+/// One hub request, built with the coordinator's next NWK frame counter.
+type HubRequest = Box<dyn Fn(u32) -> MacFrame>;
+
+/// The requests of a typical hub interview of this sensor, in order:
+/// descriptors, Basic and Power Configuration reads, reporting
+/// configuration, and the initial measurement reads (twelve exchanges).
+fn hub_interview_requests() -> Vec<HubRequest> {
+    let [lo, hi] = OLD_SHORT.0.to_le_bytes();
+    vec![
+        Box::new(move |fc| zdo_request_frame(0x0002, &[fc as u8, lo, hi], fc)),
+        Box::new(move |fc| zdo_request_frame(0x0005, &[fc as u8, lo, hi], fc)),
+        Box::new(move |fc| zdo_request_frame(0x0004, &[fc as u8, lo, hi, 1], fc)),
+        Box::new(|fc| read_attributes_frame(ClusterId::BASIC, &[0x0004, 0x0005], fc)),
+        Box::new(|fc| read_attributes_frame(ClusterId::BASIC, &[0x0007, 0x0000], fc)),
+        Box::new(|fc| read_attributes_frame(ClusterId::BASIC, &[0x4000], fc)),
+        Box::new(|fc| read_attributes_frame(ClusterId::POWER_CONFIG, &[0x0020, 0x0021], fc)),
+        Box::new(|fc| {
+            configure_reporting_frame(
+                ClusterId::TEMPERATURE,
+                0x0000,
+                0x29,
+                &1i16.to_le_bytes(),
+                fc,
+            )
+        }),
+        Box::new(|fc| {
+            configure_reporting_frame(ClusterId::HUMIDITY, 0x0000, 0x21, &1u16.to_le_bytes(), fc)
+        }),
+        Box::new(|fc| configure_reporting_frame(ClusterId::POWER_CONFIG, 0x0021, 0x20, &[1], fc)),
+        Box::new(|fc| read_attributes_frame(ClusterId::TEMPERATURE, &[0x0000], fc)),
+        Box::new(|fc| read_attributes_frame(ClusterId::HUMIDITY, &[0x0000], fc)),
+    ]
+}
+
+/// Wake controller that also plays the hub and the parent's indirect queue.
+///
+/// The hub sends one request at a time: the next one reaches the parent
+/// `latency_ms` after the device fetched (and, in the same service
+/// iteration, answered) the previous one. The coordinator acknowledges
+/// every device frame that requests an APS ACK at once. The parent holds
+/// both until the device polls. Time advances only by the waits the device
+/// requests.
+struct HubWake<'a> {
+    now: u32,
+    requests: std::collections::VecDeque<HubRequest>,
+    next_ready_at: Option<u32>,
+    latency_ms: u32,
+    /// The coordinator's next NWK frame counter.
+    frame_counter: u32,
+    /// Frames queued at the parent so far, and the queue position of the
+    /// outstanding request.
+    queued: usize,
+    outstanding: Option<usize>,
+    /// When each request reached the parent and when the device fetched it.
+    ready: &'a RefCell<Vec<u32>>,
+    delivered: &'a RefCell<Vec<u32>>,
+    waits: &'a RefCell<Vec<(u32, WaitRequest)>>,
+}
+
+impl HubWake<'_> {
+    fn queue(&mut self, mac: &mut MockMac, frame: MacFrame) -> usize {
+        self.frame_counter += 1;
+        mac.enqueue_poll_response(frame);
+        self.queued += 1;
+        self.queued - 1
+    }
+}
+
+impl WakeController<MockMac> for HubWake<'_> {
+    type Mark = u32;
+    type Error = WaitFailure;
+
+    fn is_recoverable(error: &WaitFailure) -> bool {
+        error.recoverable
+    }
+
+    fn error_code(error: &WaitFailure) -> u32 {
+        error.code
+    }
+
+    fn mark(&self) -> u32 {
+        self.now
+    }
+
+    fn add_ms(mark: u32, duration_ms: u32) -> u32 {
+        mark.wrapping_add(duration_ms)
+    }
+
+    fn elapsed_ms(later: u32, earlier: u32) -> u32 {
+        later.wrapping_sub(earlier)
+    }
+
+    async fn wait(
+        &mut self,
+        mac: &mut MockMac,
+        request: WaitRequest,
+    ) -> Result<WakeReason, WaitFailure> {
+        self.waits.borrow_mut().push((self.now, request));
+        // The device polled right after the previous wait: a fetched request
+        // was answered then.
+        let fetched = self.queued - mac.queued_poll_responses();
+        if let Some(position) = self.outstanding
+            && fetched > position
+        {
+            self.outstanding = None;
+            self.delivered.borrow_mut().push(self.now);
+            if !self.requests.is_empty() {
+                self.next_ready_at = Some(self.now + self.latency_ms);
+            }
+        }
+        // The coordinator acknowledges what the device sent meanwhile.
+        let acked: Vec<ApsHeader> = mac
+            .tx_history()
+            .iter()
+            .filter(|record| record.dst == MacAddress::Short(PAN_ID, COORDINATOR))
+            .filter_map(|record| transmitted_aps_header(record.payload.as_slice()))
+            .filter(|header| {
+                header.frame_control.ack_request
+                    && header.frame_control.frame_type == ApsFrameType::Data as u8
+            })
+            .collect();
+        mac.clear_tx_history();
+        for header in acked {
+            let frame = aps_ack_frame(&header, self.frame_counter);
+            self.queue(mac, frame);
+        }
+        let end = self.now + request.timeout_ms;
+        if self.outstanding.is_none()
+            && let Some(ready_at) = self.next_ready_at
+            && ready_at <= end
+            && let Some(build) = self.requests.pop_front()
+        {
+            self.next_ready_at = None;
+            self.ready.borrow_mut().push(ready_at);
+            let frame = build(self.frame_counter);
+            self.outstanding = Some(self.queue(mac, frame));
+        }
+        self.now = end;
+        mac.delay_micros(request.timeout_ms.saturating_mul(1_000))
+            .await;
+        Ok(WakeReason::Timer)
+    }
+
+    async fn button_held_for(&mut self, _duration_ms: u32) -> bool {
+        false
+    }
+
+    async fn delay_ms(&mut self, duration_ms: u32) {
+        self.now = self.now.wrapping_add(duration_ms);
+    }
+}
+
+/// Result of [`simulate_interview`].
+#[derive(Debug)]
+struct InterviewRun {
+    /// When each request reached the parent / was fetched by the device.
+    ready: Vec<u32>,
+    delivered: Vec<u32>,
+    /// Every wait the device requested: (start, request).
+    waits: Vec<(u32, WaitRequest)>,
+    diagnostics: Vec<DiagnosticEvent>,
+    record: sensor_sed_app::AnomalyRecord,
+}
+
+impl InterviewRun {
+    /// From the first request reaching the parent to the device fetching
+    /// the last one.
+    fn duration_ms(&self) -> u32 {
+        self.delivered.last().unwrap() - self.ready.first().unwrap()
+    }
+
+    /// How long each request waited at the parent for the device's poll.
+    fn hold_ms(&self) -> Vec<u32> {
+        self.ready
+            .iter()
+            .zip(&self.delivered)
+            .map(|(ready, delivered)| delivered - ready)
+            .collect()
+    }
+
+    /// Time spent in waits of `timeout_ms` that started in `from..to`.
+    fn time_in_waits_ms(&self, timeout_ms: u32, from: u32, to: u32) -> u32 {
+        self.waits
+            .iter()
+            .filter(|(at, wait)| (from..to).contains(at) && wait.timeout_ms == timeout_ms)
+            .map(|(_, wait)| wait.timeout_ms)
+            .sum()
+    }
+}
+
+/// Run a warm-resumed sensor while a hub interviews it from `start_ms` on,
+/// for `steps` service iterations.
+fn simulate_interview(
+    policy: &'static SensorPolicy,
+    requests: Vec<HubRequest>,
+    start_ms: u32,
+    latency_ms: u32,
+    steps: usize,
+) -> InterviewRun {
+    let ready = RefCell::new(Vec::new());
+    let delivered = RefCell::new(Vec::new());
+    let waits = RefCell::new(Vec::new());
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::with_state(commissioned_state(0x02), &store_calls);
+    let mut profile = test_profile();
+    let mut device = test_device(&profile, policy);
+    let total = requests.len();
+    let record;
+    {
+        let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+        let wake = HubWake {
+            now: 0,
+            requests: requests.into(),
+            next_ready_at: Some(start_ms),
+            latency_ms,
+            frame_counter: 0x100,
+            queued: 0,
+            outstanding: None,
+            ready: &ready,
+            delivered: &delivered,
+            waits: &waits,
+        };
+        let mut app = SensorApp::new(
+            node,
+            policy,
+            SensorSedParts {
+                wake,
+                status: NoStatus,
+                environment: CountingEnvironment {
+                    samples: &environment_samples,
+                },
+                battery: CountingBattery {
+                    samples: &battery_samples,
+                },
+                ota: NoOta,
+                actions: NoUserAction,
+                supervisor: RecordingSupervisor {
+                    heartbeats: &heartbeats,
+                },
+                diagnostics: RecordingDiagnostics {
+                    events: &diagnostics,
+                },
+            },
+        )
+        .expect("valid interview policy");
+        block_on(app.initialize()).unwrap();
+        for _ in 0..steps {
+            block_on(app.step()).unwrap();
+        }
+        record = *app.anomalies();
+    }
+    let run = InterviewRun {
+        ready: ready.into_inner(),
+        delivered: delivered.into_inner(),
+        waits: waits.into_inner(),
+        diagnostics: diagnostics.into_inner(),
+        record,
+    };
+    assert!(run.delivered.len() <= total);
+    run
+}
+
+/// The ESP32-C6 light-sleep sensor product's policy: 250 ms fast and 5 s
+/// slow polls, a 60 s window after a silent resume and 120 s after a join,
+/// 30 s activity windows and the default recovery (5 min/h budget).
+static C6_LIGHT_SLEEP_POLICY: SensorPolicy = SensorPolicy {
+    sample_interval_ms: 60_000,
+    fast_poll_ms: 250,
+    slow_poll_ms: 5_000,
+    fresh_join_fast_ms: 120_000,
+    restored_fast_ms: 60_000,
+    interview_complete_grace_ms: 5_000,
+    activity_fast_ms: 30_000,
+    recovery: sensor_sed_app::RecoveryPolicy::DEFAULT,
+    ..BASE_POLICY
+};
+
+/// The same product without activity windows or a budget (the behavior
+/// before them).
+static C6_WITHOUT_ACTIVITY_POLICY: SensorPolicy = SensorPolicy {
+    activity_fast_ms: 0,
+    recovery: sensor_sed_app::RecoveryPolicy {
+        fast_poll_budget_ms: 0,
+        ..sensor_sed_app::RecoveryPolicy::DEFAULT
+    },
+    ..C6_LIGHT_SLEEP_POLICY
+};
+
+/// Measured with this simulation (twelve sequential exchanges, 100 ms hub
+/// latency) on the C6 light-sleep cadence: a hub that starts after the
+/// resume window has closed took 21.75 s (first request at a poll) to
+/// 24.35 s before activity windows, because every request answered without
+/// an APS ACK request (Read Attributes) waited one 5 s slow poll at the
+/// parent. With them the first request waits for the slow poll and every
+/// later one for one fast poll: 2.75 s to 5.35 s.
+#[test]
+fn a_hub_interview_after_the_fast_windows_closed_runs_at_the_fast_cadence() {
+    // The resume window (60 s) has long closed: the hub learned of the
+    // device late (a Device_annce it never saw), or re-interviews it.
+    let run = simulate_interview(
+        &C6_LIGHT_SLEEP_POLICY,
+        hub_interview_requests(),
+        122_400,
+        100,
+        600,
+    );
+    assert_eq!(run.delivered.len(), 12, "{run:?}");
+    let holds = run.hold_ms();
+    assert_eq!(holds[0], 2_600, "the first request waits for the slow poll");
+    assert!(holds[1..].iter().all(|hold| *hold <= 250), "{holds:?}");
+    assert_eq!(run.duration_ms(), 2_600 + 11 * 250);
+    assert_eq!(run.record.total, 0, "{:?}", run.diagnostics);
+
+    // The same interview without activity windows: every Read Attributes
+    // (its response requests no APS ACK, so nothing keeps the poll fast)
+    // waits one slow poll.
+    let before = simulate_interview(
+        &C6_WITHOUT_ACTIVITY_POLICY,
+        hub_interview_requests(),
+        122_400,
+        100,
+        600,
+    );
+    assert_eq!(before.delivered.len(), 12);
+    assert_eq!(before.duration_ms(), 24_350, "{:?}", before.hold_ms());
+}
+
+/// Once the hub goes quiet the device fast-polls for `activity_fast_ms`
+/// after the last frame and then returns to the slow poll.
+#[test]
+fn the_activity_window_ends_activity_fast_ms_after_the_last_frame() {
+    let run = simulate_interview(
+        &C6_LIGHT_SLEEP_POLICY,
+        hub_interview_requests(),
+        122_400,
+        100,
+        600,
+    );
+    assert_eq!(run.delivered.len(), 12);
+    let last = *run.delivered.last().unwrap();
+    let window_end = last + 30_000;
+    let tail: Vec<_> = run.waits.iter().filter(|(at, _)| *at >= last).collect();
+    assert!(
+        tail.iter()
+            .take_while(|(at, _)| *at < window_end)
+            .all(|(_, wait)| wait.timeout_ms == 250),
+        "{tail:?}"
+    );
+    assert_eq!(
+        tail.iter().find(|(at, _)| *at >= window_end),
+        Some(&&(
+            window_end,
+            WaitRequest {
+                timeout_ms: 5_000,
+                sleep_depth: SleepDepth::Retention,
+            }
+        )),
+        "{tail:?}"
+    );
+}
+
+/// A peer that never stops talking (a read every 8 s, inside the 10 s
+/// activity window) would keep the device fast-polling for good; the
+/// hourly budget caps it at one budget per hour after the first, full
+/// burst, records the anomaly, and leaves the requests to the slow poll.
+#[test]
+fn the_hourly_budget_bounds_fast_polling_under_endless_traffic() {
+    static POLICY: SensorPolicy = SensorPolicy {
+        sample_interval_ms: 60_000,
+        fast_poll_ms: 250,
+        slow_poll_ms: 5_000,
+        fresh_join_fast_ms: 1_000,
+        restored_fast_ms: 1_000,
+        interview_complete_grace_ms: 1_000,
+        activity_fast_ms: 10_000,
+        recovery: sensor_sed_app::RecoveryPolicy {
+            fast_poll_budget_ms: 60_000,
+            ..DETERMINISTIC_RECOVERY
+        },
+        ..BASE_POLICY
+    };
+    const HOUR: u32 = 3_600_000;
+    let reads = (0..1_400)
+        .map(|_| -> HubRequest {
+            Box::new(|fc| read_attributes_frame(ClusterId::BASIC, &[0x0004], fc))
+        })
+        .collect();
+    let run = simulate_interview(&POLICY, reads, 10_000, 8_000, 4_000);
+    let end = run.waits.last().unwrap().0;
+    assert!(end > 3 * HOUR, "simulated {end} ms");
+    let first_hour = run.time_in_waits_ms(250, 0, HOUR);
+    let later_hours = [
+        run.time_in_waits_ms(250, HOUR, 2 * HOUR),
+        run.time_in_waits_ms(250, 2 * HOUR, 3 * HOUR),
+    ];
+    // A full bucket plus the hour's refill, then one refill per hour; the
+    // ±2 s slack is the per-iteration accounting granularity.
+    assert!(
+        first_hour <= 2 * 60_000 + 2_000,
+        "first hour: {first_hour} ms"
+    );
+    for fast in later_hours {
+        assert!(
+            (45_000..=62_000).contains(&fast),
+            "later hours: {later_hours:?}"
+        );
+    }
+    assert!(run.record.count(sensor_sed_app::AnomalyReason::FastPoll) >= 1);
+    // The traffic itself still gets through on the slow poll.
+    assert!(
+        run.delivered.len() > 1_000,
+        "{} delivered",
+        run.delivered.len()
+    );
+}
+
+/// Poll Control (0x0020) Fast Poll Stop: the client tells the device to
+/// stop fast polling, so the activity window its own frame opened closes
+/// at once instead of 30 s later.
+#[test]
+fn poll_control_fast_poll_stop_closes_the_activity_window() {
+    static POLICY: SensorPolicy = SensorPolicy {
+        activity_fast_ms: 30_000,
+        recovery: sensor_sed_app::RecoveryPolicy {
+            max_fast_poll_ms: 0,
+            ..FAST_WINDOW_BOUND_POLICY.recovery
+        },
+        ..FAST_WINDOW_BOUND_POLICY
+    };
+    let waits = RefCell::new(Vec::new());
+    let poll_counts = RefCell::new(Vec::new());
+    let delay_calls = Cell::new(0);
+    let environment_samples = Cell::new(0);
+    let battery_samples = Cell::new(0);
+    let heartbeats = Cell::new(0);
+    let diagnostics = RefCell::new(Vec::new());
+    let status = RefCell::new(Vec::new());
+    let store_calls = Cell::new(0);
+    let mut store = CountingStore::with_state(commissioned_state(0x02), &store_calls);
+    let mut profile = DeviceProfile::new(
+        1,
+        0x0104,
+        DeviceId::TEMPERATURE_SENSOR,
+        PolledEnvironment {
+            inner: TemperatureHumidityBattery::new(
+                TemperatureRange {
+                    min_centi_celsius: -4_000,
+                    max_centi_celsius: 12_500,
+                },
+                BatteryDescriptor {
+                    size: 4,
+                    quantity: 2,
+                    rated_voltage_100mv: 15,
+                },
+                EnvironmentalReporting::default(),
+            ),
+            poll_control: PollControlCluster::with_config(PollControlConfig {
+                check_in_interval: 0,
+                ..POLL_CONTROL_CONFIG
+            }),
+        },
+    );
+    let mut device = test_device(&profile, &POLICY);
+    let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+    let wake = RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+    let mut app = SensorApp::new(
+        node,
+        &POLICY,
+        parts(
+            wake,
+            RecordingStatus { events: &status },
+            NoOta,
+            &environment_samples,
+            &battery_samples,
+            &heartbeats,
+            &diagnostics,
+        ),
+    )
+    .unwrap();
+    block_on(app.initialize()).unwrap();
+    for _ in 0..20 {
+        block_on(app.step()).unwrap();
+    }
+    let slow = waits.borrow().last().unwrap().timeout_ms;
+    assert_eq!(slow, 2_000, "the resume window closed");
+
+    // Any unicast frame (here an Identify Query) opens the activity window.
+    app.device_mut()
+        .mac_mut()
+        .enqueue_poll_response(identify_query_frame(0x40));
+    block_on(app.step()).unwrap();
+    block_on(app.step()).unwrap();
+    assert_eq!(waits.borrow().last().unwrap().timeout_ms, 250);
+
+    // Fast Poll Stop closes it on the iteration that received it.
+    app.device_mut()
+        .mac_mut()
+        .enqueue_poll_response(poll_control_frame(0x01, &[], 0x41));
+    block_on(app.step()).unwrap();
+    block_on(app.step()).unwrap();
+    assert_eq!(waits.borrow().last().unwrap().timeout_ms, slow);
+
+    // A Check-in Response asking for 2 s of fast polling gets 2 s: the
+    // client's timeout governs, not the activity window of its frame.
+    app.device_mut()
+        .mac_mut()
+        .enqueue_poll_response(poll_control_frame(0x00, &[1, 8, 0], 0x42));
+    let from = waits.borrow().len();
+    for _ in 0..20 {
+        block_on(app.step()).unwrap();
+    }
+    let fast_ms: u32 = waits.borrow()[from..]
+        .iter()
+        .filter(|wait| wait.timeout_ms == 250)
+        .map(|wait| wait.timeout_ms)
+        .sum();
+    assert!((2_000..=2_250).contains(&fast_ms), "{fast_ms} ms");
+}
+
+/// An OTA session holds the fast poll by itself: its frames (blocks,
+/// responses) do not open activity windows that would outlive it or drain
+/// the hourly budget during a long download.
+#[test]
+fn ota_session_frames_leave_no_activity_tail() {
+    static POLICY: SensorPolicy = SensorPolicy {
+        activity_fast_ms: 500,
+        recovery: sensor_sed_app::RecoveryPolicy {
+            fast_poll_budget_ms: 1_000,
+            ..DETERMINISTIC_RECOVERY
+        },
+        ..BASE_POLICY
+    };
+    let active = Cell::new(false);
+    let aborts = Cell::new(0);
+    let run = run_bounded(
+        &POLICY,
+        test_profile(),
+        StuckOta {
+            active: &active,
+            aborts: &aborts,
+        },
+        |_| active.set(true),
+        8,
+        |step, device| {
+            if step < 3 {
+                device
+                    .mac_mut()
+                    .enqueue_poll_response(identify_query_frame(0x60 + step as u32));
+            } else if step == 3 {
+                active.set(false);
+            }
+        },
+    );
+    let after = run.after();
+    assert!(
+        after[4..].iter().all(|wait| *wait
+            == WaitRequest {
+                timeout_ms: POLICY.slow_poll_ms,
+                sleep_depth: POLICY.slow_sleep_depth,
+            }),
+        "no window outlives the session: {after:?}"
+    );
+    assert_eq!(run.record.total, 0, "{:?}", run.diagnostics);
+}
+
+/// OTA client whose session starts when the server's (raw) OTA command
+/// arrives, like an Image Notify, and ends when the test says so.
+struct NotifiedOta<'a> {
+    active: &'a Cell<bool>,
+}
+
+impl<M, S, P> OtaLifecycle<M, S, P> for NotifiedOta<'_>
+where
+    M: MacDriver,
+    S: SecurityStateStore,
+    P: ApplicationProfile,
+{
+    const ENABLED: bool = true;
+
+    fn is_active(&self, _profile: &P) -> bool {
+        self.active.get()
+    }
+
+    fn next_deadline_ms(&self, _profile: &P) -> Option<u32> {
+        None
+    }
+
+    async fn handle_event(
+        &mut self,
+        _node: &mut ZigbeeNode<'_, M, S, P>,
+        event: &StackEvent,
+    ) -> OtaEventOutcome {
+        if matches!(
+            event,
+            StackEvent::CommandReceived { cluster_id, .. }
+                if *cluster_id == ClusterId::OTA_UPGRADE.0
+        ) {
+            self.active.set(true);
+            OtaEventOutcome::Handled {
+                activation_pending: false,
+            }
+        } else {
+            OtaEventOutcome::NotHandled
+        }
+    }
+
+    async fn service(
+        &mut self,
+        _node: &mut ZigbeeNode<'_, M, S, P>,
+        _elapsed_secs: u16,
+    ) -> OtaServiceOutcome {
+        OtaServiceOutcome::IDLE
+    }
+
+    fn activate(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) -> OtaActivationOutcome {
+        unreachable!("nothing is staged");
+    }
+
+    fn abort(&mut self, _node: &mut ZigbeeNode<'_, M, S, P>) {}
+}
+
+/// The frame that starts an OTA session (the notify) hands the fast poll to
+/// the session: when the server then has no image, no activity tail is left.
+#[test]
+fn an_ota_notify_leaves_no_activity_tail_after_its_session() {
+    static POLICY: SensorPolicy = SensorPolicy {
+        activity_fast_ms: 500,
+        ..BASE_POLICY
+    };
+    let active = Cell::new(false);
+    let run = run_bounded(
+        &POLICY,
+        test_profile(),
+        NotifiedOta { active: &active },
+        |device| {
+            device
+                .mac_mut()
+                .enqueue_poll_response(raw_ota_command(0x70))
+        },
+        8,
+        |step, _| {
+            if step == 3 {
+                active.set(false);
+            }
+        },
+    );
+    let after = run.after();
+    assert_eq!(
+        after[1],
+        WaitRequest {
+            timeout_ms: POLICY.fast_poll_ms,
+            sleep_depth: SleepDepth::Active,
+        },
+        "the session fast-polls awake: {after:?}"
+    );
+    assert!(
+        after[4..].iter().all(|wait| *wait
+            == WaitRequest {
+                timeout_ms: POLICY.slow_poll_ms,
+                sleep_depth: POLICY.slow_sleep_depth,
+            }),
+        "no window outlives the session: {after:?}"
+    );
+}
+
+/// Each Device_annce retry opens the activity window: a coordinator that
+/// hears the announcement starts its interview now.
+#[test]
+fn a_device_announce_retry_opens_the_activity_window() {
+    fn fast_waits_after_cold_join(activity_fast_ms: u32) -> usize {
+        static WITH: SensorPolicy = SensorPolicy {
+            announce_retries: 2,
+            announce_retry_ms: 1_000,
+            activity_fast_ms: 300,
+            // The scripted join leaves its link-key exchange pending; bound
+            // it so the device reaches its slow poll.
+            recovery: sensor_sed_app::RecoveryPolicy {
+                max_active_ms: 300,
+                ..DETERMINISTIC_RECOVERY
+            },
+            ..BASE_POLICY
+        };
+        static WITHOUT: SensorPolicy = SensorPolicy {
+            activity_fast_ms: 0,
+            ..WITH
+        };
+        let policy = if activity_fast_ms == 0 {
+            &WITHOUT
+        } else {
+            &WITH
+        };
+        let mut script = Script::new(policy, 0);
+        script.beacon = true;
+        let waits = RefCell::new(Vec::new());
+        let poll_counts = RefCell::new(Vec::new());
+        let delay_calls = Cell::new(0);
+        let environment_samples = Cell::new(0);
+        let battery_samples = Cell::new(0);
+        let heartbeats = Cell::new(0);
+        let diagnostics = RefCell::new(Vec::new());
+        let status = RefCell::new(Vec::new());
+        let store_calls = Cell::new(0);
+        let mut store = CountingStore::empty(&store_calls);
+        let mut profile = test_profile();
+        let mut device = test_device(&profile, policy);
+        script_cold_join(&mut device);
+        {
+            let node = ZigbeeNode::new(&mut device, &mut store, &mut profile);
+            let wake = RecordingWake::new(0, Vec::new(), &waits, &poll_counts, &delay_calls);
+            let mut app = SensorApp::new(
+                node,
+                policy,
+                parts(
+                    wake,
+                    RecordingStatus { events: &status },
+                    NoOta,
+                    &environment_samples,
+                    &battery_samples,
+                    &heartbeats,
+                    &diagnostics,
+                ),
+            )
+            .unwrap();
+            block_on(app.initialize()).unwrap();
+            assert!(app.device().is_joined());
+            for _ in 0..200 {
+                block_on(app.step()).unwrap();
+            }
+        }
+        let retries = diagnostics
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, DiagnosticEvent::DeviceAnnounceRetry { .. }))
+            .count();
+        assert_eq!(retries, 2);
+        // Fast waits after the 100 ms join window.
+        waits
+            .borrow()
+            .iter()
+            .skip_while(|wait| wait.timeout_ms == 10)
+            .filter(|wait| wait.timeout_ms == 10)
+            .count()
+    }
+    assert_eq!(fast_waits_after_cold_join(0), 0);
+    // Two retries, 300 ms of 10 ms polls each.
+    assert_eq!(fast_waits_after_cold_join(300), 2 * 30);
 }

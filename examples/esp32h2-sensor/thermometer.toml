@@ -76,6 +76,11 @@ restored_fast_ms = 60000
 # Fast-poll window after the interview completes and after a BOOT press
 # (force report), so queued commands from the coordinator can be delivered.
 button_fast_poll_ms = 10000
+# Fast-poll window after each unicast frame from the network (a hub's
+# interview request, a read, a command) and each Device_annce: the next
+# request of a sequential exchange waits one fast poll, not one slow poll.
+# 0 disables.
+activity_fast_ms = 30000
 # Device_annce retries after a join or rejoin: interval (1000..=600000 ms)
 # and count (0..=255). Each retry shortens one slow wait.
 announce_retry_ms = 8000
@@ -133,6 +138,12 @@ max_identify_awake_ms = 120000
 # Back-to-back timed fast-poll windows (join/interview, resume, button,
 # Poll Control fast poll and check-in response); must cover each of them.
 max_fast_poll_ms = 600000
+# Hourly budget of the windows the device opens on its own (join/interview,
+# resume, button, network activity): at most this much fast polling per
+# burst and per hour on average; then slow polls until a quarter refilled.
+# Poll Control client requests and check-in responses are not charged.
+# 0 = unbudgeted; otherwise it must cover each of those windows, <= 1 h.
+fast_poll_budget_ms = 300000
 # No APS-acknowledged traffic for the shortest configured reporting maximum
 # interval plus this grace counts as a missed report: one parent-loss strike
 # and every report forced due. 0 disables; needs report_aps_ack.

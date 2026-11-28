@@ -33,6 +33,56 @@ The fast depth is used during commissioning, interview, commands, reporting
 configuration, and other short-poll windows. The slow depth is used only in
 the stable joined state. An active OTA session forces active waiting.
 
+## Fast-poll windows
+
+A joined sensor polls its parent at `slow_poll_ms` and switches to
+`fast_poll_ms` (250 ms in every product) while a window is open. A window
+exists so that a peer's next frame waits one fast poll at the parent, not
+one slow poll:
+
+| window | opened by | length |
+|---|---|---|
+| join | a fresh join or rejoin (also after a parent-loss rejoin) | `fresh_join_fast_ms` (120 s) |
+| resume | a silent resume at boot | `restored_fast_ms` (60–120 s) |
+| activity | every unicast APS data frame the parent delivers (an interview request, a read, a command, a response) and every Device_annce retry; restarted by each one | `activity_fast_ms` (30 s after the latest frame) |
+| interview grace | Configure Reporting completing the profile's reporting; replaces the join and activity windows | `interview_complete_grace_ms` (5 s) |
+| Poll Control | a client's Check-in Response, or the Check-in itself | the client's FastPollTimeout / `CheckInResponseTimeout` |
+
+The runtime marks an accepted unicast APS data frame
+(`PowerManager::take_inbound_unicast`); APS acknowledgements, duplicates and
+broadcast or group frames are not activity, so the APS ACK of an
+acknowledged report does not keep the device awake. Frames of an OTA
+session, and the notify that starts one, do not open activity windows: the
+session holds the fast poll itself (see the OTA guide). A Poll Control
+client's decision governs the frame that carries it: a Check-in Response
+sets the fast poll to the requested timeout and a Fast Poll Stop ends the
+activity window at once.
+
+Without activity windows a hub that interviews the device after its join or
+resume window has closed (one that missed the Device_annce, or
+re-interviews) waited one slow poll per request whose response needs no
+APS ACK (Read Attributes). The host simulation in
+`apps/sensor-sed/tests/lifecycle.rs` (twelve sequential exchanges, 100 ms hub
+latency, the ESP32-C6 light-sleep cadence of 250 ms / 5 s) measures 21.75 s
+to 24.35 s before and 2.75 s to 5.35 s with them: only the first request
+waits for the slow poll.
+
+**Budget.** `RecoveryPolicy::fast_poll_budget_ms` (5 min per hour by
+default) bounds the windows the device opens on its own — join, resume,
+activity, interview grace, Device_annce — as a token bucket: at most one
+budget in a burst and one budget per hour on average, however often a peer
+talks to the device. When it runs out the windows close,
+`AnomalyReason::FastPoll` is recorded and the device polls slowly until a
+quarter of the budget has refilled. Poll Control client requests, OTA
+sessions, pending protocol work and Identify keep their own bounds and are
+not charged. The budget is RAM state; a reboot starts it full. A product
+must configure a budget that covers each of its windows
+(`SensorPolicy::is_valid`).
+
+Status: host-tested (`apps/sensor-sed/tests/lifecycle.rs`, runtime and
+budget unit tests). The interview time on hardware and the current drawn by
+the activity windows are not measured yet.
+
 ## Atomic platform wait
 
 `WakeController::wait(mac, WaitRequest)` must:
@@ -90,8 +140,10 @@ can keep a battery device awake, via `SensorPolicy::recovery`
   aborted through `OtaLifecycle::abort`, a suspended download stays
   resumable), Identify `max_identify_awake_ms` (2 min; Identify then runs on
   the slow poll) and back-to-back timed fast-poll windows
-  `max_fast_poll_ms` (10 min; the windows are closed). A window that ends
-  on time never fires.
+  `max_fast_poll_ms` (10 min; the windows are closed), and the hourly
+  fast-poll budget `fast_poll_budget_ms` (5 min per hour, see
+  [Fast-poll windows](#fast-poll-windows)). A window that ends on time
+  never fires.
 - **Missed reports.** With `report_aps_ack`, no APS-acknowledged traffic
   for the shortest periodic reporting maximum interval plus
   `missed_report_grace_ms` (2 min) counts one strike and forces every
