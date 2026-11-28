@@ -106,9 +106,12 @@ pub const PRODUCT_NAME: &str = "zigbee-rs-ncp";
 ///   20)`), GSDK's `SL_RAIL_UTIL_PA_POWER_DECI_DBM` default; the stock
 ///   image's PA configuration is GSDK's default one (highest PA, 3300 mV,
 ///   10 us ramp), its runtime power comes from the EZSP host. Certification
-///   limit of the product unknown; with its ~5 dBi antenna the EU limit
-///   of 20 dBm EIRP (EN 300 328) means about +15 dBm conducted (platform
-///   guide).
+///   limit of the product unknown. In the EU the binding limit for
+///   802.15.4 is EN 300 328's 10 dBm/MHz EIRP power spectral density: about
+///   11.5 dBm EIRP for the 2 Mchip/s O-QPSK spectrum (about +6.5 dBm
+///   conducted with the ~5 dBi antenna; the PSD scales with antenna gain).
+///   This +10 dBm default is above that; the regional limit is the user's
+///   responsibility (platform guide, "Transmit power").
 /// - Every other board: 0 dBm. At 39 MHz the 20 dBm PA is
 ///   hardware-verified on the BRD4187A and the 10 dBm PA (`(-30, 10)`) on
 ///   the EK2703A; a higher default waits for each board's RF path and TX

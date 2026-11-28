@@ -8,9 +8,10 @@ use ncp_coordinator_app::platform::NcpPlatform;
 use efr32s2_hal::radio::{TX_POWER_RANGE_DBM, tx_power_step_dbm};
 
 /// Highest transmit power the NCP accepts: the fitted PA's
-/// ([`crate::board::PA_MAX_DBM`]). No regulatory limit is applied here; the
-/// platform guide gives the EU EIRP arithmetic per product (e.g. the SONOFF
-/// Dongle Max), and the host chooses the power.
+/// ([`crate::board::PA_MAX_DBM`]). No regulatory limit is applied here: the
+/// user (or the host for them) is responsible for the regional limit. The
+/// platform guide estimates the EU one (EN 300 328's power spectral
+/// density limit, which scales with the antenna gain).
 pub const TX_POWER_MAX_DBM: i8 = crate::board::PA_MAX_DBM;
 
 /// The MG24 NCP's [`NcpPlatform`].

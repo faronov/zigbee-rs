@@ -1610,19 +1610,32 @@ bit 18).
   Dongle-M and 0 dBm on the other boards (`TX_POWER_DBM`). The setting is
   volatile: the host replays it after an NCP reset, as on the ESP32 NCPs.
 
-**EU limit (ETSI EN 300 328).** EN 300 328 limits 2.4 GHz wideband
-transmitters to 20 dBm (100 mW) EIRP. EIRP is the conducted output plus
-the antenna gain. With an antenna of about 5 dBi, which is our working
-figure for the SONOFF Dongle Max (SONOFF does not publish the gain, and we
-have not measured it), the EU limit is about +15 dBm conducted. The default
-of +10 dBm stays below it. A host that offers higher values should cap them
-per region.
+**EU limits (ETSI EN 300 328).** For 802.15.4 the binding EU limit is
+the power spectral density (PSD) limit, not the 20 dBm (100 mW) EIRP limit
+on total output. Non-frequency-hopping wideband equipment is limited to
+10 dBm/MHz EIRP, measured over the worst 1 MHz of the spectrum.
 
-EN 300 328 also limits non-frequency-hopping equipment to 10 dBm/MHz EIRP
-power spectral density. For the roughly 2 MHz-wide O-QPSK signal of
-802.15.4, this limit can bind before the 20 dBm EIRP one. Whether a given
-power complies depends on the product's measured spectrum, which we have
-not measured.
+802.15.4 at 2.4 GHz is half-sine O-QPSK at 2 Mchip/s, which is MSK at
+2 Mb/s. Its ideal spectrum puts about 70 % of the power into the central
+1 MHz (−1.6 dB). We computed this from the MSK spectrum and from a
+simulated chip stream; we have not measured it on these radios. So:
+
+- **EIRP.** The PSD limit allows about 11.5 dBm EIRP in total. Even if only
+  half the power fell into that 1 MHz, the limit would be 13 dBm EIRP.
+  Either way it binds well before 20 dBm.
+- **Conducted output.** EIRP is the conducted output plus the antenna
+  gain, and the PSD scales the same way: every dB of antenna gain costs a
+  dB of allowed conducted output. Our working figure for the SONOFF Dongle
+  Max's antenna is about 5 dBi (SONOFF does not publish the gain, and we
+  have not measured it). That gives about +6.5 dBm conducted, or +8 dBm
+  with the half-power assumption.
+- **The Dongle-M default.** Its default of +10 dBm is therefore above the
+  EU PSD limit with that antenna: about 15 dBm EIRP, or roughly
+  13.5 dBm/MHz.
+- **Responsibility.** The NCP applies no regional limit (the cap is the
+  fitted PA). The user, or a host acting for them, is responsible for the
+  regional limit. Only a PSD measurement of the product with its antenna
+  settles the real figure.
 
 **Hardware run (BRD4187A NCP, WSTK VCOM 115 200, `hubctl` `network/set_tx_power`).**
 The run used channel 25 and ZCL reads to the EK2703A Router, about 27 NCP
