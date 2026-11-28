@@ -884,23 +884,21 @@ pub(super) fn pa_prestage() {
 
 /// Steps 2 and 3 of [`pa_ramp_up`]: the ramp, then the steady PA.
 fn pa_ramp() {
-    let started = pa_ramp_start();
+    let started = cycles();
+    pa_ramp_start();
     pa_ramp_finish(started);
 }
 
-/// Start the ramp (step 2); returns its cycle stamp for
-/// [`pa_ramp_finish`], which may follow up to [`PA_RAMP_LEAD_US`] later
-/// without waiting.
-pub(super) fn pa_ramp_start() -> u32 {
-    let started = cycles();
+/// Start the ramp (step 2). [`pa_ramp_finish`] may follow up to
+/// [`PA_RAMP_LEAD_US`] later without waiting.
+pub(super) fn pa_ramp_start() {
     unsafe { write(RAC_TX, TX_PA_RAMP) };
     set_bits(RAC_PACTRL, PACTRL_SLICERST, false);
     set_bits(RAC_PAENCTRL, PAENCTRL_PARAMP, true);
-    started
 }
 
-/// Wait out the ramp started at `started` (`MODRAMPUPDONE`, at most
-/// [`PA_RAMP_US`], and at least the ramp clock), then the steady PA
+/// Wait out the ramp started at cycle stamp `started` (`MODRAMPUPDONE`, at
+/// most [`PA_RAMP_US`], and at least the ramp clock), then the steady PA
 /// (step 3).
 pub(super) fn pa_ramp_finish(started: u32) {
     let elapsed = || cycles().wrapping_sub(started);

@@ -437,8 +437,10 @@ For each newly completed frame in the RX buffer, the handler:
   an interrupt* below); the frame is delivered only once its ACK is on
   air;
 - drops ACK frames, frames for other nodes or PANs, and frames it could no
-  longer ACK within 400 µs of their end (the sender retransmits, so such a
-  frame must not be delivered twice);
+  longer ACK in time: decided more than 400 µs, or started more than
+  512 µs (macAckWaitDuration less the ACK itself) after their earliest
+  possible end (the sender retransmits, so such a frame must not be
+  delivered twice);
 - moves every kept frame (`[len, MPDU, raw RSSI]`) out of the 1 KiB
   hardware RX buffer into a 1 KiB software queue, and always advances the
   buffer's read offset. The hardware buffer is therefore empty after every
@@ -453,8 +455,10 @@ For each newly completed frame in the RX buffer, the handler:
 Task-side radio operations mask the `FRC` and `TIMER0` lines, so the
 interrupts never see the radio mid-operation, and first finish an ACK in
 flight (the task steps it to its end, at most about 0.6 ms). When the lock
-is released, it re-pends the interrupt if a frame completed meanwhile, and
-that frame is aged from the start of the lock. `receive` pops only from the
+is released, it re-pends the interrupt if a frame completed meanwhile. That
+frame may have ended anywhere in the lock: its deadlines count from the
+lock's start, its ACK starts 181 µs after the interrupt (so never before
+aTurnaroundTime). `receive` pops only from the
 software queue, which holds frames the interrupt has already examined and
 acknowledged, so the ACK decision always comes before delivery; it, the FP
 table and the counters only mask the lines around the access and never wait
@@ -542,8 +546,13 @@ the APS figures from the NCP's diagnostics counters.
   Now both start at 192 µs ± 3 µs, except where the warm-up chain is
   longer: on the NCP, the 20 dBm PA's `FRC` part and pre-stage end the
   chain at 194–196 µs. A frame that completed while the task held the radio
-  is aged from the start of the lock and acknowledged as soon as possible
-  (the 235 µs maximum).
+  is acknowledged after the interrupt that follows the lock, hence later
+  than 192 µs after its end (the 235 µs maximum); if that ACK would start
+  more than 512 µs after the lock's start, the frame is left
+  unacknowledged and the sender retries. (In the measured version such an
+  ACK was planned from the lock's start and went out as soon as possible,
+  which for a frame that ended just before the release could be earlier
+  than 192 µs; fixed since, host-tested.)
 - **Reliability.** On the air, the master run had 53 retransmissions of
   2,236 frames to the Router and 15 of 4,404 to the NCP; a 120 s run of
   this change had 0 of 849 and 2 of 1,706. Most of the master losses were
@@ -1627,9 +1636,9 @@ receiver added 368–492 B of flash and 124 B of static RAM to the NCP images
 (the 128-byte descriptor chain; the 8 KiB ring replaces the interrupt ring),
 taken from the linked stack; the Routers moved by 0 to −16 B.
 
-The timer-stepped Imm-Ack (`isr-ack` images only) added 1,120 B of flash
-to the BRD4187 NCP (462,464 → 463,584 B file-backed) and 1,520 B to the
-EK2703A Router (346,840 → 348,360 B), with the same `.bss`; the ACK state
+The timer-stepped Imm-Ack (`isr-ack` images only) added 1,080 B of flash
+to the BRD4187 NCP (462,464 → 463,544 B file-backed) and 1,592 B to the
+EK2703A Router (346,840 → 348,432 B), with the same `.bss`; the ACK state
 adds 40 B of `.data`. That moved the EK2703A Router's 512-byte-aligned
 `.bss` up by 512 B (linked stack 224,496 → 223,984 B); the NCP's and the
 MG21 Routers' static RAM ends did not move. End-device images do not

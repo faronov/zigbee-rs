@@ -499,19 +499,16 @@ pub(super) const PA_RAMP_LEAD_US: u32 = 24;
 #[inline(always)]
 pub(super) fn pa_prestage() {}
 
-/// [`pa_ramp_up`] up to its wait: returns the ramp's cycle stamp for
-/// [`pa_ramp_finish`].
+/// [`pa_ramp_up`] up to its wait.
 #[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
-pub(super) fn pa_ramp_start() -> u32 {
-    let started = crate::delay::cycles();
+pub(super) fn pa_ramp_start() {
     unsafe { write(RAC_PAENCTRL, PAENCTRL_PARAMP) };
     set_bits(RAC_APC, APC_ENAPCSW, true);
     set_bits(RAC_TX, TX_PAENPAOUT, true);
     set_bits(RAC_PACTRL, PACTRL_PAENPOWERRAMPINGCLK, true);
-    started
 }
 
-/// The rest of [`pa_ramp_up`] for a ramp started at `started`.
+/// The rest of [`pa_ramp_up`] for a ramp started at cycle stamp `started`.
 #[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
 pub(super) fn pa_ramp_finish(started: u32) {
     let limit = crate::delay::us_to_cycles(PA_RAMP_US);

@@ -68,8 +68,11 @@
 //! in the task (at most one ACK, about 0.6 ms). Its release hands over the
 //! RX state, channel, TX power and ACK filter, and re-pends `FRC` when a
 //! frame completed meanwhile. A frame that completed while the radio was
-//! locked is aged from the start of the lock, so an ACK is never started
-//! later than [`ACK_DEADLINE_US`] after the frame ended. [`pop`], the Frame
+//! locked may have ended anywhere in the lock: it is aged from the lock's
+//! start (decided within [`ACK_DEADLINE_US`], started within
+//! [`ACK_LATEST_US`], or left unacknowledged), and its ACK starts
+//! [`ACK_START_US`] after the interrupt's entry ([`ack_start`]), so never
+//! before aTurnaroundTime. [`pop`], the Frame
 //! Pending table and the counters only mask the lines around the access,
 //! so they never wait for an ACK. The two handlers share this state
 //! without further locking, so they must not preempt each other: [`init`]
@@ -100,6 +103,10 @@ pub(super) const RX_QUEUE_LEN: usize = 1024;
 /// macAckWaitDuration (864 us) for the ACK; past this the frame is
 /// dropped unacknowledged.
 const ACK_DEADLINE_US: u32 = 400;
+/// Latest ACK start after the end of a frame: macAckWaitDuration (54
+/// symbols) less the ACK's own 22 symbols (aTurnaroundTime +
+/// aUnitBackoffPeriod). An ACK that would start later is not sent.
+const ACK_LATEST_US: u32 = 512;
 /// TX start (the `TXWARM` release) of the Imm-Ack after the `FRC`
 /// interrupt's entry: puts the ACK's first symbol aTurnaroundTime (192 us)
 /// after the frame's last symbol on the air. Calibrated with the nRF
@@ -649,11 +656,37 @@ fn later(a: u32, b: u32) -> u32 {
     if after(b, a) { b } else { a }
 }
 
+/// TX start of the ACK for a frame that ended between the cycle stamps
+/// `earliest` (the start of the lock that delayed the interrupt, or its
+/// entry) and `latest`: [`ACK_START_US`] after the latest end, so the ACK
+/// never starts before aTurnaroundTime. `None` when that is more than
+/// [`ACK_LATEST_US`] after the earliest end: the frame is then left
+/// unacknowledged and the sender retries.
+fn ack_start(earliest: u32, latest: u32) -> Option<u32> {
+    let start = latest.wrapping_add(us_to_cycles(ACK_START_US));
+    (start.wrapping_sub(earliest) <= us_to_cycles(ACK_LATEST_US)).then_some(start)
+}
+
 /// `TxRamp` of an ACK starting at `start`: the ramp ends
 /// [`START_MARGIN_US`] before the TX start. `TxPrestage` (xG24) is due
 /// [`chip::PA_PRESTAGE_US`] earlier.
 fn ramp_at(start: u32) -> u32 {
     start.wrapping_sub(us_to_cycles(chip::PA_RAMP_LEAD_US + START_MARGIN_US))
+}
+
+/// `TxStart` of an ACK starting at `start` whose PA ramp started at cycle
+/// stamp `ramp`: [`START_MARGIN_US`] before the start, or once the ramp
+/// is steady if it started late. A chip without a CPU ramp (xG22) does not
+/// look at `ramp`.
+fn tx_start_due(ramp: u32, start: u32) -> u32 {
+    let margin = start.wrapping_sub(us_to_cycles(START_MARGIN_US));
+    if chip::PA_RAMP_LEAD_US == 0 {
+        return margin;
+    }
+    later(
+        ramp.wrapping_add(us_to_cycles(chip::PA_RAMP_LEAD_US)),
+        margin,
+    )
 }
 
 /// Run the steps that are due and arm the alarm for the next one (disarm
@@ -702,11 +735,10 @@ fn step(s: &mut Shared) {
             s.ack.at = later(settled, ramp_at(s.ack.start));
         }
         Step::TxRamp => {
-            s.ack.ramp = chip::pa_ramp_start();
+            s.ack.ramp = cycles();
+            chip::pa_ramp_start();
             s.ack.step = Step::TxStart;
-            let ramped = s.ack.ramp.wrapping_add(us_to_cycles(chip::PA_RAMP_LEAD_US));
-            let margin = s.ack.start.wrapping_sub(us_to_cycles(START_MARGIN_US));
-            s.ack.at = later(ramped, margin);
+            s.ack.at = tx_start_due(s.ack.ramp, s.ack.start);
         }
         Step::TxStart => {
             chip::pa_ramp_finish(s.ack.ramp);
@@ -841,7 +873,15 @@ fn examine(s: &mut Shared, entry: u32, rx_done: bool) {
             *byte = rx_ram_byte(offset + 1 + i as u32);
         }
         let existed = offset.wrapping_sub(readoff0) & BUF_OFFSET_MASK < available0;
-        let base = if existed { old_base } else { entry };
+        // The frame ended between `earliest` and `latest`: in the buffer at
+        // entry, between the start of the lock that delayed this
+        // interrupt (or the entry) and the entry; otherwise since the entry.
+        let (earliest, latest) = if existed {
+            (old_base, entry)
+        } else {
+            (entry, cycles())
+        };
+        let start = ack_start(earliest, latest);
         let verdict = classify(&header[..len], stored, &s.filter, &s.table);
         let room = admits(q.free(), stored, matches!(verdict, Verdict::Ack { .. }));
         let keep = match verdict {
@@ -859,7 +899,8 @@ fn examine(s: &mut Shared, entry: u32, rx_done: bool) {
             Verdict::Ack { .. }
                 if s.ack.step != Step::Idle
                     || !s.rx_armed
-                    || cycles().wrapping_sub(base) > us_to_cycles(ACK_DEADLINE_US) =>
+                    || start.is_none()
+                    || cycles().wrapping_sub(earliest) > us_to_cycles(ACK_DEADLINE_US) =>
             {
                 s.stats.late = s.stats.late.wrapping_add(1);
                 false
@@ -878,7 +919,8 @@ fn examine(s: &mut Shared, entry: u32, rx_done: bool) {
                     flags: record_flags(verdict),
                     frame_pending,
                 };
-                if !start_ack(s, header[2], frame, base) {
+                let start = start.unwrap_or(latest);
+                if !start_ack(s, header[2], frame, earliest, start) {
                     end_ack(s, false, cycles());
                 }
                 // The frame and the rest of BUFC now belong to the ACK.
@@ -894,15 +936,16 @@ fn examine(s: &mut Shared, entry: u32, rx_done: bool) {
     }
 }
 
-/// Start the Imm-Ack `[FCF, seq]` for `frame` (aged from `base`): receiver
-/// off, the ACK into the TX buffer, `TXEN`; the RSM then waits in the held
-/// `TXWARM` for the `TxSynth` step. `false` (RSM not off, or not in
-/// `TXWARM`) leaves the radio idle.
-fn start_ack(s: &mut Shared, sequence: u8, frame: Held, base: u32) -> bool {
+/// Start the Imm-Ack `[FCF, seq]` for `frame` (aged from `base`, TX start
+/// at `start`, see [`ack_start`]): receiver off, the ACK into the TX
+/// buffer, `TXEN`; the RSM then waits in the held `TXWARM` for the
+/// `TxSynth` step. `false` (RSM not off, or not in `TXWARM`) leaves the
+/// radio idle.
+fn start_ack(s: &mut Shared, sequence: u8, frame: Held, base: u32, start: u32) -> bool {
     s.ack = InFlight {
         step: Step::Idle,
         at: 0,
-        start: base.wrapping_add(us_to_cycles(ACK_START_US)),
+        start,
         ramp: 0,
         base,
         frame,
@@ -1189,6 +1232,55 @@ mod tests {
         assert!(!after(5, 5));
         assert!(after(2, u32::MAX - 2));
         assert!(!after(u32::MAX - 2, 2));
+    }
+
+    /// `TxStart` is due before the TX start in either half of the counter.
+    /// A chip without a CPU ramp (xG22) ignores the ramp stamp: zero there
+    /// once scheduled `TxStart` at stamp 0, half a counter period (about
+    /// 56 s) ahead when the counter was in its upper half, with the RSM held
+    /// in `TXWARM` and a task-side lock spinning on it.
+    #[test]
+    fn tx_start_is_due_before_the_tx_start_in_either_counter_half() {
+        let margin = us_to_cycles(START_MARGIN_US);
+        for start in [10_000u32, (1 << 31) + 1_000, u32::MAX - 5] {
+            let due = tx_start_due(ramp_at(start), start);
+            assert!(!after(due, start));
+            assert!(start.wrapping_sub(due) <= margin + 1);
+            // A ramp that started late delays `TxStart` until it is steady.
+            let late = start.wrapping_sub(margin);
+            let lead = us_to_cycles(chip::PA_RAMP_LEAD_US);
+            assert_eq!(
+                tx_start_due(late, start),
+                later(late.wrapping_add(lead), start.wrapping_sub(margin))
+            );
+            if chip::PA_RAMP_LEAD_US == 0 {
+                assert_eq!(tx_start_due(0, start), start.wrapping_sub(margin));
+            }
+        }
+    }
+
+    /// A frame that completed while the task held the radio may have ended
+    /// just before the lock's release: its ACK starts [`ACK_START_US`] after
+    /// the interrupt's entry, not after the lock's start (which is already
+    /// past and would put the ACK on air early), and is not sent when that
+    /// is later than [`ACK_LATEST_US`] after the lock's start.
+    #[test]
+    fn a_lock_aged_frame_is_acknowledged_from_its_latest_end() {
+        let turnaround = us_to_cycles(ACK_START_US);
+        for entry in [50_000u32, (1 << 31) + 1_000, 7] {
+            // No lock: the frame ended at the entry.
+            assert_eq!(
+                ack_start(entry, entry),
+                Some(entry.wrapping_add(turnaround))
+            );
+            // It completed during a 300 us lock.
+            let lock = entry.wrapping_sub(us_to_cycles(300));
+            assert_eq!(ack_start(lock, entry), Some(entry.wrapping_add(turnaround)));
+            // A lock so long that the ACK would start too late for a frame
+            // that ended at its start: no ACK.
+            let long = entry.wrapping_sub(us_to_cycles(ACK_LATEST_US - ACK_START_US + 2));
+            assert_eq!(ack_start(long, entry), None);
+        }
     }
 
     #[test]

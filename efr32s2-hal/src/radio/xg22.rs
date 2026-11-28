@@ -368,9 +368,7 @@ pub(super) fn pa_prestage() {}
 
 #[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
 #[inline(always)]
-pub(super) fn pa_ramp_start() -> u32 {
-    0
-}
+pub(super) fn pa_ramp_start() {}
 
 #[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
 #[inline(always)]
