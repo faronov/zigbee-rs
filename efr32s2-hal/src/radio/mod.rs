@@ -84,6 +84,39 @@ pub const TX_POWER_RANGE_DBM: (i8, i8) = {
     }
 };
 
+/// The whole-dBm transmit power a request of `dbm` really selects, for a
+/// host-facing power API (ZRHP `NWK_SET_TX_POWER.applied_dbm`).
+///
+/// [`Radio::set_tx_power_ddbm`] programs the highest PA table entry not
+/// above the request. That entry is reported rounded up to whole dBm, which
+/// gives each entry its own value: the result never exceeds `dbm` (unless
+/// `dbm` is below the table, which clamps to its first entry), and asking
+/// for the result again selects the same entry. `0` when the build has no
+/// validated PA table ([`TX_POWER_RANGE_DBM`] `(0, 0)`). The dBm values are
+/// RAIL's PA-curve estimates, not conducted measurements.
+pub const fn tx_power_step_dbm(dbm: i8) -> i8 {
+    let table = chip::TX_POWER;
+    if table.is_empty() || !chip::SUPPORTED {
+        return 0;
+    }
+    let request = dbm as i16 * 10;
+    let mut chosen = table[0].0;
+    let mut index = 0;
+    while index < table.len() {
+        if table[index].0 <= request {
+            chosen = table[index].0;
+        }
+        index += 1;
+    }
+    // Ceiling division by 10 (towards +infinity) for either sign.
+    let ceil = if chosen >= 0 {
+        (chosen + 9) / 10
+    } else {
+        chosen / 10
+    };
+    ceil as i8
+}
+
 /// Default clear-channel threshold (IEEE 802.15.4 ED mode; RAIL default).
 pub const DEFAULT_CCA_THRESHOLD_DBM: i8 = -75;
 /// Chip RSSI adjustment added to the AGC reading (see `chip::RSSI_ADJUST_DBM`).
@@ -1645,6 +1678,71 @@ mod tests {
             not(any(feature = "hfxo-39mhz", feature = "hfxo-38m4hz"))
         ))]
         assert_eq!(TX_POWER_RANGE_DBM, (0, 0));
+    }
+
+    #[test]
+    fn tx_power_steps_are_stable_and_never_above_the_request() {
+        let (min, max) = TX_POWER_RANGE_DBM;
+        if (min, max) == (0, 0) {
+            assert_eq!(tx_power_step_dbm(10), 0);
+            return;
+        }
+        assert_eq!(tx_power_step_dbm(i8::MIN), min);
+        assert_eq!(tx_power_step_dbm(i8::MAX), max);
+        let mut steps = 0;
+        for dbm in i8::MIN..=i8::MAX {
+            let step = tx_power_step_dbm(dbm);
+            assert!(step >= min && step <= max, "{dbm} -> {step}");
+            if dbm >= min {
+                assert!(step <= dbm, "{dbm} -> {step}");
+            }
+            // The reported step selects the same PA entry again.
+            assert_eq!(
+                tx_power_entry(i16::from(step) * 10),
+                tx_power_entry(i16::from(dbm) * 10)
+            );
+            assert_eq!(tx_power_step_dbm(step), step);
+            if step == dbm {
+                steps += 1;
+            }
+        }
+        // Every table entry is reachable through its own whole-dBm step.
+        assert_eq!(steps, chip::TX_POWER.len());
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "efr32mg24-pa20",
+        any(feature = "hfxo-39mhz", feature = "hfxo-38m4hz")
+    ))]
+    fn xg24_hp_tx_power_steps() {
+        // 9.9 dBm is the +10 entry; 19.0 the +19.
+        assert_eq!(tx_power_step_dbm(10), 10);
+        assert_eq!(tx_power_entry(100).0, 99);
+        assert_eq!(tx_power_step_dbm(15), 15);
+        assert_eq!(tx_power_entry(150).0, 149);
+        assert_eq!(tx_power_step_dbm(0), 0);
+        assert_eq!(tx_power_entry(0).0, -2);
+        // -10 dBm selects the -15.8 entry.
+        assert_eq!(tx_power_step_dbm(-10), -15);
+        assert_eq!(tx_power_step_dbm(20), 20);
+        assert_eq!(tx_power_step_dbm(-24), -24);
+        assert_eq!(tx_power_step_dbm(-25), -24);
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "efr32mg24-pa10",
+        any(feature = "hfxo-39mhz", feature = "hfxo-38m4hz")
+    ))]
+    fn xg24_mp_tx_power_steps() {
+        assert_eq!(tx_power_step_dbm(10), 10);
+        assert_eq!(tx_power_step_dbm(12), 10);
+        assert_eq!(tx_power_step_dbm(5), 5);
+        assert_eq!(tx_power_entry(50).0, 49);
+        assert_eq!(tx_power_step_dbm(0), 0);
+        assert_eq!(tx_power_step_dbm(-30), -30);
+        assert_eq!(tx_power_step_dbm(-29), -30);
     }
 
     #[test]

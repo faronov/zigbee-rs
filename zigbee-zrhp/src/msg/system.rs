@@ -121,6 +121,12 @@ pub mod capacity {
     /// `host_response_bytes`: response bytes a host may keep outstanding
     /// per endpoint without `BUSY` for queue space (6.2).
     pub const HOST_RESPONSE_BYTES: u8 = 19;
+    /// `tx_power_min_dbm`: the lowest antenna-referred output
+    /// `NWK_SET_TX_POWER` can select, as a two's-complement `i32` (only
+    /// with capability `TX_POWER`).
+    pub const TX_POWER_MIN_DBM: u8 = 20;
+    /// `tx_power_max_dbm`: the highest one (as [`TX_POWER_MIN_DBM`]).
+    pub const TX_POWER_MAX_DBM: u8 = 21;
 }
 
 /// Config IDs for `SYS_SET_CONFIG` / `SYS_GET_CONFIG` (7.1).
@@ -199,6 +205,26 @@ impl SysNegotiateRsp<'_> {
     /// Look up a capacity value.
     pub fn capacity(&self, id: u8) -> Option<u32> {
         self.capacities.iter().find(|c| c.id == id).map(|c| c.value)
+    }
+
+    /// The `NWK_SET_TX_POWER` range `(min, max)` in dBm (capacities 20 and
+    /// 21). `None` when the NCP does not report it: no `TX_POWER`
+    /// capability, or firmware before NCP 0.1.4.
+    pub fn tx_power_range(&self) -> Option<(i8, i8)> {
+        let dbm = |id| {
+            self.capacity(id)
+                .and_then(|value| i8::try_from(value as i32).ok())
+        };
+        if self.ncp_caps & caps::TX_POWER == 0 {
+            return None;
+        }
+        match (
+            dbm(capacity::TX_POWER_MIN_DBM)?,
+            dbm(capacity::TX_POWER_MAX_DBM)?,
+        ) {
+            (min, max) if min <= max => Some((min, max)),
+            _ => None,
+        }
     }
 }
 
@@ -429,4 +455,58 @@ message_def! {
     EvtIndicationsDropped = ids::EVT_INDICATIONS_DROPPED, Event;
     EvtFatal<'a> = ids::EVT_FATAL, Event;
     EvtProtocolError = ids::EVT_PROTOCOL_ERROR, Event;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn negotiated<'a>(ncp_caps: u64, capacities: &'a [Capacity]) -> SysNegotiateRsp<'a> {
+        SysNegotiateRsp {
+            major: 1,
+            minor: 0,
+            ncp_caps,
+            capacities: List::new(capacities),
+            fw: Bytes8(b"0.1.4"),
+            build_id: [0; 8],
+            chip: 12,
+        }
+    }
+
+    fn range(min: i32, max: i32) -> [Capacity; 2] {
+        [
+            Capacity {
+                id: capacity::TX_POWER_MIN_DBM,
+                value: min as u32,
+            },
+            Capacity {
+                id: capacity::TX_POWER_MAX_DBM,
+                value: max as u32,
+            },
+        ]
+    }
+
+    #[test]
+    fn tx_power_range_decodes_signed_capacities() {
+        let hp = range(-24, 20);
+        assert_eq!(
+            negotiated(caps::TX_POWER, &hp).tx_power_range(),
+            Some((-24, 20))
+        );
+        // Encoded as a two's-complement i32.
+        assert_eq!(hp[0].value, 0xFFFF_FFE8);
+        // Without the capability, or with one of the two missing, or with
+        // values that are no dBm range: nothing.
+        assert_eq!(negotiated(0, &hp).tx_power_range(), None);
+        assert_eq!(negotiated(caps::TX_POWER, &hp[..1]).tx_power_range(), None);
+        assert_eq!(negotiated(caps::TX_POWER, &[]).tx_power_range(), None);
+        assert_eq!(
+            negotiated(caps::TX_POWER, &range(20, -24)).tx_power_range(),
+            None
+        );
+        assert_eq!(
+            negotiated(caps::TX_POWER, &range(-24, 200)).tx_power_range(),
+            None
+        );
+    }
 }

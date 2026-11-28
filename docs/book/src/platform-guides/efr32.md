@@ -1406,7 +1406,7 @@ ESP32):
 | GBL | v3 header `0x0300_0000`, type 0; HEADER, APPLICATION, one ERASEPROG at `0x0800_6000`, END | the same records in the same order, plus the ZRHP METADATA record (a tag the GBL parser skips); `efr32_gbl::write` reproduces the stock file byte for byte from its records (CI) |
 | application | `ApplicationProperties_t` v1.2 at `0x0803_C148`, type ZIGBEE, signature NONE, version 1, product ID zero | v1.2, type ZIGBEE, signature NONE, version `0x0001_0000`, zigbee-rs product ID |
 | PHY | GSDK 4.5.0 38.4 MHz 802.15.4 configuration, byte for byte | the same (`hfxo-38m4hz`) with RAIL's per-channel words |
-| PA | `2P4GIG_HIGHEST`, 3300 mV, 10 µs ramp; power set by the EZSP host | 20 dBm PA table of the BRD4187A; fixed +10 dBm (no `NWK_SET_TX_POWER` on the MG24 NCP yet) |
+| PA | `2P4GIG_HIGHEST`, 3300 mV, 10 µs ramp; power set by the EZSP host | 20 dBm PA table of the BRD4187A; +10 dBm default, `NWK_SET_TX_POWER` −24…+20 dBm ([Transmit power](#transmit-power-nwk_set_tx_power)) |
 | NV | NVM3 at `0x0817_6000..0x0817_E000` | journals at `0x0815_8000..0x0818_0000`: the first boot finds NVM3 page headers (or no valid security record) and erases the whole window |
 | IEEE | EZSP EUI-64 `B0E8E8FFFE5D4D03` on the probed unit | `MFG_CUSTOM_EUI_64` if programmed, else DEVINFO: the same IEEE as stock either way |
 | CTUNE | `MODXOCAL` → `MFG_CTUNE` → 100 | the same order; value and source logged at boot |
@@ -1586,6 +1586,78 @@ First run on a unit (the hardware gate): the boot log line
 and RX against the stock image with the nRF sniffer (frequency offset,
 output, RSSI), ACK timing, formation and a join, then RAIL's per-state
 values at 38.4 MHz against the shared analog states.
+
+### Transmit power (`NWK_SET_TX_POWER`)
+
+The MG24 NCP sets its transmit power on the host's request
+(`products/efr32mg24/src/platform.rs`, `Mg24Platform`; ZRHP capability
+bit 18).
+
+- **Steps.** The steps are the PA table entries RAIL programs: the 20 dBm
+  PA has 29 entries from −24.9 to +20.0 dBm, the 10 dBm PA 20 entries from
+  −30.0 to +10.0 dBm (`efr32s2-hal/src/radio/xg24.rs`). A request selects
+  the highest entry not above it.
+- **`applied_dbm`.** This is the entry's RAIL estimate rounded up to whole
+  dBm (`efr32s2_hal::radio::tx_power_step_dbm`). It is never above the
+  request, and setting it again selects the same entry. For example, a
+  request of 10 dBm selects the 9.9 dBm entry and reports 10, and −10
+  selects −15.8 and reports −15.
+- **Range.** The NCP reports it at negotiation (capacities 20/21):
+  −24…+20 dBm on the Dongle-M and BRD4187A, −30…+10 dBm on the EK2703A
+  and RF-BM-MG24B1. The cap is the fitted PA (`board::PA_MAX_DBM`); the NCP
+  applies no regulatory limit.
+- **Default.** Until the host sets a power, the NCP uses +10 dBm on the
+  Dongle-M and 0 dBm on the other boards (`TX_POWER_DBM`). The setting is
+  volatile: the host replays it after an NCP reset, as on the ESP32 NCPs.
+
+**EU limit (ETSI EN 300 328).** EN 300 328 limits 2.4 GHz wideband
+transmitters to 20 dBm (100 mW) EIRP. EIRP is the conducted output plus
+the antenna gain. With an antenna of about 5 dBi, which is our working
+figure for the SONOFF Dongle Max (SONOFF does not publish the gain, and we
+have not measured it), the EU limit is about +15 dBm conducted. The default
+of +10 dBm stays below it. A host that offers higher values should cap them
+per region.
+
+EN 300 328 also limits non-frequency-hopping equipment to 10 dBm/MHz EIRP
+power spectral density. For the roughly 2 MHz-wide O-QPSK signal of
+802.15.4, this limit can bind before the 20 dBm EIRP one. Whether a given
+power complies depends on the product's measured spectrum, which we have
+not measured.
+
+**Hardware run (BRD4187A NCP, WSTK VCOM 115 200, `hubctl` `network/set_tx_power`).**
+The run used channel 25 and ZCL reads to the EK2703A Router, about 27 NCP
+frames per level. The table gives the nRF52840 sniffer's median RSSI of the
+NCP's frames (source 0x0000) and the WSTK AEM peak current of the NCP's TX
+bursts. The Router's frames, sent at a constant power, stayed at −37/−38 dBm
+throughout, and every read succeeded (26/26 per level).
+
+| requested | `applied_dbm` (entry) | NCP frames at the sniffer | TX current (AEM peak) |
+|---:|---:|---:|---:|
+| −20 | −24 (−24.9) | −67 dBm | below the AEM's rise detection |
+| −10 | −15 (−15.8) | −62 dBm | below the AEM's rise detection |
+| 0 | 0 (−0.2) | −48 dBm | 21.8 mA |
+| 5 | 5 (4.8) | −44 dBm | 34.3 mA |
+| 10 | 10 (9.9) | −38 dBm | 55.8 mA |
+| 15 | 15 (14.9) | −33 dBm | 93.1 mA |
+| 20 | 20 (20.0) | −29 dBm | 95.7 mA (AEM saturated) |
+| 25 | 20 | — | — |
+| −40 | −24 | — | — |
+
+Results:
+
+- **0 to +20 dBm.** The sniffer readings follow the steps within 1 dB:
+  +4, +10, +15 and +19 dB against 0 dBm.
+- **TX current.** The current at 10 dBm matches the earlier HAL bursts
+  (56.5 mA).
+- **Low end.** The sniffer saw −24.9 dBm only 19 dB below 0 dBm, where
+  RAIL's estimate is 24.7 dB. These are RAIL's own PA settings, captured
+  from RAILtest, and RAILtest itself was not measured at these levels. The
+  low-end readings therefore show the step order, not absolute power.
+
+The 10 dBm PA (EK2703A) is covered by host tests only on this path: its
+NCP did not run here. Its HAL power path matches RAILtest from −30 to
++10 dBm (above). The Dongle Max's output and its certified limit are not
+measured.
 
 ### Size and RAM (release, `nightly-2026-03-23`)
 

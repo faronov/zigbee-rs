@@ -58,6 +58,8 @@ compile_error!(
 pub mod fatal;
 pub mod gecko;
 pub mod layout;
+#[cfg(feature = "ncp")]
+pub mod platform;
 #[cfg(feature = "router")]
 pub mod router;
 pub mod stores;
@@ -96,14 +98,17 @@ pub const CHIP: u8 = 12;
 pub const BOARD_NAME: &str = board::BOARD_NAME;
 /// `SYS_GET_INFO.product`.
 pub const PRODUCT_NAME: &str = "zigbee-rs-ncp";
-/// Default `phyTransmitPower`. The MG24 NCP has no `NcpPlatform` yet, so
-/// `NWK_SET_TX_POWER` is unsupported and this is the NCP's operating power.
+/// Default `phyTransmitPower`, until the host sets another with
+/// `NWK_SET_TX_POWER` (the NCP: [`platform::Mg24Platform`]; volatile, the
+/// host replays it after a reset).
 ///
 /// - Dongle-M: +10 dBm on the 20 dBm PA (`TX_POWER_RANGE_DBM` `(-24,
 ///   20)`), GSDK's `SL_RAIL_UTIL_PA_POWER_DECI_DBM` default; the stock
 ///   image's PA configuration is GSDK's default one (highest PA, 3300 mV,
 ///   10 us ramp), its runtime power comes from the EZSP host. Certification
-///   limit of the product unknown; output not yet measured (first HIL).
+///   limit of the product unknown; with its ~5 dBi antenna the EU limit
+///   of 20 dBm EIRP (EN 300 328) means about +15 dBm conducted (platform
+///   guide).
 /// - Every other board: 0 dBm. At 39 MHz the 20 dBm PA is
 ///   hardware-verified on the BRD4187A and the 10 dBm PA (`(-30, 10)`) on
 ///   the EK2703A; a higher default waits for each board's RF path and TX

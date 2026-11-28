@@ -532,6 +532,13 @@ macro_rules! setup {
         ] {
             assert_ne!(negotiated.ncp_caps & bit, 0, "capability {bit:#x}");
         }
+        // The settable range: the platform's 2 dB steps of -20..=10 dBm.
+        assert_eq!(negotiated.tx_power_range(), Some((-20, 10)));
+        assert_eq!(
+            negotiated.capacity(capacity::TX_POWER_MIN_DBM),
+            Some(-20_i32 as u32)
+        );
+        assert_eq!(negotiated.capacity(capacity::TX_POWER_MAX_DBM), Some(10));
     };
 }
 
