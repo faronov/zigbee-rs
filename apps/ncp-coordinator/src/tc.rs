@@ -1570,9 +1570,13 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
     fn device(&self, index: usize) -> Option<DeviceView> {
         let table = self.app.tc_table();
         let nwk = self.app.device().aps().nwk();
+        // Only children the NCP still vouches for: authenticated (a
+        // provisional joiner has not proved the network key) and within
+        // their End Device Timeout even before the aging pass runs. A
+        // backup that listed any other one would have a restore re-create
+        // it as a live child with a fresh window.
         let child_of = |ieee: &[u8; 8]| {
-            nwk.neighbor_table()
-                .children()
+            nwk.live_children()
                 .find(|entry| entry.ieee_address == *ieee)
                 .map(|entry| (child_capability(entry), entry.end_device_timeout))
         };
@@ -1622,10 +1626,9 @@ impl<A: TcApp> CoordinatorPort for TcPort<A> {
                 link,
             });
         }
-        // Children without a Trust Center record.
+        // Live children without a Trust Center record.
         let entry = nwk
-            .neighbor_table()
-            .children()
+            .live_children()
             .filter(|entry| table.device(&entry.ieee_address).is_none_or(|d| !d.active))
             .nth(index - known)?;
         Some(DeviceView {

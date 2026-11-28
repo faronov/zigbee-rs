@@ -913,6 +913,7 @@ impl<M: MacDriver> NwkLayer<M> {
             entry.refresh_end_device_timeout();
             entry.age = 0;
             entry.keepalive_confirmed = true;
+            self.mark_child_countdowns();
         }
 
         // This parent implements both keepalive methods.
@@ -14019,6 +14020,95 @@ mod tests {
         // Aging is a parent-only concern; an end device returns nothing.
         let mut end_device = secured_node(DeviceType::EndDevice, OUR_ADDR, RELAY_IEEE);
         assert!(end_device.age_end_device_children(u16::MAX).is_empty());
+    }
+
+    #[cfg(feature = "router")]
+    fn live_children(parent: &NwkLayer<MockMac>) -> heapless::Vec<ShortAddress, 4> {
+        parent
+            .live_children()
+            .map(|entry| entry.network_address)
+            .collect()
+    }
+
+    /// A parent vouches for a child outside the stack (backup, durable
+    /// table) only while its End Device Timeout has not provably elapsed,
+    /// even before an aging pass charged the elapsed time; the aging pass
+    /// stays the only removal path.
+    #[test]
+    #[cfg(feature = "router")]
+    fn a_child_past_its_deadline_is_not_live_before_the_aging_pass() {
+        let mut parent = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        parent.mac.set_time_micros(5_000_000);
+        // Restored with enumeration 0 (10 s), not heard yet.
+        assert!(parent.restore_child(ORIGIN_IEEE, ORIGIN, false, true, false, 0));
+        assert_eq!(live_children(&parent).as_slice(), &[ORIGIN]);
+
+        // 9 s later, no aging pass: within its window.
+        parent.mac.set_time_micros(14_000_000);
+        assert_eq!(live_children(&parent).as_slice(), &[ORIGIN]);
+        // A MAC Data Poll re-arms it; the time before it is not counted
+        // against the new window.
+        let _ = block_on(parent.service_child_data_request(MacAddress::Short(PAN, ORIGIN)));
+        parent.mac.set_time_micros(23_000_000);
+        assert_eq!(live_children(&parent).as_slice(), &[ORIGIN]);
+
+        // Its window elapses without an aging pass: no longer vouched for,
+        // but still in the table until the pass evicts it.
+        parent.mac.set_time_micros(24_500_000);
+        assert!(live_children(&parent).is_empty());
+        assert!(parent.neighbor_table().find_by_short(ORIGIN).is_some());
+        assert_eq!(parent.age_end_device_children(11).as_slice(), &[ORIGIN]);
+        assert!(parent.neighbor_table().find_by_short(ORIGIN).is_none());
+    }
+
+    /// An aging pass charges every countdown up to now: the estimate starts
+    /// again from zero, so nothing is charged twice.
+    #[test]
+    #[cfg(feature = "router")]
+    fn an_aging_pass_resets_the_uncharged_time() {
+        let mut parent = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        assert!(parent.restore_child(ORIGIN_IEEE, ORIGIN, false, true, false, 1));
+        // 100 s pass and are charged by the pass: 20 s of the 2 min left.
+        parent.mac.set_time_micros(100_000_000);
+        assert!(parent.age_end_device_children(100).is_empty());
+        parent.mac.set_time_micros(119_000_000);
+        assert_eq!(live_children(&parent).as_slice(), &[ORIGIN]);
+        parent.mac.set_time_micros(120_000_000);
+        assert!(live_children(&parent).is_empty());
+    }
+
+    /// Only authenticated children are vouched for; a router child until it
+    /// is stale and silent (the condition router-child aging evicts it on).
+    #[test]
+    #[cfg(feature = "router")]
+    fn provisional_and_stale_router_children_are_not_live() {
+        let mut parent = secured_node(DeviceType::Router, OUR_ADDR, RELAY_IEEE);
+        assert!(parent.restore_child(ORIGIN_IEEE, ORIGIN, false, true, false, 8));
+        assert!(parent.restore_child(RESTORED_CHILD_IEEE, RESTORED_CHILD, true, true, true, 8));
+        assert_eq!(live_children(&parent).as_slice(), &[ORIGIN, RESTORED_CHILD]);
+
+        parent
+            .neighbors
+            .find_by_short_mut(ORIGIN)
+            .unwrap()
+            .relationship = crate::neighbor::Relationship::UnauthenticatedChild;
+        assert_eq!(live_children(&parent).as_slice(), &[RESTORED_CHILD]);
+
+        let router = parent.neighbors.find_by_short_mut(RESTORED_CHILD).unwrap();
+        router.awaiting_link_status = false;
+        router.link_status_age = crate::neighbor::ROUTER_AGE_LIMIT + 1;
+        router.age = crate::ROUTER_CHILD_SILENCE_SECS - 1;
+        assert_eq!(
+            live_children(&parent).as_slice(),
+            &[RESTORED_CHILD],
+            "stale but not silent long enough"
+        );
+        parent
+            .neighbors
+            .find_by_short_mut(RESTORED_CHILD)
+            .unwrap()
+            .age = crate::ROUTER_CHILD_SILENCE_SECS;
+        assert!(live_children(&parent).is_empty());
     }
 
     // ── R22 child restore + Parent Announce ──────────────────

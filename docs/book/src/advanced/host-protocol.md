@@ -2547,6 +2547,9 @@ Child info: `u8 capability, u8 timeout_exp`.
   node descriptor). Otherwise it uses `0x80` (allocate address, rx-off) and
   timeout index 8 (256 min). The NCP corrects both on the child's next
   poll or rejoin.
+- `timeout_exp` is the R22 End Device Timeout enumeration (0..=14). On
+  import, an undefined value (above 14, e.g. `0xFF` for "unknown") is the
+  R22 default 8 (256 min), never the longest window (14, about 11 days).
 
 Link block: `[16] key, u8 key_seq, u8 attrs (0 provisional, 1 unverified,
 2 verified), u8 origin (0 global, 1 install code, 2 TC generated, 3
@@ -2648,6 +2651,26 @@ Rules:
    went with the previous network), and they are persisted with the APS
    tables like `NWK_GROUP_MEMBERSHIP`. `BKP_RESTORE_COMMIT` has no group
    count: a host checks the result with `TBL_READ` of table `0x0D`.
+9. **Restored children age like joined ones.** A `DEVICE` with a child
+   block is installed as an authenticated child of the NCP at its short
+   address, with its End Device Timeout (an undefined one becomes the
+   default 8, see 9.3). It has not been heard yet: its window starts when
+   the restored network starts, and `DIAG_GET_CHILDREN.last_poll_ms` is
+   `0xFFFFFFFF` until it is heard. A MAC Data Poll, an End Device Timeout
+   Request or a NWK-secured frame from it restarts the window. A child that
+   never keeps alive within the window is aged out like any other:
+   `EVT_DEVICE_LEFT` reason 4, removed from the durable child table, and no
+   longer exported as a child (its Trust Center record stays). The same
+   applies after an NCP reboot: children are reloaded from the child
+   journal at `NWK_INIT` and their windows start there (the countdown
+   itself is not persisted).
+
+   The window restarts at every restore and every reboot. A child that has
+   left is therefore only dropped after one full window of NCP uptime
+   without a restore. A host that restores (or reboots the NCP) more often
+   than a child's timeout re-creates it each time: before a restore it
+   should drop the child block of a device it has not heard from for longer
+   than that device's timeout (8 → 256 min).
 
 `EVT_NCP_READY`, `NWK_GET_INFO` and the export always report the IEEE the
 radio actually uses.
@@ -2673,10 +2696,18 @@ radio actually uses.
   and then streamed from a RAM or flash copy.
 - Counters are exported as **durable limits**. The NWK value equals the last
   `EVT_FC_CHECKPOINT`, so a backup never under-reports a counter.
-- `DEVICE` records cover children and cached entries. The host merges them
-  with its own store. Export records carry no `rev` (Z4): `rev` belongs to
-  `TBL_*` entries (8.5) of an NCP that pages its tables to the host. A
-  standalone NCP (no paging, `TBL_READ` entries with `rev` 0) is
+- `DEVICE` records cover children and cached entries. A record carries a
+  child block only for a child the NCP still vouches for (the same rule as
+  the durable child table): an authenticated child (not a provisional
+  joiner that has not proved the network key) whose End Device Timeout has
+  not elapsed. This is checked at export time, so a child past its timeout
+  is exported without a child block (or not at all without a Trust Center
+  record) even if the stack's aging pass has not run yet. `TBL_READ` and
+  `TBL_STATS.pinned` apply the same rule. `DIAG_GET_CHILDREN` stays the raw
+  neighbour-table view.
+- The host merges `DEVICE` records with its own store. Export records
+  carry no `rev` (Z4): `rev` belongs to `TBL_*` entries (8.5) of an NCP
+  that pages its tables to the host. A standalone NCP (no paging, `TBL_READ` entries with `rev` 0) is
   authoritative for what it exports, so the presence rule applies: a record
   with a link block replaces the host's key for that device; a record
   without one keeps the host's key (keys not exported, or held only by the

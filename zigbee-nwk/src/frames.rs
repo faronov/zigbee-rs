@@ -889,6 +889,22 @@ pub const fn ed_timeout_enum_to_seconds(timeout_enum: u8) -> Option<u32> {
     }
 }
 
+/// The End Device Timeout enumeration a parent applies to a child whose
+/// enumeration comes from outside the R22 exchange (a backup, a host): the
+/// value itself when it is defined (`0..=`[`ED_TIMEOUT_ENUM_MAX`]), otherwise
+/// the R22 default [`ED_TIMEOUT_ENUM_DEFAULT`] (256 min).
+///
+/// An unknown value is never widened to the longest window: a child the
+/// parent knows nothing about gets exactly what a child that never
+/// negotiated gets.
+pub const fn ed_timeout_enum_or_default(timeout_enum: u8) -> u8 {
+    if timeout_enum <= ED_TIMEOUT_ENUM_MAX {
+        timeout_enum
+    } else {
+        ED_TIMEOUT_ENUM_DEFAULT
+    }
+}
+
 /// End Device Timeout Request (NWK command 0x0B).
 ///
 /// Sent by an end device to its parent after joining/rejoining to request a
@@ -996,9 +1012,10 @@ impl EdTimeoutResponse {
 mod tests {
     use super::NwkHeader;
     use super::{
-        ED_TIMEOUT_ENUM_MAX, EdTimeoutRequest, EdTimeoutResponse, LINK_STATUS_FIRST_FRAME,
-        LINK_STATUS_LAST_FRAME, LinkStatusCommand, LinkStatusEntry, LinkStatusReport,
-        NWK_REPORT_ID_SHIFT, PanIdConflictReport, PanIdUpdate, ed_timeout_enum_to_seconds,
+        ED_TIMEOUT_ENUM_DEFAULT, ED_TIMEOUT_ENUM_MAX, EdTimeoutRequest, EdTimeoutResponse,
+        LINK_STATUS_FIRST_FRAME, LINK_STATUS_LAST_FRAME, LinkStatusCommand, LinkStatusEntry,
+        LinkStatusReport, NWK_REPORT_ID_SHIFT, PanIdConflictReport, PanIdUpdate,
+        ed_timeout_enum_or_default, ed_timeout_enum_to_seconds,
     };
     use zigbee_types::{PanId, ShortAddress};
 
@@ -1108,6 +1125,20 @@ mod tests {
         let mut buf = [0xAAu8; 2];
         assert_eq!(EdTimeoutRequest::new(8).unwrap().serialize(&mut buf), 2);
         assert_eq!(buf, [8, 0x00]);
+    }
+
+    #[test]
+    fn an_undefined_enumeration_from_outside_falls_back_to_the_default() {
+        for defined in 0..=ED_TIMEOUT_ENUM_MAX {
+            assert_eq!(ed_timeout_enum_or_default(defined), defined);
+        }
+        for undefined in [ED_TIMEOUT_ENUM_MAX + 1, 0x7F, 0xFF] {
+            assert_eq!(
+                ed_timeout_enum_or_default(undefined),
+                ED_TIMEOUT_ENUM_DEFAULT,
+                "never widened to the longest window"
+            );
+        }
     }
 
     #[test]

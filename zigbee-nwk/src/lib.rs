@@ -458,6 +458,13 @@ pub struct NwkLayer<M: MacDriver> {
     /// Seconds elapsed in the current `nwkLinkStatusPeriod` interval, used to
     /// age router neighbors (R22 §3.6.3.4.3).
     link_status_age_counter: u16,
+    /// MAC clock (µs) at or after which every armed End Device Timeout
+    /// countdown was last brought up to date: the last aging pass that
+    /// charged elapsed time, or the last (re)arm of any child's countdown.
+    /// The time since it is a lower bound of what no countdown has been
+    /// charged yet (see [`Self::child_is_live`]).
+    #[cfg(feature = "router")]
+    child_countdown_mark_us: u32,
     /// Counter for stochastic child address assignment.
     next_child_addr_offset: u16,
     /// Lifecycle outcome of the NWK command in the frame being processed,
@@ -540,6 +547,8 @@ impl<M: MacDriver> NwkLayer<M> {
             #[cfg(feature = "router")]
             pending_lifecycle_relay: None,
             link_status_age_counter: 0,
+            #[cfg(feature = "router")]
+            child_countdown_mark_us: 0,
             next_child_addr_offset: 1,
             pending_command_outcome: None,
             host_events: host_events::HostNwkEvents::new(),
@@ -611,6 +620,8 @@ impl<M: MacDriver> NwkLayer<M> {
             #[cfg(feature = "router")]
             core::ptr::addr_of_mut!((*slot).pending_lifecycle_relay).write(None);
             core::ptr::addr_of_mut!((*slot).link_status_age_counter).write(0);
+            #[cfg(feature = "router")]
+            core::ptr::addr_of_mut!((*slot).child_countdown_mark_us).write(0);
             core::ptr::addr_of_mut!((*slot).next_child_addr_offset).write(1);
             core::ptr::addr_of_mut!((*slot).pending_command_outcome).write(None);
             core::ptr::addr_of_mut!((*slot).host_events).write(host_events::HostNwkEvents::new());
@@ -1373,6 +1384,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // arm its deadline so it is aged out unless it keeps alive.
         if entry.device_type == neighbor::NeighborDeviceType::EndDevice {
             entry.refresh_end_device_timeout();
+            self.mark_child_countdowns();
         }
         true
     }
@@ -1400,6 +1412,7 @@ impl<M: MacDriver> NwkLayer<M> {
             {
                 entry.parent_annce_pending = false;
             }
+            self.mark_child_countdowns();
         }
     }
 
@@ -1430,6 +1443,7 @@ impl<M: MacDriver> NwkLayer<M> {
             {
                 entry.parent_annce_pending = false;
             }
+            self.mark_child_countdowns();
         }
     }
 
@@ -1474,6 +1488,9 @@ impl<M: MacDriver> NwkLayer<M> {
             }
         }
         let elapsed = u32::from(elapsed_secs);
+        // Every countdown is charged up to now (the caller's whole seconds
+        // never exceed the time that actually elapsed).
+        self.mark_child_countdowns();
         let mut expired: heapless::Vec<(ShortAddress, IeeeAddress), { neighbor::MAX_NEIGHBORS }> =
             heapless::Vec::new();
         for entry in self.neighbors.iter_mut_all() {
@@ -1497,6 +1514,72 @@ impl<M: MacDriver> NwkLayer<M> {
         }
         crate::host_events::host_event!(self.host_note_aged(&evicted));
         evicted
+    }
+
+    /// Record that every armed End Device Timeout countdown is up to date
+    /// as of now (an aging pass charged the elapsed time, or a countdown
+    /// was just (re)armed). Moving the mark forward only ever lowers
+    /// [`Self::child_is_live`]'s estimate, so a spurious call is harmless.
+    #[cfg(feature = "router")]
+    fn mark_child_countdowns(&mut self) {
+        self.child_countdown_mark_us = self.mac.monotonic_micros();
+    }
+
+    /// A non-routing build has no children to age.
+    #[cfg(not(feature = "router"))]
+    fn mark_child_countdowns(&mut self) {}
+
+    /// Whole seconds that no End Device Timeout countdown has been charged
+    /// yet: a lower bound, because every countdown was last brought up to
+    /// date at or before the mark, and the wrapping microsecond clock can
+    /// only under-count a gap longer than its period (≈ 71.6 min).
+    fn uncharged_child_countdown_secs(&self) -> u32 {
+        #[cfg(feature = "router")]
+        {
+            self.mac
+                .monotonic_micros()
+                .wrapping_sub(self.child_countdown_mark_us)
+                / 1_000_000
+        }
+        #[cfg(not(feature = "router"))]
+        {
+            0
+        }
+    }
+
+    /// Whether this parent may vouch for `entry` as its child outside the
+    /// running stack — in a backup export, `TBL_READ` or the durable child
+    /// table — even before the next aging pass has run.
+    ///
+    /// Only an authenticated [`Child`] qualifies; a provisional
+    /// (unauthenticated) child has not proved the network key. An end-device
+    /// child is live while its End Device Timeout countdown exceeds the time
+    /// not yet charged to it ([`Self::age_end_device_children`] would evict
+    /// it otherwise); a router child until it is stale and silent, the
+    /// condition router-child aging evicts it on. Never a reason to evict:
+    /// the aging pass remains the only removal path (with its coupled-state
+    /// cleanup and host departure event).
+    ///
+    /// [`Child`]: neighbor::Relationship::Child
+    pub fn child_is_live(&self, entry: &neighbor::NeighborEntry) -> bool {
+        if !entry.active || entry.relationship != neighbor::Relationship::Child {
+            return false;
+        }
+        match entry.device_type {
+            neighbor::NeighborDeviceType::EndDevice => {
+                entry.keepalive_remaining_secs > self.uncharged_child_countdown_secs()
+            }
+            #[cfg(feature = "router")]
+            _ if entry.is_stale_router_child() => entry.age < ROUTER_CHILD_SILENCE_SECS,
+            _ => true,
+        }
+    }
+
+    /// The children [`Self::child_is_live`] vouches for, in table order.
+    pub fn live_children(&self) -> impl Iterator<Item = &neighbor::NeighborEntry> {
+        self.neighbors
+            .iter()
+            .filter(move |entry| self.child_is_live(entry))
     }
 
     /// Re-install an authenticated child from durable persistence (reboot).
@@ -1568,6 +1651,8 @@ impl<M: MacDriver> NwkLayer<M> {
             entry.refresh_end_device_timeout();
         }
         let installed = self.neighbors.add_or_update(entry).is_ok();
+        // Its window starts now (not heard yet this power cycle).
+        self.mark_child_countdowns();
         // Nothing is known of a restored sleepy child's polling this power
         // cycle: hold its frames up to its End Device Timeout until a long
         // poll is measured again (see `poll_estimate`).
@@ -2344,6 +2429,7 @@ impl<M: MacDriver> NwkLayer<M> {
                 }
                 entry.keepalive_confirmed = secured;
             }
+            self.mark_child_countdowns();
             if !secured {
                 self.security.clear_frame_counters_for_source(&child_ieee);
                 self.indirect.remove_all(existing_address);
@@ -2427,6 +2513,7 @@ impl<M: MacDriver> NwkLayer<M> {
         // provisional and is armed only once it proves the network key.
         if secured && requested_type == neighbor::NeighborDeviceType::EndDevice {
             entry.refresh_end_device_timeout();
+            self.mark_child_countdowns();
         }
         self.neighbors
             .add_or_update(entry)

@@ -19,7 +19,12 @@
 //! deadline is re-armed to the full window of its accepted enumeration. That
 //! is the safe direction: a restored child is granted a fresh full window to
 //! prove liveness rather than being evicted immediately after a reboot, and it
-//! avoids rewriting flash every time a countdown ticks.
+//! avoids rewriting flash every time a countdown ticks. The window therefore
+//! starts at the restore: a child that never keeps alive again is aged out one
+//! window of uptime later, and a snapshot never re-persists a child whose
+//! window has elapsed (`NwkLayer::child_is_live`), even before the aging pass
+//! evicts it — unless a durable removal or reassignment transaction still owns
+//! it.
 //!
 //! # Network binding
 //!

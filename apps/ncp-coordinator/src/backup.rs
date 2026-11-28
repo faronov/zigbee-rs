@@ -3,9 +3,13 @@
 //! **Export** streams a record set built from the running network:
 //! `NODE`, `NETWORK`, `NETWORK_KEY`, `TC_LINK_KEY` and the restored
 //! `EZSP_HASHED_TCLK` root (keys only with export flag bit0 and an
-//! unlocked key export), one `DEVICE` per Trust Center record or child
-//! (flag bit1), one `APS_GROUP` per group of the APS group table (flag
-//! bit3), `RS_PARAMS`, then `END` with the count and CRC-32C.
+//! unlocked key export), one `DEVICE` per Trust Center record or live
+//! child (flag bit1), one `APS_GROUP` per group of the APS group table
+//! (flag bit3), `RS_PARAMS`, then `END` with the count and CRC-32C. A
+//! `DEVICE` carries a child block only for a child the NCP still vouches
+//! for (`NwkLayer::child_is_live`: authenticated, End Device Timeout not
+//! elapsed even if the aging pass has not run yet), so a backup never
+//! makes a restore re-create a child that has gone.
 //! Counters are exported as durable limits; every link-key `tx_counter` is
 //! the global durable APS limit (8.4). The records are generated on demand
 //! per `BKP_EXPORT_READ` (no RAM copy): a device or group that joins or
@@ -27,7 +31,10 @@
 //! are first heard.
 //! Children of the NCP (`DEVICE` with a child block, up to
 //! [`MAX_STAGED_CHILDREN`]) are written to the durable child table before
-//! the resume, so they keep their parent and short address. `APS_GROUP`
+//! the resume, so they keep their parent and short address; an undefined
+//! End Device Timeout is the R22 default (8, 256 min). They have not been
+//! heard yet: their windows start at the resume and they age out like
+//! joined children if they never keep alive. `APS_GROUP`
 //! records (merged per group) replace the APS group table once the network
 //! runs, through the port's `NWK_GROUP_MEMBERSHIP` add, and are persisted
 //! with the APS tables like it. Deviations, reported as notes: link keys
@@ -577,7 +584,10 @@ fn stage(restore: &mut Restore, record: &Record<'_>, facts: &StageFacts) -> Resu
         Record::Device(device) => {
             let mut result = None;
             match &device.child {
-                // A child of the NCP keeps its short address and parent.
+                // A child of the NCP keeps its short address and parent. An
+                // undefined timeout (one the backup's source did not know)
+                // is the R22 default, never the longest window: the child
+                // is aged out like any other one if it never polls.
                 Some(child)
                     if (0x0001..=0xFFF7).contains(&device.nwk)
                         && restore
@@ -586,7 +596,9 @@ fn stage(restore: &mut Restore, record: &Record<'_>, facts: &StageFacts) -> Resu
                                 ieee: device.ieee.0,
                                 nwk: device.nwk,
                                 capability: child.capability,
-                                timeout: child.timeout_exp.min(14),
+                                timeout: zigbee_nwk::frames::ed_timeout_enum_or_default(
+                                    child.timeout_exp,
+                                ),
                             })
                             .is_ok() => {}
                 Some(_) => result = Some(note::CHILD_DEMOTED),

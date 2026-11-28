@@ -780,6 +780,23 @@ the `u16` neighbour age counter). The deadline is:
 Router children age via Link Status, not this deadline; unauthenticated
 (provisional) children keep the existing short provisional-child timer.
 
+A child restored from the durable child table (reboot) or from a backup
+(`restore_child`) has not been heard yet: its deadline is armed to the full
+window of its enumeration at that moment, so its clock starts at the
+restore. The countdown is not persisted, so every reboot or restore starts
+a new window. An enumeration that comes from outside the R22 exchange and
+is undefined (`frames::ed_timeout_enum_or_default`) is the default 8, never
+the longest window.
+
+Anything that vouches for a child outside the running stack — the durable
+child table snapshot and a coordinator's backup export — asks
+`NwkLayer::child_is_live` / `live_children`: an authenticated `Child` (never
+a provisional one) whose countdown still exceeds the time not yet charged
+to it. That time is a lower bound kept with one MAC-clock mark, moved at
+every aging pass and every (re)arm, so a child whose window has elapsed is
+not vouched for even before the next aging pass. The aging pass remains the
+only removal path (coupled-state cleanup and the host departure event).
+
 ### Durable child table, Parent Announce and the orphan procedure
 
 A router persists its authenticated children through a **separate** crash-safe

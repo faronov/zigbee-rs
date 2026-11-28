@@ -11658,9 +11658,10 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
 
         // The snapshot is bound to the network these children belong to, so a
         // later restore can reject a table left over from a previous network.
-        let extended_pan_id = self.bdb.zdo().nwk().nib().extended_pan_id;
+        let nwk = self.bdb.zdo().nwk();
+        let extended_pan_id = nwk.nib().extended_pan_id;
         let mut table = child_store::PersistentChildTable::new(extended_pan_id);
-        for entry in self.bdb.zdo().nwk().neighbor_table().iter() {
+        for entry in nwk.neighbor_table().iter() {
             if entry.relationship != Relationship::Child {
                 continue;
             }
@@ -11668,6 +11669,16 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
                 .filter(|snapshot| snapshot.matches_network(&extended_pan_id))
                 .and_then(|snapshot| snapshot.child(&entry.ieee_address))
                 .filter(|child| !child.departure_pending);
+            // A child past its End Device Timeout is not re-persisted as
+            // live even before the aging pass evicts it (that pass still
+            // reports it to the host). A child with a durable removal or
+            // address-reassignment transaction keeps its record: that
+            // transaction owns its eviction.
+            let transaction = pending
+                .is_some_and(|child| child.removal_pending || child.reassignment_address.is_some());
+            if !nwk.child_is_live(entry) && !transaction {
+                continue;
+            }
             let child = child_store::PersistentChild {
                 ieee_address: entry.ieee_address,
                 short_address: entry.network_address.0,
@@ -20365,6 +20376,95 @@ mod parent_router_tests {
                 .find_by_short(CHILD)
                 .is_none(),
             "a silent child ages out via the joined tick"
+        );
+    }
+
+    #[test]
+    fn a_reloaded_child_past_its_timeout_is_not_re_persisted_as_live() {
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+        // Enumeration 0: a 10 s window.
+        block_on(
+            device
+                .bdb_mut()
+                .zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .respond_to_end_device_timeout_request(CHILD, CHILD_IEEE, 0),
+        )
+        .unwrap();
+        let mut store = crate::child_store::RamChildTableStore::new();
+        device.save_child_table(&mut store).unwrap();
+
+        // Reboot: the child is reloaded, its window starting now.
+        let mut rebooted = centralized_router();
+        assert_eq!(rebooted.restore_child_table(&mut store), Ok(1));
+        block_on(PlatformServices::delay_micros(
+            rebooted.mac_mut(),
+            9_000_000,
+        ));
+        rebooted.save_child_table(&mut store).unwrap();
+        assert_eq!(
+            store.load().unwrap().unwrap().len(),
+            1,
+            "within its window it stays persisted"
+        );
+
+        // Its window elapses before any aging pass: a save no longer keeps
+        // it as a live child.
+        block_on(PlatformServices::delay_micros(
+            rebooted.mac_mut(),
+            2_000_000,
+        ));
+        rebooted.save_child_table(&mut store).unwrap();
+        assert!(
+            store.load().unwrap().unwrap().is_empty(),
+            "an expired child is not re-persisted as live"
+        );
+        // The aging pass still removes it from the live table.
+        let mut clusters: [ClusterRef<'_>; 0] = [];
+        block_on(rebooted.tick(11, &mut clusters));
+        assert!(
+            rebooted
+                .bdb()
+                .zdo()
+                .aps()
+                .nwk()
+                .neighbor_table()
+                .find_by_short(CHILD)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_expired_child_with_a_pending_removal_keeps_its_durable_transaction() {
+        let mut device = centralized_router();
+        const CHILD: ShortAddress = ShortAddress(0x89AB);
+        authenticated_sleepy_child(&mut device, CHILD);
+        block_on(
+            device
+                .bdb_mut()
+                .zdo_mut()
+                .aps_mut()
+                .nwk_mut()
+                .respond_to_end_device_timeout_request(CHILD, CHILD_IEEE, 0),
+        )
+        .unwrap();
+        let mut store = crate::child_store::RamChildTableStore::new();
+        assert_eq!(
+            device.stage_child_removal(&mut store, &CHILD_IEEE),
+            Ok(true)
+        );
+
+        block_on(PlatformServices::delay_micros(device.mac_mut(), 11_000_000));
+        device.save_child_table(&mut store).unwrap();
+        let table = store.load().unwrap().unwrap();
+        assert!(
+            table
+                .pending_removal()
+                .is_some_and(|child| child.ieee_address == CHILD_IEEE),
+            "the removal transaction owns the child's eviction"
         );
     }
 
