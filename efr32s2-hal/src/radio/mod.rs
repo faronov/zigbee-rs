@@ -40,8 +40,9 @@
 //! - ACKs are generated and checked in software. By default
 //!   [`Radio::receive`] acknowledges matching frames, so turnaround depends
 //!   on the caller polling `receive`. With the `isr-ack` feature (parent
-//!   images) the `FRC` RX-done interrupt sends every Imm-Ack instead, with a
-//!   Frame Pending bit from a source-match table (see `isr_ack.rs`).
+//!   images) the `FRC` RX-done interrupt decides every Imm-Ack instead, with
+//!   a Frame Pending bit from a source-match table, and timer interrupts
+//!   send it at the turnaround time (see `isr_ack.rs`).
 //!
 //! The per-chip tables and the radio state hand-shake (xG22: `RAC.SEQIF`
 //! with the sequencer clock-gated; xG21: a driver-owned sequencer vector
@@ -403,6 +404,9 @@ pub struct AckStats {
     /// Longest frame-end-to-ACK-TX-start latency seen, in microseconds
     /// (measured from interrupt entry, so it excludes interrupt latency).
     pub max_turnaround_us: u32,
+    /// Longest run of a radio interrupt handler (`FRC` or the Imm-Ack step
+    /// timer), in microseconds.
+    pub max_isr_us: u32,
 }
 
 #[repr(C, align(256))]
@@ -454,6 +458,8 @@ impl RadioToken {
             stats: RadioStats::default(),
         };
         apply_state(&chip::IDLE);
+        #[cfg(feature = "isr-ack")]
+        isr_ack::init();
         radio.set_tx_power_ddbm(0);
         radio.set_channel(11)?;
         Ok(radio)
@@ -515,15 +521,6 @@ macro_rules! radio_op {
 }
 
 impl Radio {
-    #[cfg(feature = "isr-ack")]
-    #[inline(always)]
-    fn locked<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
-        isr_ack::lock(self);
-        let result = f(self);
-        isr_ack::unlock(self);
-        result
-    }
-
     pub fn channel(&self) -> u8 {
         self.channel
     }
@@ -589,7 +586,7 @@ impl Radio {
     pub fn set_frame_pending(&mut self, address: FpAddress, pending: bool) -> Result<(), FpError> {
         #[cfg(feature = "isr-ack")]
         {
-            self.locked(|_| isr_ack::set_frame_pending(address, pending))
+            isr_ack::set_frame_pending(address, pending)
         }
         #[cfg(not(feature = "isr-ack"))]
         {
@@ -601,7 +598,7 @@ impl Radio {
     /// Empty the Frame Pending table (MLME-RESET).
     pub fn clear_frame_pending(&mut self) {
         #[cfg(feature = "isr-ack")]
-        self.locked(|_| isr_ack::clear_frame_pending());
+        isr_ack::clear_frame_pending();
     }
 
     /// Counters of the interrupt-driven Imm-Ack path.
@@ -943,26 +940,35 @@ impl Radio {
         None
     }
 
-    radio_op! {
-        /// Fetch the next received frame into `out` (without FCS). Sends a
-        /// software ACK first when the frame requests one and is addressed to
-        /// this node (see [`set_ack_filter`](Self::set_ack_filter)).
-        pub fn receive(&mut self, out: &mut [u8; MAX_FRAME]) -> Option<RxFrame> {
-            service_sequencer();
-            self.service_overflow();
-            let frame = self.read_frame(out, true)?;
-            self.stats.rx_frames += 1;
-            #[cfg(not(feature = "isr-ack"))]
-            if self.rx_enabled && needs_ack(&out[..frame.len], &self.ack_filter) {
-                let ack = [0x02, 0x00, out[2]];
-                if self.transmit_raw(&ack).is_ok() {
-                    self.stats.acks_sent += 1;
-                }
-                self.rx_enabled = false;
-                let _ = self.rx_on();
+    /// Fetch the next received frame into `out` (without FCS). Sends a
+    /// software ACK first when the frame requests one and is addressed to
+    /// this node (see [`set_ack_filter`](Self::set_ack_filter)).
+    #[cfg(not(feature = "isr-ack"))]
+    pub fn receive(&mut self, out: &mut [u8; MAX_FRAME]) -> Option<RxFrame> {
+        service_sequencer();
+        self.service_overflow();
+        let frame = self.read_frame(out, true)?;
+        self.stats.rx_frames += 1;
+        if self.rx_enabled && needs_ack(&out[..frame.len], &self.ack_filter) {
+            let ack = [0x02, 0x00, out[2]];
+            if self.transmit_raw(&ack).is_ok() {
+                self.stats.acks_sent += 1;
             }
-            Some(frame)
+            self.rx_enabled = false;
+            let _ = self.rx_on();
         }
+        Some(frame)
+    }
+
+    /// Fetch the next frame the `FRC` interrupt queued (already
+    /// acknowledged when it requested an ACK). Only takes the queue: an
+    /// Imm-Ack in flight goes on meanwhile, and the interrupt owns RX
+    /// overflow recovery.
+    #[cfg(feature = "isr-ack")]
+    pub fn receive(&mut self, out: &mut [u8; MAX_FRAME]) -> Option<RxFrame> {
+        let frame = self.read_frame(out, true)?;
+        self.stats.rx_frames += 1;
+        Some(frame)
     }
 
     // Out of line: called from six places; inlining duplicated it into
@@ -1199,6 +1205,20 @@ fn release_warm(state: RacState, warm: Warm) {
 /// [`service_sequencer`]), lock the synthesizer, then release the state.
 /// The warm state is released even on failure so the RSM can be disabled.
 fn warm_up(state: RacState, warm: Warm, rx_if: bool, cached: &mut u16) -> Result<(), RadioError> {
+    enter_warm(state, warm)?;
+    spin_cycles(us_to_cycles(WARM_SETTLE_US));
+    let result = start_synth(rx_if, cached);
+    if result.is_ok() && matches!(warm, Warm::Tx) {
+        chip::pa_ramp_up();
+    }
+    release_warm(state, warm);
+    result
+}
+
+/// Wait for the RSM to reach the held warm `state`; on timeout release it
+/// (so the RSM can be disabled) and record the stalled state. The
+/// synthesizer may start [`WARM_SETTLE_US`] after this returns.
+fn enter_warm(state: RacState, warm: Warm) -> Result<(), RadioError> {
     let deadline = Deadline::after_us(SYNTH_TIMEOUT_US);
     while rac_state_raw() != state {
         service_sequencer();
@@ -1213,13 +1233,7 @@ fn warm_up(state: RacState, warm: Warm, rx_if: bool, cached: &mut u16) -> Result
             return Err(RadioError::SynthLock);
         }
     }
-    spin_cycles(us_to_cycles(WARM_SETTLE_US));
-    let result = start_synth(rx_if, cached);
-    if result.is_ok() && matches!(warm, Warm::Tx) {
-        chip::pa_ramp_up();
-    }
-    release_warm(state, warm);
-    result
+    Ok(())
 }
 
 /// Ramp the PA down in the held `TXPD` state, then let the RSM leave it.
@@ -1246,11 +1260,19 @@ extern "C" fn RAC_RSM() {
     service_sequencer();
 }
 
-/// `FRC` interrupt: RX done / RX overflow; sends Imm-Acks (`isr-ack`).
+/// `FRC` interrupt: RX done / RX overflow; starts Imm-Acks (`isr-ack`).
 #[cfg(all(feature = "isr-ack", target_arch = "arm", target_os = "none"))]
 #[unsafe(no_mangle)]
 extern "C" fn FRC() {
     isr_ack::on_frc_interrupt();
+}
+
+/// `TIMER0` interrupt: the next step of an Imm-Ack in flight (`isr-ack`,
+/// [`crate::delay::alarm`]).
+#[cfg(all(feature = "isr-ack", target_arch = "arm", target_os = "none"))]
+#[unsafe(no_mangle)]
+extern "C" fn TIMER0() {
+    isr_ack::on_timer_interrupt();
 }
 
 /// LO-counter target for the programmed channel, matching the hardware's
@@ -1551,6 +1573,26 @@ fn rx_ram_byte(offset: u32) -> u8 {
     // SAFETY: the index is reduced modulo the buffer length; the bytes were
     // written by BUFC before STATUS reported them available.
     unsafe { core::ptr::read_volatile(base.add((offset % RX_BUF_LEN) as usize)) }
+}
+
+/// The `len` bytes of the RX buffer from `offset`, as up to two runs (the
+/// buffer is a ring).
+#[cfg(feature = "isr-ack")]
+fn rx_ram_runs(offset: u32, len: usize) -> [&'static [u8]; 2] {
+    let start = (offset % RX_BUF_LEN) as usize;
+    let first = len.min(RX_BUF_LEN as usize - start);
+    // Order the copy after the STATUS read that reported the bytes.
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+    let base = RX_RAM.0.get() as *const u8;
+    // SAFETY: both runs lie inside the buffer. BUFC wrote these bytes
+    // before STATUS reported them, and does not write them again before
+    // READOFFSET has passed them, which the caller does after the copy.
+    unsafe {
+        [
+            core::slice::from_raw_parts(base.add(start), first),
+            core::slice::from_raw_parts(base, len - first),
+        ]
+    }
 }
 
 fn buf(index: u32) -> u32 {

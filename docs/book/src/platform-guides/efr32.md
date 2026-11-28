@@ -383,8 +383,9 @@ Each Series 2 example crate builds one bin per role. The features `ed`,
 
 **MAC.** The router uses `Efr32s2RouterMac = SoftMacCore<Efr32s2RadioPhy,
 Parent<8, 8, 0>>` with the HAL feature `isr-ack`. The `FRC` RX-done
-interrupt sends every Imm-Ack (see *Interrupt Imm-Ack* below), so the PHY
-reports `hardware_auto_ack` and the core never calls `send_ack`. The Frame
+interrupt decides every Imm-Ack and timer interrupts send it (see
+*Interrupt Imm-Ack* below), so the PHY reports `hardware_auto_ack` and the
+core never calls `send_ack`. The Frame
 Pending bit comes from an 8 short + 8 extended source-match table in the
 HAL that the core arms through `RadioPhy::set_ack_frame_pending` whenever
 it queues indirect data or an association response. `PENDING = 0`: the HAL
@@ -427,14 +428,19 @@ For each newly completed frame in the RX buffer, the handler:
 
 - reads the MHR (24 bytes at most) and checks the PAN ID and destination
   the way the HAL's ACK filter does;
-- sends a precomputed 5-byte ACK at once if AR = 1 and the frame is for us,
-  setting FP = 1 only for an unsecured MAC Data Request (command 0x04) whose
-  source address is in the FP table. An ACK to a data frame carries FP = 0
-  (802.15.4-2006 7.2.2.3.1; we do not use the "FP on every frame from a
-  pending child" variant);
+- starts a 5-byte ACK if AR = 1 and the frame is for us, setting FP = 1 only
+  for an unsecured MAC Data Request (command 0x04) whose source address is
+  in the FP table. The FP bit is decided here, before the ACK is built. An
+  ACK to a data frame carries FP = 0 (802.15.4-2006 7.2.2.3.1; we do not use
+  the "FP on every frame from a pending child" variant). Timer interrupts
+  then send the ACK at the turnaround time (see *Imm-Ack without waiting in
+  an interrupt* below); the frame is delivered only once its ACK is on
+  air;
 - drops ACK frames, frames for other nodes or PANs, and frames it could no
-  longer ACK within 400 µs of their end (the sender retransmits, so such a
-  frame must not be delivered twice);
+  longer ACK in time: decided more than 400 µs, or started more than
+  512 µs (macAckWaitDuration less the ACK itself) after their earliest
+  possible end (the sender retransmits, so such a frame must not be
+  delivered twice);
 - moves every kept frame (`[len, MPDU, raw RSSI]`) out of the 1 KiB
   hardware RX buffer into a 1 KiB software queue, and always advances the
   buffer's read offset. The hardware buffer is therefore empty after every
@@ -446,15 +452,121 @@ For each newly completed frame in the RX buffer, the handler:
   (`AckStats::queue_full_unacked`). A corrupt length byte clears the buffer
   (`AckStats::resyncs`).
 
-Task-side radio operations mask the `FRC` line, so the interrupt never sees
-the radio mid-operation. When the lock is released, it re-pends the
-interrupt if a frame completed meanwhile, and that frame is aged from the
-start of the lock. `receive` pops only from the software queue, which holds
-frames the interrupt has already examined, so the ACK decision always comes
-before delivery. The sequencer's
-hardware auto-ACK was evaluated and rejected: it is driven by RAIL's
-sequencer microcode, which this driver does not load (the sequencer stays
-clock-gated).
+Task-side radio operations mask the `FRC` and `TIMER0` lines, so the
+interrupts never see the radio mid-operation, and first finish an ACK in
+flight (the task steps it to its end, at most about 0.6 ms). When the lock
+is released, it re-pends the interrupt if a frame completed meanwhile. That
+frame may have ended anywhere in the lock: its deadlines count from the
+lock's start, its ACK starts 181 µs after the interrupt (so never before
+aTurnaroundTime). `receive` pops only from the
+software queue, which holds frames the interrupt has already examined and
+acknowledged, so the ACK decision always comes before delivery; it, the FP
+table and the counters only mask the lines around the access and never wait
+for an ACK. The sequencer's hardware auto-ACK was evaluated and rejected:
+it is driven by RAIL's sequencer microcode, which this driver does not load
+(the sequencer stays clock-gated).
+
+**Imm-Ack without waiting in an interrupt** (all Series 2 dies; measured
+on xG24). The first `isr-ack` handler sent the ACK from the `FRC`
+interrupt and waited there through the warm-up, the 352 µs of ACK airtime,
+the PA ramp-down and the RX restart: up to 629 µs (Router) and 670 µs
+(NCP) per ACK on the MG24 lab pair (below).
+No interrupt of the same NVIC priority could run meanwhile (on the MG24 NCP
+this cost host UART bytes until the LDMA receiver), and the task lost that
+time for every ACK. The CPU is the radio sequencer here: the RSM waits in
+`TXWARM` until the driver has locked the synthesizer and ramped the PA, and
+in `TXPD` until it has ramped the PA down. Those steps are short, the waits
+between them are not, so the ACK is now a chain of short steps, each run by
+the `TIMER0` interrupt at a cycle stamp (compare channel 2 of the TIMER0
+time base, `delay::alarm`):
+
+| step | due | work |
+|---|---|---|
+| `FRC` RX done | frame end + latency | classify, FP decision, RX off, ACK into the TX buffer, `TXEN` (RSM held in `TXWARM`) |
+| `TxSynth` | + 50 µs settle | lock the synthesizer |
+| `TxPrestage` (xG24) | TX start − 58 µs | PA regulators up, slices in reset (RAIL's order) |
+| `TxRamp` | TX start − 18 µs, ≥ 40 µs after the pre-stage | start the PA ramp |
+| `TxStart` | TX start − 2 µs | steady PA, release `TXWARM` at the TX start: the ACK goes on air |
+| `TxEnd` | + 352 µs | PA ramp-down in the held `TXPD`, RSM off, RX on (RSM held in `RXWARM`) |
+| `Queue` | + 15 µs | queue the frame for the stack, examine the frames behind it |
+| `RxSynth` | RX on + 50 µs | lock the synthesizer for RX, release `RXWARM` |
+
+The TX start is 181 µs after the `FRC` interrupt's entry, which puts the
+ACK's first symbol aTurnaroundTime (12 symbols, 192 µs) after the frame's
+last symbol on the air (calibrated with the nRF sniffer). The alarm fires
+10 µs before each step and the handler waits out the rest: a handler
+fetched from flash reaches its step about 8 µs after the compare match.
+`TXWARM` is released by one register write timed by the CPU in `TxStart`
+(cycle-exact against TIMER0); nothing else in the chain is timing-critical.
+What is hardware: the step interrupts (TIMER0 compare), the ACK frame and
+the RSM's TX → `TXPD` transition. What stays CPU work: the FP decision,
+synthesizer locks, the PA sequences and the two state releases. No vendor
+runtime is used. Evaluated and not used: `RAC.CTRL.TXAFTERRX`,
+`RAC.CMD.TXAFTERFRAME` and PRS TX enable only start `TXWARM`, where the RSM
+still waits for the CPU's `RAC.SEQIF` clear; `RAC.STIMER`/`STIMCMPEV` would
+be one more interrupt like TIMER0; PROTIMER is not in the GSDK register
+model. An LDMA write of `RAC.SEQIF` on a TIMER0 compare could release
+`TXWARM` without the CPU, but the steps before it are CPU work anyway, so
+it would not move the ACK; it was not tried. The frame stays at the head of
+the hardware buffer until `TxEnd` has seen `TXDONE`, so a frame whose ACK
+failed is never delivered (`ack_tx_fail`). `FRC` and `TIMER0` share the ACK
+state without further locking, so the HAL gives `TIMER0` the `FRC`
+priority; all other interrupts keep the default priority, and a step that
+starts late (another handler, a critical section) only delays the steps
+after it. `AckStats::max_isr_us` records the longest `FRC`/`TIMER0` run.
+
+Measured on the MG24 lab pair (2026-11-28): BRD4187A ZRHP NCP (20 dBm PA)
+and EK2703A Router (10 dBm PA), channel 25, `hubctl`, 300 s of Basic reads
+from the hub to the Router with 16 pipelined reads every 20 s, both
+directions acknowledged. Interrupt and turnaround figures come from a
+temporary probe build (handler durations, a 100 µs TIMER1 tick at the same
+NVIC priority as `FRC`, `transmit_cca` timestamps; read over SWD), the
+on-air ACK timing from the nRF sniffer (gap from the frame's last symbol to
+the ACK's first, derived from the sniffer's frame timestamps and lengths),
+the APS figures from the NCP's diagnostics counters.
+
+| | master | this change |
+|---|---|---|
+| longest radio handler, NCP / Router | 670 / 629 µs (`FRC`) | 87 / 70 µs (`TIMER0`; `FRC` 73 / 54 µs) |
+| radio handler runs ≥ 400 µs, NCP / Router | 4,404 / 2,227 | 0 / 0 |
+| lateness of the 100 µs tick, max, NCP / Router | 673 / 633 µs | 130 / 70 µs |
+| ticks missed (late by a whole period), NCP / Router | 28,099 / 11,803 | 3,479 / 0 |
+| ACK after the frame, on air, Router (10 dBm PA) | 159–296 µs, median 168 | 191–195 µs, median 193 |
+| ACK after the frame, on air, NCP (20 dBm PA) | 184–291 µs, median 190 | 194–235 µs, median 196 |
+| our TX → RX after a data frame (`TXDONE` to RX search), NCP / Router | 100–120 / 97–108 µs | 104–122 / 99–114 µs |
+| reads | 2,069, 0 failed | 2,033, 0 failed |
+| `aps_tx_failed` (all APS NO_ACK, 0xA7) | 234 of 2,188 (10.7 %) | 144 of 2,077 (6.9 %) |
+| NCP transmissions without a MAC ACK | 73 of 2,300 | 4 of 2,082 |
+| Router: ACK requests left unACKed, queue full | 65 | 9 |
+
+- **ACK timing.** The Router's ACKs started 159–179 µs after the frame
+  (all but two aged frames), earlier than aTurnaroundTime; a sender whose receiver needs the
+  full 192 µs could miss them. Our own senders did not: our receiver is
+  back 97–122 µs after a frame (row above), before either ACK's preamble.
+  Now both start at 192 µs ± 3 µs, except where the warm-up chain is
+  longer: on the NCP, the 20 dBm PA's `FRC` part and pre-stage end the
+  chain at 194–196 µs. A frame that completed while the task held the radio
+  is acknowledged after the interrupt that follows the lock, hence later
+  than 192 µs after its end (the 235 µs maximum); if that ACK would start
+  more than 512 µs after the lock's start, the frame is left
+  unacknowledged and the sender retries. (In the measured version such an
+  ACK was planned from the lock's start and went out as soon as possible,
+  which for a frame that ended just before the release could be earlier
+  than 192 µs; fixed since, host-tested.)
+- **Reliability.** On the air, the master run had 53 retransmissions of
+  2,236 frames to the Router and 15 of 4,404 to the NCP; a 120 s run of
+  this change had 0 of 849 and 2 of 1,706. Most of the master losses were
+  the Router dropping ACK requests with a full RX queue during the bursts
+  (65 unACKed): its task now gets the ~0.5 ms per ACK back. `aps_tx_failed`
+  is APS-level: every failure was an APS NO_ACK (0xA7) for pipelined reads
+  whose responses did arrive; it fell from 10.7 % to 6.9 % but does not
+  come from the radio.
+- **The remaining NCP tick delays** of 100–130 µs (3,479 in 300 s; master
+  3,377) are not radio handlers, whose longest run is 87 µs; they predate
+  this change.
+- **Not run on hardware:** xG21 (ZBT-1, BRD4181A) and xG22. They share the
+  code (xG21 with its own PA ramp split, xG22 without PA steps) and are
+  host-tested and build-checked only.
 
 **RREQ relay and RX overflow.** A router relays Route Requests three times,
 254 ms apart, after a 4–256 ms jitter. The core does not receive while these
@@ -1048,9 +1160,10 @@ USART0 receive interrupt waited longer than about two character times
 read over SWD). Under 90 s of ZCL reads (12 overruns), every overrun was
 serviced 3 µs after an `FRC` interrupt that had run 646–661 µs:
 
-- **The radio interrupt.** With `isr-ack` the `FRC` handler sends the
+- **The radio interrupt.** With `isr-ack` the `FRC` handler sent the
   Imm-Ack itself: turnaround, 352 µs of ACK airtime, then TX done, all inside
-  the interrupt. The USART0 RX interrupt has the same NVIC priority and
+  the interrupt (since replaced: see *Imm-Ack without waiting in an
+  interrupt*; the longest radio handler is now 87 µs). The USART0 RX interrupt has the same NVIC priority and
   cannot preempt it. Each ZCL read brings about two acknowledged frames (APS
   ACK and response), about 1,300 such interrupts in 90 s.
 - **Flash writes**, the second source. A page erase took 12.5 ms and
@@ -1102,10 +1215,12 @@ In phase 3, 219 of 6,465 reads failed with `not_delivered`:
 
 - 204 `busy_responses`: 32 concurrent requests exceed the NCP's 16 APS
   in-flight slots;
-- radio-side APS failures, `aps_tx_failed` 1,588 of 7,038.
+- APS failures, `aps_tx_failed` 1,588 of 7,038.
 
 The APS failure rate is the same with both receivers (27/638 and 32/641 in
-the A/B run); it is not part of this change.
+the A/B run); it is not part of this change. They are APS NO_ACK (0xA7)
+for pipelined reads, not radio losses (see *Imm-Ack without waiting in an
+interrupt*).
 
 **RAM and stack.** The NCP's static RAM ends at `0x2002_A2D4`
 (`.bss` 168,660 B, with the LDMA receiver); the linked stack is 89,388 B. The stack high-water mark
@@ -1520,6 +1635,14 @@ factory-reset version). Static RAM and stack did not change. The LDMA host
 receiver added 368–492 B of flash and 124 B of static RAM to the NCP images
 (the 128-byte descriptor chain; the 8 KiB ring replaces the interrupt ring),
 taken from the linked stack; the Routers moved by 0 to −16 B.
+
+The timer-stepped Imm-Ack (`isr-ack` images only) added 1,080 B of flash
+to the BRD4187 NCP (462,464 → 463,544 B file-backed) and 1,592 B to the
+EK2703A Router (346,840 → 348,432 B), with the same `.bss`; the ACK state
+adds 40 B of `.data`. That moved the EK2703A Router's 512-byte-aligned
+`.bss` up by 512 B (linked stack 224,496 → 223,984 B); the NCP's and the
+MG21 Routers' static RAM ends did not move. End-device images do not
+contain it.
 
 Enabling the Dongle-M radio (`hfxo-38m4hz`), GSDK's CTUNE and EUI-64
 precedence, and the boot log line with their sources added 596–684 B to

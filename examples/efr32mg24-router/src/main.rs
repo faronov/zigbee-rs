@@ -309,7 +309,7 @@ fn log_summary(app: &App) {
     let ack = phy.ack_stats();
     log::info!(
         "[MG24] neighbours {} children {} routes {} rx {} rx-ovf {} tx {} tx-fail {} acks {} late {} \
-         queue-full {} ({} unACKed) ack-fail {} max-turnaround {} us",
+         queue-full {} ({} unACKed) ack-fail {} max-turnaround {} us max-isr {} us",
         neighbors.len(),
         neighbors.children().count(),
         nwk.routing_table().len(),
@@ -322,7 +322,8 @@ fn log_summary(app: &App) {
         ack.queue_full,
         ack.queue_full_unacked,
         ack.ack_tx_fail,
-        ack.max_turnaround_us
+        ack.max_turnaround_us,
+        ack.max_isr_us
     );
 }
 

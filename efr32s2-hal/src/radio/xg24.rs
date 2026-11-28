@@ -75,6 +75,7 @@ use super::{
     AnalogState, CLR, Deadline, L, Layout, RAC_IF, RAC_IF_STATECHANGE, RacState, SYNTH_CHCTRL,
     Warm, rac_state_raw, read, write,
 };
+use crate::delay::{cycles, us_to_cycles};
 
 /// The radio runs only when the board names its crystal:
 ///
@@ -94,9 +95,12 @@ pub(super) const SUPPORTED: bool = cfg!(all(
     any(feature = "hfxo-39mhz", feature = "hfxo-38m4hz")
 ));
 
-/// `FRC_IRQn` and `RAC_RSM_IRQn` (GSDK 4.5.0 `efr32mg24*.h`).
+/// `FRC_IRQn`, `TIMER0_IRQn` and `RAC_RSM_IRQn` (GSDK 4.5.0
+/// `efr32mg24*.h`).
 #[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
 pub(super) const FRC_IRQN: u32 = 33;
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+pub(super) const TIMER0_IRQN: u32 = 4;
 #[cfg_attr(not(feature = "rt"), allow(dead_code))]
 pub(super) const RAC_RSM_IRQN: u32 = 36;
 
@@ -824,8 +828,14 @@ const TX_PA_ON: u32 = 0xC029_C001;
 #[cfg(feature = "efr32mg24-pa10")]
 const TX_PADEBUG: u32 = 0;
 /// RAIL: pre-stage 11..40 us, ramp clock 11..35 us; the longer values.
-const PA_PRESTAGE_US: u32 = 40;
+/// [`pa_prestage`] runs this long before [`pa_ramp_start`].
+pub(super) const PA_PRESTAGE_US: u32 = 40;
 const PA_RAMP_CLK_US: u32 = 16;
+/// Time from [`pa_ramp_start`] to a steady PA: the ramp clock. The ramp
+/// itself is shorter (RAIL: 6 us HP, 10 us MP); [`pa_ramp_finish`] waits
+/// for a slower one, up to [`PA_RAMP_US`].
+#[cfg_attr(not(feature = "isr-ack"), allow(dead_code))]
+pub(super) const PA_RAMP_LEAD_US: u32 = PA_RAMP_CLK_US;
 
 /// Read-modify-write: the sequencer is clock-gated, the CPU is the only
 /// writer of these registers.
@@ -856,18 +866,46 @@ pub(super) const PA_RAMP_IN_TXPD: bool = true;
 /// Power and ramp the PA up at the end of `TXWARM` (synthesizer locked,
 /// state held). [`tx_state_power`] has loaded `PACTRL`.
 pub(super) fn pa_ramp_up() {
+    pa_prestage();
+    delay_us(PA_PRESTAGE_US);
+    pa_ramp();
+}
+
+/// Step 1 of [`pa_ramp_up`]: slices in reset, regulators up. The ramp
+/// follows [`PA_PRESTAGE_US`] later (the interrupt Imm-Ack returns in
+/// between).
+pub(super) fn pa_prestage() {
     set_bits(RAC_PACTRL, PACTRL_SLICERST, true);
     unsafe {
         write(MODEM_PADEBUG, TX_PADEBUG);
         write(RAC_TX, TX_PA_PRESTAGE);
     }
-    delay_us(PA_PRESTAGE_US);
-    let ramp_clock = Deadline::after_us(PA_RAMP_CLK_US);
+}
+
+/// Steps 2 and 3 of [`pa_ramp_up`]: the ramp, then the steady PA.
+fn pa_ramp() {
+    let started = cycles();
+    pa_ramp_start();
+    pa_ramp_finish(started);
+}
+
+/// Start the ramp (step 2). [`pa_ramp_finish`] may follow up to
+/// [`PA_RAMP_LEAD_US`] later without waiting.
+pub(super) fn pa_ramp_start() {
     unsafe { write(RAC_TX, TX_PA_RAMP) };
     set_bits(RAC_PACTRL, PACTRL_SLICERST, false);
     set_bits(RAC_PAENCTRL, PAENCTRL_PARAMP, true);
-    wait_ramp(true);
-    while !ramp_clock.expired() {}
+}
+
+/// Wait out the ramp started at cycle stamp `started` (`MODRAMPUPDONE`, at
+/// most [`PA_RAMP_US`], and at least the ramp clock), then the steady PA
+/// (step 3).
+pub(super) fn pa_ramp_finish(started: u32) {
+    let elapsed = || cycles().wrapping_sub(started);
+    while unsafe { read(RAC_RFSTATUS) } & RFSTATUS_MODRAMPUPDONE == 0
+        && elapsed() < us_to_cycles(PA_RAMP_US)
+    {}
+    while elapsed() < us_to_cycles(PA_RAMP_CLK_US) {}
     unsafe { write(RAC_TX, TX_PA_ON) };
 }
 
