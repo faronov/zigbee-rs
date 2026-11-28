@@ -42,6 +42,7 @@ static POLICY: SensorPolicy = SensorPolicy {
     announce_retries: 0,
     secure_rejoin_failure_limit: 2,
     interview_complete_grace_ms: 1,
+    activity_fast_ms: 4,
     button: sensor_sed_app::ButtonPolicy {
         long_press_ms: None,
         debounce_ms: 1,

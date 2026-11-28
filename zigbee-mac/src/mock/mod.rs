@@ -290,6 +290,12 @@ impl MockMac {
         let _ = self.poll_queue.push(frame);
     }
 
+    /// Frames still queued for later MLME-POLLs (see
+    /// [`Self::enqueue_poll_response`]).
+    pub fn queued_poll_responses(&self) -> usize {
+        self.poll_queue.len()
+    }
+
     /// Set the simulated delay before the next poll result.
     pub fn set_poll_delay_us(&mut self, delay_us: u32) {
         self.poll_delay_us = delay_us;

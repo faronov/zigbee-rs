@@ -145,6 +145,7 @@ mod thermometer {
             max_ota_awake_ms: int(&mut values, "max_ota_awake_ms", 0, 86_400_000),
             max_identify_awake_ms: int(&mut values, "max_identify_awake_ms", 0, 86_400_000),
             max_fast_poll_ms: int(&mut values, "max_fast_poll_ms", 0, 86_400_000),
+            fast_poll_budget_ms: int(&mut values, "fast_poll_budget_ms", 0, 3_600_000),
             missed_report_grace_ms: int(&mut values, "missed_report_grace_ms", 0, 86_400_000),
             anomaly_max_writes_per_boot: int(&mut values, "anomaly_max_writes_per_boot", 0, 255),
             sleep_failure_limit: int(&mut values, "sleep_failure_limit", 0, 255),
@@ -156,6 +157,7 @@ mod thermometer {
             fresh_join_fast_ms: int(&mut values, "fresh_join_fast_ms", 1, 3_600_000),
             restored_fast_ms: int(&mut values, "restored_fast_ms", 1, 3_600_000),
             button_fast_poll_ms: int(&mut values, "button_fast_poll_ms", 1, 600_000),
+            activity_fast_ms: int(&mut values, "activity_fast_ms", 0, 600_000),
             announce_retry_ms: int(&mut values, "announce_retry_ms", 1_000, 600_000),
             announce_retries: int(&mut values, "announce_retries", 0, 255),
             sample_every_polls: int(&mut values, "sample_every_polls", 1, 1_000),
@@ -203,6 +205,7 @@ mod thermometer {
         max_ota_awake_ms: i64,
         max_identify_awake_ms: i64,
         max_fast_poll_ms: i64,
+        fast_poll_budget_ms: i64,
         missed_report_grace_ms: i64,
         anomaly_max_writes_per_boot: i64,
         sleep_failure_limit: i64,
@@ -214,6 +217,7 @@ mod thermometer {
         fresh_join_fast_ms: i64,
         restored_fast_ms: i64,
         button_fast_poll_ms: i64,
+        activity_fast_ms: i64,
         announce_retry_ms: i64,
         announce_retries: i64,
         sample_every_polls: i64,
@@ -298,12 +302,25 @@ mod thermometer {
                         self.fresh_join_fast_ms,
                         self.restored_fast_ms,
                         self.button_fast_poll_ms,
+                        self.activity_fast_ms,
                         self.fast_poll_timeout_max_ms,
                         self.check_in_response_ms,
                     ]
                     .iter()
                     .all(|window| *window <= self.max_fast_poll_ms),
                 "max_fast_poll_ms must be 0 or cover every configured fast-poll window"
+            );
+            assert!(
+                self.fast_poll_budget_ms == 0
+                    || [
+                        self.fresh_join_fast_ms,
+                        self.restored_fast_ms,
+                        self.button_fast_poll_ms,
+                        self.activity_fast_ms,
+                    ]
+                    .iter()
+                    .all(|window| *window <= self.fast_poll_budget_ms),
+                "fast_poll_budget_ms must be 0 or cover every window the device opens itself"
             );
             // Pads the firmware itself uses; flash and USB pads are refused
             // again (with the chip facts) by `product::pad_isolation`.
@@ -357,6 +374,7 @@ mod thermometer {
                  pub const FRESH_JOIN_FAST_MS: u32 = {fresh};\n\
                  pub const RESTORED_FAST_MS: u32 = {restored};\n\
                  pub const BUTTON_FAST_POLL_MS: u32 = {button};\n\
+                 pub const ACTIVITY_FAST_MS: u32 = {activity};\n\
                  pub const ANNOUNCE_RETRY_MS: u32 = {annce_ms};\n\
                  pub const ANNOUNCE_RETRIES: u8 = {annce_retries};\n\
                  pub const SAMPLE_EVERY_POLLS: u32 = {every};\n\
@@ -382,6 +400,7 @@ mod thermometer {
                  pub const MAX_OTA_AWAKE_MS: u32 = {max_ota};\n\
                  pub const MAX_IDENTIFY_AWAKE_MS: u32 = {max_identify};\n\
                  pub const MAX_FAST_POLL_MS: u32 = {max_fast};\n\
+                 pub const FAST_POLL_BUDGET_MS: u32 = {fast_budget};\n\
                  pub const MISSED_REPORT_GRACE_MS: u32 = {missed_grace};\n\
                  #[allow(dead_code)]\n\
                  pub const ANOMALY_MAX_WRITES_PER_BOOT: u8 = {anomaly_writes};\n\
@@ -415,6 +434,7 @@ mod thermometer {
                 fresh = self.fresh_join_fast_ms,
                 restored = self.restored_fast_ms,
                 button = self.button_fast_poll_ms,
+                activity = self.activity_fast_ms,
                 annce_ms = self.announce_retry_ms,
                 annce_retries = self.announce_retries,
                 every = self.sample_every_polls,
@@ -440,6 +460,7 @@ mod thermometer {
                 max_ota = self.max_ota_awake_ms,
                 max_identify = self.max_identify_awake_ms,
                 max_fast = self.max_fast_poll_ms,
+                fast_budget = self.fast_poll_budget_ms,
                 missed_grace = self.missed_report_grace_ms,
                 anomaly_writes = self.anomaly_max_writes_per_boot,
                 sleep_failures = self.sleep_failure_limit,

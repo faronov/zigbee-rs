@@ -42,6 +42,7 @@ pub static POLICY: SensorPolicy = SensorPolicy {
     fresh_join_fast_ms: config::FRESH_JOIN_FAST_MS,
     restored_fast_ms: config::RESTORED_FAST_MS,
     interview_complete_grace_ms: config::BUTTON_FAST_POLL_MS,
+    activity_fast_ms: config::ACTIVITY_FAST_MS,
     announce_retry_ms: config::ANNOUNCE_RETRY_MS,
     announce_retries: config::ANNOUNCE_RETRIES,
     button: ButtonPolicy {
@@ -69,6 +70,7 @@ pub static POLICY: SensorPolicy = SensorPolicy {
         max_ota_awake_ms: config::MAX_OTA_AWAKE_MS,
         max_identify_awake_ms: config::MAX_IDENTIFY_AWAKE_MS,
         max_fast_poll_ms: config::MAX_FAST_POLL_MS,
+        fast_poll_budget_ms: config::FAST_POLL_BUDGET_MS,
         missed_report_grace_ms: config::MISSED_REPORT_GRACE_MS,
         sleep_failure_limit: config::SLEEP_FAILURE_LIMIT,
     },

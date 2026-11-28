@@ -44,8 +44,11 @@ NO_IMAGE_AVAILABLE or any other non-success status, an Image Notify declined
 by QueryJitter, a response timeout, a failure or an abort ends the session,
 and the device returns to its slow poll on the next service iteration. An
 OTA event never opens, extends or shortens the generic commissioning or
-interview window. Periodic OTA service uses the same checkpoint/activation
-path.
+interview window, and neither the frames of a session nor the notify that
+starts one open a network-activity window (`SensorPolicy::activity_fast_ms`,
+see the power guide), so no fast-poll tail follows the session and a long
+download does not use up the hourly fast-poll budget. Periodic OTA service
+uses the same checkpoint/activation path.
 If reading or writing the security checkpoint fails, the application records
 the persistence fault and stops before invoking activation.
 

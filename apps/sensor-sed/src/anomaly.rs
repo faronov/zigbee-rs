@@ -25,7 +25,9 @@ pub enum AnomalyReason {
     /// Identify kept the fast poll longer than `max_identify_awake_ms`.
     Identify = 3,
     /// Consecutive timed fast-poll windows (commissioning grace, Poll
-    /// Control fast poll, control events) outlived `max_fast_poll_ms`.
+    /// Control fast poll, network activity, control events) outlived
+    /// `max_fast_poll_ms`, or the timed windows used up their hourly
+    /// budget (`fast_poll_budget_ms`, see [`FastPollBudget`]).
     FastPoll = 4,
     /// No acknowledged report within the shortest configured reporting
     /// maximum interval plus `missed_report_grace_ms`.
@@ -146,6 +148,79 @@ impl AwakeBound {
     /// Forget the budget, e.g. after a rejoin.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// One hour of measured time: the refill period of a [`FastPollBudget`].
+pub const FAST_POLL_BUDGET_PERIOD_MS: u32 = 60 * 60 * 1_000;
+
+/// Hourly budget of the timed fast-poll windows (a token bucket).
+///
+/// The bucket holds `budget_ms` of fast polling and refills at `budget_ms`
+/// per hour of measured time, so the windows that open on their own —
+/// after a join or resume, on network activity, after a Device_annce, the
+/// interview grace — cost at most `budget_ms` in one burst and `budget_ms`
+/// per hour on average, however often a peer talks to the device. When the
+/// bucket runs dry the windows close and none opens again until a quarter of
+/// the budget has refilled, so an exhausted budget does not chatter between
+/// fast and slow polls.
+///
+/// Like [`AwakeBound`] it accumulates per-iteration deltas, and the first
+/// iteration with a window open only starts the charge: the long wait that
+/// preceded the frame which opened the window is not fast-poll time. The
+/// budget lives in RAM; a reboot starts it full.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FastPollBudget {
+    /// Fast-poll time charged and not yet refilled.
+    used_ms: u32,
+    /// Refill below one millisecond, in `ms × budget_ms` units.
+    remainder: u32,
+    /// A window was open at the previous step.
+    charging: bool,
+    exhausted: bool,
+}
+
+impl FastPollBudget {
+    /// Advance by `delta_ms` of measured time with timed windows `open` or
+    /// not, against a budget of `budget_ms` per hour (`0` = unbounded).
+    /// Returns `true` on the step that exhausts the budget: the caller closes
+    /// the windows and records the anomaly.
+    pub fn step(&mut self, open: bool, delta_ms: u32, budget_ms: u32) -> bool {
+        if budget_ms == 0 {
+            *self = Self::default();
+            return false;
+        }
+        let period = u64::from(FAST_POLL_BUDGET_PERIOD_MS);
+        let scaled = u64::from(delta_ms) * u64::from(budget_ms) + u64::from(self.remainder);
+        self.remainder = (scaled % period) as u32;
+        let refill = (scaled / period).min(u64::from(u32::MAX)) as u32;
+        self.used_ms = self.used_ms.saturating_sub(refill);
+        if open && self.charging {
+            self.used_ms = self.used_ms.saturating_add(delta_ms).min(budget_ms);
+        }
+        self.charging = open;
+        if self.exhausted {
+            if self.used_ms <= budget_ms - budget_ms / 4 {
+                self.exhausted = false;
+            }
+            return false;
+        }
+        if self.used_ms >= budget_ms {
+            self.exhausted = true;
+            self.charging = false;
+            return true;
+        }
+        false
+    }
+
+    /// Whether a timed fast-poll window may open or stay open.
+    pub const fn allows(&self) -> bool {
+        !self.exhausted
+    }
+
+    /// Fast-poll time charged and not yet refilled.
+    pub const fn used_ms(&self) -> u32 {
+        self.used_ms
     }
 }
 
@@ -413,6 +488,90 @@ mod tests {
         let mut bound = AwakeBound::default();
         bound.step(true, 0, u32::MAX);
         assert_eq!(bound.step(true, u32::MAX, u32::MAX), BoundStep::Fired);
+    }
+
+    const MINUTE: u32 = 60_000;
+
+    #[test]
+    fn fast_poll_budget_charges_open_windows_and_refills_per_hour() {
+        let budget = 5 * MINUTE;
+        let mut bucket = FastPollBudget::default();
+        // The wait before the frame that opened the window is not charged.
+        assert!(!bucket.step(true, 30 * MINUTE, budget));
+        assert_eq!(bucket.used_ms(), 0);
+        // Four minutes of fast polling, 250 ms at a time, refilling 5 min/h.
+        for _ in 0..4 * 4 * 60 {
+            assert!(!bucket.step(true, 250, budget));
+        }
+        // 4 min charged, 20 s refilled meanwhile (5 min/h for 4 min), less
+        // the refill of the very first step, which found the bucket full.
+        let used = bucket.used_ms();
+        assert!(
+            (4 * MINUTE - 20_000..4 * MINUTE - 19_950).contains(&used),
+            "{used}"
+        );
+        assert!(bucket.allows());
+        // Closed windows only refill: 12 minutes refill one minute.
+        assert!(!bucket.step(false, 12 * MINUTE, budget));
+        assert_eq!(bucket.used_ms(), used - MINUTE);
+        // An hour without windows refills everything.
+        bucket.step(false, 60 * MINUTE, budget);
+        assert_eq!(bucket.used_ms(), 0);
+    }
+
+    #[test]
+    fn exhausted_fast_poll_budget_resumes_after_a_quarter_refilled() {
+        let budget = 4 * MINUTE;
+        let mut bucket = FastPollBudget::default();
+        bucket.step(true, 0, budget);
+        let mut fired = 0;
+        let mut open_ms = 0;
+        while bucket.allows() {
+            fired += u32::from(bucket.step(true, 1_000, budget));
+            open_ms += 1_000;
+        }
+        assert_eq!(fired, 1);
+        // Charged 4 min minus what refilled meanwhile (1/15 of the time).
+        assert!(
+            (4 * MINUTE..=4 * MINUTE + 20_000).contains(&open_ms),
+            "{open_ms}"
+        );
+        // Closed: no chatter before a quarter of the budget (1 min) refilled,
+        // which takes a quarter of an hour.
+        for _ in 0..14 {
+            assert!(!bucket.step(false, MINUTE, budget));
+            assert!(!bucket.allows());
+        }
+        assert!(!bucket.step(false, MINUTE, budget));
+        assert!(bucket.allows());
+        assert_eq!(bucket.used_ms(), 3 * MINUTE);
+        // Reopening starts a fresh charge: its first step only refills.
+        assert!(!bucket.step(true, 10 * MINUTE, budget));
+        assert_eq!(bucket.used_ms(), 3 * MINUTE - 40_000);
+        assert!(!bucket.step(true, 1_000, budget));
+        assert_eq!(bucket.used_ms(), 3 * MINUTE - 40_000 + 1_000 - 66);
+    }
+
+    #[test]
+    fn fast_poll_budget_refill_keeps_sub_millisecond_remainders() {
+        // 1 s/h refills 1 ms per 3.6 s; 100 ms steps must not lose it.
+        let mut bucket = FastPollBudget::default();
+        bucket.step(true, 0, 1_000);
+        bucket.step(true, 1_000, 1_000);
+        assert_eq!(bucket.used_ms(), 1_000);
+        for _ in 0..36 {
+            bucket.step(false, 100, 1_000);
+        }
+        assert_eq!(bucket.used_ms(), 999);
+    }
+
+    #[test]
+    fn zero_fast_poll_budget_is_unbounded() {
+        let mut bucket = FastPollBudget::default();
+        for _ in 0..10 {
+            assert!(!bucket.step(true, u32::MAX, 0));
+            assert!(bucket.allows());
+        }
     }
 
     #[test]

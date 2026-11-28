@@ -105,6 +105,18 @@ pub struct SensorPolicy {
     /// network removes it with a Leave.
     pub secure_rejoin_failure_limit: u8,
     pub interview_complete_grace_ms: u32,
+    /// Fast-poll window opened, or extended, by network activity: every
+    /// unicast APS data frame the parent delivers (a hub's interview
+    /// request, a read, a command) and every Device_annce retry. The
+    /// device then polls at the fast cadence until this long after the
+    /// latest frame, so each request of a sequential exchange waits one
+    /// fast poll at the parent instead of one slow poll. APS
+    /// acknowledgements and broadcast or group frames do not open it.
+    /// Configure Reporting completing the interview closes it in favour of
+    /// [`interview_complete_grace_ms`](Self::interview_complete_grace_ms),
+    /// and a Poll Control Fast Poll Stop closes it. Charged to
+    /// [`RecoveryPolicy::fast_poll_budget_ms`]. `0` disables it.
+    pub activity_fast_ms: u32,
     pub button: ButtonPolicy,
     pub status: StatusPolicy,
     /// Wait depth while joined and the fast-poll window is active.
@@ -167,10 +179,28 @@ pub struct RecoveryPolicy {
     /// running at the normal cadence until it ends. `0` leaves it unbounded.
     pub max_identify_awake_ms: u32,
     /// Longest uninterrupted run of timed fast-poll windows (commissioning
-    /// and interview grace, Poll Control fast poll, control events). When it
-    /// fires the windows are closed. `0` leaves the windows unbounded; a
-    /// non-zero value must cover the longest configured window.
+    /// and interview grace, Poll Control fast poll, network activity,
+    /// control events). When it fires the windows are closed. `0` leaves
+    /// the windows unbounded; a non-zero value must cover the longest
+    /// configured window.
     pub max_fast_poll_ms: u32,
+    /// Hourly budget of the fast-poll windows that open on their own: after
+    /// a join, rejoin or resume, on network activity
+    /// ([`SensorPolicy::activity_fast_ms`]), after a Device_annce, the
+    /// interview grace and the other control-event windows. At most this
+    /// much fast polling in one burst and per hour on average (see
+    /// [`FastPollBudget`](crate::FastPollBudget)); when it runs out the
+    /// windows close, [`AnomalyReason::FastPoll`](crate::AnomalyReason::FastPoll)
+    /// is recorded, and the device polls slowly until a quarter has
+    /// refilled. Poll Control fast polling requested by a client, OTA
+    /// sessions, pending protocol work and Identify have their own bounds
+    /// and are not charged. Windows the user opens (a button join, a
+    /// force-report press, Finding & Binding) are charged but never blocked
+    /// or closed by an empty budget, and a new network session (a Leave, a
+    /// button join, the fresh join after giving a network up) starts with
+    /// a full one. `0` leaves the windows unbudgeted; a non-zero value must
+    /// cover the longest configured window and be at most one hour.
+    pub fast_poll_budget_ms: u32,
     /// Count a missed report as one parent-loss strike: no acknowledged
     /// report within the shortest configured reporting maximum interval
     /// plus this grace. Requires [`report_aps_ack`](Self::report_aps_ack).
@@ -190,8 +220,9 @@ impl RecoveryPolicy {
     /// Recommended battery-sensor recovery: 15-minute backoff cap, 25 %
     /// jitter, rejoin after three strikes, 30-second pending-work bound,
     /// two-hour OTA, two-minute Identify and ten-minute fast-poll bounds,
-    /// a two-minute missed-report grace, and sleep disabled for the boot
-    /// after three consecutive failed sleep transitions.
+    /// five minutes of self-opened fast polling per hour, a two-minute
+    /// missed-report grace, and sleep disabled for the boot after three
+    /// consecutive failed sleep transitions.
     pub const DEFAULT: Self = Self {
         join_retry_max_ms: 15 * 60 * 1_000,
         join_retry_jitter_pct: 25,
@@ -201,6 +232,7 @@ impl RecoveryPolicy {
         max_ota_awake_ms: 2 * 60 * 60 * 1_000,
         max_identify_awake_ms: 2 * 60 * 1_000,
         max_fast_poll_ms: 10 * 60 * 1_000,
+        fast_poll_budget_ms: 5 * 60 * 1_000,
         missed_report_grace_ms: 2 * 60 * 1_000,
         sleep_failure_limit: 3,
     };
@@ -210,6 +242,7 @@ impl RecoveryPolicy {
             && self.join_retry_max_ms <= JOIN_RETRY_MAX_MS
             && self.join_retry_jitter_pct <= MAX_JOIN_RETRY_JITTER_PCT
             && self.max_active_ms <= MAX_WAIT_MS
+            && self.fast_poll_budget_ms <= crate::anomaly::FAST_POLL_BUDGET_PERIOD_MS
             && (self.missed_report_grace_ms == 0 || self.report_aps_ack)
     }
 
@@ -241,9 +274,9 @@ impl SensorPolicy {
             && self.recovery.is_valid()
             && self.join_retry_ms <= self.recovery.join_retry_max_ms
             && (self.recovery.max_fast_poll_ms == 0
-                || (self.recovery.max_fast_poll_ms >= self.fresh_join_fast_ms
-                    && self.recovery.max_fast_poll_ms >= self.restored_fast_ms
-                    && self.recovery.max_fast_poll_ms >= self.interview_complete_grace_ms))
+                || self.recovery.max_fast_poll_ms >= self.longest_timed_fast_poll_ms())
+            && (self.recovery.fast_poll_budget_ms == 0
+                || self.recovery.fast_poll_budget_ms >= self.longest_timed_fast_poll_ms())
             && self.announce_retry_ms != 0
             && self.interview_complete_grace_ms != 0
             && self.button.debounce_ms != 0
@@ -255,6 +288,21 @@ impl SensorPolicy {
                 || (self.status.blink_on_ms != 0
                     && self.status.blink_gap_ms != 0
                     && self.status.reset_phase_ms != 0))
+    }
+
+    /// Longest fast-poll window this policy opens on its own.
+    const fn longest_timed_fast_poll_ms(&self) -> u32 {
+        let mut longest = self.fresh_join_fast_ms;
+        if self.restored_fast_ms > longest {
+            longest = self.restored_fast_ms;
+        }
+        if self.interview_complete_grace_ms > longest {
+            longest = self.interview_complete_grace_ms;
+        }
+        if self.activity_fast_ms > longest {
+            longest = self.activity_fast_ms;
+        }
+        longest
     }
 
     /// Whether the joined slow poll fetches a frame that the parent queued
@@ -498,6 +546,31 @@ mod tests {
     }
 
     #[test]
+    fn fast_poll_bounds_cover_every_window_the_policy_opens() {
+        let mut policy = VALID;
+        policy.activity_fast_ms = 30_000;
+        policy.fresh_join_fast_ms = 120_000;
+        assert!(policy.is_valid());
+        // The hourly budget must cover the longest window and fit an hour.
+        policy.recovery.fast_poll_budget_ms = 119_999;
+        assert!(!policy.is_valid());
+        policy.recovery.fast_poll_budget_ms = 0;
+        assert!(policy.is_valid(), "0 leaves the windows unbudgeted");
+        policy.recovery.fast_poll_budget_ms = crate::FAST_POLL_BUDGET_PERIOD_MS + 1;
+        assert!(!policy.is_valid());
+        policy.recovery.fast_poll_budget_ms = crate::FAST_POLL_BUDGET_PERIOD_MS;
+        assert!(policy.is_valid());
+        // So must the continuous bound, activity windows included.
+        policy.fresh_join_fast_ms = 1;
+        policy.activity_fast_ms = policy.recovery.max_fast_poll_ms + 1;
+        assert!(!policy.is_valid());
+        policy.recovery.max_fast_poll_ms = 0;
+        assert!(policy.is_valid());
+        policy.activity_fast_ms = 0;
+        assert!(policy.is_valid(), "0 disables activity windows");
+    }
+
+    #[test]
     fn joined_wait_bound_must_fit_one_platform_wait() {
         let mut policy = VALID;
         policy.slow_poll_ms = MAX_WAIT_MS + 1;
@@ -546,6 +619,7 @@ mod tests {
         announce_retries: 0,
         secure_rejoin_failure_limit: 1,
         interview_complete_grace_ms: 1,
+        activity_fast_ms: 1,
         button: ButtonPolicy {
             long_press_ms: None,
             debounce_ms: 1,

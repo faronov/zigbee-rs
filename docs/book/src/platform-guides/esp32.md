@@ -313,7 +313,9 @@ cargo +nightly-2026-08-01 build --release --locked -Z build-std=core,alloc \
   reset only if they still fit the profile's limits.
 - Keep-awake limits and the anomaly record: `thermometer.toml` sets
   `max_active_ms`, `max_ota_awake_ms`, `max_identify_awake_ms`,
-  `max_fast_poll_ms` and `missed_report_grace_ms` (see the power guide).
+  `max_fast_poll_ms`, the hourly `fast_poll_budget_ms`, the network
+  activity window `activity_fast_ms` and `missed_report_grace_ms` (see the
+  power guide).
   `anomaly-record` (enabled by `thermometer`) journals the record in the
   two-sector `0x3F6000..0x3F8000` window only when it changes (at most
   `anomaly_max_writes_per_boot` writes per boot) and serves it from a

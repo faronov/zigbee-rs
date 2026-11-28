@@ -47,6 +47,10 @@ pub struct PowerManager {
     failed_polls: u8,
     pending_tx: bool,
     pending_reports: bool,
+    /// A unicast APS data frame arrived since the application last took it
+    /// ([`PowerManager::take_inbound_unicast`]). Fits the padding after the
+    /// flags above, so the manager does not grow.
+    inbound_unicast: bool,
 }
 
 /// First retry delay after a poll the parent did not acknowledge.
@@ -65,6 +69,7 @@ impl PowerManager {
             failed_polls: 0,
             pending_tx: false,
             pending_reports: false,
+            inbound_unicast: false,
         }
     }
 
@@ -114,6 +119,23 @@ impl PowerManager {
         }
         let shift = (self.failed_polls - 1).min(FAILED_POLL_MAX_SHIFT);
         poll_interval_ms.min(FAILED_POLL_RETRY_BASE_MS << shift)
+    }
+
+    /// Record a unicast APS data frame addressed to this device: a request,
+    /// a command or a response from a peer. APS acknowledgements,
+    /// duplicates and broadcast or group frames are not recorded.
+    pub fn record_inbound_unicast(&mut self) {
+        self.inbound_unicast = true;
+    }
+
+    /// Whether a unicast APS data frame arrived since the previous call.
+    ///
+    /// A sleepy application that schedules its own polls uses this to keep
+    /// polling fast while a peer — typically a hub interviewing or
+    /// configuring the device — is exchanging frames with it, so each next
+    /// request waits one fast poll instead of one long poll at the parent.
+    pub fn take_inbound_unicast(&mut self) -> bool {
+        core::mem::take(&mut self.inbound_unicast)
     }
 
     /// Set whether there are pending transmissions.
@@ -204,6 +226,21 @@ mod tests {
         power.record_poll(1_000);
         assert!(!power.should_poll(1_999));
         assert!(power.should_poll(2_000));
+    }
+
+    #[test]
+    fn inbound_unicast_is_taken_once_and_costs_no_size() {
+        let mut power = PowerManager::default();
+        assert!(!power.take_inbound_unicast());
+        power.record_inbound_unicast();
+        power.record_inbound_unicast();
+        assert!(power.take_inbound_unicast());
+        assert!(!power.take_inbound_unicast());
+        // The flag lives in the padding after the other flags.
+        assert_eq!(
+            core::mem::size_of::<PowerManager>(),
+            core::mem::size_of::<PowerMode>() + 2 * 4 + 4
+        );
     }
 
     #[test]

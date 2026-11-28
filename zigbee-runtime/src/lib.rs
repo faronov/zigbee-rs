@@ -5390,6 +5390,65 @@ mod resume_tests {
         assert!(device.pending_responses.is_empty());
     }
 
+    /// An accepted unicast APS data frame marks inbound activity for a
+    /// sleepy application's poll policy; a group frame, an APS
+    /// acknowledgement and a replayed frame do not.
+    #[test]
+    fn only_accepted_unicast_aps_data_marks_inbound_activity() {
+        let mut device = ZigbeeDevice::builder(MockMac::new(IEEE_ADDRESS))
+            .endpoint(1, 0x0104, crate::DeviceId::TEMPERATURE_SENSOR, |endpoint| {
+                endpoint.cluster_server(crate::ClusterId::IDENTIFY)
+            })
+            .build();
+        let mut store = RamSecurityStateStore::new();
+        store.store(&commissioned_state()).unwrap();
+        block_on(device.start_or_resume_with_security_store(&mut store)).unwrap();
+        let confirm = device.bdb_mut().zdo_mut().aps_mut().apsme_add_group(
+            &zigbee_aps::apsme::ApsmeAddGroupRequest {
+                group_address: 0x0007,
+                endpoint: 1,
+            },
+        );
+        assert_eq!(confirm.status, zigbee_aps::ApsStatus::Success);
+        assert!(!device.power_mut().take_inbound_unicast());
+
+        let _ = block_on(
+            device.process_incoming(&indication(group_identify_frame(0x0007, 1, 1)), &mut []),
+        );
+        assert!(!device.power_mut().take_inbound_unicast(), "group frame");
+
+        // APS data acknowledgement of an unknown transaction.
+        let ack = [0x02, 0x01, 0x03, 0x00, 0x04, 0x01, 0x01, 0x33];
+        let _ = block_on(device.process_incoming(
+            &indication(nwk_frame(
+                zigbee_nwk::frames::NwkFrameType::Data,
+                ShortAddress(OUR_SHORT),
+                &ack,
+                2,
+                true,
+            )),
+            &mut [],
+        ));
+        assert!(!device.power_mut().take_inbound_unicast(), "APS ACK");
+
+        let identify = || {
+            cluster_command_frame_from(
+                (COORDINATOR, COORDINATOR_IEEE),
+                1,
+                crate::ClusterId::IDENTIFY.0,
+                0x01, // Identify Query
+                &[],
+                0x44,
+            )
+        };
+        let _ = block_on(device.process_incoming(&indication(identify()), &mut []));
+        assert!(device.power_mut().take_inbound_unicast(), "unicast request");
+        assert!(!device.power_mut().take_inbound_unicast(), "taken once");
+        // The same frame again is a NWK replay.
+        let _ = block_on(device.process_incoming(&indication(identify()), &mut []));
+        assert!(!device.power_mut().take_inbound_unicast(), "replay");
+    }
+
     /// Unicast Groups-cluster command to `endpoint` (APS unicast, ZCL
     /// cluster-specific client→server).
     #[cfg(feature = "groups")]
@@ -15227,6 +15286,13 @@ impl<M: MacDriver, R: crate::role::DeviceRole> ZigbeeDevice<M, R> {
         // it runs in the shared `#[inline(never)]` `aps_route_metadata` helper
         // kept out of the per-backend receive future.
         let (dst_ep, cluster_id, src_addr) = aps_route_metadata(&aps_indication);
+        // Network activity for a sleepy application's poll policy: an
+        // accepted unicast APS data frame. APS acknowledgements, commands and
+        // duplicates never reach this point; group and broadcast frames are
+        // not a peer talking to this device.
+        if dst.0 < 0xFFF8 {
+            self.power.record_inbound_unicast();
+        }
 
         // Send APS ACK now if the incoming frame requested one. This must happen for *every* endpoint (ZDO and application clusters alike),
         // not just for ZDO — otherwise the coordinator/TC retransmits ZCL Read Attributes (e.g. Basic Manufacturer/Model) until the ZHA

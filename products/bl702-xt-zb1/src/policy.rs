@@ -28,6 +28,7 @@ pub static SENSOR_POLICY: SensorPolicy = SensorPolicy {
     announce_retries: 5,
     secure_rejoin_failure_limit: 0,
     interview_complete_grace_ms: 5_000,
+    activity_fast_ms: 30_000,
     button: ButtonPolicy {
         long_press_ms: None,
         debounce_ms: 300,
