@@ -1426,3 +1426,68 @@ fn permit_join_state_follows_open_rearm_and_expiry() {
     assert_eq!(reported.len(), 1);
     assert!(reported[0] > 50);
 }
+
+/// A backup and `TBL_READ` vouch only for authenticated children. A device
+/// that associated to the NCP but has not proved the network key yet (a
+/// provisional child, which ages out after 10 s) is not exported with a
+/// child block: a restore would otherwise install it as an authenticated
+/// child with a full End Device Timeout window. Its first secured frame
+/// makes it a child, exported with the default timeout.
+#[test]
+fn a_provisional_child_is_not_exported_as_a_child() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    formed_port!(port);
+    let key = network_key(&port);
+    let child = associate(&mut port, PEER_IEEE);
+    assert!(
+        port.app()
+            .device()
+            .aps()
+            .nwk()
+            .child_is_unauthenticated(child),
+        "no network-key proof yet"
+    );
+    let view = (0..)
+        .map_while(|index| port.device(index))
+        .find(|view| view.ieee == PEER_IEEE);
+    assert!(
+        view.is_none_or(|view| view.child.is_none()),
+        "a provisional child is not vouched for: {view:?}"
+    );
+
+    // Its first NWK-secured frame proves the key.
+    let aps = aps_data_frame(0x20, None, &[0x01, 0x02, 0x00]);
+    receive(
+        &mut port,
+        child,
+        -50,
+        secured_nwk_frame(
+            &key,
+            NwkFrameType::Data,
+            (child, PEER_IEEE),
+            ShortAddress(0),
+            0x30,
+            &aps,
+        ),
+    );
+    assert!(
+        !port
+            .app()
+            .device()
+            .aps()
+            .nwk()
+            .child_is_unauthenticated(child)
+    );
+    let view = (0..)
+        .map_while(|index| port.device(index))
+        .find(|view| view.ieee == PEER_IEEE)
+        .expect("an authenticated child is listed");
+    assert_eq!(view.nwk, Some(child.0));
+    assert_eq!(
+        view.child,
+        Some((
+            0x80 | 0x40 | 0x08 | 0x04,
+            zigbee_nwk::frames::ED_TIMEOUT_ENUM_DEFAULT
+        ))
+    );
+}

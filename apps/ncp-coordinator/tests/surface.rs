@@ -2869,3 +2869,635 @@ fn active_scan_answers_with_every_beacon_and_keeps_the_network() {
         ncp_coordinator_app::port::NetworkState::Up
     );
 }
+
+// ── Restored and reloaded children age out ──────────────────────────
+
+/// A second keyless child of the restored backups below.
+const OTHER_CHILD: [u8; 8] = [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
+
+/// TLV of a keyless sleepy end-device child of the NCP (`DEVICE` with a
+/// child block, capability `0x80`).
+fn child_tlv(ieee: [u8; 8], nwk: u16, timeout_exp: u8) -> Vec<u8> {
+    tlv(&Record::Device(DeviceRecord {
+        ieee: Ieee(ieee),
+        nwk,
+        flags: 0,
+        child: Some(zigbee_zrhp::records::ChildInfo {
+            capability: 0x80,
+            timeout_exp,
+        }),
+        link: None,
+    }))
+}
+
+/// The complete `BKP_EXPORT` stream (keys and devices).
+fn export_stream<A: TcApp>(
+    ncp: &mut Ncp<8>,
+    host: &mut Host,
+    port: &mut TcPort<A>,
+    platform: &mut FakePlatform,
+    pipe: &mut Pipe,
+    log: &LogRing<8>,
+    now: &mut u64,
+) -> Vec<u8> {
+    let begin = host.request(&BkpExportBegin { flags: 0x03 });
+    exchange(ncp, host, port, platform, pipe, log, now);
+    let begin: BkpExportBeginRsp = host.response(begin).body();
+    let mut stream = Vec::new();
+    loop {
+        let read = host.request(&BkpExportRead {
+            txn: begin.txn,
+            max_bytes: 480,
+        });
+        exchange(ncp, host, port, platform, pipe, log, now);
+        let read = host.response(read);
+        stream.extend_from_slice(&read.payload[2..]);
+        if read.payload[1] == 0 {
+            break;
+        }
+    }
+    let end = host.request(&BkpExportEnd { txn: begin.txn });
+    exchange(ncp, host, port, platform, pipe, log, now);
+    assert_eq!(host.response(end).status(), 0);
+    stream
+}
+
+/// Wipe the running network and restore `stream` with `extra` records.
+#[allow(clippy::too_many_arguments)]
+fn restore_stream<A: TcApp>(
+    ncp: &mut Ncp<8>,
+    host: &mut Host,
+    port: &mut TcPort<A>,
+    platform: &mut FakePlatform,
+    pipe: &mut Pipe,
+    log: &LogRing<8>,
+    now: &mut u64,
+    stream: &[u8],
+    extra: &[Vec<u8>],
+) -> BkpRestoreCommitRsp {
+    let leave = host.request(&NwkLeaveReset { flags: 0 });
+    exchange(ncp, host, port, platform, pipe, log, now);
+    assert_eq!(host.response(leave).status(), 0);
+    let backup = with_records(stream, extra);
+    let restore = host.request(&BkpRestoreBegin {
+        flags: 0,
+        nwk_margin: 0,
+        aps_margin: 0,
+        expected_records: 0,
+    });
+    exchange(ncp, host, port, platform, pipe, log, now);
+    let txn = host.response(restore).body::<BkpRestoreBeginRsp>().txn;
+    let mut payload = txn.to_le_bytes().to_vec();
+    payload.extend_from_slice(&backup);
+    let put = host.request_raw(ids::BKP_RESTORE_PUT, &payload);
+    let commit = host.request(&BkpRestoreCommit { txn });
+    exchange(ncp, host, port, platform, pipe, log, now);
+    let put = host.response(put);
+    let put: BkpRestorePutRsp = put.body();
+    assert_eq!(put.notes.iter().count(), 0, "nothing demoted or ignored");
+    host.response(commit).body()
+}
+
+/// The child block of `ieee`'s `DEVICE` record in an export stream:
+/// `None` when it is not listed, `Some(None)` when it is listed as a
+/// device that is not a child of the NCP.
+fn exported_child(stream: &[u8], ieee: [u8; 8]) -> Option<Option<(u8, u8)>> {
+    RawRecords::new(stream).find_map(|item| {
+        let (_, tlv) = item.unwrap();
+        match zigbee_zrhp::codec::Reader::new(tlv)
+            .read::<Record<'_>>()
+            .unwrap()
+        {
+            Record::Device(device) if device.ieee.0 == ieee => Some(
+                device
+                    .child
+                    .map(|child| (child.capability, child.timeout_exp)),
+            ),
+            _ => None,
+        }
+    })
+}
+
+/// `(capability, timeout_exp)` of `ieee` as the NCP's device view (backup
+/// export, `TBL_READ`) reports it; `None` when it is not a child.
+fn child_view<A: TcApp>(port: &TcPort<A>, ieee: [u8; 8]) -> Option<(u8, u8)> {
+    (0..)
+        .map_while(|index| port.device(index))
+        .find(|view| view.ieee == ieee)
+        .and_then(|view| view.child)
+}
+
+/// Whether `ieee` is in the live neighbour table as an authenticated child.
+fn in_child_table<A: TcApp>(port: &TcPort<A>, ieee: [u8; 8]) -> bool {
+    port.app()
+        .device()
+        .aps()
+        .nwk()
+        .neighbor_table()
+        .find_by_ieee(&ieee)
+        .is_some_and(|entry| entry.relationship == zigbee_nwk::neighbor::Relationship::Child)
+}
+
+/// Move the mock radio clock `secs` forward without running the stack.
+fn advance_clock<A: TcApp<Mac = MockMac>>(port: &mut TcPort<A>, secs: u32) {
+    use zigbee_mac::PlatformServices as _;
+    let mac = mock_mac(port);
+    let now = mac.monotonic_micros();
+    mac.set_time_micros(now.wrapping_add(secs * 1_000_000));
+}
+
+/// Run the stack (the platform loop's `TcPort::step`) for `secs` seconds of
+/// radio time, a minute per step at most.
+fn run_for<A: TcApp<Mac = MockMac>>(port: &mut TcPort<A>, secs: u32) {
+    let mut left = secs;
+    while left > 0 {
+        let step = left.min(60);
+        advance_clock(port, step);
+        pollster::block_on(port.step()).unwrap();
+        left -= step;
+    }
+}
+
+/// Whether the NCP reported `ieee` as an aged-out child
+/// (`EVT_DEVICE_LEFT` reason 4); drains the device events.
+fn reported_aged_out<A: TcApp>(port: &mut TcPort<A>, ieee: [u8; 8]) -> bool {
+    use ncp_coordinator_app::port::{DeviceEvent, left};
+    let mut reported = false;
+    while let Some(event) = port.take_device_event() {
+        if let DeviceEvent::Left {
+            ieee: departed,
+            reason,
+            ..
+        } = event
+            && departed == ieee
+            && reason == left::REASON_CHILD_TIMEOUT
+        {
+            reported = true;
+        }
+    }
+    reported
+}
+
+/// A MAC Data Request (keepalive poll) of the child at `nwk`.
+fn child_polls<A: TcApp<Mac = MockMac>>(port: &mut TcPort<A>, nwk: u16) {
+    use zigbee_mac::MacCommandEvent;
+    use zigbee_mac::primitives::MlmeDataRequestIndication;
+    use zigbee_types::{MacAddress, PanId, ShortAddress};
+    let pan = PanId(port.info().pan_id);
+    mock_mac(port).enqueue_command_event(MacCommandEvent::DataRequest(MlmeDataRequestIndication {
+        source_address: MacAddress::Short(pan, ShortAddress(nwk)),
+        destination_address: MacAddress::Short(pan, ShortAddress::COORDINATOR),
+        lqi: 180,
+        security_use: false,
+        acked_without_frame_pending: true,
+    }));
+    for _ in 0..2 {
+        pollster::block_on(port.step()).unwrap();
+    }
+}
+
+/// R22 default End Device Timeout enumeration (256 min).
+const DEFAULT_TIMEOUT: u8 = zigbee_nwk::frames::ED_TIMEOUT_ENUM_DEFAULT;
+/// Its window in seconds.
+const DEFAULT_WINDOW_SECS: u32 = 256 * 60;
+
+/// A backup whose child block carries an undefined End Device Timeout
+/// (`0xFF`: the host did not know it) restores that child with the R22
+/// default (enumeration 8, 256 min), not the longest window (14, ≈ 11
+/// days). Its clock starts at the restore, and a child that never polls
+/// ages out like a joined one: reported as `EVT_DEVICE_LEFT` reason 4 and
+/// exported afterwards as a known device, no longer a child.
+#[test]
+fn a_restored_child_with_an_undefined_timeout_ages_out_at_the_default() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let form = host.request(&form_request(0x5EA7, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let stream = export_stream(
+        &mut ncp,
+        &mut host,
+        &mut port,
+        &mut platform,
+        &mut pipe,
+        &log,
+        &mut now,
+    );
+    let commit = restore_stream(
+        &mut ncp,
+        &mut host,
+        &mut port,
+        &mut platform,
+        &mut pipe,
+        &log,
+        &mut now,
+        &stream,
+        &[child_tlv(DEVICE_IEEE, 0x4C21, 0xFF)],
+    );
+    assert_eq!(commit.children, 1);
+    assert_eq!(
+        child_view(&port, DEVICE_IEEE),
+        Some((0x80, DEFAULT_TIMEOUT)),
+        "an undefined timeout is restored as the R22 default"
+    );
+
+    // The window runs from the restore: still a child a minute before it
+    // ends, aged out once it has elapsed without a poll.
+    run_for(&mut port, DEFAULT_WINDOW_SECS - 60);
+    assert!(in_child_table(&port, DEVICE_IEEE), "within its window");
+    assert!(!reported_aged_out(&mut port, DEVICE_IEEE));
+    run_for(&mut port, 120);
+    assert!(
+        !in_child_table(&port, DEVICE_IEEE),
+        "a restored child that never polls ages out"
+    );
+    assert!(reported_aged_out(&mut port, DEVICE_IEEE));
+    assert_eq!(child_view(&port, DEVICE_IEEE), None);
+    let stream = export_stream(
+        &mut ncp,
+        &mut host,
+        &mut port,
+        &mut platform,
+        &mut pipe,
+        &log,
+        &mut now,
+    );
+    assert_eq!(
+        exported_child(&stream, DEVICE_IEEE),
+        Some(None),
+        "still known to the Trust Center, no longer exported as a child"
+    );
+}
+
+/// A backup vouches only for children that are still alive. A restored
+/// child whose own End Device Timeout (2 min) has elapsed without a
+/// keepalive is exported as a plain device even before the stack's aging
+/// pass has run, while a child within its window keeps its child block;
+/// the next aging pass then removes the expired one through the normal
+/// path (`EVT_DEVICE_LEFT` reason 4).
+#[test]
+fn a_backup_never_exports_an_expired_child_before_the_aging_pass() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let form = host.request(&form_request(0x5EA7, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let stream = export_stream(
+        &mut ncp,
+        &mut host,
+        &mut port,
+        &mut platform,
+        &mut pipe,
+        &log,
+        &mut now,
+    );
+    let commit = restore_stream(
+        &mut ncp,
+        &mut host,
+        &mut port,
+        &mut platform,
+        &mut pipe,
+        &log,
+        &mut now,
+        &stream,
+        &[
+            child_tlv(DEVICE_IEEE, 0x4C21, 1),
+            child_tlv(OTHER_CHILD, 0x4C22, 3),
+        ],
+    );
+    assert_eq!(commit.children, 2);
+    let stream = export_stream(
+        &mut ncp,
+        &mut host,
+        &mut port,
+        &mut platform,
+        &mut pipe,
+        &log,
+        &mut now,
+    );
+    assert_eq!(exported_child(&stream, DEVICE_IEEE), Some(Some((0x80, 1))));
+    assert_eq!(exported_child(&stream, OTHER_CHILD), Some(Some((0x80, 3))));
+
+    // Three minutes of radio time, no poll and no stack step (no aging
+    // pass yet).
+    advance_clock(&mut port, 180);
+    let stream = export_stream(
+        &mut ncp,
+        &mut host,
+        &mut port,
+        &mut platform,
+        &mut pipe,
+        &log,
+        &mut now,
+    );
+    assert_eq!(
+        exported_child(&stream, DEVICE_IEEE),
+        Some(None),
+        "an expired child is not vouched for, even before the aging pass"
+    );
+    assert_eq!(
+        exported_child(&stream, OTHER_CHILD),
+        Some(Some((0x80, 3))),
+        "a child within its window still is"
+    );
+    let stats = host.request(&TblStats {
+        table: record_type::DEVICE,
+    });
+    exchange!();
+    let stats: TblStatsRsp = host.response(stats).body();
+    assert_eq!(stats.pinned, 1, "only the live child is pinned");
+
+    // The aging pass removes it through the usual path.
+    assert!(in_child_table(&port, DEVICE_IEEE), "not swept yet");
+    pollster::block_on(port.step()).unwrap();
+    assert!(!in_child_table(&port, DEVICE_IEEE));
+    assert!(reported_aged_out(&mut port, DEVICE_IEEE));
+    assert!(in_child_table(&port, OTHER_CHILD));
+}
+
+/// The happy path is unchanged: a restored child that keeps polling stays a
+/// child well past its window and is exported with its own timeout; once
+/// it stops, it ages out after that window.
+#[test]
+fn a_restored_child_that_keeps_alive_stays_a_child() {
+    setup!(ncp, host, port, platform, pipe, log, now, exchange);
+    let form = host.request(&form_request(0x5EA7, 1 << 15));
+    exchange!();
+    assert_eq!(host.response(form).status(), 0);
+    let stream = export_stream(
+        &mut ncp,
+        &mut host,
+        &mut port,
+        &mut platform,
+        &mut pipe,
+        &log,
+        &mut now,
+    );
+    restore_stream(
+        &mut ncp,
+        &mut host,
+        &mut port,
+        &mut platform,
+        &mut pipe,
+        &log,
+        &mut now,
+        &stream,
+        &[child_tlv(DEVICE_IEEE, 0x4C21, 1)],
+    );
+    // Ten minutes, a poll every minute (its window is 2 min).
+    for _ in 0..10 {
+        run_for(&mut port, 60);
+        child_polls(&mut port, 0x4C21);
+    }
+    assert!(in_child_table(&port, DEVICE_IEEE));
+    assert!(!reported_aged_out(&mut port, DEVICE_IEEE));
+    let stream = export_stream(
+        &mut ncp,
+        &mut host,
+        &mut port,
+        &mut platform,
+        &mut pipe,
+        &log,
+        &mut now,
+    );
+    assert_eq!(exported_child(&stream, DEVICE_IEEE), Some(Some((0x80, 1))));
+    let children = host.request(&DiagGetChildren { start: 0 });
+    exchange!();
+    let children = host.response(children);
+    let children: DiagGetChildrenRsp = children.body();
+    let child = children.entries.iter().next().unwrap();
+    assert!(child.last_poll_ms < 60_000, "heard since the restore");
+
+    // It stops polling: gone once its own window has elapsed.
+    run_for(&mut port, 60);
+    assert!(in_child_table(&port, DEVICE_IEEE));
+    run_for(&mut port, 120);
+    assert!(!in_child_table(&port, DEVICE_IEEE));
+    assert!(reported_aged_out(&mut port, DEVICE_IEEE));
+}
+
+/// A child table store shared across simulated reboots (the flash journal
+/// outlives the application).
+struct SharedChildren<'s>(&'s mut RamChildTableStore);
+
+impl zigbee_runtime::child_store::ChildTableStore for SharedChildren<'_> {
+    fn load(
+        &mut self,
+    ) -> Result<
+        Option<zigbee_runtime::child_store::PersistentChildTable>,
+        zigbee_runtime::child_store::ChildStoreError,
+    > {
+        self.0.load()
+    }
+
+    fn store(
+        &mut self,
+        table: &zigbee_runtime::child_store::PersistentChildTable,
+    ) -> Result<(), zigbee_runtime::child_store::ChildStoreError> {
+        self.0.store(table)
+    }
+}
+
+/// A Trust Center store shared across simulated reboots.
+struct SharedTrustCenter<'s>(&'s mut RamTrustCenterDeviceStore);
+
+impl zigbee_runtime::trust_center_store::TrustCenterDeviceStore for SharedTrustCenter<'_> {
+    fn load_into(
+        &mut self,
+        state: &mut zigbee_runtime::trust_center_store::PersistentTrustCenterState,
+    ) -> Result<bool, zigbee_runtime::trust_center_store::TrustCenterStoreError> {
+        self.0.load_into(state)
+    }
+
+    fn store(
+        &mut self,
+        state: &zigbee_runtime::trust_center_store::PersistentTrustCenterState,
+    ) -> Result<(), zigbee_runtime::trust_center_store::TrustCenterStoreError> {
+        self.0.store(state)
+    }
+
+    fn clear(&mut self) -> Result<(), zigbee_runtime::trust_center_store::TrustCenterStoreError> {
+        self.0.clear()
+    }
+}
+
+/// One NCP boot over durable `security`, `children` and `trust_center`
+/// stores (see [`boot!`]).
+macro_rules! reboot {
+    ($security:ident, $children:ident, $trust_center:ident,
+     |$ncp:ident, $host:ident, $port:ident, $platform:ident, $pipe:ident, $log:ident,
+      $now:ident| $body:block) => {{
+        let mut gp_store = zigbee_runtime::gp_store::RamGpProxyStore::new();
+        let mut profile = profile();
+        let mut device = device(&profile);
+        let node = ZigbeeNode::new(&mut device, &mut $security, &mut profile);
+        let mut app = TrustCenterCoordinatorApp::new(
+            node,
+            PersistentChildren::new(SharedChildren(&mut $children)),
+            SharedTrustCenter(&mut $trust_center),
+            &POLICY,
+            RouterParts::new(NoStatus, NoSupervisor, NoDiagnostics),
+        )
+        .unwrap();
+        app.set_green_power_store(&mut gp_store);
+        let mut $port = TcPort::new(app, IEEE, clock_ms);
+        let $log = LogRing::<8>::new();
+        let mut $pipe = Pipe::default();
+        let mut $platform = FakePlatform::default();
+        let mut $now = 1_000u64;
+        let mut $ncp = Ncp::<8>::new(identity(), 0xC0FF_EE07, $now);
+        let mut $host = Host::new($now);
+        exchange(
+            &mut $ncp,
+            &mut $host,
+            &mut $port,
+            &mut $platform,
+            &mut $pipe,
+            &$log,
+            &mut $now,
+        );
+        assert!($host.event(ids::EVT_NCP_READY).is_some());
+        let negotiate = $host.request(&SysNegotiateReq {
+            major_min: 1,
+            major_max: 1,
+            host_caps: 0,
+            name: Bytes8(b"surface"),
+        });
+        exchange(
+            &mut $ncp,
+            &mut $host,
+            &mut $port,
+            &mut $platform,
+            &mut $pipe,
+            &$log,
+            &mut $now,
+        );
+        let _: SysNegotiateRsp = $host.response(negotiate).body();
+        $body
+    }};
+}
+
+/// After a reboot the NCP reloads its children from the durable child
+/// table. A child restored with an undefined timeout was persisted with
+/// the default and ages out with it, a child with a known timeout ages out
+/// with that one, and both clocks start at the reload. Once aged out they
+/// are neither exported as children nor kept in the durable table.
+#[test]
+fn a_reloaded_child_ages_out_at_its_persisted_timeout() {
+    use zigbee_runtime::child_store::ChildTableStore as _;
+    let mut security = RamSecurityStateStore::new();
+    let mut children = RamChildTableStore::new();
+    let mut trust_center = RamTrustCenterDeviceStore::new();
+    reboot!(
+        security,
+        children,
+        trust_center,
+        |ncp, host, port, platform, pipe, log, now| {
+            let form = host.request(&form_request(0x5EA7, 1 << 15));
+            exchange(
+                &mut ncp,
+                &mut host,
+                &mut port,
+                &mut platform,
+                &mut pipe,
+                &log,
+                &mut now,
+            );
+            assert_eq!(host.response(form).status(), 0);
+            let stream = export_stream(
+                &mut ncp,
+                &mut host,
+                &mut port,
+                &mut platform,
+                &mut pipe,
+                &log,
+                &mut now,
+            );
+            let commit = restore_stream(
+                &mut ncp,
+                &mut host,
+                &mut port,
+                &mut platform,
+                &mut pipe,
+                &log,
+                &mut now,
+                &stream,
+                &[
+                    child_tlv(DEVICE_IEEE, 0x4C21, 0xFF),
+                    child_tlv(OTHER_CHILD, 0x4C22, 3),
+                ],
+            );
+            assert_eq!(commit.children, 2);
+        }
+    );
+    let stored = children.load().unwrap().expect("a durable child table");
+    let timeouts: Vec<([u8; 8], u8)> = stored
+        .children()
+        .map(|child| (child.ieee_address, child.end_device_timeout))
+        .collect();
+    assert_eq!(
+        timeouts,
+        [(DEVICE_IEEE, DEFAULT_TIMEOUT), (OTHER_CHILD, 3)],
+        "persisted with the default, never the longest window"
+    );
+
+    reboot!(
+        security,
+        children,
+        trust_center,
+        |ncp, host, port, platform, pipe, log, now| {
+            let init = host.request(&zigbee_zrhp::msg::network::NwkInit {
+                nwk_fc_floor: 0,
+                aps_fc_floor: 0,
+            });
+            exchange(
+                &mut ncp,
+                &mut host,
+                &mut port,
+                &mut platform,
+                &mut pipe,
+                &log,
+                &mut now,
+            );
+            assert_eq!(host.response(init).status(), 0);
+            assert_eq!(
+                child_view(&port, DEVICE_IEEE),
+                Some((0x80, DEFAULT_TIMEOUT))
+            );
+            assert_eq!(child_view(&port, OTHER_CHILD), Some((0x80, 3)));
+
+            // The known 8-minute timeout.
+            run_for(&mut port, 7 * 60);
+            assert!(in_child_table(&port, OTHER_CHILD));
+            run_for(&mut port, 2 * 60);
+            assert!(!in_child_table(&port, OTHER_CHILD));
+            assert!(reported_aged_out(&mut port, OTHER_CHILD));
+
+            // The default 256-minute one, counted from the reload.
+            run_for(&mut port, DEFAULT_WINDOW_SECS - 10 * 60);
+            assert!(in_child_table(&port, DEVICE_IEEE), "within its window");
+            run_for(&mut port, 2 * 60);
+            assert!(
+                !in_child_table(&port, DEVICE_IEEE),
+                "a reloaded child that never polls ages out"
+            );
+            assert!(reported_aged_out(&mut port, DEVICE_IEEE));
+            let stream = export_stream(
+                &mut ncp,
+                &mut host,
+                &mut port,
+                &mut platform,
+                &mut pipe,
+                &log,
+                &mut now,
+            );
+            assert_eq!(exported_child(&stream, DEVICE_IEEE), Some(None));
+            assert_eq!(exported_child(&stream, OTHER_CHILD), Some(None));
+        }
+    );
+    assert!(
+        children
+            .load()
+            .unwrap()
+            .is_some_and(|table| table.is_empty()),
+        "aged-out children leave the durable table"
+    );
+}

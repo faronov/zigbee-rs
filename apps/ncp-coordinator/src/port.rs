@@ -381,8 +381,6 @@ pub trait CoordinatorPort {
     fn device_capacity(&self) -> usize {
         0
     }
-    /// The `index`-th known device (Trust Center records first, then
-    /// children without a record); `None` past the end.
     /// Entries of a `DIAG_GET_*` table (`DiagTable`), the coordinator's
     /// Mgmt_Lqi / Mgmt_Rtg view (spec 7.8). None by default.
     fn diag_count(&self, _table: DiagTable) -> usize {
@@ -404,6 +402,10 @@ pub trait CoordinatorPort {
         None
     }
 
+    /// The `index`-th known device (Trust Center records first, then
+    /// children without a record); `None` past the end. Only children the
+    /// NCP still vouches for carry `child`: authenticated, and not past
+    /// their End Device Timeout even if the aging pass has not run yet.
     fn device(&self, index: usize) -> Option<DeviceView> {
         let _ = index;
         None
@@ -564,7 +566,10 @@ pub struct RestoredKey {
 }
 
 /// A child of the NCP carried by a backup (`DEVICE` record with a child
-/// block): it keeps its parent and short address across a restore.
+/// block): it keeps its parent and short address across a restore. It has
+/// not been heard yet: its End Device Timeout window starts when the
+/// restored network starts, and it ages out like any other child if it
+/// never keeps alive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestoredChild {
     pub ieee: [u8; 8],
@@ -572,7 +577,8 @@ pub struct RestoredChild {
     /// MAC capability information (bit1 FFD, bit3 RX on when idle, bit6
     /// security capable).
     pub capability: u8,
-    /// R22 End Device Timeout enumeration.
+    /// R22 End Device Timeout enumeration (0..=14): the backup's when it is
+    /// defined, the R22 default 8 (256 min) otherwise.
     pub timeout: u8,
 }
 
