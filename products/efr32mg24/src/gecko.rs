@@ -175,6 +175,10 @@ mod tests {
     fn version_encoding() {
         assert_eq!(parse_version("7.4.5"), 0x0704_0500);
         assert_eq!(parse_version("0.1.0"), 0x0001_0000);
+        // No room for a pre-release suffix: `0.2.0-rc.1` runs as 0.2.0
+        // (the release tooling compares the Gecko word with that).
+        assert_eq!(parse_version("0.2.0-rc.1"), 0x0002_0000);
+        assert_eq!(parse_version("1.2.3+build.4"), 0x0102_0300);
         assert_eq!(APP_VERSION, parse_version(env!("CARGO_PKG_VERSION")));
     }
 

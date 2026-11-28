@@ -231,6 +231,17 @@ def gecko_version(word: int) -> str:
     return f"{word >> 24}.{(word >> 16) & 0xFF}.{(word >> 8) & 0xFF}"
 
 
+def core_version(version: str) -> str:
+    """`MAJOR.MINOR.PATCH` of a release version: the Gecko application
+    version word has no room for a pre-release or build suffix
+    (products/efr32mg24/src/gecko.rs drops it), so `0.2.0-rc.1` is
+    `0.2.0` there."""
+    m = re.fullmatch(r"(\d+\.\d+\.\d+)(?:[-+].*)?", version)
+    if m is None:
+        raise ReleaseError(f"version {version!r} is not MAJOR.MINOR.PATCH[-PRE][+BUILD]")
+    return m.group(1)
+
+
 def cmd_gecko(args: argparse.Namespace) -> None:
     """Describe one Gecko bootloader image (`gecko.json` in `--out`, a list
     the manifest step collects) and copy it next to that description."""
@@ -244,9 +255,14 @@ def cmd_gecko(args: argparse.Namespace) -> None:
             raise ReleaseError(f"{src.name}: an application GBL needs its application and ZRHP records")
         version = gecko_version(app["version"])
         fw = info["zrhp"]["fw_version"]
-        if args.expect_version and (version != args.expect_version or fw != args.expect_version):
+        # The ZRHP record carries the full version string; the Gecko word
+        # only MAJOR.MINOR.PATCH.
+        if args.expect_version and (fw != args.expect_version
+                                    or version != core_version(args.expect_version)):
             raise ReleaseError(f"{src.name}: Gecko version {version}, ZRHP firmware {fw}, "
                                f"release {args.expect_version}")
+        if version != core_version(fw):
+            raise ReleaseError(f"{src.name}: Gecko version {version} does not match ZRHP firmware {fw}")
     elif app is not None:
         raise ReleaseError(f"{src.name}: a maintenance GBL carries no application record")
     if any(start < 0x0800_6000 for start, _ in info["programs"]):
@@ -264,7 +280,10 @@ def cmd_gecko(args: argparse.Namespace) -> None:
         "file": file_entry(out / src.name, None),
     }
     if args.kind == "application":
-        entry["app_version"] = gecko_version(app["version"])
+        # `app_version` is the firmware's own version string (as on the ESP
+        # boards); `gecko_version` the word the Gecko bootloader sees.
+        entry["app_version"] = info["zrhp"]["fw_version"]
+        entry["gecko_version"] = gecko_version(app["version"])
         entry["build_id"] = info["zrhp"]["build_id"]
     listing = out / "gecko.json"
     entries = json.loads(listing.read_text()) if listing.exists() else []
@@ -418,8 +437,11 @@ def cmd_manifest(args: argparse.Namespace) -> None:
             src = directory / entry["file"]["name"]
             if sha256(src) != entry["file"]["sha256"]:
                 raise ReleaseError(f"{src.name}: SHA-256 changed since it was described")
-            if entry["kind"] == "application" and entry["app_version"] != args.version:
-                raise ReleaseError(f"{entry['id']}: firmware {entry['app_version']} != release {args.version}")
+            if entry["kind"] == "application" and (
+                    entry["app_version"] != args.version
+                    or entry.get("gecko_version", core_version(args.version)) != core_version(args.version)):
+                raise ReleaseError(f"{entry['id']}: firmware {entry['app_version']} "
+                                   f"(Gecko {entry.get('gecko_version')}) != release {args.version}")
             shutil.copyfile(src, out / src.name)
             gecko.append(entry)
     manifest = {
